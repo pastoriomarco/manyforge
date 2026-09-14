@@ -271,12 +271,22 @@ class OwnerTaskSnapshot:
     metadata: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     reason_code: str | None = None
     message: str = ""
+    # Evidence carried by a terminal owner result, not a second lifecycle.
+    # False means no settlement proof is carried, not that motion is active.
+    # Successful native tasks still cross the exact acknowledgement gate.
+    settlement_proven: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_id, str) or not self.task_id:
             raise ValueError("owner task id must be non-empty text")
         if not isinstance(self.state, OwnerTaskState):
             raise TypeError("owner task state must be an OwnerTaskState")
+        if type(self.settlement_proven) is not bool:
+            raise TypeError("owner task settlement proof must be boolean")
+        if self.settlement_proven and self.state not in {
+            OwnerTaskState.SUCCEEDED, OwnerTaskState.FAILED
+        }:
+            raise ValueError("settlement proof requires a terminal owner result")
         if not isinstance(self.message, str):
             raise TypeError("owner task message must be text")
         if not isinstance(self.metadata, Mapping):

@@ -304,6 +304,15 @@ describe('Program authoring panels', () => {
     expect(unavailableItem).not.toContain('Authoring is currently unavailable');
   });
 
+  it('does not build parameter details while palette information is closed', () => {
+    const readParameters = vi.fn(() => sequence.parameters);
+    const entry = { ...sequence, get parameters() { return readParameters(); } };
+    const markup = renderToStaticMarkup(<NodePaletteItem entry={entry} />);
+
+    expect(markup).toContain('Information about Sequence');
+    expect(readParameters).not.toHaveBeenCalled();
+  });
+
   it('marks executable catalog information without an inline status sentence', () => {
     const executableEnvironment: NodeEnvironmentResponse = {
       ...environment,

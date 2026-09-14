@@ -3058,7 +3058,17 @@ def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:
     assert transport.attachments == []
 
 
-def test_scene_node_retries_a_concurrent_pose_revision_with_one_correlation() -> None:
+@pytest.mark.parametrize(
+    "code,reason,retry",
+    [
+        ("stale_revision", "scene_advanced", True),
+        ("stale_generation", "expected_generation_stale", True),
+        ("stale_generation", "claim_owner_epoch_stale", False),
+    ],
+)
+def test_scene_node_retries_a_concurrent_revision_with_one_correlation(
+    code, reason, retry
+) -> None:
     class _ConcurrentPoseTransport(_SceneTransport):
         def __init__(self) -> None:
             super().__init__()
@@ -3075,9 +3085,12 @@ def test_scene_node_retries_a_concurrent_pose_revision_with_one_correlation() ->
                     "revision_id": revision_id,
                     "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
                 }
-                raise _scene_rejection(
-                    body, "stale_revision", "external pose update advanced the scene"
+                self.admission_generation += 1
+                error = _scene_rejection(
+                    body, code, "concurrent owner revision advanced"
                 )
+                error.response["error"]["details"]["reason"] = reason
+                raise error
             return super().commit_scene_transaction(body)
 
     transport = _ConcurrentPoseTransport()
@@ -3099,6 +3112,12 @@ def test_scene_node_retries_a_concurrent_pose_revision_with_one_correlation() ->
         ),
     )
 
+    if not retry:
+        assert not result.succeeded
+        assert result.reason_code == code
+        assert len(transport.rejected_requests) == 1
+        assert not transport.submissions
+        return
     assert result.succeeded is True
     assert result.metadata["stale_revision_retry_count"] == 1
     assert len(transport.rejected_requests) == 1
@@ -3107,6 +3126,9 @@ def test_scene_node_retries_a_concurrent_pose_revision_with_one_correlation() ->
     committed_context = transport.submissions[0]["request_context"]
     assert rejected_context["request_id"] != committed_context["request_id"]
     assert rejected_context["correlation_id"] == committed_context["correlation_id"]
+    assert transport.submissions[0]["expected_admission_generation"] == (
+        transport.rejected_requests[0]["expected_admission_generation"] + 1
+    )
 
 
 def test_scene_resource_relative_pose_is_forwarded_to_the_scene_owner() -> None:

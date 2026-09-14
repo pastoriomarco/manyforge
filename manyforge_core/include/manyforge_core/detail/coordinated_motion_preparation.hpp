@@ -22,6 +22,10 @@ class CoordinatedMotionPreparation final {
       std::stop_token stop);
   void cancel() noexcept;
   [[nodiscard]] std::shared_ptr<CoordinatedExecutionClock> execution_clock();
+  // The sealed candidate must carry the actual common result, not merely
+  // compatible independent bounds. Does not arm or dispatch the participant.
+  [[nodiscard]] bool accepts_prepared(const OperationParticipantId& participant,
+                                      const TrajectoryRuntimeScaleBoundsDTO& bounds);
 
  private:
   struct Slot {

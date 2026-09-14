@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <set>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -10,6 +11,8 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/model_asset_codec.hpp>
+#include <manyforge_deployment/model_source.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/scenario_catalog.hpp>
 
@@ -631,9 +634,20 @@ CanonicalValue ProgramSelectionOwner::Prepare(
             "Program Apply compiler returned a divergent Program Binding");
 
     // Import the complete immutable deployment closure before either Program
-    // artifact. The source side is get-only and pinned to install_root; every
+    // artifact. The source side is get-only and pinned to source_root; every
     // destination write is no-replace and quota checked. A failure here can
     // leave only unreachable immutable values and cannot advance Applied.
+    const auto copy_raw = [&](const auto &key, const auto &digest,
+                              std::uint64_t size) {
+      const auto bytes = raw_artifact_source.get_verified(key, digest, size);
+      Require(bytes.has_value(), "program_apply_bundle_invalid",
+              "Program Apply raw-artifact closure is unavailable");
+      const auto stored = raw_artifact_store_.put_if_absent(*bytes);
+      Require(stored.content_addressed_store_key == key &&
+                  stored.content_digest == digest && stored.byte_size == size,
+              "program_apply_repository_invalid",
+              "Program Apply raw artifact reopened under another identity");
+    };
     for (const auto &record : bundle->value().catalogs.records) {
       std::visit(
           [&](const auto &reference) {
@@ -645,23 +659,21 @@ CanonicalValue ProgramSelectionOwner::Prepare(
             static_cast<void>(catalog_store_.put_if_absent(
                 reference.content_addressed_store_key,
                 reference.content_digest, *bytes));
+            if constexpr (std::is_same_v<std::decay_t<decltype(reference)>,
+                                         core::ModelAssetCatalogRecordRefDTO>) {
+              const auto model = deployment::resolve_and_qualify_model_asset(
+                  reference, reference.content_addressed_store_key, *bytes);
+              const auto sources =
+                  deployment::preflight_model_source_declaration(model);
+              // Compiled product refs do not include the model's source mesh,
+              // texture and XML closure. Successor owners verify those too.
+              for (const auto &source : sources.artifacts())
+                copy_raw(source.expected_store_key, source.content_digest,
+                         source.byte_size);
+            }
           },
           record);
     }
-    const auto copy_raw = [&](const auto &reference) {
-      const auto bytes = raw_artifact_source.get_verified(
-          reference.content_addressed_store_key, reference.content_digest,
-          reference.byte_size);
-      Require(bytes.has_value(), "program_apply_bundle_invalid",
-              "Program Apply raw-artifact closure is unavailable");
-      const auto stored = raw_artifact_store_.put_if_absent(*bytes);
-      Require(stored.content_addressed_store_key ==
-                  reference.content_addressed_store_key &&
-                  stored.content_digest == reference.content_digest &&
-                  stored.byte_size == reference.byte_size,
-              "program_apply_repository_invalid",
-              "Program Apply raw artifact reopened under another identity");
-    };
     for (const auto &schema : bundle->value().catalogs.schema_artifacts) {
       const auto bytes = raw_artifact_source.get_verified(
           schema.content_addressed_store_key, schema.content_digest);
@@ -677,7 +689,8 @@ CanonicalValue ProgramSelectionOwner::Prepare(
     ForEachProduct(bundle->value().compiled_products,
                    [&](const core::RetainedProductDTO &product) {
                      for (const auto &artifact : product.artifact_refs) {
-                       copy_raw(artifact);
+                       copy_raw(artifact.content_addressed_store_key,
+                                artifact.content_digest, artifact.byte_size);
                      }
                    });
     static_cast<void>(bundle_repository_.put_if_absent(bundle));

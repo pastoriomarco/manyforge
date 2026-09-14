@@ -569,6 +569,8 @@ export function ProgramTransportControls({
     && program.commandAllowed('program_run');
   const motionStopSettled = selectedGroups.length > 0
     && selectedGroups.every((group) => group.state === 'held') && programMotionRunning;
+  const motionStopSettling = selectedGroups.some((group) => group.state === 'stopping')
+    && selectedGroups.every((group) => group.state === 'stopping' || group.state === 'held');
   const motionStopped = motionStopSettled
     || programFullStopped
     || state.run?.state === 'stopped'
@@ -582,6 +584,7 @@ export function ProgramTransportControls({
     && !stopCommandPending
     && !programStopping
     && !motionStopSettled
+    && !motionStopSettling
     && groupIds.length > 0
     && (
       (state.runnerAvailable && (programStarting || (programMotionRunning
@@ -625,6 +628,8 @@ export function ProgramTransportControls({
   const velocityReason = robot.runtimeScaleError
     ?? robot.runtimeScaleStatus?.reason
     ?? 'The addressed target does not currently expose qualified runtime velocity control.';
+  const velocityGroup = robot.runtimeScaleStatus?.selector.kind === 'group'
+    ? robot.runtimeScaleStatus.selector.synchronizedTargets : null;
   const fullCellStop = robot.state.status?.cellStopAction ?? null;
   const fullStopReason = fullCellStop === null
     ? 'The current execution owner status is unavailable.'
@@ -800,7 +805,7 @@ export function ProgramTransportControls({
               }
             }}
           >
-            {programStopping || selectedGroups.some((group) => group.state === 'stopping')
+            {programStopping || motionStopSettling
               ? 'Stopping'
               : robot.controlPending === 'stop'
               ? 'Sending Stop'
@@ -880,10 +885,12 @@ export function ProgramTransportControls({
         </button>
         <span className="viewer-tool-separator" aria-hidden="true" />
         <label className="transport-velocity" title={velocityAvailable
-          ? 'Scale current and subsequent moves for this addressed target.'
+          ? velocityGroup
+            ? `One shared velocity for ${velocityGroup.map((target) => `${target.componentRoleId}/${target.targetRoleId}`).join(', ')}.`
+            : 'Scale current and subsequent moves for this addressed target.'
           : velocityReason}
         >
-          <span>Velocity</span>
+          <span>{velocityGroup ? 'Group velocity' : 'Velocity'}</span>
           <input
             type="range"
             min="0"

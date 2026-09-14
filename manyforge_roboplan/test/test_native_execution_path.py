@@ -348,12 +348,16 @@ def _wait_for_current_cclc_routes(
     execution_run_root: Path,
 ) -> dict[str, Any]:
     client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=1.0)
+    execution = ExecutionCommandClient(execution_run_root, timeout_seconds=1.0)
     deadline = time.monotonic() + 10.0
     last_snapshot: dict[str, Any] | None = None
     while time.monotonic() < deadline:
         try:
             last_snapshot = client.component_snapshot("lite6_arm")
-            if _cclc_active_routes_are_current(last_snapshot):
+            identity = execution.identity()["identity"]
+            if _cclc_active_routes_are_current(last_snapshot) and identity[
+                "control_management_mode"
+            ] == "component_lifecycle":
                 return last_snapshot
         except HeadlessApiError:
             pass
@@ -443,7 +447,16 @@ def _start_host(
                         if snapshot.get("component_lifecycle_state") == "active":
                             _wait_for_current_cclc_routes(execution_run_root)
                         else:
+                            while (
+                                client.identity()["identity"][
+                                    "control_management_mode"
+                                ]
+                                == "pending"
+                            ):
+                                assert time.monotonic() < deadline
+                                time.sleep(0.01)
                             _qualify_native_cclc_product(execution_run_root)
+                            _wait_for_current_cclc_routes(execution_run_root)
                     except Exception as error:
                         _stop_host(process)
                         detail = (
@@ -477,7 +490,7 @@ def _stop_host(process: subprocess.Popen[bytes]) -> None:
             process.wait(timeout=5.0)
 
 
-def _runner_submission(
+def _unclaimed_program_submission(
     runner: OrchestratorRunner,
     *,
     request_id: str,
@@ -498,30 +511,49 @@ def _runner_submission(
     )
 
 
-def _gripper_submission(
-    runner: OrchestratorRunner,
+def _manual_joint_submission(
+    client: HeadlessHttpClient,
+    *,
+    request_id: str,
+    joint_names: tuple[str, ...],
+    positions: tuple[float, ...],
+) -> dict[str, Any]:
+    return client.execute(
+        _direct_control_motion_operation(
+            client.execution_diagnostics()["status"],
+            request_id=request_id,
+            motion={
+                "kind": "joint_goal",
+                "joint_names": list(joint_names),
+                "positions_rad": list(positions),
+            },
+        )
+    )
+
+
+def _manual_gripper_submission(
+    client: HeadlessHttpClient,
     *,
     request_id: str,
     position_kind: str,
     position: float,
     command_duration_s: float = 0.05,
 ) -> dict[str, Any]:
-    return runner.submit_gripper_position(
+    operation = _direct_control_gripper_operation(
+        client.execution_diagnostics()["status"],
         request_id=request_id,
-        program_run_id="n5-program-run-1",
-        component_role_id="robot",
-        target_role_id="gripper",
-        node_instance_id="root/native-gripper[0]",
-        node_attempt_id=f"n5-program-run-1/{request_id}",
-        position_kind=position_kind,  # type: ignore[arg-type]
         position=position,
-        command_duration_s=command_duration_s,
-        completion_timeout_s=max(2.0, command_duration_s + 1.0),
-        correlation_id="n5-process-test",
     )
+    payload = operation["participants"][0]["payload"]
+    assert payload["command_value"]["position"]["kind"] == position_kind
+    payload["caller_options"][0]["value_s"] = command_duration_s
+    payload["completion_timeout_s"] = max(2.0, command_duration_s + 1.0)
+    return client.execute(operation)
 
 
-def _wait_terminal(runner: OrchestratorRunner, operation_id: str) -> dict[str, Any]:
+def _wait_terminal(
+    runner: OrchestratorRunner | HeadlessHttpClient, operation_id: str
+) -> dict[str, Any]:
     deadline = time.monotonic() + 20.0
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
@@ -602,7 +634,7 @@ def _wait_retired(client: ExecutionCommandClient, operation_id: str) -> None:
 
 
 def _wait_state(
-    runner: OrchestratorRunner,
+    runner: OrchestratorRunner | HeadlessHttpClient,
     operation_id: str,
     expected: set[str],
     *,
@@ -1135,8 +1167,8 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
                 }
             )
             observation = viewer.receive_json()
-        accepted = _runner_submission(
-            runner,
+        accepted = _manual_joint_submission(
+            headless,
             request_id="accept-while-reconciliation-gated",
             joint_names=("joint1",),
             positions=(0.1,),
@@ -1163,10 +1195,10 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         )
         assert control_state["control_state"]["manual_operations"] == []
         manual_operations = resident_control_state["control_state"]["manual_operations"]
-        # This fixture submission belongs to the independent test Program run,
-        # not either direct-control Program run, so the scoped projection must
-        # not leak it into Robot Control recovery.
-        assert manual_operations == []
+        # This is a real manual operation, not a fabricated captured Program.
+        assert [row["operation"]["operation_id"] for row in manual_operations] == [
+            operation_id
+        ]
         assert targets["identity"] == control_state["identity"] == identity["identity"]
         assert observation["ok"] is True
         assert observation["command"] == "observation"
@@ -1823,11 +1855,260 @@ def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
         raw_api.close()
 
 
-def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
-    from manyforge_program_runner.execution_transport import (
-        ProgramRunnerExecutionTransport,
+def _check_malformed_stop_recovery(
+    raw_api: TestClient,
+    headless: HeadlessHttpClient,
+    execution: ExecutionCommandClient,
+    execution_state_root: Path,
+    owner_epoch: str,
+    malformed_operation_id: str,
+    before_recovery: Callable[[], str] | None = None,
+) -> None:
+    malformed_response = raw_api.post(
+        "/api/execution/stops",
+        content=b'{"operations":[',
+        headers={
+            "Content-Type": "application/json",
+            "X-Request-ID": "native-malformed-stop",
+        },
     )
+    assert malformed_response.status_code == 200, malformed_response.text
+    malformed_acceptance = malformed_response.json()["accepted"]
+    assert malformed_acceptance["request_id"] == (
+        "malformed-stop.native-malformed-stop"
+    )
+    assert malformed_acceptance["resolution_disposition"] == ("promoted_to_full")
+    assert malformed_acceptance["resolution_reason"] == ("malformed_ordinary_intent")
+    malformed_terminal = _wait_terminal(headless, malformed_operation_id)["operation"]
+    assert malformed_terminal["state"] == "stopped"
+    assert malformed_terminal["active_stop_id"] == malformed_acceptance["stop_id"]
 
+    with sqlite3.connect(
+        execution_state_root / "operation-journal.sqlite3"
+    ) as database:
+        malformed_row = database.execute(
+            "SELECT payload_json FROM journal_records WHERE request_id=? "
+            "AND record_kind='stop_acceptance_projected'",
+            ("malformed-stop.native-malformed-stop",),
+        ).fetchone()
+    assert malformed_row is not None
+    malformed_payload = json.loads(malformed_row[0])
+    assert malformed_payload["acceptance"]["malformed_ingress_reason"] == (
+        "recognized_stop_payload_invalid"
+    )
+    assert malformed_payload["acceptance"]["normalized_request_digest"] is None
+    assert malformed_payload["intent"] == {
+        "intent_kind": "malformed_ingress",
+        "value": None,
+    }
+
+    if before_recovery is not None:
+        owner_epoch = before_recovery()
+    # Assessment belongs to the backend, not to a series of rejected clear
+    # requests. Reading the offer must eventually show ready while the fault
+    # remains latched; only the explicit request below may clear it.
+    assessment_deadline = time.monotonic() + 2.0
+    while True:
+        offer = headless.stop_fault()["stop_fault"]
+        assert offer is not None
+        assert offer["latch"]["state"] == "latched"
+        if offer["latch"]["recovery_status"] == "ready":
+            break
+        assert time.monotonic() < assessment_deadline, {
+            key: offer["latch"][key]
+            for key in (
+                "recovery_status",
+                "reason_code",
+                "recovery_assessment_revision",
+            )
+        }
+        time.sleep(0.05)
+    recovered_result = _recover_active_stop_fault(
+        headless,
+        owner_epoch=owner_epoch,
+        request_prefix="recover-native-malformed",
+        correlation_id="native-malformed-stop-recovery",
+        reason="operator verified post-Stop cell truth",
+    )
+    assert recovered_result is not None
+    assert recovered_result["accepted"] is True, recovered_result
+    assert recovered_result["latch"]["state"] == "cleared"
+    assert headless.stop_fault()["stop_fault"] is None
+    with sqlite3.connect(
+        execution_state_root / "operation-journal.sqlite3"
+    ) as database:
+        clear_rows = database.execute(
+            "SELECT sequence,payload_json FROM journal_records "
+            "WHERE record_kind='stop_fault_cleared' AND stop_id=?",
+            (malformed_acceptance["stop_id"],),
+        ).fetchall()
+    assert len(clear_rows) == 1
+    durable_clear = json.loads(clear_rows[0][1])
+    assert durable_clear[0] == (
+        "manyforge.internal.stop-journal-fault-clear-projection.v2"
+    )
+    assert durable_clear[2][0] == recovered_result["request_id"]
+    clear_page = execution.events(owner_epoch, int(clear_rows[0][0]) - 1, limit=1)
+    assert len(clear_page["events"]) == 1
+    clear_event = clear_page["events"][0]
+    assert clear_event["record_kind"] == "stop_fault_cleared"
+    assert clear_event["request_id"] == recovered_result["request_id"]
+    assert clear_event["operation_id"] is None
+    assert clear_event["operation_revision"] is None
+    clear_history = clear_event["payload"]
+    assert clear_history["api_version"] == ("manyforge.stop_fault_clear_projection.v1")
+    assert clear_history["fault_latch"]["latch_id"] == (
+        recovered_result["latch"]["latch_id"]
+    )
+    assert clear_history["fault_latch"]["state"] == "cleared"
+    assert clear_history["fault_latch"]["recovery_status"] == "cleared"
+    assert clear_history["result"]["accepted"] is True
+
+
+@pytest.mark.parametrize("restart_with_fault", [False, True])
+def test_manual_motion_malformed_stop_recovers_with_durable_evidence(
+    tmp_path: Path,
+    restart_with_fault: bool,
+) -> None:
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    state_root, run_root = tmp_path / "state", tmp_path / "run"
+    state_root.mkdir()
+    run_root.mkdir()
+    process = _start_host(fixture_root, state_root, run_root, manifest)
+    execution = ExecutionCommandClient(run_root, timeout_seconds=3.0)
+    raw_api = TestClient(
+        create_app(
+            service=HeadlessService(UnusedCore(), UnusedManager(), execution),
+            trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
+        )
+    )
+    headless = HeadlessHttpClient("http://headless.test", client=raw_api)
+    try:
+        status = headless.execution_diagnostics()["status"]
+        positions = list(status["direct_control"]["observed_state"]["positions_rad"])
+        positions[0] = 0.55
+        request = _direct_control_joint_operation(
+            status,
+            status["direct_control"],
+            request_id="manual-malformed-stop-operation",
+            positions_rad=positions,
+        )
+        accepted = headless.execute(request)
+        operation_id = accepted["accepted"]["operation_id"]
+        _wait_state(headless, operation_id, {"executing"})
+
+        def cclc_recovery_footprint() -> dict[str, list[tuple[Any, ...]]]:
+            with sqlite3.connect(state_root / "cclc-journal.sqlite3") as database:
+                return {
+                    "owners": database.execute(
+                        "SELECT owner_epoch FROM cclc_owner_epochs ORDER BY epoch_sequence"
+                    ).fetchall(),
+                    "lifecycle_effects": database.execute(
+                        "SELECT attempt_sequence, effect_kind, "
+                        "completed_attempt_blob IS NOT NULL "
+                        "FROM cclc_effect_attempts ORDER BY attempt_sequence"
+                    ).fetchall(),
+                    "route_effects": database.execute(
+                        "SELECT attempt_sequence, effect_kind, "
+                        "completed_attempt_blob IS NOT NULL "
+                        "FROM cclc_route_effect_attempts ORDER BY attempt_sequence"
+                    ).fetchall(),
+                }
+
+        retained_cclc_footprint = None
+
+        def restart_before_recovery() -> str:
+            nonlocal process, retained_cclc_footprint
+            fault = headless.stop_fault()["stop_fault"]
+            assert fault is not None
+            _stop_host(process)
+            predecessor_footprint = cclc_recovery_footprint()
+            process = _start_host(
+                fixture_root, state_root, run_root, manifest, qualify_cclc=False
+            )
+            restored = headless.stop_fault()["stop_fault"]
+            assert restored is not None
+            assert restored["latch"]["latch_id"] == fault["latch"]["latch_id"]
+            assert restored["latch"]["state"] != "cleared"
+            assert CellAdmissionClient(run_root).get()["authoring_allowed"] is False
+            assert _wait_for_cclc_component(run_root) is not None
+            _wait_for_current_cclc_routes(run_root)
+            # Route readiness arrives asynchronously; it cannot clear the fault.
+            assert CellAdmissionClient(run_root).get()["authoring_allowed"] is False
+            retained_cclc_footprint = cclc_recovery_footprint()
+            assert len(retained_cclc_footprint["owners"]) == len(
+                predecessor_footprint["owners"]
+            ) + 1
+            assert (
+                retained_cclc_footprint["lifecycle_effects"]
+                == predecessor_footprint["lifecycle_effects"]
+            )
+            predecessor_route_sequence = max(
+                (row[0] for row in predecessor_footprint["route_effects"]),
+                default=0,
+            )
+            recovery_effects = [
+                row
+                for row in retained_cclc_footprint["route_effects"]
+                if row[0] > predecessor_route_sequence
+            ]
+            assert recovery_effects
+            assert all(
+                row[1]
+                in {
+                    "kernel_route_configuration_fence_acquire",
+                    "kernel_route_configuration_fence_release",
+                }
+                and row[2] == 1
+                for row in recovery_effects
+            )
+            return headless.execution_identity()["identity"]["owner_epoch"]
+
+        _check_malformed_stop_recovery(
+            raw_api,
+            headless,
+            execution,
+            state_root,
+            status["owner_epoch"],
+            operation_id,
+            restart_before_recovery if restart_with_fault else None,
+        )
+        if restart_with_fault:
+            assert cclc_recovery_footprint() == retained_cclc_footprint
+        assert CellAdmissionClient(run_root).get()["authoring_allowed"] is True
+        assert _wait_for_cclc_component(run_root) is not None
+        retained = headless.operation(operation_id)["operation"]
+        journal_path = state_root / "operation-journal.sqlite3"
+        journal_identity = (journal_path.stat().st_dev, journal_path.stat().st_ino)
+        run_identity = (run_root.stat().st_dev, run_root.stat().st_ino)
+        _stop_host(process)
+        assert (run_root.stat().st_dev, run_root.stat().st_ino) == run_identity
+        assert not (run_root / "execution-command.sock").exists()
+        assert not (run_root / "execution-observation.sock").exists()
+        process = _start_host(fixture_root, state_root, run_root, manifest)
+        assert (run_root.stat().st_dev, run_root.stat().st_ino) == run_identity
+        assert (run_root / "execution-command.sock").is_socket()
+        assert (run_root / "execution-observation.sock").is_socket()
+        assert (
+            journal_path.stat().st_dev,
+            journal_path.stat().st_ino,
+        ) == journal_identity
+        restarted = headless.execution_diagnostics()["status"]
+        assert restarted["owner_epoch"] != status["owner_epoch"]
+        with pytest.raises(HeadlessClientError) as stale:
+            headless.execute(request)
+        assert stale.value.code == "stale_request_owner_epoch"
+        assert stale.value.status_code == 409
+        assert headless.operation(operation_id)["operation"] == retained
+        assert headless.stop_fault()["stop_fault"] is None
+    finally:
+        _stop_host(process)
+        raw_api.close()
+
+
+def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> None:
     built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
     fixture_root = tmp_path / "fixture"
     shutil.copytree(built_fixture, fixture_root)
@@ -2287,32 +2568,101 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         )
         _wait_retired(native, direct_gripper_operation_id)
 
-        with pytest.raises(HeadlessClientError) as rejected:
-            _runner_submission(
+        # Public callers cannot impersonate a captured Program effect. Keep
+        # that boundary check separate from payload validation below.
+        with pytest.raises(HeadlessClientError) as forged:
+            _unclaimed_program_submission(
                 runner,
-                request_id="reject-unknown-source-joint",
+                request_id="reject-public-program-origin",
                 joint_names=("arm_joints",),
                 positions=(0.05,),
             )
-        assert rejected.value.code == "execution_rejected", vars(rejected.value)
-        assert rejected.value.status_code == 400
+        assert forged.value.code == "invalid_request"
+        assert forged.value.status_code == 400
         assert recording.last_submission is not None
-        raw_rejection = raw_api.post(
+        raw_forged = raw_api.post(
             "/api/execution/operations", json=recording.last_submission
         )
-        assert raw_rejection.status_code == 400
+        assert raw_forged.status_code == 400
+        assert raw_forged.json()["error"]["details"]["reason"] == (
+            "program_execution_scope_missing"
+        )
+
+        invalid_joint_intent = _direct_control_motion_operation(
+            headless.execution_diagnostics()["status"],
+            request_id="reject-unknown-source-joint",
+            motion={
+                "kind": "joint_goal",
+                "joint_names": ["arm_joints"],
+                "positions_rad": [0.05],
+            },
+        )
+        with pytest.raises(HeadlessClientError) as rejected:
+            composer.execute(invalid_joint_intent)
+        assert rejected.value.code == "execution_rejected", vars(rejected.value)
+        assert rejected.value.status_code == 400
+        invalid_joint_intent["request_context"]["request_id"] += "-raw"
+        raw_rejection = raw_api.post(
+            "/api/execution/operations", json=invalid_joint_intent
+        )
+        assert raw_rejection.status_code == 400, raw_rejection.json()
         assert raw_rejection.json()["error"]["details"]["reason"] == (
             "joint_goal_source_joint_unresolved"
         )
 
-        accepted = _runner_submission(
-            runner,
-            request_id="accepted-source-joint-subset",
-            joint_names=("joint1",),
-            positions=(0.05,),
+        gripper_status = headless.execution_diagnostics()["status"]
+        wrong_unit_intent = _direct_control_gripper_operation(
+            gripper_status, request_id="reject-angular-gripper-unit", position=0.004
         )
-        stale_submission = copy.deepcopy(recording.last_submission)
-        assert stale_submission is not None
+        wrong_unit_intent["participants"][0]["payload"]["command_value"]["position"] = {
+            "kind": "angular_rad",
+            "value_rad": 0.004,
+        }
+        assert wrong_unit_intent["program_binding_id"] == (
+            gripper_status["direct_control_gripper"]["program_binding_id"]
+        )
+        with pytest.raises(HeadlessClientError) as wrong_unit:
+            composer.execute(wrong_unit_intent)
+        assert wrong_unit.value.status_code == 400
+        wrong_unit_intent["request_context"]["request_id"] += "-raw"
+        raw_wrong_unit = raw_api.post(
+            "/api/execution/operations", json=wrong_unit_intent
+        )
+        assert raw_wrong_unit.status_code == 400, raw_wrong_unit.json()
+        assert raw_wrong_unit.json()["error"]["details"]["reason"] == (
+            "runtime_command_resource_unit_mismatch"
+        )
+
+        beyond_limit_intent = _direct_control_gripper_operation(
+            gripper_status, request_id="reject-gripper-limit", position=0.02
+        )
+        assert beyond_limit_intent["program_binding_id"] == (
+            gripper_status["direct_control_gripper"]["program_binding_id"]
+        )
+        with pytest.raises(HeadlessClientError) as beyond_limit:
+            composer.execute(beyond_limit_intent)
+        assert beyond_limit.value.status_code == 400
+        beyond_limit_intent["request_context"]["request_id"] += "-raw"
+        raw_beyond_limit = raw_api.post(
+            "/api/execution/operations", json=beyond_limit_intent
+        )
+        assert raw_beyond_limit.status_code == 400, raw_beyond_limit.json()
+        assert raw_beyond_limit.json()["error"]["code"] == "invalid_request"
+        assert raw_beyond_limit.json()["error"]["details"]["reason"] == (
+            "gripper_position_limit_violation"
+        )
+
+        subset_intent = _direct_control_motion_operation(
+            headless.execution_diagnostics()["status"],
+            request_id="accepted-source-joint-subset",
+            motion={
+                "kind": "joint_goal",
+                "joint_names": ["joint1"],
+                "positions_rad": [0.05],
+            },
+        )
+        accepted = composer.execute(subset_intent)
+        stale_submission = copy.deepcopy(subset_intent)
         serialized = json.dumps(stale_submission, sort_keys=True)
         assert "robot_id" not in serialized
         assert "group_id" not in serialized
@@ -2321,71 +2671,42 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert terminal["operation"]["state"] == "completed", terminal
 
         composer_projection = composer.operation(operation_id)
-        assert composer_projection["operation"] == terminal["operation"]
+        current_projection = headless.operation(operation_id)
+        assert composer_projection == current_projection
+        assert composer_projection["operation"]["state"] == "completed"
         assert composer.execution_diagnostics()["status"]["owner_epoch"] == (
             first_status["owner_epoch"]
         )
 
-        terminal_revision = terminal["operation"]["operation_revision"]
-        acknowledged = composer.acknowledge_completed_operation(
-            operation_id,
-            {
-                "request_context": {
-                    "request_id": "acknowledge-first-operation",
-                    "request_owner_epoch": first_status["owner_epoch"],
-                    "source_label": "composer_ui",
-                    "correlation_id": "n4-public-control-test",
-                },
-                "operation_id": operation_id,
-                "expected_operation_revision": terminal_revision,
-                "reason": "release completed test operation",
-            },
-        )
-        assert acknowledged["accepted"]["control"] == "acknowledge_completed"
+        _wait_retired(native, operation_id)
         acknowledged_projection = composer.operation(operation_id)
+        with sqlite3.connect(
+            execution_state_root / "operation-journal.sqlite3"
+        ) as database:
+            acknowledgements = [
+                json.loads(row[0])
+                for row in database.execute(
+                    "SELECT payload_json FROM journal_records "
+                    "WHERE operation_id=? AND record_kind='control_accepted'",
+                    (operation_id,),
+                )
+            ]
+        assert len(acknowledgements) == 1
+        acknowledged = acknowledgements[0]["result"]
+        assert acknowledged["control"] == "acknowledge_completed"
         assert acknowledged_projection["operation"]["operation_revision"] == (
-            acknowledged["accepted"]["operation_revision_after_acceptance"]
+            acknowledged["operation_revision_after_acceptance"]
         )
 
-        with pytest.raises(HeadlessClientError) as wrong_unit:
-            _gripper_submission(
-                runner,
-                request_id="reject-angular-gripper-unit",
-                position_kind="angular_rad",
-                position=0.004,
-            )
-        assert wrong_unit.value.status_code == 400
-        assert recording.last_submission is not None
-        raw_wrong_unit = raw_api.post(
-            "/api/execution/operations", json=recording.last_submission
-        )
-        assert raw_wrong_unit.json()["error"]["details"]["reason"] == (
-            "runtime_command_resource_unit_mismatch"
-        )
-
-        with pytest.raises(HeadlessClientError) as beyond_limit:
-            _gripper_submission(
-                runner,
-                request_id="reject-gripper-limit",
-                position_kind="linear_m",
-                position=0.02,
-            )
-        assert beyond_limit.value.status_code == 400
-        assert recording.last_submission is not None
-        raw_beyond_limit = raw_api.post(
-            "/api/execution/operations", json=recording.last_submission
-        )
-        assert raw_beyond_limit.json()["error"]["code"] == "invalid_request"
-        assert raw_beyond_limit.json()["error"]["details"]["reason"] == (
-            "gripper_position_limit_violation"
-        )
-
-        gripper_accepted = _gripper_submission(
-            runner,
+        completed_gripper_intent = _direct_control_gripper_operation(
+            headless.execution_diagnostics()["status"],
             request_id="accepted-linear-gripper",
-            position_kind="linear_m",
             position=0.004,
         )
+        completed_gripper_intent["participants"][0]["payload"]["caller_options"][0][
+            "value_s"
+        ] = 0.05
+        gripper_accepted = composer.execute(completed_gripper_intent)
         gripper_id = gripper_accepted["accepted"]["operation_id"]
         gripper_terminal = _wait_terminal(runner, gripper_id)["operation"]
         assert gripper_terminal["state"] == "completed"
@@ -2402,21 +2723,17 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert gripper_observed["positions"] == [
             {"kind": "linear_m", "value_m": pytest.approx(0.004)}
         ]
-        runner.acknowledge_completed_operation(
-            request_id="ack-linear-gripper",
-            operation_id=gripper_id,
-            expected_operation_revision=gripper_terminal["operation_revision"],
-            reason="release completed gripper operation",
-            correlation_id="n5-process-test",
-        )
+        _wait_retired(native, gripper_id)
 
-        cancellable = _gripper_submission(
-            runner,
+        cancellable_intent = _direct_control_gripper_operation(
+            headless.execution_diagnostics()["status"],
             request_id="cancellable-linear-gripper",
-            position_kind="linear_m",
             position=0.008,
-            command_duration_s=1.0,
         )
+        cancellable_intent["participants"][0]["payload"]["caller_options"][0][
+            "value_s"
+        ] = 1.0
+        cancellable = composer.execute(cancellable_intent)
         cancellable_id = cancellable["accepted"]["operation_id"]
         cancellable_state = _wait_state(runner, cancellable_id, {"executing"})[
             "operation"
@@ -2432,13 +2749,7 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         cancelled = _wait_terminal(runner, cancellable_id)["operation"]
         assert cancelled["state"] == "stopped", json.dumps(cancelled, sort_keys=True)
         assert cancelled["active_stop_id"] == gripper_stop["accepted"]["stop_id"]
-        runner.reset_operation(
-            request_id="reset-linear-gripper",
-            operation_id=cancellable_id,
-            expected_operation_revision=cancelled["operation_revision"],
-            reason="release stopped gripper operation",
-            correlation_id="n5-process-test",
-        )
+        _wait_retired(native, cancellable_id)
         # A certified nominal Stop followed by exact operation Reset is the
         # complete normal cycle. It must not fabricate an intervention latch
         # or require a second recovery command for the same physical Stop.
@@ -2452,15 +2763,19 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         assert gripper_recovery is None
         assert headless.stop_fault()["stop_fault"] is None
 
-        controlled = _runner_submission(
-            runner,
+        controlled_intent = _direct_control_motion_operation(
+            headless.execution_diagnostics()["status"],
             request_id="n4-controlled-operation",
-            joint_names=("joint1",),
             # Keep enough path after Pause/Resume for this test to exercise the
             # one-second replacement Stop trajectory rather than the separately
             # qualified short-path natural-completion policy.
-            positions=(1.5,),
+            motion={
+                "kind": "joint_goal",
+                "joint_names": ["joint1"],
+                "positions_rad": [1.5],
+            },
         )
+        controlled = composer.execute(controlled_intent)
         controlled_id = controlled["accepted"]["operation_id"]
         executing = _wait_state(runner, controlled_id, {"executing"})["operation"]
         projected_scale_control = composer.execution_control_state()["control_state"][
@@ -2575,20 +2890,6 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         stopped = _wait_terminal(runner, controlled_id)["operation"]
         stop_settlement_elapsed_s = time.monotonic() - stop_requested_at
         assert stopped["state"] == "stopped", json.dumps(stopped, sort_keys=True)
-        current_query = ProgramRunnerExecutionTransport(
-            execution_run_root, timeout_seconds=2.0
-        )
-        controlled_query = {
-            "schema_version": "manyforge.program_operation_query.v1",
-            "owner_epoch": first_status["owner_epoch"],
-            "program_binding_id": manifest["program_binding_id"],
-            "program_run_id": "n3-program-run-1",
-            "target_role_id": manifest["target_role_id"],
-        }
-        assert (
-            current_query.query_operation(controlled_query)["operation"]["operation_id"]
-            == controlled_id
-        )
         assert stopped["active_stop_id"] == stop_accepted["accepted"]["stop_id"]
         assert stop_acceptance_elapsed_s < 0.5
         projected_stop = headless.execution_diagnostics()["status"]["cell_stop_action"]
@@ -2711,21 +3012,8 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
             == "settled"
         )
 
-        # Exercise the complete recognized-malformed ingress and durable
-        # recovery boundary through the production HTTP/native/SQLite path.
-        # The first Stop above is released before starting new work so the
-        # malformed request must contain a genuinely live operation rather
-        # than an idle snapshot.
-        runner.reset_operation(
-            request_id="reset-controlled-operation",
-            operation_id=controlled_id,
-            expected_operation_revision=stopped["operation_revision"],
-            reason="release first stopped operation",
-            correlation_id="n4-public-control-test",
-        )
-        with pytest.raises(HeadlessApiError) as retired_query:
-            current_query.query_operation(controlled_query)
-        assert retired_query.value.code == "execution_operation_context_unavailable"
+        # The manual owner retires nominal Stop without clearing an invented fault.
+        _wait_retired(native, controlled_id)
         persisted_scale_control = composer.runtime_scale_control(scale_selector)[
             "runtime_scale_control"
         ]
@@ -2746,110 +3034,6 @@ def test_first_complete_addressed_native_motion_path(tmp_path: Path) -> None:
         )
         assert controlled_recovery is None
         assert headless.stop_fault()["stop_fault"] is None
-        malformed_operation = _runner_submission(
-            runner,
-            request_id="native-malformed-stop-operation",
-            joint_names=("joint1",),
-            positions=(-0.55,),
-        )
-        malformed_operation_id = malformed_operation["accepted"]["operation_id"]
-        _wait_state(runner, malformed_operation_id, {"executing"})
-        malformed_response = raw_api.post(
-            "/api/execution/stops",
-            content=b'{"operations":[',
-            headers={
-                "Content-Type": "application/json",
-                "X-Request-ID": "native-malformed-stop",
-            },
-        )
-        assert malformed_response.status_code == 200, malformed_response.text
-        malformed_acceptance = malformed_response.json()["accepted"]
-        assert malformed_acceptance["request_id"] == (
-            "malformed-stop.native-malformed-stop"
-        )
-        assert malformed_acceptance["resolution_disposition"] == ("promoted_to_full")
-        assert malformed_acceptance["resolution_reason"] == (
-            "malformed_ordinary_intent"
-        )
-        malformed_terminal = _wait_terminal(runner, malformed_operation_id)["operation"]
-        assert malformed_terminal["state"] == "stopped"
-        assert malformed_terminal["active_stop_id"] == malformed_acceptance["stop_id"]
-
-        with sqlite3.connect(
-            execution_state_root / "operation-journal.sqlite3"
-        ) as database:
-            malformed_row = database.execute(
-                "SELECT payload_json FROM journal_records WHERE request_id=? "
-                "AND record_kind='stop_acceptance_projected'",
-                ("malformed-stop.native-malformed-stop",),
-            ).fetchone()
-        assert malformed_row is not None
-        malformed_payload = json.loads(malformed_row[0])
-        assert malformed_payload["acceptance"]["malformed_ingress_reason"] == (
-            "recognized_stop_payload_invalid"
-        )
-        assert malformed_payload["acceptance"]["normalized_request_digest"] is None
-        assert malformed_payload["intent"] == {
-            "intent_kind": "malformed_ingress",
-            "value": None,
-        }
-
-        recovered_result = _recover_active_stop_fault(
-            headless,
-            owner_epoch=first_status["owner_epoch"],
-            request_prefix="recover-native-malformed",
-            correlation_id="native-malformed-stop-recovery",
-            reason="operator verified post-Stop cell truth",
-        )
-        assert recovered_result is not None
-        assert recovered_result["accepted"] is True, recovered_result
-        assert recovered_result["latch"]["state"] == "cleared"
-        assert headless.stop_fault()["stop_fault"] is None
-        with sqlite3.connect(
-            execution_state_root / "operation-journal.sqlite3"
-        ) as database:
-            clear_rows = database.execute(
-                "SELECT sequence,payload_json FROM journal_records "
-                "WHERE record_kind='stop_fault_cleared' AND stop_id=?",
-                (malformed_acceptance["stop_id"],),
-            ).fetchall()
-        assert len(clear_rows) == 1
-        durable_clear = json.loads(clear_rows[0][1])
-        assert durable_clear[0] == (
-            "manyforge.internal.stop-journal-fault-clear-projection.v2"
-        )
-        assert durable_clear[2][0] == recovered_result["request_id"]
-        clear_page = native.events(
-            first_status["owner_epoch"], int(clear_rows[0][0]) - 1, limit=1
-        )
-        assert len(clear_page["events"]) == 1
-        clear_event = clear_page["events"][0]
-        assert clear_event["record_kind"] == "stop_fault_cleared"
-        assert clear_event["request_id"] == recovered_result["request_id"]
-        assert clear_event["operation_id"] is None
-        assert clear_event["operation_revision"] is None
-        clear_history = clear_event["payload"]
-        assert clear_history["api_version"] == (
-            "manyforge.stop_fault_clear_projection.v1"
-        )
-        assert clear_history["fault_latch"]["latch_id"] == (
-            recovered_result["latch"]["latch_id"]
-        )
-        assert clear_history["fault_latch"]["state"] == "cleared"
-        assert clear_history["fault_latch"]["recovery_status"] == "cleared"
-        assert clear_history["result"]["accepted"] is True
-
-        # N7-b exercises the largest maintained page through the real
-        # SOCK_SEQPACKET boundary. The preceding maintained workflow has
-        # produced more than one page; this is not a synthetic event source.
-        largest_page = native.events(first_status["owner_epoch"], 0, limit=16)
-        assert len(largest_page["events"]) == 16
-        assert largest_page["has_more"] is True
-        assert (
-            largest_page["next_after_sequence"]
-            == largest_page["events"][-1]["sequence"]
-        )
-
         durable_journal = execution_state_root / "operation-journal.sqlite3"
         durable_identity = (
             durable_journal.stat().st_dev,
@@ -3281,6 +3465,122 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
         _stop_host(process)
 
 
+def test_native_runtime_scale_selector_codec_preserves_singular_scope(
+    tmp_path: Path,
+) -> None:
+    """Exercise the native decoder with the runtime-scale selector variants."""
+
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(built_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    execution_state_root = tmp_path / "execution-state"
+    execution_run_root = tmp_path / "execution-run"
+    execution_state_root.mkdir()
+    execution_run_root.mkdir()
+    process = _start_host(
+        fixture_root, execution_state_root, execution_run_root, manifest
+    )
+    client = ExecutionCommandClient(execution_run_root, timeout_seconds=5.0)
+    try:
+        api_version = EXECUTION_COMMAND_VERSION
+        binding = manifest["program_binding_id"]
+        singular_selector = {
+            "program_binding_id": binding,
+            "component_role_id": "robot",
+            "target_role_id": manifest["target_role_id"],
+        }
+
+        singular_before = client._exchange(
+            {
+                "api_version": api_version,
+                "command": "get_runtime_scale_control",
+                "selector": singular_selector,
+            }
+        )
+        assert singular_before["ok"] is True, singular_before
+        assert singular_before["runtime_scale_control"]["selector"] == (
+            singular_selector
+        )
+
+        synchronized = client._exchange(
+            {
+                "api_version": api_version,
+                "command": "get_runtime_scale_control",
+                "selector": {
+                    "program_binding_id": binding,
+                    "synchronized_targets": [
+                        {
+                            "component_role_id": "robot",
+                            "target_role_id": manifest["target_role_id"],
+                        },
+                        {
+                            "component_role_id": "robot",
+                            "target_role_id": manifest["gripper_target_role_id"],
+                        },
+                    ],
+                },
+            }
+        )
+        if synchronized["ok"] is False:
+            assert synchronized["error"]["code"] in {
+                "runtime_scale_control_unsupported",
+                "runtime_scale_control_target_missing",
+            }, synchronized
+        else:
+            assert synchronized["command"] == "get_runtime_scale_control"
+
+        malformed_selectors = [
+            {
+                **singular_selector,
+                "synchronized_targets": [
+                    {
+                        "component_role_id": "robot",
+                        "target_role_id": manifest["target_role_id"],
+                    },
+                    {
+                        "component_role_id": "robot",
+                        "target_role_id": manifest["gripper_target_role_id"],
+                    },
+                ],
+            },
+            {
+                "program_binding_id": binding,
+                "synchronized_targets": [
+                    {
+                        "component_role_id": "robot",
+                        "target_role_id": manifest["target_role_id"],
+                    },
+                    {
+                        "component_role_id": "robot",
+                        "target_role_id": manifest["target_role_id"],
+                    },
+                ],
+            },
+        ]
+        for selector in malformed_selectors:
+            rejected = client._exchange(
+                {
+                    "api_version": api_version,
+                    "command": "get_runtime_scale_control",
+                    "selector": selector,
+                }
+            )
+            assert rejected["ok"] is False
+            assert rejected["error"]["code"] == "execution_command_invalid"
+
+        singular_after = client._exchange(
+            {
+                "api_version": api_version,
+                "command": "get_runtime_scale_control",
+                "selector": singular_selector,
+            }
+        )
+        assert singular_after == singular_before
+    finally:
+        _stop_host(process)
+
+
 def test_addressed_native_benchmark_preserves_historical_measurements(
     tmp_path: Path,
 ) -> None:
@@ -3479,24 +3779,23 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
         assert marker.exists()
         assert not preview_done.is_set()
 
-        stopped = headless.stop_operations(
-            {
-                "request_context": {
-                    "request_id": "stop-while-preview-blocked",
-                    "request_owner_epoch": status["owner_epoch"],
-                    "source_label": "headless_process_test",
-                    "correlation_id": "n6-c1-stop-isolation",
-                },
-                "operations": [
-                    {
-                        "operation_id": "non-resident-operation",
-                        "expected_operation_revision": 1,
-                        "expected_stop_generation": 0,
-                    }
-                ],
-                "reason": "prove Stop transport is independent from preview",
-            }
-        )
+        stop_request = {
+            "request_context": {
+                "request_id": "stop-while-preview-blocked",
+                "request_owner_epoch": status["owner_epoch"],
+                "source_label": "headless_process_test",
+                "correlation_id": "n6-c1-stop-isolation",
+            },
+            "operations": [
+                {
+                    "operation_id": "non-resident-operation",
+                    "expected_operation_revision": 1,
+                    "expected_stop_generation": 0,
+                }
+            ],
+            "reason": "prove Stop transport is independent from preview",
+        }
+        stopped = headless.stop_operations(stop_request)
         assert stopped["accepted"]["resolution_disposition"] == ("promoted_to_full")
         assert stopped["accepted"]["resolution_reason"] == "unknown_operation"
         assert not preview_done.is_set()
@@ -3505,6 +3804,36 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
         assert preview_done.is_set()
         assert not preview_error
         assert preview_response[0]["ok"] is False
+        replay = headless.stop_operations(stop_request)["accepted"]
+        assert replay["replay_status"] == "replayed_exact", replay
+        for field in ("stop_id", "stop_generation"):
+            assert replay[field] == stopped["accepted"][field]
+        with sqlite3.connect(
+            f"file:{execution_state_root / 'operation-journal.sqlite3'}?mode=ro",
+            uri=True,
+        ) as journal:
+            records = journal.execute(
+                "SELECT sequence,payload_json FROM journal_records "
+                "WHERE record_kind='stop_acceptance_projected' AND request_id=?",
+                (stop_request["request_context"]["request_id"],),
+            ).fetchall()
+        assert len(records) == 1, records
+        sequence, payload_json = records[0]
+        payload = json.loads(payload_json)
+        assert payload["intent"]["value"]["request_attribution"] == {
+            "assurance": "externally_authenticated",
+            "principal_id": "operator.process-test",
+            "transport": "http",
+        }
+        events = execution.events(status["owner_epoch"], sequence - 1, limit=1)[
+            "events"
+        ]
+        assert len(events) == 1
+        assert events[0]["sequence"] == sequence
+        assert events[0]["record_kind"] == "stop_acceptance_projected"
+        assert events[0]["operation_id"] is None
+        assert events[0]["operation_revision"] is None
+        assert events[0]["payload"] == payload
     finally:
         _stop_host(process)
         if preview_thread is not None:
@@ -3512,10 +3841,10 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
         raw_api.close()
 
 
-@pytest.mark.parametrize("stopped_target", ["arm", "gripper", "both"])
-def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
+@pytest.mark.parametrize("active_target", ["arm", "gripper"])
+def test_native_manual_arm_and_gripper_are_exclusive_and_recover_independently(
     tmp_path: Path,
-    stopped_target: str,
+    active_target: str,
 ) -> None:
     fixture_root = tmp_path / "fixture"
     shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
@@ -3544,16 +3873,10 @@ def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
         }
         intents["arm"]["participants"][0]["payload"]["speed_profile"][
             "velocity_scale"
-        ] = 0.1
-        # This tests explicit owner Reset, not the manual-control host's
-        # automatic terminal retirement. Give each independent operation a
-        # non-manual run identity so both owners cannot race the same Reset.
-        for target, intent in intents.items():
-            intent["program_run_id"] = f"native-isolation-{target}"
+        ] = 0.5
         tool_payload = intents["gripper"]["participants"][0]["payload"]
         tool_payload["completion_timeout_s"] = 3.0
         tool_payload["caller_options"][0]["value_s"] = 2.0
-        operations = {}
 
         def wait_state(operation_id, states, timeout=6.0):
             deadline = time.monotonic() + timeout
@@ -3564,44 +3887,29 @@ def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
                 time.sleep(0.005)
             pytest.fail(f"native operation did not reach {states}: {row}")
 
-        for target in ("arm", "gripper"):
-            response = client.submit(
-                OperationIntentRequest.model_validate(intents[target]),
-                trusted_principal_id=None,
-            )
-            assert response["ok"] is True, response
-            operations[target] = response["accepted"]["operation_id"]
-            wait_state(operations[target], {"executing"})
-        if stopped_target == "both":
-            stopped = client.full_stop(
-                FullStopIntentRequest.model_validate(
-                    {
-                        "request_context": {
-                            "request_id": "stop-both-participants",
-                            "request_owner_epoch": status["owner_epoch"],
-                            "source_label": "native-isolation-test",
-                        },
-                        "expected_stop_generation": 0,
-                    }
-                ),
-                trusted_principal_id=None,
-            )
-            assert stopped["ok"] is True, stopped
-            for operation_id in operations.values():
-                contained = wait_state(operation_id, {"stopped"})["operation"]
-                assert contained["active_stop_id"] == stopped["accepted"]["stop_id"]
-                assert all(
-                    row["terminal_error"] is None for row in contained["participants"]
-                )
-            return
-        other = "gripper" if stopped_target == "arm" else "arm"
-        before = client.read(operations[other])["operation"]
-        assert before["state"] == "executing"
-        selected = client.read(operations[stopped_target])["operation"]
+        other = "gripper" if active_target == "arm" else "arm"
+        response = client.submit(
+            OperationIntentRequest.model_validate(intents[active_target]),
+            trusted_principal_id=None,
+        )
+        assert response["ok"] is True, json.dumps(response, sort_keys=True)
+        operation_id = response["accepted"]["operation_id"]
+        selected = wait_state(operation_id, {"executing"})["operation"]
+
+        conflicting = client.submit(
+            OperationIntentRequest.model_validate(intents[other]),
+            trusted_principal_id=None,
+        )
+        assert conflicting["ok"] is False
+        assert conflicting["error"]["code"] == "authoring_not_ready"
+        assert conflicting["error"]["details"]["reason"] == (
+            "positive_admission_required"
+        )
+
         context = {
-            "request_id": f"stop-only-{stopped_target}",
+            "request_id": f"stop-manual-{active_target}",
             "request_owner_epoch": status["owner_epoch"],
-            "source_label": "native-isolation-test",
+            "source_label": "native-manual-exclusion-test",
         }
         stopped = client.stop(
             StopIntentRequest.model_validate(
@@ -3609,7 +3917,7 @@ def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
                     "request_context": context,
                     "operations": [
                         {
-                            "operation_id": operations[stopped_target],
+                            "operation_id": operation_id,
                             "expected_operation_revision": selected[
                                 "operation_revision"
                             ],
@@ -3621,29 +3929,22 @@ def test_native_arm_and_gripper_scoped_stop_do_not_cross_lifecycles(
             trusted_principal_id=None,
         )
         assert stopped["ok"] is True, stopped
-        selected = wait_state(operations[stopped_target], {"stopped"})["operation"]
-        continued = client.read(operations[other])["operation"]
-        assert continued["state"] in {"executing", "completed"}, continued
-        assert continued["active_stop_id"] is None
-        assert continued["participants"][0]["controller_goal_generation"] == (
-            before["participants"][0]["controller_goal_generation"]
-        )
-        reset = client.reset(
-            OperationControlRequest.model_validate(
-                {
-                    "request_context": {
-                        **context,
-                        "request_id": f"reset-only-{stopped_target}",
-                    },
-                    "operation_id": operations[stopped_target],
-                    "expected_operation_revision": selected["operation_revision"],
-                    "reason": "retire only the stopped target",
-                }
-            ),
+        wait_state(operation_id, {"stopped"})
+        deadline = time.monotonic() + 2.0
+        while not CellAdmissionClient(run_root).get()["authoring_allowed"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+
+        resumed_other = client.submit(
+            OperationIntentRequest.model_validate(intents[other]),
             trusted_principal_id=None,
         )
-        assert reset["ok"] is True, reset
-        completed = wait_state(operations[other], {"completed"})["operation"]
+        assert resumed_other["ok"] is True, json.dumps(
+            resumed_other, sort_keys=True
+        )
+        completed = wait_state(
+            resumed_other["accepted"]["operation_id"], {"completed"}
+        )["operation"]
         assert all(row["terminal_error"] is None for row in completed["participants"])
         assert completed["active_stop_id"] is None
         with client.open_observation_session() as stream:
@@ -3843,8 +4144,8 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             execution_run_root, timeout_seconds=5.0
         ).owner_identity()["request_owner_epoch"]
         cclc_before_loss = _wait_for_cclc_component(execution_run_root)
-        planning_acceptance = _runner_submission(
-            runner,
+        planning_acceptance = _manual_joint_submission(
+            headless,
             request_id="planning-stop-operation",
             joint_names=("joint1",),
             positions=(0.2,),
@@ -3865,16 +4166,10 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         assert stopped["state"] == "stopped"
         assert stopped["active_stop_id"] == stop["accepted"]["stop_id"]
 
-        reset = runner.reset_operation(
-            request_id="reset-planning-stop",
-            operation_id=planning_id,
-            expected_operation_revision=stopped["operation_revision"],
-            reason="release stopped operation",
-            correlation_id="n4d-process-test",
-        )
-        assert reset["accepted"]["control"] == "reset"
-        recovered_acceptance = _runner_submission(
-            runner,
+        native = ExecutionCommandClient(execution_run_root, timeout_seconds=2.0)
+        _wait_retired(native, planning_id)
+        recovered_acceptance = _manual_joint_submission(
+            headless,
             request_id="worker-after-cancel",
             joint_names=("joint1",),
             positions=(0.1,),
@@ -3882,17 +4177,11 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         recovered_id = recovered_acceptance["accepted"]["operation_id"]
         recovered = _wait_terminal(runner, recovered_id)["operation"]
         assert recovered["state"] == "completed", recovered
-        runner.acknowledge_completed_operation(
-            request_id="ack-worker-after-cancel",
-            operation_id=recovered_id,
-            expected_operation_revision=recovered["operation_revision"],
-            reason="release completed operation",
-            correlation_id="n4d-process-test",
-        )
+        _wait_retired(native, recovered_id)
 
         marker.unlink()
-        orphan_acceptance = _runner_submission(
-            runner,
+        orphan_acceptance = _manual_joint_submission(
+            headless,
             request_id="active-host-loss",
             joint_names=("joint1",),
             positions=(0.3,),
@@ -4017,8 +4306,8 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         # The new owner adopted the exact durable route, proved current
         # quiescence/no-live-goal without a command, released only those
         # orphan-resource slots, and then republished normal readiness.
-        gripper_after_restart = _gripper_submission(
-            runner,
+        gripper_after_restart = _manual_gripper_submission(
+            headless,
             request_id="gripper-after-arm-host-loss",
             position_kind="linear_m",
             position=0.003,
@@ -4026,16 +4315,10 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         gripper_after_restart_id = gripper_after_restart["accepted"]["operation_id"]
         gripper_terminal = _wait_terminal(runner, gripper_after_restart_id)["operation"]
         assert gripper_terminal["state"] == "completed"
-        runner.acknowledge_completed_operation(
-            request_id="ack-gripper-after-arm-host-loss",
-            operation_id=gripper_after_restart_id,
-            expected_operation_revision=gripper_terminal["operation_revision"],
-            reason="release restarted gripper operation",
-            correlation_id="n4d-process-test",
-        )
+        _wait_retired(native, gripper_after_restart_id)
 
-        arm_after_restart = _runner_submission(
-            runner,
+        arm_after_restart = _manual_joint_submission(
+            headless,
             request_id="arm-after-arm-host-loss",
             joint_names=("joint1",),
             positions=(0.05,),
@@ -4043,13 +4326,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         arm_after_restart_id = arm_after_restart["accepted"]["operation_id"]
         arm_terminal = _wait_terminal(runner, arm_after_restart_id)["operation"]
         assert arm_terminal["state"] == "completed"
-        runner.acknowledge_completed_operation(
-            request_id="ack-arm-after-arm-host-loss",
-            operation_id=arm_after_restart_id,
-            expected_operation_revision=arm_terminal["operation_revision"],
-            reason="release restarted arm operation",
-            correlation_id="n4d-process-test",
-        )
+        _wait_retired(native, arm_after_restart_id)
     finally:
         _stop_host(process)
         raw_api.close()
@@ -4086,8 +4363,9 @@ def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
 
     try:
         first_epoch = headless.execution_diagnostics()["status"]["owner_epoch"]
-        accepted = _gripper_submission(
-            runner,
+        native = ExecutionCommandClient(execution_run_root, timeout_seconds=2.0)
+        accepted = _manual_gripper_submission(
+            headless,
             request_id="active-gripper-host-loss",
             position_kind="linear_m",
             position=0.007,
@@ -4114,8 +4392,8 @@ def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
             "unreconciled_external_or_orphan_goal"
         )
 
-        arm_after_restart = _runner_submission(
-            runner,
+        arm_after_restart = _manual_joint_submission(
+            headless,
             request_id="arm-after-gripper-host-loss",
             joint_names=("joint1",),
             positions=(0.05,),
@@ -4123,16 +4401,10 @@ def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
         arm_after_restart_id = arm_after_restart["accepted"]["operation_id"]
         arm_terminal = _wait_terminal(runner, arm_after_restart_id)["operation"]
         assert arm_terminal["state"] == "completed"
-        runner.acknowledge_completed_operation(
-            request_id="ack-arm-after-gripper-host-loss",
-            operation_id=arm_after_restart_id,
-            expected_operation_revision=arm_terminal["operation_revision"],
-            reason="release restarted arm operation",
-            correlation_id="n4d-process-test",
-        )
+        _wait_retired(native, arm_after_restart_id)
 
-        gripper_after_restart = _gripper_submission(
-            runner,
+        gripper_after_restart = _manual_gripper_submission(
+            headless,
             request_id="gripper-after-gripper-host-loss",
             position_kind="linear_m",
             position=0.002,
@@ -4140,13 +4412,7 @@ def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
         gripper_after_restart_id = gripper_after_restart["accepted"]["operation_id"]
         gripper_terminal = _wait_terminal(runner, gripper_after_restart_id)["operation"]
         assert gripper_terminal["state"] == "completed"
-        runner.acknowledge_completed_operation(
-            request_id="ack-gripper-after-gripper-host-loss",
-            operation_id=gripper_after_restart_id,
-            expected_operation_revision=gripper_terminal["operation_revision"],
-            reason="release restarted gripper operation",
-            correlation_id="n4d-process-test",
-        )
+        _wait_retired(native, gripper_after_restart_id)
     finally:
         _stop_host(process)
         raw_api.close()

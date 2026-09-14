@@ -1,3 +1,5 @@
+#include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_roboplan/retained_native_cclc_runtime.hpp>
 
 #include <algorithm>
@@ -120,9 +122,16 @@ exact_graph_binding(const core::RuntimeParticipantBindingDTO &physical,
 }
 
 struct RuntimeEpochRouteReconciliation final {
-  core::ControlDomainId control_domain_id;
+  core::ActiveControlConfigurationDTO predecessor;
   core::ControllableComponentId controllable_component_id;
   core::RuntimeEpoch source_runtime_epoch;
+  std::optional<core::RouteSelectionTransactionId> transaction_id;
+  bool settled{};
+};
+
+struct RuntimeEpochRouteReconciliationState final {
+  std::mutex mutex;
+  std::vector<RuntimeEpochRouteReconciliation> rows;
 };
 
 [[nodiscard]] core::Result<std::vector<RuntimeEpochRouteReconciliation>>
@@ -239,16 +248,22 @@ adopt_durable_route_configurations(
             "native_cclc_restart_source_mismatch",
             "durable current route belongs to another runtime unit");
       }
-      if (*current_source_epoch != active.source_runtime_epoch) {
+      const auto fault = runtime.addressed_kernel->get_stop_fault_latch();
+      if (*current_source_epoch != active.source_runtime_epoch ||
+          (fault && fault->state != core::StopFaultLatchStateDTO::kCleared)) {
         auto adopted =
             runtime.AdoptAndReadBackRouteConfigurationPredecessor(active);
         if (!adopted.ok()) {
           return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::
               Err(adopted.error());
         }
-        reconciliations.push_back({active.control_domain_id,
-                                   *current_component_id,
-                                   *current_source_epoch});
+        reconciliations.push_back({
+            .predecessor = active,
+            .controllable_component_id = *current_component_id,
+            .source_runtime_epoch = *current_source_epoch,
+            .transaction_id = std::nullopt,
+            .settled = false,
+        });
         continue;
       }
 
@@ -319,57 +334,69 @@ adopt_durable_route_configurations(
 [[nodiscard]] core::Result<void> reconcile_runtime_epoch_routes(
     deployment::CCLCRuntimeComposition &composition,
     core::IKernelCellAdmissionPort &cell_admission,
-    const std::vector<RuntimeEpochRouteReconciliation> &reconciliations) {
+    std::vector<RuntimeEpochRouteReconciliation> &reconciliations) {
   auto &port = composition.open_request_port();
   const auto owner_epoch = port.ReadRequestOwnerEpoch();
   for (std::size_t index = 0U; index < reconciliations.size(); ++index) {
-    const auto &required = reconciliations[index];
-    auto templates =
-        port.ReadRouteSelectionTemplates(required.controllable_component_id);
-    if (!templates.ok()) {
-      return core::Result<void>::Err(templates.error());
+    auto &required = reconciliations[index];
+    if (required.settled)
+      continue;
+    if (!required.transaction_id) {
+      if (!composition.coordinator().accepting_new_requests()) {
+        return reject<void>("native_cclc_restart_recovery_pending",
+                            "retained CCLC work is still reconciling");
+      }
+      auto templates =
+          port.ReadRouteSelectionTemplates(required.controllable_component_id);
+      if (!templates.ok()) {
+        return core::Result<void>::Err(templates.error());
+      }
+      const auto selected = std::find_if(
+          templates.value().templates.begin(),
+          templates.value().templates.end(), [&](const auto &candidate) {
+            return active_configuration_matches_desired(
+                required.predecessor, candidate.desired_configuration);
+          });
+      if (selected == templates.value().templates.end()) {
+        return reject<void>(
+            "native_cclc_restart_route_template_missing",
+            "current retained route has no owner-reconciliation template");
+      }
+      core::RouteSelectionIntentDTO intent{
+          {core::RequestId("native-owner-reconcile." +
+                           std::to_string(index + 1U)),
+           owner_epoch, "native_owner_restart", std::nullopt},
+          templates.value().retained_bundle_id,
+          templates.value().graph_revision,
+          selected->desired_configuration,
+          selected->expected_active_control_configuration,
+          selected->component_expectations,
+          {core::RequestTransportDTO::kInternal,
+           core::RequestAssuranceDTO::kUnverified, std::nullopt},
+          cell_admission.GetAuthoringAdmission().admission_generation};
+      auto submitted = composition.coordinator().SubmitRouteRecovery(
+          intent, required.predecessor);
+      if (!submitted.ok()) {
+        return core::Result<void>::Err(submitted.error());
+      }
+      if (!submitted.value().acceptance.has_value()) {
+        return reject<void>(
+            "native_cclc_restart_route_acceptance_missing",
+            "runtime-owner reconciliation produced no route acceptance");
+      }
+      required.transaction_id =
+          submitted.value().acceptance->route_selection_transaction_id;
     }
-    const auto selected = std::find_if(
-        templates.value().templates.begin(), templates.value().templates.end(),
-        [&](const auto &candidate) {
-          return candidate.desired_configuration.control_domain_id ==
-                 required.control_domain_id;
-        });
-    if (selected == templates.value().templates.end()) {
-      return reject<void>(
-          "native_cclc_restart_route_template_missing",
-          "current retained route has no owner-reconciliation template");
-    }
-    core::RouteSelectionIntentDTO intent{
-        {core::RequestId("native-owner-reconcile." +
-                         std::to_string(index + 1U)),
-         owner_epoch, "native_owner_restart", std::nullopt},
-        templates.value().retained_bundle_id,
-        templates.value().graph_revision,
-        selected->desired_configuration,
-        selected->expected_active_control_configuration,
-        selected->component_expectations,
-        {core::RequestTransportDTO::kInternal,
-         core::RequestAssuranceDTO::kUnverified, std::nullopt},
-        cell_admission.GetAuthoringAdmission().admission_generation};
-    auto submitted = port.SubmitRouteSelection(intent);
-    if (!submitted.ok()) {
-      return core::Result<void>::Err(submitted.error());
-    }
-    if (!submitted.value().acceptance.has_value()) {
-      return reject<void>(
-          "native_cclc_restart_route_acceptance_missing",
-          "runtime-owner reconciliation produced no route acceptance");
-    }
-    if (!composition.coordinator().DrainFor(std::chrono::seconds(5))) {
-      return reject<void>(
-          "native_cclc_restart_route_reconciliation_timeout",
-          "runtime-owner route reconciliation did not settle during startup");
-    }
-    auto status = port.LoadRouteSelectionStatus(
-        submitted.value().acceptance->route_selection_transaction_id);
+    auto status = port.LoadRouteSelectionStatus(*required.transaction_id);
     if (!status.ok()) {
       return core::Result<void>::Err(status.error());
+    }
+    if (status.value() && !status.value()->terminal_result) {
+      if (status.value()->error)
+        return core::Result<void>::Err(*status.value()->error);
+      return reject<void>(
+          "native_cclc_restart_recovery_pending",
+          "controller route observation or settlement is pending");
     }
     if (!status.value().has_value() ||
         status.value()->terminal_result !=
@@ -382,6 +409,7 @@ adopt_durable_route_configurations(
           "native_cclc_restart_route_reconciliation_failed",
           "runtime-owner route reconciliation did not publish current truth");
     }
+    required.settled = true;
   }
   return core::Result<void>::Ok();
 }
@@ -743,7 +771,7 @@ CreateRetainedNativeCCLCRuntime(
         Err(closure.error());
   }
   auto &value = closure.value();
-  return deployment::CCLCRuntimeComposition::CreateAndStart(
+  auto composition = deployment::CCLCRuntimeComposition::Create(
       std::move(config.composition), std::move(retained_bundle),
       active_publication_reader, std::move(expected_active_publication),
       artifact_source, lifecycle_catalog_source,
@@ -753,6 +781,7 @@ CreateRetainedNativeCCLCRuntime(
       kernel_disable_handoff_port, kernel_cell_admission_port,
       kernel_route_fence_port, kernel_publication_owner, clock, scheduler,
       std::move(kernel_current_configuration_source));
+  return composition;
 }
 
 core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>
@@ -789,27 +818,151 @@ CreateRetainedNativeCCLCRuntime(
     return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
         Err(adopted.error());
   }
+  // Adoption reconciles orphan resources from fresh command-free evidence.
+  // Retire the predecessor's manual claim before requesting route authority;
+  // the regular host reconciliation lane starts only after this composition.
+  auto manual_reconciled =
+      runtime.addressed_kernel->reconcile_manual_operation_admission();
+  if (!manual_reconciled.ok()) {
+    return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
+        Err(manual_reconciled.error());
+  }
+  auto observation_bundle = retained_bundle;
   auto physical_bindings = runtime.control_binding_representatives;
+  std::function<
+      core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+          const core::ControlDomainId &)>
+      current_configuration;
+  current_configuration = [&runtime](const core::ControlDomainId &domain_id) {
+    return runtime.ReadCurrentPublishedRouteConfiguration(domain_id);
+  };
   auto composition = CreateRetainedNativeCCLCRuntime(
       std::move(config), std::move(retained_bundle), active_publication_reader,
       std::move(expected_active_publication), artifact_source,
       lifecycle_catalog_source, std::move(brand_ports),
       std::move(physical_bindings), kernel_disable_handoff_port,
       kernel_cell_admission_port, kernel_route_fence_port, runtime,
-      *runtime.clock, *runtime.scheduler,
-      [&runtime](const core::ControlDomainId &domain_id) {
-        return runtime.ReadCurrentPublishedRouteConfiguration(domain_id);
-      },
+      *runtime.clock, *runtime.scheduler, std::move(current_configuration),
       std::move(externally_managed_controller_snapshot_source));
   if (!composition.ok()) {
     return composition;
   }
-  auto reconciled = reconcile_runtime_epoch_routes(
-      *composition.value(), kernel_cell_admission_port, adopted.value());
-  if (!reconciled.ok()) {
+  auto started = composition.value()->Start();
+  if (!started.ok()) {
     return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
-        Err(reconciled.error());
+        Err(started.error());
   }
+  auto reconciliation_state =
+      std::make_shared<RuntimeEpochRouteReconciliationState>();
+  reconciliation_state->rows = std::move(adopted.value());
+  runtime.reconcile_controller_routes = [owner = composition.value().get(),
+                                         &kernel_cell_admission_port, &runtime,
+                                         reconciliation_state]() mutable {
+    std::lock_guard lock(reconciliation_state->mutex);
+    auto result = reconcile_runtime_epoch_routes(
+        *owner, kernel_cell_admission_port, reconciliation_state->rows);
+    if (!result.ok())
+      return result;
+    return runtime.addressed_kernel->SetRouteRecoveryPending(false);
+  };
+  runtime.stop_recovery_configuration_source =
+      [owner = composition.value().get(),
+       bundle = std::move(observation_bundle), &runtime, reconciliation_state](
+          const core::StopFaultRecoveryConfigurationExpectationDTO &expectation)
+      -> core::Result<core::ContentDigest> {
+    const auto &desired = bundle->value().desired_control_configurations;
+    const auto selected = std::find_if(
+        desired.begin(), desired.end(), [&](const auto &candidate) {
+          return candidate.control_domain_id == expectation.control_domain_id;
+        });
+    if (selected == desired.end()) {
+      return reject<core::ContentDigest>(
+          "stop_recovery_domain_not_retained",
+          "Stop recovery domain is not in the retained product");
+    }
+
+    std::optional<core::ActiveControlConfigurationDTO> recovered_successor;
+    {
+      std::lock_guard lock(reconciliation_state->mutex);
+      const auto recovered = std::find_if(
+          reconciliation_state->rows.begin(), reconciliation_state->rows.end(),
+          [&](const auto &row) {
+            return row.settled &&
+                   row.predecessor.control_domain_id ==
+                       expectation.control_domain_id &&
+                   row.predecessor.active_control_configuration_id ==
+                       expectation.active_control_configuration_id &&
+                   row.predecessor.active_control_configuration_generation ==
+                       expectation.active_control_configuration_generation;
+          });
+      if (recovered != reconciliation_state->rows.end()) {
+        auto current = runtime.ReadCurrentPublishedRouteConfiguration(
+            expectation.control_domain_id);
+        if (!current.ok()) {
+          return core::Result<core::ContentDigest>::Err(current.error());
+        }
+        if (!current.value().has_value() ||
+            current.value()->state !=
+                core::ActiveControlConfigurationStateDTO::kReconciled ||
+            current.value()->source_runtime_unit_id !=
+                recovered->predecessor.source_runtime_unit_id ||
+            !active_configuration_matches_desired(*current.value(),
+                                                  *selected)) {
+          return reject<core::ContentDigest>(
+              "stop_recovery_route_successor_mismatch",
+              "Recovered controller route is not the exact retained successor");
+        }
+        recovered_successor = *current.value();
+      }
+    }
+    const auto observed_configuration_id =
+        recovered_successor
+            ? recovered_successor->active_control_configuration_id
+            : expectation.active_control_configuration_id;
+    const auto observed_configuration_generation =
+        recovered_successor
+            ? recovered_successor->active_control_configuration_generation
+            : expectation.active_control_configuration_generation;
+    auto observed = owner->coordinator().ObserveRouteConfiguration(
+        bundle->retained_bundle_id(), bundle->value().cell_graph.graph_revision,
+        *selected,
+        core::ExpectedActiveControlConfigurationDTO{
+            core::ExpectedActiveControlConfigurationPresenceDTO::kPresent,
+            observed_configuration_id, observed_configuration_generation});
+    if (!observed.ok())
+      return core::Result<core::ContentDigest>::Err(observed.error());
+    if (observed.value().second.disposition !=
+        core::ControllerLifecycleReconciliationDispositionDTO::kReconciled) {
+      return reject<core::ContentDigest>(
+          "stop_recovery_controller_unreconciled",
+          "Observed controller state does not match the retained route");
+    }
+    using content_identity::CanonicalValue;
+    const auto &observation = observed.value().first;
+    return core::Result<core::ContentDigest>::Ok(core::ContentDigest(
+        content_identity::sha256_digest(content_identity::canonical_json(
+            CanonicalValue(CanonicalValue::Array{
+                CanonicalValue(std::string(
+                    "manyforge.stop-recovery-controller-observation.v2")),
+                CanonicalValue(bundle->retained_bundle_id().value()),
+                CanonicalValue(
+                    bundle->value().cell_graph.graph_revision.value()),
+                CanonicalValue(expectation.control_domain_id.value()),
+                CanonicalValue(
+                    expectation.active_control_configuration_id.value()),
+                CanonicalValue(std::to_string(
+                    expectation.active_control_configuration_generation
+                        .value())),
+                CanonicalValue(observed_configuration_id.value()),
+                CanonicalValue(
+                    std::to_string(observed_configuration_generation.value())),
+                CanonicalValue(observation.query.source_runtime_epoch.value()),
+                CanonicalValue(
+                    observation.query.source_runtime_unit_id.value()),
+                CanonicalValue(std::to_string(observation.observed_at_ns)),
+                CanonicalValue(
+                    std::to_string(observation.source_sequence))})))));
+  };
   return composition;
 }
 

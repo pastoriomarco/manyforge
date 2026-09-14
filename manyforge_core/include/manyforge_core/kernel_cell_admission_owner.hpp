@@ -40,7 +40,12 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
       std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set = std::nullopt,
       CellAdmissionClaimGeneration recovered_claim_generation_high_water =
           CellAdmissionClaimGeneration(0U),
-      CellAdmissionProgramNodeValidator program_node_validator = {});
+      CellAdmissionProgramNodeValidator program_node_validator = {},
+      std::function<bool()> stop_fault_active = {});
+
+  /// Noncritical publication of the live Kernel fault restriction. Closing is
+  /// immediate; reopening waits for a durable admission generation advance.
+  [[nodiscard]] Result<void> RefreshStopFaultAdmission();
 
   [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
@@ -50,6 +55,9 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   /// Process-local Kernel composition: validate its freshly resolved manual
   /// offer without storing a second pending-offer registry.
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireManualCellAdmissionClaim(
+      const CellAdmissionClaimIntentDTO& intent,
+      const CellAdmissionInterventionValidator& validate_offer);
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireRouteRecoveryClaim(
       const CellAdmissionClaimIntentDTO& intent,
       const CellAdmissionInterventionValidator& validate_offer);
   /// Read the same readiness/claim preconditions used by manual acquisition.
@@ -70,6 +78,9 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] bool LatchManagerLivenessLoss(const ManagerLivenessLossIntentDTO& intent) noexcept;
 
   [[nodiscard]] bool has_unresolved_claims() const;
+  [[nodiscard]] bool has_unresolved_claims_except(CellAdmissionOwnerRoleDTO owner_role) const;
+  /// Kernel-owned attachment barrier; Manager readiness cannot clear it.
+  [[nodiscard]] Result<void> SetRouteRecoveryPending(bool pending);
   /// Current held authority, excluding released and reconciled predecessors.
   [[nodiscard]] std::optional<CellAdmissionClaimDTO> held_claim(
       CellAdmissionClaimKindDTO kind) const;
@@ -125,9 +136,12 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   CellAdmissionSettlementValidator settlement_validator_;
   CellAdmissionReconcileValidator reconcile_validator_;
   CellAdmissionProgramNodeValidator program_node_validator_;
+  std::function<bool()> stop_fault_active_;
+  bool published_stop_fault_active_{};
   mutable std::mutex mutex_;
   mutable std::mutex liveness_transition_mutex_;
   CellAdmissionReadinessSnapshotDTO readiness_;
+  bool route_recovery_pending_{};
   std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set_;
   std::vector<ManagerLivenessRow> manager_liveness_rows_;
   std::size_t manager_liveness_current_unfenced_count_{};

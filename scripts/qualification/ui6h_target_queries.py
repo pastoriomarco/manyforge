@@ -15,12 +15,14 @@ from copy import deepcopy
 import importlib.util
 import json
 import hashlib
+import math
 import os
 from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 
 from manyforge_behavior.canonical_artifact import (
     canonical_json_bytes,
@@ -38,6 +40,140 @@ from manyforge_headless_api.models import (
     TargetObservationQuery,
 )
 from manyforge_headless_api.native import HeadlessApiError
+
+
+def read_stop_terminal(native, owner_epoch, stop_id):
+    """Read exact durable owner evidence; never infer rest from a receipt."""
+    cursor = 0
+    # This private short workflow has a bounded history. Exhaustion is a failed
+    # qualification, not permission to use another Stop's latest projection.
+    for _ in range(64):
+        page = native.events(owner_epoch, cursor)
+        for event in page["events"]:
+            if event["record_kind"] != "stop_terminal_projected":
+                continue
+            terminal = event["payload"]
+            if terminal["stop_id"] == stop_id:
+                assert terminal["owner_epoch"] == owner_epoch, terminal
+                assert not terminal["details_truncated"], terminal
+                return terminal
+        if not page["has_more"]:
+            return None
+        assert page["next_after_sequence"] > cursor, page
+        cursor = page["next_after_sequence"]
+    raise AssertionError(
+        "Stop terminal evidence exceeds the short-workflow history bound"
+    )
+
+
+def check_completed_program_operations(native, composer, journal_path, run_id):
+    """Join captured Program completion to its exact durable acknowledgement."""
+    with sqlite3.connect(f"file:{journal_path}?mode=ro", uri=True) as journal:
+        operations = journal.execute(
+            "SELECT operation_id FROM operation_snapshots "
+            "WHERE program_run_id=? AND state='completed' ORDER BY operation_id",
+            (run_id,),
+        ).fetchall()
+        checked = []
+        for (operation_id,) in operations:
+            rows = journal.execute(
+                "SELECT sequence,payload_json FROM journal_records "
+                "WHERE operation_id=? AND record_kind IN "
+                "('operation_accepted','control_accepted') ORDER BY sequence",
+                (operation_id,),
+            ).fetchall()
+            records = [(sequence, json.loads(payload)) for sequence, payload in rows]
+            accepted = [
+                row for _, row in records if row["record_kind"] == "operation_accepted"
+            ]
+            assert len(accepted) == 1, (operation_id, accepted)
+            intent = accepted[0]["intent"]
+            scopes = [row.get("execution_scope") for row in intent["participants"]]
+            assert all(scope and scope["node_attempt_id"] for scope in scopes), intent
+            acknowledgements = [
+                (sequence, row)
+                for sequence, row in records
+                if row["record_kind"] == "control_accepted"
+                and row["result"]["control"] == "acknowledge_completed"
+            ]
+            assert len(acknowledgements) == 1, (operation_id, acknowledgements)
+            sequence, acknowledgement = acknowledgements[0]
+            assert acknowledgement["operation_state"]["state"] == "completed"
+            observed = native.read(operation_id)
+            assert observed["operation"]["state"] == "completed", observed
+            assert observed["resident"] is False, observed
+            assert (
+                composer.operation(operation_id)["operation"] == observed["operation"]
+            )
+            assert (
+                observed["operation"]["operation_revision"]
+                == acknowledgement["result"]["operation_revision_after_acceptance"]
+            ), acknowledgement
+            serialized = json.dumps(intent, sort_keys=True)
+            assert (
+                '"robot_id"' not in serialized and '"group_id"' not in serialized
+            ), intent
+            assert [
+                row["execution_scope"]
+                for row in acknowledgement["operation_state"]["participants"]
+            ] == scopes
+            event = native.events(
+                acknowledgement["owner_epoch"], sequence - 1, limit=1
+            )["events"]
+            assert len(event) == 1 and event[0]["sequence"] == sequence, event
+            assert event[0]["payload"] == acknowledgement, event
+            checked.append(
+                {
+                    "operation_id": operation_id,
+                    "scopes": scopes,
+                    "acknowledgement_sequence": sequence,
+                    "accepted_payloads": [
+                        row["payload"] for row in intent["participants"]
+                    ],
+                }
+            )
+    assert {
+        scope["node_instance_id"] for row in checked for scope in row["scopes"]
+    } == {"controlled_motion", "moving_gripper"}, checked
+    return checked
+
+
+def check_stop_history(native, journal_path, terminal):
+    """Join the actual selected Stop to its durable acceptance and terminal."""
+    with sqlite3.connect(f"file:{journal_path}?mode=ro", uri=True) as journal:
+        rows = journal.execute(
+            "SELECT sequence,record_kind,payload_json,payload_digest "
+            "FROM journal_records WHERE stop_id=? AND record_kind IN "
+            "('stop_acceptance_projected','stop_terminal_projected') "
+            "ORDER BY sequence",
+            (terminal["stop_id"],),
+        ).fetchall()
+    assert [row[1] for row in rows] == [
+        "stop_acceptance_projected",
+        "stop_terminal_projected",
+    ], rows
+    for sequence, kind, payload_json, digest in rows:
+        page = native.events(terminal["owner_epoch"], sequence - 1, limit=1)
+        assert len(page["events"]) == 1, page
+        event = page["events"][0]
+        assert event["sequence"] == sequence, event
+        assert event["record_kind"] == kind, event
+        assert event["operation_id"] is None, event
+        assert event["operation_revision"] is None, event
+        if kind == "stop_acceptance_projected":
+            assert event["request_id"] == terminal["request_id"], event
+            assert event["payload"] == json.loads(payload_json), event
+            assert event["payload"]["intent"]["value"]["request_attribution"] == {
+                "assurance": "unverified",
+                "principal_id": None,
+                "transport": "internal",
+            }, event
+        else:
+            assert event["request_id"] is None, event
+            assert event["payload"] == terminal, event
+            assert terminal["api_version"] == "manyforge.stop_terminal_projection.v1"
+            assert terminal["durable_projection_digest"] == digest, terminal
+            assert terminal["details_truncated"] is False, terminal
 
 
 def check_skill_authoring():
@@ -267,11 +403,12 @@ class SelectionBrowser:
         )
 
 
-def check_jerk_authoring(endpoint, stack, workbench):
+def check_jerk_authoring(endpoint, stack, workbench, *, pending_scene_apply=False):
     """Real selector/Save/Apply/reload, on a private Deployment, without motion."""
     browser = SelectionBrowser(endpoint, stack, workbench)
     selector = 'select[aria-label="lite6_robot / arm ordinary motion jerk"]'
     client = HeadlessHttpClient("http://127.0.0.1:9001", timeout_seconds=5)
+    apply_pending = False
 
     def workspace():
         return client.request("GET", "/api/deployment/workspace")
@@ -323,17 +460,57 @@ def check_jerk_authoring(endpoint, stack, workbench):
         assert saved_path.is_relative_to(workbench.STATE_ROOT.parent), saved_path
         original_settings = settings(original["draft"]["document"])
         assert original_settings["enabled"] is True
+        required = any(
+            row.get("imported", {}).get("machine_required") is True
+            for row in original_settings["joint_limits"]
+        )
         results = []
-        for enabled in (False, True):
-            browser.click(selector)
-            element = browser.driver.command(
-                "POST", "/element", {"using": "css selector", "value": selector}
-            )["element-6066-11e4-a52e-4f735466cecf"]
-            browser.driver.command(
-                "POST",
-                f"/element/{element}/value",
-                {"text": ("e" if enabled else "o") + "\ue007"},
+        deadline_failures = []
+        for enabled in (True,) if required else (False, True):
+            reference_time = original_settings["preset_reference_time_s"] * (
+                2 if required else 1
             )
+            # Observe client parser refusals without changing socket behavior.
+            # Reload below discards this bounded diagnostic wrapper each time.
+            browser.js(
+                "window.__qualificationCloses = [];"
+                "const original = WebSocket.prototype.close;"
+                "WebSocket.prototype.close = function(code, reason) {"
+                "if (window.__qualificationCloses.length < 8) "
+                "window.__qualificationCloses.push({url:this.url,code,reason});"
+                "return original.call(this,code,reason);}; return true;"
+            )
+            if required:
+                assert browser.js(
+                    "return document.querySelector("
+                    + json.dumps(selector)
+                    + ")?.querySelector('option[value=off]')?.disabled === true;"
+                )
+                field = (
+                    "//label[span[normalize-space(.)='Preset reference time']]//input"
+                )
+                click_xpath(field)
+                element = browser.driver.command(
+                    "POST", "/element", {"using": "xpath", "value": field}
+                )["element-6066-11e4-a52e-4f735466cecf"]
+                browser.driver.command("POST", f"/element/{element}/clear", {})
+                browser.driver.command(
+                    "POST",
+                    f"/element/{element}/value",
+                    {
+                        "text": str(reference_time) + "\ue007",
+                    },
+                )
+            else:
+                browser.click(selector)
+                element = browser.driver.command(
+                    "POST", "/element", {"using": "css selector", "value": selector}
+                )["element-6066-11e4-a52e-4f735466cecf"]
+                browser.driver.command(
+                    "POST",
+                    f"/element/{element}/value",
+                    {"text": ("e" if enabled else "o") + "\ue007"},
+                )
             changed = browser.wait(
                 "jerk Draft edit",
                 lambda: (
@@ -342,6 +519,10 @@ def check_jerk_authoring(endpoint, stack, workbench):
                         "enabled"
                     ]
                     is enabled
+                    and settings(current["draft"]["document"])[
+                        "preset_reference_time_s"
+                    ]
+                    == reference_time
                     else None
                 ),
             )
@@ -356,9 +537,29 @@ def check_jerk_authoring(endpoint, stack, workbench):
                 lambda: not workspace()["draft"]["differsFromSaved"],
             )
             saved = settings(load_strict_json_yaml(saved_path))
-            assert saved == {**original_settings, "enabled": enabled}, saved
+            assert saved == {
+                **original_settings,
+                "enabled": enabled,
+                "preset_reference_time_s": reference_time,
+            }, saved
             action("Preview Draft")
-            action("Apply Draft")
+            apply_pending = True
+            if pending_scene_apply:
+                from ui6i_shutdown_check import check_pending_scene_read_shutdown
+
+                print(
+                    json.dumps(
+                        check_pending_scene_read_shutdown(
+                            stack,
+                            workbench.STATE_ROOT,
+                            workbench,
+                            apply_change=lambda: action("Apply Draft"),
+                        )
+                    ),
+                    flush=True,
+                )
+            else:
+                action("Apply Draft")
 
             def applied_result():
                 current = workspace()
@@ -375,7 +576,24 @@ def check_jerk_authoring(endpoint, stack, workbench):
                     return current
                 return None
 
-            applied = browser.wait("applied jerk choice", applied_result)
+            try:
+                applied = browser.wait("applied jerk choice", applied_result)
+            except workbench.WorkbenchError as error:
+                failure = {"enabled": enabled, "error": str(error)}
+                deadline_failures.append(failure)
+                print(json.dumps({"apply_deadline_failure": failure}), flush=True)
+                # Reuse the bounded post-failure observation period. A late
+                # success permits the remaining functional checks, but never
+                # erases this failure or changes the overall exit status.
+                try:
+                    applied = browser.wait(
+                        "late Apply completion after failed deadline", applied_result
+                    )
+                finally:
+                    apply_pending = False
+            apply_pending = False
+            closes = browser.js("return window.__qualificationCloses;")
+            assert not any(row.get("code") == 4002 for row in closes), closes
             assert (
                 applied["managerApplied"]["deploymentRevision"]
                 == changed["draft"]["deploymentRevision"]
@@ -384,7 +602,46 @@ def check_jerk_authoring(endpoint, stack, workbench):
             descriptor = native.diagnostics()["status"]["direct_control"][
                 "target_descriptor"
             ]
-            assert descriptor["ordinary_jerk"]["enabled"] is enabled
+            profile = descriptor["ordinary_jerk"]
+            assert profile["enabled"] is enabled
+            assert (
+                profile["preset_reference_time_s"] == saved["preset_reference_time_s"]
+            )
+            authored = {row["source_joint_name"]: row for row in saved["joint_limits"]}
+            assert [row["source_joint_name"] for row in profile["joint_limits"]] == [
+                row["source_joint_name"]
+                for row in descriptor["operational_joint_limits"]
+            ]
+            for joint, effective in zip(
+                profile["joint_limits"],
+                descriptor["operational_joint_limits"],
+                strict=True,
+            ):
+                setting = authored.get(joint["source_joint_name"], {})
+                imported = setting.get("imported")
+                assert joint["imported"] == imported, joint
+                if not enabled:
+                    expected_source, expected_maximum = "off", None
+                elif "override_rad_s3" in setting:
+                    expected_source, expected_maximum = (
+                        "override",
+                        setting["override_rad_s3"],
+                    )
+                elif imported is not None and imported["enabled"]:
+                    expected_source, expected_maximum = (
+                        "imported",
+                        imported["maximum_rad_s3"],
+                    )
+                else:
+                    expected_source, expected_maximum = "preset", joint["preset_rad_s3"]
+                    assert expected_maximum > 0
+                assert (joint["source"], joint["maximum_rad_s3"]) == (
+                    expected_source,
+                    expected_maximum,
+                ), joint
+                assert (
+                    effective["effective_max_jerk_rad_s3"] == expected_maximum
+                ), effective
             browser.driver.command("POST", "/refresh", {})
             browser.click('button[data-workspace="deployment"]')
             browser.wait(
@@ -397,23 +654,65 @@ def check_jerk_authoring(endpoint, stack, workbench):
                     + ";"
                 ),
             )
+            browser.wait(
+                "reloaded authoritative Run readiness",
+                lambda: workspace()["runAdmission"]["ready"]
+                and browser.js(
+                    "const button = document.querySelector('button.transport-run');"
+                    "return !!button && !button.disabled && button.textContent.trim() === 'Run';"
+                ),
+            )
             results.append(
                 {
                     "enabled": enabled,
+                    "machine_required": required,
+                    "reload_run_available": True,
                     "deployment_revision": applied["managerApplied"][
                         "deploymentRevision"
                     ],
+                    "ordinary_jerk": profile,
                 }
             )
         screenshot = workbench.STATE_ROOT.parent / "jerk-authoring.png"
         screenshot.write_bytes(browser.driver.screenshot_png())
         return {
-            "passed": True,
+            "passed": not deadline_failures,
+            "functional_complete": True,
+            "deadline_failures": deadline_failures,
             "jerk_authoring": results,
             "motion_issued": False,
             "screenshot": str(screenshot),
         }
     except Exception:
+        if apply_pending:
+            # Keep the original failure and its deadline. Observe the already
+            # submitted request before cleanup can turn it into a transport
+            # error; this period cannot convert the failed check into a pass.
+            try:
+                terminal = browser.wait(
+                    "failed Apply terminal evidence",
+                    lambda: browser.js(
+                        "const root = document.querySelector('.deployment-workspace');"
+                        "const error = root?.querySelector('.panel-state.error-state')?.textContent;"
+                        "const feedback = root?.querySelector('.program-feedback')?.textContent;"
+                        "return error ? {error} : feedback?.includes('rebound to the current Program.')"
+                        " ? {feedback} : null;"
+                    ),
+                )
+                print(
+                    json.dumps({"failed_apply_terminal_evidence": terminal}), flush=True
+                )
+            except Exception as diagnostic_error:
+                print(
+                    json.dumps(
+                        {
+                            "failed_apply_terminal_evidence_unavailable": str(
+                                diagnostic_error
+                            )
+                        }
+                    ),
+                    flush=True,
+                )
         screenshot = workbench.STATE_ROOT.parent / "jerk-authoring-failed.png"
         screenshot.write_bytes(browser.driver.screenshot_png())
         print(
@@ -439,6 +738,11 @@ def main() -> None:
     parser.add_argument("--build-root", type=Path, required=True)
     parser.add_argument("--prepared-root", type=Path, required=True)
     parser.add_argument(
+        "--pending-scene-shutdown",
+        action="store_true",
+        help="Hold one actual native Scene read and prove clean managed shutdown; no motion",
+    )
+    parser.add_argument(
         "--scene-transactions",
         action="store_true",
         help="Short real Scene/Stop/Resume/Reset workflow, without arm motion",
@@ -449,14 +753,29 @@ def main() -> None:
         help="With --scene-transactions, discard one actual release reply and recover by Reset",
     )
     parser.add_argument(
+        "--lost-scene-reply",
+        action="store_true",
+        help="With --scene-transactions, recover a committed attach receipt only after Stop",
+    )
+    parser.add_argument(
         "--lifecycle-transactions",
         action="store_true",
-        help="Short real CCLC Enable/Stop/Resume/Reset workflow, without arm motion",
+        help="Real CCLC Disable/Stop/Resume/Prepare/Enable/Reset workflow, without arm motion",
+    )
+    parser.add_argument(
+        "--lost-lifecycle-reply",
+        action="store_true",
+        help="With --lifecycle-transactions, recover a lost Disable response only after Stop",
     )
     parser.add_argument(
         "--route-transactions",
         action="store_true",
         help="Short real CCLC route/Stop/Resume/Reset workflow, without arm motion",
+    )
+    parser.add_argument(
+        "--pending-scene-apply",
+        action="store_true",
+        help="Hold a Scene read after the real jerk-authoring Apply fence",
     )
     parser.add_argument(
         "--controls",
@@ -485,6 +804,11 @@ def main() -> None:
         help="Extend --recover-parallel with real held-arm cleanup, manual motion/Stop and original-target Resume",
     )
     parser.add_argument(
+        "--joint-subset",
+        action="store_true",
+        help="With --selections --recover-parallel, qualify a captured one-joint Program goal",
+    )
+    parser.add_argument(
         "--ordinary-jerk",
         action="store_true",
         help="Enable the saved native ordinary-motion jerk profile in the private candidate Deployment",
@@ -493,6 +817,46 @@ def main() -> None:
         "--ordinary-jerk-import",
         action="store_true",
         help="Exercise the MoveIt importer, overrides and disabled source metadata with --ordinary-jerk",
+    )
+    parser.add_argument(
+        "--ordinary-jerk-required",
+        action="store_true",
+        help="Retain a machine-required imported cap in the selected authoring or execution workflow",
+    )
+    parser.add_argument(
+        "--scale-stop",
+        action="store_true",
+        help="Qualify repeated live scaling and Stop during a transition in the selected native workflow",
+    )
+    parser.add_argument(
+        "--stop-mode",
+        choices=("soft_on_path", "spring_back_hold"),
+        help="Save and Apply this controlled Stop mode in the private Deployment",
+    )
+    parser.add_argument(
+        "--natural-completion",
+        choices=("on", "off"),
+        help="Explicit saved short-tail choice with --stop-mode",
+    )
+    parser.add_argument(
+        "--stop-jerk",
+        choices=("on", "off"),
+        help="Save an explicit controlled-Stop jerk choice, independently of ordinary jerk",
+    )
+    parser.add_argument(
+        "--stop-ramp-duration",
+        type=float,
+        help="Save the controlled Stop ramp duration in seconds; normal compiler validation applies",
+    )
+    parser.add_argument(
+        "--expect-stop-refusal",
+        action="store_true",
+        help="Require an infeasible Soft ramp to escalate, settle and retain a fault blocking Resume",
+    )
+    parser.add_argument(
+        "--expect-natural-completion",
+        choices=("on", "off"),
+        help="Require the exact arm Stop certificate to report this outcome",
     )
     parser.add_argument(
         "--jerk-authoring",
@@ -521,8 +885,40 @@ def main() -> None:
         help="Drive --selections --recover-parallel through the actual GUI/WebSocket",
     )
     args = parser.parse_args()
+    if args.lost_lifecycle_reply and not args.lifecycle_transactions:
+        parser.error("--lost-lifecycle-reply requires --lifecycle-transactions")
     if args.ordinary_jerk_import and not args.ordinary_jerk:
         parser.error("--ordinary-jerk-import requires --ordinary-jerk")
+    if args.ordinary_jerk_required and not args.ordinary_jerk_import:
+        parser.error("--ordinary-jerk-required requires --ordinary-jerk-import")
+    if args.natural_completion is not None and args.stop_mode is None:
+        parser.error("--natural-completion requires --stop-mode")
+    stop_profile_edit = (
+        args.stop_mode is not None
+        or args.stop_jerk is not None
+        or args.stop_ramp_duration is not None
+    )
+    if (stop_profile_edit or args.expect_natural_completion) and not args.selections:
+        parser.error("Stop profile/outcome checks require --selections")
+    if args.expect_stop_refusal and (
+        not args.selections
+        or args.stop_ramp_duration is None
+        or args.recover_parallel
+        or args.expect_natural_completion is not None
+        or args.stop_mode == "spring_back_hold"
+    ):
+        parser.error(
+            "--expect-stop-refusal requires --selections --stop-ramp-duration, "
+            "without recovery, Spring or natural-completion outcome checks"
+        )
+    if args.scale_stop and not (
+        args.ordinary_jerk and args.selections and args.recover_parallel
+    ):
+        parser.error(
+            "--scale-stop requires --ordinary-jerk --selections --recover-parallel"
+        )
+    if args.pending_scene_apply and not args.jerk_authoring:
+        parser.error("--pending-scene-apply requires --jerk-authoring")
     if args.jerk_authoring and (
         not args.ordinary_jerk
         or args.controls
@@ -539,6 +935,8 @@ def main() -> None:
         parser.error(
             "--uncertain-resume-reset requires --scene-transactions (no arm motion)"
         )
+    if args.lost_scene_reply and not args.scene_transactions:
+        parser.error("--lost-scene-reply requires --scene-transactions")
     transactions = sum(
         (args.scene_transactions, args.lifecycle_transactions, args.route_transactions)
     )
@@ -558,6 +956,12 @@ def main() -> None:
         )
     if args.cartesian_handover and not args.manual_handover:
         parser.error("--cartesian-handover requires --manual-handover")
+    if args.joint_subset and (
+        not args.selections or not args.recover_parallel or args.cartesian_handover
+    ):
+        parser.error(
+            "--joint-subset requires --selections --recover-parallel without Cartesian"
+        )
     if not 0.0 <= args.stop_progress < 1.0:
         parser.error("--stop-progress must be in [0, 1)")
     if not 0.0 < args.gripper_duration < 30.0:
@@ -685,9 +1089,13 @@ def main() -> None:
                     (0.6, 0.0, 1.5707963267948966, 0.0, 0.0, 0.0)
                 )
             ],
-            velocity_scale=0.2,
+            # The controls row additionally scales to 0.4 after Pause. Keep
+            # that semantic check short without changing Stop-profile rows.
+            velocity_scale=0.4 if args.controls else 0.2,
             acceleration_scale=0.25,
         )
+        if args.joint_subset:
+            motion["parameters"]["goal"] = motion["parameters"]["goal"][:1]
         if args.cartesian_handover:
             program["target_roles"]["arm"]["required_capabilities"].append(
                 {
@@ -847,7 +1255,11 @@ def main() -> None:
             "parameters": {},
             "children": [
                 {
-                    "node_id": node_id,
+                    "node_id": (
+                        "lifecycle.disable_component"
+                        if args.lifecycle_transactions
+                        else node_id
+                    ),
                     "instance_id": "first",
                     "parameters": dict(parameters),
                     "children": [],
@@ -866,6 +1278,16 @@ def main() -> None:
                 },
             ],
         }
+    if args.lifecycle_transactions:
+        program["tree"]["children"].insert(
+            2,
+            {
+                "node_id": "lifecycle.prepare_component",
+                "instance_id": "prepare_again",
+                "parameters": dict(parameters),
+                "children": [],
+            },
+        )
     program["program_revision"] = compute_content_identity(
         program,
         own_field="program_revision",
@@ -877,18 +1299,42 @@ def main() -> None:
     deployment_path = (
         workspace / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
     )
-    if args.ordinary_jerk:
+    if args.ordinary_jerk or stop_profile_edit:
         from manyforge_composer.backend.deployment_draft import (
             compile_deployment_document,
         )
 
         candidate = load_strict_json_yaml(deployment_path)
         edited = 0
-        for unit in candidate["graph"]["runtime_units"]:
-            for target in unit.get("configuration", {}).get("motion_target_limits", []):
-                target["ordinary_motion_jerk"]["enabled"] = True
-                edited += 1
-        assert edited > 0, "no native ordinary jerk settings in candidate"
+        if args.ordinary_jerk:
+            for unit in candidate["graph"]["runtime_units"]:
+                for target in unit.get("configuration", {}).get(
+                    "motion_target_limits", []
+                ):
+                    target["ordinary_motion_jerk"]["enabled"] = True
+                    edited += 1
+            assert edited > 0, "no native ordinary jerk settings in candidate"
+        if stop_profile_edit:
+            stop_rows = [
+                row
+                for row in candidate["policies"]["stop_stage_parameters"]
+                if row["provider_contract_ref"]["contract_schema_id"]
+                == "manyforge.value_schema.provider_contract.motion_controlled_stop.v1"
+            ]
+            assert stop_rows, "no controlled Stop settings in candidate"
+            for row in stop_rows:
+                profile = row["default_contract_parameters"]
+                if args.stop_mode:
+                    profile["stop_mode"] = args.stop_mode
+                    profile["allow_natural_completion_on_short_path"] = (
+                        args.natural_completion == "on"
+                        if args.natural_completion is not None
+                        else args.stop_mode == "soft_on_path"
+                    )
+                if args.stop_jerk is not None:
+                    profile["jerk_limits_enabled"] = args.stop_jerk == "on"
+                if args.stop_ramp_duration is not None:
+                    profile["deceleration_time_s"] = args.stop_ramp_duration
         deployment_path = state / "query.deployment.yaml"
         compiled = compile_deployment_document(json.dumps(candidate)).canonical_json
         if args.ordinary_jerk_import:
@@ -915,6 +1361,18 @@ def main() -> None:
                 target["command_target_id"],
                 [f"joint{index}" for index in range(1, 7)],
             )["canonical_json"]
+            if args.ordinary_jerk_required:
+                required_candidate = json.loads(compiled)
+                # Explicit private machine policy, before compilation/sealing;
+                # source metadata still identifies the actual imported bytes.
+                required_candidate["graph"]["runtime_units"][0]["configuration"][
+                    "motion_target_limits"
+                ][0]["ordinary_motion_jerk"]["joint_limits"][0]["imported"][
+                    "machine_required"
+                ] = True
+                compiled = compile_deployment_document(
+                    json.dumps(required_candidate)
+                ).canonical_json
         deployment_path.write_text(compiled)
     subprocess.run(
         [
@@ -964,7 +1422,7 @@ def main() -> None:
     # construction, exact tuple checks, lifecycle convergence and teardown run.
     workbench._import_package = lambda: None
     workbench._ensure_deployment_compiler = lambda: (compiler, prepared)
-    if args.ordinary_jerk:
+    if args.ordinary_jerk or stop_profile_edit:
         # Verify the private, compiler-produced Deployment with the same
         # revision check as the ordinary workspace source. Do not bypass it.
         require_deployment = workbench._require_current_workspace_deployment
@@ -985,16 +1443,21 @@ def main() -> None:
         frontend_port=3001,
         artifact_root=state if args.jerk_authoring else None,
     )
-    if args.uncertain_resume_reset:
-        # Test-only transport loss after the real Kernel processed release.
+    if (
+        args.uncertain_resume_reset
+        or args.lost_scene_reply
+        or args.lost_lifecycle_reply
+    ):
+        # Test-only transport loss after the real owner processed a command.
         # No owner result, settlement, journal row or admission is fabricated.
         spawn = stack._spawn
 
         def spawn_with_one_lost_reply(name, command, **kwargs):
             if name == "Program runner":
                 assert command[1:3] == ("-m", "manyforge_program_runner")
-                injection = """
-import runpy
+                injection = "import runpy\n"
+                if args.uncertain_resume_reset:
+                    injection += """
 from manyforge_program_runner.execution_transport import ProgramRunnerExecutionTransport
 exchange = ProgramRunnerExecutionTransport._exchange_on
 lost = False
@@ -1007,8 +1470,78 @@ def exchange_once(self, command, socket_path):
         raise OSError('qualification: actual selection-release reply lost')
     return result
 ProgramRunnerExecutionTransport._exchange_on = exchange_once
-runpy.run_module('manyforge_program_runner', run_name='__main__')
 """
+                if args.lost_scene_reply:
+                    injection += f"""
+import json
+from pathlib import Path
+from manyforge_headless_api.client import HeadlessHttpClient
+commit = HeadlessHttpClient.commit_scene_transaction
+receipt = HeadlessHttpClient.scene_transaction_status
+lost_scene_request = None
+scene_evidence = Path({str(state / 'lost-scene-reply.json')!r})
+scene_release = Path({str(state / 'release-scene-reply')!r})
+def commit_once(self, body):
+    global lost_scene_request
+    request_id = body['request_context']['request_id']
+    attaching = body['operation']['kind'] == 'attach_carried_object'
+    assert not (attaching and lost_scene_request is not None), 'Scene effect was resubmitted'
+    result = commit(self, body)
+    if attaching:
+        assert result['ok'] and result['projection_status'] == 'committed', result
+        lost_scene_request = request_id
+        scene_evidence.write_text(json.dumps({{'request_id': request_id, 'committed': result}}))
+        print('QUALIFICATION: discarded committed Scene reply', request_id, flush=True)
+        raise OSError('qualification: actual committed Scene reply lost')
+    return result
+def read_receipt(self, body):
+    result = receipt(self, body)
+    if body['request_context']['request_id'] == lost_scene_request and result.get('result'):
+        if not scene_release.exists():
+            raise OSError('qualification: Scene receipt unavailable until held')
+        assert result['result']['request_id'] == lost_scene_request, result
+        print('QUALIFICATION: recovered Scene receipt', lost_scene_request, flush=True)
+        evidence = json.loads(scene_evidence.read_text())
+        evidence['recovered'] = result
+        scene_evidence.write_text(json.dumps(evidence))
+    return result
+HeadlessHttpClient.commit_scene_transaction = commit_once
+HeadlessHttpClient.scene_transaction_status = read_receipt
+"""
+                if args.lost_lifecycle_reply:
+                    injection += f"""
+import json
+from pathlib import Path
+from manyforge_headless_api.client import HeadlessHttpClient
+submit_lifecycle = HeadlessHttpClient.submit_component_lifecycle
+read_lifecycle = HeadlessHttpClient.component_lifecycle_request_result
+lost_lifecycle_request = None
+lifecycle_evidence = Path({str(state / 'lost-lifecycle-reply.json')!r})
+lifecycle_release = Path({str(state / 'release-lifecycle-reply')!r})
+def submit_lifecycle_once(self, body):
+    global lost_lifecycle_request
+    disabling = body['intent'] == 'disable'
+    assert not (disabling and lost_lifecycle_request is not None), 'Disable was resubmitted'
+    result = submit_lifecycle(self, body)
+    if disabling:
+        assert result.get('acceptance') and not result.get('rejection'), result
+        lost_lifecycle_request = body['request_context']['request_id']
+        lifecycle_evidence.write_text(json.dumps({{'request_id': lost_lifecycle_request, 'accepted': result}}))
+        raise OSError('qualification: actual Disable response lost')
+    return result
+def read_lifecycle_once(self, body):
+    result = read_lifecycle(self, body)
+    if body['request_context']['request_id'] == lost_lifecycle_request:
+        if not lifecycle_release.exists():
+            raise OSError('qualification: Disable receipt unavailable until held')
+        evidence = json.loads(lifecycle_evidence.read_text())
+        evidence['recovered'] = result
+        lifecycle_evidence.write_text(json.dumps(evidence))
+    return result
+HeadlessHttpClient.submit_component_lifecycle = submit_lifecycle_once
+HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
+"""
+                injection += "runpy.run_module('manyforge_program_runner', run_name='__main__')\n"
                 command = (command[0], "-c", injection, *command[3:])
             spawn(name, command, **kwargs)
 
@@ -1040,12 +1573,28 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                 except Exception as error:
                     print(f"Startup diagnostic {path}: {error}", flush=True)
             raise
+        if args.pending_scene_shutdown:
+            from ui6i_shutdown_check import check_pending_scene_read_shutdown
+
+            print(
+                json.dumps(
+                    check_pending_scene_read_shutdown(
+                        stack, workbench.STATE_ROOT, workbench
+                    )
+                )
+            )
+            return
         skill_authoring = check_skill_authoring()
         if args.jerk_authoring:
-            print(
-                json.dumps(check_jerk_authoring(args.jerk_authoring, stack, workbench)),
-                flush=True,
+            result = check_jerk_authoring(
+                args.jerk_authoring,
+                stack,
+                workbench,
+                pending_scene_apply=args.pending_scene_apply,
             )
+            print(json.dumps(result), flush=True)
+            if not result["passed"]:
+                raise SystemExit(1)
             return
         if args.authoring_groups:
             print(
@@ -1081,7 +1630,9 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                         == "sha256:"
                         + hashlib.sha256(moveit_source.encode()).hexdigest()
                     )
-                    assert row["imported"]["machine_required"] is False
+                    assert row["imported"]["machine_required"] is (
+                        args.ordinary_jerk_required and name == "joint1"
+                    )
                     assert row["imported"]["enabled"] is (name != "joint3")
                     if name != "joint3":
                         assert (row["source"], row["maximum_rad_s3"]) == (
@@ -1094,6 +1645,7 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                     assert row["source"] == "preset" and row["imported"] is None
                     assert row["maximum_rad_s3"] == row["preset_rad_s3"] > 0
                 assert effective["effective_max_jerk_rad_s3"] == row["maximum_rad_s3"]
+            print(json.dumps({"ordinary_jerk": profile}), flush=True)
         initial_tcp = (
             native.diagnostics()["status"]["direct_control"]["observed_state"][
                 "current_tcp_pose"
@@ -1287,6 +1839,24 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
             assert configured["requested_scale"] == 0.8, configured
         with HeadlessHttpClient("http://127.0.0.1:9101", timeout_seconds=3) as client:
             applied = client.program_applied()
+            if args.lifecycle_transactions:
+                binding_id = stack.metadata["program_binding_id"].removeprefix(
+                    "sha256:"
+                )
+                binding = json.loads(
+                    (
+                        package / "program-bindings/sha256" / f"{binding_id}.json"
+                    ).read_text()
+                )
+                lifecycle_component = next(
+                    row["controllable_component_id"]
+                    for row in binding["component_role_bindings"]
+                    if row["component_role_id"] == "robot"
+                )
+                lifecycle_before = client.cclc_component(lifecycle_component)
+                assert (
+                    lifecycle_before["component_lifecycle_state"] == "active"
+                ), lifecycle_before
             scene_baseline = (
                 client.scene()["logical_scene"]["payload"]["snapshot"]["objects"]
                 if args.scene_transactions
@@ -1337,6 +1907,24 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                     current = client.program_run(run_id)
                     assert current["state"] in {"running", "succeeded"}, current
                     nodes = current["node_statuses"]
+                    if args.lost_scene_reply:
+                        return (
+                            current
+                            if (state / "lost-scene-reply.json").exists()
+                            and nodes.get(first_node) == "running"
+                            else None
+                        )
+                    if args.lost_lifecycle_reply:
+                        return (
+                            current
+                            if (state / "lost-lifecycle-reply.json").exists()
+                            and nodes.get(first_node) == "running"
+                            and client.cclc_component(lifecycle_component)[
+                                "component_lifecycle_state"
+                            ]
+                            == "disabled"
+                            else None
+                        )
                     return (
                         current
                         if nodes.get(first_node) == "success"
@@ -1349,6 +1937,15 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                     attached_and_waiting,
                     stack.processes,
                 )
+                if args.lifecycle_transactions:
+                    lifecycle_disabled = client.cclc_component(lifecycle_component)
+                    assert (
+                        lifecycle_disabled["component_lifecycle_state"] == "disabled"
+                    ), lifecycle_disabled
+                    assert (
+                        lifecycle_disabled["component_lifecycle_generation"]
+                        > lifecycle_before["component_lifecycle_generation"]
+                    )
                 attached_scene = client.scene()["logical_scene"]["payload"]["snapshot"]
                 if args.scene_transactions:
                     assert (
@@ -1363,19 +1960,47 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                     "group_ids": ["all"],
                 }
                 client.program_run_motion_stop(run_id, request)
+                if args.lost_lifecycle_reply or args.lost_scene_reply:
+                    unknown = client.program_run(run_id)
+                    assert unknown["node_statuses"][first_node] == "running", unknown
+                    assert unknown["node_statuses"][second_node] == "idle", unknown
+                    if args.lost_lifecycle_reply:
+                        assert (
+                            unknown["node_statuses"]["prepare_again"] == "idle"
+                        ), unknown
+                    unknown_controls = client.program_runtime_controls(run_id)
+                    assert not next(
+                        row["resume_allowed"]
+                        for row in unknown_controls["execution_selections"]["groups"]
+                        if row["group_id"] == "all"
+                    ), unknown_controls
+                    release = (
+                        "release-lifecycle-reply"
+                        if args.lost_lifecycle_reply
+                        else "release-scene-reply"
+                    )
+                    (state / release).touch()
                 previous_held_revision = None
 
                 def held_ready():
                     nonlocal previous_held_revision
                     current = client.program_run(run_id)
-                    assert current["node_statuses"][first_node] == "success", current
+                    assert current["node_statuses"][first_node] in {
+                        "running",
+                        "success",
+                    }, current
                     assert current["node_statuses"][second_node] == "idle", current
+                    if args.lifecycle_transactions:
+                        assert (
+                            current["node_statuses"]["prepare_again"] == "idle"
+                        ), current
                     controls = client.program_runtime_controls(run_id)
                     stable = previous_held_revision == controls["run_revision"]
                     previous_held_revision = controls["run_revision"]
                     return (
                         controls
-                        if stable
+                        if current["node_statuses"][first_node] == "success"
+                        and stable
                         and any(
                             row["group_id"] == "all" and row["resume_allowed"]
                             for row in controls["execution_selections"]["groups"]
@@ -1386,6 +2011,32 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                 controls = workbench._wait_until(
                     "transaction branch held", held_ready, stack.processes
                 )
+                if args.lost_scene_reply:
+                    evidence = json.loads((state / "lost-scene-reply.json").read_text())
+                    recovered = evidence["recovered"]
+                    assert recovered["ok"] and recovered["result"]["ok"], recovered
+                    assert recovered["result"] == {
+                        **evidence["committed"],
+                        "replay_status": "replayed_exact",
+                    }, evidence
+                    assert (
+                        recovered["result"]["request_id"] == evidence["request_id"]
+                    ), evidence
+                if args.lost_lifecycle_reply:
+                    evidence = json.loads(
+                        (state / "lost-lifecycle-reply.json").read_text()
+                    )
+                    recovered = evidence["recovered"]["result"]
+                    assert (
+                        recovered["acceptance"] == evidence["accepted"]["acceptance"]
+                    ), evidence
+                    assert (
+                        recovered["acceptance"]["request_id"] == evidence["request_id"]
+                    ), evidence
+                if args.lifecycle_transactions:
+                    assert (
+                        client.cclc_component(lifecycle_component) == lifecycle_disabled
+                    )
                 assert (
                     client.scene()["logical_scene"]["payload"]["snapshot"][
                         "transaction_sequence"
@@ -1444,6 +2095,15 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                         "second native owner transaction", completed, stack.processes
                     )
                     assert set(result["node_statuses"].values()) == {"success"}, result
+                    if args.lifecycle_transactions:
+                        lifecycle_enabled = client.cclc_component(lifecycle_component)
+                        assert (
+                            lifecycle_enabled["component_lifecycle_state"] == "active"
+                        ), lifecycle_enabled
+                        assert (
+                            lifecycle_enabled["component_lifecycle_generation"]
+                            > lifecycle_disabled["component_lifecycle_generation"]
+                        )
                     final_scene = workbench._wait_until(
                         "Scene detach publication", detach_published, stack.processes
                     )
@@ -1504,6 +2164,8 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                     json.dumps(
                         {
                             "passed": True,
+                            "lost_scene_reply_recovered": args.lost_scene_reply,
+                            "lost_lifecycle_reply_recovered": args.lost_lifecycle_reply,
                             "qualification": (
                                 "scene_unknown_resume_reset"
                                 if args.uncertain_resume_reset
@@ -1637,6 +2299,90 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                         )
                     ), released
 
+                scale_transitions = []
+                if args.scale_stop:
+                    direct = native.diagnostics()["status"]["direct_control"]
+                    scale_selector = RuntimeScaleControlSelectorRequest.model_validate(
+                        {
+                            key: direct[key]
+                            for key in (
+                                "program_binding_id",
+                                "component_role_id",
+                                "target_role_id",
+                            )
+                        }
+                    )
+                    for index, target_scale in enumerate((0.4, 0.9, 0.6)):
+                        before_scale = native.get_runtime_scale_control(scale_selector)[
+                            "runtime_scale_control"
+                        ]
+                        assert (
+                            before_scale["active_operation_id"]
+                            == operation_for("arm")["operation_id"]
+                        ), before_scale
+                        started_ns = time.monotonic_ns()
+                        accepted_scale = native.set_runtime_scale_control(
+                            RuntimeScaleControlRequest.model_validate(
+                                {
+                                    "request_context": {
+                                        "request_id": f"selection.scale.{index}",
+                                        "request_owner_epoch": identity["owner_epoch"],
+                                        "source_label": "native_scale_stop_qualification",
+                                        "correlation_id": run_id,
+                                    },
+                                    "selector": scale_selector.model_dump(),
+                                    "expected_control_generation": before_scale[
+                                        "control_generation"
+                                    ],
+                                    "scale": target_scale,
+                                }
+                            ),
+                            trusted_principal_id=None,
+                        )["accepted"]
+                        accepted_ns = time.monotonic_ns()
+
+                        def scale_observed():
+                            current = native.get_runtime_scale_control(scale_selector)[
+                                "runtime_scale_control"
+                            ]
+                            assert (
+                                current["control_generation"]
+                                == accepted_scale["control_generation"]
+                            ), current
+                            assert current["requested_scale"] == target_scale, current
+                            effective = current["effective_scale"]
+                            reached = (
+                                effective == target_scale
+                                if index < 2
+                                else (
+                                    effective is not None
+                                    and target_scale < effective < 0.9
+                                )
+                            )
+                            return current if reached else None
+
+                        observed_scale = workbench._wait_until(
+                            (
+                                "native scale convergence"
+                                if index < 2
+                                else "native scale transition before Stop"
+                            ),
+                            scale_observed,
+                            stack.processes,
+                        )
+                        scale_transitions.append(
+                            {
+                                "target": target_scale,
+                                "acceptance_latency_ns": accepted_ns - started_ns,
+                                "observation_latency_ns": time.monotonic_ns()
+                                - accepted_ns,
+                                "observed": observed_scale,
+                            }
+                        )
+                    print(
+                        json.dumps({"scale_transitions": scale_transitions}), flush=True
+                    )
+
                 def at_stop_progress():
                     moving = both_moving()
                     return (
@@ -1730,6 +2476,116 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                         else None
                     )
 
+                arm_terminal = workbench._wait_until(
+                    "exact durable arm Stop certificate",
+                    lambda: read_stop_terminal(
+                        native, identity["owner_epoch"], arm_stop_id
+                    ),
+                    stack.processes,
+                )
+                # Retain the exact outcome even when a configured profile
+                # fails; waiting for a fault-free held scope would obscure it.
+                print(json.dumps({"arm_stop_terminal": arm_terminal}), flush=True)
+                check_stop_history(
+                    native,
+                    workbench.STATE_ROOT / "execution-state/operation-journal.sqlite3",
+                    arm_terminal,
+                )
+                assert arm_terminal["state"] == "succeeded", arm_terminal
+                assert arm_terminal["failed_count"] == 0, arm_terminal
+                assert arm_terminal["acceptance_to_terminal_latency_ns"] <= (
+                    arm_terminal["acceptance"]["fixed_outer_duration_ns"]
+                ), arm_terminal
+                if args.stop_jerk is not None or args.stop_ramp_duration is not None:
+                    profiles = [
+                        stage["profile"]
+                        for stage in arm_terminal["attempted_stages"][:1]
+                        if stage["profile"] is not None
+                    ]
+                    assert len(profiles) == 1, arm_terminal
+                    if args.stop_jerk is not None:
+                        assert profiles[0]["jerk_limits_enabled"] is (
+                            args.stop_jerk == "on"
+                        ), profiles
+                    if args.stop_ramp_duration is not None:
+                        assert profiles[0]["deceleration_time_s"] == (
+                            args.stop_ramp_duration
+                        ), profiles
+                assert arm_terminal["participant_settlement"], arm_terminal
+                assert all(
+                    row["facts"]["terminal_settlement"] == "settled"
+                    for row in arm_terminal["participant_settlement"]
+                ), arm_terminal
+                if args.expect_stop_refusal:
+                    assert arm_terminal["result"] == "succeeded_escalated", arm_terminal
+                    assert arm_terminal["escalated"], arm_terminal
+                    assert arm_terminal["hard_stop_floor_used"], arm_terminal
+                    stages = arm_terminal["attempted_stages"]
+                    assert len(stages) == 2, stages
+                    refused, hard = stages
+                    assert refused["outcome"] == "failed", refused
+                    assert refused["attempt_disposition"] == "not_dispatched", refused
+                    assert refused["error"]["details"]["reason"] == (
+                        "soft_on_path_deceleration_time_infeasible"
+                    ), refused
+                    assert hard["stage"]["action_class"] == "software_hard", hard
+                    assert hard["outcome"] == "succeeded", hard
+                    assert hard["attempt_disposition"] == "dispatched", hard
+
+                    def faulted_and_settled():
+                        value = scope()
+                        return (
+                            value
+                            if (
+                                sorted(
+                                    value["held_node_indices"]
+                                    + value["faulted_node_indices"]
+                                )
+                                == [0, 1, 2]
+                                and not value["pending_effects"]
+                                and not value["stopping_node_indices"]
+                            )
+                            else None
+                        )
+
+                    final_scope = workbench._wait_until(
+                        "failed profile containment settles with fault retained",
+                        faulted_and_settled,
+                        stack.processes,
+                    )
+                    stop_fault = native.stop_fault()["stop_fault"]
+                    assert stop_fault is not None, arm_terminal
+                    assert stop_fault["latch"]["state"] == "latched", stop_fault
+                    assert (
+                        stop_fault["latch"]["latch_id"]
+                        == arm_terminal["fault_latch"]["latch_id"]
+                    ), stop_fault
+                    controls = client.program_runtime_controls(run_id)
+                    groups = {
+                        row["group_id"]: row
+                        for row in controls["execution_selections"]["groups"]
+                    }
+                    assert not groups["arm"]["resume_allowed"], groups
+                    assert not groups["all"]["resume_allowed"], groups
+                    print(
+                        json.dumps(
+                            {
+                                "passed": True,
+                                "qualification": "selected_stop_profile_refusal",
+                                "private_state": str(state),
+                                "arm_stop_terminal": arm_terminal,
+                                "stop_fault": stop_fault,
+                                "final_scope": final_scope,
+                                "runtime_controls": controls,
+                                "unselected_gripper_before": tool_before,
+                                "unselected_gripper_after": tool_after,
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                    return
+                assert not arm_terminal["escalated"], arm_terminal
+                assert not arm_terminal["hard_stop_floor_used"], arm_terminal
                 final_scope = workbench._wait_until(
                     "selected native effects settle", settled, stack.processes
                 )
@@ -1737,6 +2593,38 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                 # nominal Stop separately before that recovery can clear it.
                 stop_fault = native.stop_fault()["stop_fault"]
                 assert stop_fault is None, stop_fault
+                rest_evidence = [
+                    item["evidence"]
+                    for stage in arm_terminal["attempted_stages"]
+                    for item in stage["evidence_items"]
+                    if item["required_class"] == "motion_rest"
+                    and item["state"] == "satisfied"
+                ]
+                assert len(rest_evidence) == 1, arm_terminal
+                if (
+                    args.stop_ramp_duration is not None
+                    and not rest_evidence[0]["completed_by_natural_completion"]
+                ):
+                    assert math.isclose(
+                        float(
+                            rest_evidence[0]["provider_diagnostics"]["effective_ramp_s"]
+                        ),
+                        args.stop_ramp_duration,
+                        rel_tol=1e-9,
+                    ), rest_evidence
+                if args.expect_natural_completion is not None:
+                    assert rest_evidence[0]["completed_by_natural_completion"] is (
+                        args.expect_natural_completion == "on"
+                    ), arm_terminal
+                if args.stop_mode:
+                    assert (
+                        rest_evidence[0]["requested_stop_mode"] == args.stop_mode
+                    ), arm_terminal
+                if args.scale_stop:
+                    handoff = rest_evidence[0]["provider_diagnostics"]
+                    assert (
+                        float(handoff["runtime_scale_rate_per_s_at_trip"]) < 0
+                    ), handoff
                 recovery_result = None
                 reset_result = None
                 manual_handover_result = None
@@ -1808,7 +2696,12 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                     manual = OperationIntentRequest.model_validate(manual).model_dump(
                         mode="json"
                     )
-                    proof = client.read_manual_handover(manual)
+                    # Exercise the browser-facing read route, not just Headless:
+                    # a missing Composer forwarder must fail this practical row.
+                    with HeadlessHttpClient(
+                        "http://127.0.0.1:9001", timeout_seconds=3
+                    ) as composer:
+                        proof = composer.read_manual_handover(manual)
                     assert proof["availability"]["available"], proof
                     assert proof["availability"]["cleanup_required"], proof
                     manual["manual_handover"] = proof["manual_handover"]
@@ -1827,7 +2720,10 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                         },
                     )
                     assert native.read(arm["operation_id"])["resident"] is False
-                    proof = client.read_manual_handover(manual)
+                    with HeadlessHttpClient(
+                        "http://127.0.0.1:9001", timeout_seconds=3
+                    ) as composer:
+                        proof = composer.read_manual_handover(manual)
                     assert proof["availability"] == {
                         "available": True,
                         "cleanup_required": False,
@@ -1972,18 +2868,88 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                         "fresh arm and gripper attempts complete",
                         recovered,
                         stack.processes,
-                        # This Cartesian fixture declares a 30-second move
-                        # budget; the generic workbench startup wait is 20s.
-                        timeout_seconds=35 if args.cartesian_handover else 20,
+                        # Both motion variants and the gripper declare a
+                        # 30-second execution/completion budget. Observe that
+                        # budget plus owner publication, including when the
+                        # selected gripper duration itself is 20 seconds.
+                        # Product deadlines and Stop budgets are unchanged.
+                        timeout_seconds=35,
                     )
                     assert recovery_result["node_statuses"] == {
                         "control_root": "success",
                         "controlled_motion": "success",
                         "moving_gripper": "success",
                     }, recovery_result
+                    with HeadlessHttpClient(
+                        "http://127.0.0.1:9001", timeout_seconds=3
+                    ) as composer:
+                        recovery_result["qualified_completed_operations"] = (
+                            check_completed_program_operations(
+                                native,
+                                composer,
+                                workbench.STATE_ROOT
+                                / "execution-state/operation-journal.sqlite3",
+                                run_id,
+                            )
+                        )
+                    gripper_completed = next(
+                        row
+                        for row in recovery_result["qualified_completed_operations"]
+                        if row["scopes"][0]["node_instance_id"] == "moving_gripper"
+                    )
+                    gripper_payload = gripper_completed["accepted_payloads"][0]
+                    assert gripper_payload["kind"] == "capability_command"
+                    assert (
+                        gripper_payload["command_schema_id"]
+                        == "gripper.command_position"
+                    )
+                    gripper_goal = gripper_payload["command_value"]["position"]
+                    assert gripper_goal["kind"] == "linear", gripper_goal
+                    gripper_observation = native.query_target(
+                        TargetObservationQuery.model_validate(
+                            {
+                                **common,
+                                "target_role_id": "gripper",
+                                "kind": "gripper_status",
+                            }
+                        )
+                    )["target_observation"]
+                    gripper_position = gripper_observation["value"]["observed_position"]
+                    assert gripper_position["kind"] == "linear_m", gripper_observation
+                    assert math.isclose(
+                        gripper_position["value_m"],
+                        gripper_goal["value"],
+                        rel_tol=1e-6,
+                        abs_tol=1e-12,
+                    ), (gripper_goal, gripper_observation)
+                    recovery_result["qualified_final_gripper_observation"] = (
+                        gripper_observation
+                    )
+                    if args.joint_subset:
+                        arm_completed = next(
+                            row
+                            for row in recovery_result["qualified_completed_operations"]
+                            if row["scopes"][0]["node_instance_id"]
+                            == "controlled_motion"
+                        )
+                        assert arm_completed["accepted_payloads"][0]["motion"] == {
+                            "kind": "joint_goal",
+                            "joint_names": ["joint1"],
+                            "positions_rad": [0.6],
+                        }, arm_completed
                     assert native.read(arm["operation_id"])["resident"] is False
                     assert native.read(tool["operation_id"])["resident"] is False
                     if manual_handover_result is not None:
+                        # Manual handover adds enough real operation events
+                        # for the legacy full-page/continuation checks.
+                        page = native.events(identity["owner_epoch"], 0, limit=16)
+                        assert (
+                            len(page["events"]) == 16 and page["has_more"] is True
+                        ), page
+                        assert (
+                            page["next_after_sequence"]
+                            == page["events"][-1]["sequence"]
+                        ), page
                         final_observed = native.diagnostics()["status"][
                             "direct_control"
                         ]["observed_state"]
@@ -2087,6 +3053,8 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                             "logical_hold": logical,
                             "logical_release": released,
                             "arm_stop": first,
+                            "arm_stop_terminal": arm_terminal,
+                            "scale_transitions": scale_transitions,
                             "overlap_stop": both,
                             "unselected_gripper_before": tool_before,
                             "unselected_gripper_after": tool_after,
@@ -2103,6 +3071,7 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
             queried_operation: str | None = None
             observed_operation_scale = False
             resume_actor = None
+            last_program = None
             operation_query = ProgramOperationQuery.model_validate(
                 {
                     "schema_version": "manyforge.program_operation_query.v1",
@@ -2114,8 +3083,9 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
             )
 
             def terminal():
-                nonlocal queried_operation, observed_operation_scale, resume_actor
+                nonlocal queried_operation, observed_operation_scale, resume_actor, last_program
                 current = client.program_run(run_id)
+                last_program = current
                 nodes = current.get("node_statuses", {})
                 if (
                     args.controls
@@ -2222,9 +3192,35 @@ runpy.run_module('manyforge_program_runner', run_name='__main__')
                         ), resume_actor
                 return current if current["state"] != "running" else None
 
-            result = workbench._wait_until(
-                "query-only Program terminal", terminal, stack.processes
-            )
+            try:
+                result = workbench._wait_until(
+                    (
+                        "controls Program terminal"
+                        if args.controls
+                        else "query-only Program terminal"
+                    ),
+                    terminal,
+                    stack.processes,
+                )
+            except workbench.WorkbenchError:
+                # Preserve the last owner result before private stack teardown.
+                # This observes the failed run; it never retries its commands.
+                print(
+                    json.dumps(
+                        {
+                            "failed_program": last_program,
+                            "queried_operation": queried_operation,
+                            "operation": (
+                                native.read(queried_operation)
+                                if queried_operation
+                                else None
+                            ),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                raise
             assert result["state"] == "succeeded", result
             expected_statuses = (
                 {

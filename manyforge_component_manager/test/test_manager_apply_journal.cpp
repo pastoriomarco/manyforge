@@ -2623,6 +2623,42 @@ TEST(ManagerApplyCompletionJournal,
 }
 
 TEST(ManagerApplyCompletionJournal,
+     DependencyReadsDoNotRetainAbsenceOrCorruptionAcrossCalls) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "read-scope.sqlite3";
+  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+  const auto transition = EnsureSelectedBundleTransition(journal);
+  const auto read = [&] {
+    return journal.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U));
+  };
+  EXPECT_FALSE(read().has_value());
+  const auto completed = EnsureApplyCompletion(journal, transition);
+  EXPECT_EQ(read(), completed.terminal);
+
+  // A separate writer changes a deep predecessor without changing schema
+  // shape. A completed earlier read must not hide it, and an exception must
+  // not leave a stale read context behind after the database is restored.
+  const auto rewrite_source = [&](const std::string &source) {
+    ExecSql(
+        path,
+        "DROP TRIGGER manager_apply_intents_no_update;"
+        "UPDATE manager_apply_intents SET source_label='" +
+            source +
+            "';"
+            "CREATE TRIGGER manager_apply_intents_no_update "
+            "BEFORE UPDATE ON manager_apply_intents BEGIN "
+            "SELECT RAISE(ABORT, 'manager_apply_intents is immutable'); END;");
+  };
+  rewrite_source("tampered-source");
+  EXPECT_THROW(static_cast<void>(read()), ManagerApplyJournalIntegrityError);
+  EXPECT_THROW(static_cast<void>(journal.VerifyIntegrity()),
+               ManagerApplyJournalIntegrityError);
+  rewrite_source(Intent().request_context.source_label);
+  EXPECT_EQ(read(), completed.terminal);
+  EXPECT_EQ(journal.VerifyIntegrity().terminal_outcome_count, 1);
+}
+
+TEST(ManagerApplyCompletionJournal,
      RejectsPrematureTerminalAndConflictingCompletionRecords) {
   TemporaryDirectory directory;
   SqliteManagerApplyJournal journal(

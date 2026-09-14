@@ -301,6 +301,44 @@ describe('Program command settlement', () => {
     );
   });
 
+  it('retains unchanged run data while accepting new control and node revisions', () => {
+    const run = {
+      ownerEpoch: 'runner.epoch.1',
+      runRevision: 5,
+      nodeStatusRevision: 8,
+      capture: { programRunId: 'run-1' },
+      nodeStatuses: { first: 'running' },
+    } as unknown as ProgramRunStatus;
+    const controls = {
+      ownerEpoch: run.ownerEpoch,
+      programRunId: run.capture.programRunId,
+      runRevision: run.runRevision,
+      runtimeControls: { runtimeControlRevision: 9 },
+    } as ProgramRuntimeControlProjection;
+    const cycle = {
+      programRunnerOwnerEpoch: run.ownerEpoch,
+      programRunId: run.capture.programRunId,
+      run: structuredClone(run),
+      runtimeControls: controls,
+    } as Parameters<typeof programRuntimeAfterSnapshot>[2];
+    const unchanged = programRuntimeAfterSnapshot(run, null, cycle);
+    expect(unchanged.run).toBe(run);
+    expect(unchanged.controls).toBe(controls);
+
+    const advanced = {
+      ...run,
+      nodeStatusRevision: 9,
+      nodeStatuses: { first: 'success' },
+    } as ProgramRunStatus;
+    expect(programRuntimeAfterSnapshot(run, controls, {
+      ...cycle, run: advanced,
+    }).run).toBe(advanced);
+    const successor = { ...run, ownerEpoch: 'runner.epoch.2' };
+    expect(programRuntimeAfterSnapshot(run, controls, {
+      ...cycle, programRunnerOwnerEpoch: successor.ownerEpoch, run: successor,
+    }).run).toBe(successor);
+  });
+
   it('never lets an older shared snapshot undo a newer command response', () => {
     const currentRun = {
       ownerEpoch: 'runner.epoch.1',

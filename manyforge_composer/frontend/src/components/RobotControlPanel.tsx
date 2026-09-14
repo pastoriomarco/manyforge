@@ -313,6 +313,11 @@ export function RobotControlPanelView({
   const previewInfoId = useId();
   const [inputRebase, setInputRebase] = useState(0);
   const [pendingInputs, setPendingInputs] = useState<ReadonlySet<string>>(new Set());
+  const setManualPanelVisible = controller.setManualPanelVisible;
+  useEffect(() => {
+    setManualPanelVisible(true);
+    return () => setManualPanelVisible(false);
+  }, [setManualPanelVisible]);
   const reportAuthoringPending = controller.reportAuthoringPending;
   const reportPending = useCallback((label: string, dirty: boolean) => {
     reportAuthoringPending(label, dirty);

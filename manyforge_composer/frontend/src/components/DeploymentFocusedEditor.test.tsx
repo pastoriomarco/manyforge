@@ -117,6 +117,71 @@ function controller(): DeploymentWorkspaceController {
 }
 
 describe('DeploymentFocusedEditor', () => {
+  it.each([
+    { enabled: false, override: null, imported: null, maximum: '0' },
+    { enabled: true, override: 10, imported: 12, maximum: '10' },
+    { enabled: true, override: null, imported: 12, maximum: '12' },
+    { enabled: true, override: null, imported: null, maximum: null },
+  ])('bounds manual jerk from explicit Draft settings: %j', ({ enabled, override, imported, maximum }) => {
+    const value = controller();
+    const document = value.workspace!.draft.document as unknown as {
+      graph: { runtime_units: Array<{ configuration: Record<string, unknown> }> };
+    };
+    const configuration = document.graph.runtime_units[0].configuration;
+    const targets = configuration.motion_target_limits as Array<Record<string, unknown>>;
+    targets[0].ordinary_motion_jerk = {
+      enabled, preset_reference_time_s: 2,
+      joint_limits: [{ source_joint_name: 'joint1',
+        ...(override === null ? {} : { override_rad_s3: override }),
+        ...(imported === null ? {} : { imported: { enabled: true, maximum_rad_s3: imported } }),
+      }],
+    };
+    const descriptor = statusFixture().directControl.targetDescriptor;
+    descriptor.controllableComponentId = 'robot';
+    descriptor.operationalLimit = {
+      catalogPolicyMaximumTcpLinearSpeedMps: 0.2, deploymentMaximumTcpLinearSpeedMps: 0.15,
+      effectiveMaximumTcpLinearSpeedMps: 0.15, policyId: 'policy', policyRevision: digest,
+      selectedScope: 'command_target', sourceContentDigest: digest,
+    };
+    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptor={descriptor} gripperDescriptor={null} />);
+    const input = markup.match(/Maximum jerk<\/span>[\s\S]*?(<input[^>]*>)/)?.[1];
+    expect(input).toBeDefined();
+    if (maximum === null) expect(input).not.toContain('max=');
+    else expect(input).toContain(`max="${maximum}"`);
+    // An applied preset is never used as an invented Draft ceiling.
+    expect(input).not.toContain('disabled='); // clearing remains possible
+  });
+
+  it.each(['robot', 'other-robot'])('keeps manual jerk guards on the exact target: %s', (component) => {
+    const value = controller();
+    const document = value.workspace!.draft.document as unknown as {
+      graph: { runtime_units: Array<{ configuration: Record<string, unknown> }> };
+    };
+    const configuration = document.graph.runtime_units[0].configuration;
+    configuration.direct_control_joint_limits = [{ controllable_component_id: component,
+      command_target_id: 'arm', source_joint_name: 'joint1', max_jerk_rad_s3: 8 }];
+    const targets = configuration.motion_target_limits as Array<Record<string, unknown>>;
+    targets[0].ordinary_motion_jerk = { enabled: true, preset_reference_time_s: 1, joint_limits: [] };
+    const descriptor = statusFixture().directControl.targetDescriptor;
+    descriptor.controllableComponentId = 'robot';
+    descriptor.ordinaryJerk = { enabled: true, presetReferenceTimeS: 1, jointLimits: [{
+      sourceJointName: 'joint1', source: 'preset', maximumRadS3: 12, presetRadS3: 12, imported: null,
+    }] };
+    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptor={descriptor} gripperDescriptor={null} />);
+    const selector = markup.match(/aria-label="robot \/ arm ordinary motion jerk"[\s\S]*?<\/select>/)?.[0];
+    if (component === 'robot') {
+      expect(selector).toContain('<option value="off" disabled="">');
+      expect(markup).toContain('min="8"');
+      expect(markup).toContain("Clear this target&#x27;s Robot Control jerk caps");
+    } else {
+      expect(selector).toContain('<option value="off">');
+      expect(markup).not.toContain('min="8"');
+      expect(markup).not.toContain('Clear this target');
+    }
+  });
+
   it('selects the exact described target instead of borrowing the first target limits', () => {
     const value = controller();
     const document = value.workspace!.draft.document as unknown as {

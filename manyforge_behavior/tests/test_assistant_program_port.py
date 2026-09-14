@@ -1214,6 +1214,7 @@ def test_query_model_rejects_untrusted_identity_or_low_confidence(
 
         assert completed.state is OwnerTaskState.FAILED
         assert completed.reason_code == reason_code
+        assert completed.settlement_proven is True
         assert completed.metadata["authored_failure_policy"] == (
             "pause_for_operator"
         )
@@ -1222,6 +1223,31 @@ def test_query_model_rejects_untrusted_identity_or_low_confidence(
             if reason_code == "model_confidence_below_threshold"
             else "model_runtime_failure_policy"
         )
+    finally:
+        port.close()
+
+
+def test_settled_selection_failures_can_reuse_one_task_slot() -> None:
+    port = ProgramAssistantPort(
+        _ModelTransport(),
+        HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=_AuditSink(),
+        maximum_tasks=1,
+    )
+    try:
+        port.bind(_context(_program(), assistant_projection=_assistant_projection()))
+        for attempt in range(3):
+            identity = _identity(f"invalid-selection-{attempt}")
+            failed = port.start(
+                "assistant.validate_scene_selection",
+                identity,
+                OwnerNodeInputs(parameters={}, blackboard={}),
+            )
+            assert failed.state is OwnerTaskState.FAILED
+            assert failed.settlement_proven is True
+            port.acknowledge(failed.task_id, identity)
+            with pytest.raises(ProgramAssistantPortError, match="unknown"):
+                port.observe(failed.task_id)
     finally:
         port.close()
 
@@ -1352,6 +1378,7 @@ def test_unbind_retries_the_exact_completed_outcome_after_audit_failure(timestam
         )
         failed = _wait_terminal(port, started.task_id)
         assert failed.reason_code == "model_audit_commit_failed"
+        assert failed.settlement_proven is False
 
         port.unbind("program-run-1")
 
@@ -1410,6 +1437,7 @@ def test_timed_out_task_suppresses_a_transport_that_returns_late() -> None:
         timed_out = port.observe(started.task_id)
         assert timed_out.state is OwnerTaskState.FAILED
         assert timed_out.reason_code == "model_request_timeout"
+        assert timed_out.settlement_proven is False
         transport.release.set()
         time.sleep(0.01)
         assert port.observe(started.task_id) == timed_out

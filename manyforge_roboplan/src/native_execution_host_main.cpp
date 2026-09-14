@@ -144,6 +144,9 @@ constexpr std::size_t kOwnerEpochRandomBytes = 16U;
 constexpr int kManagedPackageRootFd = 6;
 constexpr int kSocketBacklog = 16;
 constexpr int kReconcilePeriodMilliseconds = 5;
+// Recovery evidence is not a control deadline. Refresh it at 20 Hz on the
+// existing noncritical lane, independently of browser requests.
+constexpr core::Duration kRecoveryObservationPeriodNs = 50'000'000;
 constexpr int kClientPacketDeadlineMilliseconds = 100;
 constexpr int kManagerSceneDeadlineMilliseconds = 5000;
 constexpr std::size_t kPlanningSceneSynchronizationAttempts = 32U;
@@ -835,6 +838,30 @@ public:
           }
         },
         request);
+  }
+
+  // A readiness hint only: callers must still verify the retained bundle,
+  // exact provider binding and current projection before composition.
+  [[nodiscard]] bool
+  HasCurrentProjectionFor(const core::ProjectionRevisionDTO &expected) const {
+    std::lock_guard lock(mutex_);
+    for (const auto &[key, projection] : projections_) {
+      if (projection == nullptr) {
+        continue;
+      }
+      const auto health = projection->ProjectionHealth();
+      if (!health.active_projection_revision.has_value()) {
+        continue;
+      }
+      const auto &current = *health.active_projection_revision;
+      if (current.retained_bundle_id == expected.retained_bundle_id &&
+          current.graph_revision == expected.graph_revision &&
+          current.scene_revision.scene_id == expected.scene_revision.scene_id &&
+          health.healthy_for_target(current)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection>
@@ -2043,11 +2070,33 @@ DecodeStopFaultRecoveryIntent(const CanonicalValue &value) {
 
 [[nodiscard]] core::RuntimeScaleControlSelectorDTO
 DecodeRuntimeScaleControlSelector(const CanonicalValue &value) {
-  RequireExactObjectSize(value, 3U, "runtime-scale control selector");
+  if (value.find_object_member("synchronized_targets") == nullptr) {
+    RequireExactObjectSize(value, 3U, "runtime-scale control selector");
+    return core::RuntimeScaleControlSelectorDTO{
+        core::ProgramBindingId(Text(value, "program_binding_id")),
+        core::ComponentRoleId(Text(value, "component_role_id")),
+        core::TargetRoleId(Text(value, "target_role_id"))};
+  }
+  RequireExactObjectSize(value, 2U, "runtime-scale synchronized selector");
+  const auto &targets = Array(value, "synchronized_targets");
+  Require(targets.size() >= 2U &&
+              targets.size() <= core::kMaxOperationParticipants,
+          "runtime-scale synchronized selector target count is out of bounds");
+  std::vector<core::RuntimeScaleControlTargetDTO> decoded;
+  decoded.reserve(targets.size());
+  for (const auto &target : targets) {
+    RequireExactObjectSize(target, 2U, "runtime-scale synchronized target");
+    core::RuntimeScaleControlTargetDTO item{
+        core::ComponentRoleId(Text(target, "component_role_id")),
+        core::TargetRoleId(Text(target, "target_role_id"))};
+    Require(std::none_of(decoded.begin(), decoded.end(),
+                         [&](const auto &prior) { return prior == item; }),
+            "runtime-scale synchronized selector contains duplicate targets");
+    decoded.push_back(std::move(item));
+  }
   return core::RuntimeScaleControlSelectorDTO{
       core::ProgramBindingId(Text(value, "program_binding_id")),
-      core::ComponentRoleId(Text(value, "component_role_id")),
-      core::TargetRoleId(Text(value, "target_role_id"))};
+      core::ComponentRoleId(""), core::TargetRoleId(""), std::move(decoded)};
 }
 
 [[nodiscard]] core::RuntimeScaleControlRequestDTO
@@ -2310,16 +2359,19 @@ struct Command final {
   }
   if (command == "gripper_confirm") {
     RequireExactObjectSize(root, 7U, "gripper confirmation command");
-    const auto& request = Member(root, "request");
+    const auto &request = Member(root, "request");
     RequireExactObjectSize(request, 8U, "gripper confirmation request");
-    Require(Text(request, "schema_version") == "manyforge.gripper_confirmation_request.v1",
+    Require(Text(request, "schema_version") ==
+                "manyforge.gripper_confirmation_request.v1",
             "gripper confirmation schema is unsupported");
     auto context = DecodeRequestContext(Member(request, "request_context"));
     const auto origin = Text(root, "origin_epoch");
-    Require(!origin.empty() && origin.size() <= 256U, "confirmation ingress origin is invalid");
-    const auto observation_id =
-        content_identity::sha256_digest(canonical_json(CanonicalValue(CanonicalValue::Array{
-            CanonicalValue(origin), CanonicalValue(context.request_id.value())})));
+    Require(!origin.empty() && origin.size() <= 256U,
+            "confirmation ingress origin is invalid");
+    const auto observation_id = content_identity::sha256_digest(
+        canonical_json(CanonicalValue(CanonicalValue::Array{
+            CanonicalValue(origin),
+            CanonicalValue(context.request_id.value())})));
     Command decoded{CommandKind::kConfirmGrasp};
     decoded.confirmation = GripperConfirmationCommand{
         context,
@@ -2332,17 +2384,20 @@ struct Command final {
             Counter(request, "expected_status_revision", 1U),
             observation_id,
             Boolean(request, "confirmed"),
-            content_identity::parse_nonnegative_int64(Member(root, "received_monotonic_ns")),
+            content_identity::parse_nonnegative_int64(
+                Member(root, "received_monotonic_ns")),
             context.source_label},
         DecodeRequestAttribution(Member(root, "attribution")),
-        content_identity::parse_nonnegative_int64(Member(root, "valid_until_monotonic_ns"))};
+        content_identity::parse_nonnegative_int64(
+            Member(root, "valid_until_monotonic_ns"))};
     return decoded;
   }
   if (command == "query_target") {
     RequireExactObjectSize(root, 3U, "target observation command");
     const auto &query = Member(root, "query");
     const auto kind = Text(query, "kind");
-    Require(kind == "frame_pose" || kind == "gripper_status" || kind == "gripper_confirmation",
+    Require(kind == "frame_pose" || kind == "gripper_status" ||
+                kind == "gripper_confirmation",
             "target observation kind is unsupported");
     RequireExactObjectSize(query, kind == "frame_pose" ? 6U : 5U,
                            "target observation query");
@@ -2354,8 +2409,9 @@ struct Command final {
         core::RequestOwnerEpoch(Text(query, "owner_epoch")),
         core::ProgramBindingId(Text(query, "program_binding_id")),
         core::TargetRoleId(Text(query, "target_role_id")),
-        kind == "frame_pose" ? std::optional(core::FrameRoleId(Text(query, "frame_role_id")))
-                             : std::nullopt,
+        kind == "frame_pose"
+            ? std::optional(core::FrameRoleId(Text(query, "frame_role_id")))
+            : std::nullopt,
         kind == "gripper_confirmation"};
     return decoded;
   }
@@ -4697,10 +4753,25 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
 
 [[nodiscard]] CanonicalValue RuntimeScaleControlSelectorValue(
     const core::RuntimeScaleControlSelectorDTO &value) {
+  if (value.synchronized_targets.empty()) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"component_role_id", CanonicalValue(value.component_role_id.value())},
+        {"program_binding_id",
+         CanonicalValue(value.program_binding_id.value())},
+        {"target_role_id", CanonicalValue(value.target_role_id.value())},
+    });
+  }
+  CanonicalValue::Array targets;
+  targets.reserve(value.synchronized_targets.size());
+  for (const auto &target : value.synchronized_targets) {
+    targets.emplace_back(CanonicalValue::Object{
+        {"component_role_id", CanonicalValue(target.component_role_id.value())},
+        {"target_role_id", CanonicalValue(target.target_role_id.value())},
+    });
+  }
   return CanonicalValue(CanonicalValue::Object{
-      {"component_role_id", CanonicalValue(value.component_role_id.value())},
       {"program_binding_id", CanonicalValue(value.program_binding_id.value())},
-      {"target_role_id", CanonicalValue(value.target_role_id.value())},
+      {"synchronized_targets", CanonicalValue(std::move(targets))},
   });
 }
 
@@ -4735,7 +4806,30 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
 
 [[nodiscard]] CanonicalValue RuntimeScaleControlStatusValue(
     const core::RuntimeScaleControlStatusDTO &value) {
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Array synchronized_members;
+  synchronized_members.reserve(value.synchronized_members.size());
+  for (const auto &member : value.synchronized_members) {
+    synchronized_members.emplace_back(CanonicalValue::Object{
+        {"active_control_configuration_generation",
+         CanonicalValue(static_cast<double>(
+             member.active_control_configuration_generation.value()))},
+        {"active_control_configuration_id",
+         CanonicalValue(member.active_control_configuration_id.value())},
+        {"control_binding_id",
+         CanonicalValue(member.control_binding_id.value())},
+        {"control_binding_revision",
+         CanonicalValue(member.control_binding_revision.value())},
+        {"control_domain_id", CanonicalValue(member.control_domain_id.value())},
+        {"control_domain_revision",
+         CanonicalValue(member.control_domain_revision.value())},
+        {"scaling_domain_id", CanonicalValue(member.scaling_domain_id.value())},
+        {"component_role_id",
+         CanonicalValue(member.target.component_role_id.value())},
+        {"target_role_id",
+         CanonicalValue(member.target.target_role_id.value())},
+    });
+  }
+  CanonicalValue::Object object{
       {"active_control_configuration_generation",
        value.active_control_configuration_generation.has_value()
            ? CanonicalValue(static_cast<double>(
@@ -4794,7 +4888,12 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
            : CanonicalValue(nullptr)},
       {"selector", RuntimeScaleControlSelectorValue(value.selector)},
       {"supported", CanonicalValue(value.supported)},
-  });
+  };
+  if (!synchronized_members.empty()) {
+    object.emplace_back("synchronized_members",
+                        CanonicalValue(std::move(synchronized_members)));
+  }
+  return CanonicalValue(std::move(object));
 }
 
 [[nodiscard]] CanonicalValue
@@ -5138,7 +5237,9 @@ DecodeProjectionRevision(const CanonicalValue &value) {
 
 [[nodiscard]] CanonicalValue
 ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
-                       CanonicalValue command) {
+                       CanonicalValue command,
+                       const std::stop_token stop_token = {}) {
+  Require(!stop_token.stop_requested(), "Manager scene request cancelled");
   const auto bytes = content_identity::canonical_json(command);
   Require(!bytes.empty() && bytes.size() <= kMaximumPacketBytes,
           "Manager scene request is empty or oversized");
@@ -5158,6 +5259,12 @@ ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
   if (!descriptor) {
     FailErrno("create Manager scene client socket");
   }
+  // Wake an outstanding socket wait when the hosting execution surface drains.
+  // The callback is destroyed before the descriptor, so it cannot affect a
+  // subsequently reused descriptor. No owner state or Scene revision is cached.
+  const std::stop_callback cancel_wait(stop_token, [&descriptor] {
+    static_cast<void>(::shutdown(descriptor.get(), SHUT_RDWR));
+  });
   const int receive_buffer_bytes =
       static_cast<int>(kMaximumManagerResponseBytes);
   const int send_buffer_bytes = static_cast<int>(kMaximumPacketBytes);
@@ -5176,6 +5283,7 @@ ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
             std::string("connect to Manager command socket failed: ") +
                 std::system_error(errno, std::generic_category()).what());
     pollfd connected{descriptor.get(), POLLOUT, 0};
+    Require(!stop_token.stop_requested(), "Manager scene request cancelled");
     int ready = -1;
     do {
       ready = ::poll(&connected, 1, kManagerSceneDeadlineMilliseconds);
@@ -5191,6 +5299,7 @@ ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
   }
 
   pollfd outbound{descriptor.get(), POLLOUT, 0};
+  Require(!stop_token.stop_requested(), "Manager scene request cancelled");
   int ready = -1;
   do {
     ready = ::poll(&outbound, 1, kManagerSceneDeadlineMilliseconds);
@@ -5205,6 +5314,7 @@ ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
           "Manager scene request was not sent atomically");
 
   pollfd inbound{descriptor.get(), POLLIN, 0};
+  Require(!stop_token.stop_requested(), "Manager scene request cancelled");
   do {
     ready = ::poll(&inbound, 1, kManagerSceneDeadlineMilliseconds);
   } while (ready < 0 && errno == EINTR);
@@ -5414,6 +5524,11 @@ public:
     return Read().projection_revision;
   }
 
+  [[nodiscard]] core::ProjectionRevisionDTO
+  CurrentProjectionRevision(const std::stop_token stop_token) const {
+    return Read(stop_token).projection_revision;
+  }
+
   [[nodiscard]] std::shared_ptr<const core::LogicalSceneSnapshotDTO>
   LogicalSnapshot() const override {
     return Read().logical_scene;
@@ -5505,14 +5620,16 @@ public:
   }
 
 private:
-  [[nodiscard]] ManagerSceneRead Read() const {
+  [[nodiscard]] ManagerSceneRead
+  Read(const std::stop_token stop_token = {}) const {
     const auto response = ExchangeManagerCommand(
         manager_run_root_,
         CanonicalValue(CanonicalValue::Object{
             {"api_version",
              CanonicalValue(std::string(kManagerCommandApiVersion))},
             {"command", CanonicalValue("scene_owner_read")},
-        }));
+        }),
+        stop_token);
     if (!Boolean(response, "ok")) {
       const auto error = DecodeManagerError(Member(response, "error"));
       Fail("Manager scene read failed: " + error.code + ": " + error.message);
@@ -6187,9 +6304,11 @@ CanonicalNullableText(const std::optional<std::string> &value) {
     Require(row != coordinate_map->resources.end(),
             "manual-control gripper descriptor has no exact resource row");
     Require(resource.source_joint_name.has_value()
-                ? !row->coordinates.empty() && !row->component_local_coordinate_kind.has_value()
+                ? !row->coordinates.empty() &&
+                      !row->component_local_coordinate_kind.has_value()
                 : row->coordinates.empty() &&
-                      row->component_local_coordinate_kind == resource.coordinate_kind,
+                      row->component_local_coordinate_kind ==
+                          resource.coordinate_kind,
             "manual-control gripper descriptor crosses coordinate semantics");
     for (const auto &coordinate : row->coordinates) {
       if (!coordinate.derived_mimic) {
@@ -6492,6 +6611,8 @@ struct Composition final {
   std::unique_ptr<RetainedNativeLifecycleProduct> cclc_lifecycle_product;
 #endif
   std::unique_ptr<deployment::CCLCRuntimeComposition> cclc_runtime;
+  std::atomic_bool cclc_attached{false};
+  std::atomic_bool cclc_route_recovery_pending{false};
   bool direct_route_configuration_published{};
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   std::unique_ptr<RetainedRos2ControlAdmissionOwner>
@@ -6591,6 +6712,7 @@ struct ExecutionCompositionAccess final {
   mutable std::shared_mutex mutex;
   Composition *current{};
   core::ResourceAddressedExecutionKernel *addressed_kernel{};
+  std::function<void()> on_cell_admission_settled;
 
   void replace_current(Composition *replacement) {
     // Caller holds mutex exclusively; current remains alive through this
@@ -6682,6 +6804,13 @@ BuildOwnerSettlementValidator(
        cell_id = std::move(cell_id)](
           const core::CellAdmissionClaimDTO &claim,
           const core::CellAdmissionClaimReleaseDTO &release) {
+        if (claim.intent.claim_kind ==
+                core::CellAdmissionClaimKindDTO::kInterventionOrRecovery &&
+            claim.intent.owner_role ==
+                core::CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner) {
+          return core::ValidateCCLCCellAdmissionSettlementReadOnly(
+              lifecycle_journal, cell_id, claim, release);
+        }
         switch (claim.intent.claim_kind) {
         case core::CellAdmissionClaimKindDTO::kProgramCycle:
           return detail::ValidateProgramCycleSettlementReadOnly(
@@ -7238,14 +7367,16 @@ BuildProductComposition(CompositionBuildInput input) {
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   runtime_input.ordinary_motion_jerk = motion_limit->ordinary_motion_jerk;
 #endif
-  for (const auto &limit : retained_runtime_configuration.direct_control_joint_limits) {
+  for (const auto &limit :
+       retained_runtime_configuration.direct_control_joint_limits) {
     const auto &target = runtime_input.motion_binding.value();
     if (limit.controllable_component_id == target.controllable_component_id &&
         limit.command_target_id == target.command_target_id) {
       runtime_input.direct_control_joint_limits.emplace(
           limit.source_joint_name,
           core::JointDynamicsLimitDTO{limit.max_velocity_rad_s,
-                                     limit.max_acceleration_rad_s2, limit.max_jerk_rad_s3});
+                                      limit.max_acceleration_rad_s2,
+                                      limit.max_jerk_rad_s3});
     }
   }
   if (input.planner_scene_projection != nullptr) {
@@ -7447,11 +7578,13 @@ BuildProductComposition(CompositionBuildInput input) {
       std::move(input.status_motion_target_role_id),
       std::move(input.status_gripper_target_role_id));
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-  for (const auto& target : retained_runtime_configuration.gripper_target_configurations) {
-    const auto& gripper = composition->direct_control_gripper_binding.value();
+  for (const auto &target :
+       retained_runtime_configuration.gripper_target_configurations) {
+    const auto &gripper = composition->direct_control_gripper_binding.value();
     if (target.controllable_component_id == gripper.controllable_component_id &&
         target.command_target_id == gripper.command_target_id) {
-      composition->operator_confirmation_validity_ns = target.operator_confirmation_validity_ns;
+      composition->operator_confirmation_validity_ns =
+          target.operator_confirmation_validity_ns;
     }
   }
 #endif
@@ -7762,7 +7895,11 @@ void PublishDirectNativeRoutes(Composition &composition,
          published.error().message);
   }
   composition.direct_route_configuration_published = true;
+  composition.cclc_route_recovery_pending.store(false,
+                                                std::memory_order_release);
 }
+
+void DetachRetainedCCLC(Composition &composition);
 
 void AttachRetainedNativeCCLC(Composition &composition,
                               const HostConfig &config,
@@ -7770,9 +7907,29 @@ void AttachRetainedNativeCCLC(Composition &composition,
   Require(composition.runtime != nullptr &&
               composition.runtime->addressed_kernel != nullptr &&
               composition.runtime->clock != nullptr &&
-              composition.runtime->scheduler != nullptr &&
-              composition.cclc_runtime == nullptr,
+              composition.runtime->scheduler != nullptr,
           "native CCLC attachment requires one stable addressed runtime");
+
+  auto &kernel = *composition.runtime->addressed_kernel;
+  // Products without lifecycle-managed routes use the existing direct
+  // publication path.  The retained Stop latch still independently blocks
+  // public authoring; there is no CCLC service or recovery barrier to start.
+  PublishDirectNativeRoutes(composition, config.package_root);
+  if (composition.direct_route_configuration_published) {
+    Require(kernel.SetRouteRecoveryPending(false).ok(),
+            "direct native route publication could not release recovery "
+            "admission");
+    return;
+  }
+  if (composition.cclc_runtime) {
+    Require(composition.cclc_attached.load(std::memory_order_acquire),
+            "constructed native CCLC is not attached");
+    return;
+  }
+  Require(kernel.SetRouteRecoveryPending(true).ok(),
+          "route recovery could not retain closed admission");
+  composition.cclc_route_recovery_pending.store(true,
+                                                std::memory_order_release);
 
   auto active_publication_reader =
       std::make_unique<component_manager::SqliteActiveBundlePublicationStore>(
@@ -7811,10 +7968,6 @@ void AttachRetainedNativeCCLC(Composition &composition,
       deployment::FilesystemVerifiedRetainedProviderManifestSource>(
       config.package_root);
   auto physical_bindings = PhysicalControlBindings(composition);
-  if (!RetainedProductDeclaresLifecycle(composition, *provider_manifest_source,
-                                        physical_bindings)) {
-    return;
-  }
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   Require(composition.ros2_control_runtime_handle != nullptr &&
               !composition.ros2_control_binding_contract_generation_id.empty(),
@@ -7888,9 +8041,15 @@ void AttachRetainedNativeCCLC(Composition &composition,
   }
   composition.ros2_control_admission_owner = std::move(admission.value());
 #endif
+  composition.cclc_attached.store(true, std::memory_order_release);
 }
 
 void DetachRetainedCCLC(Composition &composition) {
+  composition.cclc_attached.store(false, std::memory_order_release);
+  composition.cclc_route_recovery_pending.store(false,
+                                                std::memory_order_release);
+  composition.runtime->stop_recovery_configuration_source = {};
+  composition.runtime->reconcile_controller_routes = {};
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   composition.ros2_control_admission_owner.reset();
 #endif
@@ -7904,8 +8063,20 @@ void DetachRetainedCCLC(Composition &composition) {
 void TryAttachManagedCCLC(Composition &composition,
                           const ManagedRuntimeChildConfig &config,
                           ManagedKernelApplyFenceOwner &fence_owner) {
-  if (composition.cclc_runtime != nullptr ||
-      composition.direct_route_configuration_published) {
+  auto &kernel = *composition.runtime->addressed_kernel;
+  if (composition.cclc_attached.load(std::memory_order_acquire))
+    return;
+  if (composition.direct_route_configuration_published) {
+    Require(kernel.SetRouteRecoveryPending(false).ok(),
+            "completed route attachment could not release admission");
+    return;
+  }
+  Require(kernel.SetRouteRecoveryPending(true).ok(),
+          "route attachment could not close admission");
+  // Another owner's unresolved recovery remains authoritative. The existing
+  // reconciliation wake retries attachment after it settles; never create a
+  // competing claim here.
+  if (kernel.has_external_route_recovery_claims()) {
     return;
   }
   component_manager::SqliteActiveBundlePublicationStore publication_store(
@@ -7926,6 +8097,8 @@ void TryAttachManagedCCLC(Composition &composition,
   attachment_config.cell_id = config.cell_id;
   PublishDirectNativeRoutes(composition, config.package_root);
   if (composition.direct_route_configuration_published) {
+    Require(kernel.SetRouteRecoveryPending(false).ok(),
+            "direct route attachment could not release admission");
     return;
   }
   AttachRetainedNativeCCLC(composition, attachment_config, fence_owner);
@@ -7951,6 +8124,15 @@ TryBuildCurrentManagedCompositionInput(
           "managed active retained-bundle publication cannot be verified");
   const auto receipt = publication.value();
   publication_store.Close();
+
+  // A replacement initially has no projection for the still-published
+  // predecessor. Avoid re-reading all retained artifacts before every Manager
+  // packet while waiting for activation. This hint grants no admission; the
+  // exact bundle/provider/projection checks below remain authoritative.
+  if (!projections.HasCurrentProjectionFor(
+          receipt.request.candidate_projection_revision)) {
+    return std::nullopt;
+  }
 
   const deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       config.package_root);
@@ -8470,6 +8652,44 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   std::set<std::pair<std::string, std::string>> retired_manager_epochs;
   ExecutionCompositionAccess execution_composition;
   execution_composition.addressed_kernel = detached_addressed_kernel.get();
+  bool current_composition_building = false;
+  execution_composition.on_cell_admission_settled = [&] {
+    Composition *composition = nullptr;
+    bool skip_attachment = false;
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      if (current_composition_building ||
+          active_managed_composition == nullptr ||
+          active_managed_composition->runtime->addressed_kernel
+              ->has_external_route_recovery_claims()) {
+        skip_attachment = true;
+      } else {
+        // Do not reserve while an external claim remains held: its release
+        // callback must be able to take over after this short decision.
+        // The same reservation that protects initial construction prevents
+        // replacement while controller I/O runs without the observation mutex.
+        current_composition_building = true;
+        composition = active_managed_composition.get();
+      }
+    }
+    if (skip_attachment) {
+      return;
+    }
+    try {
+      TryAttachManagedCCLC(*composition, config, fence_owner);
+    } catch (const std::exception &error) {
+      // Claim settlement is already durable. Attachment owns its separate
+      // closed admission barrier; its failure cannot undo that receipt.
+      std::cerr << "native CCLC attachment after claim settlement failed: "
+                << error.what() << '\n';
+    } catch (...) {
+      std::cerr << "native CCLC attachment after claim settlement failed\n";
+    }
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      current_composition_building = false;
+    }
+  };
   ManagedExecutionSurfaceControl execution_surface_control(
       config.execution_run_root, &execution_composition,
       &manager_liveness_admission,
@@ -8510,7 +8730,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   std::exception_ptr managed_composition_failure;
   std::jthread current_composition_builder;
   bool current_composition_builder_started = false;
-  bool current_composition_building = false;
   std::jthread managed_composition_builder;
   bool managed_composition_building = false;
 
@@ -8617,6 +8836,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       input->shared_clock = detached_owner_clock;
       input->shared_scheduler = detached_owner_scheduler;
       current_composition_builder_started = true;
+      Require(stable_kernel_owner->SetRouteRecoveryPending(true).ok(),
+              "initial runtime composition could not close admission");
       current_composition_building = true;
     }
     current_composition_builder =
@@ -8676,6 +8897,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       "recovery");
               current_composition_building = false;
             }
+            // A release may have arrived after the builder deferred recovery
+            // but before it dropped the reservation. Join that event once;
+            // completed attachment is read-only and held claims defer again.
+            execution_composition.on_cell_admission_settled();
           } catch (...) {
             std::lock_guard lock(managed_composition_mutex);
             managed_composition_failure = std::current_exception();
@@ -8924,6 +9149,11 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                      reconfigured.error().message);
               }
             }
+            Require(
+                detached_addressed_kernel != nullptr &&
+                    detached_addressed_kernel->SetRouteRecoveryPending(false)
+                        .ok(),
+                "empty selected runtime could not release route recovery");
           } else {
             Require(prepared != nullptr,
                     "physical selected product has no prepared composition");
@@ -9004,6 +9234,11 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 detached_owner_scheduler.reset();
               }
             }
+            Require(
+                prepared->runtime->addressed_kernel
+                    ->SetRouteRecoveryPending(true)
+                    .ok(),
+                "selected runtime could not close route recovery admission");
             PublishDirectNativeRoutes(*prepared, config.package_root);
             auto staged =
                 prepared->runtime->addressed_kernel
@@ -9108,18 +9343,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         return component_manager::detail::EncodeManagerLivenessRpcRejection(
             "superseded_active_publication");
       }
-      // A replaced native process may first receive liveness after its
-      // candidate was published. It has no predecessor receiver to rebind,
-      // but must perform the same deferred lifecycle attachment. Bootstrap
-      // without an installed composition is still handled by its builder.
-      {
-        std::lock_guard lock(managed_composition_mutex);
-        if (active_managed_composition != nullptr &&
-            active_managed_composition->publication_generation ==
-                decoded.active_publication_generation) {
-          TryAttachManagedCCLC(*active_managed_composition, config, fence_owner);
-        }
-      }
+      // Initial construction and exact claim settlement own attachment.
+      // Their Kernel barrier remains closed through controller readback;
+      // this independent lease handler never performs controller I/O.
       const auto installed =
           stable_kernel_owner->ReplaceManagerLivenessRequiredSet(
               decoded.required_set);
@@ -9225,20 +9451,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     current_publication->publication_generation.value(),
             "Manager liveness successor lacks exact installed composition "
             "evidence");
-        // A candidate composition is installed while its predecessor remains
-        // authoritative. Attach lifecycle control only once Manager has made
-        // that exact candidate current; this event is the single retry point
-        // and avoids both premature acceptance and background polling.
-        {
-          std::lock_guard lock(managed_composition_mutex);
-          Require(active_managed_composition != nullptr &&
-                      active_managed_composition->publication_generation ==
-                          current_publication->publication_generation,
-                  "Manager liveness successor has no exact active runtime "
-                  "composition");
-          TryAttachManagedCCLC(*active_managed_composition, config,
-                               fence_owner);
-        }
+        // The exact installed handoff authorizes this lease rebind. The
+        // subsequent Apply/authoring claim settlement owns attachment, with
+        // ordinary execution closed by the Kernel's route-recovery barrier.
         manager_liveness_admission.CloseForRequiredSetRebind();
         const auto installed =
             stable_kernel_owner->ReplaceManagerLivenessRequiredSet(
@@ -9376,6 +9591,24 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       static_cast<void>(::shutdown(config.manager_channel_fd, SHUT_RDWR));
     }
   });
+
+  // Keep renewal servicing and captured state alive until every composition
+  // builder and execution lane has drained, including exception unwinding.
+  // Otherwise reverse declaration order stops renewal before that drain while
+  // the receiver's independent watchdog is still armed.
+  struct DrainBeforeLivenessShutdown {
+    std::array<std::jthread *, 3> workers;
+    ~DrainBeforeLivenessShutdown() {
+      for (auto *worker : workers)
+        worker->request_stop();
+      for (auto *worker : workers) {
+        if (worker->joinable())
+          worker->join();
+      }
+    }
+  } drain_before_liveness_shutdown{{&execution_surface,
+                                    &current_composition_builder,
+                                    &managed_composition_builder}};
 
   while (g_stop_requested == 0) {
     rethrow_manager_liveness_failure();
@@ -9531,11 +9764,20 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             component_manager::detail::DecodeKernelCellAdmissionRpcRequest(
                 request);
         response_command = decoded.command;
-        std::lock_guard lock(managed_composition_mutex);
-        auto *const owner = stable_addressed_kernel();
-        Require(owner != nullptr, "stable Kernel is not installed");
-        response = component_manager::detail::DispatchKernelCellAdmissionRpc(
-            *owner, decoded);
+        core::ResourceAddressedExecutionKernel *owner = nullptr;
+        {
+          std::lock_guard lock(managed_composition_mutex);
+          owner = stable_addressed_kernel();
+          Require(owner != nullptr, "stable Kernel is not installed");
+          response = component_manager::detail::DispatchKernelCellAdmissionRpc(
+              *owner, decoded);
+        }
+        if ((decoded.command == "cell_admission_release" ||
+             decoded.command == "cell_admission_reconcile") &&
+            std::holds_alternative<core::AuthoringAdmissionDTO>(response)) {
+          execution_composition.on_cell_admission_settled();
+          response = owner->GetAuthoringAdmission();
+        }
       } catch (const std::exception &error) {
         response =
             core::ErrorDTO{"cell_admission_request_failed", error.what(), {}};
@@ -9626,7 +9868,7 @@ public:
         FailErrno("poll execution command socket");
       }
       if ((descriptor.revents & POLLIN) != 0) {
-        HandleOneClient(command_socket_, CommandLane::kOrdinary);
+        HandleOneClient(command_socket_, CommandLane::kOrdinary, stop_token);
       }
       if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
         Fail("execution command socket became unavailable");
@@ -9914,60 +10156,81 @@ private:
                            "target route is not reconciled");
     const auto resolved = composition.target_resolver->ResolveObservationTarget(
         query.program_binding_id, query.target_role_id,
-        core::CapabilityId(frame_query                ? "model.kinematics.fk"
-                           : query.grasp_confirmation ? "tool.gripper.confirmation.operator"
-                                                      : "tool.gripper.feedback"),
+        core::CapabilityId(frame_query ? "model.kinematics.fk"
+                           : query.grasp_confirmation
+                               ? "tool.gripper.confirmation.operator"
+                               : "tool.gripper.feedback"),
         observed_binding, representatives.value());
     if (!resolved.ok())
       return ErrorResponse(resolved.error().code, resolved.error().message);
     const auto &target = resolved.value().target.target_role();
     if (query.grasp_confirmation) {
       if (!composition.operator_confirmation_validity_ns)
-        return ErrorResponse("grasp_confirmation_unavailable",
-                             "target has no explicit operator confirmation policy");
-      const auto current =
-          composition.runtime->ReadGripperStatus(resolved.value().observation_binding);
-      if (!current.ok()) return ErrorResponse(current.error().code, current.error().message);
-      const auto& status = current.value();
+        return ErrorResponse(
+            "grasp_confirmation_unavailable",
+            "target has no explicit operator confirmation policy");
+      const auto current = composition.runtime->ReadGripperStatus(
+          resolved.value().observation_binding);
+      if (!current.ok())
+        return ErrorResponse(current.error().code, current.error().message);
+      const auto &status = current.value();
       if (status.command_id == 0U || status.revision == 0U)
         return ErrorResponse("gripper_command_unavailable",
                              "confirmation requires a current gripper command");
-      const auto& source = *resolved.value().observation_binding.value().control_path;
+      const auto &source =
+          *resolved.value().observation_binding.value().control_path;
       const bool fresh =
-          status.grasp_evidence && core::gripper_grasp_evidence_is_fresh(
-                                       *status.grasp_evidence, composition.runtime->clock->now());
+          status.grasp_evidence &&
+          core::gripper_grasp_evidence_is_fresh(
+              *status.grasp_evidence, composition.runtime->clock->now());
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("query_target")},
           {"ok", CanonicalValue(true)},
           {"target_observation",
            CanonicalValue(CanonicalValue::Object{
-               {"schema_version", CanonicalValue("manyforge.target_observation.v1")},
+               {"schema_version",
+                CanonicalValue("manyforge.target_observation.v1")},
                {"kind", CanonicalValue("gripper_confirmation")},
                {"owner_epoch", CanonicalValue(owner_epoch_.value())},
-               {"program_binding_id", CanonicalValue(query.program_binding_id.value())},
+               {"program_binding_id",
+                CanonicalValue(query.program_binding_id.value())},
                {"target_role_id", CanonicalValue(query.target_role_id.value())},
-               {"source_epoch", CanonicalValue(source.provider_runtime_epoch.value())},
-               {"source_sequence", CanonicalValue(static_cast<double>(status.revision))},
+               {"source_epoch",
+                CanonicalValue(source.provider_runtime_epoch.value())},
+               {"source_sequence",
+                CanonicalValue(static_cast<double>(status.revision))},
                {"value",
                 CanonicalValue(CanonicalValue::Object{
-                    {"state", CanonicalValue(core::gripper_command_state_name(status.state))},
-                    {"command_id", CanonicalValue(static_cast<double>(status.command_id))},
-                    {"generation", CanonicalValue(static_cast<double>(status.generation))},
-                    {"revision", CanonicalValue(static_cast<double>(status.revision))},
-                    {"source_id", CanonicalValue(source.control_binding_id.value())},
-                    {"source_revision", CanonicalValue(source.control_binding_revision.value())},
-                    {"source_epoch", CanonicalValue(source.provider_runtime_epoch.value())},
+                    {"state", CanonicalValue(core::gripper_command_state_name(
+                                  status.state))},
+                    {"command_id",
+                     CanonicalValue(static_cast<double>(status.command_id))},
+                    {"generation",
+                     CanonicalValue(static_cast<double>(status.generation))},
+                    {"revision",
+                     CanonicalValue(static_cast<double>(status.revision))},
+                    {"source_id",
+                     CanonicalValue(source.control_binding_id.value())},
+                    {"source_revision",
+                     CanonicalValue(source.control_binding_revision.value())},
+                    {"source_epoch",
+                     CanonicalValue(source.provider_runtime_epoch.value())},
                     {"active_control_configuration_id",
-                     CanonicalValue(source.active_control_configuration_id.value())},
+                     CanonicalValue(
+                         source.active_control_configuration_id.value())},
                     {"active_control_configuration_generation",
                      CanonicalValue(static_cast<double>(
-                         source.active_control_configuration_generation.value()))},
+                         source.active_control_configuration_generation
+                             .value()))},
                     {"grasp_confirmed",
-                     fresh ? CanonicalValue(status.grasp_evidence->observation.confirmed)
+                     fresh ? CanonicalValue(
+                                 status.grasp_evidence->observation.confirmed)
                            : CanonicalValue(nullptr)},
-                    {"evidence", status.grasp_evidence ? GraspEvidenceValue(*status.grasp_evidence)
-                                                       : CanonicalValue(nullptr)},
+                    {"evidence",
+                     status.grasp_evidence
+                         ? GraspEvidenceValue(*status.grasp_evidence)
+                         : CanonicalValue(nullptr)},
                 })},
            })},
       });
@@ -10042,27 +10305,35 @@ private:
       if (!composition.runtime->gripper || binding.resources.size() != 1U)
         return ErrorResponse("gripper_feedback_unavailable",
                              "target has no qualified gripper feedback");
-      const auto current =
-          composition.runtime->ReadGripperStatus(resolved.value().observation_binding);
-      if (!current.ok()) return ErrorResponse(current.error().code, current.error().message);
-      const auto& status = current.value();
-      const auto& source = *resolved.value().observation_binding.value().control_path;
+      const auto current = composition.runtime->ReadGripperStatus(
+          resolved.value().observation_binding);
+      if (!current.ok())
+        return ErrorResponse(current.error().code, current.error().message);
+      const auto &status = current.value();
+      const auto &source =
+          *resolved.value().observation_binding.value().control_path;
       value = CanonicalValue(CanonicalValue::Object{
           {"source_id", CanonicalValue(source.control_binding_id.value())},
-          {"source_revision", CanonicalValue(source.control_binding_revision.value())},
-          {"source_epoch", CanonicalValue(source.provider_runtime_epoch.value())},
+          {"source_revision",
+           CanonicalValue(source.control_binding_revision.value())},
+          {"source_epoch",
+           CanonicalValue(source.provider_runtime_epoch.value())},
           {"active_control_configuration_id",
            CanonicalValue(source.active_control_configuration_id.value())},
           {"active_control_configuration_generation",
-           CanonicalValue(
-               static_cast<double>(source.active_control_configuration_generation.value()))},
-          {"command_id", CanonicalValue(static_cast<double>(status.command_id))},
-          {"generation", CanonicalValue(static_cast<double>(status.generation))},
+           CanonicalValue(static_cast<double>(
+               source.active_control_configuration_generation.value()))},
+          {"command_id",
+           CanonicalValue(static_cast<double>(status.command_id))},
+          {"generation",
+           CanonicalValue(static_cast<double>(status.generation))},
           // No command echo or unqualified evidence label proves a grasp.
           {"grasp_confirmed", CanonicalValue(nullptr)},
-          {"observed_position", CoordinatePositionValue(state.positions.front())},
+          {"observed_position",
+           CoordinatePositionValue(state.positions.front())},
           {"revision", CanonicalValue(static_cast<double>(status.revision))},
-          {"state", CanonicalValue(core::gripper_command_state_name(status.state))},
+          {"state",
+           CanonicalValue(core::gripper_command_state_name(status.state))},
       });
     }
     CanonicalValue::Object result{
@@ -10088,9 +10359,9 @@ private:
     });
   }
 
-  [[nodiscard]] static CanonicalValue GraspEvidenceValue(
-      const core::GripperGraspEvidenceDTO& evidence) {
-    const auto& accepted = evidence.observation;
+  [[nodiscard]] static CanonicalValue
+  GraspEvidenceValue(const core::GripperGraspEvidenceDTO &evidence) {
+    const auto &accepted = evidence.observation;
     return CanonicalValue(CanonicalValue::Object{
         {"source_kind", CanonicalValue("operator")},
         {"source_id", CanonicalValue(evidence.source_id.value())},
@@ -10098,50 +10369,64 @@ private:
         {"source_epoch", CanonicalValue(evidence.source_epoch.value())},
         {"observation_id", CanonicalValue(accepted.observation_id)},
         {"attribution", CanonicalValue(accepted.attribution)},
-        {"command_id", CanonicalValue(static_cast<double>(accepted.command_id))},
-        {"generation", CanonicalValue(static_cast<double>(accepted.generation))},
+        {"command_id",
+         CanonicalValue(static_cast<double>(accepted.command_id))},
+        {"generation",
+         CanonicalValue(static_cast<double>(accepted.generation))},
         {"confirmed", CanonicalValue(accepted.confirmed)},
-        {"observed_at_ns", content_identity::nonnegative_int64_value(accepted.observed_at_ns)},
-        {"expires_at_ns", content_identity::nonnegative_int64_value(evidence.expires_at_ns)},
+        {"observed_at_ns",
+         content_identity::nonnegative_int64_value(accepted.observed_at_ns)},
+        {"expires_at_ns",
+         content_identity::nonnegative_int64_value(evidence.expires_at_ns)},
     });
   }
 
-  [[nodiscard]] CanonicalValue ConfirmGraspResponse(const GripperConfirmationCommand& command,
-                                                    Composition& composition) const {
+  [[nodiscard]] CanonicalValue
+  ConfirmGraspResponse(const GripperConfirmationCommand &command,
+                       Composition &composition) const {
     if (command.context.request_owner_epoch != owner_epoch_)
       return ErrorResponse("stale_request_owner_epoch",
                            "confirmation names a replaced native owner");
     if (!composition.operator_confirmation_validity_ns ||
         !composition.runtime->gripper_state_channel)
-      return ErrorResponse("grasp_confirmation_unavailable",
-                           "target has no explicitly configured operator source");
+      return ErrorResponse(
+          "grasp_confirmation_unavailable",
+          "target has no explicitly configured operator source");
     const auto physical = composition.runtime->gripper_state_channel->binding();
-    const auto configuration = composition.runtime->ReadCurrentPublishedRouteConfiguration(
-        physical.value().control_path->control_domain_id);
+    const auto configuration =
+        composition.runtime->ReadCurrentPublishedRouteConfiguration(
+            physical.value().control_path->control_domain_id);
     if (!configuration.ok() || !configuration.value())
-      return ErrorResponse("grasp_confirmation_source_stale",
-                           "operator source has no current route configuration");
+      return ErrorResponse(
+          "grasp_confirmation_source_stale",
+          "operator source has no current route configuration");
     const auto representatives =
-        composition.runtime->ReadCurrentPhysicalParticipants(*configuration.value());
+        composition.runtime->ReadCurrentPhysicalParticipants(
+            *configuration.value());
     if (!representatives.ok())
-      return ErrorResponse(representatives.error().code, representatives.error().message);
+      return ErrorResponse(representatives.error().code,
+                           representatives.error().message);
     const auto source = composition.target_resolver->ResolveObservationTarget(
         command.program_binding_id, command.target_role_id,
         core::CapabilityId("tool.gripper.confirmation.operator"), physical,
         representatives.value());
-    if (!source.ok()) return ErrorResponse(source.error().code, source.error().message);
+    if (!source.ok())
+      return ErrorResponse(source.error().code, source.error().message);
     auto observation = command.observation;
     observation.gripper_id = physical.value().command_target_id.value();
     const auto recorded = composition.runtime->RecordGraspObservation(
         source.value().observation_binding, observation,
-        *composition.operator_confirmation_validity_ns, command.admission_deadline_ns);
-    if (!recorded.ok()) return ErrorResponse(recorded.error().code, recorded.error().message);
+        *composition.operator_confirmation_validity_ns,
+        command.admission_deadline_ns);
+    if (!recorded.ok())
+      return ErrorResponse(recorded.error().code, recorded.error().message);
     return CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("gripper_confirm")},
         {"ok", CanonicalValue(true)},
         {"owner_epoch", CanonicalValue(owner_epoch_.value())},
-        {"program_binding_id", CanonicalValue(command.program_binding_id.value())},
+        {"program_binding_id",
+         CanonicalValue(command.program_binding_id.value())},
         {"target_role_id", CanonicalValue(command.target_role_id.value())},
         {"confirmation", GraspEvidenceValue(recorded.value())},
     });
@@ -10447,15 +10732,12 @@ private:
   }
 
   [[nodiscard]] CanonicalValue::Object
-  IdentityFields(Composition &composition) const {
+  IdentityFields(Composition &composition,
+                 const core::ProjectionRevisionDTO &projection) const {
     const auto &bundle = *composition.bundle;
     const auto &binding = composition.program_binding != nullptr
                               ? *composition.program_binding
                               : *composition.direct_control_binding;
-    const auto projection =
-        composition.scene_authority_proxy != nullptr
-            ? composition.scene_authority_proxy->CurrentProjectionRevision()
-            : composition.projection_revision;
     Require(projection.retained_bundle_id ==
                     composition.projection_revision.retained_bundle_id &&
                 projection.graph_revision ==
@@ -10475,7 +10757,11 @@ private:
         {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
         {"control_management_mode",
          CanonicalValue(
-             composition.cclc_runtime != nullptr ? "component_lifecycle"
+             composition.cclc_attached.load(std::memory_order_acquire)
+                 ? (composition.cclc_route_recovery_pending.load(
+                        std::memory_order_acquire)
+                        ? "pending"
+                        : "component_lifecycle")
              : composition.direct_route_configuration_published ? "direct"
                                                                 : "pending")},
         {"graph_revision",
@@ -10500,14 +10786,18 @@ private:
     };
   }
 
-  [[nodiscard]] CanonicalValue IdentityValue(Composition &composition) const {
-    auto fields = IdentityFields(composition);
+  [[nodiscard]] CanonicalValue
+  IdentityValue(Composition &composition,
+                const core::ProjectionRevisionDTO &projection) const {
+    auto fields = IdentityFields(composition, projection);
     fields.emplace_back("schema_version",
                         CanonicalValue("manyforge.execution_identity.v1"));
     return CanonicalValue(std::move(fields));
   }
 
-  [[nodiscard]] CanonicalValue StatusResponse(Composition &composition) const {
+  [[nodiscard]] CanonicalValue
+  StatusResponse(Composition &composition,
+                 const core::ProjectionRevisionDTO &projection) const {
     const auto current = ReadCurrentControlState(composition);
     const auto cell_stop_action =
         composition.runtime->addressed_kernel->cell_stop_action_projection();
@@ -10519,7 +10809,7 @@ private:
       observed_targets.push_back(ObservedTargetValue(
           composition.status_gripper_target_role_id, *current.gripper));
     }
-    auto status = IdentityFields(composition);
+    auto status = IdentityFields(composition, projection);
     status.emplace_back("cell_stop_action",
                         CellStopActionValue(cell_stop_action));
     status.emplace_back("direct_control",
@@ -10546,7 +10836,8 @@ private:
   }
 
   [[nodiscard]] CanonicalValue
-  IdentityResponse(Composition &composition) const {
+  IdentityResponse(Composition &composition,
+                   const core::ProjectionRevisionDTO &projection) const {
     const auto admission =
         composition.runtime->addressed_kernel->GetAuthoringAdmission();
     return CanonicalValue(CanonicalValue::Object{
@@ -10554,16 +10845,18 @@ private:
                                      admission.admission_generation.value()))},
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("identity")},
-        {"identity", IdentityValue(composition)},
+        {"identity", IdentityValue(composition, projection)},
         {"ok", CanonicalValue(true)},
     });
   }
 
-  [[nodiscard]] CanonicalValue TargetsResponse(Composition &composition) const {
+  [[nodiscard]] CanonicalValue
+  TargetsResponse(Composition &composition,
+                  const core::ProjectionRevisionDTO &projection) const {
     return CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("targets")},
-        {"identity", IdentityValue(composition)},
+        {"identity", IdentityValue(composition, projection)},
         {"ok", CanonicalValue(true)},
         {"targets",
          CanonicalValue(CanonicalValue::Object{
@@ -10577,7 +10870,8 @@ private:
   }
 
   [[nodiscard]] CanonicalValue
-  ControlStateResponse(Composition &composition) const {
+  ControlStateResponse(Composition &composition,
+                       const core::ProjectionRevisionDTO &projection) const {
     const auto current = ReadCurrentControlState(composition);
     const core::RuntimeParticipantBindingDTO *motion_binding =
         &composition.direct_control_motion_binding.value();
@@ -10599,7 +10893,7 @@ private:
         motion_binding->program_binding_id, motion_binding->component_role_id,
         motion_binding->target_role_id};
     const auto runtime_scale_control =
-        composition.runtime->addressed_kernel->get_runtime_scale_control(
+        composition.runtime->addressed_kernel->present_runtime_scale_control(
             runtime_scale_selector);
     if (!runtime_scale_control.ok()) {
       Fail("runtime-scale control projection failed: " +
@@ -10637,7 +10931,7 @@ private:
              {"schema_version",
               CanonicalValue("manyforge.execution_control_state.v4")},
          })},
-        {"identity", IdentityValue(composition)},
+        {"identity", IdentityValue(composition, projection)},
         {"ok", CanonicalValue(true)},
     });
   }
@@ -10903,8 +11197,9 @@ private:
     });
   }
 
-  [[nodiscard]] CanonicalValue Execute(const Command &command,
-                                       Composition &composition) {
+  [[nodiscard]] CanonicalValue
+  Execute(const Command &command, Composition &composition,
+          const core::ProjectionRevisionDTO &projection) {
     if (command.kind == CommandKind::kReadProgramExecutionScope) {
       const auto result =
           composition.runtime->addressed_kernel->get_program_execution_scope(
@@ -10919,16 +11214,16 @@ private:
           {"scope", ProgramExecutionScopeValue(result.value())}});
     }
     if (command.kind == CommandKind::kStatus) {
-      return StatusResponse(composition);
+      return StatusResponse(composition, projection);
     }
     if (command.kind == CommandKind::kIdentity) {
-      return IdentityResponse(composition);
+      return IdentityResponse(composition, projection);
     }
     if (command.kind == CommandKind::kTargets) {
-      return TargetsResponse(composition);
+      return TargetsResponse(composition, projection);
     }
     if (command.kind == CommandKind::kControlState) {
-      return ControlStateResponse(composition);
+      return ControlStateResponse(composition, projection);
     }
     if (command.kind == CommandKind::kObservation) {
       return ObservationResponse(composition);
@@ -11628,6 +11923,8 @@ private:
 
   void RunReconciliationLane(std::stop_token stop_token) noexcept {
     try {
+      std::optional<core::TimePoint> last_recovery_observation;
+      std::optional<core::ErrorDTO> recovery_error;
       while (!stop_token.stop_requested()) {
 #if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
         const char *marker =
@@ -11659,6 +11956,28 @@ private:
           std::shared_lock lock(composition_access_.mutex);
           if (composition_access_.current != nullptr) {
             auto &composition = *composition_access_.current;
+            const auto now = composition.runtime->clock->now();
+            if (!last_recovery_observation ||
+                now < *last_recovery_observation ||
+                now - *last_recovery_observation >=
+                    kRecoveryObservationPeriodNs) {
+              last_recovery_observation = now;
+              const auto routes =
+                  composition.runtime->reconcile_controller_routes
+                      ? composition.runtime->reconcile_controller_routes()
+                      : core::Result<void>::Ok();
+              if (routes.ok()) {
+                composition.cclc_route_recovery_pending.store(
+                    false, std::memory_order_release);
+              }
+              const auto assessed =
+                  composition.runtime->addressed_kernel
+                      ->refresh_stop_fault_recovery_assessment();
+              recovery_error = !routes.ok() ? std::optional(routes.error())
+                               : !assessed.ok()
+                                   ? std::optional(assessed.error())
+                                   : std::nullopt;
+            }
             auto error = [&]() -> std::optional<core::ErrorDTO> {
               const auto reconciled = composition.runtime->addressed_kernel
                                           ->reconcile_subordinate_state();
@@ -11679,7 +11998,7 @@ private:
               return std::nullopt;
             }();
             std::lock_guard error_lock(reconcile_error_mutex_);
-            last_reconcile_error_ = std::move(error);
+            last_reconcile_error_ = error ? std::move(error) : recovery_error;
           }
         }
         pollfd interruptible_wait{-1, 0, 0};
@@ -11742,6 +12061,7 @@ private:
 
   void HandleOneClient(const CommandSocket &socket, const CommandLane lane,
                        const std::stop_token stop_token = {}) noexcept {
+    const bool ordinary = lane == CommandLane::kOrdinary;
     try {
       FileDescriptor client(::accept4(socket.get(), nullptr, nullptr,
                                       SOCK_CLOEXEC | SOCK_NONBLOCK));
@@ -11823,10 +12143,21 @@ private:
               auto *const owner = composition_access_.addressed_kernel;
               Require(owner != nullptr,
                       "stable addressed execution Kernel is not installed");
-              response = detail::CellAdmissionResponseValue(
-                  cell_admission->command,
+              auto result =
                   component_manager::detail::DispatchKernelCellAdmissionRpc(
-                      *owner, *cell_admission));
+                      *owner, *cell_admission);
+              if ((cell_admission->command == "cell_admission_release" ||
+                   cell_admission->command == "cell_admission_reconcile") &&
+                  std::holds_alternative<core::AuthoringAdmissionDTO>(result) &&
+                  composition_access_.on_cell_admission_settled) {
+                // Attachment takes the Manager composition mutex and may
+                // reconfigure routes. Never invert its execution-lock order.
+                composition_lock.unlock();
+                composition_access_.on_cell_admission_settled();
+                result = owner->GetAuthoringAdmission();
+              }
+              response = detail::CellAdmissionResponseValue(
+                  cell_admission->command, result);
             } else {
               const auto command = DecodeCommand(bytes);
               if (lane == CommandLane::kObservation &&
@@ -11866,12 +12197,41 @@ private:
                   response = ObservationResponseAfter(command, client.get(),
                                                       stop_token);
                 } else {
+                  auto projection =
+                      composition_access_.current->projection_revision;
+                  if (ordinary &&
+                      (command.kind == CommandKind::kIdentity ||
+                       command.kind == CommandKind::kStatus ||
+                       command.kind == CommandKind::kTargets ||
+                       command.kind == CommandKind::kControlState)) {
+                    const auto scene =
+                        composition_access_.current->scene_authority_proxy;
+                    const auto generation =
+                        composition_access_.current->publication_generation;
+                    if (scene != nullptr) {
+                      // Manager may be waiting to replace this composition.
+                      // Never retain its lock across a request back to Manager.
+                      // The shared proxy outlives the unlocked read; only the
+                      // exact captured publication may consume its result.
+                      composition_lock.unlock();
+                      projection = scene->CurrentProjectionRevision(stop_token);
+                      composition_lock.lock();
+                      Require(composition_access_.current != nullptr &&
+                                  composition_access_.current
+                                          ->publication_generation ==
+                                      generation &&
+                                  composition_access_.current
+                                          ->scene_authority_proxy == scene,
+                              "execution identity changed during Scene read");
+                    }
+                  }
                   response =
                       lane == CommandLane::kStop
                           ? ExecuteStop(command,
                                         *composition_access_.current->runtime
                                              ->addressed_kernel)
-                          : Execute(command, *composition_access_.current);
+                          : Execute(command, *composition_access_.current,
+                                    projection);
                 }
               }
             }
@@ -12000,9 +12360,11 @@ public:
                     1U, core::ProgramCycleStateDTO::kIdleAfterReset,
                     std::nullopt, std::nullopt, std::nullopt},
                 true, 0U, 0U, true, true, 0U, 0U, 0U});
-    Require(fixture_readiness.ok() &&
-                fixture_readiness.value().authoring_allowed,
-            "standalone admission fixture did not reach deterministic Idle");
+    // Readiness publication is not permission to move. Retained claims and
+    // faults must reach real reconciliation/ingress while admission stays
+    // closed; do not require authoring eligibility before recovery can run.
+    Require(fixture_readiness.ok(),
+            "standalone admission fixture could not publish readiness");
 #endif
     AttachRetainedNativeCCLC(*composition_, config_, *fence_owner_);
     composition_access_.current = composition_.get();

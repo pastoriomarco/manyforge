@@ -4186,9 +4186,16 @@ class HeadlessSceneProgramPort:
                         operation=operation,
                         program_node_evidence=evidence,
                     )
-                except Exception as error:
+                except SceneTransactionRejectedError as error:
+                    # Only a proven no-effect rejection can retry. An admission
+                    # revision race uses the same bounded fresh-request path as
+                    # a Scene revision race; owner/claim changes do not.
+                    stale_admission = error.code == "stale_generation" and (
+                        error.response["error"].get("details", {}).get("reason")
+                        == "expected_generation_stale"
+                    )
                     if (
-                        getattr(error, "code", None) != "stale_revision"
+                        not (error.code == "stale_revision" or stale_admission)
                         or attempt + 1 == _MAX_SCENE_NODE_STALE_RETRIES
                     ):
                         raise

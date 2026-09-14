@@ -80,4 +80,13 @@ std::shared_ptr<CoordinatedExecutionClock> CoordinatedMotionPreparation::executi
   return cancelled_ ? nullptr : execution_clock_;
 }
 
+bool CoordinatedMotionPreparation::accepts_prepared(const OperationParticipantId& participant,
+                                                    const TrajectoryRuntimeScaleBoundsDTO& bounds) {
+  std::lock_guard lock(mutex_);
+  return !cancelled_ && execution_clock_ && bounds.nominal_time_multiplier &&
+         *bounds.nominal_time_multiplier == common_.trajectory_time_multiplier &&
+         execution_clock_->accepts(participant,
+                                   {bounds.max_rate_per_s, bounds.max_rate_change_per_s2});
+}
+
 }  // namespace manyforge::core::detail

@@ -1220,7 +1220,8 @@ def lite6_gripper_lifecycle_predicate(
 
 def lite6_gripper_lifecycle_plans() -> list[dict[str, Any]]:
     timeout_ns = 30_000_000_000
-    declared = lite6_gripper_lifecycle_predicate("declared", False, False)
+    prepare_eligible = lite6_gripper_lifecycle_predicate("declared", False, False)
+    prepare_eligible["allowed_states"].append("disabled")
     prepared = lite6_gripper_lifecycle_predicate("prepared", False, False)
     active = lite6_gripper_lifecycle_predicate("active", True, False)
     disabled = lite6_gripper_lifecycle_predicate("disabled", False, False)
@@ -1231,7 +1232,7 @@ def lite6_gripper_lifecycle_plans() -> list[dict[str, Any]]:
             "requested_postcondition": prepared,
             "timeout_duration_ns": timeout_ns,
             "transitions": [
-                lifecycle_transition("native.gripper.prepare", declared, prepared)
+                lifecycle_transition("native.gripper.prepare", prepare_eligible, prepared)
             ],
         },
         {

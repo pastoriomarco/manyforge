@@ -420,6 +420,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] std::optional<StopFaultLatchDTO> get_stop_fault_latch() const;
   [[nodiscard]] Result<std::optional<StopFaultRecoveryOfferDTO>> get_stop_fault_recovery_offer()
       const;
+  /// Refresh owner-held recovery predicates without clearing the fault or
+  /// issuing effects. Run on the noncritical reconciliation lane; reads may
+  /// call bounded source adapters. No active terminal fault is a no-op.
+  [[nodiscard]] Result<void> refresh_stop_fault_recovery_assessment();
   [[nodiscard]] Result<StopFaultRecoveryResultDTO> recover_stop_fault(
       const StopFaultRecoveryIntentDTO& intent);
   [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale(
@@ -430,12 +434,21 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const RuntimeScaleControlRequestDTO& request);
   [[nodiscard]] Result<RuntimeScaleControlStatusDTO> get_runtime_scale_control(
       const RuntimeScaleControlSelectorDTO& selector) const;
+  /// Presentation query: expose the complete active synchronized scope for a
+  /// selected target. Setters still require that explicit returned selector.
+  [[nodiscard]] Result<RuntimeScaleControlStatusDTO> present_runtime_scale_control(
+      const RuntimeScaleControlSelectorDTO& selector) const;
 
   [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
+  [[nodiscard]] bool has_external_route_recovery_claims() const;
+  [[nodiscard]] Result<void> SetRouteRecoveryPending(bool pending);
   [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
       const CellAdmissionReadinessSnapshotDTO& snapshot) override;
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent) override;
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireRouteRecoveryCellAdmissionClaim(
+      const CellAdmissionClaimIntentDTO& intent,
+      const ActiveControlConfigurationDTO& predecessor) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseCellAdmissionClaim(
       const CellAdmissionClaimReleaseDTO& release) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
@@ -582,6 +595,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct RuntimeScaleControlReplayEntry;
   struct RuntimeScaleControlSetting;
   struct RuntimeScaleControlResolution;
+  struct RuntimeScaleControlScope;
   struct ActiveOperation;
   class OperationCommitGuard;
   struct StopTransaction;
@@ -684,8 +698,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       RuntimeScaleStatusDTO status, const char* reason);
   [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale_impl(
       const RuntimeScaleRequestDTO& request, bool retain_public_replay);
-  [[nodiscard]] Result<RuntimeScaleControlResolution> resolve_runtime_scale_control_locked(
+  [[nodiscard]] Result<RuntimeScaleControlResolution> resolve_runtime_scale_control_target_locked(
       const RuntimeScaleControlSelectorDTO& selector) const;
+  [[nodiscard]] Result<RuntimeScaleControlScope> resolve_runtime_scale_control_locked(
+      const RuntimeScaleControlSelectorDTO& selector) const;
+  [[nodiscard]] Result<RuntimeScaleControlStatusDTO> runtime_scale_control_locked(
+      const RuntimeScaleControlSelectorDTO& selector, bool present_group) const;
   [[nodiscard]] double runtime_scale_setting_for_binding_locked(
       const RuntimeParticipantBindingDTO& binding) const noexcept;
   void ProgressStop(StopControlWorkToken token) noexcept override;
@@ -706,6 +724,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] std::optional<StopControlWorkToken> allocate_stop_projection_job_locked() noexcept;
   void latch_stop_fault_locked(StopTransaction& transaction, StopFaultTriggerDTO trigger);
   void refresh_stop_fault_latch_locked();
+  [[nodiscard]] Result<void> publish_stop_fault_assessment_locked(
+      const StopStatusDTO& expected, const StopFaultLatchDTO& assessed);
   [[nodiscard]] bool commit_stop_terminal_locked(StopTransaction& transaction,
                                                  std::int64_t completed_at_ns) noexcept;
   [[nodiscard]] Result<StopAcceptedDTO> accept_stop(

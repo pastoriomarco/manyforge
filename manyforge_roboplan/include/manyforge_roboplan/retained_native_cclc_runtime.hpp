@@ -18,8 +18,8 @@ struct RetainedNativeCCLCRuntimeConfig final {
   [[nodiscard]] bool locally_valid() const noexcept;
 };
 
-/// Build and start the complete CCLC owner for one already composed retained
-/// native runtime.
+/// Construct the CCLC owner and verified observation sources without starting
+/// workers or request admission. The caller explicitly invokes Start.
 ///
 /// Brand registrations remain product-specific: their exact provider
 /// occurrences and adapters are injected by the selected product (for
@@ -44,16 +44,19 @@ CreateRetainedNativeCCLCRuntime(
     deployment::IRouteConfigurationKernelPublicationOwner
         &kernel_publication_owner,
     core::IClock &clock, core::IScheduler &scheduler,
-    std::function<core::Result<
-        std::optional<core::ActiveControlConfigurationDTO>>(
-        const core::ControlDomainId &)>
+    std::function<
+        core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+            const core::ControlDomainId &)>
         kernel_current_configuration_source = {},
     RetainedExternallyManagedDomainSnapshotSource
         externally_managed_controller_snapshot_source = {});
 
 /// Convenience overload for the production retained-native owner. Only the
 /// physical representatives are consumed; Program aliases cannot widen CCLC
-/// domain or resource scope.
+/// domain or resource scope. Startup adopts and reconciles routes through the
+/// same owner even with a retained Stop fault. Private recovery can publish
+/// verified current truth but cannot change controllers; Kernel keeps ordinary
+/// admission closed until the fault is explicitly cleared.
 [[nodiscard]] core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>
 CreateRetainedNativeCCLCRuntime(
     RetainedNativeCCLCRuntimeConfig config,

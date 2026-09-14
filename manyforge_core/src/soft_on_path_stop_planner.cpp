@@ -1246,12 +1246,6 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
     return err("runtime_scale_continuation_unavailable",
                "A changing scale requires its captured continuation");
   }
-  if (accepted_trajectory.runtime_scale_bounds &&
-      !ramp_rate_within_unit_range(handoff_rate, handoff_rate_accel, effective_ramp_s)) {
-    return err("soft_on_path_scale_ramp_infeasible",
-               "Requested Stop ramp would exceed the accepted velocity envelope",
-               {{"recommended_disposition", "hard_stop"}});
-  }
   const double stop_path_time = handoff_path_time + 0.5 * handoff_rate * effective_ramp_s +
                                 0.1 * handoff_rate_accel * effective_ramp_s * effective_ramp_s;
   if (stop_path_time > path_end_s + kEpsilon) {
@@ -1503,6 +1497,17 @@ Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
         std::to_string(retimed_plan.replacement_trajectory.waypoints.size());
     return Result<SoftOnPathStopPlanDTO>::Ok(std::move(retimed_plan));
   };
+
+  // A changing scale can make the fixed Hermite ramp reverse or overspeed.
+  // That invalidates this candidate, not every controlled Stop: use the same
+  // bounded, envelope-validated retimer as for acceleration/jerk failures.
+  if (accepted_trajectory.runtime_scale_bounds &&
+      !ramp_rate_within_unit_range(handoff_rate, handoff_rate_accel, effective_ramp_s)) {
+    return try_jerk_limited_retimer(
+        "soft_on_path_scale_ramp_infeasible",
+        {{"handoff_rate", format_double(handoff_rate)},
+         {"handoff_rate_accel", format_double(handoff_rate_accel)}});
+  }
 
   // Per-joint limits hoisted into index-aligned vectors: the ramp loop
   // below reads them per joint per waypoint.

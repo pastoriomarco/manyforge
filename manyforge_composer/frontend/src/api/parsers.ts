@@ -364,6 +364,10 @@ function stringAt(value: unknown, path: string): string {
   return value;
 }
 
+function runtimeScalePairIdentity(componentRoleId: string, targetRoleId: string): string {
+  return JSON.stringify([componentRoleId, targetRoleId]);
+}
+
 function nonnegativeInt64TextAt(value: unknown, path: string): string {
   const text = stringAt(value, path);
   if (
@@ -7449,14 +7453,17 @@ export function parseExecutionControlStatus(
     control.runtime_scale_control,
     'executionControlState.control_state.runtime_scale_control',
   );
-  if (
-    runtimeScaleControl.selector.programBindingId
-      !== status.directControl.programBindingId
-    || runtimeScaleControl.selector.componentRoleId
-      !== status.directControl.componentRoleId
-    || runtimeScaleControl.selector.targetRoleId
-      !== status.directControl.targetRoleId
-  ) {
+  if (runtimeScaleControl.selector.kind === 'group') {
+    return fail(
+      'executionControlState.control_state.runtime_scale_control.selector',
+      'the exact direct-control motion target, not a synchronized group',
+    );
+  }
+  if (runtimeScaleControl.selector.kind === 'singular' && (
+    runtimeScaleControl.selector.programBindingId !== status.directControl.programBindingId
+    || runtimeScaleControl.selector.componentRoleId !== status.directControl.componentRoleId
+    || runtimeScaleControl.selector.targetRoleId !== status.directControl.targetRoleId
+  )) {
     return fail(
       'executionControlState.control_state.runtime_scale_control.selector',
       'the exact direct-control motion target',
@@ -8657,20 +8664,50 @@ const RUNTIME_SCALE_STATES = new Set([
   'failed',
 ]);
 
+function runtimeScalePortableAt(value: unknown, field: string): string {
+  const result = stringAt(value, field);
+  if (result.length === 0 || result !== result.normalize('NFC')
+    || new TextEncoder().encode(result).length > 256) {
+    return fail(field, 'a non-empty NFC-normalized identifier within 256 UTF-8 bytes');
+  }
+  return result;
+}
+
 function runtimeScaleControlSelectorAt(
   value: unknown,
   path: string,
 ): RuntimeScaleControlStatus['selector'] {
   const selector = objectAt(value, path);
-  exactKeysAt(
-    selector,
-    ['component_role_id', 'program_binding_id', 'target_role_id'],
-    path,
-  );
+  const binding = runtimeScalePortableAt(selector.program_binding_id, `${path}.program_binding_id`);
+  if (Object.prototype.hasOwnProperty.call(selector, 'synchronized_targets')) {
+    exactKeysAt(selector, ['program_binding_id', 'synchronized_targets'], path);
+    const rows = arrayAt(selector.synchronized_targets, `${path}.synchronized_targets`);
+    if (rows.length < 2 || rows.length > 4096) {
+      return fail(`${path}.synchronized_targets`, 'between 2 and 4096 targets');
+    }
+    const targets = rows.map((row, index) => {
+      const member = objectAt(row, `${path}.synchronized_targets[${index}]`);
+      exactKeysAt(member, ['component_role_id', 'target_role_id'], `${path}.synchronized_targets[${index}]`);
+      return {
+        componentRoleId: runtimeScalePortableAt(member.component_role_id, `${path}.synchronized_targets[${index}].component_role_id`),
+        targetRoleId: runtimeScalePortableAt(member.target_role_id, `${path}.synchronized_targets[${index}].target_role_id`),
+      };
+    });
+    const identities = targets.map((target) => runtimeScalePairIdentity(
+      target.componentRoleId,
+      target.targetRoleId,
+    ));
+    if (new Set(identities).size !== identities.length) {
+      return fail(`${path}.synchronized_targets`, 'unique target pairs');
+    }
+    return { kind: 'group', programBindingId: binding, synchronizedTargets: targets };
+  }
+  exactKeysAt(selector, ['component_role_id', 'program_binding_id', 'target_role_id'], path);
   return {
-    componentRoleId: stringAt(selector.component_role_id, `${path}.component_role_id`),
-    programBindingId: stringAt(selector.program_binding_id, `${path}.program_binding_id`),
-    targetRoleId: stringAt(selector.target_role_id, `${path}.target_role_id`),
+    kind: 'singular',
+    componentRoleId: runtimeScalePortableAt(selector.component_role_id, `${path}.component_role_id`),
+    programBindingId: binding,
+    targetRoleId: runtimeScalePortableAt(selector.target_role_id, `${path}.target_role_id`),
   };
 }
 
@@ -8683,11 +8720,17 @@ function nullableNonnegativeIntegerAt(
   return result >= 0 ? result : fail(path, 'a nonnegative integer or null');
 }
 
+function nonnegativeIntegerAt(value: unknown, path: string): number {
+  const result = nullableNonnegativeIntegerAt(value, path);
+  return result === null ? fail(path, 'a nonnegative integer') : result;
+}
+
 function runtimeScaleControlStatusAt(
   value: unknown,
   path: string,
 ): RuntimeScaleControlStatus {
   const status = objectAt(value, path);
+  const selector = runtimeScaleControlSelectorAt(status.selector, `${path}.selector`);
   exactKeysAt(status, [
     'active_control_configuration_generation',
     'active_control_configuration_id',
@@ -8707,6 +8750,7 @@ function runtimeScaleControlStatusAt(
     'scaling_domain_id',
     'selector',
     'supported',
+    ...(selector.kind === 'group' ? ['synchronized_members'] : []),
   ], path);
   const controlGeneration = integerAt(
     status.control_generation,
@@ -8774,11 +8818,52 @@ function runtimeScaleControlStatusAt(
     activeControlConfigurationGeneration,
   ];
   const supported = booleanAt(status.supported, `${path}.supported`);
-  if (supported !== resolvedScope.every((item) => item !== null)) {
+  if (selector.kind === 'singular' && supported !== resolvedScope.every((item) => item !== null)) {
     return fail(path, 'support truth consistent with one complete resolved control scope');
   }
+  let synchronizedMembers: RuntimeScaleControlStatus['synchronizedMembers'];
+  if (selector.kind === 'group') {
+    const rows = arrayAt(status.synchronized_members, `${path}.synchronized_members`);
+    if (rows.length < 2 || rows.length > 4096) {
+      return fail(`${path}.synchronized_members`, 'between 2 and 4096 members');
+    }
+    const expected = new Set(selector.synchronizedTargets.map((target) => (
+      runtimeScalePairIdentity(target.componentRoleId, target.targetRoleId)
+    )));
+    const seen = new Set<string>();
+    if (!supported) return fail(path, 'a synchronized group must be supported');
+    synchronizedMembers = rows.map((row, index) => {
+      const member = objectAt(row, `${path}.synchronized_members[${index}]`);
+      exactKeysAt(member, [
+        'active_control_configuration_generation', 'active_control_configuration_id',
+        'control_binding_id', 'control_binding_revision', 'control_domain_id',
+        'control_domain_revision', 'scaling_domain_id', 'component_role_id', 'target_role_id',
+      ], `${path}.synchronized_members[${index}]`);
+      const componentRoleId = runtimeScalePortableAt(member.component_role_id, `${path}.synchronized_members[${index}].component_role_id`);
+      const targetRoleId = runtimeScalePortableAt(member.target_role_id, `${path}.synchronized_members[${index}].target_role_id`);
+      const identity = runtimeScalePairIdentity(componentRoleId, targetRoleId);
+      if (!expected.has(identity) || seen.has(identity)) return fail(`${path}.synchronized_members[${index}]`, 'exactly one selected target');
+      seen.add(identity);
+      const fields = [
+        'control_domain_id', 'control_domain_revision', 'control_binding_id',
+        'control_binding_revision', 'scaling_domain_id', 'active_control_configuration_id',
+      ].map((field) => runtimeScalePortableAt(member[field], `${path}.synchronized_members[${index}].${field}`));
+      return {
+        componentRoleId, targetRoleId,
+        controlDomainId: fields[0], controlDomainRevision: fields[1], controlBindingId: fields[2],
+        controlBindingRevision: fields[3], scalingDomainId: fields[4], activeControlConfigurationId: fields[5],
+        activeControlConfigurationGeneration: nonnegativeIntegerAt(
+          member.active_control_configuration_generation,
+          `${path}.synchronized_members[${index}].active_control_configuration_generation`,
+        ),
+      };
+    });
+    if (seen.size !== expected.size || resolvedScope.some((item) => item !== null)) {
+      return fail(path, 'group members must exactly resolve the selected scope while group scope stays null');
+    }
+  }
   return {
-    selector: runtimeScaleControlSelectorAt(status.selector, `${path}.selector`),
+    selector,
     controlGeneration,
     requestedScale,
     supported,
@@ -8805,6 +8890,7 @@ function runtimeScaleControlStatusAt(
     effectiveScale,
     applicationState: applicationState as RuntimeScaleControlStatus['applicationState'],
     reason,
+    ...(synchronizedMembers === undefined ? {} : { synchronizedMembers }),
   };
 }
 

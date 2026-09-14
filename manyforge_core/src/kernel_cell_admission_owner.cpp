@@ -77,7 +77,8 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
     std::vector<CellAdmissionCurrentOwnerEpochDTO> recovered_current_owners,
     std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set,
     CellAdmissionClaimGeneration recovered_claim_generation_high_water,
-    CellAdmissionProgramNodeValidator program_node_validator)
+    CellAdmissionProgramNodeValidator program_node_validator,
+    std::function<bool()> stop_fault_active)
     : kernel_owner_epoch_(std::move(kernel_owner_epoch)),
       capacity_(capacity),
       clock_(clock),
@@ -86,6 +87,7 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
       settlement_validator_(std::move(settlement_validator)),
       reconcile_validator_(std::move(reconcile_validator)),
       program_node_validator_(std::move(program_node_validator)),
+      stop_fault_active_(std::move(stop_fault_active)),
       manager_liveness_required_set_(std::move(manager_liveness_required_set)),
       membership_(std::move(recovered_membership)),
       current_owners_(std::move(recovered_current_owners)) {
@@ -296,7 +298,34 @@ Result<void> KernelCellAdmissionOwner::AdvanceGenerationLocked() {
 }
 
 AuthoringAdmissionDTO KernelCellAdmissionOwner::AdmissionLocked() const noexcept {
-  return AuthoringAdmissionDTO{BaseReadinessLocked() && held_claim_count_ == 0U, generation_};
+  return AuthoringAdmissionDTO{
+      !published_stop_fault_active_ && !(stop_fault_active_ && stop_fault_active_()) &&
+          !route_recovery_pending_ && BaseReadinessLocked() && held_claim_count_ == 0U,
+      generation_};
+}
+
+Result<void> KernelCellAdmissionOwner::RefreshStopFaultAdmission() {
+  std::lock_guard transition_lock(liveness_transition_mutex_);
+  std::lock_guard lock(mutex_);
+  const bool active = stop_fault_active_ && stop_fault_active_();
+  if (active == published_stop_fault_active_) return Result<void>::Ok();
+  published_stop_fault_active_ = true;
+  auto advanced = AdvanceGenerationLocked();
+  if (!advanced.ok()) return advanced;
+  published_stop_fault_active_ = active;
+  return Result<void>::Ok();
+}
+
+Result<void> KernelCellAdmissionOwner::SetRouteRecoveryPending(bool pending) {
+  std::lock_guard transition_lock(liveness_transition_mutex_);
+  std::lock_guard lock(mutex_);
+  if (route_recovery_pending_ == pending) return Result<void>::Ok();
+  // A failed journal write must never reopen admission during attachment.
+  route_recovery_pending_ = true;
+  auto advanced = AdvanceGenerationLocked();
+  if (!advanced.ok()) return advanced;
+  route_recovery_pending_ = pending;
+  return Result<void>::Ok();
 }
 
 AuthoringAdmissionDTO KernelCellAdmissionOwner::GetAuthoringAdmission() const {
@@ -577,6 +606,16 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireManualCellAdmissi
   return AcquireClaim(intent, validate_offer);
 }
 
+Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireRouteRecoveryClaim(
+    const CellAdmissionClaimIntentDTO& intent,
+    const CellAdmissionInterventionValidator& validate_offer) {
+  if (intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
+      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner || !validate_offer) {
+    return Reject<CellAdmissionClaimDTO>("invalid_request", "route_recovery_validator_required");
+  }
+  return AcquireClaim(intent, validate_offer);
+}
+
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     const CellAdmissionClaimIntentDTO& intent,
     const CellAdmissionInterventionValidator& validate_offer) {
@@ -615,6 +654,18 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
   }
   if (!intent.program_node_evidence && intent.expected_admission_generation != generation_) {
     return Reject<CellAdmissionClaimDTO>("stale_generation", "expected_generation_stale");
+  }
+  // Exact replay above remains observable during a fault. Only the private
+  // replacement-route offer may acquire new authority while it is latched.
+  if ((published_stop_fault_active_ || (stop_fault_active_ && stop_fault_active_())) &&
+      !(intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery &&
+        intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner)) {
+    return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
+                                                    "active_stop_fault_requires_recovery");
+  }
+  if (route_recovery_pending_ &&
+      intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery) {
+    return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "route_recovery_pending");
   }
   const auto retire_released = [&](const auto& entry) {
     return entry.release.has_value() && entry.claim.intent.owner_role == intent.owner_role &&
@@ -715,8 +766,14 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
         intent,
         parent == nullptr ? std::nullopt : std::optional<CellAdmissionClaimDTO>(parent->claim));
     if (!evidence.ok()) {
-      return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
-                                                      "intervention_offer_not_current");
+      auto error =
+          AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "intervention_offer_not_current")
+              .error();
+      const auto reason = evidence.error().details.find("reason");
+      error.details.emplace("intervention_offer_reason", reason == evidence.error().details.end()
+                                                             ? evidence.error().code
+                                                             : reason->second);
+      return Result<CellAdmissionClaimDTO>::Err(std::move(error));
     }
   } else if (!AdmissionLocked().authoring_allowed && !MatchingStartingProgramCycleLocked(intent)) {
     return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "positive_admission_required");
@@ -1255,6 +1312,15 @@ Result<void> KernelCellAdmissionOwner::ValidateProgramResetSceneAuthorization(
 bool KernelCellAdmissionOwner::has_unresolved_claims() const {
   std::lock_guard lock(mutex_);
   return held_claim_count_ != 0U;
+}
+
+bool KernelCellAdmissionOwner::has_unresolved_claims_except(
+    CellAdmissionOwnerRoleDTO owner_role) const {
+  std::lock_guard lock(mutex_);
+  return std::any_of(entries_.begin(), entries_.end(), [&](const auto& entry) {
+    return !entry.release && !entry.reconcile_settlement &&
+           entry.claim.intent.owner_role != owner_role;
+  });
 }
 
 }  // namespace manyforge::core

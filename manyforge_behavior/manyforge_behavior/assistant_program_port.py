@@ -2242,12 +2242,21 @@ class ProgramAssistantPort:
             task_id,
             OwnerTaskState.FAILED,
             metadata=(
-                {}
-                if task is None
-                else self._authored_failure_policy(task, reason_code)
+                {} if task is None else self._authored_failure_policy(task, reason_code)
             ),
             reason_code=reason_code,
             message=message,
+            # A failed result can be consumed only after local work ended and
+            # every external attempt's terminal audit is durable. A timeout
+            # alone proves neither; retain it for the existing cleanup path.
+            settlement_proven=(
+                task is not None
+                and (task.future is None or task.future.done())
+                and all(
+                    attempt.terminal_outcome is not None
+                    for attempt in task.external_attempts.values()
+                )
+            ),
         )
 
     def _refresh(self, task_id: str, task: _Task) -> OwnerTaskSnapshot:

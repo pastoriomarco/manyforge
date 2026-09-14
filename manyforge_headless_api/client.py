@@ -29,6 +29,10 @@ from .program_binding_projection import (
     validate_program_apply_result,
     validate_scenario_program_selection,
 )
+from .models import (
+    MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES,
+    RuntimeScaleControlSelectorRequest,
+)
 
 
 MAX_HTTP_RESPONSE_BYTES = 64 * 1024 * 1024
@@ -1085,18 +1089,31 @@ class HeadlessHttpClient:
     def set_runtime_scale_control(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/runtime-scale-control", body=body)
 
-    def runtime_scale_control(self, selector: Mapping[str, str]) -> dict[str, Any]:
-        expected = {
-            "program_binding_id",
-            "component_role_id",
-            "target_role_id",
-        }
-        if set(selector) != expected or any(not selector[key] for key in expected):
-            raise ValueError("runtime-scale control selector is incomplete")
+    def runtime_scale_control(self, selector: Mapping[str, Any]) -> dict[str, Any]:
+        validated = RuntimeScaleControlSelectorRequest.model_validate(selector)
+        normalized = validated.model_dump(mode="json")
+        if validated.synchronized_targets is not None:
+            encoded = json.dumps(
+                normalized["synchronized_targets"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if len(encoded.encode("utf-8")) > MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES:
+                raise ValueError("runtime-scale synchronized target list is too large")
+            params = (
+                ("program_binding_id", normalized["program_binding_id"]),
+                ("synchronized_targets", encoded),
+            )
+        else:
+            params = tuple(
+                (key, normalized[key])
+                for key in ("component_role_id", "program_binding_id", "target_role_id")
+            )
         return self.request(
             "GET",
             "/api/execution/runtime-scale-control",
-            params=tuple((key, selector[key]) for key in sorted(expected)),
+            params=params,
         )
 
     def scene(self) -> dict[str, Any]:

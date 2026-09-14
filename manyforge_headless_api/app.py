@@ -11,7 +11,15 @@ import re
 import threading
 import uuid
 
-from fastapi import FastAPI, Path, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
@@ -83,6 +91,8 @@ from .models import (
     PlaceSequencePlanningRequest,
     RuntimeScaleControlRequest,
     RuntimeScaleControlSelectorRequest,
+    MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES,
+    decode_runtime_scale_selector_query,
     RouteSelectionRequest,
     RouteSelectionRequestResultQuery,
     SceneResourcePoseQuery,
@@ -1751,15 +1761,50 @@ def create_app(
 
     @app.get("/api/execution/runtime-scale-control")
     def execution_get_runtime_scale_control(
+        request: Request,
         program_binding_id: Annotated[str, Query(min_length=1, max_length=256)],
-        component_role_id: Annotated[str, Query(min_length=1, max_length=256)],
-        target_role_id: Annotated[str, Query(min_length=1, max_length=256)],
+        component_role_id: Annotated[
+            str | None, Query(min_length=1, max_length=256)
+        ] = None,
+        target_role_id: Annotated[
+            str | None, Query(min_length=1, max_length=256)
+        ] = None,
+        synchronized_targets: Annotated[
+            str | None, Query(max_length=MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES)
+        ] = None,
     ) -> JSONResponse:
-        selector = RuntimeScaleControlSelectorRequest(
-            program_binding_id=program_binding_id,
-            component_role_id=component_role_id,
-            target_role_id=target_role_id,
+        selector_keys = (
+            "program_binding_id",
+            "component_role_id",
+            "target_role_id",
+            "synchronized_targets",
         )
+        if any(len(request.query_params.getlist(key)) > 1 for key in selector_keys):
+            raise HTTPException(
+                422, "runtime-scale selector query keys must be singular"
+            )
+        if synchronized_targets is None:
+            payload = {
+                "program_binding_id": program_binding_id,
+                "component_role_id": component_role_id,
+                "target_role_id": target_role_id,
+            }
+        else:
+            if component_role_id is not None or target_role_id is not None:
+                raise HTTPException(422, "runtime-scale selector has mixed forms")
+            try:
+                payload = {
+                    "program_binding_id": program_binding_id,
+                    "synchronized_targets": decode_runtime_scale_selector_query(
+                        synchronized_targets
+                    ),
+                }
+            except ValueError:
+                raise HTTPException(422, "synchronized_targets must be strict JSON")
+        try:
+            selector = RuntimeScaleControlSelectorRequest.model_validate(payload)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
         return execution_response(service.execution_get_runtime_scale_control(selector))
 
     @app.get("/api/scene")

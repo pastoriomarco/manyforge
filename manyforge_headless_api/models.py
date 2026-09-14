@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unicodedata
 from typing import Annotated, Any, Literal
 
@@ -34,6 +35,7 @@ MAX_STOP_IDENTITY_BYTES = 128
 MAX_STOP_REASON_BYTES = 1024
 MAX_STOP_SELECTOR_TARGETS = 4096
 MAX_OPERATION_PARTICIPANTS = 4096
+MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES = 2 * 1024 * 1024
 SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
@@ -43,6 +45,34 @@ def _bounded_nfc(value: str, *, label: str, maximum_bytes: int) -> str:
     if len(value.encode("utf-8")) > maximum_bytes:
         raise ValueError(f"{label} exceeds {maximum_bytes} UTF-8 bytes")
     return value
+
+
+def decode_runtime_scale_selector_query(value: str) -> Any:
+    """Decode the grouped selector query using the public JSON strictness rules."""
+    if len(value.encode("utf-8")) > MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES:
+        raise ValueError(
+            "synchronized_targets exceeds the runtime-scale selector byte bound"
+        )
+
+    def reject_constant(token: str) -> None:
+        raise ValueError(f"non-finite JSON number {token} is forbidden")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            result[key] = item
+        return result
+
+    try:
+        return json.loads(
+            value,
+            parse_constant=reject_constant,
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except RecursionError as exc:
+        raise ValueError("synchronized_targets JSON nesting is too deep") from exc
 
 
 class StrictRequest(BaseModel):
@@ -2752,10 +2782,26 @@ class StopFaultRecoveryIntentRequest(StrictRequest):
         return self
 
 
-class RuntimeScaleControlSelectorRequest(StrictRequest):
-    program_binding_id: str
+class RuntimeScaleControlTargetRequest(StrictRequest):
     component_role_id: str
     target_role_id: str
+
+    @field_validator("component_role_id", "target_role_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+
+class RuntimeScaleControlSelectorRequest(StrictRequest):
+    program_binding_id: str
+    component_role_id: str | None = None
+    target_role_id: str | None = None
+    synchronized_targets: Annotated[
+        list[RuntimeScaleControlTargetRequest] | None,
+        Field(min_length=2, max_length=MAX_OPERATION_PARTICIPANTS),
+    ] = None
 
     @field_validator(
         "program_binding_id",
@@ -2769,6 +2815,39 @@ class RuntimeScaleControlSelectorRequest(StrictRequest):
             label=info.field_name,
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
+
+    @model_validator(mode="after")
+    def validate_form(self) -> "RuntimeScaleControlSelectorRequest":
+        singular = self.component_role_id is not None or self.target_role_id is not None
+        group = self.synchronized_targets is not None
+        if singular == group or (
+            singular and (self.component_role_id is None or self.target_role_id is None)
+        ):
+            raise ValueError(
+                "runtime-scale selector must contain exactly one selector form"
+            )
+        if group:
+            targets = [
+                (x.component_role_id, x.target_role_id)
+                for x in self.synchronized_targets or []
+            ]
+            if len(set(targets)) != len(targets):
+                raise ValueError("synchronized runtime-scale targets must be unique")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_form(self, handler) -> dict[str, Any]:
+        result = handler(self)
+        if self.synchronized_targets is None:
+            result.pop("synchronized_targets", None)
+        else:
+            result.pop("component_role_id", None)
+            result.pop("target_role_id", None)
+        if self.component_role_id is None:
+            result.pop("component_role_id", None)
+        if self.target_role_id is None:
+            result.pop("target_role_id", None)
+        return result
 
 
 class OperationRuntimeScaleRequest(StrictRequest):

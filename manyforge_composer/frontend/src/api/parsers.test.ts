@@ -1935,6 +1935,118 @@ describe('addressed Robot Control parsers', () => {
     });
   });
 
+  it('parses synchronized runtime-scale status only when its member set and scopes agree', () => {
+    const selector = {
+      program_binding_id: 'binding-program-1',
+      synchronized_targets: [
+        { component_role_id: 'robot', target_role_id: 'arm' },
+        { component_role_id: 'robot', target_role_id: 'gripper' },
+      ],
+    };
+    const member = (target_role_id: string) => ({
+      active_control_configuration_generation: 1,
+      active_control_configuration_id: `active-${target_role_id}`,
+      control_binding_id: `binding-${target_role_id}`,
+      control_binding_revision: 'revision-1',
+      control_domain_id: `domain-${target_role_id}`,
+      control_domain_revision: 'revision-1',
+      scaling_domain_id: `scale-${target_role_id}`,
+      component_role_id: 'robot', target_role_id,
+    });
+    const memberFor = (component_role_id: string, target_role_id: string) => ({
+      ...member(target_role_id), component_role_id, target_role_id,
+    });
+    const response = {
+      api_version: 'manyforge.execution_command_response.v1', command: 'get_runtime_scale_control', ok: true,
+      runtime_scale_control: {
+        active_control_configuration_generation: null, active_control_configuration_id: null,
+        active_operation_id: null, active_operation_revision: null, active_operation_scale_generation: null,
+        application_state: null, control_binding_id: null, control_binding_revision: null,
+        control_domain_id: null, control_domain_revision: null, control_generation: 1,
+        effective_scale: null, frozen: false, reason: null, requested_scale: 0.5,
+        scaling_domain_id: null, selector, supported: true,
+        synchronized_members: [
+          member('arm'), member('gripper'),
+        ],
+      },
+    };
+    expect(parseRuntimeScaleControlStatus(response).selector).toEqual({
+      kind: 'group', programBindingId: 'binding-program-1',
+      synchronizedTargets: [
+        { componentRoleId: 'robot', targetRoleId: 'arm' },
+        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+      ],
+    });
+    expect(parseRuntimeScaleControlAccepted({
+      accepted: {
+        accepted_at_ns: 123, active_operation_id: null, active_operation_revision: null,
+        active_operation_scale_generation: null, control_generation: 2,
+        replay_status: 'accepted_new', request_id: 'request-group-1', requested_scale: 0.25,
+        selector,
+      },
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'set_runtime_scale_control', ok: true,
+    }).selector).toMatchObject({ kind: 'group', programBindingId: 'binding-program-1' });
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        synchronized_members: [member('arm'), member('arm')],
+      },
+    })).toThrow();
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        synchronized_members: [member('arm'), member('other')],
+      },
+    })).toThrow();
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        selector: {
+          program_binding_id: 'binding-program-1',
+          synchronized_targets: [
+            { component_role_id: 'a', target_role_id: 'b\u0000c' },
+            { component_role_id: 'a\u0000b', target_role_id: 'c' },
+          ],
+        },
+        synchronized_members: [
+          memberFor('a', 'b\u0000c'), memberFor('a\u0000b', 'c'),
+        ],
+      },
+    })).not.toThrow();
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        selector: {
+          ...selector,
+          program_binding_id: 'x'.repeat(257),
+        },
+      },
+    })).toThrow();
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        synchronized_members: [{
+          ...member('arm'), active_control_configuration_generation: -1,
+        }, member('gripper')],
+      },
+    })).toThrow();
+    expect(() => parseRuntimeScaleControlStatus({
+      ...response,
+      runtime_scale_control: {
+        ...response.runtime_scale_control,
+        synchronized_members: [{
+          ...member('arm'), control_domain_id: '',
+        }, member('gripper')],
+      },
+    })).toThrow();
+  });
+
   it('accepts source-local limits and exactly one matching observation', () => {
     const exactRevision = `sha256:${'a'.repeat(64)}`;
     const contracts = {
@@ -2220,6 +2332,43 @@ describe('addressed Robot Control parsers', () => {
         ok: true,
     };
     const scoped = parseExecutionControlStatus(targetsResponse, controlResponse);
+    const groupedControlResponse: { control_state: Record<string, unknown> } = structuredClone(controlResponse);
+    groupedControlResponse.control_state.runtime_scale_control = {
+      ...controlResponse.control_state.runtime_scale_control,
+      active_control_configuration_generation: null,
+      active_control_configuration_id: null,
+      control_binding_id: null,
+      control_binding_revision: null,
+      control_domain_id: null,
+      control_domain_revision: null,
+      scaling_domain_id: null,
+      selector: {
+        program_binding_id: 'sha256:binding',
+        synchronized_targets: [
+          { component_role_id: 'controlled_component', target_role_id: 'command_target' },
+          { component_role_id: 'controlled_component', target_role_id: 'gripper_target' },
+        ],
+      },
+      synchronized_members: [
+        {
+          active_control_configuration_generation: 1,
+          active_control_configuration_id: 'active-motion',
+          control_binding_id: 'binding-motion', control_binding_revision: exactRevision,
+          control_domain_id: 'domain-motion', control_domain_revision: exactRevision,
+          scaling_domain_id: 'scale-motion', component_role_id: 'controlled_component',
+          target_role_id: 'command_target',
+        },
+        {
+          active_control_configuration_generation: 1,
+          active_control_configuration_id: 'active-gripper',
+          control_binding_id: 'binding-gripper', control_binding_revision: exactRevision,
+          control_domain_id: 'domain-gripper', control_domain_revision: exactRevision,
+          scaling_domain_id: 'scale-gripper', component_role_id: 'controlled_component',
+          target_role_id: 'gripper_target',
+        },
+      ],
+    };
+    expect(() => parseExecutionControlStatus(targetsResponse, groupedControlResponse)).toThrow();
     const retired = {
       resident: false, operation: {
         program_run_id: motionTarget.program_run_id, operation_id: 'manual-1', operation_revision: 2,

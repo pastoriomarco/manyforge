@@ -2400,6 +2400,119 @@ TEST(CanonicalEmptySceneOwner,
 }
 
 TEST(CanonicalEmptySceneOwner,
+     NamedApplyStatusUsesCurrentCacheAcrossStageAndActivation) {
+  TemporaryDirectory directory("scene-apply-status-cache");
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+  CanonicalEmptySceneOwner first(database_path, admission, publication_reader,
+                                 bundle_source);
+  static_cast<void>(
+      FinalizeCanonicalBootstrap(first, publication_reader, admission));
+  CanonicalEmptySceneOwner second(database_path, admission, publication_reader,
+                                  bundle_source);
+  const auto predecessor = first.CurrentProjectionRevision();
+  const ProjectionApplyStatusQueryDTO query{ApplyId("apply-alpha"),
+                                            ApplyGeneration(1U)};
+
+  // Warm both process-local views before either connection creates the named
+  // Apply. The second stage must invalidate the first owner's absent cache,
+  // and the exact retry must replay the durable stage identity.
+  const auto first_absent = first.ProjectionApplyStatus(query);
+  const auto second_absent = second.ProjectionApplyStatus(query);
+  ASSERT_EQ(first_absent.state, ProjectionApplyStatusState::kAbsent);
+  ASSERT_EQ(second_absent.state, ProjectionApplyStatusState::kAbsent);
+  const auto stage_request = NamedStageRequest(admission, predecessor);
+  const auto staged = second.StageCandidateProjection(stage_request);
+  ASSERT_EQ(staged.state, ProjectionApplyStageResultState::kStaged);
+  const auto replayed_staged = first.StageCandidateProjection(stage_request);
+  ASSERT_EQ(replayed_staged.state, ProjectionApplyStageResultState::kStaged);
+  EXPECT_EQ(replayed_staged.projection_stage_generation,
+            staged.projection_stage_generation);
+  EXPECT_EQ(replayed_staged.candidate_projection_revision,
+            staged.candidate_projection_revision);
+
+  const auto first_staged = first.ProjectionApplyStatus(query);
+  const auto second_staged = second.ProjectionApplyStatus(query);
+  const auto repeated_staged = first.ProjectionApplyStatus(query);
+  ASSERT_EQ(first_staged.state, ProjectionApplyStatusState::kStaged);
+  EXPECT_EQ(second_staged.state, ProjectionApplyStatusState::kStaged);
+  EXPECT_EQ(repeated_staged.state, ProjectionApplyStatusState::kStaged);
+  EXPECT_EQ(repeated_staged.projection_stage_generation,
+            first_staged.projection_stage_generation);
+  EXPECT_EQ(repeated_staged.candidate_projection_revision,
+            first_staged.candidate_projection_revision);
+
+  const auto activation_request = ActivationRequest(staged);
+  const auto first_activated_result =
+      first.ActivateStagedProjection(activation_request);
+  ASSERT_EQ(first_activated_result.state,
+            ProjectionApplyActivationResultState::kActivated);
+  const auto second_activated_result =
+      second.ActivateStagedProjection(activation_request);
+  ASSERT_EQ(second_activated_result.state,
+            ProjectionApplyActivationResultState::kActivated);
+  EXPECT_EQ(second_activated_result.expected_active_projection_revision,
+            first_activated_result.expected_active_projection_revision);
+  EXPECT_EQ(second_activated_result.projection_stage_generation,
+            first_activated_result.projection_stage_generation);
+  EXPECT_EQ(second_activated_result.candidate_projection_revision,
+            first_activated_result.candidate_projection_revision);
+  EXPECT_EQ(second_activated_result.acknowledged_candidate_projection_revision,
+            first_activated_result.acknowledged_candidate_projection_revision);
+  const auto first_activated = first.ProjectionApplyStatus(query);
+  const auto second_activated = second.ProjectionApplyStatus(query);
+  const auto repeated_activated = first.ProjectionApplyStatus(query);
+  const auto repeated_second_activated = second.ProjectionApplyStatus(query);
+  EXPECT_EQ(first_activated.state, ProjectionApplyStatusState::kActivated);
+  EXPECT_EQ(second_activated.state, ProjectionApplyStatusState::kActivated);
+  EXPECT_EQ(repeated_activated.state, ProjectionApplyStatusState::kActivated);
+  EXPECT_EQ(repeated_second_activated.state,
+            ProjectionApplyStatusState::kActivated);
+  EXPECT_EQ(repeated_activated.candidate_projection_revision,
+            first_activated.candidate_projection_revision);
+  EXPECT_EQ(repeated_second_activated.candidate_projection_revision,
+            second_activated.candidate_projection_revision);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     NamedApplyStatusCacheRejectsSemanticallyTamperedDurableStage) {
+  TemporaryDirectory directory("scene-apply-status-tamper");
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
+  CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
+                                 bundle_source);
+  const auto predecessor =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  const auto staged =
+      owner.StageCandidateProjection(NamedStageRequest(admission, predecessor));
+  ASSERT_EQ(staged.state, ProjectionApplyStageResultState::kStaged);
+  const ProjectionApplyStatusQueryDTO query{staged.apply_id,
+                                            staged.apply_generation};
+  ASSERT_EQ(owner.ProjectionApplyStatus(query).state,
+            ProjectionApplyStatusState::kStaged);
+
+  ExecuteSql(
+      database_path,
+      "DROP TRIGGER logical_scene_named_apply_stages_no_update;"
+      "UPDATE logical_scene_named_apply_stages SET "
+      "candidate_scene_content_hash='sha256:"
+      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';"
+      "CREATE TRIGGER logical_scene_named_apply_stages_no_update "
+      "BEFORE UPDATE ON logical_scene_named_apply_stages BEGIN "
+      "SELECT RAISE(ABORT, 'logical_scene_named_apply_stages is immutable');"
+      "END;");
+  EXPECT_THROW(owner.ProjectionApplyStatus(query),
+               CanonicalEmptySceneOwnerIntegrityError);
+}
+
+TEST(CanonicalEmptySceneOwner,
      PortableSupportDeclarationsNormalizePersistAndProtectReferences) {
   TemporaryDirectory directory("scene-support-declarations");
   const auto database_path = directory.path() / "logical-scene.sqlite3";

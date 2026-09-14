@@ -5,6 +5,8 @@
 
 namespace manyforge::core {
 
+struct ActiveControlConfigurationDTO;
+
 class IKernelCellAdmissionPort {
  public:
   virtual ~IKernelCellAdmissionPort() = default;
@@ -22,6 +24,15 @@ class IKernelCellAdmissionPort {
   }
   [[nodiscard]] virtual Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent) = 0;
+  /// Process-local replacement recovery; ordinary transport does not expose
+  /// this authority. Kernel must verify its exact adopted predecessor.
+  [[nodiscard]] virtual Result<CellAdmissionClaimDTO> AcquireRouteRecoveryCellAdmissionClaim(
+      const CellAdmissionClaimIntentDTO&, const ActiveControlConfigurationDTO&) {
+    return Result<CellAdmissionClaimDTO>::Err(
+        ErrorDTO{"invalid_request",
+                 "Kernel route recovery admission is unavailable",
+                 {{"reason", "route_recovery_admission_unsupported"}}});
+  }
   [[nodiscard]] virtual Result<AuthoringAdmissionDTO> ReleaseCellAdmissionClaim(
       const CellAdmissionClaimReleaseDTO& release) = 0;
   [[nodiscard]] virtual Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(

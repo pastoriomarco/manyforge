@@ -707,6 +707,37 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
         "scale": 0.4,
     }
     assert RuntimeScaleControlRequest.model_validate(scale_control).scale == 0.4
+    group_selector = {
+        "program_binding_id": "binding-1",
+        "synchronized_targets": [
+            {"component_role_id": "robot-a", "target_role_id": "arm"},
+            {"component_role_id": "robot-b", "target_role_id": "arm"},
+        ],
+    }
+    group = RuntimeScaleControlRequest.model_validate(
+        {**scale_control, "selector": group_selector}
+    )
+    assert group.selector.model_dump(mode="json") == group_selector
+    with pytest.raises(ValidationError):
+        RuntimeScaleControlRequest.model_validate(
+            {
+                **scale_control,
+                "selector": {**group_selector, "component_role_id": "robot"},
+            }
+        )
+    with pytest.raises(ValidationError):
+        RuntimeScaleControlRequest.model_validate(
+            {
+                **scale_control,
+                "selector": {
+                    **group_selector,
+                    "synchronized_targets": [
+                        {"component_role_id": "robot-a", "target_role_id": "arm"},
+                        {"component_role_id": "robot-a", "target_role_id": "arm"},
+                    ],
+                },
+            }
+        )
     with pytest.raises(ValidationError):
         RuntimeScaleControlRequest.model_validate(
             {**scale_control, "expected_control_generation": -1}
@@ -715,6 +746,35 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
         RuntimeScaleControlRequest.model_validate(
             {**scale_control, "selector": {"program_binding_id": "binding-1"}}
         )
+    for field, value in (
+        ("component_role_id", ""),
+        ("target_role_id", "x" * 257),
+        ("component_role_id", "e\u0301"),
+    ):
+        with pytest.raises(ValidationError):
+            RuntimeScaleControlRequest.model_validate(
+                {
+                    **scale_control,
+                    "selector": {
+                        "program_binding_id": "binding-1",
+                        "component_role_id": (
+                            value if field == "component_role_id" else "robot"
+                        ),
+                        "target_role_id": value if field == "target_role_id" else "arm",
+                    },
+                }
+            )
+    for field, value in (
+        ("component_role_id", ""),
+        ("target_role_id", "x" * 257),
+        ("target_role_id", "e\u0301"),
+    ):
+        invalid_group = deepcopy(group_selector)
+        invalid_group["synchronized_targets"][0][field] = value
+        with pytest.raises(ValidationError):
+            RuntimeScaleControlRequest.model_validate(
+                {**scale_control, "selector": invalid_group}
+            )
 
 
 def test_gripper_command_requires_unit_tags_and_matching_nonnegative_effort() -> None:

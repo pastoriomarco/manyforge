@@ -504,11 +504,27 @@ export type RuntimeScaleApplicationState =
   | 'rejected'
   | 'failed';
 
-export interface RuntimeScaleControlSelector {
+export interface RuntimeScaleControlSingularSelector {
+  kind: 'singular';
   programBindingId: string;
   componentRoleId: string;
   targetRoleId: string;
 }
+
+export interface RuntimeScaleControlGroupSelector {
+  kind: 'group';
+  programBindingId: string;
+  synchronizedTargets: RuntimeScaleControlTarget[];
+}
+
+export interface RuntimeScaleControlTarget {
+  componentRoleId: string;
+  targetRoleId: string;
+}
+
+export type RuntimeScaleControlSelector =
+  | RuntimeScaleControlSingularSelector
+  | RuntimeScaleControlGroupSelector;
 
 /** Persistent owner setting; exact operation fields are observation only. */
 export interface RuntimeScaleControlStatus {
@@ -530,6 +546,17 @@ export interface RuntimeScaleControlStatus {
   effectiveScale: number | null;
   applicationState: RuntimeScaleApplicationState | null;
   reason: string | null;
+  synchronizedMembers?: RuntimeScaleControlMember[];
+}
+
+export interface RuntimeScaleControlMember extends RuntimeScaleControlTarget {
+  controlDomainId: string;
+  controlDomainRevision: string;
+  controlBindingId: string;
+  controlBindingRevision: string;
+  scalingDomainId: string;
+  activeControlConfigurationId: string;
+  activeControlConfigurationGeneration: number;
 }
 
 export interface RuntimeScaleControlAccepted {

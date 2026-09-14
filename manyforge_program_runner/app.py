@@ -19,6 +19,10 @@ from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlClient,
 )
+from manyforge_headless_api.program_cycle import (
+    PROGRAM_CONTROL_STATE_SCHEMA,
+    program_cycle_event_class,
+)
 from manyforge_headless_api.models import (
     ProgramFullStopResetRequest,
     ProgramFullStopResumeRequest,
@@ -43,7 +47,6 @@ from .models import (
 from .runtime import ProgramRunnerError
 
 
-_PROGRAM_CONTROL_STATE_SCHEMA = "manyforge.program_control_state.v1"
 _MAXIMUM_PROGRAM_CONTROL_CLIENTS = 4
 _MAXIMUM_PROGRAM_CONTROL_MESSAGE_BYTES = 16 * 1024 * 1024
 _NODE_PROGRESS_PERIOD_NS = 50_000_000
@@ -147,7 +150,7 @@ async def _serve_program_control_state(
             )
         return
     sequence = 0
-    last_control_revision: int | None = None
+    previous_cycle: dict[str, Any] | None = None
     last_node_send_ns = 0
     disconnect = asyncio.create_task(websocket.receive())
     try:
@@ -171,11 +174,8 @@ async def _serve_program_control_state(
                 return
             subscription.wake.clear()
             cycle, observed_ns = await asyncio.to_thread(source.snapshot)
-            control_revision = cycle.get("execution_control_revision")
-            node_only = (
-                last_control_revision is not None
-                and control_revision == last_control_revision
-            )
+            event_class = program_cycle_event_class(previous_cycle, cycle)
+            node_only = event_class == "node_progress"
             remaining_ns = _NODE_PROGRESS_PERIOD_NS - (observed_ns - last_node_send_ns)
             if node_only and remaining_ns > 0:
                 deadline_ns = observed_ns + remaining_ns
@@ -192,15 +192,18 @@ async def _serve_program_control_state(
                         break
                     subscription.wake.clear()
                     cycle, observed_ns = await asyncio.to_thread(source.snapshot)
-                    control_revision = cycle.get("execution_control_revision")
-                    node_only = control_revision == last_control_revision
+                    node_only = (
+                        program_cycle_event_class(previous_cycle, cycle)
+                        == "node_progress"
+                    )
                 cycle, observed_ns = await asyncio.to_thread(source.snapshot)
-                control_revision = cycle.get("execution_control_revision")
+                event_class = program_cycle_event_class(previous_cycle, cycle)
             sequence += 1
             payload = json.dumps(
                 {
-                    "schema_version": _PROGRAM_CONTROL_STATE_SCHEMA,
+                    "schema_version": PROGRAM_CONTROL_STATE_SCHEMA,
                     "server_sequence": str(sequence),
+                    "event_class": event_class,
                     "program_cycle": cycle,
                 },
                 allow_nan=False,
@@ -214,9 +217,7 @@ async def _serve_program_control_state(
                 )
                 return
             await websocket.send_text(payload)
-            last_control_revision = (
-                control_revision if isinstance(control_revision, int) else None
-            )
+            previous_cycle = cycle
             last_node_send_ns = observed_ns
     except (WebSocketDisconnect, RuntimeError):
         pass

@@ -230,8 +230,10 @@ predicate(std::vector<ComponentLifecycleStateDTO> states,
 }
 
 [[nodiscard]] std::vector<LifecycleIntentPlanDTO> gripper_plans() {
-  const auto declared = gripper_predicate(
-      ComponentLifecycleStateDTO::kDeclared, false, false);
+  auto prepare_eligible =
+      gripper_predicate(ComponentLifecycleStateDTO::kDeclared, false, false);
+  prepare_eligible.allowed_states.push_back(
+      ComponentLifecycleStateDTO::kDisabled);
   const auto prepared = gripper_predicate(
       ComponentLifecycleStateDTO::kPrepared, false, false);
   const auto active = gripper_predicate(
@@ -244,7 +246,7 @@ predicate(std::vector<ComponentLifecycleStateDTO> states,
        std::nullopt,
        prepared,
        kPlanTimeoutNs,
-       {{LifecyclePrimitiveId("native.gripper.prepare"), declared,
+       {{LifecyclePrimitiveId("native.gripper.prepare"), prepare_eligible,
          prepared}}},
       {ComponentLifecycleIntentKindDTO::kEnable,
        ComponentLifecycleStateDTO::kActive,

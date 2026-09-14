@@ -64,6 +64,7 @@ it('keeps known target rejection local without hiding transport or protocol fail
 
 const status = {
   selector: {
+    kind: 'singular',
     programBindingId: 'binding-1',
     componentRoleId: 'robot',
     targetRoleId: 'arm',
@@ -88,6 +89,75 @@ const status = {
 } satisfies RuntimeScaleControlStatus;
 
 describe('persistent runtime-scale transport cadence', () => {
+  it('keeps distinct synchronized target sets in distinct correlation fences', () => {
+    const group = {
+      ...status,
+      selector: {
+        kind: 'group' as const,
+        programBindingId: 'binding-1',
+        synchronizedTargets: [
+          { componentRoleId: 'robot', targetRoleId: 'arm' },
+          { componentRoleId: 'robot', targetRoleId: 'gripper' },
+        ],
+      },
+      synchronizedMembers: [
+        {
+          componentRoleId: 'robot', targetRoleId: 'arm',
+          controlDomainId: 'domain-arm', controlDomainRevision: 'rev-arm',
+          controlBindingId: 'binding-arm', controlBindingRevision: 'binding-rev-arm',
+          scalingDomainId: 'scale-arm', activeControlConfigurationId: 'config-arm',
+          activeControlConfigurationGeneration: 1,
+        },
+        {
+          componentRoleId: 'robot', targetRoleId: 'gripper',
+          controlDomainId: 'domain-gripper', controlDomainRevision: 'rev-gripper',
+          controlBindingId: 'binding-gripper', controlBindingRevision: 'binding-rev-gripper',
+          scalingDomainId: 'scale-gripper', activeControlConfigurationId: 'config-gripper',
+          activeControlConfigurationGeneration: 1,
+        },
+      ],
+    };
+    const differentGroup = {
+      ...group,
+      selector: { ...group.selector, synchronizedTargets: [
+        { componentRoleId: 'robot', targetRoleId: 'arm' },
+        { componentRoleId: 'robot', targetRoleId: 'camera' },
+      ] },
+    };
+    expect(runtimeScaleControlScopeFence('owner-1', group)).not.toBe(
+      runtimeScaleControlScopeFence('owner-1', differentGroup),
+    );
+    const delimiterCollisionGroup = {
+      ...group,
+      selector: {
+        kind: 'group' as const,
+        programBindingId: 'binding-1',
+        synchronizedTargets: [
+          { componentRoleId: 'a', targetRoleId: 'b\u0000c' },
+          { componentRoleId: 'a\u0000b', targetRoleId: 'c' },
+        ],
+      },
+    };
+    expect(runtimeScaleControlScopeFence('owner-1', group)).not.toBe(
+      runtimeScaleControlScopeFence('owner-1', delimiterCollisionGroup),
+    );
+    const reordered = { ...group, synchronizedMembers: [...group.synchronizedMembers].reverse() };
+    expect(runtimeScaleControlScopeFence('owner-1', group)).toBe(
+      runtimeScaleControlScopeFence('owner-1', reordered),
+    );
+    const changedMember = {
+      ...group,
+      synchronizedMembers: group.synchronizedMembers.map((member) => (
+        member.targetRoleId === 'arm'
+          ? { ...member, activeControlConfigurationGeneration: 2 }
+          : member
+      )),
+    };
+    expect(runtimeScaleControlScopeFence('owner-1', group)).not.toBe(
+      runtimeScaleControlScopeFence('owner-1', changedMember),
+    );
+  });
+
   it('sends the first value immediately and coalesces later values to 250 ms', () => {
     expect(runtimeScaleFlushDelay(10, Number.NEGATIVE_INFINITY, true, false))
       .toBe(0);

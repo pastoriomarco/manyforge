@@ -222,6 +222,67 @@ def _state(
     return state
 
 
+@pytest.mark.parametrize("replay_status", ["accepted_new", "replayed_exact"])
+@pytest.mark.parametrize("foreign_status", [False, True])
+def test_candidate_apply_retains_acceptance_across_status_polling(
+    monkeypatch: pytest.MonkeyPatch,
+    replay_status: str,
+    foreign_status: bool,
+) -> None:
+    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
+    headless = _Headless(_selection(program.to_dict()))
+    headless.manager_target = True
+    state = _state(headless, _Coordinator(), program=None)
+    acceptance = {
+        "api_version": "manyforge.manager_command_response.v1",
+        "apply_id": "apply-1",
+        "apply_generation": 1,
+        "request_id": "request-1",
+        "request_owner_epoch": "manager-owner-1",
+        "replay_status": replay_status,
+        "ok": True,
+        "error": None,
+        "state": "pending",
+        "candidate_projection_revision": None,
+    }
+    terminal = {
+        key: value
+        for key, value in acceptance.items()
+        if key not in ("request_id", "request_owner_epoch", "replay_status")
+    }
+    terminal.update(
+        state="succeeded",
+        apply_id="foreign-apply" if foreign_status else "apply-1",
+        candidate_projection_revision={"retained_bundle_id": "candidate"},
+    )
+    monkeypatch.setattr(headless, "manager_apply", lambda _body: deepcopy(acceptance))
+
+    def status(apply_id: str, generation: int) -> dict[str, Any]:
+        assert (apply_id, generation) == ("apply-1", 1)
+        return deepcopy(terminal)
+
+    monkeypatch.setattr(headless, "manager_apply_status", status, raising=False)
+    monkeypatch.setattr("manyforge_composer.backend.state.time.sleep", lambda _: None)
+    intent = {
+        "manager_apply": {
+            "candidate_receipt": {
+                "candidate_retained_bundle_id": headless.selection[
+                    "retained_bundle_id"
+                ],
+                "candidate_graph_revision": headless.selection["graph_revision"],
+            }
+        }
+    }
+    if foreign_status:
+        with pytest.raises(AuthoringJournalError) as error:
+            state.apply_manager_deployment_candidate(intent, {})
+        assert error.value.code == "manager_apply_status_identity_mismatch"
+    else:
+        result = state.apply_manager_deployment_candidate(intent, {})
+        assert result == {**acceptance, **terminal}
+        assert acceptance["state"] == "pending"
+
+
 def test_scene_preparation_retains_readiness_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

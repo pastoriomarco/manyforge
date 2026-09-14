@@ -488,14 +488,25 @@ def test_accepted_task_retries_only_typed_observation_unavailability() -> None:
     assert task.acknowledgements == [("task-1", task.starts[0][1])]
 
 
-@pytest.mark.parametrize("unstarted", [False, True])
-def test_held_task_observation_distinguishes_unstarted_from_settled_failure(unstarted):
+@pytest.mark.parametrize("proof", [1, "true", None])
+def test_task_settlement_evidence_requires_an_explicit_boolean(proof):
+    with pytest.raises(TypeError, match="settlement proof must be boolean"):
+        OwnerTaskSnapshot("task", OwnerTaskState.SUCCEEDED, settlement_proven=proof)
+
+
+def test_active_task_cannot_claim_terminal_settlement():
+    with pytest.raises(ValueError, match="terminal owner result"):
+        OwnerTaskSnapshot("task", OwnerTaskState.ACTIVE, settlement_proven=True)
+
+
+@pytest.mark.parametrize("unstarted,settlement_proven", [(True, False), (False, False), (False, True)])
+def test_held_task_observation_distinguishes_unstarted_from_settled_failure(unstarted, settlement_proven):
     class Port(_TaskPort):
         def observe(self, task_id):
             if unstarted:
                 raise OwnerInvocationHeldError(4)
             return OwnerTaskSnapshot(task_id=task_id, state=OwnerTaskState.FAILED,
-                                     metadata={"finish_current_settled": True}, reason_code="refused")
+                                     settlement_proven=settlement_proven, reason_code="refused")
 
     document = _minimal_document()
     document["tree"] = {"node_id": "simulation.reset", "instance_id": "action",
@@ -527,11 +538,17 @@ def test_held_task_observation_distinguishes_unstarted_from_settled_failure(unst
         assert task.starts[0][1] != task.starts[1][1]
     else:
         assert adapter.status is py_trees.common.Status.FAILURE
-        assert adapter.observe_control_state() == "settled"
-        assert not task.acknowledgements and not task.cancellations
+        assert adapter.observe_control_state() == ("settled" if settlement_proven else "unrecoverable")
+        assert len(task.acknowledgements) == int(settlement_proven)
+        assert not task.cancellations
 
 
-def test_terminal_task_remains_running_while_owner_settlement_is_pending() -> None:
+@pytest.mark.parametrize("selected_resume", [False, True])
+@pytest.mark.parametrize("reject_settlement", [False, True])
+def test_terminal_task_remains_running_while_owner_settlement_is_pending(
+    selected_resume: bool,
+    reject_settlement: bool,
+) -> None:
     class _SettlingTaskPort(_TaskPort):
         def __init__(self) -> None:
             super().__init__((OwnerTaskState.SUCCEEDED,))
@@ -544,6 +561,8 @@ def test_terminal_task_remains_running_while_owner_settlement_is_pending() -> No
         ) -> None:
             self.acknowledgement_attempts += 1
             if self.acknowledgement_attempts == 1:
+                if reject_settlement:
+                    raise ValueError("settlement refused")
                 raise OwnerTaskSettlementPendingError("still settling")
             super().acknowledge(task_id, identity)
 
@@ -574,8 +593,23 @@ def test_terminal_task_remains_running_while_owner_settlement_is_pending() -> No
     )
 
     adapter.initialise()
+    if reject_settlement:
+        assert adapter.update() is py_trees.common.Status.FAILURE
+        assert adapter.observe_control_state() == "unrecoverable"
+        assert not adapter.has_active_task
+        assert adapter.failure_reason_code == "owner_acknowledgement_failed"
+        assert task.acknowledgement_attempts == 1
+        return
     assert adapter.update() is py_trees.common.Status.RUNNING
-    assert adapter.update() is py_trees.common.Status.SUCCESS
+    assert adapter.observe_control_state() == "active"
+    assert adapter.has_active_task
+    if selected_resume:
+        assert adapter.reconcile_full_stop_task(selected_resume=True) == "settled"
+        assert adapter.status is py_trees.common.Status.SUCCESS
+    else:
+        assert adapter.update() is py_trees.common.Status.SUCCESS
+    assert adapter.observe_control_state() == "settled"
+    assert not adapter.has_active_task
     assert task.acknowledgement_attempts == 2
     assert task.acknowledgements == [("task-1", task.starts[0][1])]
 

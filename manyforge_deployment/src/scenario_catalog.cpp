@@ -91,6 +91,30 @@ const durability::ReadMessages kReadMessages{
     "scenario artifact changed while it was read",
     "scenario artifact grew while it was read",
 };
+const durability::PublicationMessages kPublicationMessages{
+    "scenario-catalog temporary file cannot be created",
+    "scenario-catalog temporary name cannot be allocated",
+    "scenario-catalog temporary file cannot be written",
+    "scenario-catalog temporary file cannot be synchronized",
+    "scenario-catalog temporary file cannot be closed",
+    "scenario-catalog revision cannot be published",
+    "scenario-catalog temporary file cannot be removed",
+    "scenario-catalog temporary link cannot be removed",
+};
+
+void retain_catalog(const std::filesystem::path &root, const std::string &name,
+                    const ScenarioCatalog &catalog) {
+  const auto path = root / (name + ".scenario-catalog." +
+                            catalog.revision().value().substr(7U) + ".json");
+  static_cast<void>(durability::publish_immutable_file_no_replace(
+      path, catalog.canonical_bytes(), kMaxArtifactEncodedBytes, kErrors,
+      kReadMessages, kDirectorySyncMessages, kPublicationMessages,
+      [&](const std::string_view existing) {
+        if (existing != catalog.canonical_bytes()) {
+          fail("retained scenario-catalog revision has divergent bytes");
+        }
+      }));
+}
 
 [[nodiscard]] const CanonicalValue::Object &
 require_object(const CanonicalValue &value, std::string_view path) {
@@ -992,6 +1016,12 @@ FilesystemScenarioCatalogRepository::compare_and_set(
       (current != nullptr && current->revision() != *expected_revision)) {
     return ScenarioCatalogPublishResult::kRevisionConflict;
   }
+  // Preserve a pre-retention head as well as the new candidate before the
+  // mutable publication moves. Preview must not erase an Applied referent.
+  if (current != nullptr) {
+    retain_catalog(storage_->root, storage_->name, *current);
+  }
+  retain_catalog(storage_->root, storage_->name, *candidate);
   if (current != nullptr && current->revision() == candidate->revision()) {
     return ScenarioCatalogPublishResult::kAlreadyCurrent;
   }

@@ -106,6 +106,7 @@ export function ProgramWorkspace({
   } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [paletteCollapsed, setPaletteCollapsed] = useState(false);
+  const collapsePalette = useCallback(() => setPaletteCollapsed(true), []);
   const [toolView, setToolView] = useState<'nodes' | 'params'>('nodes');
   const [declarationSelection, setDeclarationSelection] = useState<ProgramDeclarationSelection | null>(null);
   const [declarationPrefill, setDeclarationPrefill] = useState<{
@@ -195,12 +196,12 @@ export function ProgramWorkspace({
   const busy = state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
   const catalogEntries = catalog.status === 'ready' ? catalog.data.entries : [];
-  const catalogIdentity = catalog.status === 'ready' ? {
+  const catalogIdentity = useMemo(() => catalog.status === 'ready' ? {
     catalogId: catalog.data.catalogId,
     contentVersion: catalog.data.contentVersion,
     catalogDigest: catalog.data.catalogDigest,
     environmentDigest: catalog.data.environmentDigest,
-  } : null;
+  } : null, [catalog]);
   const nodeEnvironment = environment.status === 'ready' ? environment.data : null;
   const environmentAligned = catalog.status === 'ready'
     && environment.status === 'ready'
@@ -459,8 +460,8 @@ export function ProgramWorkspace({
             environment={nodeEnvironment}
             busy={authoringBusy}
             onMutate={mutate}
-            onSelect={(instanceId) => selectNode(instanceId)}
-            onCollapse={() => setPaletteCollapsed(true)}
+            onSelect={selectNode}
+            onCollapse={collapsePalette}
             collapseButtonRef={paletteCollapseButton}
             onViewChange={changeToolView}
           />

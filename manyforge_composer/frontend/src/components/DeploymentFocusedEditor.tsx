@@ -416,6 +416,7 @@ function OptionalNumberDraft({
   disabled,
   onCommit,
   maximum,
+  minimum,
   placeholder = 'model only',
 }: {
   label: string;
@@ -424,6 +425,7 @@ function OptionalNumberDraft({
   disabled: boolean;
   onCommit: (value: number | null) => Promise<unknown> | unknown;
   maximum?: number;
+  minimum?: number;
   placeholder?: string;
 }) {
   const [draft, setDraft] = useState(value === null ? '' : String(value));
@@ -434,7 +436,9 @@ function OptionalNumberDraft({
   }, [value]);
   const commit = async () => {
     const parsed = draft.trim() === '' ? null : Number(draft);
-    if (parsed !== null && (!Number.isFinite(parsed) || parsed <= 0 || (maximum !== undefined && parsed > maximum))) {
+    if (parsed !== null && (!Number.isFinite(parsed) || parsed <= 0
+      || (maximum !== undefined && parsed > maximum)
+      || (minimum !== undefined && parsed < minimum))) {
       setInvalid(true);
       return;
     }
@@ -449,7 +453,7 @@ function OptionalNumberDraft({
         <input
           type="number"
           value={draft}
-          min="0.000001"
+          min={minimum ?? 0.000001}
           max={maximum}
           step="any"
           placeholder={placeholder}
@@ -471,8 +475,10 @@ function OptionalNumberDraft({
         <small>{unit}</small>
       </span>
       {invalid && <small className="deployment-field-error">
-        {maximum === undefined ? 'Enter a positive value, or leave blank.'
-          : `Enter a positive value at most ${maximum}; the imported ceiling cannot be exceeded.`}
+        {maximum === 0 ? 'Enable ordinary jerk shaping first, or leave blank.'
+          : minimum !== undefined ? `Use at least ${minimum}${maximum === undefined ? '' : ` and at most ${maximum}`}, or clear the manual jerk cap first.`
+          : maximum === undefined ? 'Enter a positive value, or leave blank.'
+            : `Enter a positive value at most ${maximum}, or leave blank.`}
       </small>}
     </label>
   );
@@ -535,6 +541,13 @@ function DirectControlJointLimitsEditor({
   descriptor: ManualControlMotionDescriptor;
 }) {
   const authored = directControlJointLimits(runtime);
+  const targets = runtime.configuration.motion_target_limits;
+  const target = Array.isArray(targets) ? targets.map(objectValue).find((row) => (
+    row?.controllable_component_id === descriptor.controllableComponentId
+    && row?.command_target_id === descriptor.commandTargetId
+  )) : null;
+  const ordinary = objectValue(target?.ordinary_motion_jerk);
+  const ordinaryRows = Array.isArray(ordinary?.joint_limits) ? ordinary.joint_limits : [];
   const disabled = !controller.mutationAvailable || controller.busy;
   const commit = (
     sourceJointName: string,
@@ -562,6 +575,16 @@ function DirectControlJointLimitsEditor({
             && row.targetId === descriptor.commandTargetId
             && row.sourceJointName === limit.sourceJointName
           ));
+          const ordinaryJoint = ordinaryRows.map(objectValue).find((row) => (
+            row?.source_joint_name === limit.sourceJointName
+          ));
+          const imported = objectValue(ordinaryJoint?.imported);
+          // Only explicit Draft caps are known here. Presets and final
+          // consistency remain the native activation owner's responsibility.
+          const jerkMaximum = ordinary?.enabled !== true ? 0
+            : numberValue(ordinaryJoint?.override_rad_s3)
+              ?? (imported?.enabled === true ? numberValue(imported.maximum_rad_s3) : null)
+              ?? undefined;
           return (
             <section className="deployment-joint-cap" key={limit.sourceJointName}>
               <header>
@@ -591,6 +614,8 @@ function DirectControlJointLimitsEditor({
                 <OptionalNumberDraft
                   label="Maximum jerk"
                   value={draft?.maxJerkRadS3 ?? null}
+                  maximum={jerkMaximum}
+                  placeholder={ordinary?.enabled === true ? 'ordinary profile' : 'enable ordinary jerk first'}
                   unit="rad/s³"
                   disabled={disabled}
                   onCommit={(value) => commit(limit.sourceJointName, 'maxJerkRadS3', value)}
@@ -606,7 +631,7 @@ function DirectControlJointLimitsEditor({
         })}
       </div>
       <p className="field-help">
-        Blank fields use the robot-model limit. Draft changes become effective only after Deployment Apply.
+        Blank velocity and acceleration fields use the robot model. Manual jerk caps require ordinary jerk shaping and cannot exceed its limits. Clear manual jerk caps before switching ordinary shaping off. Draft changes become effective only after Deployment Apply.
       </p>
     </details>
   );
@@ -628,6 +653,10 @@ function OrdinaryMotionJerkEditor({ controller, runtime, limit, descriptor }: {
   const enabled = settings.enabled === true;
   const joints = Array.isArray(settings.joint_limits) ? settings.joint_limits : [];
   const required = joints.some((row) => objectValue(objectValue(row)?.imported)?.machine_required === true);
+  const manualCaps = directControlJointLimits(runtime).filter((row) => (
+    row.componentId === limit.componentId && row.targetId === limit.targetId
+    && row.maxJerkRadS3 !== null
+  ));
   const commit = (changes: Record<string, JsonValue>) => controller.mutate(
     ['graph', 'runtime_units', runtime.index, 'configuration', 'motion_target_limits', limit.rowIndex, 'ordinary_motion_jerk'],
     'set', { ...settings, ...changes },
@@ -652,7 +681,7 @@ function OrdinaryMotionJerkEditor({ controller, runtime, limit, descriptor }: {
           <select aria-label={`${limit.componentId} / ${limit.targetId} ordinary motion jerk`}
             disabled={disabled} value={enabled ? 'on' : 'off'}
             onChange={(event) => { void commit({ enabled: event.target.value === 'on' }); }}>
-            <option value="off" disabled={required}>Off</option>
+            <option value="off" disabled={required || manualCaps.length > 0}>Off</option>
             <option value="on">Enforce limits</option>
           </select>
         </label>
@@ -660,6 +689,9 @@ function OrdinaryMotionJerkEditor({ controller, runtime, limit, descriptor }: {
           value={numberValue(settings.preset_reference_time_s) ?? 1} disabled={disabled || !enabled}
           onCommit={(value) => commit({ preset_reference_time_s: value })} />
       </div>
+      {manualCaps.length > 0 && <p className="field-help">
+        Clear this target's Robot Control jerk caps before switching ordinary shaping off.
+      </p>}
       {applied !== null && <details>
         <summary>Ordinary joint jerk limits</summary>
         {applied.jointLimits.map((joint) => {
@@ -669,6 +701,7 @@ function OrdinaryMotionJerkEditor({ controller, runtime, limit, descriptor }: {
           return <section className="deployment-joint-cap" key={joint.sourceJointName}>
             <OptionalNumberDraft label={joint.sourceJointName} unit="rad/s³"
               value={numberValue(draft?.override_rad_s3)} disabled={disabled || !enabled}
+              minimum={manualCaps.find((row) => row.sourceJointName === joint.sourceJointName)?.maxJerkRadS3 ?? undefined}
               maximum={ceiling} placeholder={ceiling === undefined ? 'ManyForge preset' : `Imported: ${ceiling}`}
               onCommit={(value) => override(joint.sourceJointName, value)} />
             <small title={joint.imported ? `${joint.imported.sourceId}\n${joint.imported.sourceDigest}`

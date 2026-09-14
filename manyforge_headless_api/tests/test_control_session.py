@@ -44,6 +44,9 @@ from manyforge_headless_api.execution_control import (
 )
 from manyforge_headless_api.service import HeadlessService
 from manyforge_headless_api import control_state as control_state_module
+from manyforge_headless_api.program_cycle import (
+    program_cycle_event_class as _program_event_class,
+)
 from scripts.qualification.source_snapshot_fixture import source_snapshot_text
 
 
@@ -294,7 +297,9 @@ class _CommandSocket(_HandshakeSocket):
                             "control_session_id": self.session_id,
                             "client_sequence": "1",
                             "freshness": control.freshness.model_dump(mode="json"),
-                            "expected_semantic_owner_epoch": (control.semantic_owner_epoch),
+                            "expected_semantic_owner_epoch": (
+                                control.semantic_owner_epoch
+                            ),
                             "expected_execution_control_revision": (
                                 control.execution_control_revision
                             ),
@@ -397,6 +402,61 @@ def _facts_for_cycle(cycle: dict[str, Any]) -> ComponentOverviewFacts:
         execution_control_response={},
         errors={},
     )
+
+
+@pytest.mark.parametrize(
+    "target_owner,control_owner",
+    [
+        (None, "new"),
+        ("old", None),
+        ("old", "new"),
+        ("new", "new"),
+    ],
+)
+def test_control_shell_never_publishes_a_partial_or_crossed_execution_pair(
+    target_owner,
+    control_owner,
+) -> None:
+    targets = (
+        None
+        if target_owner is None
+        else {"ok": True, "identity": {"owner_epoch": target_owner}}
+    )
+    control = (
+        None
+        if control_owner is None
+        else {"ok": True, "identity": {"owner_epoch": control_owner}}
+    )
+    facts = replace(
+        _facts_for_cycle(_cycle()),
+        execution_targets_response=targets,
+        execution_control_response=control,
+    )
+    shell = HeadlessControlStateSource._shell_from_facts(facts)
+    coherent = target_owner is not None and target_owner == control_owner
+    assert shell["execution_targets"] == (targets if coherent else None)
+    assert shell["execution_control_state"] == (control if coherent else None)
+    assert facts.execution_targets_response is targets
+    assert facts.execution_control_response is control
+
+
+@pytest.mark.parametrize(
+    "targets_ok,control_ok", [(False, False), (False, True), (True, False)]
+)
+def test_control_shell_preserves_failed_native_responses_only_as_diagnostic_facts(
+    targets_ok,
+    control_ok,
+) -> None:
+    facts = replace(
+        _facts_for_cycle(_cycle()),
+        execution_targets_response={"ok": targets_ok, "error": "owner_unavailable"},
+        execution_control_response={"ok": control_ok, "error": "owner_unavailable"},
+    )
+    shell = HeadlessControlStateSource._shell_from_facts(facts)
+    assert shell["execution_targets"] is None
+    assert shell["execution_control_state"] is None
+    assert facts.execution_targets_response["ok"] is targets_ok
+    assert facts.execution_control_response["ok"] is control_ok
 
 
 def test_control_session_starts_with_versioned_current_snapshot() -> None:
@@ -566,7 +626,9 @@ def test_replaced_sparse_state_retains_facts_the_client_never_applied() -> None:
     assert pending.shell["complete"] is False
 
 
-def test_websocket_command_uses_the_same_ingress_without_waiting_for_state_poll() -> None:
+def test_websocket_command_uses_the_same_ingress_without_waiting_for_state_poll() -> (
+    None
+):
     stamps: list[Any] = []
     ingress = _ingress(stamps)
     frame = _frame(ingress)
@@ -579,7 +641,11 @@ def test_websocket_command_uses_the_same_ingress_without_waiting_for_state_poll(
     finally:
         ingress.close()
 
-    receipts = [message for message in socket.sent if message["message_kind"] == "command_receipt"]
+    receipts = [
+        message
+        for message in socket.sent
+        if message["message_kind"] == "command_receipt"
+    ]
     assert len(receipts) == 1
     assert receipts[0]["receipt"]["correlation_id"] == "request.1"
     assert receipts[0]["receipt"]["disposition"] == "received"
@@ -660,7 +726,9 @@ def test_runtime_scale_and_one_discrete_command_can_progress_independently() -> 
                             "control_session_id": session._session_id,  # noqa: SLF001
                             "client_sequence": str(sequence),
                             "freshness": control.freshness.model_dump(mode="json"),
-                            "expected_semantic_owner_epoch": (control.semantic_owner_epoch),
+                            "expected_semantic_owner_epoch": (
+                                control.semantic_owner_epoch
+                            ),
                             "expected_execution_control_revision": (
                                 control.execution_control_revision
                             ),
@@ -694,7 +762,9 @@ def test_runtime_scale_and_one_discrete_command_can_progress_independently() -> 
     asyncio.run(exercise())
 
 
-def test_outbound_state_and_heartbeat_are_latest_only_while_receipts_keep_order() -> None:
+def test_outbound_state_and_heartbeat_are_latest_only_while_receipts_keep_order() -> (
+    None
+):
     async def exercise() -> None:
         slots = _OutboundSlots()
         slots.put_state("old-state")
@@ -723,9 +793,12 @@ def test_inflight_command_does_not_hold_authoritative_state() -> None:
             session._slots.put_heartbeat("heartbeat")  # noqa: SLF001
             allowed = lambda: session._state_inflight is None  # noqa: E731, SLF001
 
-            assert await session._slots.take(state_allowed=allowed) == "heartbeat"  # noqa: SLF001
             assert (
-                await session._slots.take(state_allowed=allowed) == "newest-state"  # noqa: SLF001
+                await session._slots.take(state_allowed=allowed) == "heartbeat"
+            )  # noqa: SLF001
+            assert (
+                await session._slots.take(state_allowed=allowed)
+                == "newest-state"  # noqa: SLF001
             )
         finally:
             session._slots.close()  # noqa: SLF001
@@ -734,7 +807,9 @@ def test_inflight_command_does_not_hold_authoritative_state() -> None:
     asyncio.run(exercise())
 
 
-def test_one_state_credit_bounds_delivery_without_blocking_receipt_or_heartbeat() -> None:
+def test_one_state_credit_bounds_delivery_without_blocking_receipt_or_heartbeat() -> (
+    None
+):
     async def exercise() -> None:
         ingress = _ingress([])
         source = _Source(_frame(ingress))
@@ -752,7 +827,8 @@ def test_one_state_credit_bounds_delivery_without_blocking_receipt_or_heartbeat(
             state_allowed = lambda: session._state_inflight is None  # noqa: E731,SLF001
 
             assert (
-                await session._slots.take(state_allowed=state_allowed) == "receipt"  # noqa: SLF001
+                await session._slots.take(state_allowed=state_allowed)
+                == "receipt"  # noqa: SLF001
             )
             assert (
                 await session._slots.take(state_allowed=state_allowed)  # noqa: SLF001
@@ -829,7 +905,9 @@ def test_heartbeat_keeps_one_challenge_outstanding_and_reclaims_a_dead_peer() ->
 
         with pytest.raises(TimeoutError, match="stopped answering"):
             session._next_heartbeat(  # noqa: SLF001
-                session._last_heartbeat_ns + _CONTROL_DEAD_PEER_TIMEOUT_NS + 1  # noqa: SLF001
+                session._last_heartbeat_ns
+                + _CONTROL_DEAD_PEER_TIMEOUT_NS
+                + 1  # noqa: SLF001
             )
     finally:
         ingress.close()
@@ -876,13 +954,18 @@ def test_delayed_and_stale_heartbeat_are_one_sparse_incident_episode() -> None:
     try:
         assert session._next_heartbeat(now_ns) is not None  # noqa: SLF001
         assert (
-            session._next_heartbeat(now_ns + CONTROL_HEARTBEAT_DELAYED_NS + 1)  # noqa: SLF001
+            session._next_heartbeat(
+                now_ns + CONTROL_HEARTBEAT_DELAYED_NS + 1
+            )  # noqa: SLF001
             is None
         )
         assert (
-            session._next_heartbeat(now_ns + CONTROL_HEARTBEAT_STALE_NS + 1) is None  # noqa: SLF001
+            session._next_heartbeat(now_ns + CONTROL_HEARTBEAT_STALE_NS + 1)
+            is None  # noqa: SLF001
         )
-        assert [(event["incident_kind"], event["phase"]) for event in source.incidents] == [
+        assert [
+            (event["incident_kind"], event["phase"]) for event in source.incidents
+        ] == [
             ("control_delayed", "activated"),
             ("control_stale", "activated"),
         ]
@@ -911,8 +994,12 @@ def test_delayed_and_stale_heartbeat_are_one_sparse_incident_episode() -> None:
             session._delay_level = 0  # noqa: SLF001
         assert len(source.incidents) == 2
         assert len(session._server_incidents) == 2  # noqa: SLF001
-        session._resolve_heartbeat_incidents(now_ns + 205_000_000_000, 10_000_000)  # noqa: SLF001
-        assert [(event["incident_kind"], event["phase"]) for event in source.incidents] == [
+        session._resolve_heartbeat_incidents(
+            now_ns + 205_000_000_000, 10_000_000
+        )  # noqa: SLF001
+        assert [
+            (event["incident_kind"], event["phase"]) for event in source.incidents
+        ] == [
             ("control_delayed", "activated"),
             ("control_stale", "activated"),
             ("control_delayed", "resolved"),
@@ -993,7 +1080,9 @@ def test_volatile_receiver_counters_do_not_create_a_cold_state_change() -> None:
     later["runtime"]["sections"]["manager"]["receiver_age_ns"] = 900_000_000
     later["runtime"]["sections"]["manager"]["source_generation"] = 81
     later["runtime"]["sections"]["scene_runtime"]["source_generation"] += 1
-    later["runtime"]["sections"]["scene_runtime"]["source_content_digest"] = "pose-only-change"
+    later["runtime"]["sections"]["scene_runtime"][
+        "source_content_digest"
+    ] = "pose-only-change"
     later["alarms"]["state_revision"] = 21
 
     assert _shell_key(later) == _shell_key(first)
@@ -1221,15 +1310,31 @@ def test_no_control_client_creates_no_tasks_reads_or_timers() -> None:
 
 
 @pytest.mark.parametrize(
-    "malformed",
+    "malformed,event_class",
     [
-        {"state": "running"},
-        {**_cycle(), "node_status_revision": 0},
-        {key: value for key, value in _cycle().items() if key != "runtime_controls"},
-        {**_cycle(), "run_revision": 1},
-        {**_cycle(), "runtime_control_revision": 1},
+        ({"state": "running"}, "critical"),
+        ({**_cycle(), "node_status_revision": 0}, "critical"),
+        (
+            {
+                key: value
+                for key, value in _cycle().items()
+                if key != "runtime_controls"
+            },
+            "critical",
+        ),
+        ({**_cycle(), "run_revision": 1}, "critical"),
+        ({**_cycle(), "runtime_control_revision": 1}, "critical"),
+        (_cycle(), None),
+        (_cycle(), "unknown"),
+        (_cycle(), {}),
         *[
-            {**_running_cycle(1), "run": {**_running_cycle(1)["run"], field: value}}
+            (
+                {
+                    **_running_cycle(1),
+                    "run": {**_running_cycle(1)["run"], field: value},
+                },
+                "critical",
+            )
             for field, value in (
                 ("state", []),
                 ("tree_status", {}),
@@ -1239,11 +1344,11 @@ def test_no_control_client_creates_no_tasks_reads_or_timers() -> None:
     ],
 )
 def test_program_source_recovers_same_current_cycle_after_malformed_identity(
-    monkeypatch, malformed
+    monkeypatch, malformed, event_class
 ) -> None:
     async def exercise() -> None:
         ingress = _ingress([])
-        requests: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        requests: asyncio.Queue[tuple[dict[str, Any], Any]] = asyncio.Queue()
         attempts: asyncio.Queue[int] = asyncio.Queue()
         count = 0
 
@@ -1262,17 +1367,24 @@ def test_program_source_recovers_same_current_cycle_after_malformed_identity(
                 return self
 
             async def __anext__(self):
-                cycle = await requests.get()
+                cycle, classification = await requests.get()
                 self.sequence += 1
                 return json.dumps(
                     {
-                        "schema_version": "manyforge.program_control_state.v1",
+                        "schema_version": "manyforge.program_control_state.v2",
                         "server_sequence": str(self.sequence),
+                        **(
+                            {"event_class": classification}
+                            if classification is not None
+                            else {}
+                        ),
                         "program_cycle": cycle,
                     }
                 )
 
-        monkeypatch.setattr(control_state_module, "connect_websocket", lambda *_a, **_k: Upstream())
+        monkeypatch.setattr(
+            control_state_module, "connect_websocket", lambda *_a, **_k: Upstream()
+        )
         monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
         source = HeadlessControlStateSource(
             SimpleNamespace(
@@ -1287,20 +1399,20 @@ def test_program_source_recovers_same_current_cycle_after_malformed_identity(
         second = await source.subscribe()
         try:
             assert await asyncio.wait_for(attempts.get(), 1) == 1
-            requests.put_nowait(_cycle())
+            requests.put_nowait((_cycle(), "critical"))
             await asyncio.wait_for(first.wake.wait(), 1)
             source.take(first)
             source.take(second)
             # A new connection containing a bad identity invalidates semantics
             # without dropping either browser or poisoning the cached cycle.
-            requests.put_nowait(malformed)
+            requests.put_nowait((malformed, event_class))
             assert await asyncio.wait_for(attempts.get(), 1) == 2
             assert source.semantic_context().status == "unavailable"
             assert source._cycle == _cycle()  # noqa: SLF001
             assert source.take(first) is None and source.take(second) is None
-            requests.put_nowait(malformed)
+            requests.put_nowait((malformed, event_class))
             assert await asyncio.wait_for(attempts.get(), 1) == 3
-            requests.put_nowait(_cycle())
+            requests.put_nowait((_cycle(), "critical"))
             await asyncio.wait_for(first.wake.wait(), 1)
             assert source.semantic_context().status == "current"
             assert source.take(first).shell["program_cycle"] == _cycle()
@@ -1357,7 +1469,9 @@ def test_fallback_read_recovers_and_bursts_use_one_existing_task(monkeypatch) ->
             assert source.diagnostics()["source_failures"] == 1
         finally:
             await source.unsubscribe(subscription)
-            assert source._runner_task is None and source._cold_task is None  # noqa: SLF001
+            assert (
+                source._runner_task is None and source._cold_task is None
+            )  # noqa: SLF001
             assert source._program_wake is None  # noqa: SLF001
             ingress.close()
 
@@ -1387,7 +1501,9 @@ def test_cold_source_failure_recovers_without_a_second_file_event(
 
         monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
         source = HeadlessControlStateSource(
-            SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=facts),
+            SimpleNamespace(
+                program_cycle_status=_cycle, component_overview_facts=facts
+            ),
             ingress,
             program_runner_websocket_url=None,
         )
@@ -1414,7 +1530,9 @@ def test_incident_recorder_failure_is_counted_and_logged_once_per_episode(
     caplog,
 ) -> None:
     ingress = _ingress([])
-    source = HeadlessControlStateSource(object(), ingress, program_runner_websocket_url=None)
+    source = HeadlessControlStateSource(
+        object(), ingress, program_runner_websocket_url=None
+    )
 
     def fail(**_record):
         raise OSError("history sink failed")
@@ -1423,11 +1541,17 @@ def test_incident_recorder_failure_is_counted_and_logged_once_per_episode(
         for _ in range(100):
             source._record_incident_now(fail, {})  # noqa: SLF001
         assert source.diagnostics()["incident_recording_failures"] == 100
-        assert sum("trace may be incomplete" in row.message for row in caplog.records) == 1
+        assert (
+            sum("trace may be incomplete" in row.message for row in caplog.records) == 1
+        )
         source._record_incident_now(lambda **_record: {}, {})  # noqa: SLF001
         source._record_incident_now(fail, {})  # noqa: SLF001
-        assert sum("trace may be incomplete" in row.message for row in caplog.records) == 2
-        source._record_incident_now(lambda **_record: {"recorded": False}, {})  # noqa: SLF001
+        assert (
+            sum("trace may be incomplete" in row.message for row in caplog.records) == 2
+        )
+        source._record_incident_now(
+            lambda **_record: {"recorded": False}, {}
+        )  # noqa: SLF001
         assert source.diagnostics()["incident_recording_failures"] == 102
     finally:
         ingress.close()
@@ -1576,7 +1700,9 @@ def test_last_client_drains_physical_read_and_cancels_remaining_capture() -> Non
 
                 return read
 
-        source = HeadlessControlStateSource(Service(), ingress, program_runner_websocket_url=None)
+        source = HeadlessControlStateSource(
+            Service(), ingress, program_runner_websocket_url=None
+        )
         first = await source.subscribe()
         await asyncio.wait_for(entered.wait(), 1)
         teardown = asyncio.create_task(source.unsubscribe(first))
@@ -1602,10 +1728,14 @@ def test_last_client_drains_physical_read_and_cancels_remaining_capture() -> Non
 
 
 @pytest.mark.parametrize("busy", [False, True])
-def test_stop_rejection_does_not_require_initial_semantic_snapshot(monkeypatch, busy) -> None:
+def test_stop_rejection_does_not_require_initial_semantic_snapshot(
+    monkeypatch, busy
+) -> None:
     async def exercise() -> None:
         ingress = _ingress([])
-        source = HeadlessControlStateSource(object(), ingress, program_runner_websocket_url=None)
+        source = HeadlessControlStateSource(
+            object(), ingress, program_runner_websocket_url=None
+        )
         session = ExecutionControlSession(_HandshakeSocket(), source, ingress)
         session_id = session._session_id  # noqa: SLF001
         command = ExecutionControlCommandDTO.model_validate(
@@ -1622,7 +1752,9 @@ def test_stop_rejection_does_not_require_initial_semantic_snapshot(monkeypatch, 
                         "source_label": "test",
                         "control_session_id": session_id,
                         "client_sequence": "1",
-                        "freshness": ingress.freshness_for("runner.1", 4).model_dump(mode="json"),
+                        "freshness": ingress.freshness_for("runner.1", 4).model_dump(
+                            mode="json"
+                        ),
                         "expected_semantic_owner_epoch": "runner.1",
                         "expected_execution_control_revision": 4,
                     },
@@ -1715,7 +1847,9 @@ def test_control_source_rejects_clients_above_the_fixed_product_cap() -> None:
             program_runner_websocket_url=None,
         )
         for _ in range(CONTROL_MAXIMUM_CLIENTS):
-            source._subscriptions.add(ControlStateSubscription(asyncio.Event()))  # noqa: SLF001
+            source._subscriptions.add(
+                ControlStateSubscription(asyncio.Event())
+            )  # noqa: SLF001
         with pytest.raises(RuntimeError, match="client limit reached"):
             await source.subscribe()
         source._subscriptions.clear()  # noqa: SLF001
@@ -1775,7 +1909,9 @@ def test_client_incident_rate_resets_without_a_lifetime_exhaustion_counter() -> 
         ingress.close()
 
 
-def test_client_incident_episode_survives_reconnect_without_duplicate_activation() -> None:
+def test_client_incident_episode_survives_reconnect_without_duplicate_activation() -> (
+    None
+):
     ingress = _ingress([])
     source = HeadlessControlStateSource(
         object(),  # type: ignore[arg-type]
@@ -1900,7 +2036,9 @@ def test_abandoned_client_incident_correlations_remain_bounded_for_years() -> No
             now_ns=index + 1,
         )
 
-    assert len(source._active_client_incidents) == CONTROL_MAXIMUM_CLIENTS * 8  # noqa: SLF001
+    assert (
+        len(source._active_client_incidents) == CONTROL_MAXIMUM_CLIENTS * 8
+    )  # noqa: SLF001
     # A resolution for an expired diagnostic correlation is harmless. It must
     # never close a healthy control session or exhaust the application.
     source.record_client_incident_transition(
@@ -1916,6 +2054,55 @@ def test_abandoned_client_incident_correlations_remain_bounded_for_years() -> No
         now_ns=10_001,
     )
     ingress.close()
+
+
+def test_group_stop_and_resume_are_critical_without_a_cycle_revision_change() -> None:
+    def cycle(state: str, **changes: Any) -> dict[str, Any]:
+        return {
+            "execution_control_revision": 3,
+            "node_status_revision": 1,
+            "runtime_controls": {
+                "execution_selections": {
+                    "groups": [
+                        {
+                            "group_id": "arm",
+                            "state": state,
+                            "stop_allowed": True,
+                            "resume_allowed": state == "held",
+                            **changes,
+                        }
+                    ]
+                }
+            },
+        }
+
+    for before, after in (
+        ("active", "stopping"),
+        ("stopping", "held"),
+        ("held", "active"),
+    ):
+        assert _program_event_class(cycle(before), cycle(after)) == "critical"
+    assert (
+        _program_event_class(
+            cycle("active"), {**cycle("active"), "node_status_revision": 2}
+        )
+        == "node_progress"
+    )
+    assert (
+        _program_event_class(cycle("held"), cycle("held", held_node_count=2))
+        == "node_progress"
+    )
+    assert (
+        _program_event_class(cycle("held"), cycle("held", resume_allowed=False))
+        == "critical"
+    )
+    assert _program_event_class(None, cycle("active")) == "critical"
+    assert (
+        _program_event_class(
+            cycle("active"), {**cycle("active"), "execution_control_revision": 4}
+        )
+        == "critical"
+    )
 
 
 def test_control_source_keeps_only_the_newest_unapplied_owner_frame() -> None:
@@ -2036,7 +2223,9 @@ def test_control_source_reduces_new_cycle_from_cached_owner_facts() -> None:
         assert frame is not None
         assert frame.event_class == "critical"
         assert frame.shell["program_cycle"]["cycle_generation"] == 3
-        assert frame.shell["component_overview"]["basis"]["program_cycle_generation"] == 3
+        assert (
+            frame.shell["component_overview"]["basis"]["program_cycle_generation"] == 3
+        )
         assert cold_wakes == [None]
         source._subscriptions.clear()  # noqa: SLF001
         await source.close()

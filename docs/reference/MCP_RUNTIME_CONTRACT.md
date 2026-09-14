@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-09-10 23:46:37 UTC
+  Last regenerated: 2026-09-11 20:12:16 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -7519,11 +7519,59 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "additionalProperties": false,
         "properties": {
           "component_role_id": {
-            "title": "Component Role Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Component Role Id"
           },
           "program_binding_id": {
             "title": "Program Binding Id",
+            "type": "string"
+          },
+          "synchronized_targets": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/$defs/RuntimeScaleControlTargetRequest"
+                },
+                "maxItems": 4096,
+                "minItems": 2,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Synchronized Targets"
+          },
+          "target_role_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Role Id"
+          }
+        },
+        "required": [
+          "program_binding_id"
+        ],
+        "title": "RuntimeScaleControlSelectorRequest",
+        "type": "object"
+      },
+      "RuntimeScaleControlTargetRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "component_role_id": {
+            "title": "Component Role Id",
             "type": "string"
           },
           "target_role_id": {
@@ -7532,11 +7580,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           }
         },
         "required": [
-          "program_binding_id",
           "component_role_id",
           "target_role_id"
         ],
-        "title": "RuntimeScaleControlSelectorRequest",
+        "title": "RuntimeScaleControlTargetRequest",
         "type": "object"
       },
       "SceneResourceReferenceRequest": {
@@ -8076,10 +8123,17 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "additionalProperties": false,
             "properties": {
               "component_role_id": {
-                "maxLength": 256,
-                "minLength": 1,
-                "title": "Component Role Id",
-                "type": "string"
+                "anyOf": [
+                  {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Component Role Id"
               },
               "program_binding_id": {
                 "maxLength": 256,
@@ -8087,17 +8141,34 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "title": "Program Binding Id",
                 "type": "string"
               },
+              "synchronized_targets": {
+                "anyOf": [
+                  {
+                    "maxLength": 2097152,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Synchronized Targets"
+              },
               "target_role_id": {
-                "maxLength": 256,
-                "minLength": 1,
-                "title": "Target Role Id",
-                "type": "string"
+                "anyOf": [
+                  {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Target Role Id"
               }
             },
             "required": [
-              "program_binding_id",
-              "component_role_id",
-              "target_role_id"
+              "program_binding_id"
             ],
             "type": "object"
           }

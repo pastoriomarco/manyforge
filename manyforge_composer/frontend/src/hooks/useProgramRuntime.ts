@@ -418,7 +418,11 @@ export function programRuntimeAfterSnapshot(
     && currentRun.ownerEpoch === cycle.programRunnerOwnerEpoch
     && currentRun.capture.programRunId === cycle.programRunId;
   const run = currentMatchesCycle && (
-    observedRun === null || currentRun.runRevision > observedRun.runRevision
+    observedRun === null
+    || currentRun.runRevision > observedRun.runRevision
+    // A control-only publication must not rebuild the unchanged tree data.
+    // Node-status revision remains part of the existing authoritative key.
+    || programRunProjectionKey(currentRun) === programRunProjectionKey(observedRun)
   )
     ? currentRun
     : observedRun;

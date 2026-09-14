@@ -55,9 +55,7 @@ def _client_applied() -> dict[str, object]:
         "deployment_artifact_id": "cell-a",
         "deployment_revision": "sha256:" + "e" * 64,
         "graph_revision": binding["graph_revision"],
-        "node_environment_digest": binding["node_environment"][
-            "environment_digest"
-        ],
+        "node_environment_digest": binding["node_environment"]["environment_digest"],
         "preparation_digest": "sha256:" + "f" * 64,
         "program": {
             "program_id": "fixture",
@@ -175,9 +173,7 @@ def test_client_uses_the_component_overview_route() -> None:
         )
     finally:
         raw.close()
-    assert [request.url.path for request in requests] == [
-        "/api/component-overview"
-    ]
+    assert [request.url.path for request in requests] == ["/api/component-overview"]
 
 
 def test_client_relays_bounded_owner_json_without_reencoding() -> None:
@@ -197,12 +193,13 @@ def test_client_relays_bounded_owner_json_without_reencoding() -> None:
     )
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        assert client.component_overview_payload() == payloads[
-            "/api/component-overview"
-        ]
-        assert client.history_payload(params=(("limit", 32),)) == payloads[
-            "/api/execution/history"
-        ]
+        assert (
+            client.component_overview_payload() == payloads["/api/component-overview"]
+        )
+        assert (
+            client.history_payload(params=(("limit", 32),))
+            == payloads["/api/execution/history"]
+        )
     finally:
         raw.close()
     assert requests[1].url.params["limit"] == "32"
@@ -290,6 +287,37 @@ def test_client_sends_runtime_scale_selector_as_query_parameters() -> None:
     assert dict(requests[0].url.params) == selector
 
 
+def test_client_sends_group_runtime_scale_selector_as_one_json_query_parameter() -> (
+    None
+):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test", transport=httpx.MockTransport(handler)
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    selector = {
+        "program_binding_id": "binding-1",
+        "synchronized_targets": [
+            {"component_role_id": "robot-a", "target_role_id": "arm"},
+            {"component_role_id": "robot-b", "target_role_id": "arm"},
+        ],
+    }
+    try:
+        client.runtime_scale_control(selector)
+    finally:
+        raw.close()
+    assert dict(requests[0].url.params)["program_binding_id"] == "binding-1"
+    assert (
+        json.loads(dict(requests[0].url.params)["synchronized_targets"])
+        == selector["synchronized_targets"]
+    )
+
+
 def test_client_uses_the_dedicated_source_model_route() -> None:
     requests: list[httpx.Request] = []
 
@@ -340,9 +368,7 @@ def test_client_uses_the_atomic_source_model_context_route() -> None:
         )
     finally:
         raw.close()
-    assert [request.url.path for request in requests] == [
-        "/api/source-model-context"
-    ]
+    assert [request.url.path for request in requests] == ["/api/source-model-context"]
 
 
 def test_client_uses_the_atomic_assistant_mode_context_route() -> None:
@@ -367,9 +393,10 @@ def test_client_uses_the_atomic_assistant_mode_context_route() -> None:
     )
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        assert client.assistant_mode_context("composer-assistant")[
-            "schema_version"
-        ] == "manyforge.assistant_mode_context.v1"
+        assert (
+            client.assistant_mode_context("composer-assistant")["schema_version"]
+            == "manyforge.assistant_mode_context.v1"
+        )
     finally:
         raw.close()
     assert [request.url.path for request in requests] == [
@@ -401,9 +428,7 @@ def test_context_http_bound_is_method_specific() -> None:
 
 
 def test_context_http_bound_rejects_payload_over_context_limit() -> None:
-    payload = _sized_context_payload(
-        MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES + 1
-    )
+    payload = _sized_context_payload(MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES + 1)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=payload, request=request)
@@ -531,9 +556,7 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
 def test_client_rejects_rehashed_malformed_scenario_binding() -> None:
     selection = _client_scenario_selection()
     binding = selection["program_binding"]
-    binding["target_role_bindings"][0]["frame_role_bindings"][0][
-        "unknown"
-    ] = True
+    binding["target_role_bindings"][0]["frame_role_bindings"][0]["unknown"] = True
     binding["program_binding_id"] = compute_content_identity(
         binding,
         own_field="program_binding_id",
@@ -604,9 +627,7 @@ def _viewer_headers(
         "content-type": "application/xml" if kind == "urdf" else "model/stl",
         "x-manyforge-asset-kind": kind,
         "x-manyforge-cell-id": "cell-a",
-        "x-manyforge-content-digest": (
-            f"sha256:{hashlib.sha256(payload).hexdigest()}"
-        ),
+        "x-manyforge-content-digest": (f"sha256:{hashlib.sha256(payload).hexdigest()}"),
         "x-manyforge-graph-revision": "graph.1",
         "x-manyforge-product-contract-id": "manyforge.viewer_model",
         "x-manyforge-product-contract-revision": "sha256:" + "2" * 64,

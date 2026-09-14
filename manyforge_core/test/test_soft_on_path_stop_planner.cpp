@@ -278,12 +278,59 @@ TEST(SoftOnPathStopPlannerTest, ChangingScaleCannotOverspeedTheAcceptedVelocityE
   profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{100.0}}};
   const auto result = plan_soft_on_path_stop(accepted, profile, state, config);
   ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().details.at("reason"), "soft_on_path_scale_ramp_infeasible");
+  EXPECT_EQ(result.error().details.at("reason"), "soft_on_path_retimer_not_dispatchable");
+  EXPECT_EQ(result.error().details.at("trigger_reason"), "soft_on_path_scale_ramp_infeasible");
   EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(result.error()));
   const auto fallback = compute_jerk_limited_stop_profile(
       accepted, 1.7, 0.9, 1.6, 1.0, {{"joint_1", 100.0}}, {{"joint_1", 2.0}}, 0.01);
   ASSERT_TRUE(fallback.ok()) << fallback.error().message;
   EXPECT_FALSE(fallback.value().dispatchable);
+}
+
+TEST(SoftOnPathStopPlannerTest, DecreasingScaleUsesValidatedRetimerInsteadOfReversing) {
+  const auto accepted = prepared_cruise_trajectory();
+  auto state = measured_state_1d(1.2, 0.8);
+  state.trajectory_time_from_start_s = 1.7;
+  state.velocity_source = SoftOnPathStateSource::kModelDerived;
+  state.runtime_scale_rate_per_s_at_trip = -3.0;
+  state.runtime_scale_target_at_trip = 0.4;
+  auto profile = soft_profile(1.0);
+  SoftOnPathPlannerConfig config;
+  config.allow_model_velocity_fallback = true;
+  config.stop_traj_delta_s = 0.0;
+  config.per_joint_max_jerk_rad_s3 = {{"joint_1", 1000.0}};
+
+  const auto result = plan_soft_on_path_stop(accepted, profile, state, config);
+  ASSERT_TRUE(result.ok()) << result.error().message << " "
+                          << testing::PrintToString(result.error().details);
+  const auto& points = result.value().replacement_trajectory.waypoints;
+  ASSERT_EQ(points.size(), 4U);  // exact constant-jerk phases, including both switches
+  EXPECT_NEAR(points.front().velocities_rad_s[0], 0.8, 1e-9);
+  EXPECT_NEAR(points.front().accelerations_rad_s2[0], -3.0, 1e-9);
+  EXPECT_NEAR(points.back().time_from_start_s, 1.0, 1e-9);
+  EXPECT_NEAR(points.back().velocities_rad_s[0], 0.0, 1e-9);
+  EXPECT_NEAR(points.back().accelerations_rad_s2[0], 0.0, 1e-9);
+  for (size_t i = 1; i < points.size(); ++i) {
+    EXPECT_GE(points[i].positions_rad[0], points[i - 1].positions_rad[0] - 1e-9);
+    EXPECT_GE(points[i].velocities_rad_s[0], -1e-9);
+    EXPECT_LE(points[i].velocities_rad_s[0], 1.0 + 1e-9);
+    const auto& previous = points[i - 1];
+    const double dt = points[i].time_from_start_s - previous.time_from_start_s;
+    const double jerk = (points[i].accelerations_rad_s2[0] - previous.accelerations_rad_s2[0]) / dt;
+    EXPECT_LE(std::abs(jerk), 1000.0 + 1e-8);
+    EXPECT_NEAR(points[i].positions_rad[0],
+                previous.positions_rad[0] + previous.velocities_rad_s[0] * dt +
+                    previous.accelerations_rad_s2[0] * dt * dt / 2.0 +
+                    jerk * dt * dt * dt / 6.0,
+                1e-9);
+  }
+  // Do not reverse while removing acceleration or accept an over-limit seam.
+  EXPECT_FALSE(detail::affine_path_stop_candidate(accepted, 1.7, 0.8, -3.0, 1.0, {100.0}, {5.0}));
+  EXPECT_FALSE(detail::affine_path_stop_candidate(accepted, 1.7, 0.8, -3.0, 1.0, {2.0}, {1000.0}));
+  config.jerk_limits_enabled = false;
+  const auto off = plan_soft_on_path_stop(accepted, profile, state, config);
+  ASSERT_FALSE(off.ok());
+  EXPECT_TRUE(soft_on_path_error_recommends_hard_stop(off.error()));
 }
 
 TEST(SoftOnPathStopPlannerTest, BuildsDerivativeCompleteWallTimeRampFromMeasuredScaledVelocity) {

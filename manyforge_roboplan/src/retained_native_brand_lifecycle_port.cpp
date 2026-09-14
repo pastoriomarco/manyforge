@@ -315,8 +315,30 @@ RetainedNativeBrandLifecyclePort::Dispatch(
       selected = &transition;
     }
   }
-  if (selected == nullptr ||
-      selected->postcondition_predicate.allowed_states.size() != 1U ||
+  std::optional<core::ComponentLifecycleStateDTO> next_state;
+  if (selected != nullptr) {
+    const auto &allowed = selected->postcondition_predicate.allowed_states;
+    if (allowed.size() == 1U) {
+      next_state = allowed.front();
+    } else if (std::find(allowed.begin(), allowed.end(),
+                         state_->observed_state) != allowed.end()) {
+      next_state = state_->observed_state;
+    } else {
+      // This deterministic simulator does not invent a new hardware fault.
+      // A catalog may permit nominal or faulted feedback for the same command;
+      // select only a unique nominal outcome, never an arbitrary first state.
+      for (const auto candidate : allowed) {
+        if (candidate == core::ComponentLifecycleStateDTO::kFaulted)
+          continue;
+        if (next_state.has_value()) {
+          next_state.reset();
+          break;
+        }
+        next_state = candidate;
+      }
+    }
+  }
+  if (!next_state.has_value() ||
       state_->observation_generation ==
           std::numeric_limits<std::uint64_t>::max()) {
     return result(
@@ -327,9 +349,23 @@ RetainedNativeBrandLifecyclePort::Dispatch(
                    "primitive_not_eligible"));
   }
 
-  state_->observed_state =
-      selected->postcondition_predicate.allowed_states.front();
-  state_->facts = predicate_facts(selected->postcondition_predicate);
+  state_->observed_state = *next_state;
+  // Simulated primitives change their declared facts, not unrelated feedback
+  // (for example, disabling motion must not erase the known fault status).
+  for (const auto &fact : predicate_facts(selected->postcondition_predicate)) {
+    const auto existing = std::lower_bound(
+        state_->facts.begin(), state_->facts.end(), fact.lifecycle_fact_id,
+        [](const core::LifecycleFactDTO &candidate,
+           const core::LifecycleFactId &id) {
+          return candidate.lifecycle_fact_id < id;
+        });
+    if (existing != state_->facts.end() &&
+        existing->lifecycle_fact_id == fact.lifecycle_fact_id) {
+      *existing = fact;
+    } else {
+      state_->facts.insert(existing, fact);
+    }
+  }
   augment_unambiguous_next_facts(state_->catalog, state_->observed_state,
                                  state_->facts);
   ++state_->observation_generation;

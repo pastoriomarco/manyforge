@@ -10,8 +10,8 @@
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
-#include <manyforge_deployment/route_configuration_publication.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/route_configuration_publication.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_focused_adapters.hpp>
@@ -199,7 +199,8 @@ struct RetainedNativeRuntimeInput final {
   /// Retained manual-motion ceilings for the exact motion binding above.
   core::PerJointDynamicsLimitsDTO direct_control_joint_limits{};
   /// Saved settings, resolved once against the immutable model at activation.
-  std::optional<deployment::native_execution_runtime_contract::OrdinaryMotionJerkSettings>
+  std::optional<
+      deployment::native_execution_runtime_contract::OrdinaryMotionJerkSettings>
       ordinary_motion_jerk{};
 };
 
@@ -233,6 +234,14 @@ struct RetainedNativeRuntime final
   std::shared_ptr<RetainedKinematicStateProjector> state_projector;
   std::shared_ptr<RetainedObservedStateChannel> motion_state_channel;
   std::shared_ptr<RetainedObservedStateChannel> gripper_state_channel;
+  /// Owner-local current controller proof. The enclosing composition pins
+  /// the coordinator during reads and clears this binding before detachment.
+  std::function<core::Result<core::ContentDigest>(
+      const core::StopFaultRecoveryConfigurationExpectationDTO &)>
+      stop_recovery_configuration_source;
+  /// Advances existing CCLC replacement transactions on the host's ordinary
+  /// reconciliation lane. Cleared before the owning CCLC is detached.
+  std::function<core::Result<void>()> reconcile_controller_routes;
 
   std::shared_ptr<WallClock> clock;
   std::shared_ptr<SimpleScheduler> scheduler;
@@ -303,13 +312,14 @@ struct RetainedNativeRuntime final
   /// Final source check and evidence write share route-publication ordering.
   /// The host supplies the verified confirmation representative and its
   /// explicit policy; this is not an unqualified public mutation endpoint.
-  [[nodiscard]] core::Result<core::GripperGraspEvidenceDTO> RecordGraspObservation(
-      const core::RuntimeParticipantBinding& source,
-      const core::GripperGraspObservationDTO& observation, core::Duration freshness_budget_ns,
-      core::TimePoint admission_deadline_ns);
+  [[nodiscard]] core::Result<core::GripperGraspEvidenceDTO>
+  RecordGraspObservation(const core::RuntimeParticipantBinding &source,
+                         const core::GripperGraspObservationDTO &observation,
+                         core::Duration freshness_budget_ns,
+                         core::TimePoint admission_deadline_ns);
 
-  [[nodiscard]] core::Result<core::GripperCommandStatusDTO> ReadGripperStatus(
-      const core::RuntimeParticipantBinding& source) const;
+  [[nodiscard]] core::Result<core::GripperCommandStatusDTO>
+  ReadGripperStatus(const core::RuntimeParticipantBinding &source) const;
 
   /// Publish the exact route facts already sealed into a direct native
   /// runtime. Maintained products without a lifecycle owner call this once
@@ -317,9 +327,10 @@ struct RetainedNativeRuntime final
   [[nodiscard]] core::Result<void> PublishCurrentRetainedRouteConfigurations();
 
 private:
- // Caller holds route_publication_mutex_. No owner read or write escapes it.
- [[nodiscard]] bool GripperSourceIsCurrent(const core::RuntimeParticipantBinding& source) const;
- mutable std::mutex route_publication_mutex_;
+  // Caller holds route_publication_mutex_. No owner read or write escapes it.
+  [[nodiscard]] bool
+  GripperSourceIsCurrent(const core::RuntimeParticipantBinding &source) const;
+  mutable std::mutex route_publication_mutex_;
 };
 
 /// Assemble only the product-specific subordinate participant runtime. This

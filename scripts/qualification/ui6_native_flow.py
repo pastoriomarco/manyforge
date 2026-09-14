@@ -4,6 +4,7 @@ The caller owns one native workbench and two geckodriver processes.  This
 collector creates isolated Firefox sessions, records compact aggregate facts,
 and deletes only those sessions.  It never writes Program or Deployment state.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -450,7 +451,9 @@ def _visibility_row(
     baseline_clients: int,
 ) -> dict[str, Any]:
     first_handle = driver.command("GET", "/window")
-    _require(isinstance(first_handle, str) and first_handle, "browser window is missing")
+    _require(
+        isinstance(first_handle, str) and first_handle, "browser window is missing"
+    )
     opened = driver.command("POST", "/window/new", {"type": "tab"})
     if not isinstance(opened, dict) or not isinstance(opened.get("handle"), str):
         raise CollectorError("browser did not create a second tab")
@@ -490,8 +493,7 @@ def _visibility_row(
     _control_ready, _ = _wait(
         lambda: _dom_state(driver),
         lambda state: (
-            state["deploymentConnected"]
-            and state["velocityDisabled"] is False
+            state["deploymentConnected"] and state["velocityDisabled"] is False
         ),
         "foreground control-session recovery",
         DEFAULT_TIMEOUT_S,
@@ -523,6 +525,44 @@ STOP_PROBE_INSTALL_SCRIPT = r"""return (() => {
     stoppedPerfMs: null,
   };
   window.__manyforgeUi6StopProbe = probe;
+  if (window.__manyforgeUi6Diagnose === true) {
+    clearInterval(window.__manyforgeUi6LagTimer);
+    probe.loopPauses = [];
+    probe.maxLoopLagMs = 0;
+    probe.animationTaskMaxMs = 0;
+    probe.animationTasks = [];
+    probe.stateFrames = [];
+    if (window.__manyforgeUi6OriginalAnimationFrame === undefined) {
+      window.__manyforgeUi6OriginalAnimationFrame = window.requestAnimationFrame;
+      window.requestAnimationFrame = (callback) =>
+        window.__manyforgeUi6OriginalAnimationFrame.call(window, (timestamp) => {
+          const active = window.__manyforgeUi6StopProbe;
+          const startMs = performance.now();
+          try { callback(timestamp); }
+          finally {
+            const endMs = performance.now();
+            const durationMs = endMs - startMs;
+            if (active?.animationTasks !== undefined) {
+              active.animationTaskMaxMs = Math.max(active.animationTaskMaxMs, durationMs);
+              if (durationMs > 20) {
+                active.animationTasks.push({startMs, endMs, durationMs});
+                if (active.animationTasks.length > 20) active.animationTasks.shift();
+              }
+            }
+          }
+        });
+    }
+    let previous = performance.now();
+    window.__manyforgeUi6LagTimer = setInterval(() => {
+      const now = performance.now();
+      const lag = Math.max(0, now - previous - 20);
+      probe.maxLoopLagMs = Math.max(probe.maxLoopLagMs, lag);
+      if (lag > 20 && probe.loopPauses.length < 10) {
+        probe.loopPauses.push({startMs: previous, endMs: now, lagMs: lag});
+      }
+      previous = now;
+    }, 20);
+  }
   if (window.__manyforgeUi6OriginalWebSocketSend === undefined) {
     window.__manyforgeUi6OriginalWebSocketSend = WebSocket.prototype.send;
     WebSocket.prototype.send = function(data) {
@@ -540,13 +580,30 @@ STOP_PROBE_INSTALL_SCRIPT = r"""return (() => {
         active.commandKind = kind;
         const socket = this;
         const receive = (event) => {
+          if (active !== window.__manyforgeUi6StopProbe || active.stoppedPerfMs !== null) {
+            socket.removeEventListener('message', receive);
+            return;
+          }
           let incoming = null;
           try { incoming = typeof event.data === 'string' ? JSON.parse(event.data) : null;
           } catch { return; }
+          if (active.stateFrames !== undefined && active.stateFrames.length < 24
+            && incoming?.shell?.program_cycle !== undefined) {
+            const cycle = incoming.shell.program_cycle;
+            active.stateFrames.push({
+              eventTimestampMs: event.timeStamp,
+              observedPerfMs: performance.now(),
+              serverSequence: incoming.server_sequence,
+              eventClass: incoming.event_class,
+              cycleState: cycle.state,
+              executionControlRevision: cycle.execution_control_revision,
+              selections: cycle.runtime_controls?.execution_selections ?? null,
+            });
+          }
           const receiptMatches = incoming?.message_kind === 'command_receipt'
             && incoming?.receipt?.correlation_id === active.correlationId;
           if (!receiptMatches) {
-            if (active.messagesBeforeReceipt.length < 16) {
+            if (active.receiptPerfMs === null && active.messagesBeforeReceipt.length < 16) {
               active.messagesBeforeReceipt.push({
                 kind: incoming?.message_kind ?? 'unknown',
                 bytes: typeof event.data === 'string' ? event.data.length : null,
@@ -556,11 +613,14 @@ STOP_PROBE_INSTALL_SCRIPT = r"""return (() => {
             return;
           }
           active.receiptPerfMs = performance.now();
+          if (window.__manyforgeUi6Diagnose === true) {
+            active.receiptEventTimestampMs = event.timeStamp;
+          }
           active.receiptWallMs = Date.now();
           active.receipt = incoming.receipt;
           active.controlIngressMonotonicNs = incoming.receipt.received_monotonic_ns;
           active.receiptEmittedMonotonicNs = incoming.emitted_monotonic_ns;
-          socket.removeEventListener('message', receive);
+          if (active.stateFrames === undefined) socket.removeEventListener('message', receive);
         };
         socket.addEventListener('message', receive);
       }
@@ -685,7 +745,9 @@ def _wait_stop_terminal(
                     "sequence": sequence,
                 }
         if time.monotonic() >= deadline:
-            raise CollectorError("timed out waiting for the exact terminal Stop history")
+            raise CollectorError(
+                "timed out waiting for the exact terminal Stop history"
+            )
         time.sleep(POLL_SECONDS)
 
 
@@ -755,18 +817,14 @@ def _stop_latency(
     result = {
         "clickToDispatchMs": dispatch_perf - click_perf,
         "dispatchToControlIngressMs": ingress_wall_ms - dispatch_wall,
-        "controlIngressToKernelAcceptanceMs": (accepted_ns - ingress_ns)
-        / 1_000_000.0,
-        "kernelAcceptanceToReceiptMs": receipt_perf - dispatch_perf
+        "controlIngressToKernelAcceptanceMs": (accepted_ns - ingress_ns) / 1_000_000.0,
+        "kernelAcceptanceToReceiptMs": receipt_perf
+        - dispatch_perf
         - (accepted_wall_ms - dispatch_wall),
-        "kernelAcceptanceToReceiptEmissionMs": (
-            emitted_ns - accepted_ns
-        ) / 1_000_000.0,
-        "receiptEmissionToBrowserMs": receipt_perf - dispatch_perf
-        - (
-            (emitted_ns + monotonic_wall_offset_ns) / 1_000_000.0
-            - dispatch_wall
-        ),
+        "kernelAcceptanceToReceiptEmissionMs": (emitted_ns - accepted_ns) / 1_000_000.0,
+        "receiptEmissionToBrowserMs": receipt_perf
+        - dispatch_perf
+        - ((emitted_ns + monotonic_wall_offset_ns) / 1_000_000.0 - dispatch_wall),
         "kernelAcceptanceToStoppingPresentationMs": (
             stopping_perf
             - click_perf
@@ -777,8 +835,12 @@ def _stop_latency(
         ),
         "kernelAcceptanceToPhysicalSettlementMs": (completed_ns - accepted_ns)
         / 1_000_000.0,
-        "physicalSettlementToStoppedPresentationMs": stopped_perf - click_perf
-        - (completed_wall_ms - _finite(probe.get("clickWallMs"), "Stop click wall time")),
+        "physicalSettlementToStoppedPresentationMs": stopped_perf
+        - click_perf
+        - (
+            completed_wall_ms
+            - _finite(probe.get("clickWallMs"), "Stop click wall time")
+        ),
         "clickToStoppedPresentationMs": stopped_perf - click_perf,
         "transport": "websocket",
         "commandKind": probe.get("commandKind"),
@@ -861,14 +923,13 @@ def _run_and_stop(
     _wait_running_node(composer_url, "move_to_rest")
     _motion_flow, _ = _wait(
         lambda: _flow(driver),
-        lambda state: (
-            state["receivedFrames"] >= 1
-            and state["appliedFrames"] >= 1
-        ),
+        lambda state: (state["receivedFrames"] >= 1 and state["appliedFrames"] >= 1),
         "first applied robot motion before UI6 Stop",
         DEFAULT_TIMEOUT_S,
     )
-    clicked = _execute(driver, r"""return (() => {
+    clicked = _execute(
+        driver,
+        r"""return (() => {
       const stop = document.querySelector('.viewer-transport .transport-stop-primary');
       const probe = window.__manyforgeUi6StopProbe;
       if (!(stop instanceof HTMLButtonElement) || stop.disabled || probe === undefined) {
@@ -878,7 +939,8 @@ def _run_and_stop(
       probe.clickWallMs = Date.now();
       stop.click();
       return true;
-    })();""")
+    })();""",
+    )
     _require(clicked is True, "Stop was unavailable at dispatch")
     stopped, stop_trace = _wait(
         lambda: _dom_state(driver),
@@ -950,10 +1012,7 @@ def _ensure_idle(driver: RawWebDriver) -> None:
         lambda: _dom_state(driver),
         lambda state: (
             (state["runText"] == "Run" and state["runDisabled"] is False)
-            or (
-                state["runText"] == "Resume Motion"
-                and state["runDisabled"] is False
-            )
+            or (state["runText"] == "Resume Motion" and state["runDisabled"] is False)
             or state["resetDisabled"] is False
         ),
         "actionable owner state before UI6 qualification",
@@ -1008,8 +1067,12 @@ def _slow_client_row(
     fast_snapshot = _performance(fast)
     _require(fast_flow["receivedFrames"] > 0, "fast client received no motion frames")
     _require(fast_flow["appliedFrames"] > 0, "fast client applied no motion frames")
-    _require(fast_flow["replacedBeforeApply"] == 0, "fast client accumulated stale frames")
-    _require(fast_flow["maxUnappliedFrames"] <= 1, "fast client exceeded one unapplied frame")
+    _require(
+        fast_flow["replacedBeforeApply"] == 0, "fast client accumulated stale frames"
+    )
+    _require(
+        fast_flow["maxUnappliedFrames"] <= 1, "fast client exceeded one unapplied frame"
+    )
     _require(
         fast_snapshot["performance"]["modelBuilds"] == 0,
         "slow-client pressure rebuilt fast-client geometry",
@@ -1293,11 +1356,17 @@ def main(argv: list[str] | None = None) -> int:
             require_software_renderer=arguments.require_software_renderer,
         )
     except CollectorError as error:
-        print(json.dumps({
-            "schemaVersion": RESULT_SCHEMA,
-            "success": False,
-            "error": str(error),
-        }, separators=(",", ":"), sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "schemaVersion": RESULT_SCHEMA,
+                    "success": False,
+                    "error": str(error),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
         return 1
     print(json.dumps(result, separators=(",", ":"), sort_keys=True))
     return 0

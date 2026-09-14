@@ -549,7 +549,7 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "lite6_robot.gripper.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:61da7b92dc520ea444972ceb03b1cf50d7142145715f92ad3753a44d98ac416f",
+      "capability_provider_binding_revision": "sha256:5a573b2ea00eac8f0f3b523d5196fb32d2cc890eb3244d716cc0bef8e344d4c4",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -566,7 +566,7 @@
         "command_target_id": "gripper",
         "component_type_revision": "sha256:ba67295ae3d02b262bde54cbda369875b84b05643e29b120724a2c9e14b9d09e",
         "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:502f3714777691db534ef1030736c66b6fe3319c395ec3120cde505272ffbae0",
+        "control_binding_revision": "sha256:13f29d085e1b661dec76163897ed2f3020b91626bb6c5213b711216e63abce54",
         "controllable_component_id": "lite6_robot"
       }
     },
@@ -574,7 +574,7 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "lite6_robot.gripper.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:69c165dee079281dec5d2be2e2de6be71e025e3c9bc2be5c3e822625b6ffe0bc",
+      "capability_provider_binding_revision": "sha256:76b978dc41a412154d095837865064faa4eefaebe762fd32af34d129c7e21b7c",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -591,7 +591,7 @@
         "command_target_id": "gripper",
         "component_type_revision": "sha256:ba67295ae3d02b262bde54cbda369875b84b05643e29b120724a2c9e14b9d09e",
         "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:502f3714777691db534ef1030736c66b6fe3319c395ec3120cde505272ffbae0",
+        "control_binding_revision": "sha256:13f29d085e1b661dec76163897ed2f3020b91626bb6c5213b711216e63abce54",
         "controllable_component_id": "lite6_robot"
       }
     }
@@ -1049,11 +1049,11 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/provider_manifest/lite6_gripper_provider/6667e1b8ca8226336033079afdee398b8aac9305c1adfa4e6c852e503342467f",
-        "content_digest": "sha256:899ac6998ab66e9422b9b9a8dfce307ceedbafd8a10661625d58d008108f2e35",
+        "content_addressed_store_key": "catalog/maintained/provider_manifest/lite6_gripper_provider/ad4bb5ea208ef73b5422198eed2fca1140c28b95c56eaf604cc6a57ca3432aa6",
+        "content_digest": "sha256:c9a4f08b74895724cb579440e8d8eea65a7eac4dd089a940a0f6f87515cc571a",
         "record_id": "lite6_gripper_provider",
         "record_kind": "provider_manifest",
-        "record_revision": "sha256:6667e1b8ca8226336033079afdee398b8aac9305c1adfa4e6c852e503342467f",
+        "record_revision": "sha256:ad4bb5ea208ef73b5422198eed2fca1140c28b95c56eaf604cc6a57ca3432aa6",
         "schema_id": "manyforge.provider_manifest.v1",
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
@@ -1125,7 +1125,7 @@
     ]
   },
   "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
-  "deployment_revision": "sha256:91e36015a668296f12566b759b28f18530b720b801e69e97aae60eb3f7db22a1",
+  "deployment_revision": "sha256:20d2860d5d30b2a275e216dbd50aa221707e4676b1f5f48b4acf71787b67ef84",
   "description": "Native ManyForge pick-and-place deployment for UFACTORY Lite6 with the lite pneumatic gripper. The model bundle is self-contained; xarm_ros2 is a generation-time and real-robot runtime dependency only.",
   "desired_control_configurations": [
     {
@@ -1197,12 +1197,12 @@
       "binding_routes": [
         {
           "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-          "control_binding_revision": "sha256:502f3714777691db534ef1030736c66b6fe3319c395ec3120cde505272ffbae0",
+          "control_binding_revision": "sha256:13f29d085e1b661dec76163897ed2f3020b91626bb6c5213b711216e63abce54",
           "control_route_id": "gripper_position"
         },
         {
           "control_binding_id": "lite6_robot.gripper.tool-gripper-feedback",
-          "control_binding_revision": "sha256:72e07e8654cf657942d01efba56fae5c63a7eb1b0a03d4dd3786b4ac509ea91b",
+          "control_binding_revision": "sha256:48eb0d092f8e5625e46914e6885cf2aee96fb0ed9ebe25932f2543ec11c3d574",
           "control_route_id": "gripper_position"
         }
       ],
@@ -1925,7 +1925,7 @@
         "command_target_id": "gripper",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:502f3714777691db534ef1030736c66b6fe3319c395ec3120cde505272ffbae0",
+        "control_binding_revision": "sha256:13f29d085e1b661dec76163897ed2f3020b91626bb6c5213b711216e63abce54",
         "control_domain_id": "lite6_robot.gripper.control",
         "control_interface_contract_id": "manyforge.native_gripper_position",
         "control_interface_revision": "sha256:865d6a1fa8ecd0de6bf1a7a88ea683f63120616d9355faf33535c7a55ec4b2db",
@@ -1936,7 +1936,7 @@
         ],
         "provider_instance_id": "lite6_robot.native_gripper_control",
         "provider_manifest_id": "lite6_gripper_provider",
-        "provider_manifest_revision": "sha256:6667e1b8ca8226336033079afdee398b8aac9305c1adfa4e6c852e503342467f",
+        "provider_manifest_revision": "sha256:ad4bb5ea208ef73b5422198eed2fca1140c28b95c56eaf604cc6a57ca3432aa6",
         "provider_runtime_unit_id": "lite6_robot.native_execution",
         "resource_bindings": [
           {
@@ -1967,7 +1967,7 @@
         "command_target_id": "gripper",
         "containment_granularity": "resource",
         "control_binding_id": "lite6_robot.gripper.tool-gripper-feedback",
-        "control_binding_revision": "sha256:72e07e8654cf657942d01efba56fae5c63a7eb1b0a03d4dd3786b4ac509ea91b",
+        "control_binding_revision": "sha256:48eb0d092f8e5625e46914e6885cf2aee96fb0ed9ebe25932f2543ec11c3d574",
         "control_domain_id": "lite6_robot.gripper.control",
         "control_interface_contract_id": "manyforge.native_gripper_position",
         "control_interface_revision": "sha256:865d6a1fa8ecd0de6bf1a7a88ea683f63120616d9355faf33535c7a55ec4b2db",
@@ -1978,7 +1978,7 @@
         ],
         "provider_instance_id": "lite6_robot.native_gripper_control",
         "provider_manifest_id": "lite6_gripper_provider",
-        "provider_manifest_revision": "sha256:6667e1b8ca8226336033079afdee398b8aac9305c1adfa4e6c852e503342467f",
+        "provider_manifest_revision": "sha256:ad4bb5ea208ef73b5422198eed2fca1140c28b95c56eaf604cc6a57ca3432aa6",
         "provider_runtime_unit_id": "lite6_robot.native_execution",
         "resource_bindings": [
           {
@@ -3346,7 +3346,7 @@
       },
       {
         "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:502f3714777691db534ef1030736c66b6fe3319c395ec3120cde505272ffbae0",
+        "control_binding_revision": "sha256:13f29d085e1b661dec76163897ed2f3020b91626bb6c5213b711216e63abce54",
         "control_domain_id": "lite6_robot.gripper.control",
         "control_domain_revision": "sha256:9c243c2074db7815b705266014668b65ffff352b7d6f876a4309c0e382066ef1",
         "control_route_id": "gripper_position",
@@ -3364,7 +3364,7 @@
       },
       {
         "control_binding_id": "lite6_robot.gripper.tool-gripper-feedback",
-        "control_binding_revision": "sha256:72e07e8654cf657942d01efba56fae5c63a7eb1b0a03d4dd3786b4ac509ea91b",
+        "control_binding_revision": "sha256:48eb0d092f8e5625e46914e6885cf2aee96fb0ed9ebe25932f2543ec11c3d574",
         "control_domain_id": "lite6_robot.gripper.control",
         "control_domain_revision": "sha256:9c243c2074db7815b705266014668b65ffff352b7d6f876a4309c0e382066ef1",
         "control_route_id": "gripper_position",
@@ -3483,7 +3483,7 @@
       },
       {
         "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:502f3714777691db534ef1030736c66b6fe3319c395ec3120cde505272ffbae0",
+        "control_binding_revision": "sha256:13f29d085e1b661dec76163897ed2f3020b91626bb6c5213b711216e63abce54",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3492,7 +3492,7 @@
       },
       {
         "control_binding_id": "lite6_robot.gripper.tool-gripper-feedback",
-        "control_binding_revision": "sha256:72e07e8654cf657942d01efba56fae5c63a7eb1b0a03d4dd3786b4ac509ea91b",
+        "control_binding_revision": "sha256:48eb0d092f8e5625e46914e6885cf2aee96fb0ed9ebe25932f2543ec11c3d574",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,

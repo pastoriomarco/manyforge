@@ -274,7 +274,11 @@ class OwnerTaskAdapter(_OwnerAdapter):
             return py_trees.common.Status.FAILURE
         if task.state is OwnerTaskState.ACTIVE:
             return py_trees.common.Status.RUNNING
-        if task.state is OwnerTaskState.SUCCEEDED:
+        if task.state is OwnerTaskState.SUCCEEDED or (
+            task.state is OwnerTaskState.FAILED
+            and task.settlement_proven
+            and task.metadata.get("authored_failure_policy") in (None, "condition_failure")
+        ):
             if not self._acknowledged:
                 if self._identity is None:
                     self._record_failure(
@@ -290,6 +294,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
                     self._record_failure("owner_acknowledgement_failed", str(exc))
                     return py_trees.common.Status.FAILURE
                 self._acknowledged = True
+        if task.state is OwnerTaskState.SUCCEEDED:
             return (
                 py_trees.common.Status.SUCCESS
                 if self._write_output(
@@ -449,7 +454,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
 
     @property
     def has_active_task(self) -> bool:
-        return self._task is not None and self._task.state is OwnerTaskState.ACTIVE
+        return self._control_state(self._task) == "active"
 
     def observe_control_state(self) -> str:
         """Read status without settling tasks, acknowledging or writing outputs."""
@@ -466,12 +471,15 @@ class OwnerTaskAdapter(_OwnerAdapter):
             task = observed
         return self._control_state(task)
 
-    @staticmethod
-    def _control_state(task: OwnerTaskSnapshot | None) -> str:
+    def _control_state(self, task: OwnerTaskSnapshot | None) -> str:
         if task is None:
             return "inactive"
         if task.state is OwnerTaskState.ACTIVE:
             return "active"
+        if (task.state is OwnerTaskState.SUCCEEDED or task.settlement_proven) and not self._acknowledged:
+            # The action result alone cannot release a selected hold while
+            # its existing owner-settlement acknowledgement is still pending.
+            return "unrecoverable" if self._failure_reason_code else "active"
         assessment = task.metadata.get("recovery_assessment")
         if (
             task.state is OwnerTaskState.INTERRUPTED
@@ -480,7 +488,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         ):
             return "held"
         if task.state is OwnerTaskState.SUCCEEDED or (
-            task.state is OwnerTaskState.FAILED and task.metadata.get("finish_current_settled") is True
+            task.state is OwnerTaskState.FAILED and task.settlement_proven
         ):
             return "settled"
         return "unrecoverable"

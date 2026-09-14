@@ -685,6 +685,37 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(source.getShellSnapshot().snapshot?.snapshotSequence).toBe(3);
     expect(source.getShellSnapshot().snapshot?.authoringAdmission.admissionGeneration)
       .toBe(2);
+    const changed = vi.fn();
+    source.subscribeShell(changed);
+    // An ordinary publication is pending when a critical owner delta arrives.
+    receiveControlSnapshot(FakeWebSocket.shell, second);
+    changed.mockClear();
+    receiveControl(FakeWebSocket.shell, {
+      schema_version: 'manyforge.execution_control.v2',
+      message_kind: 'delta',
+      control_session_id: CONTROL_SESSION_ID,
+      server_sequence: nextControlServerSequence(FakeWebSocket.shell),
+      state_sequence: '4',
+      received_client_sequence: '2',
+      event_class: 'critical',
+      control: {
+        receiver_incarnation: 'headless.receiver.1',
+        semantic_owner_epoch: 'runner.epoch.1',
+        execution_control_revision: 1,
+        freshness: controlFreshness(1),
+      },
+      shell: {
+        complete: false,
+        authoring_admission: { admission_generation: 3, authoring_allowed: false },
+      },
+    });
+    expect(source.getShellSnapshot().error).toBeNull();
+    expect(source.getShellSnapshot().snapshot?.authoringAdmission.admissionGeneration)
+      .toBe(3);
+    expect(changed).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(source.getViewerSnapshot()).toBe(viewerBaseline);
     source.dispose();
   });
 

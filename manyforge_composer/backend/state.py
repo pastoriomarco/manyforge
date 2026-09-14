@@ -786,6 +786,7 @@ class ComposerState:
                 "manager_apply_rejected",
                 "Manager rejected the exact Deployment candidate",
             )
+        acceptance = deepcopy(response)
         deadline = time.monotonic() + _SCENARIO_LOAD_TIMEOUT_SECONDS
         while response.get("state") != "succeeded":
             if time.monotonic() >= deadline:
@@ -802,6 +803,14 @@ class ComposerState:
                     "manager_apply_status_rejected",
                     "Manager could not observe the retained Apply identity",
                 )
+            if any(
+                response.get(field) != acceptance.get(field)
+                for field in ("apply_id", "apply_generation")
+            ):
+                raise AuthoringJournalError(
+                    "manager_apply_status_identity_mismatch",
+                    "Manager status does not name the accepted Apply",
+                )
         receipt = request.get("candidate_receipt")
         status = self.headless_client.manager_status()
         active = status.get("status", {}).get("active", {})
@@ -816,7 +825,9 @@ class ComposerState:
                 "manager_apply_projection_mismatch",
                 "Manager terminal Apply did not publish the previewed candidate",
             )
-        return response
+        # Status supplies current terminal facts, not the original request's
+        # acceptance/replay identity. Retain that receipt across polling.
+        return {**acceptance, **response}
 
     def execute_authored_deployment_candidate(
         self,

@@ -5,6 +5,7 @@ inside a native Program run.  A second row adds an independently busy browser
 and bounded read-only HTTP pressure.  The first sample in each row is reported
 separately; the following 100 warm samples support nearest-rank p99 results.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -126,23 +127,25 @@ def _summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
     return {"sampleCount": len(samples), "metricsMs": metrics}
 
 
-def _assert_budgets(summary: dict[str, Any], label: str) -> None:
+def _budget_failures(summary: dict[str, Any], label: str) -> list[str]:
     metrics = summary.get("metricsMs")
     _require(isinstance(metrics, dict), f"{label} Stop summary is malformed")
+    failures: list[str] = []
     for field, budgets in WARM_BUDGETS_MS.items():
         result = metrics.get(field)
         _require(isinstance(result, dict), f"{label} {field} is missing")
         for statistic, budget in budgets.items():
             value = result.get(statistic)
-            _require(
-                isinstance(value, (int, float)) and float(value) <= budget,
-                f"{label} {field}.{statistic} exceeded {budget:.1f} ms: {value} "
-                f"(warm sample {result.get('maxSample')})",
-            )
+            if not isinstance(value, (int, float)) or not float(value) <= budget:
+                failures.append(
+                    f"{label} {field}.{statistic} exceeded {budget:.1f} ms: {value} "
+                    f"(warm sample {result.get('maxSample')})"
+                )
+    return failures
 
 
 def _report_summary(summary: dict[str, Any], label: str) -> None:
-    """Emit bounded aggregates before a frozen-budget assertion can stop a run."""
+    """Emit bounded aggregates while independent workload rows continue."""
 
     metrics = summary.get("metricsMs")
     _require(isinstance(metrics, dict), f"{label} Stop summary is malformed")
@@ -159,7 +162,7 @@ def _report_summary(summary: dict[str, Any], label: str) -> None:
     )
 
 
-def _assert_interference(
+def _compare_interference(
     baseline: dict[str, Any],
     pressured: dict[str, Any],
 ) -> dict[str, Any]:
@@ -181,23 +184,17 @@ def _assert_interference(
         "controlIngressToKernelAcceptanceMs",
     )
     baseline_handoff = sum(
-        float(baseline["metricsMs"][field]["p99"])
-        for field in handoff_fields
+        float(baseline["metricsMs"][field]["p99"]) for field in handoff_fields
     )
     pressured_handoff = sum(
-        float(pressured["metricsMs"][field]["p99"])
-        for field in handoff_fields
+        float(pressured["metricsMs"][field]["p99"]) for field in handoff_fields
     )
     allowance = max(25.0, baseline_handoff * 0.50)
-    _require(
-        pressured_handoff <= baseline_handoff + allowance,
-        "viewer/history pressure materially delayed Stop handoff: "
-        f"{baseline_handoff:.3f} -> {pressured_handoff:.3f} ms",
-    )
     comparison["handoff"] = {
         "baselineP99Ms": baseline_handoff,
         "pressuredP99Ms": pressured_handoff,
         "allowedIncreaseMs": allowance,
+        "passed": pressured_handoff <= baseline_handoff + allowance,
     }
     return comparison
 
@@ -343,8 +340,15 @@ def _one_stop(
         DEFAULT_TIMEOUT_S,
     )
     _assert_transition_fences(run_trace, f"UI6 repeated {start_label}")
-    _wait_running_node(composer_url, "move_to_rest")
-    _wait_history_event_after(composer_url, "operation_executing", before_history)
+    running = _wait_running_node(composer_url, "move_to_rest")
+    _wait_history_event_after(
+        composer_url,
+        "operation_executing",
+        before_history,
+        program_run_id=running["capture"]["program_run_id"],
+        node_instance_id="move_to_rest",
+    )
+    before_sequence = _flow(driver)["lastApplied"]["sourceSequence"]
     # Do not sample the controller's first acceleration instant.  The latency
     # row measures an in-flight Stop, while a Stop issued on the first sample
     # can legitimately exercise the separately-qualified hard-stop fallback.
@@ -363,11 +367,25 @@ def _one_stop(
 
     _stopped, stop_trace = _click_and_await_stopped_presentation(driver)
     _assert_transition_fences(stop_trace, "UI6 repeated Stop")
+    terminal = _wait_stop_terminal(composer_url, before_history)
+    if not any(state["stopText"] == "Stopping" for state in stop_trace):
+        print(
+            json.dumps(
+                {
+                    "failedStopTrace": stop_trace[:32],
+                    "traceTruncated": len(stop_trace) > 32,
+                    "probe": _stop_probe(driver),
+                    "terminal": terminal,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
     _require(
         any(state["stopText"] == "Stopping" for state in stop_trace),
         "repeated Stop never presented Stopping",
     )
-    terminal = _wait_stop_terminal(composer_url, before_history)
     return _stop_latency(_stop_probe(driver), terminal, _monotonic_wall_offset_ns())
 
 
@@ -376,6 +394,9 @@ def _wait_history_event_after(
     event_type: str,
     after_sequence: int,
     timeout_s: float = DEFAULT_TIMEOUT_S,
+    *,
+    program_run_id: str,
+    node_instance_id: str,
 ) -> dict[str, Any]:
     """Wait for owner evidence that the operation crossed the named boundary."""
 
@@ -384,7 +405,12 @@ def _wait_history_event_after(
         page = _http_json(
             composer_url,
             "/api/execution/history",
-            params=[("event_types", event_type), ("limit", 32)],
+            params=[
+                ("event_types", event_type),
+                ("limit", 32),
+                ("program_run_id", program_run_id),
+                ("node_instance_id", node_instance_id),
+            ],
         )
         events = page.get("events")
         if not isinstance(events, list):
@@ -408,14 +434,12 @@ def _wait_history_event_after(
         time.sleep(0.02)
 
 
-def _stop_row(
+def _prepare_stop_row(
     driver: RawWebDriver,
     composer_url: str,
     *,
     label: str,
-    warm_samples: int,
-) -> dict[str, Any]:
-    _require(warm_samples >= WARM_SAMPLES, "p99 row requires at least 100 samples")
+) -> None:
     scaled = _set_range(driver, CONTROL_SCALE)
     _require(
         scaled["identityStable"] and scaled["focused"],
@@ -429,12 +453,21 @@ def _stop_row(
     )
     _wait_runtime_scale(composer_url, CONTROL_SCALE)
 
+
+def _stop_row(
+    driver: RawWebDriver,
+    composer_url: str,
+    *,
+    label: str,
+    warm_samples: int,
+) -> dict[str, Any]:
+    _require(warm_samples >= WARM_SAMPLES, "p99 row requires at least 100 samples")
+    _prepare_stop_row(driver, composer_url, label=label)
+
     cold = _one_stop(driver, composer_url, start_label="Run")
     warm: list[dict[str, Any]] = []
     for index in range(warm_samples):
-        warm.append(
-            _one_stop(driver, composer_url, start_label="Resume Motion")
-        )
+        warm.append(_one_stop(driver, composer_url, start_label="Resume Motion"))
         if (index + 1) % 10 == 0:
             _progress(f"{label}: {index + 1}/{warm_samples} warm Stops")
 
@@ -449,7 +482,6 @@ def _stop_row(
     _wait_runtime_scale(composer_url, 1.0)
     summary = _summarize(warm)
     _report_summary(summary, label)
-    _assert_budgets(summary, label)
     _resume_and_reset_during_motion(driver)
     return {"cold": cold, "warm": summary}
 
@@ -538,7 +570,6 @@ class _HttpPressure:
                 "requestCount": self.requests,
                 "errors": list(self.errors),
             }
-        _require(not result["errors"], "HTTP pressure produced request errors")
         return result
 
 
@@ -553,7 +584,9 @@ def collect_ui6_stop_latency(
     viewport_width: int = 1440,
     viewport_height: int = 960,
     require_software_renderer: bool = False,
+    diagnostic_samples: int = 0,
 ) -> dict[str, Any]:
+    _require(0 <= diagnostic_samples <= 10, "diagnostic sample count must be 0..10")
     _require(pressure_workers >= 1, "at least one HTTP pressure worker is required")
     target_url = _url_with_opt_in(composer_url)
     baseline_status = _wait_client_baseline(composer_backend_url)
@@ -562,6 +595,7 @@ def collect_ui6_stop_latency(
     pressure_browser: RawWebDriver | None = None
     pressure: _HttpPressure | None = None
     pressure_result: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
     try:
         primary = _create_browser(
             geckodriver_endpoint,
@@ -577,6 +611,64 @@ def collect_ui6_stop_latency(
             lambda status: _client_count(status) == baseline_clients + 1,
             "repeated-Stop browser demand",
         )
+        if diagnostic_samples:
+            _execute(primary, "window.__manyforgeUi6Diagnose = true; return true;")
+            _prepare_stop_row(primary, composer_url, label="diagnostic")
+            _execute(primary, "performance.clearResourceTimings(); return true;")
+            samples = []
+            for index in range(diagnostic_samples):
+                samples.append(
+                    {
+                        "timing": _one_stop(
+                            primary,
+                            composer_url,
+                            start_label="Run" if index == 0 else "Resume Motion",
+                        ),
+                        "probe": _stop_probe(primary),
+                    }
+                )
+            availability_reads = lambda: _execute(
+                primary,
+                """
+                return performance.getEntriesByType('resource').filter(
+                  entry => new URL(entry.name).pathname === '/api/execution/manual-handover'
+                ).length;
+            """,
+            )
+            _require(
+                availability_reads() == 0,
+                "closed Robot panel queried manual availability",
+            )
+            _click_selector(
+                primary, ".viewer-surface-launchers button:first-child", "Robot panel"
+            )
+            _wait(
+                lambda: _execute(
+                    primary,
+                    """
+                return {available: document.querySelector(
+                  '.robot-control-number input[aria-label$="target degrees"]'
+                )?.disabled === false};
+            """,
+                ),
+                lambda state: state["available"],
+                "held manual panel availability",
+                DEFAULT_TIMEOUT_S,
+            )
+            _require(
+                availability_reads() > 0, "opened Robot panel did not query its owner"
+            )
+            _click_selector(
+                primary, '[aria-label="Close viewer inspector"]', "close Robot panel"
+            )
+            return {
+                "diagnosticOnly": True,
+                "qualificationPassed": False,
+                "manualAvailabilityDemandChecked": True,
+                "samples": samples,
+                "viewer": _performance(primary),
+                "flow": _flow(primary),
+            }
         _progress("baseline repeated-Stop row")
         baseline = _stop_row(
             primary,
@@ -624,24 +716,35 @@ def collect_ui6_stop_latency(
             _execute(pressure_browser, CLEAR_PRESSURE_SCRIPT) is True,
             "browser CPU pressure could not be cleared",
         )
-        comparison = _assert_interference(baseline["warm"], loaded["warm"])
+        comparison = _compare_interference(baseline["warm"], loaded["warm"])
+        failures = _budget_failures(baseline["warm"], "baseline")
+        failures.extend(_budget_failures(loaded["warm"], "pressured"))
+        if not comparison["handoff"]["passed"]:
+            failures.append(
+                "viewer/history pressure materially delayed Stop handoff: "
+                f"{comparison['handoff']['baselineP99Ms']:.3f} -> "
+                f"{comparison['handoff']['pressuredP99Ms']:.3f} ms"
+            )
+        failures.extend(
+            f"HTTP pressure: {error}" for error in pressure_result["errors"]
+        )
         renderer = ready["qualification"]["renderer"]
-        _require(
-            not require_software_renderer
-            or (
-                renderer["software"] is True
-                and pressure_ready["qualification"]["renderer"]["software"] is True
-            ),
-            "forced-software Stop row did not use software WebGL in both browsers",
-        )
-        _require(
-            before_performance["performance"]["modelBuilds"] == 0
-            and after_performance["performance"]["modelBuilds"] == 0,
-            "repeated Stop pressure rebuilt static viewer geometry",
-        )
-        return {
+        if require_software_renderer and not (
+            renderer["software"] is True
+            and pressure_ready["qualification"]["renderer"]["software"] is True
+        ):
+            failures.append(
+                "forced-software Stop row did not use software WebGL in both browsers"
+            )
+        if (
+            before_performance["performance"]["modelBuilds"] != 0
+            or after_performance["performance"]["modelBuilds"] != 0
+        ):
+            failures.append("repeated Stop pressure rebuilt static viewer geometry")
+        result = {
             "schemaVersion": RESULT_SCHEMA,
-            "success": True,
+            "success": not failures,
+            "failures": failures,
             "scope": "O1.5-UI6 repeated native/browser Stop latency",
             "warmSamplesPerRow": warm_samples,
             "frozenBudgetsMs": WARM_BUDGETS_MS,
@@ -656,14 +759,19 @@ def collect_ui6_stop_latency(
                 "http": pressure_result,
             },
             "finalViewerStatus": _viewer_status(composer_backend_url),
-            "claims": [
-                "each warm p99 is supported by at least 100 exact native Stops",
-                "cold samples are excluded from warm percentiles",
-                "browser dispatch, Composer ingress, Kernel acceptance, physical settlement, and Stopped presentation are separately timed",
-                "one independently busy browser and bounded history/status pressure do not materially delay the Stop handoff",
-                "the native cycle completes and resets after each row",
-            ],
+            "claims": (
+                []
+                if failures
+                else [
+                    "each warm p99 is supported by at least 100 exact native Stops",
+                    "cold samples are excluded from warm percentiles",
+                    "browser dispatch, Composer ingress, Kernel acceptance, physical settlement, and Stopped presentation are separately timed",
+                    "one independently busy browser and bounded history/status pressure do not materially delay the Stop handoff",
+                    "the native cycle completes and resets after each row",
+                ]
+            ),
         }
+        return result
     finally:
         active_error = sys.exc_info()[1]
         cleanup_errors: list[str] = []
@@ -672,6 +780,33 @@ def collect_ui6_stop_latency(
                 pressure.close()
             except CollectorError as error:
                 cleanup_errors.append(str(error))
+        if active_error is not None:
+            # Capture current evidence before disposable owners and browsers
+            # disappear. Failure-only reads cannot perturb measured samples.
+            for path in (
+                "/api/program/runs?active_only=true&limit=1",
+                "/api/component-overview",
+                "/api/execution/history?limit=16",
+            ):
+                try:
+                    active_error.add_note(
+                        f"Stop failure {path}: "
+                        + json.dumps(_http_json(composer_url, path), sort_keys=True)
+                    )
+                except CollectorError as error:
+                    active_error.add_note(f"Stop failure {path}: {error}")
+            if primary is not None and primary.session_id is not None:
+                try:
+                    _execute(
+                        primary,
+                        "document.querySelector('[aria-label=\"Expand runtime details\"]')?.click(); return true;",
+                    )
+                    active_error.add_note(
+                        "Stop failure attention: "
+                        + json.dumps(_dom_state(primary), sort_keys=True)
+                    )
+                except CollectorError as error:
+                    active_error.add_note(f"Stop failure attention: {error}")
         for driver in (pressure_browser, primary):
             if driver is not None and driver.session_id is not None:
                 try:
@@ -687,8 +822,17 @@ def collect_ui6_stop_latency(
             )
         except CollectorError as error:
             cleanup_errors.append(str(error))
-        if active_error is None and cleanup_errors:
-            raise CollectorError("; ".join(cleanup_errors))
+        if cleanup_errors:
+            if active_error is not None:
+                active_error.add_note("Stop cleanup: " + "; ".join(cleanup_errors))
+            elif result is not None:
+                result["failures"].extend(
+                    f"cleanup: {error}" for error in cleanup_errors
+                )
+                result["success"] = False
+                result["claims"] = []
+            else:
+                raise CollectorError("; ".join(cleanup_errors))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -720,14 +864,20 @@ def main(argv: list[str] | None = None) -> int:
             require_software_renderer=arguments.require_software_renderer,
         )
     except CollectorError as error:
-        print(json.dumps({
-            "schemaVersion": RESULT_SCHEMA,
-            "success": False,
-            "error": str(error),
-        }, separators=(",", ":"), sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "schemaVersion": RESULT_SCHEMA,
+                    "success": False,
+                    "error": str(error),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
         return 1
     print(json.dumps(result, separators=(",", ":"), sort_keys=True))
-    return 0
+    return 0 if result["success"] else 1
 
 
 if __name__ == "__main__":

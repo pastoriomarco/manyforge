@@ -28,6 +28,33 @@ const T &value(const core::JsonObjectDTO &object, const std::string &key) {
 
 bool positive(double number) { return std::isfinite(number) && number > 0.0; }
 
+std::optional<std::string>
+invalid_settings(const native::OrdinaryMotionJerkSettings &settings) {
+  if (!positive(settings.preset_reference_time_s))
+    return "ordinary jerk preset reference is invalid";
+  std::set<std::string> seen;
+  for (const auto &setting : settings.joint_limits) {
+    if (setting.source_joint_name.empty() ||
+        !seen.insert(setting.source_joint_name).second ||
+        (setting.override_rad_s3 && !positive(*setting.override_rad_s3)))
+      return "ordinary jerk setting has an empty/duplicate joint or invalid "
+             "override";
+    if (!setting.imported)
+      continue;
+    const auto &source = *setting.imported;
+    if (!positive(source.maximum_rad_s3) || source.source_id.empty() ||
+        !core::IsExactLowercaseSha256Digest(source.source_digest.value()) ||
+        (source.machine_required && (!source.enabled || !settings.enabled)))
+      return "imported jerk limit is invalid, lacks provenance, or a required "
+             "limit is disabled";
+    if (source.enabled && setting.override_rad_s3 &&
+        *setting.override_rad_s3 > source.maximum_rad_s3)
+      return "ordinary jerk override exceeds the imported ceiling for " +
+             setting.source_joint_name;
+  }
+  return std::nullopt;
+}
+
 core::Result<core::OrdinaryMotionJerkPolicy> invalid(std::string message) {
   return core::Result<core::OrdinaryMotionJerkPolicy>::Err(
       core::ErrorDTO{core::kErrorInvalidRequest,
@@ -62,6 +89,8 @@ native::OrdinaryMotionJerkSettings detail::decode_ordinary_motion_jerk_settings(
     }
     result.joint_limits.push_back(std::move(setting));
   }
+  if (const auto error = invalid_settings(result))
+    throw RetainedBundleError(*error);
   return result;
 }
 
@@ -70,33 +99,17 @@ native::resolve_ordinary_motion_jerk_policy(
     const OrdinaryMotionJerkSettings &settings,
     std::span<const core::RuntimeResourceBindingDTO> resources,
     const core::JointLimitsDTO &model_limits) {
-  if (!positive(settings.preset_reference_time_s) ||
-      settings.joint_limits.size() > resources.size())
-    return invalid("ordinary jerk preset reference or joint count is invalid");
-  std::set<std::string> seen;
+  if (const auto error = invalid_settings(settings))
+    return invalid(*error);
+  if (settings.joint_limits.size() > resources.size())
+    return invalid("ordinary jerk joint count is invalid");
   for (const auto &setting : settings.joint_limits) {
     const auto resource =
         std::find_if(resources.begin(), resources.end(), [&](const auto &row) {
           return row.source_joint_name == setting.source_joint_name;
         });
-    if (resource == resources.end() ||
-        !seen.insert(setting.source_joint_name).second ||
-        (setting.override_rad_s3 && !positive(*setting.override_rad_s3)))
-      return invalid("ordinary jerk setting has an unknown/duplicate joint or "
-                     "invalid override");
-    if (setting.imported) {
-      const auto &source = *setting.imported;
-      if (!positive(source.maximum_rad_s3) || source.source_id.empty() ||
-          !core::IsExactLowercaseSha256Digest(source.source_digest.value()) ||
-          (source.machine_required && (!source.enabled || !settings.enabled)))
-        return invalid("imported jerk limit is invalid, lacks provenance, or a "
-                       "required limit is disabled");
-      if (source.enabled && setting.override_rad_s3 &&
-          *setting.override_rad_s3 > source.maximum_rad_s3)
-        return invalid(
-            "ordinary jerk override exceeds the imported ceiling for " +
-            setting.source_joint_name);
-    }
+    if (resource == resources.end())
+      return invalid("ordinary jerk setting has an unknown joint");
   }
 
   core::OrdinaryMotionJerkPolicy policy{settings.enabled, false, {}};

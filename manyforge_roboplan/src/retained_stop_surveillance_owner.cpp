@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
@@ -1089,6 +1090,60 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
       std::lock_guard lock(mutex_);
       sources = sources_;
     }
+
+    // Recovery observes the already accepted Stop's immutable predicates.
+    // It does not require a newly admitted motion/Stop-ready registration.
+    // Only source epochs may be rebound; actual samples are never relabeled.
+    for (auto &source : sources) {
+      source.observation_sources.clear();
+      const auto &binding = source.binding.value();
+      if (binding.retained_bundle_id != latch.retained_bundle_id ||
+          binding.graph_revision != latch.graph_revision ||
+          !binding.control_path.has_value())
+        continue;
+      const auto &path = *binding.control_path;
+      const auto resources = binding_resources(source.binding);
+      for (const auto &scope : status.scope_entries) {
+        const auto *participant =
+            std::get_if<core::StopParticipantScopeFactsDTO>(&scope.facts);
+        if (participant == nullptr)
+          continue;
+        std::vector<core::ResourceId> observed_resources;
+        std::set_intersection(resources.begin(), resources.end(),
+                              participant->resources.begin(),
+                              participant->resources.end(),
+                              std::back_inserter(observed_resources));
+        if (observed_resources.empty())
+          continue;
+        for (const auto &[requirement, predecessor] :
+             recovery_motion_rest_requirements(status, scope.key)) {
+          auto current = predecessor;
+          const auto epoch = std::find_if(
+              binding.runtime_unit_epochs.begin(),
+              binding.runtime_unit_epochs.end(), [&](const auto &row) {
+                return row.runtime_unit_id ==
+                       current.runtime_target.runtime_unit_id;
+              });
+          if (epoch == binding.runtime_unit_epochs.end())
+            continue;
+          current.runtime_target.provider_runtime_epoch =
+              path.provider_runtime_epoch;
+          current.runtime_target.runtime_unit_epoch = epoch->runtime_epoch;
+          if (!source_matches_binding(current, source.binding))
+            continue;
+          RetainedStopSurveillanceObservationSource row{
+              requirement, std::move(current), observed_resources};
+          if (std::find(source.observation_sources.begin(),
+                        source.observation_sources.end(),
+                        row) == source.observation_sources.end())
+            source.observation_sources.push_back(std::move(row));
+        }
+      }
+    }
+    const auto qualified_sources = ValidateSources(sources);
+    if (!qualified_sources.ok())
+      return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+          qualified_sources.error());
 
     std::map<core::ResourceId, core::StopFaultRecoveryResourceFactDTO>
         resource_facts;

@@ -80,11 +80,11 @@ namespace {
        {}});
 }
 
-[[nodiscard]] Result<CellAdmissionClaimDTO> SeedRouteClaim(
-    SqliteCCLCJournal& journal, const RequestOwnerEpoch& owner,
-    const PreparedRouteSelectionAdmission& prepared) {
+[[nodiscard]] CellAdmissionClaimIntentDTO RouteClaimIntent(
+    const RequestOwnerEpoch& owner, const PreparedRouteSelectionAdmission& prepared,
+    bool recovery) {
   const auto& intent = prepared.initial_status.accepted_intent;
-  const CellAdmissionClaimIntentDTO claim_intent{
+  CellAdmissionClaimIntentDTO claim_intent{
       CellAdmissionClaimKindDTO::kComponentLifecycle,
       CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
       owner,
@@ -96,6 +96,23 @@ namespace {
       {},
       {},
       intent.program_node_evidence};
+  if (recovery) {
+    claim_intent.claim_kind = CellAdmissionClaimKindDTO::kInterventionOrRecovery;
+    claim_intent.scope.configurations = {
+        {intent.desired_configuration.control_domain_id,
+         *intent.expected_active_control_configuration.active_control_configuration_id,
+         *intent.expected_active_control_configuration.active_control_configuration_generation}};
+    claim_intent.intervention_evidence = CellAdmissionInterventionEvidenceDTO{
+        claim_intent.owner_role, owner, claim_intent.owner_transaction_id,
+        claim_intent.request_payload_digest, std::nullopt};
+  }
+  return claim_intent;
+}
+
+[[nodiscard]] Result<CellAdmissionClaimDTO> SeedRouteClaim(
+    SqliteCCLCJournal& journal, const RequestOwnerEpoch& owner,
+    const PreparedRouteSelectionAdmission& prepared, bool recovery = false) {
+  const auto claim_intent = RouteClaimIntent(owner, prepared, recovery);
   const auto recorded = journal.RecordCellClaimAttempt(owner, claim_intent);
   if (!recorded.ok()) return Result<CellAdmissionClaimDTO>::Err(recorded.error());
   CellAdmissionClaimDTO claim{claim_intent, CellAdmissionClaimGeneration(1U),
@@ -1355,77 +1372,100 @@ TEST(SqliteCCLCJournal, RouteSelectionSharesMembershipAndReplaysBeforeCurrentChe
 }
 
 TEST(SqliteCCLCJournal, RouteOwnerReplacementCanCloseKnownNoEffectWithoutAnAttempt) {
-  ScopedTemporaryDirectory temporary;
-  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 1U);
-  RequestOwnerEpoch owner1("owner.route.1");
-  ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner1, 1, 4U).ok());
-  const auto prepared = PreparedRoute(owner1);
-  const auto claim = SeedRouteClaim(journal, owner1, prepared);
-  ASSERT_TRUE(claim.ok());
-  ASSERT_TRUE(journal
-                  .AcceptOrReplayRouteSelection(owner1, RouteIntent(owner1), prepared.acceptance,
-                                                prepared.initial_status)
-                  .ok());
-
-  RequestOwnerEpoch owner2("owner.route.2");
-  ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner2, 2, 4U).ok());
-  auto terminal = prepared.initial_status;
-  terminal.status_sequence = 2U;
-  terminal.status_owner_epoch = owner2;
-  terminal.phase = RouteSelectionTransactionPhaseDTO::kFailed;
-  terminal.effect = RouteSelectionEffectDTO::kKnownNoEffect;
-  terminal.terminal_result = RouteSelectionTerminalResultDTO::kFailedKnownNoEffect;
-  terminal.error = ErrorDTO{"route_owner_replaced", "owner replaced before effect", {}};
-  terminal.latest_updated_at_ns = 0;
-  terminal.remaining_duration_ns = 0;
-  ASSERT_TRUE(terminal.locally_valid());
-
-  // No terminal publication can become visible without its exact release
-  // proof. A pending claim remains active evidence, not evictable history.
-  EXPECT_FALSE(journal.RecordRouteSelectionStatus(owner2, terminal).ok());
-
-  const auto recorded = journal.RecordRouteTerminalAndClaimRelease(
-      owner2, terminal, RouteClaimRelease(claim.value(), terminal));
-  ASSERT_TRUE(recorded.ok()) << recorded.error().message;
-  const auto retained =
-      journal.LoadRetainedRouteSelectionStatus(prepared.acceptance.route_selection_transaction_id);
-  ASSERT_TRUE(retained.ok());
-  ASSERT_TRUE(retained.value().has_value());
-  EXPECT_EQ(*retained.value(), terminal);
-  const auto release = RouteClaimRelease(claim.value(), terminal);
-  ASSERT_TRUE(ValidateCCLCCellAdmissionSettlementReadOnly(JournalPath(temporary), CellId("cell.1"),
-                                                          claim.value(), release)
-                  .ok());
-  auto foreign = claim.value();
-  foreign.intent.expected_admission_generation = AdmissionGeneration(2U);
-  EXPECT_FALSE(ValidateCCLCCellAdmissionSettlementReadOnly(JournalPath(temporary), CellId("cell.1"),
-                                                           foreign, release)
-                   .ok());
-  for (const auto* id : {"pressure.1", "pressure.2"}) {
+  for (const bool recovery_claim : {false, true}) {
+    SCOPED_TRACE(recovery_claim);
+    ScopedTemporaryDirectory temporary;
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 1U);
+    RequestOwnerEpoch owner1("owner.route.1");
+    ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner1, 1, 4U).ok());
+    const auto prepared = PreparedRoute(owner1);
+    const auto claim = SeedRouteClaim(journal, owner1, prepared, recovery_claim);
+    ASSERT_TRUE(claim.ok());
     ASSERT_TRUE(journal
-                    .RecordRouteSelectionRejection(
-                        owner2, RouteIntent(owner2, id),
-                        {"invalid_state_transition", "unstarted", {{"effect", "not_started"}}}, {})
+                    .AcceptOrReplayRouteSelection(owner1, RouteIntent(owner1), prepared.acceptance,
+                                                  prepared.initial_status)
                     .ok());
+
+    RequestOwnerEpoch owner2("owner.route.2");
+    const auto recovered = BeginTestOwnerEpoch(journal, owner2, 2, 4U);
+    ASSERT_TRUE(recovered.ok());
+    ASSERT_EQ(recovered.value().cell_claims.size(), 1U);
+    EXPECT_EQ(recovered.value().cell_claims.front().intent, claim.value().intent);
+    EXPECT_EQ(recovered.value().cell_claims.front().claim, claim.value());
+    auto terminal = prepared.initial_status;
+    terminal.status_sequence = 2U;
+    terminal.status_owner_epoch = owner2;
+    terminal.phase = RouteSelectionTransactionPhaseDTO::kFailed;
+    terminal.effect = RouteSelectionEffectDTO::kKnownNoEffect;
+    terminal.terminal_result = RouteSelectionTerminalResultDTO::kFailedKnownNoEffect;
+    terminal.error = ErrorDTO{"route_owner_replaced", "owner replaced before effect", {}};
+    terminal.latest_updated_at_ns = 0;
+    terminal.remaining_duration_ns = 0;
+    ASSERT_TRUE(terminal.locally_valid());
+
+    // No terminal publication can become visible without its exact release
+    // proof. A pending claim remains active evidence, not evictable history.
+    EXPECT_FALSE(journal.RecordRouteSelectionStatus(owner2, terminal).ok());
+
+    const auto recorded = journal.RecordRouteTerminalAndClaimRelease(
+        owner2, terminal, RouteClaimRelease(claim.value(), terminal));
+    ASSERT_TRUE(recorded.ok()) << recorded.error().message;
+    const auto retained = journal.LoadRetainedRouteSelectionStatus(
+        prepared.acceptance.route_selection_transaction_id);
+    ASSERT_TRUE(retained.ok());
+    ASSERT_TRUE(retained.value().has_value());
+    EXPECT_EQ(*retained.value(), terminal);
+    const auto release = RouteClaimRelease(claim.value(), terminal);
+    ASSERT_TRUE(ValidateCCLCCellAdmissionSettlementReadOnly(
+                    JournalPath(temporary), CellId("cell.1"), claim.value(), release)
+                    .ok());
+    auto foreign = claim.value();
+    foreign.intent.expected_admission_generation = AdmissionGeneration(2U);
+    EXPECT_FALSE(ValidateCCLCCellAdmissionSettlementReadOnly(JournalPath(temporary),
+                                                             CellId("cell.1"), foreign, release)
+                     .ok());
+    if (recovery_claim) {
+      foreign = claim.value();
+      foreign.intent.scope.configurations.front().active_configuration_id =
+          ActiveControlConfigurationId("foreign.configuration");
+      EXPECT_FALSE(ValidateCCLCCellAdmissionSettlementReadOnly(JournalPath(temporary),
+                                                               CellId("cell.1"), foreign, release)
+                       .ok());
+      foreign = claim.value();
+      foreign.intent.claim_kind = CellAdmissionClaimKindDTO::kComponentLifecycle;
+      foreign.intent.scope.configurations.clear();
+      foreign.intent.intervention_evidence.reset();
+      EXPECT_FALSE(ValidateCCLCCellAdmissionSettlementReadOnly(JournalPath(temporary),
+                                                               CellId("cell.1"), foreign, release)
+                       .ok());
+    }
+    for (const auto* id : {"pressure.1", "pressure.2"}) {
+      ASSERT_TRUE(journal
+                      .RecordRouteSelectionRejection(
+                          owner2, RouteIntent(owner2, id),
+                          {"invalid_state_transition", "unstarted", {{"effect", "not_started"}}},
+                          {})
+                      .ok());
+    }
+    EXPECT_TRUE(
+        journal.LoadRetainedRouteSelectionStatus(prepared.acceptance.route_selection_transaction_id)
+            .value());
+    ASSERT_TRUE(
+        journal
+            .RecordCellClaimReleaseReceipt(owner2, release,
+                                           {CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact,
+                                            RequestOwnerEpoch("kernel.1"),
+                                            AdmissionGeneration(2U),
+                                            claim.value(),
+                                            release,
+                                            {},
+                                            {},
+                                            {}})
+            .ok());
+    EXPECT_FALSE(
+        journal.LoadRetainedRouteSelectionStatus(prepared.acceptance.route_selection_transaction_id)
+            .value());
   }
-  EXPECT_TRUE(
-      journal.LoadRetainedRouteSelectionStatus(prepared.acceptance.route_selection_transaction_id)
-          .value());
-  ASSERT_TRUE(
-      journal
-          .RecordCellClaimReleaseReceipt(owner2, release,
-                                         {CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact,
-                                          RequestOwnerEpoch("kernel.1"),
-                                          AdmissionGeneration(2U),
-                                          claim.value(),
-                                          release,
-                                          {},
-                                          {},
-                                          {}})
-          .ok());
-  EXPECT_FALSE(
-      journal.LoadRetainedRouteSelectionStatus(prepared.acceptance.route_selection_transaction_id)
-          .value());
 }
 
 TEST(SqliteCCLCJournal, OriginalRouteResultRemainsReadOnlyAcrossOwnerReplacement) {
@@ -1470,74 +1510,145 @@ TEST(SqliteCCLCJournal, OriginalRouteResultRemainsReadOnlyAcrossOwnerReplacement
 }
 
 TEST(SqliteCCLCJournal, UnacceptedRouteRecoveryRetainsNoEffectBeforeRetiringTheOldNamespace) {
-  for (bool acquired : {false, true}) {
+  for (const bool recovery_claim : {false, true}) {
+    for (bool acquired : {false, true}) {
+      SCOPED_TRACE(recovery_claim);
+      SCOPED_TRACE(acquired);
+      ScopedTemporaryDirectory temporary;
+      const auto path = JournalPath(temporary);
+      SqliteCCLCJournal journal(path, CellId("cell.1"), 1U);
+      RequestOwnerEpoch owner("old.seed");
+      ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, 4U).ok());
+      const auto intent = RouteIntent(owner);
+      const auto attempt = RouteClaimIntent(owner, PreparedRoute(owner), recovery_claim);
+      ASSERT_TRUE(journal.RecordCellClaimAttempt(owner, attempt).ok());
+      const CellAdmissionClaimDTO claim{attempt, CellAdmissionClaimGeneration(1U),
+                                        AdmissionGeneration(1U), 0};
+      if (acquired) {
+        ASSERT_TRUE(journal.RecordCellClaimAcquired(owner, claim).ok());
+      }
+      RequestOwnerEpoch replacement("new.seed");
+      ASSERT_TRUE(BeginTestOwnerEpoch(journal, replacement, 2, 4U).ok());
+      if (acquired) {
+        const CellAdmissionClaimReleaseDTO release{
+            attempt.owner_role,
+            owner,
+            attempt.owner_transaction_id,
+            attempt.request_id,
+            attempt.request_payload_digest,
+            claim.acquired_admission_generation,
+            claim.claim_generation,
+            {CellAdmissionSettlementKindDTO::kProvenNoEffect, attempt.request_payload_digest}};
+        ASSERT_TRUE(journal.RecordUnacceptedCellClaimRelease(replacement, release).ok());
+        // Crash/lost reply repeats exact recovery, not the physical command.
+        ASSERT_TRUE(journal.RecordUnacceptedCellClaimRelease(replacement, release).ok());
+        ASSERT_TRUE(
+            ValidateCCLCCellAdmissionSettlementReadOnly(path, CellId("cell.1"), claim, release)
+                .ok());
+        ASSERT_TRUE(journal
+                        .RecordCellClaimReleaseReceipt(
+                            replacement, release,
+                            {CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact,
+                             RequestOwnerEpoch("kernel.1"),
+                             AdmissionGeneration(2U),
+                             claim,
+                             release,
+                             {},
+                             {},
+                             {}})
+                        .ok());
+      } else {
+        const auto retired = journal.RecordCellClaimNotAcquired(replacement, attempt);
+        ASSERT_TRUE(retired.ok()) << retired.error().message;
+      }
+      const auto result = journal.ReadRouteSelectionRequestResult(intent);
+      ASSERT_TRUE(result.ok() && result.value() && result.value()->rejection);
+      EXPECT_EQ(result.value()->rejection->details.at("effect"), "not_started");
+      EXPECT_FALSE(result.value()->acceptance);
+      journal.Close();
+      SqliteCCLCJournal reopened(path, CellId("cell.1"), 1U);
+      const auto recovery = reopened.BeginOwnerEpoch(RequestOwnerEpoch("third.seed"), 3, 4U);
+      ASSERT_TRUE(recovery.ok());
+      EXPECT_TRUE(recovery.value().cell_claims.empty());
+    }
+  }
+}
+
+TEST(SqliteCCLCJournal, RouteRecoveryClaimCannotChangeKindOrConfigurationAcrossRestart) {
+  for (const bool wrong_scope : {false, true}) {
+    SCOPED_TRACE(wrong_scope);
     ScopedTemporaryDirectory temporary;
     const auto path = JournalPath(temporary);
-    SqliteCCLCJournal journal(path, CellId("cell.1"), 1U);
-    RequestOwnerEpoch owner("old.seed");
+    SqliteCCLCJournal journal(path, CellId("cell.1"), 4U);
+    RequestOwnerEpoch owner("recovery.seed");
     ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, 4U).ok());
-    const auto intent = RouteIntent(owner);
-    const CellAdmissionClaimIntentDTO attempt{
-        CellAdmissionClaimKindDTO::kComponentLifecycle,
-        CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
-        owner,
-        "route-selection.1",
-        intent.request_context.request_id,
-        ContentDigest(detail::RouteSelectionSemanticIntentDigest(intent)),
-        *intent.expected_admission_generation,
-        {},
-        {},
-        {},
-        intent.program_node_evidence};
-    ASSERT_TRUE(journal.RecordCellClaimAttempt(owner, attempt).ok());
-    const CellAdmissionClaimDTO claim{attempt, CellAdmissionClaimGeneration(1U),
-                                      AdmissionGeneration(1U), 0};
-    if (acquired) {
-      ASSERT_TRUE(journal.RecordCellClaimAcquired(owner, claim).ok());
-    }
-    RequestOwnerEpoch replacement("new.seed");
-    ASSERT_TRUE(BeginTestOwnerEpoch(journal, replacement, 2, 4U).ok());
-    if (acquired) {
-      const CellAdmissionClaimReleaseDTO release{
-          attempt.owner_role,
-          owner,
-          attempt.owner_transaction_id,
-          attempt.request_id,
-          attempt.request_payload_digest,
-          claim.acquired_admission_generation,
-          claim.claim_generation,
-          {CellAdmissionSettlementKindDTO::kProvenNoEffect, attempt.request_payload_digest}};
-      ASSERT_TRUE(journal.RecordUnacceptedCellClaimRelease(replacement, release).ok());
-      // Crash/lost reply repeats exact recovery, not the physical command.
-      ASSERT_TRUE(journal.RecordUnacceptedCellClaimRelease(replacement, release).ok());
-      ASSERT_TRUE(
-          ValidateCCLCCellAdmissionSettlementReadOnly(path, CellId("cell.1"), claim, release).ok());
-      ASSERT_TRUE(
-          journal
-              .RecordCellClaimReleaseReceipt(replacement, release,
-                                             {CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact,
-                                              RequestOwnerEpoch("kernel.1"),
-                                              AdmissionGeneration(2U),
-                                              claim,
-                                              release,
-                                              {},
-                                              {},
-                                              {}})
-              .ok());
-    } else {
-      const auto retired = journal.RecordCellClaimNotAcquired(replacement, attempt);
-      ASSERT_TRUE(retired.ok()) << retired.error().message;
-    }
-    const auto result = journal.ReadRouteSelectionRequestResult(intent);
-    ASSERT_TRUE(result.ok() && result.value() && result.value()->rejection);
-    EXPECT_EQ(result.value()->rejection->details.at("effect"), "not_started");
-    EXPECT_FALSE(result.value()->acceptance);
+    const auto prepared = PreparedRoute(owner);
+    auto intent = RouteClaimIntent(owner, prepared, true);
+    if (wrong_scope)
+      intent.scope.configurations.front().active_configuration_id =
+          ActiveControlConfigurationId("foreign.configuration");
+    ASSERT_TRUE(journal.RecordCellClaimAttempt(owner, intent).ok());
+
+    auto ordinary = intent;
+    ordinary.claim_kind = CellAdmissionClaimKindDTO::kComponentLifecycle;
+    ordinary.scope.configurations.clear();
+    ordinary.intervention_evidence.reset();
+    EXPECT_FALSE(journal.RecordCellClaimNotAcquired(owner, ordinary).ok());
+    EXPECT_FALSE(journal
+                     .RecordRouteSelectionRejection(
+                         owner, RouteIntent(owner),
+                         {"invalid_state_transition", "unstarted", {{"effect", "not_started"}}},
+                         ordinary)
+                     .ok());
+    CellAdmissionClaimDTO claim{intent, CellAdmissionClaimGeneration(1U), AdmissionGeneration(1U),
+                                0};
+    auto changed = claim;
+    changed.intent.scope.configurations.front().active_configuration_generation =
+        ActiveControlConfigurationGeneration(99U);
+    EXPECT_FALSE(journal.RecordCellClaimAcquired(owner, changed).ok());
+    ASSERT_TRUE(journal.RecordCellClaimAcquired(owner, claim).ok());
+    const auto accepted = journal.AcceptOrReplayRouteSelection(
+        owner, RouteIntent(owner), prepared.acceptance, prepared.initial_status);
+    EXPECT_EQ(accepted.ok(), !wrong_scope);
     journal.Close();
-    SqliteCCLCJournal reopened(path, CellId("cell.1"), 1U);
-    const auto recovery = reopened.BeginOwnerEpoch(RequestOwnerEpoch("third.seed"), 3, 4U);
-    ASSERT_TRUE(recovery.ok());
-    EXPECT_TRUE(recovery.value().cell_claims.empty());
+
+    SqliteCCLCJournal reopened(path, CellId("cell.1"), 4U);
+    RequestOwnerEpoch successor("successor.seed");
+    const auto recovered = BeginTestOwnerEpoch(reopened, successor, 2, 4U);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    ASSERT_EQ(recovered.value().cell_claims.size(), 1U);
+    EXPECT_EQ(recovered.value().cell_claims.front().intent, intent);
+    EXPECT_EQ(recovered.value().cell_claims.front().claim, claim);
+    EXPECT_EQ(recovered.value().cell_claims.front().transaction_accepted, !wrong_scope);
   }
+}
+
+TEST(SqliteCCLCJournal, VersionNineMigrationDoesNotInventRecoveryForAnOrdinaryClaim) {
+  ScopedTemporaryDirectory temporary;
+  const auto path = JournalPath(temporary);
+  SqliteCCLCJournal journal(path, CellId("cell.1"), 4U);
+  RequestOwnerEpoch owner("old.seed");
+  ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, 4U).ok());
+  const auto prepared = PreparedRoute(owner);
+  const auto claim = SeedRouteClaim(journal, owner, prepared);
+  ASSERT_TRUE(claim.ok());
+  journal.Close();
+  sqlite3* raw = nullptr;
+  ASSERT_EQ(sqlite3_open(path.c_str(), &raw), SQLITE_OK);
+  ASSERT_EQ(
+      sqlite3_exec(raw,
+                   "ALTER TABLE cclc_lifecycle_cell_claims DROP COLUMN recovery_configuration;"
+                   "UPDATE cclc_journal_metadata SET schema_version=9; PRAGMA user_version=9;",
+                   nullptr, nullptr, nullptr),
+      SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(raw), SQLITE_OK);
+  SqliteCCLCJournal reopened(path, CellId("cell.1"), 4U);
+  RequestOwnerEpoch successor("new.seed");
+  const auto recovered = BeginTestOwnerEpoch(reopened, successor, 2, 4U);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_EQ(recovered.value().cell_claims.size(), 1U);
+  EXPECT_EQ(recovered.value().cell_claims.front().claim, claim.value());
+  EXPECT_FALSE(recovered.value().cell_claims.front().intent.intervention_evidence);
 }
 
 TEST(SqliteCCLCJournal, RouteCodecAndVersionEightMigrationPreserveLegacyClaimlessEvidence) {
@@ -1597,6 +1708,7 @@ TEST(SqliteCCLCJournal, RouteCodecAndVersionEightMigrationPreserveLegacyClaimles
   ASSERT_EQ(
       sqlite3_exec(raw,
                    "DELETE FROM cclc_lifecycle_cell_claims;"
+                   "ALTER TABLE cclc_lifecycle_cell_claims DROP COLUMN recovery_configuration;"
                    "UPDATE cclc_journal_metadata SET schema_version=8; PRAGMA user_version=8;",
                    nullptr, nullptr, nullptr),
       SQLITE_OK);
@@ -1967,6 +2079,7 @@ TEST(SqliteCCLCJournal, UnsupportedCompactedLegacyIdentityRollsBackVersionSevenM
   ASSERT_EQ(
       sqlite3_exec(
           raw,
+          "ALTER TABLE cclc_lifecycle_cell_claims DROP COLUMN recovery_configuration;"
           "INSERT INTO cclc_lifecycle_transaction_identity_guards VALUES('lifecycle.42',1);"
           "UPDATE cclc_journal_metadata SET highest_transaction_generation=1,schema_version=7;"
           "PRAGMA user_version=7;",
@@ -2119,6 +2232,7 @@ TEST(SqliteCCLCJournal, VersionSixUpgradePreservesExistingRequestAndStatusBytes)
   ASSERT_EQ(sqlite3_open(JournalPath(temporary).c_str(), &raw), SQLITE_OK);
   const auto result =
       sqlite3_exec(raw,
+                   "ALTER TABLE cclc_lifecycle_cell_claims DROP COLUMN recovery_configuration;"
                    "ALTER TABLE cclc_lifecycle_cell_claims DROP COLUMN program_node_evidence;"
                    "ALTER TABLE cclc_request_memberships DROP COLUMN rejection_blob;"
                    "ALTER TABLE cclc_request_memberships DROP COLUMN rejection_sequence;"

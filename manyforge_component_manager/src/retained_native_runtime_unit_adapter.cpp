@@ -1743,9 +1743,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       return true;
     };
 
-    if (contains_bundle(package_root_path, "installed")) {
-      return package_root_fd.get();
-    }
+    // Returning to an installed revision still needs the authored package's
+    // retained predecessor closure during fenced replacement recovery.
+    // The child independently verifies the exact bundle in the selected root.
     if (!candidate_package_root_path.empty() &&
         contains_bundle(candidate_package_root_path, "authored")) {
       return candidate_package_root_fd.get();

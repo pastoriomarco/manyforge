@@ -34,11 +34,14 @@ from .control_protocol import (
 from .component_overview import ComponentOverviewFacts
 from .execution_control import ExecutionControlIngress
 from .native import HeadlessApiError, strict_json_object
-from .program_cycle import ProgramCycleFrameDTO
+from .program_cycle import (
+    PROGRAM_CONTROL_STATE_SCHEMA,
+    ProgramCycleFrameDTO,
+    program_cycle_control_key,
+)
 from .service import HeadlessService
 
 
-_PROGRAM_CONTROL_STATE_SCHEMA = "manyforge.program_control_state.v1"
 _MAXIMUM_ACTIVE_CLIENT_INCIDENTS = CONTROL_MAXIMUM_CLIENTS * 8
 _SOURCE_RETRY_INITIAL_SECONDS = 0.05
 _SOURCE_RETRY_MAX_SECONDS = 1.0
@@ -131,7 +134,9 @@ def _meaningful_alarm_key(alarms: dict[str, Any]) -> str:
     """Exclude recorder time/counters that do not change alarm meaning."""
 
     payload = {
-        key: value for key, value in alarms.items() if key not in {"state_revision", "timestamp_ns"}
+        key: value
+        for key, value in alarms.items()
+        if key not in {"state_revision", "timestamp_ns"}
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -140,7 +145,9 @@ def _meaningful_overview_key(overview: dict[str, Any]) -> str:
     """Compare operator status, not reduction/publication bookkeeping."""
 
     payload = {
-        key: value for key, value in overview.items() if key not in {"overview_revision", "basis"}
+        key: value
+        for key, value in overview.items()
+        if key not in {"overview_revision", "basis"}
     }
     components = payload.get("components")
     if isinstance(components, list):
@@ -266,9 +273,15 @@ class HeadlessControlStateSource:
         self._service = service
         self._ingress = ingress
         self._runner_url = program_runner_websocket_url
-        self._watch_paths = tuple(dict.fromkeys(Path(path).absolute() for path in cold_watch_paths))
-        self._watch_roots = tuple(dict.fromkeys(path.parent for path in self._watch_paths))
-        self._freshness_paths = frozenset(Path(path).absolute() for path in cold_freshness_paths)
+        self._watch_paths = tuple(
+            dict.fromkeys(Path(path).absolute() for path in cold_watch_paths)
+        )
+        self._watch_roots = tuple(
+            dict.fromkeys(path.parent for path in self._watch_paths)
+        )
+        self._freshness_paths = frozenset(
+            Path(path).absolute() for path in cold_freshness_paths
+        )
         if cold_freshness_budget_ns is not None and cold_freshness_budget_ns < 1:
             raise ValueError("cold freshness budget must be positive")
         self._cold_freshness_budget_ns = cold_freshness_budget_ns
@@ -394,7 +407,9 @@ class HeadlessControlStateSource:
         runtime = self._facts.runtime if self._facts is not None else None
         scene = mapping(mapping(mapping(runtime).get("sections")).get("logical_scene"))
         projection = mapping(
-            mapping(mapping(scene.get("payload")).get("access")).get("active_projection")
+            mapping(mapping(scene.get("payload")).get("access")).get(
+                "active_projection"
+            )
         )
         scene_revision = mapping(projection.get("scene_revision"))
         context: dict[str, str] = {
@@ -455,7 +470,9 @@ class HeadlessControlStateSource:
             for name, target in names.items():
                 value = source.get(name)
                 if (
-                    isinstance(value, str) and value and len(value.encode("utf-8")) <= 1024
+                    isinstance(value, str)
+                    and value
+                    and len(value.encode("utf-8")) <= 1024
                 ) or type(value) is int:
                     context[target] = str(value)
         return context
@@ -470,7 +487,9 @@ class HeadlessControlStateSource:
         except Exception:
             self._diagnostics["incident_recording_failures"] += 1
             if not self._incident_recording_failed:
-                _LOGGER.exception("Control incident recorder unavailable; trace may be incomplete")
+                _LOGGER.exception(
+                    "Control incident recorder unavailable; trace may be incomplete"
+                )
             self._incident_recording_failed = True
         else:
             if self._incident_recording_failed:
@@ -825,11 +844,19 @@ class HeadlessControlStateSource:
             self._shell_key = _shell_key(shell)
             self._semantic_reason = None
         self._publish(event_class)
-        if event_class == "critical" and self._facts is not None:
+        if (
+            event_class == "critical"
+            and self._facts is not None
+            and (
+                previous is None
+                or program_cycle_control_key(previous)
+                != program_cycle_control_key(cycle)
+            )
+        ):
             # Program lifecycle and Kernel authoring admission are distinct
             # authorities, but claim/release changes occur at these sparse
             # lifecycle boundaries. Refresh the dependent cold facts once;
-            # high-rate node progress never enters this path.
+            # group hold/Resume and node progress do not change the cycle claim.
             self.notify_cold()
 
     async def _run_program_source(self) -> None:
@@ -871,10 +898,16 @@ class HeadlessControlStateSource:
                                 "program_cycle",
                                 "schema_version",
                                 "server_sequence",
+                                "event_class",
                             }
-                            or value.get("schema_version") != _PROGRAM_CONTROL_STATE_SCHEMA
+                            or value.get("schema_version")
+                            != PROGRAM_CONTROL_STATE_SCHEMA
+                            or value.get("event_class")
+                            not in ("critical", "node_progress")
                         ):
-                            raise ValueError("Program control frame has an invalid shape")
+                            raise ValueError(
+                                "Program control frame has an invalid shape"
+                            )
                         sequence_text = value.get("server_sequence")
                         if (
                             not isinstance(sequence_text, str)
@@ -890,14 +923,7 @@ class HeadlessControlStateSource:
                         cycle = value.get("program_cycle")
                         if not isinstance(cycle, dict):
                             raise ValueError("Program control state omitted its cycle")
-                        previous = self._cycle
-                        event_class = (
-                            "node_progress"
-                            if previous is not None
-                            and previous.get("execution_control_revision")
-                            == cycle.get("execution_control_revision")
-                            else "critical"
-                        )
+                        event_class = value["event_class"]
                         self._accept_cycle(cycle, event_class)
                         retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
                 # A clean peer close also invalidates the cached authority.
@@ -962,13 +988,27 @@ class HeadlessControlStateSource:
             error = facts.errors.get(missing, {})
             code = error.get("code", f"{missing}_projection_unavailable")
             raise ControlStateUnavailableError(str(code))
+        targets = facts.execution_targets_response
+        control = facts.execution_control_response
+        # These sequential reads may straddle native-owner replacement. The
+        # browser consumes one identity-bound pair, never a half/crossed pair.
+        # Preserve the original facts for readiness/diagnostics and publish
+        # unavailable until the existing owner-change wake captures both.
+        if (
+            targets is None
+            or control is None
+            or targets.get("ok") is not True
+            or control.get("ok") is not True
+            or targets.get("identity") != control.get("identity")
+        ):
+            targets = control = None
         return {
             "runtime": dict(facts.runtime),
             "alarms": dict(facts.alarms),
             "component_overview": facts.reduce(),
             "authoring_admission": dict(facts.authoring_admission),
-            "execution_targets": facts.execution_targets_response,
-            "execution_control_state": facts.execution_control_response,
+            "execution_targets": targets,
+            "execution_control_state": control,
             "program_cycle": dict(facts.program_cycle),
         }
 
@@ -1036,7 +1076,9 @@ class HeadlessControlStateSource:
         changed = False
         selected = self._watch_paths if paths is None else paths
         for path in selected:
-            key, modified = await _drained_owner_read(_source_file_observation, path=path)
+            key, modified = await _drained_owner_read(
+                _source_file_observation, path=path
+            )
             if path in self._watch_keys and self._watch_keys[path] != key:
                 changed = True
             self._watch_keys[path] = key

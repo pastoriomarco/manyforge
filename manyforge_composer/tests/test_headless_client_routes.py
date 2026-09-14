@@ -7,6 +7,7 @@ import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import parse_qsl
 
 import httpx
 import pytest
@@ -117,15 +118,9 @@ def _component_overview() -> dict[str, Any]:
         ],
         "components": [],
         "basis": {
-            "runtime_projection_owner_epoch": runtime[
-                "projection_owner_epoch"
-            ],
-            "runtime_projection_generation": runtime[
-                "projection_generation"
-            ],
-            "manager_source_owner_epoch": sections["manager"][
-                "source_owner_epoch"
-            ],
+            "runtime_projection_owner_epoch": runtime["projection_owner_epoch"],
+            "runtime_projection_generation": runtime["projection_generation"],
+            "manager_source_owner_epoch": sections["manager"]["source_owner_epoch"],
             "logical_scene_source_owner_epoch": sections["logical_scene"][
                 "source_owner_epoch"
             ],
@@ -165,12 +160,18 @@ def _execution_observation() -> dict[str, Any]:
             "graph_revision": "graph.1",
             "source_epoch": "joint-source.1",
             "source_sequence": 7,
-            "targets": [{
-                "controllable_component_id": "robot-a", "command_target_id": "arm",
-                "source_epoch": "arm-source.1", "source_sequence": 7,
-                "source_joint_names": ["joint1"], "compiled_joint_names": ["robot-a__joint1"],
-                "coordinate_kinds": ["angular"], "positions_si": [0.25],
-            }],
+            "targets": [
+                {
+                    "controllable_component_id": "robot-a",
+                    "command_target_id": "arm",
+                    "source_epoch": "arm-source.1",
+                    "source_sequence": 7,
+                    "source_joint_names": ["joint1"],
+                    "compiled_joint_names": ["robot-a__joint1"],
+                    "coordinate_kinds": ["angular"],
+                    "positions_si": [0.25],
+                }
+            ],
         },
     }
 
@@ -374,7 +375,11 @@ def headless_client() -> (
                 b"manyforge-source-model-projection-semantic",
                 b"manyforge.source_model_projection.v2",
                 canonical_json_bytes(
-                    {key: value for key, value in source_model.items() if key != "source"}
+                    {
+                        key: value
+                        for key, value in source_model.items()
+                        if key != "source"
+                    }
                 ),
             )
         )
@@ -440,9 +445,7 @@ def headless_client() -> (
                 "owner_transaction_id": body["owner_transaction_id"],
                 "request_id": body["request_id"],
                 "request_payload_digest": body["request_payload_digest"],
-                "expected_admission_generation": body[
-                    "expected_admission_generation"
-                ],
+                "expected_admission_generation": body["expected_admission_generation"],
                 "scope": {"resources": [], "configurations": []},
                 "program_cycle_evidence": None,
                 "intervention_evidence": None,
@@ -581,9 +584,7 @@ def headless_client() -> (
                     request=request,
                 )
             payload = applied_program
-        elif path.startswith("/api/scenarios/") and path.endswith(
-            "/program-selection"
-        ):
+        elif path.startswith("/api/scenarios/") and path.endswith("/program-selection"):
             scenario_id = path.split("/")[-2]
             selection = scenario_selections.get(scenario_id)
             if selection is None:
@@ -632,9 +633,9 @@ def headless_client() -> (
             ):
                 malformed_program = body["program"]
                 malformed_binding = _binding_for_program(malformed_program)
-                malformed_binding["target_role_bindings"][0][
-                    "frame_role_bindings"
-                ][0]["unknown"] = True
+                malformed_binding["target_role_bindings"][0]["frame_role_bindings"][0][
+                    "unknown"
+                ] = True
                 malformed_binding["program_binding_id"] = compute_content_identity(
                     malformed_binding,
                     own_field="program_binding_id",
@@ -665,9 +666,7 @@ def headless_client() -> (
                                 "program_binding_id"
                             ],
                             "program_id": malformed_program["program_id"],
-                            "program_revision": malformed_program[
-                                "program_revision"
-                            ],
+                            "program_revision": malformed_program["program_revision"],
                             "retained_bundle_id": malformed_binding[
                                 "retained_bundle_id"
                             ],
@@ -711,9 +710,7 @@ def headless_client() -> (
                     "program_id": program["program_id"],
                     "program_revision": program["program_revision"],
                     "retained_bundle_id": "sha256:" + "4" * 64,
-                    "scenario_catalog_revision": body[
-                        "scenario_catalog_revision"
-                    ],
+                    "scenario_catalog_revision": body["scenario_catalog_revision"],
                     "scenario_id": body["scenario_id"],
                     "schema_version": "manyforge.scenario_program_selection.v2",
                     "typed_parameter_overrides": {},
@@ -735,9 +732,7 @@ def headless_client() -> (
                 "program_id": program["program_id"],
                 "program_revision": program["program_revision"],
                 "retained_bundle_id": "sha256:" + "4" * 64,
-                "scenario_catalog_revision": body[
-                    "scenario_catalog_revision"
-                ],
+                "scenario_catalog_revision": body["scenario_catalog_revision"],
                 "scenario_id": body["scenario_id"],
                 "schema_version": "manyforge.applied_program_selection.v1",
                 "source": {
@@ -774,18 +769,12 @@ def headless_client() -> (
             payload = {
                 "schema_version": "manyforge.program_scene_preparation.v1",
                 "status": "prepared",
-                "applied_record_digest": applied_program["source"][
-                    "record_digest"
-                ],
+                "applied_record_digest": applied_program["source"]["record_digest"],
                 "program_revision": applied_program["program_revision"],
-                "admission_generation": body[
-                    "expected_admission_generation"
-                ],
+                "admission_generation": body["expected_admission_generation"],
                 "prepared_scene": {
                     "schema_version": "manyforge.prepared_program_scene.v1",
-                    "applied_record_digest": applied_program["source"][
-                        "record_digest"
-                    ],
+                    "applied_record_digest": applied_program["source"]["record_digest"],
                     "program_revision": applied_program["program_revision"],
                 },
             }
@@ -822,6 +811,20 @@ def headless_client() -> (
                 "api_version": "manyforge.execution_command_response.v1",
                 "ok": True,
                 "operation": {"operation_id": "operation-1"},
+            }
+        elif path == "/api/execution/manual-handover":
+            payload = {
+                "api_version": "manyforge.execution_command_response.v1",
+                "command": "read_manual_handover",
+                "ok": True,
+                "request_id": body["request_context"]["request_id"],
+                "request_owner_epoch": body["request_context"]["request_owner_epoch"],
+                "manual_handover": None,
+                "availability": {
+                    "available": False,
+                    "cleanup_required": False,
+                    "unavailable_reason": "Program motion is active",
+                },
             }
         elif path in {
             "/api/execution/motion-previews",
@@ -877,9 +880,7 @@ def headless_client() -> (
                 "projection_status": "committed",
                 "replay_status": "accepted_new",
                 "request_id": "request.scene.1",
-                "request_owner_epoch": body["request_context"][
-                    "request_owner_epoch"
-                ],
+                "request_owner_epoch": body["request_context"]["request_owner_epoch"],
                 "transaction_sequence": 1,
                 "update_status": "geometry_changed",
             }
@@ -892,7 +893,10 @@ def headless_client() -> (
         elif path.endswith("/acknowledge") or path.endswith("/acknowledge-all"):
             payload = {"schema_version": "manyforge.headless_api_mutation_response.v1"}
         elif path == "/api/execution/history":
-            payload = {"schema_version": "manyforge.historian_summary_page.v2", "events": []}
+            payload = {
+                "schema_version": "manyforge.historian_summary_page.v2",
+                "events": [],
+            }
         elif path == "/api/execution/history/health":
             payload = {
                 "schema_version": "manyforge.historian_health.v1",
@@ -922,7 +926,11 @@ class _ComposerTestClient(TestClient):
     """Add the backend-owned admission and durable request fence."""
 
     def __init__(
-        self, state: ComposerState, *args, security: SecurityConfig | None = None, **kwargs
+        self,
+        state: ComposerState,
+        *args,
+        security: SecurityConfig | None = None,
+        **kwargs,
     ) -> None:
         super().__init__(create_app(state, security=security), *args, **kwargs)
         self._composer_state = state
@@ -974,9 +982,7 @@ def _composer_with_program(client: HeadlessHttpClient) -> TestClient:
         program_path=str(_PROGRAM_PATH),
         allowed_fs_roots=[str(_ROOT / "examples")],
         headless_client=client,
-        authoring_state_root=tempfile.mkdtemp(
-            prefix="manyforge-composer-journal-"
-        ),
+        authoring_state_root=tempfile.mkdtemp(prefix="manyforge-composer-journal-"),
     )
     return _ComposerTestClient(
         state,
@@ -1034,13 +1040,9 @@ def test_public_control_rest_contract_is_a_strict_transparent_adapter(
         )
 
     assert projection.json()["execution_control_revision"] == 4
-    assert accepted.json()["receipt"]["correlation_id"] == (
-        "request.external.stop.1"
-    )
+    assert accepted.json()["receipt"]["correlation_id"] == ("request.external.stop.1")
     assert malformed.status_code == 422
-    forwarded = [
-        item for item in requests if item["path"].startswith("/api/control/")
-    ]
+    forwarded = [item for item in requests if item["path"].startswith("/api/control/")]
     assert [(item["method"], item["path"]) for item in forwarded] == [
         ("GET", "/api/control/state"),
         ("POST", "/api/control/commands"),
@@ -1073,10 +1075,10 @@ def _without_authoring_owner_calls(
         request
         for request in requests
         if request["path"] != "/api/cell/authoring-admission"
-        and not request["path"].startswith(
-            "/api/program/authoring-transactions"
-        )
+        and not request["path"].startswith("/api/program/authoring-transactions")
     ]
+
+
 def test_headless_http_client_rejects_rehashed_malformed_binding_ingress() -> None:
     program = {
         "program_id": "fixture",
@@ -1097,9 +1099,7 @@ def test_headless_http_client_rejects_rehashed_malformed_binding_ingress() -> No
         "program_revision": binding["program_revision"],
         "retained_bundle_id": binding["retained_bundle_id"],
         "graph_revision": binding["graph_revision"],
-        "node_environment_digest": binding["node_environment"][
-            "environment_digest"
-        ],
+        "node_environment_digest": binding["node_environment"]["environment_digest"],
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1140,9 +1140,7 @@ def test_headless_http_client_maps_non_string_provenance_kind_to_stable_apply_er
         "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "c" * 64,
         "graph_revision": binding["graph_revision"],
-        "node_environment_digest": binding["node_environment"][
-            "environment_digest"
-        ],
+        "node_environment_digest": binding["node_environment"]["environment_digest"],
         "preparation_digest": "sha256:" + "d" * 64,
         "program": program,
         "program_binding": binding,
@@ -1191,9 +1189,7 @@ def test_headless_http_client_rejects_rehashed_malformed_apply_binding() -> None
         "program_revision": "sha256:" + "a" * 64,
     }
     binding = _binding_for_program(program)
-    binding["target_role_bindings"][0]["frame_role_bindings"][0][
-        "unknown"
-    ] = True
+    binding["target_role_bindings"][0]["frame_role_bindings"][0]["unknown"] = True
     binding["program_binding_id"] = compute_content_identity(
         binding,
         own_field="program_binding_id",
@@ -1206,9 +1202,7 @@ def test_headless_http_client_rejects_rehashed_malformed_apply_binding() -> None
         "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "c" * 64,
         "graph_revision": binding["graph_revision"],
-        "node_environment_digest": binding["node_environment"][
-            "environment_digest"
-        ],
+        "node_environment_digest": binding["node_environment"]["environment_digest"],
         "preparation_digest": "sha256:" + "d" * 64,
         "program": program,
         "program_binding": binding,
@@ -1298,16 +1292,15 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
         assert "ready" not in health["headless"]
         assert "robot_readiness" not in health["headless"]
         assert composer.get("/api/runtime").json() == _runtime()
-        assert composer.get("/api/component-overview").json() == (
-            _component_overview()
-        )
+        assert composer.get("/api/component-overview").json() == (_component_overview())
         assert composer.get("/api/manager/status").status_code == 200
         assert composer.get("/api/manager/graph").status_code == 200
         assert composer.get("/api/manager/diff").status_code == 200
         assert composer.get("/api/node-environment").json() == node_environment
-        assert composer.get(
-            "/api/assistant/modes/composer-assistant"
-        ).json()["mode"] == "composer-assistant"
+        assert (
+            composer.get("/api/assistant/modes/composer-assistant").json()["mode"]
+            == "composer-assistant"
+        )
         assert composer.get("/api/assistant/modes").json()["modes"] == [
             {"mode": "composer-assistant"}
         ]
@@ -1332,8 +1325,7 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
         assert composer.get("/api/execution/history").status_code == 200
 
     assert all(
-        item["method"] == "GET"
-        for item in _without_authoring_owner_calls(requests)
+        item["method"] == "GET" for item in _without_authoring_owner_calls(requests)
     )
     alarm_request = next(
         item for item in requests if item["path"] == "/api/execution/alarms"
@@ -1351,9 +1343,7 @@ def test_composer_source_model_uses_one_coherent_context_request(
         response = composer.get("/api/source-model")
 
     assert response.status_code == 200
-    assert response.json()["schema_version"] == (
-        "manyforge.source_model_projection.v2"
-    )
+    assert response.json()["schema_version"] == ("manyforge.source_model_projection.v2")
     assert [
         item["path"]
         for item in requests
@@ -1393,13 +1383,12 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
 
     with _composer_with_program(client) as composer:
         workspace = composer.get("/api/program/workspace").json()
-        start["draft_program_revision"] = workspace["draft"][
-            "programRevision"
-        ]
+        start["draft_program_revision"] = workspace["draft"]["programRevision"]
         assert composer.get("/api/scenarios").status_code == 200
-        assert composer.get(
-            "/api/program/runs?active_only=true&limit=1"
-        ).json()["runs"] == []
+        assert (
+            composer.get("/api/program/runs?active_only=true&limit=1").json()["runs"]
+            == []
+        )
         started = composer.post("/api/program/runs", json=start)
         read = composer.get("/api/program/runs/program-run.1")
         motion_stopped = composer.post(
@@ -1499,11 +1488,7 @@ def test_composer_forwards_only_strict_attributed_alarm_intent(
         )
         assert forged.status_code == 422
 
-    forwarded = next(
-        item
-        for item in requests
-        if item["path"].endswith("/acknowledge")
-    )
+    forwarded = next(item for item in requests if item["path"].endswith("/acknowledge"))
     assert forwarded["body"] == body
     assert "trusted_principal_id" not in forwarded["body"]
 
@@ -1584,8 +1569,7 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
             assert response.status_code == 200, response.text
         assert composer.post("/api/execution/stops", json=stop).status_code == 200
         assert (
-            composer.post("/api/execution/full-stop", json=full_stop).status_code
-            == 200
+            composer.post("/api/execution/full-stop", json=full_stop).status_code == 200
         )
         assert composer.get("/api/execution/stop-fault").status_code == 200
         assert (
@@ -1606,6 +1590,71 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
                 params=scale_control["selector"],
             ).status_code
             == 200
+        )
+        assert (
+            composer.get(
+                "/api/execution/runtime-scale-control",
+                params={
+                    "program_binding_id": "binding-1",
+                    "synchronized_targets": (
+                        '[{"component_role_id":"robot-a","target_role_id":"arm"},'
+                        '{"component_role_id":"robot-b","target_role_id":"arm"}]'
+                    ),
+                },
+            ).status_code
+            == 200
+        )
+        assert (
+            composer.get(
+                "/api/execution/runtime-scale-control",
+                params={
+                    "program_binding_id": "binding-1",
+                    "synchronized_targets": (
+                        '[{"component_role_id":"robot","component_role_id":"other",'
+                        '"target_role_id":"arm"}]'
+                    ),
+                },
+            ).status_code
+            == 422
+        )
+        valid_group = (
+            '[{"component_role_id":"robot-a","target_role_id":"arm"},'
+            '{"component_role_id":"robot-b","target_role_id":"arm"}]'
+        )
+        assert (
+            composer.get(
+                "/api/execution/runtime-scale-control",
+                params=[
+                    ("program_binding_id", "binding-1"),
+                    ("synchronized_targets", "not-json"),
+                    ("synchronized_targets", valid_group),
+                ],
+            ).status_code
+            == 422
+        )
+        for key in ("program_binding_id", "component_role_id", "target_role_id"):
+            params = [
+                ("program_binding_id", "binding-1"),
+                ("component_role_id", "robot"),
+                ("target_role_id", "arm"),
+                (key, "first"),
+                (key, "last"),
+            ]
+            assert (
+                composer.get(
+                    "/api/execution/runtime-scale-control", params=params
+                ).status_code
+                == 422
+            )
+        assert (
+            composer.get(
+                "/api/execution/runtime-scale-control",
+                params={
+                    "program_binding_id": "binding-1",
+                    "synchronized_targets": "[" * 2000 + "]" * 2000,
+                },
+            ).status_code
+            == 422
         )
         mismatch = composer.post(
             "/api/execution/operations/operation-2/pause", json=control
@@ -1632,6 +1681,7 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         "recover",
         "runtime-scale-control",
         "runtime-scale-control",
+        "runtime-scale-control",
     ]
     assert forwarded[0]["body"] == control
     assert forwarded[4]["body"] == stop
@@ -1640,6 +1690,13 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
     assert forwarded[7]["body"] == recovery
     assert forwarded[8]["body"] == scale_control
     assert forwarded[9]["method"] == "GET"
+    assert forwarded[10]["method"] == "GET"
+    assert json.loads(
+        dict(parse_qsl(forwarded[10]["query"]))["synchronized_targets"]
+    ) == [
+        {"component_role_id": "robot-a", "target_role_id": "arm"},
+        {"component_role_id": "robot-b", "target_role_id": "arm"},
+    ]
 
 
 def test_composer_preserves_recognized_malformed_stop_semantics(
@@ -1690,8 +1747,7 @@ def test_composer_preserves_recognized_malformed_stop_semantics(
     forwarded = [
         item
         for item in requests
-        if item["path"]
-        in {"/api/execution/stops", "/api/execution/full-stop"}
+        if item["path"] in {"/api/execution/stops", "/api/execution/full-stop"}
     ]
     assert [item["path"] for item in forwarded] == [
         "/api/execution/stops",
@@ -1701,8 +1757,17 @@ def test_composer_preserves_recognized_malformed_stop_semantics(
     assert all(item["body"] == {} for item in forwarded)
 
 
-def test_composer_preview_routes_are_strict_stateless_forwarders(
+@pytest.mark.parametrize(
+    ("route", "command"),
+    [
+        ("capability-command-previews", "preview_capability_command"),
+        ("manual-handover", "read_manual_handover"),
+    ],
+)
+def test_composer_preview_and_handover_routes_are_strict_stateless_forwarders(
     headless_client,
+    route,
+    command,
 ) -> None:
     client, requests, _node_environment = headless_client
     body = {
@@ -1749,26 +1814,34 @@ def test_composer_preview_routes_are_strict_stateless_forwarders(
     }
 
     with _composer(client) as composer:
-        response = composer.post(
-            "/api/execution/capability-command-previews", json=body
-        )
+        response = composer.post(f"/api/execution/{route}", json=body)
         forged = composer.post(
-            "/api/execution/capability-command-previews",
+            f"/api/execution/{route}",
             json={**body, "trusted_principal_id": "forged"},
         )
 
     assert response.status_code == 200, response.text
-    assert response.json()["command"] == "preview_capability_command"
+    assert response.json()["command"] == command
+    if command == "read_manual_handover":
+        assert response.json() == {
+            "api_version": "manyforge.execution_command_response.v1",
+            "command": command,
+            "ok": True,
+            "request_id": body["request_context"]["request_id"],
+            "request_owner_epoch": body["request_context"]["request_owner_epoch"],
+            "manual_handover": None,
+            "availability": {
+                "available": False,
+                "cleanup_required": False,
+                "unavailable_reason": "Program motion is active",
+            },
+        }
     assert forged.status_code == 422
-    forwarded = [
-        item
-        for item in requests
-        if item["path"] == "/api/execution/capability-command-previews"
-    ]
+    forwarded = [item for item in requests if item["path"] == f"/api/execution/{route}"]
     assert forwarded == [
         {
             "method": "POST",
-            "path": "/api/execution/capability-command-previews",
+            "path": f"/api/execution/{route}",
             "query": "",
             "body": body,
         }
@@ -1795,7 +1868,7 @@ def test_composer_scene_transaction_fences_draft_and_forwards_only_owner_fields(
             "method": "POST",
             "path": "/api/scene/transactions",
             "query": "",
-            "body": body,
+            "body": {**body, "program_node_evidence": None},
         }
     ]
 
@@ -1811,9 +1884,7 @@ def test_composer_runtime_scene_transaction_omits_authoring_fences(
             "source_label": "composer_ui",
             "correlation_id": None,
         },
-        "expected_projection_revision": _scene_body()[
-            "expected_projection_revision"
-        ],
+        "expected_projection_revision": _scene_body()["expected_projection_revision"],
         "operation": {
             "kind": "attach_carried_object",
             "carried_object_attachment_id": "carried.part.1",
@@ -1840,7 +1911,11 @@ def test_composer_runtime_scene_transaction_omits_authoring_fences(
             "method": "POST",
             "path": "/api/scene/transactions",
             "query": "",
-            "body": {**body, "expected_admission_generation": None},
+            "body": {
+                **body,
+                "expected_admission_generation": None,
+                "program_node_evidence": None,
+            },
         }
     ]
 
@@ -1856,9 +1931,7 @@ def test_composer_rejects_stale_scene_draft_before_forwarding(headless_client) -
         response = composer.post("/api/scene/transactions", json=body)
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "scene_transaction_draft_stale"
-    assert not any(
-        item["path"] == "/api/scene/transactions" for item in requests
-    )
+    assert not any(item["path"] == "/api/scene/transactions" for item in requests)
 
 
 def test_program_scene_and_viewer_draft_edits_have_no_runtime_effect(
@@ -1883,9 +1956,7 @@ def test_program_scene_and_viewer_draft_edits_have_no_runtime_effect(
             "/api/program/draft/mutations",
             json={
                 "draftId": scene_workspace["draft"]["draftId"],
-                "expectedDraftRevision": scene_workspace["draft"][
-                    "draftRevision"
-                ],
+                "expectedDraftRevision": scene_workspace["draft"]["draftRevision"],
                 "mutation": "viewer_draft_replace",
                 "arguments": {
                     "viewer": {
@@ -1898,9 +1969,7 @@ def test_program_scene_and_viewer_draft_edits_have_no_runtime_effect(
         )
         assert viewer.status_code == 200, viewer.text
 
-    assert not any(
-        request["path"] == "/api/scene/transactions" for request in requests
-    )
+    assert not any(request["path"] == "/api/scene/transactions" for request in requests)
 
 
 def test_composer_rejects_draft_and_save_during_an_active_run(
@@ -1968,7 +2037,9 @@ def test_composer_rejects_draft_and_save_during_an_active_run(
     assert saved.json()["detail"]["code"] == "authoring_not_ready"
     assert mutated.status_code == 409, mutated.text
     assert mutated.json()["detail"]["code"] == "authoring_not_ready"
-    assert state.draft_session.snapshot()["draft_revision"] == snapshot["draft_revision"]
+    assert (
+        state.draft_session.snapshot()["draft_revision"] == snapshot["draft_revision"]
+    )
 
 
 def test_composer_program_apply_advances_only_headless_applied_identity(
@@ -2009,7 +2080,8 @@ def test_composer_program_apply_advances_only_headless_applied_identity(
     assert workspace["applied"]["matchesDraft"] is True
     assert workspace["hasUnappliedChanges"] is False
     forwarded = [
-        request for request in requests[request_offset:]
+        request
+        for request in requests[request_offset:]
         if request["path"] == "/api/program/apply"
     ]
     assert len(forwarded) == 1
@@ -2075,9 +2147,7 @@ def test_new_program_rotates_fenced_draft_without_disk_or_headless_mutation(
     assert _PROGRAM_PATH.read_bytes() == disk_before
     assert all(
         request["method"] == "GET"
-        for request in _without_authoring_owner_calls(
-            requests[request_offset:]
-        )
+        for request in _without_authoring_owner_calls(requests[request_offset:])
     )
 
 
@@ -2174,9 +2244,7 @@ def test_program_discard_reads_owner_truth_without_runtime_mutation(
             "/api/program/discard",
             json={
                 "draftId": discarded.json()["draft"]["draftId"],
-                "expectedDraftRevision": discarded.json()["draft"][
-                    "draftRevision"
-                ],
+                "expectedDraftRevision": discarded.json()["draft"]["draftRevision"],
             },
         )
 
@@ -2186,16 +2254,16 @@ def test_program_discard_reads_owner_truth_without_runtime_mutation(
             "matchesDraft": True,
         }
     assert discarded.json()["draft"]["program"] == initial["draft"]["program"]
-    assert no_op.json()["draft"]["draftRevision"] == discarded.json()["draft"][
-        "draftRevision"
-    ]
-    action_requests = _without_authoring_owner_calls(
-        requests[request_offset:]
+    assert (
+        no_op.json()["draft"]["draftRevision"]
+        == discarded.json()["draft"]["draftRevision"]
     )
+    action_requests = _without_authoring_owner_calls(requests[request_offset:])
     assert all(request["method"] == "GET" for request in action_requests)
-    assert {
-        request["path"] for request in action_requests
-    } == {"/api/program/applied", "/api/node-environment"}
+    assert {request["path"] for request in action_requests} == {
+        "/api/program/applied",
+        "/api/node-environment",
+    }
 
 
 def test_program_discard_without_applied_selection_is_typed_and_atomic(
@@ -2215,9 +2283,7 @@ def test_program_discard_without_applied_selection_is_typed_and_atomic(
         after = composer.get("/api/program/workspace").json()
 
     assert response.status_code == 404
-    assert response.json()["detail"]["code"] == (
-        "program_applied_selection_not_found"
-    )
+    assert response.json()["detail"]["code"] == ("program_applied_selection_not_found")
     assert after["draft"] == before["draft"]
     assert after["saved"] == before["saved"]
     assert [
@@ -2244,14 +2310,11 @@ def test_program_revert_without_applied_selection_has_no_effect(
         after = composer.get("/api/program/workspace").json()
 
     assert response.status_code == 404
-    assert response.json()["detail"]["code"] == (
-        "program_applied_selection_not_found"
-    )
+    assert response.json()["detail"]["code"] == ("program_applied_selection_not_found")
     assert after["draft"] == before["draft"]
     assert after["saved"] == before["saved"]
     assert not any(
-        request["path"] == "/api/program/apply"
-        for request in requests[request_offset:]
+        request["path"] == "/api/program/apply" for request in requests[request_offset:]
     )
 
 
@@ -2304,9 +2367,7 @@ def test_program_revert_failure_preserves_draft_saved_and_active_run(
                 "expectedDraftRevision": dirty["draft"]["draftRevision"],
             },
         ).json()["workspace"]
-        assert dirty["applied"]["programRevision"] != dirty["saved"][
-            "programRevision"
-        ]
+        assert dirty["applied"]["programRevision"] != dirty["saved"]["programRevision"]
         forbidden_offset = len(requests)
         caller_selected = composer.post(
             "/api/program/revert",
@@ -2397,22 +2458,16 @@ def test_program_revert_rejects_malformed_binding_without_effect_or_apply(
             },
         ).json()
         before = applied_response["workspace"]
-        malformed_projection = copy.deepcopy(
-            applied_response["headless"]["applied"]
-        )
+        malformed_projection = copy.deepcopy(applied_response["headless"]["applied"])
         malformed = malformed_projection["program_binding"]
-        malformed["target_role_bindings"][0]["frame_role_bindings"][0][
-            "unknown"
-        ] = True
+        malformed["target_role_bindings"][0]["frame_role_bindings"][0]["unknown"] = True
         malformed["program_binding_id"] = compute_content_identity(
             malformed,
             own_field="program_binding_id",
             identity_domain="program-binding-id",
             api_version="manyforge.program_binding.v1",
         )
-        malformed_projection["program_binding_id"] = malformed[
-            "program_binding_id"
-        ]
+        malformed_projection["program_binding_id"] = malformed["program_binding_id"]
         monkeypatch.setattr(
             client,
             "program_applied",
@@ -2433,8 +2488,7 @@ def test_program_revert_rejects_malformed_binding_without_effect_or_apply(
     assert after["draft"] == before["draft"]
     assert after["saved"] == before["saved"]
     assert not any(
-        request["path"] == "/api/program/apply"
-        for request in requests[request_offset:]
+        request["path"] == "/api/program/apply" for request in requests[request_offset:]
     )
 
 
@@ -2466,9 +2520,7 @@ def test_program_revert_applies_exact_saved_content_and_preserves_run_capture(
                 "expectedDraftRevision": dirty["draft"]["draftRevision"],
             },
         ).json()["workspace"]
-        assert dirty["applied"]["programRevision"] != dirty["saved"][
-            "programRevision"
-        ]
+        assert dirty["applied"]["programRevision"] != dirty["saved"]["programRevision"]
         capture_before = composer.get("/api/program/runs/program-run.1").json()[
             "capture"
         ]
@@ -2513,8 +2565,7 @@ def test_program_revert_applies_exact_saved_content_and_preserves_run_capture(
     assert len(apply_requests) == 1
     assert apply_requests[0]["body"]["program"] == saved["draft"]["program"]
     assert not any(
-        request["path"] == "/api/program/apply"
-        for request in requests[no_op_offset:]
+        request["path"] == "/api/program/apply" for request in requests[no_op_offset:]
     )
 
 
@@ -2646,8 +2697,6 @@ def test_composer_preserves_manager_apply_success_receipt(
     assert response.json() == receipt
 
 
-
-
 def test_viewer_demand_lease_expires_without_waiting_for_wall_clock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2722,8 +2771,6 @@ def test_viewer_demand_lease_expires_without_waiting_for_wall_clock(
         0.0,
     )
     asyncio.run(exercise())
-
-
 
 
 def test_composer_rejects_a_mismatched_active_environment_without_local_fallback(
@@ -2801,6 +2848,8 @@ def test_composer_does_not_fall_back_when_the_headless_environment_is_lost() -> 
         raw.close()
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "manager_source_unavailable"
+
+
 _ROOT = Path(__file__).resolve().parents[2]
 _PROGRAM_PATH = _ROOT / "examples" / "pick_and_place_minimal.program.yaml"
 _LOAD_PROGRAM_PATH = _ROOT / "examples" / "semantic_shape_pick.program.yaml"

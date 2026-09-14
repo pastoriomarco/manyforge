@@ -195,9 +195,18 @@ def test_pinned_lite6_moveit_source_without_jerk_does_not_invent_limits():
     assert result == native.compile_deployment_draft(json.dumps(document))
 
 
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "enabled,machine_required,two_robots,unit_index",
+    [
+        (False, False, False, 0),
+        (True, False, False, 0),
+        (True, True, False, 0),
+        (True, False, True, 0),
+        (True, False, True, 1),
+    ],
+)
 def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
-    tmp_path, enabled
+    tmp_path, enabled, machine_required, two_robots, unit_index
 ):
     source = json.loads(
         (
@@ -205,7 +214,24 @@ def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
             / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
         ).read_text()
     )
-    target = source["graph"]["runtime_units"][0]["configuration"][
+    if two_robots:
+        # Reuse the real component definition, with disjoint instance identities.
+        # Shared cell-wide providers/catalogs remain singletons.
+        for section in (source, source["graph"], source["policies"]):
+            for rows in section.values():
+                if not isinstance(rows, list):
+                    continue
+                rows.extend(
+                    json.loads(json.dumps(row).replace("lite6_robot", "peer_robot"))
+                    for row in list(rows)
+                    if isinstance(row, dict)
+                    and any(
+                        isinstance(value, str) and value.startswith("lite6_robot")
+                        for value in row.values()
+                    )
+                )
+        assert len(source["graph"]["runtime_units"]) == 2
+    target = source["graph"]["runtime_units"][unit_index]["configuration"][
         "motion_target_limits"
     ][0]
     assert target["ordinary_motion_jerk"]["enabled"] is False
@@ -219,21 +245,93 @@ def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
                 "imported": {
                     "maximum_rad_s3": 12.0,
                     "enabled": True,
-                    "machine_required": False,
+                    "machine_required": machine_required,
                     "source_id": "robot_moveit_config/config/joint_limits.yaml",
                     "source_digest": _DIGEST,
                 },
             }
         ],
     }
-    target["ordinary_motion_jerk"] = settings
-    compiled = compile_deployment_document(json.dumps(source))
+    client, state = _client(tmp_path)
+    # Keep the existing lightweight admission double, but use the real source
+    # compiler and actual workspace mutation/save/open routes.
+    state.deployment_draft_session = DeploymentDraftSession()
+    original = tmp_path / "original.deployment.yaml"
+    original.write_text(json.dumps(source))
+    workspace = client.get("/api/deployment/workspace").json()
+    opened = client.post(
+        "/api/deployment/open-draft",
+        json=_request(workspace, path=str(original), confirmDiscard=False, kind="open"),
+    )
+    assert opened.status_code == 200, opened.text
+    changed = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(
+            opened.json(),
+            path=[
+                "graph",
+                "runtime_units",
+                unit_index,
+                "configuration",
+                "motion_target_limits",
+                0,
+                "ordinary_motion_jerk",
+            ],
+            value=settings,
+        ),
+    )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["draft"]["differsFromSaved"] is True
+    if machine_required:
+        jerk_path = [
+            "graph",
+            "runtime_units",
+            unit_index,
+            "configuration",
+            "motion_target_limits",
+            0,
+            "ordinary_motion_jerk",
+        ]
+        for suffix, value in [
+            (["enabled"], False),
+            (["joint_limits", 0, "imported", "enabled"], False),
+            (["joint_limits", 0, "override_rad_s3"], 13.0),
+        ]:
+            rejected = client.post(
+                "/api/deployment/draft/mutations",
+                json=_request(
+                    changed.json(),
+                    path=jerk_path + suffix,
+                    value=value,
+                    kind="invalid-" + "-".join(map(str, suffix)),
+                ),
+            )
+            assert rejected.status_code == 400, (suffix, rejected.status_code)
+            assert rejected.json()["detail"]["code"] == "deployment_draft_invalid"
+            assert (
+                client.get("/api/deployment/workspace").json()["draft"]
+                == changed.json()["draft"]
+            )
     saved = tmp_path / "jerk.deployment.yaml"
-    saved.write_text(compiled.canonical_json)
+    saved_response = client.post(
+        "/api/deployment/save-as",
+        json=_request(
+            changed.json(), path=str(saved), confirmOverwrite=False, kind="save"
+        ),
+    )
+    assert saved_response.status_code == 200, saved_response.text
+    opened_again = client.post(
+        "/api/deployment/open-draft",
+        json=_request(
+            saved_response.json(), path=str(saved), confirmDiscard=False, kind="reopen"
+        ),
+    )
+    assert opened_again.status_code == 200, opened_again.text
+    assert opened_again.json()["draft"]["differsFromSaved"] is False
     reopened = compile_deployment_document(saved.read_text())
-    assert reopened.canonical_json == compiled.canonical_json
+    assert reopened.document == opened_again.json()["draft"]["document"]
     assert (
-        reopened.document["graph"]["runtime_units"][0]["configuration"][
+        reopened.document["graph"]["runtime_units"][unit_index]["configuration"][
             "motion_target_limits"
         ][0]["ordinary_motion_jerk"]
         == settings
@@ -241,6 +339,18 @@ def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
     # Off retains the numbers but does not activate them; the independent
     # controlled-Stop choices are unchanged in either case.
     assert reopened.document["policies"] == source["policies"]
+    if two_robots:
+        untouched = source["graph"]["runtime_units"][1 - unit_index]
+        peer = next(
+            unit
+            for unit in reopened.document["graph"]["runtime_units"]
+            if unit["runtime_unit_id"] == untouched["runtime_unit_id"]
+        )
+        assert peer == untouched
+    restored = DeploymentDraftSession()
+    restored.restore_retained_state(state.deployment_draft_session.retained_state())
+    assert restored.snapshot() == state.deployment_draft_session.snapshot()
+    client.close()
 
 
 @pytest.mark.parametrize("enabled", [False, True])

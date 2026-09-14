@@ -129,6 +129,43 @@ TEST(ScenarioCatalogRepositoryTest,
   ASSERT_NE(current, nullptr);
   EXPECT_EQ(current->revision(), second->revision());
   EXPECT_EQ(current->rows(), second->rows());
+
+  FilesystemScenarioApplyCandidateSource source(root.path(), "maintained");
+  const auto retained = source.catalog_path_for_revision(first->revision());
+  EXPECT_NE(retained, source.catalog_path());
+  // The exact retired head survives reopening; no catalog enumeration is used.
+  EXPECT_TRUE(std::filesystem::is_regular_file(retained));
+  std::filesystem::remove(retained);
+  EXPECT_THROW(
+      static_cast<void>(source.catalog_path_for_revision(first->revision())),
+      ScenarioApplyCandidateError);
+}
+
+TEST(ScenarioCatalogRepositoryTest,
+     RetainsLegacyHeadAndRejectsCorruptRevision) {
+  TemporaryDirectory root;
+  const auto first = build_scenario_catalog({row("alpha", '1')});
+  const auto second = build_scenario_catalog({row("alpha", '4')});
+  FilesystemScenarioCatalogRepository repository(root.path(), "maintained");
+  ASSERT_EQ(repository.compare_and_set(std::nullopt, first),
+            ScenarioCatalogPublishResult::kPublished);
+  const auto retained =
+      root.path() / ("maintained.scenario-catalog." +
+                     first->revision().value().substr(7U) + ".json");
+  std::filesystem::remove(retained); // Existing packages had only a head.
+  ASSERT_EQ(repository.compare_and_set(first->revision(), second),
+            ScenarioCatalogPublishResult::kPublished);
+  FilesystemScenarioApplyCandidateSource source(root.path(), "maintained");
+  EXPECT_EQ(source.catalog_path_for_revision(first->revision()), retained);
+  std::filesystem::copy_file(repository.catalog_path(), retained,
+                             std::filesystem::copy_options::overwrite_existing);
+  EXPECT_THROW(
+      static_cast<void>(source.catalog_path_for_revision(first->revision())),
+      ScenarioApplyCandidateError);
+  EXPECT_THROW(
+      static_cast<void>(repository.compare_and_set(second->revision(), first)),
+      ScenarioCatalogError);
+  EXPECT_EQ(repository.get_verified()->revision(), second->revision());
 }
 
 TEST(ScenarioApplyCandidateSourceTest,

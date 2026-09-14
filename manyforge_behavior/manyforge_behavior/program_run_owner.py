@@ -389,7 +389,17 @@ class ProgramRunOwner:
             tree_status=entry.tree_status,
             node_status_revision=entry.node_status_revision,
             node_statuses=entry.node_statuses,
-            active_operation_count=entry.active_operation_count,
+            # Scope counts are settlement samples, not a live motion feed.
+            # Once scheduling is permitted, an earlier zero is no longer proof.
+            active_operation_count=(
+                None
+                if entry.state
+                in (
+                    ProgramRunState.RUNNING,
+                    ProgramRunState.INTERVENTION_REQUIRED,
+                )
+                else entry.active_operation_count
+            ),
             reason_code=entry.reason_code,
             message=entry.message,
         )

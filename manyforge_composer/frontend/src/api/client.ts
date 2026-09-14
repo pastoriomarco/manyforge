@@ -24,6 +24,7 @@ import {
   parseProgramWorkspaceTransitionResponse,
   parseCurrentScenarioResponse,
   parseRuntimeOverrideMaterializationResponse,
+  parseRuntimeScaleControlStatus,
   parseScenarioCatalogResponse,
   parseSceneTransactionResponse,
   parseSceneMeshAssetMetadata,
@@ -87,6 +88,8 @@ import type {
   ExecutionIdentity,
   MotionPreviewReceipt,
   ManualControlAvailability,
+  RuntimeScaleControlSelector,
+  RuntimeScaleControlStatus,
 } from '../types/robotControl';
 import type {
   AssistantModeIndex,
@@ -227,6 +230,41 @@ function errorMessageFromPayload(payload: unknown, fallback: string): string {
     }
   }
   return fallback;
+}
+
+function runtimeScaleSelectorQuery(selector: RuntimeScaleControlSelector): string {
+  const parameters = new URLSearchParams();
+  parameters.set('program_binding_id', selector.programBindingId);
+  if (selector.kind === 'singular') {
+    parameters.set('component_role_id', selector.componentRoleId);
+    parameters.set('target_role_id', selector.targetRoleId);
+  } else {
+    parameters.set('synchronized_targets', JSON.stringify(selector.synchronizedTargets.map((target) => ({
+      component_role_id: target.componentRoleId,
+      target_role_id: target.targetRoleId,
+    }))));
+  }
+  return parameters.toString();
+}
+
+function sameRuntimeScaleSelector(
+  requested: RuntimeScaleControlSelector,
+  returned: RuntimeScaleControlSelector,
+): boolean {
+  if (requested.kind !== returned.kind
+    || requested.programBindingId !== returned.programBindingId) return false;
+  if (requested.kind === 'singular' && returned.kind === 'singular') {
+    return requested.componentRoleId === returned.componentRoleId
+      && requested.targetRoleId === returned.targetRoleId;
+  }
+  if (requested.kind !== 'group' || returned.kind !== 'group') return false;
+  const identity = (target: { componentRoleId: string; targetRoleId: string }) => (
+    JSON.stringify([target.componentRoleId, target.targetRoleId])
+  );
+  const requestedTargets = new Set(requested.synchronizedTargets.map(identity));
+  const returnedTargets = new Set(returned.synchronizedTargets.map(identity));
+  return requestedTargets.size === returnedTargets.size
+    && [...requestedTargets].every((target) => returnedTargets.has(target));
 }
 
 export class ApiError extends Error {
@@ -842,6 +880,31 @@ export const api = {
         parseExecutionIdentity,
         signal,
       ),
+    runtimeScaleControl: (
+      selector: RuntimeScaleControlSelector,
+      signal?: AbortSignal,
+    ): Promise<RuntimeScaleControlStatus> => {
+      // Selectors are caller-owned objects. Snapshot the complete identity
+      // before constructing the URL or awaiting the response so a caller
+      // mutation cannot cross the request and its reply validation.
+      const requestedSelector: RuntimeScaleControlSelector = selector.kind === 'singular'
+        ? { ...selector }
+        : {
+            ...selector,
+            synchronizedTargets: selector.synchronizedTargets.map((target) => ({ ...target })),
+          };
+      return requestJson(
+        `/api/execution/runtime-scale-control?${runtimeScaleSelectorQuery(requestedSelector)}`,
+        (value) => {
+          const status = parseRuntimeScaleControlStatus(value);
+          if (!sameRuntimeScaleSelector(requestedSelector, status.selector)) {
+            throw new Error('runtime-scale control status does not match its requested selector');
+          }
+          return status;
+        },
+        signal,
+      );
+    },
     manualAvailability: (
       intent: DirectControlOperationIntent,
       signal?: AbortSignal,

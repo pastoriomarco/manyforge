@@ -165,7 +165,7 @@ def _failure(task_id: str, code: str, message: str) -> OwnerTaskSnapshot:
         state=OwnerTaskState.FAILED,
         reason_code=code,
         message=message,
-        metadata={"finish_current_settled": True},
+        settlement_proven=True,
     )
 
 
@@ -808,6 +808,7 @@ class CCLCProgramTaskPort:
                 OwnerTaskState.SUCCEEDED,
                 output=_thaw(status),
                 metadata=metadata,
+                settlement_proven=True,
             )
         if terminal not in {"failed_known_no_effect", "failed_partial_effect"}:
             raise CCLCProgramPortError(
@@ -825,7 +826,8 @@ class CCLCProgramTaskPort:
         return OwnerTaskSnapshot(
             task_id,
             OwnerTaskState.FAILED,
-            metadata={**metadata, "finish_current_settled": True},
+            metadata=metadata,
+            settlement_proven=True,
             reason_code=f"cclc_{terminal}",
             message=message,
         )
@@ -857,6 +859,8 @@ class CCLCProgramTaskPort:
         context = self._context(identity.program_run_id)
         request_id = _request_id(node_id, identity)
         task_id = request_id
+        if previous_task is not None and previous_task.request is not None:
+            request_id = previous_task.request["request_context"]["request_id"]
         with self._lock:
             if previous_task is not None:
                 if self._tasks.get(task_id) is not previous_task:
@@ -887,6 +891,19 @@ class CCLCProgramTaskPort:
                     break
                 except Exception as error:
                     failure = _error_payload(error)
+                    if (
+                        refresh == 0
+                        and failure["code"] == "stale_generation"
+                        and isinstance(failure["details"], Mapping)
+                        and failure["details"].get("effect") == "not_started"
+                        and failure["details"].get("reason")
+                        == "expected_generation_stale"
+                    ):
+                        # The owner proved no admission. Reuse the bounded
+                        # refresh, with a new receipt identity for changed input.
+                        request_id = f"{task_id}-admission-{body['expected_admission_generation']}"
+                        submitted = False
+                        continue
                     # The receiver explicitly proved this request unstarted
                     # before retiring its settled namespace. Re-read all
                     # binding/admission facts once; never retry a lost reply,
@@ -986,7 +1003,7 @@ class CCLCProgramTaskPort:
                         "CCLC submission outcome is unknown"
                     )
                 transaction_id, snapshot = self._snapshot_from_result(
-                    task_id, kind, task_id, result
+                    task_id, kind, task.request["request_context"]["request_id"], result
                 )
                 with self._lock:
                     if self._tasks.get(task_id) is task:
@@ -1054,11 +1071,11 @@ class CCLCProgramTaskPort:
             if (
                 task is None
                 or task.program_run_id != identity.program_run_id
-                or task.snapshot.state is not OwnerTaskState.SUCCEEDED
+                or not task.snapshot.settlement_proven
             ):
                 raise CCLCProgramPortError(
                     "cclc_task_not_acknowledgeable",
-                    "CCLC task is absent, foreign, or not successful",
+                    "CCLC task is absent, foreign, or lacks settlement evidence",
                 )
             del self._tasks[task_id]
 

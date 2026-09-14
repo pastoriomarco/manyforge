@@ -611,6 +611,8 @@ def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> No
 
     started = owner.start(admission)
     assert started.state is ProgramRunState.RUNNING
+    assert started.active_operation_count is None
+    assert started.to_dict()["active_operation_count"] is None
     assert started.tree_status == "invalid"
     assert started.node_status_revision == 1
     assert set(started.node_statuses.values()) == {"idle"}
@@ -1002,6 +1004,7 @@ def test_authored_pause_requires_intervention_without_redispatch() -> None:
 
     paused = owner.advance_once(started.capture.program_run_id)
     assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
+    assert paused.active_operation_count is None
     assert paused.reason_code == "no_feasible_candidate"
     assert task.starts == 1
     assert owner.advance_once(started.capture.program_run_id).state is (
@@ -1912,9 +1915,33 @@ def test_selection_status_never_settles_an_observed_completed_task():
         state=OwnerTaskState.SUCCEEDED,
     )
     controls = owner.execution_selection_controls(run_id)
-    assert controls["groups"][0]["resume_allowed"]
+    assert not controls["groups"][0]["resume_allowed"]
+    assert (
+        controls["groups"][0]["resume_unavailable_reason"]
+        == "selected_owner_work_pending"
+    )
     assert "leaf_acknowledge" not in events
     assert owner.read(run_id) == before
+    assert task.starts == 1 and task.cancels == 0
+
+    held = owner.advance_once(run_id)
+    assert held.state is ProgramRunState.RUNNING
+    assert held.node_statuses["move_to_pick"] == "success"
+    assert held.node_statuses["remove_table"] == "idle"
+    assert events.count("leaf_acknowledge") == 1
+    assert task.starts == 1 and task.cancels == 0
+    controls = owner.execution_selection_controls(run_id)
+    assert controls["groups"][0]["resume_allowed"]
+    owner.resume_motion(
+        run_id,
+        expected_run_revision=held.run_revision,
+        expected_selection_revision=controls["selection_revision"],
+        request_id="resume.after-completed-task",
+    )
+    completed = owner.advance_once(run_id)
+    assert completed.state is ProgramRunState.SUCCEEDED
+    assert completed.active_operation_count == 0
+    assert events.count("leaf_acknowledge") == 1
     assert task.starts == 1 and task.cancels == 0
 
 
@@ -2554,6 +2581,7 @@ def test_full_stop_preserves_tree_and_run_recovers_a_fresh_attempt() -> None:
     assert stopped.state is ProgramRunState.FULL_STOPPING
     stopped = host.advance_ready_once()[0]
     assert stopped.state is ProgramRunState.FULL_STOPPED
+    assert stopped.active_operation_count == 0
     assert stopped.tree_status == "running"
     assert scope.stop_requests == 1
     assert task.cancels == 0
@@ -2566,6 +2594,7 @@ def test_full_stop_preserves_tree_and_run_recovers_a_fresh_attempt() -> None:
     )
 
     assert resumed.state is ProgramRunState.RUNNING
+    assert resumed.active_operation_count is None
     assert task.starts == 1
     assert len(task.recoveries) == 1
     assert scope.release_requests == 1
@@ -2839,6 +2868,7 @@ def test_stop_reaches_kernel_scope_before_tree_invalidation_and_waits_for_proof(
     started = owner.start(admission)
     running = owner.advance_once(started.capture.program_run_id)
     assert running.state is ProgramRunState.RUNNING
+    assert running.active_operation_count is None
     assert events == ["leaf_start"]
 
     scope.state = ProgramRunScopeState.ACTIVE

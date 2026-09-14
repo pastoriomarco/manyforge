@@ -976,10 +976,57 @@ class ComponentLifecycleCoordinator::Impl final {
     return ResolveAdmission([&] { return SubmitRouteSelectionResolved(intent); });
   }
 
+  [[nodiscard]] Result<
+      std::pair<ControllerLifecycleObservationDTO, ControllerLifecycleReconciliationDTO>>
+  ObserveRouteConfiguration(
+      const RetainedBundleId& retained_bundle_id, const GraphRevision& graph_revision,
+      const DesiredControlConfigurationDTO& desired_configuration,
+      const std::optional<ExpectedActiveControlConfigurationDTO>& expected_current) {
+    using Readback =
+        std::pair<ControllerLifecycleObservationDTO, ControllerLifecycleReconciliationDTO>;
+    if (!route_services_ || route_services_->current_snapshot_source == nullptr ||
+        route_services_->controller_lifecycle_port_resolver == nullptr) {
+      return Result<Readback>::Err(coordinator_error(
+          "route_observation_unavailable", "controller observation services are not composed",
+          "route_services_missing"));
+    }
+    try {
+      auto snapshot = route_services_->current_snapshot_source->ReadCurrentRouteSelectionSnapshot(
+          retained_bundle_id, graph_revision, desired_configuration);
+      if (!snapshot.ok()) return Result<Readback>::Err(snapshot.error());
+      if (expected_current) {
+        const auto& current = snapshot.value().value().active_control_configuration;
+        const ExpectedActiveControlConfigurationDTO actual{
+            current ? ExpectedActiveControlConfigurationPresenceDTO::kPresent
+                    : ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
+            current ? std::optional(current->active_control_configuration_id) : std::nullopt,
+            current ? std::optional(current->active_control_configuration_generation)
+                    : std::nullopt};
+        if (!expected_current->locally_valid() || *expected_current != actual) {
+          return Result<Readback>::Err(coordinator_error(
+              "route_observation_configuration_changed",
+              "retained controller configuration changed", "current_configuration_mismatch"));
+        }
+      }
+      std::shared_ptr<IControllerLifecyclePort> port;
+      return ObserveRouteController(snapshot.value().expected_controller_domain(), port);
+    } catch (...) {
+      return Result<Readback>::Err(coordinator_error(
+          "route_selection_snapshot_failed", "the route snapshot source raised an exception",
+          "snapshot_source_exception"));
+    }
+  }
+
+  [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteRecovery(
+      const RouteSelectionIntentDTO& intent, const ActiveControlConfigurationDTO& predecessor) {
+    return ResolveAdmission([&] { return SubmitRouteSelectionResolved(intent, &predecessor); });
+  }
+
   [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelectionResolved(
-      const RouteSelectionIntentDTO& intent) {
+      const RouteSelectionIntentDTO& intent,
+      const ActiveControlConfigurationDTO* recovery_predecessor = nullptr) {
     bool known_unstarted = false;
-    auto result = SubmitRouteSelectionAttempt(intent, known_unstarted);
+    auto result = SubmitRouteSelectionAttempt(intent, known_unstarted, recovery_predecessor);
     if (!result.ok() && known_unstarted) {
       auto error = result.error();
       error.details["effect"] = "not_started";
@@ -995,7 +1042,8 @@ class ComponentLifecycleCoordinator::Impl final {
   }
 
   [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelectionAttempt(
-      const RouteSelectionIntentDTO& intent, bool& known_unstarted) {
+      const RouteSelectionIntentDTO& intent, bool& known_unstarted,
+      const ActiveControlConfigurationDTO* recovery_predecessor) {
     if (!intent.locally_valid()) {
       return Result<CCLCRouteSelectionRequestResultDTO>::Err(
           coordinator_error("route_selection_intent_invalid",
@@ -1046,7 +1094,8 @@ class ComponentLifecycleCoordinator::Impl final {
       }
       admission_gate_generation = admission_gate_generation_;
     }
-    return CommitRouteAdmission(intent, admission_gate_generation, known_unstarted);
+    return CommitRouteAdmission(intent, admission_gate_generation, known_unstarted,
+                                recovery_predecessor);
   }
 
   [[nodiscard]] Result<std::optional<RouteSelectionStatusDTO>> LoadRouteSelectionStatus(
@@ -1379,7 +1428,8 @@ class ComponentLifecycleCoordinator::Impl final {
 
   template <typename RecordRejection>
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireDurableCellClaim(
-      const CellAdmissionClaimIntentDTO& intent, RecordRejection&& record_rejection) {
+      const CellAdmissionClaimIntentDTO& intent, RecordRejection&& record_rejection,
+      const ActiveControlConfigurationDTO* recovery_predecessor = nullptr) {
     // This submit owns the persistence flag. Closing must not wait for itself.
     const auto close = [&] {
       std::lock_guard lock(admission_mutex_);
@@ -1391,7 +1441,10 @@ class ComponentLifecycleCoordinator::Impl final {
         close();
         return Result<CellAdmissionClaimDTO>::Err(attempt.error());
       }
-      auto acquired = kernel_cell_admission_port_->AcquireCellAdmissionClaim(intent);
+      auto acquired = recovery_predecessor
+                          ? kernel_cell_admission_port_->AcquireRouteRecoveryCellAdmissionClaim(
+                                intent, *recovery_predecessor)
+                          : kernel_cell_admission_port_->AcquireCellAdmissionClaim(intent);
       if (!acquired.ok() || acquired.value().intent != intent) {
         const bool unstarted =
             !acquired.ok() && (acquired.error().code == "stale_generation" ||
@@ -1443,7 +1496,7 @@ class ComponentLifecycleCoordinator::Impl final {
 
   [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> CommitRouteAdmission(
       const RouteSelectionIntentDTO& intent, std::uint64_t admission_gate_generation,
-      bool& known_unstarted) {
+      bool& known_unstarted, const ActiveControlConfigurationDTO* recovery_predecessor) {
     std::unique_lock admission_lock(admission_mutex_);
 
     if (!accepting_.load(std::memory_order_acquire) ||
@@ -1523,6 +1576,30 @@ class ComponentLifecycleCoordinator::Impl final {
           coordinator_error("route_selection_current_snapshot_mismatch",
                             "the route snapshot and durable current configuration differ",
                             "durable_current_configuration_mismatch"));
+    }
+
+    if (recovery_predecessor) {
+      const auto& old = *recovery_predecessor;
+      const auto& desired = intent.desired_configuration;
+      if (!old.locally_valid() || old.state != ActiveControlConfigurationStateDTO::kReconciled ||
+          journal_current.value() != old || intent.program_node_evidence ||
+          desired.control_domain_id != old.control_domain_id ||
+          desired.control_domain_revision != old.control_domain_revision ||
+          desired.controller_topology_id != old.controller_topology_id ||
+          desired.topology_revision != old.topology_revision ||
+          desired.activation_set_id != old.activation_set_id ||
+          desired.binding_routes.size() != old.binding_routes.size() ||
+          !std::equal(desired.binding_routes.begin(), desired.binding_routes.end(),
+                      old.binding_routes.begin(), [](const auto& wanted, const auto& saved) {
+                        return wanted.control_binding_id == saved.control_binding_id &&
+                               wanted.control_binding_revision == saved.control_binding_revision &&
+                               wanted.control_route_id == saved.control_route_id;
+                      })) {
+        return Result<CCLCRouteSelectionRequestResultDTO>::Err(
+            coordinator_error("route_recovery_predecessor_mismatch",
+                              "replacement recovery must restore the exact durable saved route",
+                              "route_recovery_predecessor_mismatch"));
+      }
     }
 
     std::int64_t accepted_at_ns = -1;
@@ -1669,7 +1746,7 @@ class ComponentLifecycleCoordinator::Impl final {
       }
     };
 
-    const CellAdmissionClaimIntentDTO claim_intent{
+    CellAdmissionClaimIntentDTO claim_intent{
         CellAdmissionClaimKindDTO::kComponentLifecycle,
         CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
         CurrentOwnerEpoch(),
@@ -1681,13 +1758,26 @@ class ComponentLifecycleCoordinator::Impl final {
         {},
         {},
         intent.program_node_evidence};
+    if (recovery_predecessor) {
+      claim_intent.claim_kind = CellAdmissionClaimKindDTO::kInterventionOrRecovery;
+      claim_intent.scope.configurations = {
+          {recovery_predecessor->control_domain_id,
+           recovery_predecessor->active_control_configuration_id,
+           recovery_predecessor->active_control_configuration_generation}};
+      claim_intent.intervention_evidence = CellAdmissionInterventionEvidenceDTO{
+          claim_intent.owner_role, claim_intent.owner_epoch, claim_intent.owner_transaction_id,
+          claim_intent.request_payload_digest, std::nullopt};
+    }
     admission_persistence_active_ = true;
     known_unstarted = false;
     admission_lock.unlock();
-    const auto acquired = AcquireDurableCellClaim(claim_intent, [&](const ErrorDTO& error) {
-      return journal_.RecordRouteSelectionRejection(CurrentOwnerEpoch(), intent, error,
-                                                    claim_intent);
-    });
+    const auto acquired = AcquireDurableCellClaim(
+        claim_intent,
+        [&](const ErrorDTO& error) {
+          return journal_.RecordRouteSelectionRejection(CurrentOwnerEpoch(), intent, error,
+                                                        claim_intent);
+        },
+        recovery_predecessor);
     if (!acquired.ok()) {
       admission_lock.lock();
       admission_persistence_active_ = false;
@@ -2056,51 +2146,17 @@ class ComponentLifecycleCoordinator::Impl final {
     if (cancellation.stop_requested()) {
       return;
     }
-    if (!runtime->controller_port) {
-      Result<std::shared_ptr<IControllerLifecyclePort>> resolved =
-          Result<std::shared_ptr<IControllerLifecyclePort>>::Err(
-              coordinator_error("route_controller_port_resolution_failed",
-                                "the controller-lifecycle port resolver raised an exception",
-                                "controller_port_resolver_exception"));
-      try {
-        resolved = route_services_->controller_lifecycle_port_resolver
-                       ->ResolveExactControllerLifecyclePort(
-                           runtime->status.acceptance.controller_lifecycle_observation_query);
-      } catch (...) {
-      }
-      if (!resolved.ok() || !resolved.value()) {
+    const auto readback = ObserveRouteController(runtime->snapshot.expected_controller_domain(),
+                                                 runtime->controller_port);
+    if (!readback.ok()) {
+      if (!runtime->controller_port) {
         CloseAdmission();
-        return;
+      } else {
+        ScheduleRoute(runtime);
       }
-      runtime->controller_port = std::move(resolved.value());
-    }
-
-    Result<ControllerLifecycleObservationDTO> observed =
-        Result<ControllerLifecycleObservationDTO>::Err(coordinator_error(
-            "route_controller_observation_failed",
-            "the controller-lifecycle observation raised an exception", "observe_exception"));
-    try {
-      observed = runtime->controller_port->Observe(
-          runtime->status.acceptance.controller_lifecycle_observation_query);
-    } catch (...) {
-    }
-    if (!observed.ok()) {
-      ScheduleRoute(runtime);
       return;
     }
-    const auto now_ns = [&]() {
-      try {
-        return clock_.now();
-      } catch (...) {
-        return std::int64_t{-1};
-      }
-    }();
-    const auto reconciled = ReconcileControllerLifecycle(
-        runtime->snapshot.expected_controller_domain().value(), observed.value(), now_ns);
-    if (!reconciled.ok()) {
-      ScheduleRoute(runtime);
-      return;
-    }
+    const auto& [observed, reconciled] = readback.value();
 
     auto observed_status = runtime->status;
     if (!AdvanceRouteStatus(runtime, observed_status,
@@ -2108,24 +2164,35 @@ class ComponentLifecycleCoordinator::Impl final {
       CloseAdmission();
       return;
     }
-    observed_status.controller_observation = observed.value();
-    observed_status.controller_reconciliation = reconciled.value();
+    observed_status.controller_observation = observed;
+    observed_status.controller_reconciliation = reconciled;
     observed_status.controller_transition_plan.reset();
     observed_status.reconciliation_required = false;
     observed_status.error.reset();
 
-    if (reconciled.value().disposition ==
-        ControllerLifecycleReconciliationDispositionDTO::kReconciled) {
+    // The durable private-recovery claim authorizes reconciliation of observed
+    // truth, never a controller transition. A mismatch must remain a mismatch;
+    // only ordinary route selection may repair it by changing controllers.
+    const bool observation_only_recovery =
+        runtime->cell_claim && runtime->cell_claim->intent.claim_kind ==
+                                   CellAdmissionClaimKindDTO::kInterventionOrRecovery;
+    const bool configuration_reconciled =
+        reconciled.disposition == ControllerLifecycleReconciliationDispositionDTO::kReconciled;
+    if (configuration_reconciled || observation_only_recovery) {
       const bool any_dispatched =
           std::any_of(observed_status.controller_transition_results.begin(),
                       observed_status.controller_transition_results.end(), [](const auto& result) {
                         return result.dispatch_state !=
                                ControllerLifecycleTransitionDispatchStateDTO::kNotDispatched;
                       });
-      observed_status.effect = any_dispatched ? RouteSelectionEffectDTO::kEffectObserved
-                                              : RouteSelectionEffectDTO::kKnownNoEffect;
-      observed_status.affected_control_binding_ids.clear();
-      observed_status.affected_controller_role_ids.clear();
+      observed_status.effect = !configuration_reconciled
+                                   ? RouteSelectionEffectDTO::kPartialEffectObserved
+                               : any_dispatched ? RouteSelectionEffectDTO::kEffectObserved
+                                                : RouteSelectionEffectDTO::kKnownNoEffect;
+      if (configuration_reconciled) {
+        observed_status.affected_control_binding_ids.clear();
+        observed_status.affected_controller_role_ids.clear();
+      }
       if (!RecordRouteStatus(runtime, std::move(observed_status))) {
         return;
       }
@@ -2133,8 +2200,13 @@ class ComponentLifecycleCoordinator::Impl final {
       return;
     }
 
+    std::int64_t now_ns = -1;
+    try {
+      now_ns = clock_.now();
+    } catch (...) {
+    }
     const auto plan = BuildControllerLifecycleTransitionPlan(
-        runtime->snapshot.expected_controller_domain().value(), observed.value(), now_ns);
+        runtime->snapshot.expected_controller_domain().value(), observed, now_ns);
     if (!plan.ok() || plan.value().steps.empty()) {
       observed_status.effect = observed_status.controller_transition_results.empty()
                                    ? RouteSelectionEffectDTO::kPartialEffectObserved
@@ -2167,7 +2239,7 @@ class ComponentLifecycleCoordinator::Impl final {
     }
     const ControllerLifecycleTransitionIntentDTO transition{
         runtime->status.acceptance.controller_lifecycle_observation_query,
-        observed.value().source_sequence, 0U, step, runtime->status.remaining_duration_ns};
+        observed.source_sequence, 0U, step, runtime->status.remaining_duration_ns};
     auto prepared_status = runtime->status;
     if (!AdvanceRouteStatus(runtime, prepared_status, phase)) {
       CloseAdmission();
@@ -2765,8 +2837,10 @@ class ComponentLifecycleCoordinator::Impl final {
 
   [[nodiscard]] Result<
       std::pair<ControllerLifecycleObservationDTO, ControllerLifecycleReconciliationDTO>>
-  ObserveRecoveredRoute(const std::shared_ptr<RouteRuntimeState>& runtime) noexcept {
-    if (!runtime->controller_port) {
+  ObserveRouteController(const ControllerLifecycleExpectedDomain& expected,
+                         std::shared_ptr<IControllerLifecyclePort>& port) noexcept {
+    const auto query = MakeControllerLifecycleObservationQuery(expected.value());
+    if (!port) {
       Result<std::shared_ptr<IControllerLifecyclePort>> resolved =
           Result<std::shared_ptr<IControllerLifecyclePort>>::Err(
               coordinator_error("route_controller_port_resolution_failed",
@@ -2774,8 +2848,7 @@ class ComponentLifecycleCoordinator::Impl final {
                                 "controller_port_resolver_exception"));
       try {
         resolved = route_services_->controller_lifecycle_port_resolver
-                       ->ResolveExactControllerLifecyclePort(
-                           runtime->status.acceptance.controller_lifecycle_observation_query);
+                       ->ResolveExactControllerLifecyclePort(query);
       } catch (...) {
       }
       if (!resolved.ok() || !resolved.value()) {
@@ -2786,16 +2859,14 @@ class ComponentLifecycleCoordinator::Impl final {
                                                   "controller_port_missing")
                               : resolved.error());
       }
-      runtime->controller_port = std::move(resolved.value());
+      port = std::move(resolved.value());
     }
     Result<ControllerLifecycleObservationDTO> observation =
-        Result<ControllerLifecycleObservationDTO>::Err(
-            coordinator_error("route_controller_observation_failed",
-                              "the controller-lifecycle recovery observation raised an exception",
-                              "observe_exception"));
+        Result<ControllerLifecycleObservationDTO>::Err(coordinator_error(
+            "route_controller_observation_failed",
+            "the controller-lifecycle observation raised an exception", "observe_exception"));
     try {
-      observation = runtime->controller_port->Observe(
-          runtime->status.acceptance.controller_lifecycle_observation_query);
+      observation = port->Observe(query);
     } catch (...) {
     }
     if (!observation.ok()) {
@@ -2807,8 +2878,8 @@ class ComponentLifecycleCoordinator::Impl final {
       now_ns = clock_.now();
     } catch (...) {
     }
-    const auto reconciliation = ReconcileControllerLifecycle(
-        runtime->snapshot.expected_controller_domain().value(), observation.value(), now_ns);
+    const auto reconciliation =
+        ReconcileControllerLifecycle(expected.value(), observation.value(), now_ns);
     if (!reconciliation.ok()) {
       return Result<std::pair<ControllerLifecycleObservationDTO,
                               ControllerLifecycleReconciliationDTO>>::Err(reconciliation.error());
@@ -2978,7 +3049,8 @@ class ComponentLifecycleCoordinator::Impl final {
   void ReconcileRecoveredControllerTruth(
       const std::shared_ptr<RouteRuntimeState>& runtime, std::stop_token cancellation,
       std::optional<CCLCRouteEffectAttemptDTO> unresolved_transition) noexcept {
-    const auto observed = ObserveRecoveredRoute(runtime);
+    const auto observed = ObserveRouteController(
+        runtime->snapshot.expected_controller_domain(), runtime->controller_port);
     if (!observed.ok()) {
       ScheduleRoute(runtime);
       return;
@@ -5987,6 +6059,20 @@ ComponentLifecycleCoordinator::ReadLifecycleRequestResult(
 Result<CCLCRouteSelectionRequestResultDTO> ComponentLifecycleCoordinator::SubmitRouteSelection(
     const RouteSelectionIntentDTO& intent) {
   return impl_->SubmitRouteSelection(intent);
+}
+
+Result<CCLCRouteSelectionRequestResultDTO> ComponentLifecycleCoordinator::SubmitRouteRecovery(
+    const RouteSelectionIntentDTO& intent, const ActiveControlConfigurationDTO& predecessor) {
+  return impl_->SubmitRouteRecovery(intent, predecessor);
+}
+
+Result<std::pair<ControllerLifecycleObservationDTO, ControllerLifecycleReconciliationDTO>>
+ComponentLifecycleCoordinator::ObserveRouteConfiguration(
+    const RetainedBundleId& retained_bundle_id, const GraphRevision& graph_revision,
+    const DesiredControlConfigurationDTO& desired_configuration,
+    std::optional<ExpectedActiveControlConfigurationDTO> expected_current) {
+  return impl_->ObserveRouteConfiguration(retained_bundle_id, graph_revision, desired_configuration,
+                                          expected_current);
 }
 
 Result<std::optional<CCLCRouteSelectionRequestResultDTO>>

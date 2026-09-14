@@ -86,7 +86,7 @@ export function NodePaletteItem({
       >
         i
       </button>
-      <OverlayPanel
+      {infoOpen && <OverlayPanel
         open={infoOpen}
         title={entry.name}
         titleId={titleId}
@@ -141,7 +141,7 @@ export function NodePaletteItem({
             </div>
           )}
         </div>
-      </OverlayPanel>
+      </OverlayPanel>}
     </div>
   );
 }

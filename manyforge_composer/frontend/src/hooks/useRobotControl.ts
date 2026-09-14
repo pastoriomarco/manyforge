@@ -17,6 +17,7 @@ import {
   operationStateIsTerminal,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
   robotControlHasActiveOperation,
+  robotControlHasLocalDraft,
   robotControlReducer,
 } from '../state/robotControl';
 import type { ComposerHeadlessState } from '../types/headless';
@@ -42,6 +43,19 @@ function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message.trim()
     ? error.message
     : fallback;
+}
+
+function runtimeScaleSelectorIdentity(selector: RuntimeScaleControlStatus['selector']): string {
+  const compareTuples = (left: unknown[], right: unknown[]): number => {
+    const leftJson = JSON.stringify(left);
+    const rightJson = JSON.stringify(right);
+    return leftJson < rightJson ? -1 : leftJson > rightJson ? 1 : 0;
+  };
+  return selector.kind === 'singular'
+    ? JSON.stringify(['singular', selector.programBindingId, selector.componentRoleId, selector.targetRoleId])
+    : JSON.stringify(['group', selector.programBindingId, ...selector.synchronizedTargets
+      .map((target) => [target.componentRoleId, target.targetRoleId])
+      .sort(compareTuples)]);
 }
 
 /** Expected draft rejection is panel feedback, not an execution incident. */
@@ -84,17 +98,34 @@ export function runtimeScaleControlScopeFence(
   ownerEpoch: string,
   status: RuntimeScaleControlStatus,
 ): string {
-  return [
+  const memberScope = status.selector.kind === 'group'
+    ? (status.synchronizedMembers ?? []).map((member) => [
+      member.componentRoleId,
+      member.targetRoleId,
+      member.controlDomainId,
+      member.controlDomainRevision,
+      member.controlBindingId,
+      member.controlBindingRevision,
+      member.scalingDomainId,
+      member.activeControlConfigurationId,
+      member.activeControlConfigurationGeneration,
+    ]).sort((left, right) => {
+      const leftJson = JSON.stringify(left);
+      const rightJson = JSON.stringify(right);
+      return leftJson < rightJson ? -1 : leftJson > rightJson ? 1 : 0;
+    })
+    : undefined;
+  return JSON.stringify([
     ownerEpoch,
     status.selector.programBindingId,
-    status.selector.componentRoleId,
-    status.selector.targetRoleId,
+    runtimeScaleSelectorIdentity(status.selector),
     status.controlDomainId ?? 'no-control-domain',
     status.controlDomainRevision ?? 'no-control-domain-revision',
     status.controlBindingId ?? 'no-control-binding',
     status.controlBindingRevision ?? 'no-control-binding-revision',
     status.scalingDomainId ?? 'no-scaling-domain',
-  ].join('\u0000');
+    memberScope,
+  ]);
 }
 
 /**
@@ -123,9 +154,8 @@ export function acceptedRuntimeScaleStatus(
     accepted.requestId !== expectedRequestId
     || accepted.controlGeneration !== submitted.controlGeneration + 1
     || accepted.requestedScale !== expectedScale
-    || accepted.selector.programBindingId !== submitted.selector.programBindingId
-    || accepted.selector.componentRoleId !== submitted.selector.componentRoleId
-    || accepted.selector.targetRoleId !== submitted.selector.targetRoleId
+    || runtimeScaleSelectorIdentity(accepted.selector)
+      !== runtimeScaleSelectorIdentity(submitted.selector)
   ) {
     throw new Error('Runtime velocity acceptance does not match its submitted command.');
   }
@@ -163,6 +193,7 @@ export interface RobotControlController {
   currentStatus: ExecutionOwnerStatus | null;
   manualControlAllowed: boolean;
   manualControlUnavailableReason: string | null;
+  setManualPanelVisible: (visible: boolean) => void;
   controlPending: 'stop' | 'pause' | 'resume' | 'reset' | null;
   runtimeScaleStatus: RuntimeScaleControlStatus | null;
   runtimeScaleDraft: number;
@@ -244,6 +275,9 @@ export function useRobotControl(
   const [availability, setAvailability] = useState<{
     scope: string; result: ManualControlAvailability | null; error: string | null;
   } | null>(null);
+  const [manualPanelVisible, setManualPanelVisible] = useState(false);
+  const observeManualAvailability = manualPanelVisible
+    || robotControlHasLocalDraft(state) || state.operation !== null;
   const [availabilityRefresh, refreshAvailability] = useReducer((value: number) => value + 1, 0);
   const [cleanupFailure, setCleanupFailure] = useState<string | null>(null);
   const cleanupInFlight = useRef<Promise<void> | null>(null);
@@ -271,7 +305,7 @@ export function useRobotControl(
     headlessSnapshot?.programCycle?.programRunId]);
 
   useEffect(() => {
-    if (!enabled || !observeProgramRun || availabilityScope === null) return;
+    if (!enabled || !observeProgramRun || !observeManualAvailability || availabilityScope === null) return;
     const status = latestSnapshot.current?.executionControlStatus;
     if (status == null) return;
     const controller = new AbortController();
@@ -293,7 +327,7 @@ export function useRobotControl(
     };
     void read();
     return () => { current = false; controller.abort(); };
-  }, [enabled, observeProgramRun, availabilityScope, availabilityRefresh, state.mode]);
+  }, [enabled, observeProgramRun, observeManualAvailability, availabilityScope, availabilityRefresh, state.mode]);
 
   useEffect(() => {
     if (observeProgramRun) dispatch({ type: 'manual_scope_changed' });
@@ -578,7 +612,13 @@ export function useRobotControl(
       const receipt = await controlSource.sendExecutionCommand(
         'runtime_scale',
         {
-          selector: {
+          selector: observed.selector.kind === 'group' ? {
+            program_binding_id: observed.selector.programBindingId,
+            synchronized_targets: observed.selector.synchronizedTargets.map((target) => ({
+              component_role_id: target.componentRoleId,
+              target_role_id: target.targetRoleId,
+            })),
+          } : {
             program_binding_id: observed.selector.programBindingId,
             component_role_id: observed.selector.componentRoleId,
             target_role_id: observed.selector.targetRoleId,
@@ -890,6 +930,7 @@ export function useRobotControl(
     currentStatus: headlessSnapshot?.executionControlStatus ?? null,
     manualControlAllowed,
     manualControlUnavailableReason,
+    setManualPanelVisible,
     controlPending,
     runtimeScaleStatus,
     runtimeScaleDraft,

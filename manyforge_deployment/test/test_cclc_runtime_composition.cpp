@@ -317,7 +317,7 @@ TEST(CCLCRuntimeComposition,
   core::FakeClock clock;
   core::ManualScheduler scheduler;
 
-  auto composition = CCLCRuntimeComposition::CreateAndStart(
+  auto composition = CCLCRuntimeComposition::Create(
       configuration(root.path(), retained.bundle->value().cell_graph.cell_id,
                     "1"),
       retained.bundle, publication_reader, receipt, artifact_source,
@@ -325,6 +325,19 @@ TEST(CCLCRuntimeComposition,
       kernel_ports, kernel_ports, kernel_ports, publication_owner, clock,
       scheduler);
   ASSERT_TRUE(composition.ok()) << composition.error().message;
+  EXPECT_FALSE(composition.value()->coordinator().accepting_new_requests());
+  const auto run_root = root.path() / "run";
+  EXPECT_FALSE(std::filesystem::exists(
+      run_root / std::string(kCCLCOpenRequestSocketFilename)));
+  EXPECT_FALSE(std::filesystem::exists(
+      run_root / std::string(kCCLCOpenRequestRosSocketFilename)));
+  EXPECT_THROW((void)composition.value()->open_request_socket_path(),
+               std::logic_error);
+  EXPECT_THROW((void)composition.value()->ros_open_request_socket_path(),
+               std::logic_error);
+  ASSERT_TRUE(composition.value()->Start().ok());
+  const auto first_owner =
+      composition.value()->coordinator().request_owner_epoch();
   EXPECT_TRUE(composition.value()->coordinator().accepting_new_requests());
   struct stat socket_status {};
   ASSERT_EQ(::lstat(composition.value()->open_request_socket_path().c_str(),
@@ -369,16 +382,19 @@ TEST(CCLCRuntimeComposition,
   EXPECT_FALSE(std::filesystem::exists(old_socket));
   EXPECT_FALSE(std::filesystem::exists(old_ros_socket));
 
-  auto reused = CCLCRuntimeComposition::CreateAndStart(
+  auto reused = CCLCRuntimeComposition::Create(
       configuration(root.path(), retained.bundle->value().cell_graph.cell_id,
                     "1"),
       retained.bundle, publication_reader, receipt, artifact_source,
       catalogs.value(), {}, controller_sources(*retained.bundle), {}, {}, {},
       kernel_ports, kernel_ports, kernel_ports, publication_owner, clock,
       scheduler);
-  EXPECT_FALSE(reused.ok());
+  ASSERT_TRUE(reused.ok());
+  ASSERT_TRUE(reused.value()->Start().ok());
+  EXPECT_NE(reused.value()->coordinator().request_owner_epoch(), first_owner);
+  reused.value().reset();
 
-  auto replacement = CCLCRuntimeComposition::CreateAndStart(
+  auto replacement = CCLCRuntimeComposition::Create(
       configuration(root.path(), retained.bundle->value().cell_graph.cell_id,
                     "2"),
       retained.bundle, publication_reader, receipt, artifact_source,
@@ -386,6 +402,8 @@ TEST(CCLCRuntimeComposition,
       kernel_ports, kernel_ports, kernel_ports, publication_owner, clock,
       scheduler);
   ASSERT_TRUE(replacement.ok()) << replacement.error().message;
+  EXPECT_FALSE(replacement.value()->coordinator().accepting_new_requests());
+  ASSERT_TRUE(replacement.value()->Start().ok());
 }
 
 TEST(CCLCRuntimeComposition, RejectsMissingTrustedRootsWithoutCreatingThem) {
@@ -406,7 +424,7 @@ TEST(CCLCRuntimeComposition, RejectsMissingTrustedRootsWithoutCreatingThem) {
       root.path(), retained.bundle->value().cell_graph.cell_id, "missing");
   const auto missing_run_root = root.path() / "absent-run-root";
   config.run_root = missing_run_root;
-  auto composition = CCLCRuntimeComposition::CreateAndStart(
+  auto composition = CCLCRuntimeComposition::Create(
       std::move(config), retained.bundle, publication_reader, receipt,
       artifact_source, catalogs.value(), {},
       controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
@@ -432,7 +450,7 @@ TEST(CCLCRuntimeComposition, RejectsAliasedStateAndRunCapabilities) {
       root.path(), retained.bundle->value().cell_graph.cell_id, "aliased");
   config.run_root = config.state_root / ".";
 
-  auto composition = CCLCRuntimeComposition::CreateAndStart(
+  auto composition = CCLCRuntimeComposition::Create(
       std::move(config), retained.bundle, publication_reader, receipt,
       artifact_source, catalogs.value(), {},
       controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
@@ -458,7 +476,7 @@ TEST(CCLCRuntimeComposition, RejectsNestedStateAndRunCapabilities) {
   config.run_root = config.state_root / "disposable";
   ASSERT_TRUE(std::filesystem::create_directory(config.run_root));
 
-  auto composition = CCLCRuntimeComposition::CreateAndStart(
+  auto composition = CCLCRuntimeComposition::Create(
       std::move(config), retained.bundle, publication_reader, receipt,
       artifact_source, catalogs.value(), {},
       controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,
@@ -498,7 +516,7 @@ TEST(CCLCRuntimeComposition,
           std::filesystem::perm_options::replace);
     }
 
-    auto composition = CCLCRuntimeComposition::CreateAndStart(
+    auto composition = CCLCRuntimeComposition::Create(
         std::move(config), retained.bundle, publication_reader, receipt,
         artifact_source, catalogs.value(), {},
         controller_sources(*retained.bundle), {}, {}, {}, kernel_ports,

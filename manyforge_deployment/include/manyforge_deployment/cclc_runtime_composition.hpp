@@ -56,30 +56,35 @@ struct CCLCRuntimeCompositionConfig final {
 class CCLCRuntimeComposition final {
 public:
   [[nodiscard]] static core::Result<std::unique_ptr<CCLCRuntimeComposition>>
-  CreateAndStart(
-      CCLCRuntimeCompositionConfig config,
-      std::shared_ptr<const RetainedBundle> retained_bundle,
-      const core::IActiveBundlePublicationReader &active_publication_reader,
-      core::ActiveBundlePublicationReceiptDTO expected_active_publication,
-      const IVerifiedRetainedProductArtifactSource &artifact_source,
-      const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
-      std::vector<core::ResolvedLifecycleProviderOccurrenceDTO>
-          lifecycle_provider_occurrences,
-      std::vector<ControllerLifecycleSourceOccurrenceDTO> controller_sources,
-      std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
-      std::vector<core::ControllerLifecyclePortRegistrationDTO>
-          controller_ports,
-      std::vector<core::KinematicResourceSourceProjectionDTO>
-          source_projections,
-      core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
-      core::IKernelCellAdmissionPort &kernel_cell_admission_port,
-      core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
-      IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
-      core::IClock &clock, core::IScheduler &scheduler,
-      std::function<core::Result<
-          std::optional<core::ActiveControlConfigurationDTO>>(
-          const core::ControlDomainId &)>
-          kernel_current_configuration_source = {});
+  Create(CCLCRuntimeCompositionConfig config,
+         std::shared_ptr<const RetainedBundle> retained_bundle,
+         const core::IActiveBundlePublicationReader &active_publication_reader,
+         core::ActiveBundlePublicationReceiptDTO expected_active_publication,
+         const IVerifiedRetainedProductArtifactSource &artifact_source,
+         const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
+         std::vector<core::ResolvedLifecycleProviderOccurrenceDTO>
+             lifecycle_provider_occurrences,
+         std::vector<ControllerLifecycleSourceOccurrenceDTO> controller_sources,
+         std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
+         std::vector<core::ControllerLifecyclePortRegistrationDTO>
+             controller_ports,
+         std::vector<core::KinematicResourceSourceProjectionDTO>
+             source_projections,
+         core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
+         core::IKernelCellAdmissionPort &kernel_cell_admission_port,
+         core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
+         IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
+         core::IClock &clock, core::IScheduler &scheduler,
+         std::function<
+             core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+                 const core::ControlDomainId &)>
+             kernel_current_configuration_source = {});
+
+  /// Starts effectful retained-transaction recovery and request transports.
+  /// Construction alone permits owner-local observation, without admitting
+  /// requests or resuming journaled effects. Call only with startup authority;
+  /// a failed Start is terminal for this composition and requires destruction.
+  [[nodiscard]] core::Result<void> Start();
 
   ~CCLCRuntimeComposition();
 
@@ -90,10 +95,9 @@ public:
   [[nodiscard]] const core::ComponentLifecycleCoordinator &
   coordinator() const noexcept;
   [[nodiscard]] core::ICCLCOpenRequestPort &open_request_port() noexcept;
+  [[nodiscard]] const std::filesystem::path &open_request_socket_path() const;
   [[nodiscard]] const std::filesystem::path &
-  open_request_socket_path() const noexcept;
-  [[nodiscard]] const std::filesystem::path &
-  ros_open_request_socket_path() const noexcept;
+  ros_open_request_socket_path() const;
   [[nodiscard]] core::Result<core::ComponentLifecycleCurrentSnapshotDTO>
   ReadCurrentComponentSnapshot(
       const core::ControllableComponentId &controllable_component_id) const;
@@ -114,9 +118,9 @@ private:
           controller_ports,
       std::vector<core::KinematicResourceSourceProjectionDTO>
           source_projections,
-      std::function<core::Result<
-          std::optional<core::ActiveControlConfigurationDTO>>(
-          const core::ControlDomainId &)>
+      std::function<
+          core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+              const core::ControlDomainId &)>
           kernel_current_configuration_source,
       core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
       core::IKernelCellAdmissionPort &kernel_cell_admission_port,

@@ -203,7 +203,10 @@ trajectory(const RoboPlanCandidateRequestDTO &request) {
       request.resources,
       request.start_state.joint_names,
       {core::TrajectoryWaypointDTO{0.0, std::move(start), zeros, zeros},
-       core::TrajectoryWaypointDTO{1.0, std::move(target), zeros, zeros}}};
+       core::TrajectoryWaypointDTO{1.0, std::move(target), zeros, zeros}},
+      // This no-jerk fixture retains the ordinary native scale slew limits;
+      // it grants no extra Stop speed or coordinated-timing certificate.
+      core::TrajectoryRuntimeScaleBoundsDTO{4.0, 16.0}};
 }
 
 int run() {

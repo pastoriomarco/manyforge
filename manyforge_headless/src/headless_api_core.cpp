@@ -636,6 +636,29 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
   const auto selected =
       [&]() -> std::optional<deployment::ScenarioProgramSelection> {
     try {
+      std::optional<CanonicalValue> applied;
+      try {
+        applied = program_selection_owner_.ReadApplied();
+      } catch (const ProgramApplyError &error) {
+        if (error.code() != "program_applied_selection_not_found") {
+          throw;
+        }
+      }
+      if (applied.has_value() &&
+          RequiredString(*applied, "scenario_id") == scenario_id &&
+          RequiredString(*applied, "retained_bundle_id") == active_bundle_id &&
+          RequiredString(*applied, "graph_revision") == active_graph_revision) {
+        auto selection =
+            scenario_catalog_source_.LoadExactProgramSelectionForCatalog(
+                scenario_id, core::ScenarioCatalogRevision(RequiredString(
+                                 *applied, "scenario_catalog_revision")));
+        if (selection.retained_bundle_id.value() != active_bundle_id ||
+            selection.graph_revision.value() != active_graph_revision) {
+          throw deployment::ScenarioApplyCandidateError(
+              "Applied Scenario catalog names another active deployment");
+        }
+        return selection;
+      }
       return scenario_catalog_source_.TryLoadExactProgramSelectionForActive(
           scenario_id, core::RetainedBundleId(active_bundle_id),
           core::GraphRevision(active_graph_revision));

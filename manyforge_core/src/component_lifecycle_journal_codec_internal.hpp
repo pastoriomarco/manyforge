@@ -13,6 +13,11 @@ inline constexpr std::size_t kMaximumComponentLifecycleJournalRecordBytes = 64U 
 [[nodiscard]] ProgramNodeAdmissionEvidenceDTO DecodeProgramNodeAdmissionEvidence(
     std::string_view bytes);
 
+[[nodiscard]] std::string EncodeCCLCRouteRecoveryConfiguration(
+    const CellAdmissionConfigurationScopeDTO& configuration);
+[[nodiscard]] CellAdmissionConfigurationScopeDTO DecodeCCLCRouteRecoveryConfiguration(
+    std::string_view bytes);
+
 [[nodiscard]] std::string EncodeCCLCAdmissionRejection(const ErrorDTO& error);
 [[nodiscard]] ErrorDTO DecodeCCLCAdmissionRejection(std::string_view bytes);
 

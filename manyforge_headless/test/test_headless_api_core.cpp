@@ -1137,6 +1137,29 @@ TEST(HeadlessApiCore,
                 Member(scenario, "assistant_projection")),
             content_identity::canonical_json(
                 selection.normalized_assistant_projection));
+
+  // A later Preview publishes a new catalog without moving Applied Program
+  // or Manager. Current Scenario must keep its exact Applied catalog revision.
+  deployment::FilesystemScenarioCatalogRepository repository(package,
+                                                             "maintained");
+  auto preview_rows = repository.get_verified()->rows();
+  preview_rows.front().description = "Later preview";
+  const auto preview = deployment::build_scenario_catalog(preview_rows);
+  ASSERT_EQ(
+      repository.compare_and_set(selection.scenario_catalog_revision, preview),
+      deployment::ScenarioCatalogPublishResult::kPublished);
+  EXPECT_EQ(core.ScenarioProgramSelection(selection.scenario_id), scenario);
+  EXPECT_EQ(core.AppliedProgramSelection(), applied);
+
+  // Losing that exact referent must not silently adopt a matching newer head.
+  std::filesystem::remove(
+      scenarios.catalog_path_for_revision(selection.scenario_catalog_revision));
+  try {
+    static_cast<void>(core.ScenarioProgramSelection(selection.scenario_id));
+    FAIL() << "missing Applied catalog was replaced by Preview";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "scenario_program_selection_unavailable");
+  }
 }
 
 TEST(HeadlessApiCore, ServesOnlyTheExactVerifiedActiveRetainedViewerProduct) {

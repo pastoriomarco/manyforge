@@ -1370,7 +1370,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         if (viewerChanged) this.scheduleViewer();
         // The v2 backend publishes only semantic owner changes; the browser
         // does not repeat its reduction or second-guess that authority.
-        this.scheduleShell();
+        this.scheduleShell(record.event_class === 'critical');
       }
     } catch (reason) {
       this.publishError(
@@ -1721,13 +1721,20 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     for (const listener of this.viewerListeners) listener();
   }
 
-  private scheduleShell(): void {
+  private flushShell(): void {
+    this.shellTimer = null;
+    this.shellResult = this.result();
+    for (const listener of this.shellListeners) listener();
+  }
+
+  private scheduleShell(immediate = false): void {
+    if (immediate) {
+      if (this.shellTimer !== null) clearTimeout(this.shellTimer);
+      this.flushShell();
+      return;
+    }
     if (this.shellTimer !== null) return;
-    this.shellTimer = setTimeout(() => {
-      this.shellTimer = null;
-      this.shellResult = this.result();
-      for (const listener of this.shellListeners) listener();
-    }, HEADLESS_SHELL_PUBLICATION_MS);
+    this.shellTimer = setTimeout(() => this.flushShell(), HEADLESS_SHELL_PUBLICATION_MS);
   }
 
   private scheduleViewer(): void {

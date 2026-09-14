@@ -25,9 +25,41 @@ namespace {
 }
 
 [[nodiscard]] ResolvedStopBasePlanDTO BasePlan() {
-  auto base = DecodeResolvedStopBasePlan(GoldenBytes());
-  EXPECT_TRUE(base.ok());
-  return std::move(base.value());
+  auto decoded = DecodeResolvedStopBasePlan(GoldenBytes());
+  EXPECT_TRUE(decoded.ok());
+  // Decode the historical wire fixture, then prepare with the current typed Stop contract.
+  auto base = std::move(decoded.value());
+  auto& nominal = base.escalation_stages.front();
+  const ProviderContractRefDTO contract{
+      ProviderContractRoleId("stop_contract"),
+      SchemaId(std::string(kMotionControlledStopContractSchemaId)),
+      SchemaRevision(std::string(kMotionControlledStopContractSchemaRevision))};
+  nominal.containment_command.provider_contract_ref = contract;
+  if (nominal.command_qualification.controlled_substitution_contract)
+    nominal.command_qualification.controlled_substitution_contract->provider_contract_ref =
+        contract;
+  JsonValueDTO::Array limits;
+  for (const auto* id : {"joint.1", "joint.2"}) {
+    limits.emplace_back(JsonObjectDTO{
+        {"resource_id", JsonValueDTO{std::string(id)}},
+        {"max_deceleration",
+         JsonValueDTO{JsonObjectDTO{{"coordinate_kind", JsonValueDTO{"angular_rad_s2"}},
+                                    {"value_rad_s2", JsonValueDTO{2.0}}}}},
+        {"settle_velocity_threshold",
+         JsonValueDTO{JsonObjectDTO{{"coordinate_kind", JsonValueDTO{"angular_rad_s"}},
+                                    {"value_rad_s", JsonValueDTO{0.02}}}}},
+    });
+  }
+  nominal.default_contract_parameters = JsonObjectDTO{
+      {"stop_mode", JsonValueDTO{"soft_on_path"}},
+      {"deceleration_time_s", JsonValueDTO{0.5}},
+      {"jerk_limits_enabled", JsonValueDTO{false}},
+      {"allow_natural_completion_on_short_path", JsonValueDTO{true}},
+      {"per_resource_limits", JsonValueDTO{std::move(limits)}},
+  };
+  auto current = MakeResolvedStopBasePlan(std::move(base));
+  EXPECT_TRUE(current.ok()) << current.error().message;
+  return std::move(current.value());
 }
 
 [[nodiscard]] RuntimeParticipantBinding Binding(const ResolvedStopBasePlanDTO& base) {
@@ -89,6 +121,13 @@ namespace {
   return std::move(binding.value());
 }
 
+[[nodiscard]] const std::vector<HardStopResourceLimitDTO>& DefaultLimits() {
+  static const std::vector<HardStopResourceLimitDTO> limits{
+      {ResourceId("joint.1"), AngularVelocityDTO{0.02}},
+      {ResourceId("joint.2"), AngularVelocityDTO{0.02}}};
+  return limits;
+}
+
 [[nodiscard]] PreparedParticipantStopPlanDTO Plan(const ResolvedStopBasePlanDTO& base,
                                                   const RuntimeParticipantBinding& binding) {
   const auto plan = MakePreparedParticipantStopPlan(
@@ -99,8 +138,8 @@ namespace {
           binding.value().program_revision, binding.value().program_binding_id,
           ProgramRunId("program-run.1"), std::nullopt, ParticipantStopProfilePurposeDTO::kOrdinary,
           std::nullopt, MotionInterruptNodeCategory::kGeneric},
-      binding.value().resources, {});
-  EXPECT_TRUE(plan.ok());
+      binding.value().resources, DefaultLimits());
+  EXPECT_TRUE(plan.ok()) << plan.error().message;
   return plan.value();
 }
 
@@ -161,18 +200,18 @@ struct ExactFixture final {
                                         stage_index,
                                         ContentDigest("pending")};
   auto made =
-      MakeResolvedParticipantStopStage(stage, Budget(stage), base, binding, {},
+      MakeResolvedParticipantStopStage(stage, Budget(stage), base, binding, DefaultLimits(),
                                        MotionInterruptNodeCategory::kGeneric, stage.resources);
-  EXPECT_TRUE(made.ok());
+  EXPECT_TRUE(made.ok()) << made.error().message;
   return ExactFixture{std::move(base), std::move(binding), std::move(made.value())};
 }
 
 [[nodiscard]] Result<void> ValidateStage(const ExactFixture& fixture,
                                          const ResolvedParticipantStopStageDTO& stage,
                                          const RemainingStopBudgetDTO& budget) {
-  return ValidateResolvedParticipantStopStage(stage, budget, fixture.base, fixture.binding, {},
-                                              MotionInterruptNodeCategory::kGeneric,
-                                              fixture.stage.resources);
+  return ValidateResolvedParticipantStopStage(
+      stage, budget, fixture.base, fixture.binding, DefaultLimits(),
+      MotionInterruptNodeCategory::kGeneric, fixture.stage.resources);
 }
 
 [[nodiscard]] ParticipantStopStageResultDTO Success(ResolvedParticipantStopStageDTO stage) {
@@ -202,7 +241,7 @@ struct ExactFixture final {
 
 [[nodiscard]] Result<void> ValidateResult(const ExactFixture& fixture,
                                           const ParticipantStopStageResultDTO& result) {
-  return ValidateParticipantStopStageResult(result, fixture.base, fixture.binding, {},
+  return ValidateParticipantStopStageResult(result, fixture.base, fixture.binding, DefaultLimits(),
                                             MotionInterruptNodeCategory::kGeneric,
                                             fixture.stage.resources);
 }
@@ -249,8 +288,8 @@ TEST(ParticipantStopStageTest, AcceptsDirectTargetWhenSupportingProviderIsCoLoca
 
   EXPECT_FALSE(fixture.stage.capability_provider_binding_id.has_value());
   EXPECT_TRUE(ValidateResolvedParticipantStopStage(
-                  fixture.stage, Budget(fixture.stage), fixture.base, colocated.value(), {},
-                  MotionInterruptNodeCategory::kGeneric, fixture.stage.resources)
+                  fixture.stage, Budget(fixture.stage), fixture.base, colocated.value(),
+                  DefaultLimits(), MotionInterruptNodeCategory::kGeneric, fixture.stage.resources)
                   .ok());
 }
 

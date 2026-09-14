@@ -122,6 +122,16 @@ class FakeRuntime:
             "availability": {},
         }
 
+    def diagnostic_health(self) -> dict[str, Any]:
+        return self.health()
+
+    def resume_motion(self, program_run_id: str, request) -> dict[str, Any]:
+        self.calls.append(("resume_motion", (program_run_id, request)))
+        return _snapshot()
+
+    def prepare_manual_handover(self, program_run_id: str, request) -> dict[str, Any]:
+        raise AssertionError("Manual handover is outside this fixture's scenarios")
+
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
         self.calls.append(("runs", (active_only, limit)))
         return {
@@ -132,6 +142,7 @@ class FakeRuntime:
             "truncated": False,
             "runs": [_snapshot()],
         }
+
     def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]:
         self.calls.append(("start", request))
         return _snapshot()
@@ -146,9 +157,7 @@ class FakeRuntime:
             "applied_record_digest": request.expected_applied_record_digest,
             "program_revision": _DIGEST_B,
             "admission_generation": 9,
-            "prepared_scene": {
-                "schema_version": "manyforge.prepared_program_scene.v1"
-            },
+            "prepared_scene": {"schema_version": "manyforge.prepared_program_scene.v1"},
         }
 
     def read_run(self, program_run_id: str) -> dict[str, Any]:
@@ -238,9 +247,7 @@ class FakeRuntime:
         self.calls.append(("stage_runtime_override", (program_run_id, request)))
         return {"accepted": True}
 
-    def activate_runtime_override(
-        self, program_run_id: str, request
-    ) -> dict[str, Any]:
+    def activate_runtime_override(self, program_run_id: str, request) -> dict[str, Any]:
         self.calls.append(("activate_runtime_override", (program_run_id, request)))
         return {"accepted": True}
 
@@ -248,15 +255,11 @@ class FakeRuntime:
         self.calls.append(("clear_runtime_override", (program_run_id, request)))
         return {"accepted": True}
 
-    def promote_runtime_override(
-        self, program_run_id: str, request
-    ) -> dict[str, Any]:
+    def promote_runtime_override(self, program_run_id: str, request) -> dict[str, Any]:
         self.calls.append(("promote_runtime_override", (program_run_id, request)))
         return {"accepted": True}
 
-    def write_runtime_blackboard(
-        self, program_run_id: str, request
-    ) -> dict[str, Any]:
+    def write_runtime_blackboard(self, program_run_id: str, request) -> dict[str, Any]:
         self.calls.append(("write_runtime_blackboard", (program_run_id, request)))
         return {"accepted": True}
 
@@ -280,7 +283,10 @@ def _caller() -> dict[str, Any]:
 
 def test_node_availability_is_a_read_only_runner_projection() -> None:
     runtime = FakeRuntime()
-    body = {"applied": {"program_id": "program_a"}, "selection": {"scenario_id": "cell_a"}}
+    body = {
+        "applied": {"program_id": "program_a"},
+        "selection": {"scenario_id": "cell_a"},
+    }
     with TestClient(create_app(runtime)) as client:
         response = client.post("/api/program/node-availability", json=body)
 
@@ -309,9 +315,12 @@ def test_reset_is_an_explicit_strict_cycle_transition() -> None:
     assert response.status_code == 200
     assert response.json()["idle_cycle_generation"] == 5
     assert runtime.calls[0][0] == "reset"
-    assert client.post(
-        "/api/program/cycle/reset", json={**body, "unexpected": True}
-    ).status_code == 422
+    assert (
+        client.post(
+            "/api/program/cycle/reset", json={**body, "unexpected": True}
+        ).status_code
+        == 422
+    )
 
 
 def test_cycle_status_exposes_only_program_runner_owned_facts() -> None:
@@ -347,14 +356,27 @@ def test_cycle_status_exposes_only_program_runner_owned_facts() -> None:
 
 
 def test_control_state_websocket_is_change_driven_and_demand_scoped() -> None:
-    runtime = FakeRuntime()
+    class GroupRuntime(FakeRuntime):
+        group_state = "running"
+
+        def cycle_status(self) -> dict[str, Any]:
+            cycle = super().cycle_status()
+            cycle["runtime_controls"] = {
+                "execution_selections": {
+                    "groups": [{"group_id": "arm", "state": self.group_state}]
+                }
+            }
+            return cycle
+
+    runtime = GroupRuntime()
     client = TestClient(create_app(runtime))
 
     with client:
         assert runtime.control_state_observers == set()
         with client.websocket_connect("/ws/program/control-state") as websocket:
             first = websocket.receive_json()
-            assert first["schema_version"] == "manyforge.program_control_state.v1"
+            assert first["schema_version"] == "manyforge.program_control_state.v2"
+            assert first["event_class"] == "critical"
             assert first["server_sequence"] == "1"
             assert first["program_cycle"]["execution_control_revision"] == 1
             assert len(runtime.control_state_observers) == 1
@@ -364,11 +386,23 @@ def test_control_state_websocket_is_change_driven_and_demand_scoped() -> None:
             assert second["server_sequence"] == "2"
             assert second["program_cycle"]["execution_control_revision"] == 2
             assert second["program_cycle"]["node_status_revision"] == 2
+            assert second["event_class"] == "critical"
+            runtime.publish_control_state(node_only=True)
+            progress = websocket.receive_json()
+            assert progress["event_class"] == "node_progress"
+            for state in ("stopping", "held", "running"):
+                runtime.group_state = state
+                runtime.publish_control_state(node_only=True)
+                change = websocket.receive_json()
+                assert change["event_class"] == "critical"
+                assert change["program_cycle"]["execution_control_revision"] == 2
 
         assert runtime.control_state_observers == set()
 
 
-def test_control_state_websocket_releases_disconnected_clients_without_owner_wake() -> None:
+def test_control_state_websocket_releases_disconnected_clients_without_owner_wake() -> (
+    None
+):
     class FakeWebSocket:
         def __init__(self) -> None:
             self.inbound: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -581,8 +615,7 @@ def test_stop_route_progresses_while_both_ordinary_workers_are_occupied() -> Non
     async def exercise() -> None:
         async with app.router.lifespan_context(app):
             ordinary = [
-                asyncio.create_task(start_endpoint(start_request))
-                for _ in range(2)
+                asyncio.create_task(start_endpoint(start_request)) for _ in range(2)
             ]
             try:
                 assert await asyncio.to_thread(

@@ -105,8 +105,9 @@ std::optional<JerkLimitedStopProfileDTO> affine_path_stop_candidate(
   const double source_accel = sign * observed.accelerations_rad_s2[driver];
   const State start{0.0, tangent * rate, source_accel * rate * rate + tangent * rate_accel};
   if (!std::isfinite(start.acceleration) || start.velocity <= 0.0 ||
-      start.velocity / max_path_rate > tangent || start.acceleration < 0.0 ||
-      start.acceleration / max_path_rate / max_path_rate > source_accel)
+      start.velocity / max_path_rate > tangent ||
+      (start.acceleration >= 0.0 &&
+       start.acceleration / max_path_rate / max_path_rate > source_accel))
     return std::nullopt;
 
   std::vector<double> direction(count);
@@ -128,13 +129,14 @@ std::optional<JerkLimitedStopProfileDTO> affine_path_stop_candidate(
       jerk_limit = std::min(jerk_limit, max_jerk[j] / std::abs(direction[j]));
     }
   }
-  const double neutral_time = start.acceleration / jerk_limit;
+  const double neutral_time = std::abs(start.acceleration) / jerk_limit;
   const double brake_time = duration - neutral_time;
   if (!std::isfinite(jerk_limit) || !std::isfinite(brake_time) || brake_time <= 1e-9 ||
-      start.acceleration > accel_limit || (neutral_time > 0.0 && neutral_time <= 1e-9))
+      std::abs(start.acceleration) > accel_limit || (neutral_time > 0.0 && neutral_time <= 1e-9))
     return std::nullopt;
-  auto neutral = start.advance(-jerk_limit, neutral_time);
+  auto neutral = start.advance(-std::copysign(jerk_limit, start.acceleration), neutral_time);
   neutral.acceleration = 0.0;
+  if (!(neutral.velocity > 0.0)) return std::nullopt;
   const double brake_jerk = 4.0 * neutral.velocity / (brake_time * brake_time);
   const double brake_accel = 2.0 * neutral.velocity / brake_time;
   if (!std::isfinite(brake_jerk) || brake_jerk > jerk_limit || brake_accel > accel_limit)
@@ -247,6 +249,15 @@ std::optional<JerkLimitedStopProfileDTO> affine_path_stop_candidate(
     const double begin = normalized(cursor), end = normalized(stop_range->second);
     if (end <= begin) continue;
     if (!(segment.lower_derivative(1, begin, end) > 0.0)) return std::nullopt;
+    // Negative incoming acceleration is neutralized with +J, then braking
+    // continues from the lower speed. The trip velocity bounds all phases;
+    // prove it against the whole accepted path, without the +acceleration
+    // prefix argument below (which applies only to -J neutralization).
+    if (start.acceleration < 0.0) {
+      if (!at_least(segment.lower_derivative(1, begin, end), start.velocity / max_path_rate))
+        return std::nullopt;
+      continue;
+    }
     // The inverse bracket deliberately overlaps the two proofs: no sliver
     // near neutralization or the terminal position is certified by midpoint.
     const double prefix_end =

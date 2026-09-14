@@ -3830,6 +3830,76 @@ def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
             ).status_code
             == 200
         )
+        group_query = '[{"component_role_id":"robot-a","target_role_id":"arm"},{"component_role_id":"robot-b","target_role_id":"arm"}]'
+        assert (
+            client.get(
+                "/api/execution/runtime-scale-control",
+                params={
+                    "program_binding_id": "binding-1",
+                    "synchronized_targets": group_query,
+                },
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                "/api/execution/runtime-scale-control",
+                params={
+                    "program_binding_id": "binding-1",
+                    "synchronized_targets": '[{"target_role_id":"arm","target_role_id":"arm"}]',
+                },
+            ).status_code
+            == 422
+        )
+        assert (
+            client.get(
+                "/api/execution/runtime-scale-control",
+                params={
+                    "program_binding_id": "binding-1",
+                    "synchronized_targets": '[{"component_role_id":"robot","target_role_id":NaN}]',
+                },
+            ).status_code
+            == 422
+        )
+        valid_group = (
+            '[{"component_role_id":"robot-a","target_role_id":"arm"},'
+            '{"component_role_id":"robot-b","target_role_id":"arm"}]'
+        )
+        assert (
+            client.get(
+                "/api/execution/runtime-scale-control",
+                params=[
+                    ("program_binding_id", "binding-1"),
+                    ("synchronized_targets", "not-json"),
+                    ("synchronized_targets", valid_group),
+                ],
+            ).status_code
+            == 422
+        )
+        for key in ("program_binding_id", "component_role_id", "target_role_id"):
+            params = [
+                ("program_binding_id", "binding-1"),
+                ("component_role_id", "robot"),
+                ("target_role_id", "arm"),
+                (key, "first"),
+                (key, "last"),
+            ]
+            assert (
+                client.get(
+                    "/api/execution/runtime-scale-control", params=params
+                ).status_code
+                == 422
+            )
+        assert (
+            client.get(
+                "/api/execution/runtime-scale-control",
+                params={
+                    "program_binding_id": "binding-1",
+                    "synchronized_targets": "[" * 2000 + "]" * 2000,
+                },
+            ).status_code
+            == 422
+        )
 
     assert [kind for kind, _request in execution.requests] == [
         "pause",
@@ -3839,7 +3909,15 @@ def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
         "stop",
         "set_runtime_scale_control",
         "get_runtime_scale_control",
+        "get_runtime_scale_control",
     ]
+    assert execution.requests[-1][1].model_dump(mode="json") == {
+        "program_binding_id": "binding-1",
+        "synchronized_targets": [
+            {"component_role_id": "robot-a", "target_role_id": "arm"},
+            {"component_role_id": "robot-b", "target_role_id": "arm"},
+        ],
+    }
     assert execution.principals == [
         ("pause", None),
         ("resume", None),

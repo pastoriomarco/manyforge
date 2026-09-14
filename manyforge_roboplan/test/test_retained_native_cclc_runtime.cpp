@@ -1370,7 +1370,8 @@ void ExpectExactControlledStopPlan(
     core::ParticipantStopProfilePurposeDTO expected_purpose,
     std::string_view expected_profile_id,
     core::MotionInterruptStopMode expected_mode,
-    bool expected_natural_completion) {
+    bool expected_natural_completion,
+    std::optional<core::MotionInterruptStopMode> expected_recoverable_mode) {
   EXPECT_EQ(plan.participant_stop_profile_purpose, expected_purpose);
   ASSERT_TRUE(plan.participant_stop_profile.has_value());
   const auto &profile = *plan.participant_stop_profile;
@@ -1380,7 +1381,11 @@ void ExpectExactControlledStopPlan(
   EXPECT_DOUBLE_EQ(*profile.deceleration_time_s, 1.0);
   EXPECT_EQ(profile.allow_natural_completion_on_short_path,
             expected_natural_completion);
-  EXPECT_FALSE(profile.recoverable_substitution_mode.has_value());
+  ASSERT_EQ(profile.recoverable_substitution_mode.has_value(),
+            expected_recoverable_mode.has_value());
+  if (expected_recoverable_mode.has_value()) {
+    EXPECT_EQ(*profile.recoverable_substitution_mode, *expected_recoverable_mode);
+  }
   EXPECT_TRUE(profile.require_backend_confirmation);
   ASSERT_EQ(profile.per_joint_max_deceleration.size(), 6U);
   for (const auto &[joint, limit] : profile.per_joint_max_deceleration) {
@@ -1498,6 +1503,7 @@ TEST(RetainedNativeCCLCRuntime,
       catalogs, {{occurrence, brand_port}}, {runtime.binding}, kernel_ports,
       kernel_ports, kernel_ports, publication_owner, clock, scheduler);
   ASSERT_TRUE(composition.ok()) << composition.error().message;
+  ASSERT_TRUE(composition.value()->Start().ok());
   const auto current_request_owner =
       composition.value()->coordinator().request_owner_epoch();
 
@@ -1599,12 +1605,12 @@ TEST(RetainedNativeCCLCRuntime,
       prepared->ordinary_stop_plan, runtime.binding.value().resources,
       core::ParticipantStopProfilePurposeDTO::kOperator,
       "operator_soft_on_path", core::MotionInterruptStopMode::kSoftOnPath,
-      true);
+      true, core::MotionInterruptStopMode::kSpringBackHold);
   ASSERT_TRUE(prepared->fault_stop_plan.has_value());
   ExpectExactControlledStopPlan(
       *prepared->fault_stop_plan, runtime.binding.value().resources,
       core::ParticipantStopProfilePurposeDTO::kFault, "fault_spring_back_hold",
-      core::MotionInterruptStopMode::kSpringBackHold, false);
+      core::MotionInterruptStopMode::kSpringBackHold, false, std::nullopt);
 }
 
 } // namespace

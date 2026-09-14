@@ -2027,6 +2027,35 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
   }
 }
 
+namespace {
+core::Result<void>
+reconcile_observed_orphans(RetainedNativeRuntime &runtime,
+                           const std::uint64_t resource_generation,
+                           const std::vector<core::ResourceId> &resources) {
+  if (resources.empty())
+    return core::Result<void>::Ok();
+  if (!runtime.stop_surveillance_owner ||
+      !runtime.addressed_request_owner_epoch || !runtime.addressed_cell_id ||
+      !runtime.addressed_kernel || !runtime.clock) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        "native_orphan_reconciliation_owner_missing",
+        "Native command-free orphan reconciliation owner is unavailable",
+        {}});
+  }
+  auto facts =
+      runtime.stop_surveillance_owner->BuildOrphanResourceReconciliationFacts(
+          *runtime.addressed_request_owner_epoch, *runtime.addressed_cell_id,
+          resource_generation, resources, runtime.clock->now());
+  if (!facts.ok())
+    return core::Result<void>::Err(facts.error());
+  auto reconciled =
+      runtime.addressed_kernel->reconcile_orphaned_resources(facts.value());
+  if (!reconciled.ok())
+    return core::Result<void>::Err(reconciled.error());
+  return core::Result<void>::Ok();
+}
+} // namespace
+
 core::Result<core::RuntimeRouteConfigurationReadbackDTO>
 RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     const core::ActiveControlConfigurationDTO &configuration) {
@@ -2386,33 +2415,11 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     orphan_resources.erase(
         std::unique(orphan_resources.begin(), orphan_resources.end()),
         orphan_resources.end());
-    if (!orphan_resources.empty()) {
-      if (stop_surveillance_owner == nullptr ||
-          !addressed_request_owner_epoch.has_value() ||
-          !addressed_cell_id.has_value()) {
-        return route_publication_error<
-            core::RuntimeRouteConfigurationReadbackDTO>(
-            "route_predecessor_orphan_reconciliation_owner_missing",
-            "native predecessor has no command-free orphan reconciliation "
-            "owner",
-            core::ErrorCode::kMissingReference);
-      }
-      const auto assessed_at_ns = clock->now();
-      auto facts =
-          stop_surveillance_owner->BuildOrphanResourceReconciliationFacts(
-              *addressed_request_owner_epoch, *addressed_cell_id,
-              slot_snapshot.operation_resource_generation, orphan_resources,
-              assessed_at_ns);
-      if (!facts.ok()) {
-        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
-            facts.error());
-      }
-      auto reconciled =
-          addressed_kernel->reconcile_orphaned_resources(facts.value());
-      if (!reconciled.ok()) {
-        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
-            reconciled.error());
-      }
+    auto reconciled = reconcile_observed_orphans(
+        *this, slot_snapshot.operation_resource_generation, orphan_resources);
+    if (!reconciled.ok()) {
+      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+          reconciled.error());
     }
     return readback;
   } catch (const std::exception &exception) {
@@ -2443,6 +2450,59 @@ build_retained_native_stop_recovery_facts(
   if (!facts.ok())
     return facts;
   const auto &latch = *status.fault_latch;
+  // Binding identity is not proof that a replacement host has reconciled its
+  // controllers. Keep configuration evidence separate from physical rest.
+  for (auto &fact : facts.value().configuration_facts) {
+    if (runtime.stop_recovery_configuration_source) {
+      auto proof =
+          runtime.stop_recovery_configuration_source(fact.configuration);
+      fact.reconciled = proof.ok();
+      fact.evidence_digest =
+          proof.ok() ? std::optional(proof.value()) : std::nullopt;
+      continue;
+    }
+    const auto current = runtime.ReadCurrentPublishedRouteConfiguration(
+        fact.configuration.control_domain_id);
+    const auto matches_source = [&](const auto &channel) {
+      if (!channel || !current.ok() || !current.value())
+        return false;
+      const auto context = channel->query_context();
+      const auto &configuration = *current.value();
+      return configuration.state ==
+                 core::ActiveControlConfigurationStateDTO::kReconciled &&
+             configuration.control_domain_id == context.control_domain_id &&
+             configuration.active_control_configuration_id ==
+                 context.active_control_configuration_id &&
+             configuration.active_control_configuration_generation ==
+                 context.active_control_configuration_generation &&
+             configuration.source_runtime_epoch == context.runtime_epoch;
+    };
+    if (!matches_source(runtime.motion_state_channel) &&
+        !matches_source(runtime.gripper_state_channel)) {
+      fact.reconciled = false;
+      fact.evidence_digest.reset();
+    }
+  }
+  if (std::all_of(facts.value().configuration_facts.begin(),
+                  facts.value().configuration_facts.end(),
+                  [](const auto &fact) { return fact.reconciled; })) {
+    const auto slots = addressed_kernel.resource_table_snapshot();
+    std::vector<core::ResourceId> orphans;
+    for (const auto &slot : slots.slots) {
+      if (slot.state ==
+              core::ResourceSlotState::kUnreconciledExternalOrOrphanGoal &&
+          std::binary_search(latch.captured_resources.begin(),
+                             latch.captured_resources.end(),
+                             slot.resource_id)) {
+        orphans.push_back(slot.resource_id);
+      }
+    }
+    auto reconciled = reconcile_observed_orphans(
+        runtime, slots.operation_resource_generation, orphans);
+    if (!reconciled.ok())
+      return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+          reconciled.error());
+  }
   for (const auto &slot : addressed_kernel.resource_snapshot()) {
     if (!std::binary_search(latch.captured_resources.begin(),
                             latch.captured_resources.end(), slot.resource_id)) {

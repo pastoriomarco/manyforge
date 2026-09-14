@@ -1,7 +1,8 @@
 """Short software-browser/cycle cost check over the real isolated workbench.
 
 Consumes already-built native owners and a qualified retained package. Does
-not qualify Stop, hardware, maximum scene size or the maintainer's panel review.
+not qualify hardware, maximum scene size or the maintainer's panel review.
+The optional Stop mode delegates to the existing full segmented latency gate.
 """
 
 import argparse
@@ -13,8 +14,9 @@ from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
 import time
+from types import SimpleNamespace
 
-from current_workbench_browser_collector import RawWebDriver, _execute
+from current_workbench_browser_collector import CollectorError, RawWebDriver, _execute
 from manyforge_headless_api.client import HeadlessHttpClient
 
 
@@ -25,7 +27,20 @@ def main():
     parser.add_argument("--webdriver", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
-        "--manual", action="store_true", help="Measure one real native Joint preview/approval first"
+        "--stop-diagnostic-samples",
+        type=int,
+        default=0,
+        help="Bounded Stop diagnosis only (1..10); never a latency qualification",
+    )
+    parser.add_argument(
+        "--stop-latency",
+        metavar="PRESSURE_WEBDRIVER",
+        help="Run the existing 100+100 Stop gate instead of the cycle-cost check",
+    )
+    parser.add_argument(
+        "--manual",
+        action="store_true",
+        help="Measure one real native Joint preview/approval first",
     )
     parser.add_argument(
         "--recovery",
@@ -33,12 +48,59 @@ def main():
         help="Deliberately hide/freeze the viewer during this isolated cycle",
     )
     args = parser.parse_args()
+    if args.stop_latency and (args.manual or args.recovery):
+        parser.error("--stop-latency is separate from --manual/--recovery")
+    if args.stop_diagnostic_samples and not args.stop_latency:
+        parser.error("--stop-diagnostic-samples requires --stop-latency")
     workspace = Path(__file__).resolve().parents[2]
     spec = importlib.util.spec_from_file_location(
         "cost_workbench", workspace / "scripts/dev-workbench.py"
     )
     workbench = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(workbench)
+    if args.stop_diagnostic_samples:
+        original_popen = workbench.subprocess.Popen
+
+        def diagnostic_popen(command, *positional, **keywords):
+            if (
+                len(command) > 2
+                and command[1] == "-m"
+                and command[2] in {"manyforge_composer", "manyforge_headless_api"}
+            ):
+                module = command[2]
+                prelude = f"""
+import json, runpy, time
+from starlette.websockets import WebSocket
+original_send = WebSocket.send_text
+async def timed_send(self, payload):
+    received = time.monotonic_ns()
+    await original_send(self, payload)
+    sent = time.monotonic_ns()
+    if '"command_receipt"' in payload:
+        value = json.loads(payload)
+        receipt = value.get('receipt', {{}})
+        if receipt.get('code') == 'program_motion_stop_received':
+            print(json.dumps({{'stop_relay': {module!r}, 'correlation_id': receipt['correlation_id'],
+                'emitted_ns': value['emitted_monotonic_ns'], 'send_begin_ns': received,
+                'send_end_ns': sent, 'bytes': len(payload)}}), flush=True)
+    elif '"program_cycle"' in payload:
+        value = json.loads(payload)
+        cycle = value.get('shell', {{}}).get('program_cycle')
+        if isinstance(cycle, dict):
+            print(json.dumps({{'state_relay': {module!r},
+                'server_sequence': value.get('server_sequence'),
+                'execution_control_revision': cycle.get('execution_control_revision'),
+                'send_begin_ns': received, 'send_end_ns': sent,
+                'bytes': len(payload)}}), flush=True)
+WebSocket.send_text = timed_send
+runpy.run_module({module!r}, run_name='__main__')
+"""
+                command = [command[0], "-c", prelude, *command[3:]]
+            return original_popen(command, *positional, **keywords)
+
+        workbench.subprocess = SimpleNamespace(
+            **{**vars(workbench.subprocess), "Popen": diagnostic_popen}
+        )
     result = {
         "scope": "isolated Lite6 native cycle, Firefox software WebGL, 1440x900; no Stop or hardware"
     }
@@ -113,7 +175,9 @@ def main():
             assert value["viewer"]["status"]["renderer"]["software"] is True, value
             assert not value["viewer"]["status"]["errors"], value
             assert value["observations"]["maxUnappliedFrames"] <= 1, value
-            js("window.manyforgeViewerQualification.resetObservationFlow(); return true;")
+            js(
+                "window.manyforgeViewerQualification.resetObservationFlow(); return true;"
+            )
             return value
 
         def click(selector):
@@ -133,9 +197,13 @@ def main():
             selector = '.robot-control-number input[aria-label$="target degrees"]'
             wait(
                 "manual Joint input available",
-                lambda: js(f"return document.querySelector('{selector}')?.disabled === false;"),
+                lambda: js(
+                    f"return document.querySelector('{selector}')?.disabled === false;"
+                ),
             )
-            target = js(f"return Number(document.querySelector('{selector}').value) + 1;")
+            target = js(
+                f"return Number(document.querySelector('{selector}').value) + 1;"
+            )
             js(
                 """const panel=document.querySelector('.robot-control-panel');
                 const trace=window.__h6Manual={input:null,frame:null,preview:null,approve:null,states:[]};
@@ -176,10 +244,14 @@ def main():
                     ]
                 },
             )
-            driver.command("POST", f"/element/{element}/value", {"text": f"{target}\ue004"})
+            driver.command(
+                "POST", f"/element/{element}/value", {"text": f"{target}\ue004"}
+            )
             wait(
                 "real native preview ready",
-                lambda: js("return document.querySelector('.approve-button')?.disabled === false;"),
+                lambda: js(
+                    "return document.querySelector('.approve-button')?.disabled === false;"
+                ),
             )
             click(".approve-button")
 
@@ -193,12 +265,18 @@ def main():
                     assert len(participants) == 1, row
                     assert participants[0]["command_target_id"] == "arm", row
                     state = row["operation"]["state"]
-                    assert state not in {"failed", "interrupted", "intervention_required"}, row
+                    assert state not in {
+                        "failed",
+                        "interrupted",
+                        "intervention_required",
+                    }, row
                     if state == "completed" and not row["resident"]:
                         return row
                 return None
 
-            result["manual_owner_completion"] = wait("native manual clean retirement", settled)
+            result["manual_owner_completion"] = wait(
+                "native manual clean retirement", settled
+            )
             wait(
                 "manual completion presented",
                 lambda: js(
@@ -206,12 +284,15 @@ def main():
                     " && !document.querySelector('.robot-control-operation-actions');"
                 ),
             )
-            trace = js("window.__h6ManualObserver.disconnect(); return window.__h6Manual;")
+            trace = js(
+                "window.__h6ManualObserver.disconnect(); return window.__h6Manual;"
+            )
             result["manual_timing"] = {
                 "target_degrees": target,
                 "input_to_animation_frame_ms": trace["frame"] - trace["input"],
                 "input_to_validated_preview_ms": trace["preview"] - trace["input"],
-                "approve_to_first_owner_state_ms": trace["states"][0]["at"] - trace["approve"],
+                "approve_to_first_owner_state_ms": trace["states"][0]["at"]
+                - trace["approve"],
                 "trace": trace,
             }
             assert result["manual_timing"]["input_to_animation_frame_ms"] < 500, result[
@@ -226,11 +307,28 @@ def main():
             click(".viewer-surface-launchers button:first-child")
             wait(
                 "Program Run after backend manual retirement",
-                lambda: js("return document.querySelector('.transport-run')?.disabled === false;"),
+                lambda: js(
+                    "return document.querySelector('.transport-run')?.disabled === false;"
+                ),
             )
 
         try:
             stack.start()
+            if args.stop_latency:
+                from ui6_stop_latency import collect_ui6_stop_latency
+
+                result = collect_ui6_stop_latency(
+                    args.webdriver,
+                    args.stop_latency,
+                    "http://127.0.0.1:3001",
+                    "http://127.0.0.1:9001",
+                    require_software_renderer=True,
+                    diagnostic_samples=args.stop_diagnostic_samples,
+                )
+                print(json.dumps(result, sort_keys=True))
+                if result.get("success") is False:
+                    raise CollectorError("; ".join(result["failures"]))
+                return
             driver.create_session(firefox_args=("-no-remote",))
             driver.set_window_rect(1440, 900)
             driver.command(
@@ -244,7 +342,9 @@ def main():
             )
             wait(
                 "GUI Run eligibility",
-                lambda: js("return document.querySelector('.transport-run')?.disabled === false;"),
+                lambda: js(
+                    "return document.querySelector('.transport-run')?.disabled === false;"
+                ),
             )
             js(
                 """window.__h6Lag=[]; let due=performance.now()+25;
@@ -260,7 +360,9 @@ def main():
             driver.set_window_rect(1440, 900)
             time.sleep(1)
             collect("resize")
-            with HeadlessHttpClient("http://127.0.0.1:9101", timeout_seconds=2) as client:
+            with HeadlessHttpClient(
+                "http://127.0.0.1:9101", timeout_seconds=2
+            ) as client:
                 if args.manual:
                     manual_move(client)
                 run_button = driver.command(
@@ -290,7 +392,9 @@ def main():
                         disrupted = True
                         collect("before_disruption")
                         original = driver.command("GET", "/window")
-                        blank = driver.command("POST", "/window/new", {"type": "tab"})["handle"]
+                        blank = driver.command("POST", "/window/new", {"type": "tab"})[
+                            "handle"
+                        ]
                         driver.command("POST", "/window", {"handle": blank})
                         wait(
                             "hidden viewer releases demand",
@@ -302,7 +406,8 @@ def main():
                         result["hidden"] = {"before": before, "after": after}
                         assert after["source"]["active"] is False, after
                         assert (
-                            after["source"]["wake_count"] == before["source"]["wake_count"]
+                            after["source"]["wake_count"]
+                            == before["source"]["wake_count"]
                         ), result["hidden"]
                         driver.command("DELETE", "/window")
                         driver.command("POST", "/window", {"handle": original})
@@ -321,7 +426,9 @@ def main():
                             after = source_status()
                             result["frozen"] = {"before": before, "after": after}
                             assert (
-                                after["fanout"]["sent_count"] - before["fanout"]["sent_count"] <= 1
+                                after["fanout"]["sent_count"]
+                                - before["fanout"]["sent_count"]
+                                <= 1
                             ), result["frozen"]
                             frozen.result(timeout=3)
                         wait("frozen viewer resumes current frame", ready)
@@ -331,7 +438,9 @@ def main():
                 result["run_duration_s"] = time.monotonic() - begun
                 result["distinct_tree_presentations"] = len(tree_states)
                 assert run["state"] == "succeeded", run
-                assert len(tree_states) > 3, "tree presentation did not follow active nodes"
+                assert (
+                    len(tree_states) > 3
+                ), "tree presentation did not follow active nodes"
                 wait(
                     "last streamed pose rendered",
                     lambda: js(
@@ -355,7 +464,9 @@ def main():
             )
             result["reconnect"] = {
                 "viewer": js("return window.manyforgeViewerQualification.snapshot();"),
-                "observations": js("return window.manyforgeViewerQualification.observationFlow();"),
+                "observations": js(
+                    "return window.manyforgeViewerQualification.observationFlow();"
+                ),
             }
             result["passed"] = True
         except BaseException as error:

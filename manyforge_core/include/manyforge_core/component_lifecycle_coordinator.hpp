@@ -18,6 +18,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <memory>
 #include <optional>
+#include <utility>
 
 namespace manyforge::core {
 
@@ -48,7 +49,7 @@ struct ComponentLifecycleCoordinatorRouteServices final {
 
 /// Generic Controlled Component Lifecycle Coordinator transaction owner.
 ///
-/// Public calls perform bounded replay/admission work only. Brand and Kernel
+/// Open request-port calls perform bounded replay/admission work only. Brand and Kernel
 /// calls run on fixed worker threads, never on an IScheduler callback. The
 /// scheduler is used only to wake deferred observation work.
 class ComponentLifecycleCoordinator final {
@@ -86,6 +87,21 @@ class ComponentLifecycleCoordinator final {
 
   [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteSelection(
       const RouteSelectionIntentDTO& intent);
+  /// Owner-local read: qualify the current source and report observed controller
+  /// truth, including mismatch. Requires no request admission, claim or fence;
+  /// never publishes readiness, changes controllers or clears a fault. The
+  /// caller runs this bounded adapter read off the scheduler/control lane.
+  [[nodiscard]] Result<
+      std::pair<ControllerLifecycleObservationDTO, ControllerLifecycleReconciliationDTO>>
+  ObserveRouteConfiguration(
+      const RetainedBundleId& retained_bundle_id, const GraphRevision& graph_revision,
+      const DesiredControlConfigurationDTO& desired_configuration,
+      std::optional<ExpectedActiveControlConfigurationDTO> expected_current = {});
+  /// Owner-local replacement recovery; not exposed by the open request port.
+  /// Reconciles observed configuration only; its durable recovery claim never
+  /// authorizes controller transitions, including when the observed route differs.
+  [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> SubmitRouteRecovery(
+      const RouteSelectionIntentDTO& intent, const ActiveControlConfigurationDTO& predecessor);
 
   [[nodiscard]] Result<std::optional<CCLCRouteSelectionRequestResultDTO>>
   ReadRouteSelectionRequestResult(const RouteSelectionIntentDTO& intent);

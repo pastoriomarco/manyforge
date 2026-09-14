@@ -97,6 +97,20 @@ std::vector<QualifiedRuntimeProfile> SelectedBuildProfiles(const CanonicalValue&
 }
 
 CompiledDeploymentDraft Result(const RevisionVerifiedDeploymentArtifact& deployment) {
+  // Reject internally contradictory settings at authoring time. Model/target
+  // resolution still belongs to activation; no model is loaded for a Draft.
+  for (const auto &unit : deployment.graph().graph().runtime_units) {
+    if (unit.runtime_profile_id.value() !=
+        detail::kNativeExecutionRuntimeProfileId)
+      continue;
+    for (const auto &target : std::get<core::JsonValueDTO::Array>(
+             unit.configuration.at("motion_target_limits").value)) {
+      const auto &fields = std::get<core::JsonObjectDTO>(target.value);
+      static_cast<void>(detail::decode_ordinary_motion_jerk_settings(
+          std::get<core::JsonObjectDTO>(
+              fields.at("ordinary_motion_jerk").value)));
+    }
+  }
   return CompiledDeploymentDraft{
       .canonical_json = canonical_json(deployment.normalized_authored_root()),
       .deployment_artifact_id = deployment.deployment_artifact_id().value(),

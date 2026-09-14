@@ -203,7 +203,8 @@ class _Client:
         return {"status": self.route_statuses.get(transaction_id)}
 
 
-def test_lifecycle_request_uses_fresh_snapshot_and_owner_terminal_truth() -> None:
+@pytest.mark.parametrize("terminal_result", ["succeeded", "failed_known_no_effect", "failed_partial_effect"])
+def test_lifecycle_request_uses_fresh_snapshot_and_owner_terminal_truth(terminal_result) -> None:
     client = _Client()
     port = CCLCProgramTaskPort(client, program_node_evidence=_evidence)
     port.bind(_context())
@@ -214,6 +215,7 @@ def test_lifecycle_request_uses_fresh_snapshot_and_owner_terminal_truth() -> Non
         OwnerNodeInputs({"component_role": "robot"}),
     )
     assert started.state is OwnerTaskState.ACTIVE
+    assert not started.settlement_proven
     assert client.lifecycle_requests[0] == {
         "request_context": {
             "request_id": started.task_id,
@@ -251,13 +253,36 @@ def test_lifecycle_request_uses_fresh_snapshot_and_owner_terminal_truth() -> Non
     }
     client.lifecycle_statuses["lifecycle.1"] = {
         "acceptance": {"lifecycle_transaction_id": "lifecycle.1"},
-        "phase": "succeeded",
+        "phase": terminal_result,
         "reconciliation_required": False,
-        "terminal_result": "succeeded",
+        "terminal_result": terminal_result,
     }
     terminal = port.observe(started.task_id)
-    assert terminal.state is OwnerTaskState.SUCCEEDED
+    assert terminal.state is (OwnerTaskState.SUCCEEDED if terminal_result == "succeeded" else OwnerTaskState.FAILED)
+    assert terminal.settlement_proven
     port.acknowledge(started.task_id, identity)
+    assert not port._tasks
+
+
+def test_consumed_known_failures_do_not_exhaust_a_long_running_program():
+    client = _Client()
+
+    def reject(_body):
+        error = RuntimeError("known no effect")
+        error.code = "invalid_state_transition"
+        error.details = {"effect": "not_started"}
+        raise error
+
+    client.submit_component_lifecycle = reject
+    port = CCLCProgramTaskPort(client, maximum_retained_tasks=1, program_node_evidence=_evidence)
+    port.bind(_context())
+    for attempt in range(3):
+        identity = _identity(f"rejected-{attempt}")
+        result = port.start("lifecycle.enable_component", identity, OwnerNodeInputs({"component_role": "robot"}))
+        assert result.state is OwnerTaskState.FAILED
+        assert result.settlement_proven
+        port.acknowledge(result.task_id, identity)
+        assert not port._tasks
 
 
 @pytest.mark.parametrize("missing", ["authoring_admission", "component_lifecycle_request_result", "route_selection_request_result"])
@@ -303,15 +328,33 @@ def test_route_request_copies_one_exact_retained_current_template() -> None:
 
 
 @pytest.mark.parametrize("route", [False, True])
-def test_lost_reply_and_status_error_remain_active_without_resubmission(route):
+@pytest.mark.parametrize("admission_race", [False, True])
+def test_lost_reply_and_status_error_remain_active_without_resubmission(
+    route, admission_race
+):
     client = _Client()
     submit_name = "submit_route_selection" if route else "submit_component_lifecycle"
-    result_name = "route_selection_request_result" if route else "component_lifecycle_request_result"
+    result_name = (
+        "route_selection_request_result"
+        if route
+        else "component_lifecycle_request_result"
+    )
     original_submit = getattr(client, submit_name)
     retained = {}
     queries = []
+    attempted = []
 
     def lost(body):
+        attempted.append(deepcopy(body))
+        if admission_race and len(attempted) == 1:
+            client.authoring_admission = lambda: {"admission_generation": 11}
+            error = RuntimeError("cell-admission request rejected")
+            error.code = "stale_generation"
+            error.details = {
+                "reason": "expected_generation_stale",
+                "effect": "not_started",
+            }
+            raise error
         retained.update(original_submit(body))
         raise TimeoutError("lost response")
 
@@ -327,7 +370,11 @@ def test_lost_reply_and_status_error_remain_active_without_resubmission(route):
     started = port.start(
         "controller.select_route" if route else "lifecycle.enable_component",
         identity,
-        OwnerNodeInputs({"target_role": "arm", "route_role": "route.fast"} if route else {"component_role": "robot"}),
+        OwnerNodeInputs(
+            {"target_role": "arm", "route_role": "route.fast"}
+            if route
+            else {"component_role": "robot"}
+        ),
     )
     requests = client.route_requests if route else client.lifecycle_requests
     statuses = client.route_statuses if route else client.lifecycle_statuses
@@ -339,13 +386,26 @@ def test_lost_reply_and_status_error_remain_active_without_resubmission(route):
     with pytest.raises(OwnerTaskObservationUnavailableError):
         port.observe(started.task_id)  # Missing status is not terminal Failure.
     statuses[transaction_id] = {
-        "acceptance": {"route_selection_transaction_id" if route else "lifecycle_transaction_id": transaction_id},
+        "acceptance": {
+            (
+                "route_selection_transaction_id"
+                if route
+                else "lifecycle_transaction_id"
+            ): transaction_id
+        },
         "phase": "succeeded",
         "reconciliation_required": False,
         "terminal_result": "succeeded",
     }
     assert port.observe(started.task_id).state is OwnerTaskState.SUCCEEDED
     assert len(requests) == 1
+    assert len(attempted) == 1 + int(admission_race)
+    if admission_race:
+        assert (
+            attempted[0]["request_context"]["request_id"]
+            != requests[0]["request_context"]["request_id"]
+        )
+        assert requests[0]["expected_admission_generation"] == 11
     port.acknowledge(started.task_id, identity)
 
 

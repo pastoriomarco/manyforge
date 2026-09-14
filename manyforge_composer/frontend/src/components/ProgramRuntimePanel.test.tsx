@@ -400,12 +400,30 @@ describe('Program runtime projection', () => {
     );
   });
 
-  it('keeps the persistent velocity control available while Run is starting', () => {
+  it.each(['stopping', 'mixed'] as const)('reflects selected group %s without redundant Stop or blocking active motion', (state) => {
+    const running = controller('running');
+    running.state.controls = ordinaryMotionStopControls();
+    const group = running.state.controls.executionSelections!.groups[0];
+    group.state = state;
+    group.resumeAllowed = false;
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={running} robot={robotController()} />,
+    );
+    if (state === 'stopping') {
+      expect(markup).toMatch(/class="danger-button transport-stop-primary"[^>]*disabled=""[^>]*>Stopping<\/button>/);
+    } else {
+      expect(markup).toMatch(/class="danger-button transport-stop-primary"(?![^>]*disabled)[^>]*>Stop<\/button>/);
+    }
+    expect(markup).toMatch(/class="transport-run"[^>]*disabled=""/);
+  });
+
+  it.each([false, true])('shows the owner velocity scope while Run is starting (group=%s)', (group) => {
     const starting = controller('succeeded', 'idle_after_reset');
     starting.state.pending = 'run';
     const robot = robotController();
     robot.runtimeScaleStatus = {
       selector: {
+        kind: 'singular',
         programBindingId: `sha256:${'c'.repeat(64)}`,
         componentRoleId: 'controlled_component',
         targetRoleId: 'command_target',
@@ -429,6 +447,15 @@ describe('Program runtime projection', () => {
       reason: null,
     };
     robot.runtimeScaleDraft = 0.5;
+    if (group) {
+      robot.runtimeScaleStatus.selector = {
+        kind: 'group', programBindingId: `sha256:${'c'.repeat(64)}`,
+        synchronizedTargets: [
+          { componentRoleId: 'left', targetRoleId: 'arm' },
+          { componentRoleId: 'right', targetRoleId: 'arm' },
+        ],
+      };
+    }
 
     const markup = renderToStaticMarkup(
       <ProgramTransportControls enabled program={starting} robot={robot} />,
@@ -436,6 +463,8 @@ describe('Program runtime projection', () => {
 
     expect(markup).toMatch(/type="range"[^>]*value="0.5"/);
     expect(markup).not.toMatch(/type="range"[^>]*disabled=/);
+    expect(markup).toContain(group ? 'Group velocity' : '>Velocity<');
+    if (group) expect(markup).toContain('One shared velocity for left/arm, right/arm.');
   });
 
   it('blocks Program Resume for a resident manual operation in the other editor mode', () => {

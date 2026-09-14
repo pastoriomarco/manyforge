@@ -17,6 +17,13 @@ enum class RuntimeScaleApplicationState {
   kFailed,
 };
 
+struct RuntimeScaleControlTargetDTO final {
+  ComponentRoleId component_role_id;
+  TargetRoleId target_role_id;
+  friend bool operator==(const RuntimeScaleControlTargetDTO&,
+                         const RuntimeScaleControlTargetDTO&) = default;
+};
+
 /// Public selector for one operator runtime-velocity setting. The Kernel joins
 /// these portable Program identities to the current exact control/scaling
 /// domain; callers never supply controller or route identities.
@@ -24,6 +31,9 @@ struct RuntimeScaleControlSelectorDTO final {
   ProgramBindingId program_binding_id;
   ComponentRoleId component_role_id;
   TargetRoleId target_role_id;
+  /// Alternative to the singular roles: the complete synchronized motion set.
+  /// This selects control scopes, not Program membership or Run authority.
+  std::vector<RuntimeScaleControlTargetDTO> synchronized_targets{};
 
   friend bool operator==(const RuntimeScaleControlSelectorDTO&,
                          const RuntimeScaleControlSelectorDTO&) = default;
@@ -55,6 +65,17 @@ struct RuntimeScaleControlAcceptedDTO final {
   std::int64_t accepted_at_ns{};
 };
 
+struct RuntimeScaleControlMemberDTO final {
+  RuntimeScaleControlTargetDTO target;
+  ControlDomainId control_domain_id;
+  ControlDomainRevision control_domain_revision;
+  ControlBindingId control_binding_id;
+  ControlBindingRevision control_binding_revision;
+  ScalingDomainId scaling_domain_id;
+  ActiveControlConfigurationId active_control_configuration_id;
+  ActiveControlConfigurationGeneration active_control_configuration_generation;
+};
+
 /// Owner projection consumed by a stable command-bar control. Exact resolved
 /// identities prove scope and support; optional operation fields are
 /// observation only and never become client-side routing authority.
@@ -78,6 +99,7 @@ struct RuntimeScaleControlStatusDTO final {
   std::optional<double> effective_scale;
   std::optional<RuntimeScaleApplicationState> application_state;
   std::optional<ErrorDTO> reason;
+  std::vector<RuntimeScaleControlMemberDTO> synchronized_members{};
 };
 
 [[nodiscard]] constexpr const char* to_string(

@@ -7936,9 +7936,9 @@ CanonicalEmptySceneOwner::StageCandidateProjection(
   }
 
   std::lock_guard lock(impl_->mutex_);
-  impl_->InvalidateSceneCommitState();
   auto *database = impl_->database();
-  auto state = impl_->ReadStateTransaction();
+  auto state = impl_->ReadSceneCommitState().durable_state;
+  impl_->InvalidateSceneCommitState();
   std::optional<NamedApplyStageState> stage;
   bool new_stage = false;
   if (const auto *existing =
@@ -8378,9 +8378,9 @@ CanonicalEmptySceneOwner::ActivateStagedProjection(
   static_cast<void>(CheckedSafeCounter(
       request.projection_stage_generation.value(), "stage generation"));
   std::lock_guard lock(impl_->mutex_);
-  impl_->InvalidateSceneCommitState();
   auto *database = impl_->database();
-  auto state = impl_->ReadStateTransaction();
+  auto state = impl_->ReadSceneCommitState().durable_state;
+  impl_->InvalidateSceneCommitState();
   const auto *stored =
       state.FindNamedApply(request.apply_id, request.apply_generation);
   if (stored == nullptr) {
@@ -9163,7 +9163,7 @@ ProjectionApplyStatusDTO CanonicalEmptySceneOwner::ProjectionApplyStatus(
   static_cast<void>(
       CheckedSafeCounter(query.apply_generation.value(), "Apply generation"));
   std::lock_guard lock(impl_->mutex_);
-  const auto state = impl_->ReadStateTransaction();
+  const auto state = impl_->ReadSceneCommitState().durable_state;
   const auto *staged =
       state.FindNamedApply(query.apply_id, query.apply_generation);
   if (staged == nullptr) {

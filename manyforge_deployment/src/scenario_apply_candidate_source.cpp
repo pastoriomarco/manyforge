@@ -733,9 +733,32 @@ FilesystemScenarioApplyCandidateSource::catalog_path_for_revision(
   const auto base = catalog_path();
   const auto verified =
       VerifyCatalog(ReadExactArtifact(base, "scenario catalog"));
-  Require(verified.revision == scenario_catalog_revision,
-          "scenario catalog has no exact requested revision");
-  return base;
+  if (verified.revision == scenario_catalog_revision) {
+    return base;
+  }
+  const auto filename = catalog_name_ + ".scenario-catalog." +
+                        scenario_catalog_revision.value().substr(7U) + ".json";
+  for (const auto &root :
+       {candidate_package_root_,
+        std::optional<std::filesystem::path>(package_root_)}) {
+    if (!root.has_value()) {
+      continue;
+    }
+    const auto retained = *root / filename;
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(retained, error);
+    if (status.type() == std::filesystem::file_type::not_found) {
+      continue;
+    }
+    Require(!error && std::filesystem::is_regular_file(status),
+            "retained scenario catalog is not one plain file");
+    const auto catalog =
+        VerifyCatalog(ReadExactArtifact(retained, "retained scenario catalog"));
+    Require(catalog.revision == scenario_catalog_revision,
+            "retained scenario catalog has another revision");
+    return retained;
+  }
+  Fail("scenario catalog has no exact requested revision");
 }
 
 } // namespace manyforge::deployment

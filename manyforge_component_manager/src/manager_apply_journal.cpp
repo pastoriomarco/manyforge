@@ -32,6 +32,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 namespace manyforge::component_manager {
@@ -3573,9 +3574,63 @@ public:
     return generation;
   }
 
+  using VerifiedReadKey = std::tuple<ApplyId, std::int64_t, std::int64_t>;
+  template <typename Record>
+  using VerifiedRecordMap = std::map<VerifiedReadKey, std::optional<Record>>;
+  using VerifiedReads = std::tuple<
+      VerifiedRecordMap<PersistedManagerApplyIntent>,
+      VerifiedRecordMap<PersistedManagerApplyAffectedScope>,
+      VerifiedRecordMap<PersistedManagerApplyFenceAttempt>,
+      VerifiedRecordMap<PersistedManagerApplyFenceAcceptance>,
+      VerifiedRecordMap<PersistedManagerApplyRuntimeConvergenceIntent>,
+      VerifiedRecordMap<PersistedManagerApplyRuntimeStagedReady>,
+      VerifiedRecordMap<PersistedManagerApplySceneStageIntent>,
+      VerifiedRecordMap<PersistedManagerApplySceneStaged>,
+      VerifiedRecordMap<PersistedManagerApplyActivationSelection>,
+      VerifiedRecordMap<PersistedManagerApplySceneActivated>,
+      VerifiedRecordMap<PersistedManagerApplyPrivateMaterialization>,
+      VerifiedRecordMap<PersistedManagerApplyObsoleteCommandSurfacesRetired>,
+      VerifiedRecordMap<PersistedManagerApplyPublicationReceipt>,
+      VerifiedRecordMap<PersistedManagerApplySceneFinalized>,
+      VerifiedRecordMap<PersistedManagerApplyFenceReleaseIntent>,
+      VerifiedRecordMap<PersistedManagerApplyFenceReleased>,
+      VerifiedRecordMap<PersistedManagerApplyTerminalOutcome>>;
+
+  // Reuse verified predecessors only within one locked SQLite read. No
+  // result (including absence) survives the outer read or an exception.
+  // Subsequent operations still read and validate the database afresh.
+  template <typename Record, typename Reader>
+  std::optional<Record> ReadVerifiedRecord(const VerifiedReadKey &key,
+                                           Reader &&read) const {
+    if (verified_reads_ == nullptr) {
+      VerifiedReads reads;
+      struct Reset final {
+        VerifiedReads *&slot;
+        ~Reset() { slot = nullptr; }
+      } reset{verified_reads_};
+      verified_reads_ = &reads;
+      return ReadVerifiedRecord<Record>(key, std::forward<Reader>(read));
+    }
+    auto &records = std::get<VerifiedRecordMap<Record>>(*verified_reads_);
+    if (const auto found = records.find(key); found != records.end()) {
+      return found->second;
+    }
+    auto result = read();
+    records.emplace(key, result);
+    return result;
+  }
+
   std::optional<PersistedManagerApplyIntent>
   IntentLocked(const ApplyId &apply_id,
                const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyIntent>(
+        {apply_id, apply_generation, 0},
+        [&] { return IntentUncachedLocked(apply_id, apply_generation); });
+  }
+
+  std::optional<PersistedManagerApplyIntent>
+  IntentUncachedLocked(const ApplyId &apply_id,
+                       const std::int64_t apply_generation) const {
     Statement row(
         database_,
         "SELECT apply_id,apply_generation,request_id,request_owner_epoch,"
@@ -3694,6 +3749,15 @@ public:
   std::optional<PersistedManagerApplyAffectedScope>
   AffectedScopeLocked(const ApplyId &apply_id,
                       const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyAffectedScope>(
+        {apply_id, apply_generation, 0}, [&] {
+          return AffectedScopeUncachedLocked(apply_id, apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplyAffectedScope>
+  AffectedScopeUncachedLocked(const ApplyId &apply_id,
+                              const std::int64_t apply_generation) const {
     Statement row(database_,
                   "SELECT intent_digest,components_encoding,domains_encoding,"
                   "bindings_encoding,resources_encoding,busy_disposition,"
@@ -3749,6 +3813,14 @@ public:
   std::optional<PersistedManagerApplyFenceAttempt>
   FenceAttemptLocked(const ApplyId &apply_id,
                      const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyFenceAttempt>(
+        {apply_id, apply_generation, 0},
+        [&] { return FenceAttemptUncachedLocked(apply_id, apply_generation); });
+  }
+
+  std::optional<PersistedManagerApplyFenceAttempt>
+  FenceAttemptUncachedLocked(const ApplyId &apply_id,
+                             const std::int64_t apply_generation) const {
     Statement row(
         database_,
         "SELECT intent_digest,affected_scope_digest,request_id,"
@@ -3850,6 +3922,15 @@ public:
   std::optional<PersistedManagerApplyFenceAcceptance>
   FenceAcceptanceLocked(const ApplyId &apply_id,
                         const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyFenceAcceptance>(
+        {apply_id, apply_generation, 0}, [&] {
+          return FenceAcceptanceUncachedLocked(apply_id, apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplyFenceAcceptance>
+  FenceAcceptanceUncachedLocked(const ApplyId &apply_id,
+                                const std::int64_t apply_generation) const {
     Statement row(database_,
                   "SELECT fence_attempt_digest,configuration_fence_id,"
                   "configuration_fence_generation,captured_components_encoding,"
@@ -3928,6 +4009,16 @@ public:
   std::optional<PersistedManagerApplyRuntimeConvergenceIntent>
   RuntimeConvergenceIntentLocked(const ApplyId &apply_id,
                                  const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyRuntimeConvergenceIntent>(
+        {apply_id, apply_generation, 0}, [&] {
+          return RuntimeConvergenceIntentUncachedLocked(apply_id,
+                                                        apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplyRuntimeConvergenceIntent>
+  RuntimeConvergenceIntentUncachedLocked(
+      const ApplyId &apply_id, const std::int64_t apply_generation) const {
     Statement row(database_,
                   "SELECT intent_digest,candidate_retained_bundle_id,"
                   "candidate_graph_revision,fence_acceptance_digest,"
@@ -3996,6 +4087,17 @@ public:
   RuntimeStagedReadyLocked(const ApplyId &apply_id,
                            const std::int64_t apply_generation,
                            const std::int64_t staged_ready_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyRuntimeStagedReady>(
+        {apply_id, apply_generation, staged_ready_generation}, [&] {
+          return RuntimeStagedReadyUncachedLocked(apply_id, apply_generation,
+                                                  staged_ready_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplyRuntimeStagedReady>
+  RuntimeStagedReadyUncachedLocked(
+      const ApplyId &apply_id, const std::int64_t apply_generation,
+      const std::int64_t staged_ready_generation) const {
     Statement row(database_,
                   "SELECT runtime_convergence_intent_digest,"
                   "predecessor_publication_generation,"
@@ -4114,6 +4216,15 @@ public:
   std::optional<PersistedManagerApplySceneStageIntent>
   SceneStageIntentLocked(const ApplyId &apply_id,
                          const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplySceneStageIntent>(
+        {apply_id, apply_generation, 0}, [&] {
+          return SceneStageIntentUncachedLocked(apply_id, apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplySceneStageIntent>
+  SceneStageIntentUncachedLocked(const ApplyId &apply_id,
+                                 const std::int64_t apply_generation) const {
     Statement row(database_,
                   "SELECT runtime_staged_ready_digest,"
                   "predecessor_publication_generation,"
@@ -4203,6 +4314,14 @@ public:
   std::optional<PersistedManagerApplySceneStaged>
   SceneStagedLocked(const ApplyId &apply_id,
                     const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplySceneStaged>(
+        {apply_id, apply_generation, 0},
+        [&] { return SceneStagedUncachedLocked(apply_id, apply_generation); });
+  }
+
+  std::optional<PersistedManagerApplySceneStaged>
+  SceneStagedUncachedLocked(const ApplyId &apply_id,
+                            const std::int64_t apply_generation) const {
     Statement row(database_,
                   "SELECT scene_stage_intent_digest,"
                   "predecessor_retained_bundle_id,predecessor_graph_revision,"
@@ -4315,6 +4434,15 @@ public:
   std::optional<PersistedManagerApplyActivationSelection>
   ActivationSelectionLocked(const ApplyId &apply_id,
                             const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyActivationSelection>(
+        {apply_id, apply_generation, 0}, [&] {
+          return ActivationSelectionUncachedLocked(apply_id, apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplyActivationSelection>
+  ActivationSelectionUncachedLocked(const ApplyId &apply_id,
+                                    const std::int64_t apply_generation) const {
     Statement row(
         database_,
         "SELECT scene_staged_digest,predecessor_retained_bundle_id,"
@@ -4404,6 +4532,15 @@ public:
   std::optional<PersistedManagerApplySceneActivated>
   SceneActivatedLocked(const ApplyId &apply_id,
                        const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplySceneActivated>(
+        {apply_id, apply_generation, 0}, [&] {
+          return SceneActivatedUncachedLocked(apply_id, apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplySceneActivated>
+  SceneActivatedUncachedLocked(const ApplyId &apply_id,
+                               const std::int64_t apply_generation) const {
     Statement row(database_,
                   "SELECT activation_selection_digest,"
                   "predecessor_retained_bundle_id,predecessor_graph_revision,"
@@ -4506,6 +4643,16 @@ public:
   std::optional<PersistedManagerApplyPrivateMaterialization>
   PrivateMaterializationLocked(const ApplyId &apply_id,
                                const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyPrivateMaterialization>(
+        {apply_id, apply_generation, 0}, [&] {
+          return PrivateMaterializationUncachedLocked(apply_id,
+                                                      apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplyPrivateMaterialization>
+  PrivateMaterializationUncachedLocked(
+      const ApplyId &apply_id, const std::int64_t apply_generation) const {
     Statement row(database_,
                   "SELECT scene_activated_digest,projection_stage_generation,"
                   "candidate_retained_bundle_id,candidate_graph_revision,"
@@ -4583,6 +4730,17 @@ public:
   std::optional<PersistedManagerApplyObsoleteCommandSurfacesRetired>
   RetiredCommandSurfacesLocked(const ApplyId &apply_id,
                                const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<
+        PersistedManagerApplyObsoleteCommandSurfacesRetired>(
+        {apply_id, apply_generation, 0}, [&] {
+          return RetiredCommandSurfacesUncachedLocked(apply_id,
+                                                      apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplyObsoleteCommandSurfacesRetired>
+  RetiredCommandSurfacesUncachedLocked(
+      const ApplyId &apply_id, const std::int64_t apply_generation) const {
     Statement row(
         database_,
         "SELECT private_materialization_content_digest,"
@@ -4631,6 +4789,15 @@ public:
   std::optional<PersistedManagerApplyPublicationReceipt>
   PublicationReceiptLocked(const ApplyId &apply_id,
                            const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyPublicationReceipt>(
+        {apply_id, apply_generation, 0}, [&] {
+          return PublicationReceiptUncachedLocked(apply_id, apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplyPublicationReceipt>
+  PublicationReceiptUncachedLocked(const ApplyId &apply_id,
+                                   const std::int64_t apply_generation) const {
     Statement row(
         database_,
         "SELECT retired_command_surfaces_evidence_digest,"
@@ -4743,6 +4910,15 @@ public:
   std::optional<PersistedManagerApplySceneFinalized>
   SceneFinalizedLocked(const ApplyId &apply_id,
                        const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplySceneFinalized>(
+        {apply_id, apply_generation, 0}, [&] {
+          return SceneFinalizedUncachedLocked(apply_id, apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplySceneFinalized>
+  SceneFinalizedUncachedLocked(const ApplyId &apply_id,
+                               const std::int64_t apply_generation) const {
     Statement row(
         database_,
         "SELECT publication_receipt_digest,projection_stage_generation,"
@@ -4849,6 +5025,15 @@ public:
   std::optional<PersistedManagerApplyFenceReleaseIntent>
   FenceReleaseIntentLocked(const ApplyId &apply_id,
                            const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyFenceReleaseIntent>(
+        {apply_id, apply_generation, 0}, [&] {
+          return FenceReleaseIntentUncachedLocked(apply_id, apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplyFenceReleaseIntent>
+  FenceReleaseIntentUncachedLocked(const ApplyId &apply_id,
+                                   const std::int64_t apply_generation) const {
     Statement row(database_,
                   "SELECT scene_finalized_digest,fence_acceptance_digest,"
                   "release_request_encoding,fence_release_intent_digest "
@@ -4919,6 +5104,15 @@ public:
   std::optional<PersistedManagerApplyFenceReleased>
   FenceReleasedLocked(const ApplyId &apply_id,
                       const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyFenceReleased>(
+        {apply_id, apply_generation, 0}, [&] {
+          return FenceReleasedUncachedLocked(apply_id, apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplyFenceReleased>
+  FenceReleasedUncachedLocked(const ApplyId &apply_id,
+                              const std::int64_t apply_generation) const {
     Statement row(database_, "SELECT fence_release_intent_digest,"
                              "released_fence_encoding,fence_released_digest "
                              "FROM manager_apply_fence_released_records "
@@ -4968,6 +5162,15 @@ public:
   std::optional<PersistedManagerApplyTerminalOutcome>
   TerminalOutcomeLocked(const ApplyId &apply_id,
                         const std::int64_t apply_generation) const {
+    return ReadVerifiedRecord<PersistedManagerApplyTerminalOutcome>(
+        {apply_id, apply_generation, 0}, [&] {
+          return TerminalOutcomeUncachedLocked(apply_id, apply_generation);
+        });
+  }
+
+  std::optional<PersistedManagerApplyTerminalOutcome>
+  TerminalOutcomeUncachedLocked(const ApplyId &apply_id,
+                                const std::int64_t apply_generation) const {
     Statement row(database_,
                   "SELECT fence_released_digest,scene_finalized_digest,"
                   "publication_receipt_digest,candidate_retained_bundle_id,"
@@ -5608,6 +5811,7 @@ public:
   CellId cell_id_;
   sqlite3 *database_{};
   mutable std::mutex mutex_;
+  mutable VerifiedReads *verified_reads_{};
   bool closed_{};
 };
 

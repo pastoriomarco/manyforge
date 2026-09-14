@@ -111,7 +111,7 @@ bool CCLCRuntimeCompositionConfig::trusted_roots_valid() const noexcept {
 }
 
 core::Result<std::unique_ptr<CCLCRuntimeComposition>>
-CCLCRuntimeComposition::CreateAndStart(
+CCLCRuntimeComposition::Create(
     CCLCRuntimeCompositionConfig config,
     std::shared_ptr<const RetainedBundle> retained_bundle,
     const core::IActiveBundlePublicationReader &active_publication_reader,
@@ -129,12 +129,11 @@ CCLCRuntimeComposition::CreateAndStart(
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
     core::IClock &clock, core::IScheduler &scheduler,
-    std::function<core::Result<
-        std::optional<core::ActiveControlConfigurationDTO>>(
-        const core::ControlDomainId &)>
+    std::function<
+        core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
+            const core::ControlDomainId &)>
         kernel_current_configuration_source) {
-  if (!config.trusted_roots_valid() ||
-      retained_bundle == nullptr ||
+  if (!config.trusted_roots_valid() || retained_bundle == nullptr ||
       !expected_active_publication.valid() ||
       expected_active_publication.request.candidate_retained_bundle_id !=
           retained_bundle->retained_bundle_id() ||
@@ -158,31 +157,8 @@ CCLCRuntimeComposition::CreateAndStart(
             std::move(controller_ports), std::move(source_projections),
             std::move(kernel_current_configuration_source),
             kernel_disable_handoff_port, kernel_cell_admission_port,
-            kernel_route_fence_port,
-            kernel_publication_owner, clock, scheduler));
-    auto started = result->coordinator_.Start();
-    if (!started.ok()) {
-      return core::Result<std::unique_ptr<CCLCRuntimeComposition>>::Err(
-          started.error());
-    }
-    auto http_server = CCLCOpenRequestUnixServer::CreateAndStart(
-        result->config_.run_root, result->open_request_port_,
-        core::RequestTransportDTO::kHttp);
-    if (!http_server.ok()) {
-      result->coordinator_.CloseAdmission();
-      return core::Result<std::unique_ptr<CCLCRuntimeComposition>>::Err(
-          http_server.error());
-    }
-    result->http_open_request_server_ = std::move(http_server.value());
-    auto ros_server = CCLCOpenRequestUnixServer::CreateAndStart(
-        result->config_.run_root, result->open_request_port_,
-        core::RequestTransportDTO::kRos);
-    if (!ros_server.ok()) {
-      result->coordinator_.CloseAdmission();
-      return core::Result<std::unique_ptr<CCLCRuntimeComposition>>::Err(
-          ros_server.error());
-    }
-    result->ros_open_request_server_ = std::move(ros_server.value());
+            kernel_route_fence_port, kernel_publication_owner, clock,
+            scheduler));
     return core::Result<std::unique_ptr<CCLCRuntimeComposition>>::Ok(
         std::move(result));
   } catch (const std::exception &exception) {
@@ -192,6 +168,37 @@ CCLCRuntimeComposition::CreateAndStart(
     return core::Result<std::unique_ptr<CCLCRuntimeComposition>>::Err(
         composition_error("construction_failed",
                           "CCLC composition construction failed"));
+  }
+}
+
+core::Result<void> CCLCRuntimeComposition::Start() {
+  try {
+    auto started = coordinator_.Start();
+    if (!started.ok())
+      return started;
+    auto http_server = CCLCOpenRequestUnixServer::CreateAndStart(
+        config_.run_root, open_request_port_, core::RequestTransportDTO::kHttp);
+    if (!http_server.ok()) {
+      coordinator_.CloseAdmission();
+      return core::Result<void>::Err(http_server.error());
+    }
+    auto ros_server = CCLCOpenRequestUnixServer::CreateAndStart(
+        config_.run_root, open_request_port_, core::RequestTransportDTO::kRos);
+    if (!ros_server.ok()) {
+      coordinator_.CloseAdmission();
+      return core::Result<void>::Err(ros_server.error());
+    }
+    http_open_request_server_ = std::move(http_server.value());
+    ros_open_request_server_ = std::move(ros_server.value());
+    return core::Result<void>::Ok();
+  } catch (const std::exception &exception) {
+    coordinator_.CloseAdmission();
+    return core::Result<void>::Err(
+        composition_error("startup_failed", exception.what()));
+  } catch (...) {
+    coordinator_.CloseAdmission();
+    return core::Result<void>::Err(
+        composition_error("startup_failed", "CCLC composition startup failed"));
   }
 }
 
@@ -266,12 +273,16 @@ CCLCRuntimeComposition::open_request_port() noexcept {
 }
 
 const std::filesystem::path &
-CCLCRuntimeComposition::open_request_socket_path() const noexcept {
+CCLCRuntimeComposition::open_request_socket_path() const {
+  if (!http_open_request_server_)
+    throw std::logic_error("CCLC request transport is not started");
   return http_open_request_server_->socket_path();
 }
 
 const std::filesystem::path &
-CCLCRuntimeComposition::ros_open_request_socket_path() const noexcept {
+CCLCRuntimeComposition::ros_open_request_socket_path() const {
+  if (!ros_open_request_server_)
+    throw std::logic_error("CCLC ROS request transport is not started");
   return ros_open_request_server_->socket_path();
 }
 

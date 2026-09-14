@@ -1985,6 +1985,31 @@ std::string EncodeProgramNodeAdmissionEvidence(const ProgramNodeAdmissionEvidenc
   return std::move(writer).Finish();
 }
 
+std::string EncodeCCLCRouteRecoveryConfiguration(
+    const CellAdmissionConfigurationScopeDTO& configuration) {
+  if (!ValidateCellAdmissionScope({{}, {configuration}}).ok())
+    throw CodecFailure("CCLC recovery configuration is invalid");
+  Writer writer;
+  writer.String("MF-CCLC-ROUTE-RECOVERY-V1");
+  writer.String(configuration.control_domain_id.value());
+  writer.String(configuration.active_configuration_id.value());
+  writer.U64(configuration.active_configuration_generation.value());
+  return std::move(writer).Finish();
+}
+
+CellAdmissionConfigurationScopeDTO DecodeCCLCRouteRecoveryConfiguration(std::string_view bytes) {
+  Reader reader(bytes);
+  if (reader.String() != "MF-CCLC-ROUTE-RECOVERY-V1")
+    throw CodecFailure("CCLC recovery configuration magic is invalid");
+  CellAdmissionConfigurationScopeDTO configuration{
+      ControlDomainId(reader.String()), ActiveControlConfigurationId(reader.String()),
+      ActiveControlConfigurationGeneration(reader.U64())};
+  reader.RequireEnd();
+  if (!ValidateCellAdmissionScope({{}, {configuration}}).ok())
+    throw CodecFailure("CCLC recovery configuration is invalid");
+  return configuration;
+}
+
 std::string EncodeCCLCAdmissionRejection(const ErrorDTO& error) {
   if (!CCLCLifecycleRequestResultDTO{RequestReplayStatusDTO::kAcceptedNew, std::nullopt,
                                      std::nullopt, error}

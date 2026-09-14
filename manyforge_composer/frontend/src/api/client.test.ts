@@ -9,6 +9,7 @@ import {
 } from './client';
 import type { DraftFenceRequest, ManagerApplyRequest } from '../types/api';
 import type { OperatorAlarmRecord } from '../types/headless';
+import type { RuntimeScaleControlSelector } from '../types/robotControl';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -34,6 +35,109 @@ it('rejects a discovery page for a different requested index', async () => {
   await expect(api.history.discovery('program_run_id')).rejects.toThrow('different kind');
 });
 
+describe('runtime-scale control reads', () => {
+  it('serializes singular and group selectors with their exact query shape', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(runtimeScaleResponse({
+        kind: 'singular', programBindingId: 'binding/1', componentRoleId: 'robot', targetRoleId: 'arm',
+      })))
+      .mockResolvedValueOnce(response(runtimeScaleResponse({
+        kind: 'group', programBindingId: 'binding/1', synchronizedTargets: [
+          { componentRoleId: 'robot', targetRoleId: 'arm' },
+          { componentRoleId: 'robot', targetRoleId: 'gripper' },
+        ],
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.execution.runtimeScaleControl({
+      kind: 'singular', programBindingId: 'binding/1', componentRoleId: 'robot', targetRoleId: 'arm',
+    });
+    await api.execution.runtimeScaleControl({
+      kind: 'group', programBindingId: 'binding/1', synchronizedTargets: [
+        { componentRoleId: 'robot', targetRoleId: 'arm' },
+        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+      ],
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/execution/runtime-scale-control?program_binding_id=binding%2F1&component_role_id=robot&target_role_id=arm',
+    );
+    expect(fetchMock.mock.calls[1]?.[0]).toContain(
+      'program_binding_id=binding%2F1&synchronized_targets=%5B%7B%22component_role_id%22%3A%22robot%22%2C%22target_role_id%22%3A%22arm%22%7D%2C%7B%22component_role_id%22%3A%22robot%22%2C%22target_role_id%22%3A%22gripper%22%7D%5D',
+    );
+  });
+
+  it('rejects malformed and crossed owner responses', async () => {
+    const selector = {
+      kind: 'singular' as const, programBindingId: 'binding-1', componentRoleId: 'robot', targetRoleId: 'arm',
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({}))
+      .mockResolvedValueOnce(response(runtimeScaleResponse({ ...selector, targetRoleId: 'gripper' })));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.execution.runtimeScaleControl(selector)).rejects.toThrow('Invalid response');
+    await expect(api.execution.runtimeScaleControl(selector)).rejects.toThrow('does not match');
+  });
+
+  it('rejects crossed group members and bindings', async () => {
+    const selector = {
+      kind: 'group' as const, programBindingId: 'binding-1', synchronizedTargets: [
+        { componentRoleId: 'robot', targetRoleId: 'arm' },
+        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+      ],
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response(runtimeScaleResponse({
+        ...selector,
+        synchronizedTargets: [
+          selector.synchronizedTargets[0],
+          { componentRoleId: 'robot', targetRoleId: 'camera' },
+        ],
+      })))
+      .mockResolvedValueOnce(response(runtimeScaleResponse({
+        ...selector, programBindingId: 'binding-2',
+      })));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(api.execution.runtimeScaleControl(selector)).rejects.toThrow('does not match');
+    await expect(api.execution.runtimeScaleControl(selector)).rejects.toThrow('does not match');
+  });
+
+  it('validates a deferred response against a selector snapshot', async () => {
+    const selector = {
+      kind: 'group' as const, programBindingId: 'binding-1', synchronizedTargets: [
+        { componentRoleId: 'robot', targetRoleId: 'arm' },
+        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+      ],
+    };
+    let resolveResponse: ((value: Response) => void) | undefined;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => {
+      resolveResponse = resolve;
+    })));
+    const pending = api.execution.runtimeScaleControl(selector);
+    selector.programBindingId = 'binding-crossed';
+    selector.synchronizedTargets[0].targetRoleId = 'camera';
+    resolveResponse?.(response(runtimeScaleResponse({
+      kind: 'group', programBindingId: 'binding-1', synchronizedTargets: [
+        { componentRoleId: 'robot', targetRoleId: 'arm' },
+        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+      ],
+    })));
+    await expect(pending).resolves.toMatchObject({ selector: { kind: 'group' } });
+  });
+
+  it('accepts a group response whose target order differs', async () => {
+    const selector = {
+      kind: 'group' as const, programBindingId: 'binding-1', synchronizedTargets: [
+        { componentRoleId: 'robot', targetRoleId: 'arm' },
+        { componentRoleId: 'robot', targetRoleId: 'gripper' },
+      ],
+    };
+    const returned = { ...selector, synchronizedTargets: [...selector.synchronizedTargets].reverse() };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(runtimeScaleResponse(returned))));
+    await expect(api.execution.runtimeScaleControl(selector)).resolves.toMatchObject({ selector: { kind: 'group' } });
+  });
+});
+
 function response(
   payload: unknown,
   options: { ok?: boolean; status?: number; statusText?: string } = {},
@@ -44,6 +148,59 @@ function response(
     statusText: options.statusText ?? 'OK',
     json: vi.fn().mockResolvedValue(payload),
   } as unknown as Response;
+}
+
+function runtimeScaleResponse(selector: RuntimeScaleControlSelector): Record<string, unknown> {
+  const member = (target: { componentRoleId: string; targetRoleId: string }) => ({
+    active_control_configuration_generation: 1,
+    active_control_configuration_id: `active-${target.targetRoleId}`,
+    control_binding_id: `binding-${target.targetRoleId}`,
+    control_binding_revision: 'revision-1',
+    control_domain_id: `domain-${target.targetRoleId}`,
+    control_domain_revision: 'revision-1',
+    scaling_domain_id: `scale-${target.targetRoleId}`,
+    component_role_id: target.componentRoleId,
+    target_role_id: target.targetRoleId,
+  });
+  const status = {
+    active_control_configuration_generation: selector.kind === 'group' ? null : 1,
+    active_control_configuration_id: selector.kind === 'group' ? null : 'active-arm',
+    active_operation_id: null,
+    active_operation_revision: null,
+    active_operation_scale_generation: null,
+    application_state: null,
+    control_binding_id: selector.kind === 'group' ? null : 'binding-arm',
+    control_binding_revision: selector.kind === 'group' ? null : 'binding-revision-1',
+    control_domain_id: selector.kind === 'group' ? null : 'domain-arm',
+    control_domain_revision: selector.kind === 'group' ? null : 'domain-revision-1',
+    control_generation: 1,
+    effective_scale: null,
+    frozen: false,
+    reason: null,
+    requested_scale: 0.5,
+    scaling_domain_id: selector.kind === 'group' ? null : 'scale-arm',
+    selector: selector.kind === 'singular' ? {
+      program_binding_id: selector.programBindingId,
+      component_role_id: selector.componentRoleId,
+      target_role_id: selector.targetRoleId,
+    } : {
+      program_binding_id: selector.programBindingId,
+      synchronized_targets: selector.synchronizedTargets.map((target) => ({
+        component_role_id: target.componentRoleId,
+        target_role_id: target.targetRoleId,
+      })),
+    },
+    supported: true,
+    ...(selector.kind === 'group'
+      ? { synchronized_members: selector.synchronizedTargets.map(member) }
+      : {}),
+  };
+  return {
+    api_version: 'manyforge.execution_command_response.v1',
+    command: 'get_runtime_scale_control',
+    ok: true,
+    runtime_scale_control: status,
+  };
 }
 
 function draftFence(revision = 1): DraftFenceRequest {

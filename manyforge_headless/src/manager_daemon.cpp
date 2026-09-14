@@ -2827,26 +2827,31 @@ private:
       auto runner_renewal = RenewProgramRunnerLiveness(
           config_.program_runner_liveness_socket, runner, required_set,
           manager_heartbeat_sequence_, std::nullopt);
-      Require(IsCurrentProgramRunnerOwner(runner_renewal.program_cycle_status,
-                                          runner.runtime_epoch),
-              "Program cycle is not issued by the current Program Runner");
       probed_cycle_status = runner_renewal.program_cycle_status;
       if (!allow_native ||
           !manager_liveness_retry_gate_.attempt_allowed(ElapsedNs())) {
         SubmitFailClosedReadiness(probed_cycle_status);
         return;
       }
-      const auto probed_readiness = BuildCellAdmissionReadiness(
-          runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
-          forced_closed);
-      if (last_submitted_readiness_.has_value() &&
-          *last_submitted_readiness_ != probed_readiness &&
-          !IsSameProgramAdmissionProgress(*last_submitted_readiness_,
-                                          probed_readiness)) {
+      // A replacement Runner still reports its predecessor's durable cycle
+      // until the reconciliation renewal below succeeds. Keep admission
+      // closed, but do not prevent the renewal that establishes ownership.
+      if (!IsCurrentProgramRunnerOwner(*probed_cycle_status,
+                                       runner.runtime_epoch)) {
         SubmitFailClosedReadiness(probed_cycle_status);
-        Require(last_submitted_readiness_.has_value() &&
-                    !last_submitted_readiness_->program_cycle_status_current,
-                "Kernel could not be closed before a readiness transition");
+      } else {
+        const auto probed_readiness = BuildCellAdmissionReadiness(
+            runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
+            forced_closed);
+        if (last_submitted_readiness_.has_value() &&
+            *last_submitted_readiness_ != probed_readiness &&
+            !IsSameProgramAdmissionProgress(*last_submitted_readiness_,
+                                            probed_readiness)) {
+          SubmitFailClosedReadiness(probed_cycle_status);
+          Require(last_submitted_readiness_.has_value() &&
+                      !last_submitted_readiness_->program_cycle_status_current,
+                  "Kernel could not be closed before a readiness transition");
+        }
       }
       const core::ManagerHeartbeatDTO heartbeat{
           required_set.cell_id,

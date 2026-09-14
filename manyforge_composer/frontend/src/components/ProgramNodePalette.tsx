@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Ref } from 'react';
 
 import type {
@@ -111,7 +111,7 @@ export function defaultCollapsedCatalogCategories(
     .map(([category]) => category));
 }
 
-export function ProgramNodePalette({
+export const ProgramNodePalette = memo(function ProgramNodePalette({
   roots,
   program,
   catalogEntries,
@@ -311,4 +311,4 @@ export function ProgramNodePalette({
       {error && <p className="program-form-error palette-error" role="alert">{error}</p>}
     </section>
   );
-}
+});
