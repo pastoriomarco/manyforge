@@ -27,8 +27,6 @@ from .models import (
     ManualResultStageRequest,
     OperationControlRequest,
     OperationIntentRequest,
-    PickSequencePlanningRequest,
-    PlaceSequencePlanningRequest,
     ProgramCycleResetRequest,
     ProgramFullStopResetRequest,
     ProgramFullStopResumeRequest,
@@ -57,8 +55,6 @@ _NATIVE_EXECUTION_COMMANDS = frozenset(
         "operation_resume",
         "operation_reset",
         "operation_acknowledge_completed",
-        "pick_sequence_start",
-        "place_sequence_start",
         "cell_full_stop",
         "stop_recovery",
         "runtime_scale",
@@ -214,34 +210,6 @@ class HeadlessExecutionControlDispatch:
                 client_sequence=envelope.client_sequence,
             )
         return context
-
-    @staticmethod
-    def _pick_place_payload(
-        payload: Mapping[str, Any], context: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        """Apply the one admitted envelope identity to every sequence phase."""
-
-        result = dict(payload)
-        for field in (
-            "approach_operation",
-            "descend_operation",
-            "tool_operation",
-            "retreat_operation",
-        ):
-            operation = result.get(field)
-            if not isinstance(operation, Mapping):
-                continue
-            retained_context = operation.get("request_context")
-            phase_request_id = (
-                retained_context.get("request_id")
-                if isinstance(retained_context, Mapping)
-                else None
-            )
-            phase_context = dict(context)
-            if isinstance(phase_request_id, str):
-                phase_context["request_id"] = phase_request_id
-            result[field] = {**operation, "request_context": phase_context}
-        return result
 
     @staticmethod
     def _owner_result(
@@ -551,20 +519,6 @@ class HeadlessExecutionControlDispatch:
                 result = self._service.execution_stop(
                     StopIntentRequest.model_validate(
                         {**payload, "request_context": context}
-                    ),
-                    attribution,
-                )
-            elif kind == "pick_sequence_start":
-                result = self._service.execution_start_pick(
-                    PickSequencePlanningRequest.model_validate(
-                        self._pick_place_payload(payload, context)
-                    ),
-                    attribution,
-                )
-            elif kind == "place_sequence_start":
-                result = self._service.execution_start_place(
-                    PlaceSequencePlanningRequest.model_validate(
-                        self._pick_place_payload(payload, context)
                     ),
                     attribution,
                 )

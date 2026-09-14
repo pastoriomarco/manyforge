@@ -21,38 +21,35 @@ constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 static_assert(!std::is_aggregate_v<TypedAssistantSettingsCandidate>);
-static_assert(!std::is_default_constructible_v<TypedAssistantSettingsCandidate>);
+static_assert(
+    !std::is_default_constructible_v<TypedAssistantSettingsCandidate>);
 static_assert(!std::is_aggregate_v<QualifiedAssistantSettings>);
 static_assert(!std::is_default_constructible_v<QualifiedAssistantSettings>);
-static_assert(
-    !std::is_aggregate_v<BuildQualifiedAssistantInstrumentRegistry>);
+static_assert(!std::is_aggregate_v<BuildQualifiedAssistantInstrumentRegistry>);
 
-[[nodiscard]] std::string mode(
-    std::string_view mode_id = "query",
-    std::string_view tools = "\"status_read\",\"scene_inspect\"",
-    std::string_view skills = "", std::string_view nodes = "",
-    std::string_view session_kind = "null",
-    std::string_view approval_mode = "null",
-    std::string_view review_policy = "not_required") {
-  return "\"" + std::string(mode_id) + "\":{" +
-         "\"enabled\":true," +
+[[nodiscard]] std::string
+mode(std::string_view mode_id = "query",
+     std::string_view tools = "\"status_read\",\"scene_inspect\"",
+     std::string_view skills = "", std::string_view nodes = "",
+     std::string_view session_kind = "null",
+     std::string_view approval_mode = "null",
+     std::string_view review_policy = "not_required") {
+  return "\"" + std::string(mode_id) + "\":{" + "\"enabled\":true," +
          "\"description\":\"Bounded mode\"," +
          "\"provider_alias\":\"direct_local\"," +
-         "\"model_endpoint_alias\":\"primary_model\"," +
-         "\"grant_policy\":{" +
+         "\"model_endpoint_alias\":\"primary_model\"," + "\"grant_policy\":{" +
          "\"session_kind\":" + std::string(session_kind) + "," +
          "\"approval_mode\":" + std::string(approval_mode) + "," +
          "\"review_policy\":\"" + std::string(review_policy) + "\"}," +
-         "\"catalog\":{" +
-         "\"skills\":[" + std::string(skills) + "]," +
-         "\"tools\":[" + std::string(tools) + "]," +
-         "\"nodes\":[" + std::string(nodes) + "]}}";
+         "\"catalog\":{" + "\"skills\":[" + std::string(skills) + "]," +
+         "\"tools\":[" + std::string(tools) + "]," + "\"nodes\":[" +
+         std::string(nodes) + "]}}";
 }
 
-[[nodiscard]] std::string model_request_contract(
-    std::string_view supports_image_input = "true",
-    std::string_view supported_image_transports =
-        "\"http_url\",\"inline_data_url\"") {
+[[nodiscard]] std::string
+model_request_contract(std::string_view supports_image_input = "true",
+                       std::string_view supported_image_transports =
+                           "\"http_url\",\"inline_data_url\"") {
   return "{\"default_timeout_s\":30.0,"
          "\"max_output_tokens\":512,"
          "\"supports_response_tools\":true,"
@@ -64,8 +61,8 @@ static_assert(
          "],\"tool_call_family\":\"openai_chat_tools\"}";
 }
 
-[[nodiscard]] std::string model_alias(
-    std::string request_contract = model_request_contract()) {
+[[nodiscard]] std::string
+model_alias(std::string request_contract = model_request_contract()) {
   return "\"primary_model\":{"
          "\"external_resource_alias\":\"local_model\","
          "\"model_id\":\"deployment-model\","
@@ -73,39 +70,17 @@ static_assert(
          std::move(request_contract) + "}";
 }
 
-[[nodiscard]] std::string assistant_document(std::string modes = mode(),
-                                             std::string_view provider_kind = "direct",
-                                             std::string_view assistant_extra = "",
-                                             std::string_view prompt_templates =
-                                                 "\"choose_object_v1\":{"
-                                                 "\"version\":\"1\","
-                                                 "\"template_text\":\"Choose {{object_id}}\","
-                                                 "\"variable_ids\":[\"object_id\"],"
-                                                 "\"response_contract\":{"
-                                                 "\"response_mode\":\"json_object\"}}") {
-  return std::string("{\"api_version\":\"manyforge.deployment.v1\",\"assistant\":{") +
-         "\"audit_policy\":{"
-         "\"store_full_prompts\":false,"
-         "\"store_full_responses\":false,"
-         "\"redact_argument_values\":true}," +
-         "\"prompt_templates\":{" + std::string(prompt_templates) + "}," +
-         "\"model_endpoint_aliases\":{" + model_alias() + "}," +
-         "\"provider_aliases\":{" + "\"direct_local\":{" + "\"provider_kind\":\"" +
-         std::string(provider_kind) + "\"," +
-         "\"bridge_external_resource_alias\":\"assistant_bridge\"}}," + "\"modes\":{" +
-         std::move(modes) + "}" + std::string(assistant_extra) + "}}";
-}
-
-[[nodiscard]] std::string model_query_document(
-    std::string_view prompt_templates =
-        "\"choose_object_v1\":{"
-        "\"version\":\"1\","
-        "\"template_text\":\"Choose {{object_id}}\","
-        "\"variable_ids\":[\"object_id\"],"
-        "\"response_contract\":{"
-        "\"response_mode\":\"json_object\"}}",
-    std::string model_endpoint_aliases = model_alias(),
-    std::string_view provider_aliases = "") {
+[[nodiscard]] std::string
+assistant_document(std::string modes = mode(),
+                   std::string_view provider_kind = "direct",
+                   std::string_view assistant_extra = "",
+                   std::string_view prompt_templates =
+                       "\"choose_object_v1\":{"
+                       "\"version\":\"1\","
+                       "\"template_text\":\"Choose {{object_id}}\","
+                       "\"variable_ids\":[\"object_id\"],"
+                       "\"response_contract\":{"
+                       "\"response_mode\":\"json_object\"}}") {
   return std::string(
              "{\"api_version\":\"manyforge.deployment.v1\",\"assistant\":{") +
          "\"audit_policy\":{"
@@ -113,14 +88,38 @@ static_assert(
          "\"store_full_responses\":false,"
          "\"redact_argument_values\":true}," +
          "\"prompt_templates\":{" + std::string(prompt_templates) + "}," +
-         "\"model_endpoint_aliases\":{" +
-         std::string(model_endpoint_aliases) + "}," +
-         "\"provider_aliases\":{" + std::string(provider_aliases) + "}," +
-         "\"modes\":{}}}";
+         "\"model_endpoint_aliases\":{" + model_alias() + "}," +
+         "\"provider_aliases\":{" + "\"direct_local\":{" +
+         "\"provider_kind\":\"" + std::string(provider_kind) + "\"," +
+         "\"bridge_external_resource_alias\":\"assistant_bridge\"}}," +
+         "\"modes\":{" + std::move(modes) + "}" + std::string(assistant_extra) +
+         "}}";
 }
 
-[[nodiscard]] core::ExternalResourceDTO external_resource(
-    std::string alias, core::ExternalResourceKind kind) {
+[[nodiscard]] std::string
+model_query_document(std::string_view prompt_templates =
+                         "\"choose_object_v1\":{"
+                         "\"version\":\"1\","
+                         "\"template_text\":\"Choose {{object_id}}\","
+                         "\"variable_ids\":[\"object_id\"],"
+                         "\"response_contract\":{"
+                         "\"response_mode\":\"json_object\"}}",
+                     std::string model_endpoint_aliases = model_alias(),
+                     std::string_view provider_aliases = "") {
+  return std::string(
+             "{\"api_version\":\"manyforge.deployment.v1\",\"assistant\":{") +
+         "\"audit_policy\":{"
+         "\"store_full_prompts\":false,"
+         "\"store_full_responses\":false,"
+         "\"redact_argument_values\":true}," +
+         "\"prompt_templates\":{" + std::string(prompt_templates) + "}," +
+         "\"model_endpoint_aliases\":{" + std::string(model_endpoint_aliases) +
+         "}," + "\"provider_aliases\":{" + std::string(provider_aliases) +
+         "}," + "\"modes\":{}}}";
+}
+
+[[nodiscard]] core::ExternalResourceDTO
+external_resource(std::string alias, core::ExternalResourceKind kind) {
   return {
       core::ExternalResourceAlias(std::move(alias)),
       kind,
@@ -141,8 +140,8 @@ static_assert(
   };
 }
 
-[[nodiscard]] TypedAssistantSettingsCandidate decode(
-    std::string_view document) {
+[[nodiscard]] TypedAssistantSettingsCandidate
+decode(std::string_view document) {
   return decode_assistant_settings_candidate(
       parse_strict_json_model_yaml(document));
 }
@@ -152,7 +151,7 @@ void expect_decode_error(std::string document,
   try {
     (void)decode(document);
     FAIL() << "expected AssistantSettingsCodecError";
-  } catch (const AssistantSettingsCodecError& error) {
+  } catch (const AssistantSettingsCodecError &error) {
     EXPECT_NE(std::string_view(error.what()).find(expected_fragment),
               std::string_view::npos)
         << error.what();
@@ -165,21 +164,21 @@ void expect_qualification_error(std::string document,
   try {
     (void)qualify_assistant_settings(decode(document), ext);
     FAIL() << "expected AssistantSettingsCodecError";
-  } catch (const AssistantSettingsCodecError& error) {
+  } catch (const AssistantSettingsCodecError &error) {
     EXPECT_NE(std::string_view(error.what()).find(expected_fragment),
               std::string_view::npos)
         << error.what();
   }
 }
 
-[[nodiscard]] CanonicalValue replace_member(
-    const CanonicalValue& object_value, std::string_view member_name,
-    CanonicalValue replacement) {
+[[nodiscard]] CanonicalValue replace_member(const CanonicalValue &object_value,
+                                            std::string_view member_name,
+                                            CanonicalValue replacement) {
   CanonicalValue::Object object = object_value.as_object();
-  const auto iterator = std::find_if(
-      object.begin(), object.end(), [member_name](const auto& member) {
-        return member.first == member_name;
-      });
+  const auto iterator = std::find_if(object.begin(), object.end(),
+                                     [member_name](const auto &member) {
+                                       return member.first == member_name;
+                                     });
   EXPECT_NE(iterator, object.end());
   if (iterator != object.end()) {
     iterator->second = std::move(replacement);
@@ -190,8 +189,8 @@ void expect_qualification_error(std::string document,
 TEST(AssistantSettingsCodec,
      AbsentAndExactEmptyObjectsAreDisabledButPreserveSourcePresence) {
   const auto absent = decode("{\"api_version\":\"manyforge.deployment.v1\"}");
-  const auto empty = decode(
-      "{\"api_version\":\"manyforge.deployment.v1\",\"assistant\":{}}");
+  const auto empty =
+      decode("{\"api_version\":\"manyforge.deployment.v1\",\"assistant\":{}}");
   EXPECT_FALSE(absent.source_was_present());
   EXPECT_TRUE(empty.source_was_present());
   EXPECT_FALSE(absent.enabled());
@@ -210,18 +209,19 @@ TEST(AssistantSettingsCodec,
      QueryModeResolvesAliasesAndProducesDeterministicRetainedProjection) {
   const auto ext = resources();
   const auto left = qualify_assistant_settings(
-      decode(assistant_document(mode(
-          "query", "\"status_read\",\"scene_inspect\",\"alarms_read\""))),
+      decode(assistant_document(
+          mode("query", "\"status_read\",\"scene_inspect\",\"alarms_read\""))),
       ext);
   const auto right = qualify_assistant_settings(
-      decode(assistant_document(mode(
-          "query", "\"alarms_read\",\"scene_inspect\",\"status_read\""),
-                                "nemoclaw")),
+      decode(assistant_document(
+          mode("query", "\"alarms_read\",\"scene_inspect\",\"status_read\""),
+          "nemoclaw")),
       ext);
 
   ASSERT_TRUE(left.enabled());
   ASSERT_EQ(left.value().prompt_templates.size(), 1U);
-  EXPECT_TRUE(is_sha256_digest(left.value().prompt_templates.front().content_digest.value()));
+  EXPECT_TRUE(is_sha256_digest(
+      left.value().prompt_templates.front().content_digest.value()));
   EXPECT_TRUE(left.value().audit_policy.redact_argument_values);
   EXPECT_FALSE(left.value().audit_policy.store_full_prompts);
   ASSERT_EQ(left.value().modes.size(), 1U);
@@ -234,8 +234,8 @@ TEST(AssistantSettingsCodec,
   EXPECT_NE(left.projection_digest(), right.projection_digest())
       << "provider kind is retained semantic configuration";
 
-  const auto verified = verify_retained_assistant_projection(
-      left.normalized_projection(), ext);
+  const auto verified =
+      verify_retained_assistant_projection(left.normalized_projection(), ext);
   EXPECT_EQ(verified.value(), left.value());
   EXPECT_EQ(verified.projection_digest(), left.projection_digest());
 }
@@ -250,13 +250,15 @@ TEST(AssistantSettingsCodec,
   ASSERT_TRUE(qualified.enabled());
   EXPECT_TRUE(qualified.value().modes.empty());
   ASSERT_EQ(qualified.value().prompt_templates.size(), 1U);
-  EXPECT_EQ(qualified.value().prompt_templates.front()
+  EXPECT_EQ(qualified.value()
+                .prompt_templates.front()
                 .response_contract.response_mode,
             core::AssistantPromptResponseMode::kJsonObject);
-  EXPECT_FALSE(qualified.value().prompt_templates.front()
+  EXPECT_FALSE(qualified.value()
+                   .prompt_templates.front()
                    .response_contract.tool_name.has_value());
   ASSERT_EQ(qualified.value().model_endpoint_aliases.size(), 1U);
-  const auto& request_contract =
+  const auto &request_contract =
       qualified.value().model_endpoint_aliases.front().request_contract;
   EXPECT_DOUBLE_EQ(request_contract.default_timeout_s, 30.0);
   EXPECT_EQ(request_contract.max_output_tokens, 512U);
@@ -282,11 +284,11 @@ TEST(AssistantSettingsCodec,
   const auto ext = resources();
   const std::string left_modes =
       mode("query", "\"status_read\",\"scene_inspect\"") + "," +
-      mode("composer-assistant", "\"program_read\",\"catalog_read\"",
-           "", "", "null", "null", "required");
+      mode("composer-assistant", "\"program_read\",\"catalog_read\"", "", "",
+           "null", "null", "required");
   const std::string right_modes =
-      mode("composer-assistant", "\"catalog_read\",\"program_read\"",
-           "", "", "null", "null", "required") +
+      mode("composer-assistant", "\"catalog_read\",\"program_read\"", "", "",
+           "null", "null", "required") +
       "," + mode("query", "\"scene_inspect\",\"status_read\"");
   const auto left =
       qualify_assistant_settings(decode(assistant_document(left_modes)), ext);
@@ -299,17 +301,23 @@ TEST(AssistantSettingsCodec,
 
 TEST(AssistantSettingsCodec,
      BuildRegistryRetainsReadsAndStrictV1AuthoringInstruments) {
-  const auto& registry = build_qualified_assistant_instrument_registry();
+  const auto &registry = build_qualified_assistant_instrument_registry();
   EXPECT_EQ(registry.value().api_version,
             kAssistantInstrumentRegistryApiVersion);
   EXPECT_TRUE(is_sha256_digest(registry.value().registry_digest.value()));
-  EXPECT_TRUE(registry.value().skills.empty());
+  std::vector<std::string> skill_ids;
+  for (const auto &skill : registry.value().skills) {
+    skill_ids.push_back(skill.skill_id);
+  }
+  EXPECT_EQ(skill_ids,
+            (std::vector<std::string>{"move_to_named_config", "pick_object",
+                                      "place_object"}));
   std::vector<std::string> ids;
   std::vector<std::string> read_only;
   std::vector<std::string> proposals;
   std::vector<std::string> draft_mutations;
   std::size_t total_canonical_schema_bytes = 0U;
-  for (const auto& tool : registry.value().tools) {
+  for (const auto &tool : registry.value().tools) {
     ids.push_back(tool.tool_id);
     total_canonical_schema_bytes += tool.canonical_input_schema.size();
     EXPECT_EQ(tool.input_schema_digest.value(),
@@ -319,17 +327,17 @@ TEST(AssistantSettingsCodec,
             parse_strict_json_model_yaml(tool.canonical_input_schema).root()),
         tool.canonical_input_schema);
     switch (tool.effect) {
-      case core::AssistantToolEffect::kReadOnly:
-        read_only.push_back(tool.tool_id);
-        break;
-      case core::AssistantToolEffect::kProposal:
-        proposals.push_back(tool.tool_id);
-        break;
-      case core::AssistantToolEffect::kComposerDraftMutating:
-        draft_mutations.push_back(tool.tool_id);
-        break;
-      case core::AssistantToolEffect::kRuntimeMutating:
-        FAIL() << "N6-b2 must not restore runtime-mutating assistant tools";
+    case core::AssistantToolEffect::kReadOnly:
+      read_only.push_back(tool.tool_id);
+      break;
+    case core::AssistantToolEffect::kProposal:
+      proposals.push_back(tool.tool_id);
+      break;
+    case core::AssistantToolEffect::kComposerDraftMutating:
+      draft_mutations.push_back(tool.tool_id);
+      break;
+    case core::AssistantToolEffect::kRuntimeMutating:
+      FAIL() << "N6-b2 must not restore runtime-mutating assistant tools";
     }
   }
   EXPECT_LT(total_canonical_schema_bytes, 512U * 1024U);
@@ -374,7 +382,7 @@ TEST(AssistantSettingsCodec,
   EXPECT_EQ(draft_mutations.size(), 18U);
 
   std::vector<std::string> node_ids;
-  for (const auto& node : registry.value().nodes) {
+  for (const auto &node : registry.value().nodes) {
     node_ids.push_back(node.node_id);
   }
   EXPECT_EQ(
@@ -390,7 +398,7 @@ TEST(AssistantSettingsCodec,
 
   const auto catalog = std::find_if(
       registry.value().tools.begin(), registry.value().tools.end(),
-      [](const auto& tool) { return tool.tool_id == "catalog_read"; });
+      [](const auto &tool) { return tool.tool_id == "catalog_read"; });
   ASSERT_NE(catalog, registry.value().tools.end());
   EXPECT_NE(catalog->canonical_input_schema.find("\"entry_ids\""),
             std::string::npos);
@@ -399,31 +407,34 @@ TEST(AssistantSettingsCodec,
 }
 
 TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
-  expect_decode_error(assistant_document(mode(), "direct", ",\"unexpected\":true"),
-                      "unknown field 'unexpected'");
-  expect_decode_error(assistant_document(mode("query", "\"status_read\",\"status_read\"")),
-                      "duplicate instrument ID");
+  expect_decode_error(
+      assistant_document(mode(), "direct", ",\"unexpected\":true"),
+      "unknown field 'unexpected'");
+  expect_decode_error(
+      assistant_document(mode("query", "\"status_read\",\"status_read\"")),
+      "duplicate instrument ID");
   expect_decode_error(assistant_document(mode("query", "\"status.read\"")),
                       "canonical lowercase underscore tool ID");
   expect_decode_error(model_query_document("", ""),
                       "must configure an interactive mode or a bounded "
                       "model-query endpoint and prompt");
-  expect_decode_error(model_query_document("", model_alias()),
-                      "require at least one prompt template and model endpoint");
-  expect_decode_error(model_query_document(
-                          "\"choose_object_v1\":{"
-                          "\"version\":\"1\","
-                          "\"template_text\":\"Choose\","
-                          "\"variable_ids\":[],"
-                          "\"response_contract\":{"
-                          "\"response_mode\":\"json_object\"}}",
-                          model_alias(),
-                          "\"direct_local\":{"
-                          "\"provider_kind\":\"direct\","
-                          "\"bridge_external_resource_alias\":"
-                          "\"assistant_bridge\"}"),
-                      "provider aliases require at least one interactive "
-                      "assistant mode");
+  expect_decode_error(
+      model_query_document("", model_alias()),
+      "require at least one prompt template and model endpoint");
+  expect_decode_error(
+      model_query_document("\"choose_object_v1\":{"
+                           "\"version\":\"1\","
+                           "\"template_text\":\"Choose\","
+                           "\"variable_ids\":[],"
+                           "\"response_contract\":{"
+                           "\"response_mode\":\"json_object\"}}",
+                           model_alias(),
+                           "\"direct_local\":{"
+                           "\"provider_kind\":\"direct\","
+                           "\"bridge_external_resource_alias\":"
+                           "\"assistant_bridge\"}"),
+      "provider aliases require at least one interactive "
+      "assistant mode");
   expect_decode_error(
       model_query_document(
           "\"choose_object_v1\":{"
@@ -443,21 +454,22 @@ TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
           "\"variable_ids\":[],"
           "\"response_contract\":{\"response_mode\":\"tool_call\"}}"),
       "missing required field 'tool_name'");
-  expect_decode_error(assistant_document(mode(), "direct", "",
-                                         "\"choose_object_v1\":{"
-                                         "\"version\":\"1\","
-                                         "\"template_text\":\"Choose\","
-                                         "\"variable_ids\":[\"object_id\",\"object_id\"],"
-                                         "\"response_contract\":{"
-                                         "\"response_mode\":\"json_object\"}}"),
-                      "duplicate instrument ID");
+  expect_decode_error(
+      assistant_document(mode(), "direct", "",
+                         "\"choose_object_v1\":{"
+                         "\"version\":\"1\","
+                         "\"template_text\":\"Choose\","
+                         "\"variable_ids\":[\"object_id\",\"object_id\"],"
+                         "\"response_contract\":{"
+                         "\"response_mode\":\"json_object\"}}"),
+      "duplicate instrument ID");
 }
 
 TEST(AssistantSettingsCodec, RejectsUnresolvedOrWrongKindExternalAliases) {
   const auto ext = resources();
-  expect_qualification_error(
-      assistant_document(), std::span<const core::ExternalResourceDTO>{},
-      "external_resource_alias does not resolve");
+  expect_qualification_error(assistant_document(),
+                             std::span<const core::ExternalResourceDTO>{},
+                             "external_resource_alias does not resolve");
 
   auto wrong_model = ext;
   wrong_model[1] = external_resource(
@@ -507,18 +519,18 @@ TEST(AssistantSettingsCodec, RetainedProjectionRejectsAnyTampering) {
   const auto qualified =
       qualify_assistant_settings(decode(assistant_document()), ext);
 
-  const CanonicalValue bad_digest = replace_member(
-      qualified.normalized_projection(), "projection_digest",
-      CanonicalValue(std::string(kZeroDigest)));
+  const CanonicalValue bad_digest =
+      replace_member(qualified.normalized_projection(), "projection_digest",
+                     CanonicalValue(std::string(kZeroDigest)));
   EXPECT_THROW((void)verify_retained_assistant_projection(bad_digest, ext),
                AssistantSettingsCodecError);
 
-  const CanonicalValue bad_registry = replace_member(
-      qualified.normalized_projection(), "instruments",
-      CanonicalValue(CanonicalValue::Object{}));
+  const CanonicalValue bad_registry =
+      replace_member(qualified.normalized_projection(), "instruments",
+                     CanonicalValue(CanonicalValue::Object{}));
   EXPECT_THROW((void)verify_retained_assistant_projection(bad_registry, ext),
                AssistantSettingsCodecError);
 }
 
-}  // namespace
-}  // namespace manyforge::deployment
+} // namespace
+} // namespace manyforge::deployment

@@ -466,22 +466,22 @@ if(BUILD_TESTING)
     # ports so the Python/headless/Behavior/Composer process path can be
     # qualified without introducing a second production scene or runtime
     # owner. The installed host above never compiles this fixture.
-    add_executable(manyforge_native_execution_host_pick_place_fixture
+    add_executable(manyforge_native_execution_host_pick_place_planning_fixture
       src/product_backed_runtime_participant_resolver.cpp
       src/native_execution_host_main.cpp
       test/focused_pick_place_planning_fixture.cpp)
     target_include_directories(
-      manyforge_native_execution_host_pick_place_fixture PRIVATE
+      manyforge_native_execution_host_pick_place_planning_fixture PRIVATE
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src"
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_core/test_support/include"
       "${CMAKE_CURRENT_SOURCE_DIR}/test")
     target_compile_definitions(
-      manyforge_native_execution_host_pick_place_fixture PRIVATE
+      manyforge_native_execution_host_pick_place_planning_fixture PRIVATE
       COAL_DISABLE_HPP_FCL_WARNINGS
       MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE=1
       MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE=1)
     target_link_libraries(
-      manyforge_native_execution_host_pick_place_fixture PRIVATE
+      manyforge_native_execution_host_pick_place_planning_fixture PRIVATE
       manyforge_roboplan_managed_kernel_apply_fence
       manyforge_roboplan_cell_admission_command_codec
       manyforge_roboplan_native_cclc_runtime
@@ -1014,7 +1014,7 @@ if(BUILD_TESTING)
     target_compile_definitions(
       test_retained_native_runtime_unit_adapter PRIVATE
       MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
-      MANYFORGE_NATIVE_PICK_PLACE_EXECUTION_TARGET="$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>"
+      MANYFORGE_NATIVE_PICK_PLACE_PLANNING_TARGET="$<TARGET_FILE:manyforge_native_execution_host_pick_place_planning_fixture>"
       MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_native_execution_host>")
     target_link_libraries(test_retained_native_runtime_unit_adapter PRIVATE
       manyforge_component_manager
@@ -1163,7 +1163,7 @@ if(BUILD_TESTING)
       native_addressed_execution_process
       PROPERTIES
         ENVIRONMENT
-          "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host_admission_fixture>;MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host>;MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST=$<TARGET_FILE:manyforge_native_execution_host_pick_place_fixture>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_ROBOPLAN_FAKE_WORKER=$<TARGET_FILE:fake_process_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
+          "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host_admission_fixture>;MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host>;MANYFORGE_NATIVE_PICK_PLACE_PLANNING_FIXTURE_HOST=$<TARGET_FILE:manyforge_native_execution_host_pick_place_planning_fixture>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_ROBOPLAN_FAKE_WORKER=$<TARGET_FILE:fake_process_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
         # This process test intentionally executes many sequential, model-
         # limited trajectories. Keep its harness deadline independent from
         # the much shorter per-operation execution deadlines it verifies.

@@ -10951,8 +10951,8 @@ TEST_F(ExecutionKernelTest, Events_HappyPath_PlanAndExecute) {
   // Spec 230 §6.1: state_transition -> cache_miss -> plan_started ->
   //   plan_completed -> state_transition -> validation_started ->
   //   validation_passed -> state_transition -> execute_started ->
-  //   execute_completed -> state_transition
-  ASSERT_GE(events.size(), 11u);
+  //   execute_completed -> motion_execution_outcome_recorded -> state_transition
+  ASSERT_GE(events.size(), 12u);
   EXPECT_EQ(events[0], KernelEventType::kStateTransition);
   EXPECT_EQ(events[1], KernelEventType::kCacheMiss);
   EXPECT_EQ(events[2], KernelEventType::kPlanStarted);
@@ -10963,7 +10963,8 @@ TEST_F(ExecutionKernelTest, Events_HappyPath_PlanAndExecute) {
   EXPECT_EQ(events[7], KernelEventType::kStateTransition);
   EXPECT_EQ(events[8], KernelEventType::kExecuteStarted);
   EXPECT_EQ(events[9], KernelEventType::kExecuteCompleted);
-  EXPECT_EQ(events[10], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[10], KernelEventType::kMotionExecutionOutcomeRecorded);
+  EXPECT_EQ(events[11], KernelEventType::kStateTransition);
 }
 
 TEST_F(ExecutionKernelTest, AcknowledgeCompleted_CannotOvertakeTerminalPublication) {
@@ -11000,7 +11001,8 @@ TEST_F(ExecutionKernelTest, AcknowledgeCompleted_CannotOvertakeTerminalPublicati
 
   std::optional<AcknowledgeCompletedResultDTO> early_ack;
   if (callback_entered) {
-    EXPECT_EQ(kernel.get_status().state, ExecutionState::kCompleted);
+    EXPECT_EQ(kernel.get_status().state, ExecutionState::kExecuting);
+    EXPECT_EQ(kernel.get_execution_snapshot().state, ExecutionState::kExecuting);
     early_ack = kernel.acknowledge_completed(execution.value());
   }
   {
@@ -11100,7 +11102,7 @@ TEST_F(ExecutionKernelTest, Events_CacheHit) {
   // Spec 230 §6.1 plus stop-path latency hardening: execute admission first
   // enters Planning so stop/reset can interrupt slow preparation even when the
   // request later resolves to a cache hit.
-  ASSERT_GE(events.size(), 9u);
+  ASSERT_GE(events.size(), 10u);
   EXPECT_EQ(events[0], KernelEventType::kStateTransition);
   EXPECT_EQ(events[1], KernelEventType::kStateTransition);
   EXPECT_EQ(events[2], KernelEventType::kCacheHit);
@@ -11109,7 +11111,8 @@ TEST_F(ExecutionKernelTest, Events_CacheHit) {
   EXPECT_EQ(events[5], KernelEventType::kStateTransition);
   EXPECT_EQ(events[6], KernelEventType::kExecuteStarted);
   EXPECT_EQ(events[7], KernelEventType::kExecuteCompleted);
-  EXPECT_EQ(events[8], KernelEventType::kStateTransition);
+  EXPECT_EQ(events[8], KernelEventType::kMotionExecutionOutcomeRecorded);
+  EXPECT_EQ(events[9], KernelEventType::kStateTransition);
 }
 
 TEST_F(ExecutionKernelTest, Events_PlanningFailure) {

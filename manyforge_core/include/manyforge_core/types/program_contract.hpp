@@ -46,6 +46,9 @@ using ProgramNodeInstanceId = StrongString<ProgramNodeInstanceIdTag>;
 struct ProgramNodeTargetEffectDTO final {
   TargetRoleId target_role_id;
   CapabilityId capability_id;
+  /// Qualified catalog fact: this requirement may issue a physical command
+  /// against the bound target, rather than only read/plan/validate it.
+  bool effectful{};
 
   friend bool operator==(const ProgramNodeTargetEffectDTO&,
                          const ProgramNodeTargetEffectDTO&) = default;
@@ -63,6 +66,9 @@ struct ProgramExecutionSelectionDTO final {
   std::string group_id;
   // Sorted indices into ProgramExecutionTableDTO::nodes; names are stored once.
   std::vector<std::uint32_t> node_indices;
+  /// True only when this exact authored group is an optional coordinated
+  /// execution set. Ordinary overlapping control groups remain independent.
+  bool synchronized{};
 
   friend bool operator==(const ProgramExecutionSelectionDTO&,
                          const ProgramExecutionSelectionDTO&) = default;

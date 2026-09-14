@@ -104,7 +104,7 @@ def _mutate(session: ComposerDraftSession, tool_id: str, arguments: dict):
 
 def _pick_macro_arguments() -> dict:
     return {
-        "macro_id": "pick_plan_subtree",
+        "macro_id": "pick_subtree",
         "scene_resource_id": "graspable",
         "target_role": "arm",
         "tool_target_role": "gripper",
@@ -263,7 +263,7 @@ def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> N
         node for node in forest if node["instance_id"] == "authored_pick"
     )
     assert session.revision == before_revision + 1
-    assert result.details["macro_id"] == "pick_plan_subtree"
+    assert result.details["macro_id"] == "pick_subtree"
     assert result.details["inserted_instance_ids"] == [
         "authored_pick",
         "authored_pick.plan",
@@ -276,10 +276,10 @@ def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> N
     assert [child["node_id"] for child in inserted["children"]] == [
         "planning.plan_pick_sequence",
         "motion.move_to_pose",
-        "motion.move_to_pose",
+        "motion.follow_cartesian_path",
         "gripper.command_position",
         "scene.attach_carried_object",
-        "motion.move_to_pose",
+        "motion.follow_cartesian_path",
     ]
     assert all(child["children"] == [] for child in inserted["children"])
     assert inserted["children"][0]["parameters"]["target_role"] == "arm"
@@ -290,6 +290,15 @@ def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> N
         if row["key"] == "planning.pick_plan"
     )
     assert declaration["type"] == "pick_planning_result"
+    assert declaration["fields"] == [
+        {"field": "approach_pose", "type": "stored_pose"},
+        {"field": "descend_path", "type": "cartesian_path"},
+        {"field": "pick_pose", "type": "stored_pose"},
+        {"field": "retreat_path", "type": "cartesian_path"},
+        {"field": "retreat_pose", "type": "stored_pose"},
+        {"field": "selected_object_id", "type": "scene_resource"},
+        {"field": "tool_position", "type": "coordinate_position"},
+    ]
 
 
 def test_pick_authoring_macro_failure_leaves_draft_unchanged() -> None:
@@ -302,6 +311,53 @@ def test_pick_authoring_macro_failure_leaves_draft_unchanged() -> None:
         _mutate(session, "program_draft_expand_authoring_macro", arguments)
 
     assert session.retained_state() == before
+
+
+def test_place_authoring_macro_expands_the_matching_ordinary_subtree() -> None:
+    session = ComposerDraftSession(_pick_program())
+    arguments = _pick_macro_arguments()
+    arguments.update(
+        macro_id="place_subtree",
+        blackboard_key="planning.place_plan",
+        instance_prefix="authored_place",
+        place_pose={
+            "frame_ref": {"kind": "cell_frame"},
+            "position_m": [0.3, -0.2, 0.1],
+            "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+        },
+        approach_offset_m=[0.0, 0.0, 0.08],
+    )
+    arguments.pop("contact_policy_id")
+    arguments.pop("touch_body_roles")
+
+    result = _mutate(
+        session,
+        "program_draft_expand_authoring_macro",
+        arguments,
+    )
+
+    inserted = next(
+        node
+        for node in session.snapshot()["authoring"]["forest"]
+        if node["instance_id"] == "authored_place"
+    )
+    assert result.details["macro_id"] == "place_subtree"
+    assert [child["node_id"] for child in inserted["children"]] == [
+        "planning.plan_place_sequence",
+        "motion.move_to_pose",
+        "motion.follow_cartesian_path",
+        "gripper.command_position",
+        "scene.detach_carried_object",
+        "motion.follow_cartesian_path",
+    ]
+    assert inserted["children"][0]["parameters"]["place_pose"] == arguments[
+        "place_pose"
+    ]
+    assert inserted["children"][4]["value_sources"]["scene_resource_id"] == {
+        "kind": "blackboard_field",
+        "reference": "planning.place_plan",
+        "field": "selected_object_id",
+    }
 
 
 @pytest.mark.parametrize(

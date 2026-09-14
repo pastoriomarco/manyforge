@@ -11,7 +11,7 @@ program_id: revision_tool_test
 program_revision: sha256:0000000000000000000000000000000000000000000000000000000000000000
 program_profile: composable-cell-v1
 name: Revision tool test
-catalog: {api_version: manyforge.node_catalog.v2, content_version: 2.1.0}
+catalog: {api_version: manyforge.node_catalog.v2, content_version: 2.3.0}
 component_roles: {robot: {}}
 target_roles: {}
 contact_policies:

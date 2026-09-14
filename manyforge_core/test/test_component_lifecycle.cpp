@@ -1045,7 +1045,8 @@ TEST(CCLCJournalRecovery, RequiresOneExactPreparedEffectAtTheTransactionWatermar
       {},
       {},
       {},
-      {}};
+      {},
+      RequestOwnerEpoch("owner-epoch-1")};
   ASSERT_TRUE(recovery.locally_valid());
 
   auto completed = prepared;
@@ -1076,7 +1077,8 @@ TEST(CCLCJournalRecovery, RejectsProviderMismatchAndBoundedCollectionOverflow) {
       {},
       {},
       {},
-      {}};
+      {},
+      RequestOwnerEpoch("owner-epoch-1")};
   ASSERT_TRUE(recovery.locally_valid());
 
   prepared.lifecycle_primitive_intent->provider_instance_id =

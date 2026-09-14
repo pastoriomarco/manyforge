@@ -1052,10 +1052,12 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::mutex lifecycle_mutex_;
   std::atomic<std::uint64_t> control_command_epoch_{0};
   std::atomic<uint64_t> next_execution_id_{1};
-  // Exact normal-completion event batch currently being published. A matching
-  // acknowledgement is transiently rejected so it cannot overtake
-  // execute_completed -> state_transition(Completed) in the native sequence.
+  // Exact normal-completion event batch currently being published. Matching
+  // observer reads retain the prior status and acknowledgement is transiently
+  // rejected until terminal evidence precedes externally visible Completed.
   std::atomic<std::uint64_t> completion_publication_execution_id_{0};
+  mutable std::mutex completion_publication_status_mutex_;
+  ExecutionStatus completion_publication_previous_status_;
   std::atomic<double> runtime_velocity_scale_{1.0};
   mutable std::mutex runtime_velocity_scale_mutex_;
   int runtime_velocity_scale_freeze_depth_ = 0;

@@ -285,11 +285,4 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
     def plan_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._pick_place("plan_place", _ProgramPlace, body)
 
-    def start_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self._pick_place("start_pick", _ProgramPick, body)
-
-    def start_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self._pick_place("start_place", _ProgramPlace, body)
-
-
 __all__ = ["ProgramRunnerExecutionTransport"]

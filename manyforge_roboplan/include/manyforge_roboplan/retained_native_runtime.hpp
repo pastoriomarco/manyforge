@@ -324,8 +324,6 @@ struct RetainedNativeRuntime final
   /// Publish the exact route facts already sealed into a direct native
   /// runtime. Maintained products without a lifecycle owner call this once
   /// after installation; lifecycle-managed products publish through CCLC.
-  [[nodiscard]] core::Result<void> PublishCurrentRetainedRouteConfigurations();
-
 private:
   // Caller holds route_publication_mutex_. No owner read or write escapes it.
   [[nodiscard]] bool

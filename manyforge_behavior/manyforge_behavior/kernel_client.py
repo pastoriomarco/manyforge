@@ -84,6 +84,20 @@ class KernelClientResponseError(RuntimeError):
     """Raised when a transport returns a successful but malformed projection."""
 
 
+class KernelOperationAdmissionRejectedError(RuntimeError):
+    """The execution owner explicitly rejected an operation before acceptance."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details or {})
+
+
 class KernelOperationObservationUnavailableError(RuntimeError):
     """An exact operation read could not reach the native owner temporarily."""
 
@@ -216,7 +230,39 @@ class KernelClient:
         return self._successful(method(), label=method_name.replace("_", " "))
 
     def execute(self, intent: Mapping[str, Any]) -> dict[str, Any]:
-        return self._successful(self._transport.submit(intent), label="submission")
+        try:
+            response = self._transport.submit(intent)
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            # Transport loss and malformed or mismatched replies cannot prove
+            # whether the owner accepted the request. All other typed owner
+            # errors are explicit pre-acceptance rejections.
+            if isinstance(code, str) and code not in {
+                "execution_owner_unavailable",
+                "execution_command_transport_failure",
+                "execution_command_response_invalid",
+                "execution_command_response_identity_mismatch",
+            }:
+                details = getattr(exc, "details", None)
+                raise KernelOperationAdmissionRejectedError(
+                    code,
+                    str(exc) or "execution owner rejected the operation",
+                    details if isinstance(details, Mapping) else None,
+                ) from exc
+            raise
+        if isinstance(response, dict) and response.get("ok") is False:
+            error = response.get("error")
+            if (
+                isinstance(error, Mapping)
+                and isinstance(error.get("code"), str)
+                and error["code"]
+                and isinstance(error.get("message"), str)
+                and isinstance(error.get("details", {}), Mapping)
+            ):
+                raise KernelOperationAdmissionRejectedError(
+                    error["code"], error["message"], error.get("details")
+                )
+        return self._successful(response, label="submission")
 
     def plan_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
         method = getattr(self._transport, "plan_pick", None)
@@ -229,28 +275,6 @@ class KernelClient:
         if not callable(method):
             raise TypeError("execution transport has no callable plan_place")
         return self._successful(method(intent), label="place planning")
-
-    def start_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
-        method = getattr(self._transport, "start_pick", None)
-        if not callable(method):
-            raise TypeError("execution transport has no callable start_pick")
-        return self._successful(method(intent), label="pick sequence start")
-
-    def start_place(self, intent: Mapping[str, Any]) -> dict[str, Any]:
-        method = getattr(self._transport, "start_place", None)
-        if not callable(method):
-            raise TypeError("execution transport has no callable start_place")
-        return self._successful(method(intent), label="place sequence start")
-
-    def pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
-        method = getattr(self._transport, "read_pick_place_sequence", None)
-        if not callable(method):
-            raise TypeError(
-                "execution transport has no callable read_pick_place_sequence"
-            )
-        return self._successful(
-            method(sequence_id), label="pick/place sequence observation"
-        )
 
     def operation(self, operation_id: str) -> dict[str, Any]:
         try:
@@ -507,6 +531,7 @@ __all__ = [
     "ExecutionState",
     "ExecutionTransport",
     "KernelClient",
+    "KernelOperationAdmissionRejectedError",
     "KernelOperationObservationUnavailableError",
     "KernelOperationSettlementPendingError",
     "KernelClientResponseError",

@@ -843,9 +843,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         candidate_package_root_path(
             candidate_package_root.empty()
                 ? std::filesystem::path{}
-                : NormalizedPlainDirectory(
-                      std::move(candidate_package_root),
-                      "candidate retained-package root")),
+                : NormalizedPlainDirectory(std::move(candidate_package_root),
+                                           "candidate retained-package root")),
         manager_state_root_path(NormalizedPlainDirectory(
             std::move(manager_state_root), "Manager state root")),
         manager_run_root_path(NormalizedPlainDirectory(
@@ -1667,8 +1666,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     if (pid == 0) {
       EnterChild(parent, channels[1].get(), liveness_channels[1].get(),
                  exec_pipe[1].get(), target.get(),
-                 PackageRootFd(bundle.retained_bundle_id()),
-                 argv.data());
+                 PackageRootFd(bundle.retained_bundle_id()), argv.data());
     }
 
     channels[1].Reset();
@@ -1728,8 +1726,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     const auto contains_bundle = [&](const std::filesystem::path &root,
                                      std::string_view label) {
-      const auto path = root / "retained-bundles" / "sha256" /
-                        (digest.substr(7U) + ".json");
+      const auto path =
+          root / "retained-bundles" / "sha256" / (digest.substr(7U) + ".json");
       std::error_code error;
       const auto status = std::filesystem::symlink_status(path, error);
       if (error == std::errc::no_such_file_or_directory ||
@@ -1743,9 +1741,12 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       return true;
     };
 
-    // Returning to an installed revision still needs the authored package's
-    // retained predecessor closure during fenced replacement recovery.
-    // The child independently verifies the exact bundle in the selected root.
+    // An installed immutable bundle owns its complete package closure.  An
+    // authored cache is considered only for identities absent from the
+    // installation; a partial duplicate must never shadow installed bytes.
+    if (contains_bundle(package_root_path, "installed")) {
+      return package_root_fd.get();
+    }
     if (!candidate_package_root_path.empty() &&
         contains_bundle(candidate_package_root_path, "authored")) {
       return candidate_package_root_fd.get();
@@ -2355,8 +2356,8 @@ RetainedNativeRuntimeUnitAdapter::GetCellAdmissionRecoveryReceipt(
 
 manyforge::core::Result<void>
 RetainedNativeRuntimeUnitAdapter::ValidateProgramResetSceneAuthorization(
-    const manyforge::core::ProgramResetSceneAuthorizationDTO
-        &authorization) const {
+    const manyforge::core::ProgramResetSceneAuthorizationDTO &authorization)
+    const {
   const auto result = impl_->KernelCellAdmissionCall<std::monostate>(
       {"cell_admission_validate_program_reset_scene", authorization});
   return result.ok() ? manyforge::core::Result<void>::Ok()

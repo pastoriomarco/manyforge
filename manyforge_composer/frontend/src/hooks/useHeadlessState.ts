@@ -211,8 +211,6 @@ export type ExecutionControlCommandKind =
   | 'operation_resume'
   | 'operation_reset'
   | 'operation_acknowledge_completed'
-  | 'pick_sequence_start'
-  | 'place_sequence_start'
   | 'cell_full_stop'
   | 'execution_recovery'
   | 'stop_recovery'
@@ -225,8 +223,6 @@ const EXECUTION_OWNER_FENCED_COMMANDS = new Set<ExecutionControlCommandKind>([
   'operation_resume',
   'operation_reset',
   'operation_acknowledge_completed',
-  'pick_sequence_start',
-  'place_sequence_start',
   'cell_full_stop',
   'stop_recovery',
   'runtime_scale',

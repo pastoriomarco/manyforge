@@ -629,7 +629,16 @@ void validate_override_value(
     for (const auto &value : values) {
       (void)require_string(value, path);
     }
-  } else if (type == "model_response" || type == "pick_planning_result" ||
+  } else if (type == "cartesian_path") {
+    const auto &values = require_array(override_value, path);
+    if (values.size() < 2U) {
+      fail(std::string(path) + " does not match cartesian_path");
+    }
+    for (const auto &value : values) {
+      (void)require_object(value, path);
+    }
+  } else if (type == "coordinate_position" || type == "model_response" ||
+             type == "pick_planning_result" ||
              type == "scene_selection_context" ||
              type == "scene_selection_result" || type == "stored_pose") {
     (void)require_object(override_value, path);

@@ -25,6 +25,7 @@ from manyforge_behavior.nodes.v2_owner import OwnerInvocationAdapter
 from manyforge_behavior.orchestration_ports import (
     CompositeProgramRunContextPort,
     NodeAttemptIdentity,
+    OwnerInvocationHeldError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
     OwnerTaskSnapshot,
@@ -175,6 +176,25 @@ class _Transport:
                 "stop_generation": self.stop_generations[stop_id],
             },
         }
+
+
+class _LostAcceptanceReplyTransport(_Transport):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submit_attempts: list[Mapping[str, Any]] = []
+        self._retained_request: Mapping[str, Any] | None = None
+        self._retained_response: dict[str, Any] | None = None
+
+    def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        self.submit_attempts.append(deepcopy(body))
+        if self._retained_response is not None:
+            assert body == self._retained_request
+            response = deepcopy(self._retained_response)
+            response["accepted"]["replay_status"] = "replayed_exact"
+            return response
+        self._retained_request = deepcopy(body)
+        self._retained_response = super().submit(body)
+        raise TimeoutError("acceptance reply lost")
 
 
 class _ControlTransport(_Transport):
@@ -692,6 +712,32 @@ def _context() -> ProgramRunPortContext:
     )
 
 
+def _synchronized_context() -> ProgramRunPortContext:
+    return replace(
+        _context(),
+        program={
+            "program_id": "lite6_program",
+            "program_revision": _DIGEST_A,
+            "synchronized_execution_groups": ["cell_pair"],
+            "tree": {
+                "node_id": "parallel",
+                "instance_id": "paired_motion",
+                "parameters": {"success_policy": "all"},
+                "children": [
+                    {
+                        "node_id": "motion.move_to_pose",
+                        "instance_id": instance,
+                        "execution_groups": ["cell_pair"],
+                        "parameters": {},
+                        "children": [],
+                    }
+                    for instance in ("arm_a", "arm_b")
+                ],
+            },
+        },
+    )
+
+
 def _identity(instance: str = "move-relative") -> NodeAttemptIdentity:
     return NodeAttemptIdentity(
         program_run_id="program-run.1",
@@ -909,6 +955,283 @@ def test_relative_pose_submission_uses_capture_and_preserves_portable_roles() ->
     assert "compiled_frame_name" not in repr(request)
 
 
+def test_synchronized_sibling_attempts_submit_and_acknowledge_one_operation() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_synchronized_context())
+    first_identity = _identity("arm_b")
+    second_identity = _identity("arm_a")
+
+    first = port.operations.start(
+        "motion.move_to_pose", first_identity, _motion_inputs()
+    )
+    assert first.state is OwnerTaskState.ACTIVE
+    assert transport.submissions == []
+    second = port.operations.start(
+        "motion.move_to_pose", second_identity, _motion_inputs()
+    )
+
+    assert len(transport.submissions) == 1
+    request = transport.submissions[0]
+    assert request["coordination_policy"] == "coordinated_all"
+    assert [
+        participant["execution_scope"]["node_instance_id"]
+        for participant in request["participants"]
+    ] == ["arm_a", "arm_b"]
+    operation_id = second.metadata["operation_id"]
+    transport.operations[operation_id].update(
+        {"state": "completed", "operation_revision": 7}
+    )
+    assert port.operations.observe(first.task_id).state is OwnerTaskState.SUCCEEDED
+    assert port.operations.observe(second.task_id).state is OwnerTaskState.SUCCEEDED
+
+    port.operations.acknowledge(first.task_id, first_identity)
+    assert not [row for row in transport.controls if row[0] == "acknowledge"]
+    port.operations.acknowledge(second.task_id, second_identity)
+    assert [row[0] for row in transport.controls].count("acknowledge") == 1
+    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
+
+
+def test_synchronized_lost_acceptance_reply_remains_unsettled_until_scope_stop() -> None:
+    transport = _LostAcceptanceReplyTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_synchronized_context())
+    identities = (_identity("arm_a"), _identity("arm_b"))
+
+    first = port.operations.start(
+        "motion.move_to_pose", identities[0], _motion_inputs()
+    )
+    second = port.operations.start(
+        "motion.move_to_pose", identities[1], _motion_inputs()
+    )
+
+    assert len(transport.operations) == 1
+    assert second.state is OwnerTaskState.FAILED
+    assert second.reason_code == "coordinated_admission_outcome_unknown"
+    assert second.settlement_proven is False
+    assert second.metadata["request_id"].startswith(
+        "program-coordinated-operation:"
+    )
+    observed_first = port.operations.observe(first.task_id)
+    assert observed_first.reason_code == "coordinated_admission_outcome_unknown"
+    assert observed_first.settlement_proven is False
+    scope = port.scope.observe("program-run.1")
+    assert scope.state is ProgramRunScopeState.UNKNOWN
+    assert scope.reason_code == "coordinated_admission_outcome_unknown"
+
+    with pytest.raises(ProductionPortError, match="no settlement proof"):
+        port.operations.acknowledge(second.task_id, identities[1])
+
+    stopping = port.scope.request_stop(
+        "program-run.1", "stop.unknown-admission", "contain unknown admission"
+    )
+    assert stopping.state is ProgramRunScopeState.ACTIVE
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
+    next(iter(transport.operations.values()))["state"] = "stopped"
+
+    reset = port.scope.reset("program-run.1")
+
+    assert reset.state is ProgramRunScopeState.SETTLED
+    assert len(transport.submit_attempts) == 2
+    assert len(transport.operations) == 1
+    assert [control[0] for control in transport.controls].count("reset") == 1
+
+
+def test_independent_lost_acceptance_reply_is_reconciled_by_reset() -> None:
+    transport = _LostAcceptanceReplyTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    identity = _identity("independent")
+
+    started = port.operations.start(
+        "motion.move_to_pose", identity, _motion_inputs()
+    )
+
+    assert started.state is OwnerTaskState.FAILED
+    assert started.reason_code == "operation_admission_outcome_unknown"
+    assert started.settlement_proven is False
+    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.UNKNOWN
+    with pytest.raises(
+        ProductionPortError,
+        match="unknown operation admission requires settled Program Stop",
+    ):
+        port.scope.reset("program-run.1")
+    assert len(transport.submit_attempts) == 1
+    port.scope.request_stop(
+        "program-run.1", "stop.independent-unknown", "contain unknown admission"
+    )
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    next(iter(transport.operations.values()))["state"] = "stopped"
+
+    reset = port.scope.reset("program-run.1")
+
+    assert reset.state is ProgramRunScopeState.SETTLED
+    assert len(transport.submit_attempts) == 2
+    assert len(transport.operations) == 1
+    assert [control[0] for control in transport.controls].count("reset") == 1
+
+
+def test_reset_does_not_turn_a_pre_acceptance_lost_reply_into_motion() -> None:
+    class LostBeforeAcceptance(_Transport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.submit_attempts = 0
+
+        def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            self.submit_attempts += 1
+            if self.submit_attempts == 1:
+                raise TimeoutError("request delivery outcome unknown")
+            return {
+                "ok": False,
+                "error": {
+                    "code": "invalid_state_transition",
+                    "message": "fresh motion is closed by Program Stop",
+                    "details": {"reason": "motion_admission_closed"},
+                },
+            }
+
+    transport = LostBeforeAcceptance()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    started = port.operations.start(
+        "motion.move_to_pose", _identity("not-accepted"), _motion_inputs()
+    )
+    assert started.settlement_proven is False
+    port.scope.request_stop(
+        "program-run.1", "stop.not-accepted", "contain unknown admission"
+    )
+    transport.stop_states["scope-stop-1"] = "succeeded"
+
+    reset = port.scope.reset("program-run.1")
+
+    assert reset.state is ProgramRunScopeState.SETTLED
+    assert transport.submit_attempts == 2
+    assert transport.operations == {}
+    assert not [control for control in transport.controls if control[0] == "reset"]
+
+
+def test_synchronized_explicit_rejection_is_a_settled_local_failure() -> None:
+    class ExplicitRejection(_Transport):
+        def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "operation_admission_rejected",
+                    "message": "captured operation is invalid",
+                    "details": {"reason": "operation_contract_invalid"},
+                },
+            }
+
+    transport = ExplicitRejection()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_synchronized_context())
+    port.operations.start("motion.move_to_pose", _identity("arm_a"), _motion_inputs())
+    rejected = port.operations.start(
+        "motion.move_to_pose", _identity("arm_b"), _motion_inputs()
+    )
+
+    assert rejected.state is OwnerTaskState.FAILED
+    assert rejected.reason_code == "operation_admission_rejected"
+    assert rejected.settlement_proven is True
+    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
+
+
+def test_staged_synchronized_sibling_cancels_without_a_native_effect() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_synchronized_context())
+    identity = _identity("arm_a")
+
+    task = port.operations.start("motion.move_to_pose", identity, _motion_inputs())
+    port.operations.cancel(task.task_id, identity)
+
+    assert transport.submissions == []
+    assert transport.controls == []
+    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
+
+
+def test_synchronized_member_cancel_and_recovery_are_operation_scoped_once() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_synchronized_context())
+    identities = (_identity("arm_a"), _identity("arm_b"))
+    tasks = tuple(
+        port.operations.start("motion.move_to_pose", identity, _motion_inputs())
+        for identity in identities
+    )
+    operation_id = tasks[-1].metadata["operation_id"]
+    operation = transport.operations[operation_id]
+    operation.update(
+        {
+            "state": "executing",
+            "operation_revision": 1,
+            "active_stop_id": None,
+            "active_stop_generation": None,
+        }
+    )
+
+    port.operations.cancel(tasks[0].task_id, identities[0])
+    port.operations.cancel(tasks[1].task_id, identities[1])
+    assert [row[0] for row in transport.controls].count("stop") == 1
+
+    operation.update(
+        {
+            "state": "stopped",
+            "operation_revision": 2,
+            "active_stop_id": "stop.1",
+            "active_stop_generation": 1,
+        }
+    )
+    assessment = {
+        "recovery_class": "ordinary_operator_stop",
+        "assessment_revision": 3,
+        "control_command_epoch": "control.epoch.1",
+        "execution_id": "execution.1",
+        "latch_id": "",
+        "stop_certificate_id": "certificate.1",
+        "stop_owner_generation": 1,
+    }
+    transport.operation_recovery = lambda _operation_id: {
+        "ok": True,
+        "operation_revision": 2,
+        "participants": [
+            {"operation_participant_id": "participant.arm_a"},
+            {"operation_participant_id": "participant.arm_b"},
+        ],
+        "recovery_assessment": assessment,
+        "stop_generation": 1,
+        "stop_id": "stop.1",
+    }
+    recoveries: list[Mapping[str, Any]] = []
+
+    def recover(_operation_id: str, _revision: int, body: Mapping[str, Any]):
+        recoveries.append(deepcopy(body))
+        return {
+            "ok": True,
+            "result": {
+                "request_id": body["request_id"],
+                "action": body["action"],
+                "accepted": True,
+                "resulting_assessment": {"recovery_class": "recovered"},
+            },
+        }
+
+    transport.apply_operation_recovery = recover
+    for index, (task, identity) in enumerate(zip(tasks, identities, strict=True)):
+        result = port.operations.recover(
+            task.task_id,
+            identity,
+            action="replan_from_stopped_state",
+            request_id=f"coordinated-recovery.{index}",
+            reason="operator Resume Motion",
+        )
+        assert result["accepted"] is True
+        assert result["request_id"] == f"coordinated-recovery.{index}"
+    assert len(recoveries) == 1
+    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
+
+
 def test_completed_operation_is_acknowledged_with_exact_revision() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -1092,7 +1415,7 @@ def test_program_scope_stop_joins_inflight_admission_and_fences_fresh_work() -> 
     assert not admission.is_alive()
     assert not stopping.is_alive()
     assert len(admission_errors) == 1
-    assert "successful envelope" in str(admission_errors[0])
+    assert isinstance(admission_errors[0], OwnerInvocationHeldError)
     assert stopped[0].state is ProgramRunScopeState.ACTIVE
     assert stopped[0].active_operation_count == 1
     assert [row[0] for row in transport.controls] == ["stop_program_run"]
@@ -1696,7 +2019,6 @@ class _PickPlaceTransport(_Transport):
         self.pick_requests: list[dict[str, Any]] = []
         self.place_requests: list[dict[str, Any]] = []
         self.no_feasible = False
-        self.sequence_statuses: dict[str, dict[str, Any]] = {}
 
     def _planning_result(
         self,
@@ -1740,7 +2062,22 @@ class _PickPlaceTransport(_Transport):
                 "pick_pose": pose,
                 "retreat_pose": pose,
             },
-            "plan": {"kind": kind} if planned else None,
+            "plan": (
+                {
+                    "kind": kind,
+                    "approach_motion": {"kind": "pose_goal", "goal": pose},
+                    "descend_motion": {
+                        "kind": "cartesian_path",
+                        "waypoints": [pose, pose],
+                    },
+                    "retreat_motion": {
+                        "kind": "cartesian_path",
+                        "waypoints": [pose, pose],
+                    },
+                }
+                if planned
+                else None
+            ),
         }
 
     def plan_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
@@ -1750,58 +2087,11 @@ class _PickPlaceTransport(_Transport):
             "planning_result": self._planning_result(intent, kind="pick"),
         }
 
-    def start_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
-        self.pick_requests.append(deepcopy(dict(intent)))
-        return self._start_sequence(intent, kind="pick")
-
-    def start_place(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+    def plan_place(self, intent: Mapping[str, Any]) -> dict[str, Any]:
         self.place_requests.append(deepcopy(dict(intent)))
-        return self._start_sequence(intent, kind="place")
-
-    def _start_sequence(
-        self,
-        intent: Mapping[str, Any],
-        *,
-        kind: str,
-    ) -> dict[str, Any]:
-        planning = self._planning_result(intent, kind=kind)
-        if self.no_feasible:
-            return {
-                "ok": True,
-                "planning_result": planning,
-                "sequence_status": None,
-            }
-        operation_id = f"{intent['sequence_id']}.approach"
-        self.operations[operation_id] = {
-            "operation_id": operation_id,
-            "operation_revision": 1,
-            "program_run_id": intent["approach_operation"]["program_run_id"],
-            "state": "executing",
-            "active_stop_generation": None,
-            "participants": [],
-        }
-        status = {
-            "schema_version": "manyforge.pick_place_sequence_status.v1",
-            "sequence_id": intent["sequence_id"],
-            "kind": kind,
-            "selected_object_id": intent["selected_object_id"],
-            "phase": "approach",
-            "active_operation_id": operation_id,
-            "completed_operation_ids": [],
-            "committed_projection_revision": None,
-            "terminal_error": None,
-        }
-        self.sequence_statuses[intent["sequence_id"]] = status
         return {
             "ok": True,
-            "planning_result": planning,
-            "sequence_status": deepcopy(status),
-        }
-
-    def read_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "sequence_status": deepcopy(self.sequence_statuses[sequence_id]),
+            "planning_result": self._planning_result(intent, kind="place"),
         }
 
 
@@ -1850,7 +2140,7 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
     port.bind(_context())
     identity = _identity("plan-pick")
 
-    result = port.pick_place.start("planning.plan_pick_sequence", identity, _pick_inputs())
+    result = port.operations.start("planning.plan_pick_sequence", identity, _pick_inputs())
 
     assert result.state is OwnerTaskState.SUCCEEDED
     assert result.output == {
@@ -1863,6 +2153,26 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
             "position_m": [0.4, 0.0, 0.2],
             "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
         },
+        "descend_path": [
+            {
+                "frame_ref": {
+                    "kind": "target_frame",
+                    "target_role": "arm",
+                    "frame_role": "base",
+                },
+                "position_m": [0.4, 0.0, 0.2],
+                "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+            },
+            {
+                "frame_ref": {
+                    "kind": "target_frame",
+                    "target_role": "arm",
+                    "frame_role": "base",
+                },
+                "position_m": [0.4, 0.0, 0.2],
+                "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+            },
+        ],
         "pick_pose": {
             "frame_ref": {
                 "kind": "target_frame",
@@ -1881,7 +2191,28 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
             "position_m": [0.4, 0.0, 0.2],
             "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
         },
+        "retreat_path": [
+            {
+                "frame_ref": {
+                    "kind": "target_frame",
+                    "target_role": "arm",
+                    "frame_role": "base",
+                },
+                "position_m": [0.4, 0.0, 0.2],
+                "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+            },
+            {
+                "frame_ref": {
+                    "kind": "target_frame",
+                    "target_role": "arm",
+                    "frame_role": "base",
+                },
+                "position_m": [0.4, 0.0, 0.2],
+                "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+            },
+        ],
         "selected_object_id": "graspable",
+        "tool_position": {"kind": "linear_m", "value_m": 0.0},
     }
     intent = transport.pick_requests[0]
     assert intent["selected_runtime_object_id"] == "selected_object"
@@ -1919,7 +2250,7 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
             f"{identity.node_instance_id}/{phase}"
         )
     assert "prepared" not in repr(intent).lower()
-    port.pick_place.acknowledge(result.task_id, identity)
+    port.operations.acknowledge(result.task_id, identity)
 
 
 def test_pick_no_feasible_candidate_preserves_authored_policy_and_diagnostics() -> None:
@@ -1928,8 +2259,8 @@ def test_pick_no_feasible_candidate_preserves_authored_policy_and_diagnostics() 
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
 
-    result = port.pick_place.start(
-        "motion.pick_object",
+    result = port.operations.start(
+        "planning.plan_pick_sequence",
         _identity("pick-none"),
         _pick_inputs(policy="condition_failure"),
     )
@@ -1959,37 +2290,6 @@ def test_pick_no_feasible_candidate_preserves_authored_policy_and_diagnostics() 
             ],
         }
     ]
-
-
-def test_pick_sequence_observation_cancellation_and_intervention_are_exact() -> None:
-    transport = _PickPlaceTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_context())
-    identity = _identity("execute-pick")
-    started = port.pick_place.start("motion.pick_object", identity, _pick_inputs())
-    assert started.state is OwnerTaskState.ACTIVE
-
-    port.pick_place.cancel(started.task_id, identity)
-    kind, operation_id, body = transport.controls[-1]
-    assert kind == "stop"
-    assert operation_id.endswith(".approach")
-    assert body["operations"][0]["expected_operation_revision"] == 1
-
-    transport.sequence_statuses[started.task_id].update(
-        {
-            "phase": "intervention_required",
-            "active_operation_id": None,
-            "terminal_error": {
-                "code": "pick_retreat_interrupted",
-                "message": "retreat did not settle",
-            },
-        }
-    )
-    observed = port.pick_place.observe(started.task_id)
-    assert observed.state is OwnerTaskState.FAILED
-    assert observed.reason_code == "pick_retreat_interrupted"
-    assert observed.metadata["authored_failure_policy"] == "pause_for_operator"
-    port.unbind("program-run.1")
 
 
 @pytest.mark.parametrize(
@@ -2098,91 +2398,6 @@ def test_accepted_native_motion_recovery_releases_the_obsolete_task() -> None:
         port.operations.observe(started.task_id)
 
 
-def test_full_stopped_pick_place_recovers_exact_active_operation_for_run() -> None:
-    transport = _PickPlaceTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_context())
-    identity = _identity("full-stop-pick")
-    started = port.pick_place.start("motion.pick_object", identity, _pick_inputs())
-    operation_id = transport.sequence_statuses[started.task_id]["active_operation_id"]
-    assert isinstance(operation_id, str)
-
-    port.scope.request_stop("program-run.1", "full:caller.1:request.1", "Full Stop")
-    transport.stop_states["scope-stop-1"] = "succeeded"
-    transport.operations[operation_id].update(
-        {
-            "state": "stopped",
-            "operation_revision": 2,
-            "active_stop_id": "scope-stop-1",
-            "active_stop_generation": 1,
-        }
-    )
-    transport.sequence_statuses[started.task_id].update(
-        {
-            "phase": "intervention_required",
-            "terminal_error": {
-                "code": "operation_stopped",
-                "message": "Full Stop contained the active phase",
-            },
-        }
-    )
-    transport.operation_recovery = lambda exact_operation_id: {
-        "ok": True,
-        "operation_revision": 2,
-        "participants": [{"operation_participant_id": "participant.arm"}],
-        "recovery_assessment": {
-            "recovery_class": "ordinary_operator_stop",
-            "assessment_revision": 3,
-            "control_command_epoch": "control.epoch.1",
-            "execution_id": "execution.1",
-            "latch_id": "latch.1",
-            "stop_certificate_id": "certificate.1",
-            "stop_owner_generation": 1,
-        },
-        "stop_generation": 1,
-        "stop_id": "scope-stop-1",
-    }
-    recoveries: list[tuple[str, int, Mapping[str, Any]]] = []
-
-    def recover(
-        exact_operation_id: str,
-        expected_revision: int,
-        body: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        recoveries.append((exact_operation_id, expected_revision, deepcopy(body)))
-        return {
-            "ok": True,
-            "result": {
-                "request_id": body["request_id"],
-                "action": body["action"],
-                "accepted": True,
-                "resulting_assessment": {
-                    "recovery_class": "recovered",
-                },
-            },
-        }
-
-    transport.apply_operation_recovery = recover
-
-    observed = port.pick_place.observe(started.task_id)
-    assert observed.state is OwnerTaskState.INTERRUPTED
-    assert observed.metadata["active_operation_id"] == operation_id
-    assert observed.metadata["authored_failure_policy_parameter"] == ("operator_stop_policy")
-    result = port.pick_place.recover(
-        started.task_id,
-        identity,
-        action="replan_from_stopped_state",
-        request_id="resume-full-stop.1",
-        reason="operator Run after Full Stop",
-    )
-    assert result["accepted"] is True
-    assert recoveries[0][0:2] == (operation_id, 2)
-    assert recoveries[0][2]["action"] == "replan_from_stopped_state"
-    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
-    with pytest.raises(ProductionPortError, match="not retained"):
-        port.pick_place.observe(started.task_id)
-
-
 def test_place_intent_preserves_authored_pose_and_has_no_grasp_exception() -> None:
     transport = _PickPlaceTransport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -2203,13 +2418,14 @@ def test_place_intent_preserves_authored_pose_and_has_no_grasp_exception() -> No
         }
     )
 
-    result = port.pick_place.start(
-        "motion.place_object",
+    parameters["output_key"] = "place_plan"
+    result = port.operations.start(
+        "planning.plan_place_sequence",
         _identity("place"),
         OwnerNodeInputs(parameters=parameters),
     )
 
-    assert result.state is OwnerTaskState.ACTIVE
+    assert result.state is OwnerTaskState.SUCCEEDED
     intent = transport.place_requests[0]
     approach = intent["approach_operation"]["participants"][0]["payload"]
     assert approach["motion"]["goal"]["position_m"]["z_m"] == pytest.approx(0.28)

@@ -2189,9 +2189,6 @@ enum class CommandKind {
   kGetRuntimeScaleControl,
   kPlanPick,
   kPlanPlace,
-  kStartPick,
-  kStartPlace,
-  kReadPickPlaceSequence,
 };
 
 enum class CommandLane {
@@ -2267,7 +2264,6 @@ struct Command final {
   bool observation_cursor_supplied{};
   std::optional<core::PickSequencePlanningIntentDTO> pick_planning;
   std::optional<core::PlaceSequencePlanningIntentDTO> place_planning;
-  std::optional<std::string> pick_place_sequence_id;
 };
 
 [[nodiscard]] Command DecodeCommand(std::string_view bytes) {
@@ -2565,30 +2561,6 @@ struct Command final {
     Command decoded{CommandKind::kPlanPlace};
     decoded.place_planning =
         DecodePlacePlanningIntent(Member(root, "intent"), attribution);
-    return decoded;
-  }
-  if (command == "start_pick") {
-    RequireExactObjectSize(root, 4U, "pick sequence start command");
-    const auto attribution =
-        DecodeRequestAttribution(Member(root, "attribution"));
-    Command decoded{CommandKind::kStartPick};
-    decoded.pick_planning =
-        DecodePickPlanningIntent(Member(root, "intent"), attribution);
-    return decoded;
-  }
-  if (command == "start_place") {
-    RequireExactObjectSize(root, 4U, "place sequence start command");
-    const auto attribution =
-        DecodeRequestAttribution(Member(root, "attribution"));
-    Command decoded{CommandKind::kStartPlace};
-    decoded.place_planning =
-        DecodePlacePlanningIntent(Member(root, "intent"), attribution);
-    return decoded;
-  }
-  if (command == "read_pick_place_sequence") {
-    RequireExactObjectSize(root, 3U, "pick/place sequence read command");
-    Command decoded{CommandKind::kReadPickPlaceSequence};
-    decoded.pick_place_sequence_id = Text(root, "sequence_id");
     return decoded;
   }
   if (command == "stop") {
@@ -3081,17 +3053,17 @@ PickPlacePlanningResultValue(const std::string_view sequence_id,
     });
   }
   CanonicalValue plan(nullptr);
-  if (value.sequence_request.has_value()) {
-    const auto &request = *value.sequence_request;
+  if (value.plan.has_value()) {
+    const auto &planned = *value.plan;
     plan = CanonicalValue(CanonicalValue::Object{
-        {"approach_motion", MotionSpecValue(request.plan.approach_motion)},
-        {"descend_motion", MotionSpecValue(request.plan.descend_motion)},
+        {"approach_motion", MotionSpecValue(planned.approach_motion)},
+        {"descend_motion", MotionSpecValue(planned.descend_motion)},
         {"predecessor_projection_revision",
-         ProjectionRevisionValue(request.plan.predecessor_projection_revision)},
+         ProjectionRevisionValue(planned.predecessor_projection_revision)},
         {"preview_successor_projection_revision",
          ProjectionRevisionValue(
-             request.plan.preview_successor_projection_revision)},
-        {"retreat_motion", MotionSpecValue(request.plan.retreat_motion)},
+             planned.preview_successor_projection_revision)},
+        {"retreat_motion", MotionSpecValue(planned.retreat_motion)},
     });
   }
   CanonicalValue last_attempted_candidate(nullptr);
@@ -3113,42 +3085,6 @@ PickPlacePlanningResultValue(const std::string_view sequence_id,
       {"selected_object_id", CanonicalValue(value.selected_object_id.value())},
       {"sequence_id", CanonicalValue(std::string(sequence_id))},
       {"status", CanonicalValue(std::string(core::to_string(value.status)))},
-  });
-}
-
-[[nodiscard]] CanonicalValue
-PickPlaceSequenceStatusValue(const core::PickPlaceSequenceStatusDTO &value) {
-  CanonicalValue::Array completed_operations;
-  completed_operations.reserve(value.completed_operations.size());
-  for (const auto &operation_id : value.completed_operations) {
-    completed_operations.emplace_back(operation_id.value());
-  }
-  CanonicalValue active_operation_id(nullptr);
-  if (value.active_operation_id.has_value()) {
-    active_operation_id = CanonicalValue(value.active_operation_id->value());
-  }
-  CanonicalValue committed_projection_revision(nullptr);
-  if (value.committed_projection_revision.has_value()) {
-    committed_projection_revision =
-        ProjectionRevisionValue(*value.committed_projection_revision);
-  }
-  CanonicalValue terminal_error(nullptr);
-  if (value.terminal_error.has_value()) {
-    terminal_error = ErrorValue(*value.terminal_error);
-  }
-  return CanonicalValue(CanonicalValue::Object{
-      {"active_operation_id", std::move(active_operation_id)},
-      {"committed_projection_revision",
-       std::move(committed_projection_revision)},
-      {"completed_operation_ids",
-       CanonicalValue(std::move(completed_operations))},
-      {"kind", CanonicalValue(std::string(core::to_string(value.kind)))},
-      {"phase", CanonicalValue(std::string(core::to_string(value.phase)))},
-      {"schema_version",
-       CanonicalValue("manyforge.pick_place_sequence_status.v1")},
-      {"selected_object_id", CanonicalValue(value.selected_object_id.value())},
-      {"sequence_id", CanonicalValue(value.sequence_id)},
-      {"terminal_error", std::move(terminal_error)},
   });
 }
 
@@ -6593,10 +6529,6 @@ struct Composition final {
 #endif
   std::unique_ptr<core::AddressedPickPlacePlanningOwner>
       pick_place_planning_owner;
-  std::unique_ptr<core::PickPlaceSequenceCoordinator>
-      pick_place_sequence_coordinator;
-  std::unique_ptr<core::AddressedPickPlaceExecutionOwner>
-      pick_place_execution_owner;
   std::unique_ptr<component_manager::SqliteActiveBundlePublicationStore>
       cclc_active_publication_reader;
   std::unique_ptr<deployment::FilesystemVerifiedRetainedProductArtifactSource>
@@ -6613,7 +6545,7 @@ struct Composition final {
   std::unique_ptr<deployment::CCLCRuntimeComposition> cclc_runtime;
   std::atomic_bool cclc_attached{false};
   std::atomic_bool cclc_route_recovery_pending{false};
-  bool direct_route_configuration_published{};
+  bool direct_control_mode_selected{};
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   std::unique_ptr<RetainedRos2ControlAdmissionOwner>
       ros2_control_admission_owner;
@@ -6664,7 +6596,8 @@ struct Composition final {
             std::move(selected_status_gripper_target_role_id)) {}
 };
 
-[[maybe_unused]] void AttachProductPickPlaceOwners(Composition &composition) {
+[[maybe_unused]] void
+AttachProductPickPlacePlanningOwner(Composition &composition) {
   if (composition.planner_scene_projection == nullptr) {
     return;
   }
@@ -6673,9 +6606,6 @@ struct Composition final {
               composition.runtime->addressed_kernel != nullptr,
           "production pick/place join has no scene or addressed owner");
   if (composition.pick_place_planning_owner != nullptr) {
-    Require(composition.pick_place_sequence_coordinator != nullptr &&
-                composition.pick_place_execution_owner != nullptr,
-            "production pick/place owner set is incomplete");
     return;
   }
   composition.pick_place_planning_owner =
@@ -6685,14 +6615,6 @@ struct Composition final {
           *composition.scene_authority_proxy,
           *composition.planner_scene_projection,
           composition.runtime->planning_scene_synchronizer.get());
-  composition.pick_place_sequence_coordinator =
-      std::make_unique<core::PickPlaceSequenceCoordinator>(
-          *composition.runtime->addressed_kernel,
-          *composition.scene_authority_proxy);
-  composition.pick_place_execution_owner =
-      std::make_unique<core::AddressedPickPlaceExecutionOwner>(
-          *composition.pick_place_planning_owner,
-          *composition.pick_place_sequence_coordinator);
 }
 
 void InstallDirectSceneFrameResolver(ManagedProjectionRegistry &projections,
@@ -7608,12 +7530,9 @@ BuildProductComposition(CompositionBuildInput input) {
   composition->pick_place_planning_fixture_lifetime =
       std::move(fixture.lifetime);
   composition->pick_place_planning_owner = std::move(fixture.owner);
-  composition->pick_place_sequence_coordinator =
-      std::move(fixture.sequence_coordinator);
-  composition->pick_place_execution_owner = std::move(fixture.execution_owner);
 #else
   if (input.attach_addressed_owner) {
-    AttachProductPickPlaceOwners(*composition);
+    AttachProductPickPlacePlanningOwner(*composition);
   }
 #endif
   return composition;
@@ -7875,9 +7794,9 @@ PhysicalControlBindings(const Composition &composition) {
   return lifecycle_product_declared;
 }
 
-void PublishDirectNativeRoutes(Composition &composition,
-                               const std::filesystem::path &package_root) {
-  if (composition.direct_route_configuration_published ||
+void SelectDirectNativeControlMode(Composition &composition,
+                                   const std::filesystem::path &package_root) {
+  if (composition.direct_control_mode_selected ||
       composition.cclc_runtime != nullptr) {
     return;
   }
@@ -7888,13 +7807,11 @@ void PublishDirectNativeRoutes(Composition &composition,
                                        physical_bindings)) {
     return;
   }
-  auto published =
-      composition.runtime->PublishCurrentRetainedRouteConfigurations();
-  if (!published.ok()) {
-    Fail("direct native route publication failed: " +
-         published.error().message);
-  }
-  composition.direct_route_configuration_published = true;
+  // This product has no CCLC-issued readiness to publish. Its exact direct
+  // bindings were already installed with the addressed Kernel; selecting the
+  // retained direct mode must not fabricate an ActiveControlConfiguration or
+  // Stop-readiness certificate.
+  composition.direct_control_mode_selected = true;
   composition.cclc_route_recovery_pending.store(false,
                                                 std::memory_order_release);
 }
@@ -7911,13 +7828,13 @@ void AttachRetainedNativeCCLC(Composition &composition,
           "native CCLC attachment requires one stable addressed runtime");
 
   auto &kernel = *composition.runtime->addressed_kernel;
-  // Products without lifecycle-managed routes use the existing direct
-  // publication path.  The retained Stop latch still independently blocks
-  // public authoring; there is no CCLC service or recovery barrier to start.
-  PublishDirectNativeRoutes(composition, config.package_root);
-  if (composition.direct_route_configuration_published) {
+  // Products without lifecycle-managed routes keep their retained direct
+  // bindings. The Stop latch still independently blocks public authoring;
+  // there is no CCLC service or recovery barrier to start.
+  SelectDirectNativeControlMode(composition, config.package_root);
+  if (composition.direct_control_mode_selected) {
     Require(kernel.SetRouteRecoveryPending(false).ok(),
-            "direct native route publication could not release recovery "
+            "direct native control mode could not release recovery "
             "admission");
     return;
   }
@@ -8066,7 +7983,7 @@ void TryAttachManagedCCLC(Composition &composition,
   auto &kernel = *composition.runtime->addressed_kernel;
   if (composition.cclc_attached.load(std::memory_order_acquire))
     return;
-  if (composition.direct_route_configuration_published) {
+  if (composition.direct_control_mode_selected) {
     Require(kernel.SetRouteRecoveryPending(false).ok(),
             "completed route attachment could not release admission");
     return;
@@ -8095,8 +8012,8 @@ void TryAttachManagedCCLC(Composition &composition,
   attachment_config.execution_run_root = config.execution_run_root;
   attachment_config.candidate_worker = config.candidate_worker;
   attachment_config.cell_id = config.cell_id;
-  PublishDirectNativeRoutes(composition, config.package_root);
-  if (composition.direct_route_configuration_published) {
+  SelectDirectNativeControlMode(composition, config.package_root);
+  if (composition.direct_control_mode_selected) {
     Require(kernel.SetRouteRecoveryPending(false).ok(),
             "direct route attachment could not release admission");
     return;
@@ -8872,7 +8789,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   std::move(detached_addressed_kernel);
               detached_owner_clock.reset();
               detached_owner_scheduler.reset();
-              PublishDirectNativeRoutes(*built, config.package_root);
+              SelectDirectNativeControlMode(*built, config.package_root);
               fence_owner.BindDisableHandoffKernel(
                   *built->runtime->addressed_kernel);
               active_managed_composition = std::move(built);
@@ -9239,7 +9156,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     ->SetRouteRecoveryPending(true)
                     .ok(),
                 "selected runtime could not close route recovery admission");
-            PublishDirectNativeRoutes(*prepared, config.package_root);
+            SelectDirectNativeControlMode(*prepared, config.package_root);
             auto staged =
                 prepared->runtime->addressed_kernel
                     ->stage_current_runtime_configuration_facts_under_apply_fence(
@@ -9250,7 +9167,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             }
             InstallDirectSceneFrameResolver(projections, *prepared);
 #if !defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
-            AttachProductPickPlaceOwners(*prepared);
+            AttachProductPickPlacePlanningOwner(*prepared);
 #endif
             active_managed_composition = std::move(prepared);
           }
@@ -10762,8 +10679,8 @@ private:
                         std::memory_order_acquire)
                         ? "pending"
                         : "component_lifecycle")
-             : composition.direct_route_configuration_published ? "direct"
-                                                                : "pending")},
+             : composition.direct_control_mode_selected ? "direct"
+                                                        : "pending")},
         {"graph_revision",
          CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
         {"gripper_command_schema_id",
@@ -11262,16 +11179,14 @@ private:
         command.kind == CommandKind::kMalformedStop) {
       return ExecuteStop(command, *composition.runtime->addressed_kernel);
     }
-    const bool read_only =
-        command.kind == CommandKind::kQueryTarget ||
-        command.kind == CommandKind::kQueryOperation ||
-        command.kind == CommandKind::kObservation ||
-        command.kind == CommandKind::kGetStopFault ||
-        command.kind == CommandKind::kRead ||
-        command.kind == CommandKind::kReadStop ||
-        command.kind == CommandKind::kGetOperationRecovery ||
-        command.kind == CommandKind::kGetRuntimeScaleControl ||
-        command.kind == CommandKind::kReadPickPlaceSequence;
+    const bool read_only = command.kind == CommandKind::kQueryTarget ||
+                           command.kind == CommandKind::kQueryOperation ||
+                           command.kind == CommandKind::kObservation ||
+                           command.kind == CommandKind::kGetStopFault ||
+                           command.kind == CommandKind::kRead ||
+                           command.kind == CommandKind::kReadStop ||
+                           command.kind == CommandKind::kGetOperationRecovery ||
+                           command.kind == CommandKind::kGetRuntimeScaleControl;
     const auto liveness_command =
         read_only
             ? component_manager::detail::ManagerLivenessCommandClass::kReadOnly
@@ -11554,93 +11469,6 @@ private:
                composition.direct_control_motion_binding, owner_epoch_)},
       });
     }
-    if (command.kind == CommandKind::kReadPickPlaceSequence) {
-      if (!composition.pick_place_execution_owner) {
-        return ErrorResponse("pick_place_execution_owner_unavailable",
-                             "the selected native process has no joined "
-                             "pick/place sequence owner");
-      }
-      const auto result = composition.pick_place_execution_owner->GetStatus(
-          *command.pick_place_sequence_id);
-      if (!result.ok()) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-            {"error", ErrorValue(result.error())},
-            {"ok", CanonicalValue(false)},
-        });
-      }
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("read_pick_place_sequence")},
-          {"ok", CanonicalValue(true)},
-          {"sequence_status", PickPlaceSequenceStatusValue(result.value())},
-      });
-    }
-    if (command.kind == CommandKind::kStartPick ||
-        command.kind == CommandKind::kStartPlace) {
-      if (!composition.pick_place_execution_owner) {
-        return ErrorResponse("pick_place_execution_owner_unavailable",
-                             "the selected native process has no joined "
-                             "pick/place sequence owner");
-      }
-      const auto validate_origin = [&](const auto &request) {
-        for (const auto *operation :
-             {&request.approach_operation, &request.descend_operation,
-              &request.tool_operation, &request.retreat_operation}) {
-          const auto valid =
-              composition.target_resolver->ValidateExecutionOrigin(*operation);
-          if (!valid.ok())
-            return valid;
-        }
-        return core::Result<void>::Ok();
-      };
-      const auto origin = command.kind == CommandKind::kStartPick
-                              ? validate_origin(*command.pick_planning)
-                              : validate_origin(*command.place_planning);
-      if (!origin.ok()) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-            {"error", ErrorValue(origin.error())},
-            {"ok", CanonicalValue(false)},
-        });
-      }
-      const auto sequence_id = command.kind == CommandKind::kStartPick
-                                   ? command.pick_planning->sequence_id
-                                   : command.place_planning->sequence_id;
-      const auto result =
-          command.kind == CommandKind::kStartPick
-              ? composition.pick_place_execution_owner->BeginPick(
-                    *command.pick_planning)
-              : composition.pick_place_execution_owner->BeginPlace(
-                    *command.place_planning);
-      if (!result.ok()) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-            {"error", ErrorValue(result.error())},
-            {"ok", CanonicalValue(false)},
-        });
-      }
-      const auto command_name = command.kind == CommandKind::kStartPick
-                                    ? "start_pick"
-                                    : "start_place";
-      const auto kind = command.kind == CommandKind::kStartPick
-                            ? core::PickPlaceExecutionKindDTO::kPick
-                            : core::PickPlaceExecutionKindDTO::kPlace;
-      CanonicalValue sequence_status(nullptr);
-      if (result.value().sequence_status.has_value()) {
-        sequence_status =
-            PickPlaceSequenceStatusValue(*result.value().sequence_status);
-      }
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue(command_name)},
-          {"ok", CanonicalValue(true)},
-          {"planning_result",
-           PickPlacePlanningResultValue(sequence_id, kind,
-                                        result.value().planning_result)},
-          {"sequence_status", std::move(sequence_status)},
-      });
-    }
     if (command.kind == CommandKind::kPlanPick ||
         command.kind == CommandKind::kPlanPlace) {
       if (!composition.pick_place_planning_owner) {
@@ -11885,9 +11713,6 @@ private:
       case CommandKind::kGetRuntimeScaleControl:
       case CommandKind::kPlanPick:
       case CommandKind::kPlanPlace:
-      case CommandKind::kStartPick:
-      case CommandKind::kStartPlace:
-      case CommandKind::kReadPickPlaceSequence:
         Fail("execution command dispatch is inconsistent");
       }
       Fail("execution command dispatch is unreachable");
@@ -11983,13 +11808,6 @@ private:
                                           ->reconcile_subordinate_state();
               if (!reconciled.ok()) {
                 return reconciled.error();
-              }
-              if (composition.pick_place_execution_owner) {
-                const auto pick_place_reconciled =
-                    composition.pick_place_execution_owner->Reconcile();
-                if (!pick_place_reconciled.ok()) {
-                  return pick_place_reconciled.error();
-                }
               }
               const auto manual_settlement =
                   ReconcileDirectControlOperations(composition);

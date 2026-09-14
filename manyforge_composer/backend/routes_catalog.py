@@ -42,6 +42,7 @@ def _capability_response(requirement: Any) -> dict[str, Any]:
     response = {
         "capabilityId": requirement.capability_id,
         "scope": requirement.scope,
+        "effectful": requirement.effectful,
     }
     for key, value in (
         ("targetParameter", requirement.target_parameter),

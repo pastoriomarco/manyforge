@@ -30,10 +30,10 @@ from manyforge_behavior.catalog_schema import (
 
 
 EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
-EXPECTED_CONTENT_VERSION = "2.1.0"
+EXPECTED_CONTENT_VERSION = "2.3.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:7c16314aeddbdea7942cdab09aa0e2da6c913e2044adcf5c3d99111c6b280ffd"
+    "sha256:5abe4efe0a00dfb4936ba8dea9cc296ced334d01d3a613adcc569dda41ba5304"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -69,7 +69,6 @@ _OWNER_APIS = {
     "kernel.full_stop",
     "kernel.operation",
     "kernel.pause",
-    "kernel.pick_place_sequence",
     "kernel.recovery",
     "kernel.reset",
     "kernel.resume",
@@ -80,6 +79,7 @@ _OWNER_APIS = {
     "orchestration.clock",
     "orchestration.control_flow",
     "planning.pick_sequence",
+    "planning.place_sequence",
     "scene.carried_attachment",
     "scene.transaction",
     "simulator.control",
@@ -284,6 +284,7 @@ class CatalogCapabilityRequirement:
     component_parameter: str | None = None
     when_parameter: str | None = None
     when_equals: Any = None
+    effectful: bool = False
 
 
 @dataclass(frozen=True)
@@ -966,6 +967,7 @@ class NodeCatalog:
                     "target_parameter",
                     "component_parameter",
                     "when",
+                    "effectful",
                 },
                 label=requirement_label,
             )
@@ -1049,6 +1051,14 @@ class NodeCatalog:
                     raise CatalogValidationError(
                         f"{requirement_label}.when must match a declared enum value"
                     )
+            effectful = _boolean(
+                requirement.get("effectful", False),
+                f"{requirement_label}.effectful",
+            )
+            if effectful and scope != "target_binding":
+                raise CatalogValidationError(
+                    f"{requirement_label}.effectful is valid only for target_binding"
+                )
             identity = (
                 capability_id,
                 scope,
@@ -1068,6 +1078,7 @@ class NodeCatalog:
                     component_parameter=component,
                     when_parameter=when_parameter,
                     when_equals=_freeze_json_value(when_equals),
+                    effectful=effectful,
                 )
             )
         return tuple(result)

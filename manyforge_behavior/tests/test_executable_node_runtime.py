@@ -228,12 +228,19 @@ class _MaintainedProgramTaskPort(_TaskPort):
                     "reason": "fixture grasp",
                     "selected_object_id": "graspable",
                 }
-        if node_id == "planning.plan_pick_sequence":
+        if node_id in {
+            "planning.plan_pick_sequence",
+            "planning.plan_place_sequence",
+        }:
+            pose = _portable_pose()
             return {
-                "approach_pose": _portable_pose(),
-                "pick_pose": _portable_pose(),
-                "retreat_pose": _portable_pose(),
+                "approach_pose": pose,
+                "descend_path": [pose, pose],
+                "pick_pose": pose,
+                "retreat_path": [pose, pose],
+                "retreat_pose": pose,
                 "selected_object_id": inputs.parameters["selected_object_id"],
+                "tool_position": _plain(inputs.parameters["tool_position"]),
             }
         return None
 
@@ -263,7 +270,6 @@ def _ports(
         gripper_status=invocation_port,
         model_queries=invocation_port,
         assistant_requests=task_port,
-        pick_place=task_port,
         simulator_control=task_port,
         kernel_controls=task_port,
     )
@@ -297,8 +303,8 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
     resolver = build_executable_node_resolver(environment)
     dispositions = resolver.dispositions
 
-    assert len(dispositions) == len(environment.registry.rows) == 52
-    assert sum(item.adapter_build_qualified for item in dispositions) == 47
+    assert len(dispositions) == len(environment.registry.rows) == 51
+    assert sum(item.adapter_build_qualified for item in dispositions) == 46
     assert sum(not item.adapter_build_qualified for item in dispositions) == 5
     assert all(
         (
@@ -1051,7 +1057,10 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner(
             status = run.tick_once()
             if status is not py_trees.common.Status.RUNNING:
                 break
-        assert status is py_trees.common.Status.SUCCESS, source
+        assert status is py_trees.common.Status.SUCCESS, (
+            source,
+            run.terminal_failure(),
+        )
         exercised.update(node.node_id for node in _walk(program.tree))
 
     assert exercised == {
@@ -1062,12 +1071,12 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner(
         "gripper.command_position",
         "logic.check_bool",
         "logic.set_bool",
+        "motion.follow_cartesian_path",
         "motion.move_to_joint_target",
         "motion.move_to_pose",
-        "motion.pick_object",
-        "motion.place_object",
         "parallel",
         "planning.plan_pick_sequence",
+        "planning.plan_place_sequence",
         "scene.add_object",
         "scene.attach_carried_object",
         "scene.detach_carried_object",

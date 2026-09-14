@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-09-11 20:12:16 UTC
+  Last regenerated: 2026-09-14 17:20:25 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -1961,8 +1961,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               "operation_resume",
               "operation_reset",
               "operation_acknowledge_completed",
-              "pick_sequence_start",
-              "place_sequence_start",
               "cell_full_stop",
               "execution_recovery",
               "stop_recovery",

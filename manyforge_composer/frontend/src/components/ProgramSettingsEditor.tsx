@@ -89,6 +89,9 @@ export function ProgramSettingsEditor({
   const [name, setName] = useState(program.name);
   const [description, setDescription] = useState(program.description ?? '');
   const [compatibility, setCompatibility] = useState(() => initialCompatibility(program));
+  const [synchronizedGroups, setSynchronizedGroups] = useState(
+    () => (program.synchronized_execution_groups ?? []).join(', '),
+  );
   const [error, setError] = useState<string | null>(null);
   const [errorTarget, setErrorTarget] = useState('program-settings-name');
   const [componentRoleId, setComponentRoleId] = useState('');
@@ -115,6 +118,7 @@ export function ProgramSettingsEditor({
     setName(program.name);
     setDescription(program.description ?? '');
     setCompatibility(initialCompatibility(program));
+    setSynchronizedGroups((program.synchronized_execution_groups ?? []).join(', '));
     setError(null);
     setErrorTarget('program-settings-name');
     setComponentRoleId('');
@@ -153,7 +157,8 @@ export function ProgramSettingsEditor({
     || JSON.stringify([...compatibility.lanes].sort()) !== JSON.stringify([...original.lanes].sort())
     || compatibility.assistant !== original.assistant
     || compatibility.requires !== original.requires
-    || compatibility.tags !== original.tags;
+    || compatibility.tags !== original.tags
+    || synchronizedGroups !== (program.synchronized_execution_groups ?? []).join(', ');
   const settingsDiagnostics = diagnostics.filter((diagnostic) =>
     diagnostic.path.startsWith('program')
     && !diagnostic.path.startsWith('program.parameters')
@@ -170,6 +175,10 @@ export function ProgramSettingsEditor({
       const lanes = LANES.filter((lane) => compatibility.lanes.includes(lane));
       const requires = parseIdentifierList(compatibility.requires, 'Requirements');
       const tags = parseIdentifierList(compatibility.tags, 'Tags');
+      const coordinated = parseIdentifierList(
+        synchronizedGroups,
+        'Synchronized motion groups',
+      );
       const nextCompatibility: Record<string, JsonValue> = {};
       if (lanes.length > 0) nextCompatibility.lanes = lanes;
       if (compatibility.assistant) nextCompatibility.assistant = compatibility.assistant;
@@ -180,6 +189,7 @@ export function ProgramSettingsEditor({
         description: description.trim(),
         program_profile: program.program_profile,
         compatibility: nextCompatibility,
+        synchronized_execution_groups: coordinated,
       });
       setError(null);
     } catch (caught) {
@@ -190,6 +200,8 @@ export function ProgramSettingsEditor({
           ? 'program-settings-requires'
           : message.startsWith('Tags')
             ? 'program-settings-tags'
+            : message.startsWith('Synchronized motion groups')
+              ? 'program-settings-synchronized-groups'
             : 'program-settings-name',
       );
     }
@@ -200,12 +212,15 @@ export function ProgramSettingsEditor({
       if (!name.trim()) throw new Error('Program name is required.');
       parseIdentifierList(compatibility.requires, 'Requirements');
       parseIdentifierList(compatibility.tags, 'Tags');
+      parseIdentifierList(synchronizedGroups, 'Synchronized motion groups');
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : 'Program settings are invalid.';
       const target = message.startsWith('Requirements')
         ? 'program-settings-requires'
         : message.startsWith('Tags')
           ? 'program-settings-tags'
+          : message.startsWith('Synchronized motion groups')
+            ? 'program-settings-synchronized-groups'
           : 'program-settings-name';
       event.preventDefault();
       setError(message);
@@ -396,6 +411,7 @@ export function ProgramSettingsEditor({
               setName(program.name);
               setDescription(program.description ?? '');
               setCompatibility(initialCompatibility(program));
+              setSynchronizedGroups((program.synchronized_execution_groups ?? []).join(', '));
               setComponentRoleId('');
               setComponentTypeTags('');
               setComponentModelRoles('');
@@ -437,6 +453,21 @@ export function ProgramSettingsEditor({
         <label>
           Description
           <textarea rows={3} value={description} disabled={busy} onChange={(event) => setDescription(event.target.value)} />
+        </label>
+      </section>
+
+      <section className="program-settings-section">
+        <h3>Execution timing</h3>
+        <label>
+          Synchronized motion groups
+          <input
+            id="program-settings-synchronized-groups"
+            value={synchronizedGroups}
+            disabled={busy}
+            placeholder="group_a, group_b"
+            title="Optional named execution groups whose sibling motion nodes start on one shared clock. Other Parallel branches remain independent."
+            onChange={(event) => setSynchronizedGroups(event.target.value)}
+          />
         </label>
       </section>
 

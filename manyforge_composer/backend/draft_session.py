@@ -31,6 +31,11 @@ from manyforge_behavior.program import (
     merge_param_patch,
     parse_execution_groups,
 )
+from manyforge_behavior.pick_place_templates import (
+    PICK_PLACE_RESULT_FIELDS,
+    PickPlaceTemplateError,
+    build_pick_place_subtree,
+)
 
 from .authoring_forest import (
     AUTHORING_FOREST_VERSION,
@@ -1756,7 +1761,7 @@ class ComposerDraftSession:
         arguments: dict[str, Any],
         _catalog: NodeCatalog,
     ) -> dict[str, Any]:
-        required = {
+        common = {
             "macro_id",
             "scene_resource_id",
             "target_role",
@@ -1764,45 +1769,62 @@ class ComposerDraftSession:
             "base_frame_role",
             "tcp_frame_role",
             "carrier_frame_role",
-            "touch_body_roles",
             "tool_position",
-            "contact_policy_id",
             "blackboard_namespace_id",
             "blackboard_key",
             "instance_prefix",
         }
-        optional = {"parent_instance_id", "index", "position"}
+        optional = {
+            "parent_instance_id",
+            "index",
+            "position",
+            "planning_profile",
+            "motion_options",
+            "tool_max_effort",
+            "tool_command_duration_s",
+            "tool_completion_timeout_s",
+        }
+        macro_id = arguments.get("macro_id")
+        if macro_id == "pick_subtree":
+            operation = "pick"
+            specific = {"contact_policy_id", "touch_body_roles"}
+        elif macro_id == "place_subtree":
+            operation = "place"
+            specific = {"place_pose", "approach_offset_m"}
+        else:
+            _error(
+                "draft_authoring_macro_unknown",
+                f"unknown authoring macro: {macro_id}",
+                status_code=404,
+            )
+        required = common | specific
         if set(arguments) - required - optional or not required <= set(arguments):
             _error(
                 "draft_arguments_invalid",
-                "pick_plan_subtree macro arguments are incomplete or unsupported",
+                f"{operation} subtree macro arguments are incomplete or unsupported",
             )
-        if arguments["macro_id"] != "pick_plan_subtree":
-            _error(
-                "draft_authoring_macro_unknown",
-                f"unknown authoring macro: {arguments['macro_id']}",
-                status_code=404,
-            )
-        identifier_fields = required - {
-            "macro_id",
-            "touch_body_roles",
-            "tool_position",
+        identifier_fields = {
+            "scene_resource_id",
+            "target_role",
+            "tool_target_role",
+            "base_frame_role",
+            "tcp_frame_role",
+            "carrier_frame_role",
+            "blackboard_namespace_id",
+            "blackboard_key",
+            "instance_prefix",
         }
-        if any(
-            not _is_portable_id(arguments[field])
-            for field in identifier_fields
-        ):
+        if operation == "pick":
+            identifier_fields.add("contact_policy_id")
+        if any(not _is_portable_id(arguments[field]) for field in identifier_fields):
             _error(
                 "draft_arguments_invalid",
                 "authoring macro identities must be portable lower-case IDs",
             )
-        if (
+        if operation == "pick" and (
             type(arguments["touch_body_roles"]) is not list
             or not arguments["touch_body_roles"]
-            or any(
-                not _is_portable_id(role)
-                for role in arguments["touch_body_roles"]
-            )
+            or any(not _is_portable_id(role) for role in arguments["touch_body_roles"])
             or arguments["touch_body_roles"]
             != sorted(set(arguments["touch_body_roles"]))
         ):
@@ -1810,37 +1832,33 @@ class ComposerDraftSession:
                 "draft_arguments_invalid",
                 "touch_body_roles must be a non-empty canonical ID array",
             )
-        scene_ids = {
-            row.get("scene_resource_id") for row in self._scene(document)
-        }
+        scene_ids = {row.get("scene_resource_id") for row in self._scene(document)}
         if arguments["scene_resource_id"] not in scene_ids:
             _error(
                 "draft_scene_resource_not_found",
-                "pick authoring macro requires an existing detached Program scene resource",
+                f"{operation} authoring requires an existing Program scene resource",
                 status_code=404,
             )
         for role_field in ("target_role", "tool_target_role"):
             if arguments[role_field] not in document.get("target_roles", {}):
                 _error(
                     "draft_target_role_not_found",
-                    f"pick authoring macro {role_field} is not declared",
+                    f"{operation} authoring {role_field} is not declared",
                     status_code=404,
                 )
-        if arguments["contact_policy_id"] not in {
+        if operation == "pick" and arguments["contact_policy_id"] not in {
             row.get("policy_id") for row in self._contact_policy_rows(document)
         }:
             _error(
                 "draft_contact_policy_not_found",
-                "pick authoring macro contact policy is not declared",
+                "pick authoring contact policy is not declared",
                 status_code=404,
             )
 
         blackboard = self._blackboard(document)
         namespace_id = arguments["blackboard_namespace_id"]
         key_id = arguments["blackboard_key"]
-        namespaces = {
-            row["namespace_id"]: row for row in blackboard["namespaces"]
-        }
+        namespaces = {row["namespace_id"]: row for row in blackboard["namespaces"]}
         keys = {row["key"]: row for row in blackboard["keys"]}
         if namespace_id not in namespaces:
             blackboard["namespaces"].append(
@@ -1850,25 +1868,20 @@ class ComposerDraftSession:
         elif namespaces[namespace_id].get("owner") != "program":
             _error(
                 "draft_declaration_conflict",
-                "pick authoring macro namespace is not Program-owned",
+                f"{operation} authoring namespace is not Program-owned",
                 status_code=409,
             )
         if not key_id.startswith(f"{namespace_id}."):
             _error(
                 "draft_arguments_invalid",
-                "pick authoring macro result key must belong to its namespace",
+                f"{operation} result key must belong to its namespace",
             )
         expected_key = {
             "key": key_id,
             "type": "pick_planning_result",
             "access": "read_write",
             "persistence": "run",
-            "fields": [
-                {"field": "approach_pose", "type": "stored_pose"},
-                {"field": "pick_pose", "type": "stored_pose"},
-                {"field": "retreat_pose", "type": "stored_pose"},
-                {"field": "selected_object_id", "type": "scene_resource"},
-            ],
+            "fields": deepcopy(PICK_PLACE_RESULT_FIELDS),
         }
         existing_key = keys.get(key_id)
         if existing_key is not None and any(
@@ -1877,7 +1890,7 @@ class ComposerDraftSession:
         ):
             _error(
                 "draft_declaration_conflict",
-                "pick authoring macro blackboard key has an incompatible declaration",
+                f"{operation} result key has an incompatible declaration",
                 status_code=409,
             )
         if existing_key is None:
@@ -1889,108 +1902,74 @@ class ComposerDraftSession:
         base_prefix = arguments["instance_prefix"]
         prefix = base_prefix
         suffix = 2
-        child_suffixes = ("plan", "approach", "descend", "close", "attach", "retreat")
+        tool_suffix = "close" if operation == "pick" else "open"
+        scene_suffix = "attach" if operation == "pick" else "detach"
+        child_suffixes = (
+            "plan",
+            "approach",
+            "descend",
+            tool_suffix,
+            scene_suffix,
+            "retreat",
+        )
         while any(
             identity in existing_ids
             for identity in (prefix, *(f"{prefix}.{part}" for part in child_suffixes))
         ):
             prefix = f"{base_prefix}.{suffix}"
             suffix += 1
-        move_parameters = {
+
+        template_parameters = {
             "target_role": arguments["target_role"],
+            "tool_target_role": arguments["tool_target_role"],
             "base_frame_role": arguments["base_frame_role"],
             "tcp_frame_role": arguments["tcp_frame_role"],
+            "carrier_frame_role": arguments["carrier_frame_role"],
+            "selected_object_id": arguments["scene_resource_id"],
+            "tool_position": deepcopy(arguments["tool_position"]),
+            "planning_profile": arguments.get("planning_profile", "first_feasible"),
+            "motion_options": deepcopy(arguments.get("motion_options", {})),
         }
-        children = [
-            {
-                "node_id": "planning.plan_pick_sequence",
-                "instance_id": f"{prefix}.plan",
-                "parameters": {
-                    "target_role": arguments["target_role"],
-                    "tool_target_role": arguments["tool_target_role"],
-                    "base_frame_role": arguments["base_frame_role"],
-                    "tcp_frame_role": arguments["tcp_frame_role"],
-                    "carrier_frame_role": arguments["carrier_frame_role"],
-                    "selected_object_id": arguments["scene_resource_id"],
-                    "tool_position": deepcopy(arguments["tool_position"]),
-                    "output_key": key_id,
-                    "contact_policy_id": arguments["contact_policy_id"],
-                },
-                "children": [],
-            },
-            *[
-                {
-                    "node_id": "motion.move_to_pose",
-                    "instance_id": f"{prefix}.{instance_part}",
-                    "parameters": deepcopy(move_parameters),
-                    "value_sources": {
-                        "goal": {
-                            "kind": "blackboard_field",
-                            "reference": key_id,
-                            "field": field,
-                        }
-                    },
-                    "children": [],
-                }
-                for instance_part, field in (
-                    ("approach", "approach_pose"),
-                    ("descend", "pick_pose"),
-                )
-            ],
-            {
-                "node_id": "gripper.command_position",
-                "instance_id": f"{prefix}.close",
-                "parameters": {
-                    "target_role": arguments["tool_target_role"],
-                    "position": deepcopy(arguments["tool_position"]),
-                },
-                "children": [],
-            },
-            {
-                "node_id": "scene.attach_carried_object",
-                "instance_id": f"{prefix}.attach",
-                "parameters": {
-                    "scene_resource_id": arguments["scene_resource_id"],
-                    "target_role": arguments["tool_target_role"],
-                    "carrier_frame_role": arguments["carrier_frame_role"],
-                    "touch_body_roles": deepcopy(arguments["touch_body_roles"]),
-                },
-                "children": [],
-            },
-            {
-                "node_id": "motion.move_to_pose",
-                "instance_id": f"{prefix}.retreat",
-                "parameters": deepcopy(move_parameters),
-                "value_sources": {
-                    "goal": {
-                        "kind": "blackboard_field",
-                        "reference": key_id,
-                        "field": "retreat_pose",
-                    }
-                },
-                "children": [],
-            },
-        ]
-        wrapper = {
-            "node_id": "sequence",
-            "instance_id": prefix,
-            "parameters": {},
-            "children": children,
-        }
+        if operation == "pick":
+            template_parameters["contact_policy_id"] = arguments["contact_policy_id"]
+        else:
+            template_parameters["place_pose"] = deepcopy(arguments["place_pose"])
+            template_parameters["approach_offset_m"] = deepcopy(
+                arguments["approach_offset_m"]
+            )
+        for field in (
+            "tool_max_effort",
+            "tool_command_duration_s",
+            "tool_completion_timeout_s",
+        ):
+            if field in arguments:
+                template_parameters[field] = deepcopy(arguments[field])
+        try:
+            wrapper = build_pick_place_subtree(
+                operation,
+                instance_id=prefix,
+                parameters=template_parameters,
+                value_sources={},
+                result_key=key_id,
+                touch_body_roles=(
+                    arguments["touch_body_roles"] if operation == "pick" else ()
+                ),
+            )
+        except PickPlaceTemplateError as exc:
+            _error("draft_arguments_invalid", str(exc))
         insertion = {"node": wrapper}
         for field in ("parent_instance_id", "index", "position"):
             if field in arguments:
                 insertion[field] = deepcopy(arguments[field])
         self._tree_insert(document, insertion, _catalog)
         return {
-            "macro_id": arguments["macro_id"],
+            "macro_id": macro_id,
             "inserted_instance_ids": [
                 prefix,
                 *(f"{prefix}.{part}" for part in child_suffixes),
             ],
             "blackboard_key": key_id,
         }
-
     def _observed_move_store(
         self,
         document: dict[str, Any],
@@ -2237,17 +2216,24 @@ class ComposerDraftSession:
         arguments: dict[str, Any],
         _catalog: NodeCatalog,
     ) -> dict[str, Any]:
-        required = {"name", "description", "program_profile", "compatibility"}
+        required = {
+            "name",
+            "description",
+            "program_profile",
+            "compatibility",
+            "synchronized_execution_groups",
+        }
         if set(arguments) != required:
             _error(
                 "draft_arguments_invalid",
                 "program_draft_update_settings requires exactly name, description, "
-                "program_profile, and compatibility",
+                "program_profile, compatibility, and synchronized_execution_groups",
             )
         name = arguments["name"]
         description = arguments["description"]
         program_profile = arguments["program_profile"]
         compatibility = arguments["compatibility"]
+        synchronized_groups = arguments["synchronized_execution_groups"]
         if type(name) is not str or not name.strip():
             _error("draft_arguments_invalid", "Program name must be non-empty text")
         if type(description) is not str:
@@ -2256,6 +2242,14 @@ class ComposerDraftSession:
             _error("draft_arguments_invalid", "Program profile must be text")
         if type(compatibility) is not dict:
             _error("draft_arguments_invalid", "Program compatibility must be an object")
+        if (
+            type(synchronized_groups) is not list
+            or any(type(group) is not str for group in synchronized_groups)
+        ):
+            _error(
+                "draft_arguments_invalid",
+                "synchronized_execution_groups must be an array of group IDs",
+            )
 
         document["name"] = name.strip()
         document["program_profile"] = program_profile
@@ -2267,6 +2261,10 @@ class ComposerDraftSession:
             document["compatibility"] = deepcopy(compatibility)
         else:
             document.pop("compatibility", None)
+        if synchronized_groups:
+            document["synchronized_execution_groups"] = deepcopy(synchronized_groups)
+        else:
+            document.pop("synchronized_execution_groups", None)
         return {"updated": True}
 
     @staticmethod

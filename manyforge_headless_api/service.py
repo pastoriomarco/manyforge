@@ -565,27 +565,6 @@ class HeadlessService:
             request, trusted_principal_id=attribution.principal_id
         )
 
-    def execution_start_pick(
-        self,
-        request: PickSequencePlanningRequest,
-        attribution: TrustedAttribution,
-    ) -> dict[str, Any]:
-        return self._execution().start_pick(
-            request, trusted_principal_id=attribution.principal_id
-        )
-
-    def execution_start_place(
-        self,
-        request: PlaceSequencePlanningRequest,
-        attribution: TrustedAttribution,
-    ) -> dict[str, Any]:
-        return self._execution().start_place(
-            request, trusted_principal_id=attribution.principal_id
-        )
-
-    def execution_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
-        return self._execution().read_pick_place_sequence(sequence_id)
-
     def execution_pause(
         self,
         request: OperationControlRequest,

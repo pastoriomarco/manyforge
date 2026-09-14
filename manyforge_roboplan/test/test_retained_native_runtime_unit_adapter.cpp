@@ -541,14 +541,19 @@ PhysicalConfigurationScope(const NativeFixture &fixture) {
 [[nodiscard]] std::optional<core::AuthoringAdmissionDTO>
 WaitForAuthoringAdmission(
     component_manager::RetainedNativeRuntimeUnitAdapter &adapter,
-    const std::chrono::steady_clock::duration timeout) {
+    const std::chrono::steady_clock::duration timeout,
+    const std::optional<bool> expected_allowed = std::nullopt) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
     try {
-      return adapter.GetAuthoringAdmission();
+      auto admission = adapter.GetAuthoringAdmission();
+      if (!expected_allowed.has_value() ||
+          admission.authoring_allowed == *expected_allowed) {
+        return admission;
+      }
     } catch (const component_manager::RetainedNativeRuntimeUnitAdapterError &) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   return std::nullopt;
 }
@@ -776,10 +781,10 @@ TEST(RetainedNativeRuntimeUnitAdapter,
     ASSERT_NE(reply.find_object_member("accepted"), nullptr) << encoded;
     const auto *accepted = reply.find_object_member("accepted");
     const auto read = ExecutionPacket(
-          ordinary, "{\"api_version\":\"manyforge.execution_command.v1\","
-                    "\"command\":\"read_stop\",\"stop_id\":\"" +
-                        TextMember(*accepted, "stop_id") + "\"," + attribution +
-                        "}");
+        ordinary, "{\"api_version\":\"manyforge.execution_command.v1\","
+                  "\"command\":\"read_stop\",\"stop_id\":\"" +
+                      TextMember(*accepted, "stop_id") + "\"," + attribution +
+                      "}");
     EXPECT_NE(read.find_object_member("stop_status"), nullptr)
         << content_identity::canonical_json(read);
   }
@@ -791,7 +796,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       priority,
       "{\"api_version\":\"manyforge.execution_command.v1\",\"command\":"
       "\"malformed_stop\",\"request_id\":\"malformed.1\",\"recognized_route\":"
-      "\"/api/execution/stops\",\"reason\":\"recognized_stop_payload_invalid\"," +
+      "\"/api/execution/"
+      "stops\",\"reason\":\"recognized_stop_payload_invalid\"," +
           attribution + "}");
   ASSERT_NE(recognized.find_object_member("accepted"), nullptr)
       << content_identity::canonical_json(recognized);
@@ -895,7 +901,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
           std::string(contract::kInstalledTargetId),
       candidate_worker_source, target_root_a.path());
   const auto target_b =
-      InstallNativeTestTargets(MANYFORGE_NATIVE_PICK_PLACE_EXECUTION_TARGET,
+      InstallNativeTestTargets(MANYFORGE_NATIVE_PICK_PLACE_PLANNING_TARGET,
                                candidate_worker_source, target_root_b.path());
   ASSERT_NE(content_identity::sha256_digest(ReadFile(target_a)),
             content_identity::sha256_digest(ReadFile(target_b)));
@@ -1268,9 +1274,11 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto published = adapter.Publish(program_runner_observation);
   ASSERT_TRUE(published.ok()) << published.error().message;
 
-  const auto authoring_admission = adapter.GetAuthoringAdmission();
-  ASSERT_TRUE(authoring_admission.authoring_allowed);
-  EXPECT_GT(authoring_admission.admission_generation,
+  const auto authoring_admission =
+      WaitForAuthoringAdmission(adapter, std::chrono::seconds(10), true);
+  ASSERT_TRUE(authoring_admission.has_value());
+  ASSERT_TRUE(authoring_admission->authoring_allowed);
+  EXPECT_GT(authoring_admission->admission_generation,
             updated.value().admission_generation);
   const core::CellAdmissionClaimIntentDTO claim_intent{
       core::CellAdmissionClaimKindDTO::kAuthoringMutation,
@@ -1279,7 +1287,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       "adapter-authoring-transaction",
       core::RequestId("adapter-authoring-request"),
       core::ContentDigest(std::string(kIntentDigest)),
-      authoring_admission.admission_generation,
+      authoring_admission->admission_generation,
       {},
       std::nullopt,
       std::nullopt};

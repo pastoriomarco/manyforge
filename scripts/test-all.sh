@@ -352,7 +352,7 @@ build_headless_roboplan_producer_closure() {
     fi
     local producer_targets=(
         manyforge_native_execution_host
-        manyforge_native_execution_host_pick_place_fixture
+        manyforge_native_execution_host_pick_place_planning_fixture
         manyforge_roboplan_candidate_worker
     )
     set_build_keep_going_args "$build" || return 1
@@ -365,7 +365,7 @@ build_headless_roboplan_producer_closure() {
     local producer_input
     for producer_input in \
         "$build/manyforge_native_execution_host" \
-        "$build/manyforge_native_execution_host_pick_place_fixture" \
+        "$build/manyforge_native_execution_host_pick_place_planning_fixture" \
         "$build/manyforge_roboplan_candidate_worker"; do
         if [[ ! -f "$producer_input" ]]; then
             echo -e "${RED}  FAIL: RoboPlan producer closure did not create ${producer_input}${NC}"

@@ -27,6 +27,7 @@ from manyforge_behavior.kernel_client import (
     ActionSpan,
     ExecutionState,
     KernelClient,
+    KernelOperationAdmissionRejectedError,
     KernelOperationObservationUnavailableError,
     KernelOperationSettlementPendingError,
 )
@@ -85,6 +86,18 @@ _MOTION_NODE_IDS: Final = frozenset(
         "motion.follow_cartesian_path",
     }
 )
+
+
+def _held_selection_revision(error: KernelOperationAdmissionRejectedError) -> int | None:
+    if error.details.get("reason") not in {
+        "program_run_stop_fence_active",
+        "program_node_stop_fence_active",
+    }:
+        return None
+    revision = error.details.get("selection_revision")
+    return int(revision) if isinstance(revision, str) and revision.isdecimal() else 0
+
+
 _MAX_CONTEXTS: Final = 4_096
 _MAX_TASKS: Final = 65_536
 _MAX_SCENE_NODE_STALE_RETRIES: Final = 16
@@ -358,6 +371,8 @@ class _BoundContext:
     targets: Mapping[str, _TargetBinding]
     contact_grasps: Mapping[str, _ContactGraspBinding]
     request_owner_epoch: str
+    synchronized_groups: Mapping[str, tuple[str, ...]]
+    synchronized_node_groups: Mapping[str, str]
 
 
 class _SceneProgramTransport(Protocol):
@@ -398,29 +413,45 @@ class _SceneView:
 
 
 @dataclass(slots=True)
-class _OperationTask:
-    identity: NodeAttemptIdentity
-    node_id: str
+class _SharedOperation:
     operation_id: str
     request_owner_epoch: str
+    member_attempt_ids: frozenset[str]
+    member_task_ids: frozenset[str]
     stop_requested: bool = False
-    # A successful observation is immutable until its exact acknowledgement.
-    # Retain only the revision needed by that next command so acknowledge does
-    # not repeat both the operation read and owner-identity read on every node.
     completed_revision: int | None = field(default=None, compare=False)
+    acknowledged_attempt_ids: set[str] = field(default_factory=set, compare=False)
+    recovered_attempt_ids: set[str] = field(default_factory=set, compare=False)
+    recovery_result: Mapping[str, Any] | None = field(default=None, compare=False)
+    recovery_action: str | None = field(default=None, compare=False)
 
 
 @dataclass(slots=True)
-class _PickPlaceTask:
+class _OperationTask:
     identity: NodeAttemptIdentity
     node_id: str
-    sequence_id: str
-    kind: str
-    selected_object_id: str
-    planning_result: Mapping[str, Any]
-    snapshot: OwnerTaskSnapshot
-    active_stop_operation_id: str | None = None
-    scope_stop_requested: bool = False
+    task_id: str
+    operation: _SharedOperation | None = None
+    terminal: OwnerTaskSnapshot | None = None
+    held_before_admission: bool = False
+    unknown_admission: _UnknownOperationAdmission | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _UnknownOperationAdmission:
+    request_id: str
+    request_owner_epoch: str
+    intent: Mapping[str, Any]
+    member_task_ids: frozenset[str]
+
+
+@dataclass(slots=True)
+class _CoordinatedStart:
+    group_id: str
+    expected_node_ids: tuple[str, ...]
+    tasks: dict[str, _OperationTask] = field(default_factory=dict)
+    participants: dict[str, Mapping[str, Any]] = field(default_factory=dict)
+    dispatching: bool = False
 
 
 @dataclass(slots=True)
@@ -449,14 +480,55 @@ class NativeKernelProgramPort:
         self._current_owner_epoch = current_owner_epoch
         self._contexts: dict[str, _BoundContext] = {}
         self._tasks: dict[str, _OperationTask] = {}
-        self._pick_place_tasks: dict[str, _PickPlaceTask] = {}
+        self._coordinated_starts: dict[tuple[str, str], _CoordinatedStart] = {}
         self._scope_stops: dict[str, _ProgramScopeStop] = {}
         self._lock = RLock()
         self.operations = _NativeKernelOperationTaskPort(self)
         self.controls = _NativeKernelControlTaskPort(self)
         self.queries = _NativeTargetQueryPort(self)
-        self.pick_place = _NativePickPlaceTaskPort(self)
         self.scope = _NativeKernelProgramScopePort(self)
+
+    @staticmethod
+    def _synchronized_groups(
+        program: Mapping[str, Any],
+    ) -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
+        selected = program.get("synchronized_execution_groups", ())
+        if not isinstance(selected, (list, tuple)):
+            raise ProductionPortError("synchronized execution groups are invalid")
+        group_names = tuple(selected)
+        if any(not isinstance(name, str) or not name for name in group_names):
+            raise ProductionPortError("synchronized execution group identity is invalid")
+        members: dict[str, list[str]] = {name: [] for name in group_names}
+        tree = program.get("tree")
+        if not group_names:
+            return {}, {}
+        if not isinstance(tree, Mapping):
+            raise ProductionPortError("synchronized Program has no tree")
+        pending = [tree]
+        while pending:
+            node = pending.pop()
+            instance_id = _text(node.get("instance_id"), field="tree.instance_id")
+            groups = node.get("execution_groups", "inherit")
+            if isinstance(groups, (list, tuple)):
+                for group_name in group_names:
+                    if group_name in groups:
+                        members[group_name].append(instance_id)
+            children = node.get("children", ())
+            if not isinstance(children, (list, tuple)) or any(
+                not isinstance(child, Mapping) for child in children
+            ):
+                raise ProductionPortError("synchronized Program tree is invalid")
+            pending.extend(reversed(children))
+        exact = {name: tuple(sorted(values)) for name, values in members.items()}
+        by_node: dict[str, str] = {}
+        for group_name, values in exact.items():
+            if len(values) < 2:
+                raise ProductionPortError("synchronized execution group is incomplete")
+            for instance_id in values:
+                if instance_id in by_node:
+                    raise ProductionPortError("synchronized execution groups overlap")
+                by_node[instance_id] = group_name
+        return exact, by_node
 
     @staticmethod
     def _parse_context(
@@ -526,11 +598,16 @@ class NativeKernelProgramPort:
                 policy_id,
                 runtime_object_id,
             )
+        synchronized_groups, synchronized_node_groups = (
+            NativeKernelProgramPort._synchronized_groups(context.program)
+        )
         return _BoundContext(
             context,
             targets,
             contact_grasps,
             _text(request_owner_epoch, field="request_owner_epoch"),
+            synchronized_groups,
+            synchronized_node_groups,
         )
 
     def bind(self, context: ProgramRunPortContext) -> None:
@@ -555,16 +632,6 @@ class NativeKernelProgramPort:
         with self._lock:
             stop = self._scope_stops.get(program_run_id)
             has_scope_stop = stop is not None
-            tasks = tuple(
-                task
-                for task in self._tasks.values()
-                if task.identity.program_run_id == program_run_id
-            )
-            pick_place_tasks = tuple(
-                task
-                for task in self._pick_place_tasks.values()
-                if task.identity.program_run_id == program_run_id
-            )
         if has_scope_stop:
             scope = self._observe_scope(program_run_id)
             if scope.state is not ProgramRunScopeState.SETTLED:
@@ -572,10 +639,21 @@ class NativeKernelProgramPort:
                     "cannot unbind a Program run before aggregate Stop settlement"
                 )
             with self._lock:
-                for task in pick_place_tasks:
-                    self._pick_place_tasks.pop(task.sequence_id, None)
                 self._contexts.pop(program_run_id, None)
             return
+        tasks, local_tasks = self._run_operation_tasks(program_run_id)
+        if any(task.terminal is None and not task.held_before_admission for task in local_tasks):
+            raise ProductionPortError(
+                "cannot unbind a Program run with a staged coordinated operation"
+            )
+        with self._lock:
+            for task in local_tasks:
+                self._tasks.pop(task.task_id, None)
+            self._coordinated_starts = {
+                key: batch
+                for key, batch in self._coordinated_starts.items()
+                if key[0] != program_run_id
+            }
         completed: list[_OperationTask] = []
         for task in tasks:
             _operation, snapshot = self._observation(task)
@@ -590,18 +668,13 @@ class NativeKernelProgramPort:
         # operations keep only their small identity row until Program Reset
         # releases the corresponding resident Kernel operation.
         for task in completed:
-            self._acknowledge_task(task.operation_id, task.identity)
-        terminal_pick_place: list[_PickPlaceTask] = []
-        for task in pick_place_tasks:
-            snapshot = self._observe_pick_place_task(task.sequence_id)
-            if snapshot.state is OwnerTaskState.ACTIVE:
-                raise ProductionPortError(
-                    "cannot unbind a Program run with an active pick/place sequence"
-                )
-            terminal_pick_place.append(task)
+            assert task.operation is not None
+            for member_task_id in task.operation.member_task_ids:
+                with self._lock:
+                    member = self._tasks.get(member_task_id)
+                if member is not None and member.operation is task.operation:
+                    self._acknowledge_task(member_task_id, member.identity)
         with self._lock:
-            for task in terminal_pick_place:
-                self._pick_place_tasks.pop(task.sequence_id, None)
             self._contexts.pop(program_run_id, None)
 
     def _context(self, program_run_id: str) -> _BoundContext:
@@ -762,6 +835,30 @@ class NativeKernelProgramPort:
             raise ProductionPortError(
                 "runtime-object motion references require the N7-a5.3b " "scene-binding join"
             )
+        contact_policy_id = parameters.get("contact_policy_id")
+        contact_scene_resource_id = parameters.get("contact_scene_resource_id")
+        runtime_object_bindings: list[dict[str, str]] = []
+        if (contact_policy_id is None) != (contact_scene_resource_id is None):
+            raise ProductionPortError(
+                "contact policy and contact scene resource must be supplied together"
+            )
+        if contact_policy_id is not None:
+            policy_id = _text(contact_policy_id, field="contact_policy_id")
+            scene_resource_id = _text(
+                contact_scene_resource_id, field="contact_scene_resource_id"
+            )
+            try:
+                contact = context.contact_grasps[policy_id]
+            except KeyError as exc:
+                raise ProductionPortError(
+                    "Program Binding has no exact motion contact-grasp policy"
+                ) from exc
+            runtime_object_bindings.append(
+                {
+                    "runtime_object_id": contact.runtime_object_id,
+                    "scene_resource_id": scene_resource_id,
+                }
+            )
         payload = {
             "kind": "motion",
             "move_id": _request_identity("move", identity.program_run_id, identity.node_attempt_id),
@@ -792,10 +889,10 @@ class NativeKernelProgramPort:
                 target_role_id=target_role_id,
                 base_frame_role_id=base_frame_role_id,
             ),
-            "contact_policy_id": parameters.get("contact_policy_id"),
+            "contact_policy_id": contact_policy_id,
             "per_joint_dynamics_limits": dict(parameters.get("per_joint_dynamics_limits", {})),
             "motion_interrupt_scopes": [],
-            "runtime_object_bindings": [],
+            "runtime_object_bindings": runtime_object_bindings,
         }
         return context, target, payload
 
@@ -1064,7 +1161,7 @@ class NativeKernelProgramPort:
         tool = self._target(context, tool_role_id, "tool.gripper.command")
         owner_epoch, scene_revision = self._owner_status(context)
         selected_object_id = _text(parameters.get("selected_object_id"), field="selected_object_id")
-        kind = "place" if node_id == "motion.place_object" else "pick"
+        kind = "place" if node_id == "planning.plan_place_sequence" else "pick"
         sequence_id = _request_identity(
             kind,
             identity.program_run_id,
@@ -1262,25 +1359,23 @@ class NativeKernelProgramPort:
         return prefix
 
     @staticmethod
-    def _portable_pick_planning_output(
+    def _portable_pick_place_planning_output(
         planning: Mapping[str, Any],
         *,
         target_role_id: str,
         base_frame_role_id: str,
+        tool_position: object,
     ) -> dict[str, Any]:
-        """Project diagnostic candidate geometry, never its prepared plan."""
+        """Expose the validated geometry to ordinary subtree children."""
 
-        candidate = _mapping(
-            planning.get("last_attempted_candidate"),
-            field="last_attempted_candidate",
-        )
+        plan = _mapping(planning.get("plan"), field="plan")
 
-        def stored_pose(name: str) -> dict[str, Any]:
-            pose = _mapping(candidate.get(name), field=name)
-            position = _mapping(pose.get("position_m"), field=f"{name}.position_m")
+        def stored_pose(value: object, *, field: str) -> dict[str, Any]:
+            pose = _mapping(value, field=field)
+            position = _mapping(pose.get("position_m"), field=f"{field}.position_m")
             orientation = _mapping(
                 pose.get("orientation"),
-                field=f"{name}.orientation",
+                field=f"{field}.orientation",
             )
             return {
                 "frame_ref": {
@@ -1289,92 +1384,57 @@ class NativeKernelProgramPort:
                     "frame_role": base_frame_role_id,
                 },
                 "position_m": [
-                    _number(position.get(axis), field=f"{name}.position_m.{axis}")
+                    _number(position.get(axis), field=f"{field}.position_m.{axis}")
                     for axis in ("x_m", "y_m", "z_m")
                 ],
                 "orientation": {
                     "xyzw": [
                         _number(
                             orientation.get(axis),
-                            field=f"{name}.orientation.{axis}",
+                            field=f"{field}.orientation.{axis}",
                         )
                         for axis in ("x", "y", "z", "w")
                     ]
                 },
             }
 
+        approach = _mapping(plan.get("approach_motion"), field="approach_motion")
+        descend = _mapping(plan.get("descend_motion"), field="descend_motion")
+        retreat = _mapping(plan.get("retreat_motion"), field="retreat_motion")
+        if approach.get("kind") != "pose_goal":
+            raise ProductionPortError("pick/place approach is not a pose goal")
+        if descend.get("kind") != "cartesian_path" or retreat.get("kind") != "cartesian_path":
+            raise ProductionPortError("pick/place descend and retreat are not Cartesian paths")
+
+        def path(value: Mapping[str, Any], *, field: str) -> list[dict[str, Any]]:
+            waypoints = _sequence(value.get("waypoints"), field=f"{field}.waypoints")
+            if len(waypoints) < 2:
+                raise ProductionPortError(f"{field}.waypoints must contain at least two poses")
+            return [
+                stored_pose(waypoint, field=f"{field}.waypoints[{index}]")
+                for index, waypoint in enumerate(waypoints)
+            ]
+
+        descend_path = path(descend, field="descend_motion")
+        retreat_path = path(retreat, field="retreat_motion")
+
+        approach_pose = stored_pose(
+            approach.get("goal"), field="approach_motion.goal"
+        )
         return {
-            "approach_pose": stored_pose("approach_pose"),
-            "pick_pose": stored_pose("pick_pose"),
-            "retreat_pose": stored_pose("retreat_pose"),
+            "approach_pose": approach_pose,
+            "descend_path": descend_path,
+            "pick_pose": descend_path[-1],
+            "retreat_path": retreat_path,
+            "retreat_pose": retreat_path[-1],
             "selected_object_id": _text(
                 planning.get("selected_object_id"),
                 field="selected_object_id",
             ),
+            "tool_position": dict(_mapping(tool_position, field="tool_position")),
         }
 
-    @staticmethod
-    def _sequence_snapshot(
-        task: _PickPlaceTask,
-        status: Mapping[str, Any],
-    ) -> OwnerTaskSnapshot:
-        phase = status.get("phase")
-        if (
-            status.get("schema_version") != "manyforge.pick_place_sequence_status.v1"
-            or status.get("sequence_id") != task.sequence_id
-            or status.get("kind") != task.kind
-            or status.get("selected_object_id") != task.selected_object_id
-        ):
-            raise ProductionPortError("pick/place sequence response changed its public identity")
-        metadata: dict[str, Any] = {
-            "sequence_id": task.sequence_id,
-            "planning_result": dict(task.planning_result),
-            "sequence_status": dict(status),
-        }
-        if phase in {
-            "approach",
-            "descend",
-            "tool_command",
-            "scene_transition",
-            "retreat",
-        }:
-            return OwnerTaskSnapshot(
-                task_id=task.sequence_id,
-                state=OwnerTaskState.ACTIVE,
-                metadata=metadata,
-            )
-        if phase == "completed":
-            return OwnerTaskSnapshot(
-                task_id=task.sequence_id,
-                state=OwnerTaskState.SUCCEEDED,
-                metadata=metadata,
-            )
-        error = status.get("terminal_error")
-        error_value = error if isinstance(error, Mapping) else {}
-        reason_code = error_value.get("code")
-        message = error_value.get("message")
-        if not isinstance(reason_code, str) or not reason_code:
-            reason_code = f"pick_place_{phase or 'failed'}"
-        if not isinstance(message, str):
-            message = "native pick/place sequence did not complete"
-        if phase == "intervention_required":
-            metadata.update(
-                {
-                    "authored_failure_policy": "pause_for_operator",
-                    "authored_failure_policy_parameter": "owner_terminal_phase",
-                }
-            )
-        if phase not in {"failed", "intervention_required"}:
-            raise ProductionPortError("pick/place sequence has an unknown phase")
-        return OwnerTaskSnapshot(
-            task_id=task.sequence_id,
-            state=OwnerTaskState.FAILED,
-            metadata=metadata,
-            reason_code=reason_code,
-            message=message,
-        )
-
-    def _start_pick_place(
+    def _start_pick_place_planning(
         self,
         node_id: str,
         identity: NodeAttemptIdentity,
@@ -1382,112 +1442,82 @@ class NativeKernelProgramPort:
     ) -> OwnerTaskSnapshot:
         if node_id not in {
             "planning.plan_pick_sequence",
-            "motion.pick_object",
-            "motion.place_object",
+            "planning.plan_place_sequence",
         }:
-            raise ProductionPortError(f"pick/place port does not implement {node_id!r}")
+            raise ProductionPortError(f"pick/place planner does not implement {node_id!r}")
         kind, selected_object_id, intent = self._pick_place_intent(
             node_id,
             identity,
             inputs.parameters,
         )
-
-        def admit() -> OwnerTaskSnapshot:
-            if node_id == "planning.plan_pick_sequence":
-                response = self._kernel.plan_pick(intent)
-            elif node_id == "motion.pick_object":
-                response = self._kernel.start_pick(intent)
-            else:
-                response = self._kernel.start_place(intent)
-            response_value = _mapping(response, field="pick/place response")
-            planning = self._validated_planning_result(
-                response_value,
-                sequence_id=intent["sequence_id"],
-                kind=kind,
-                selected_object_id=selected_object_id,
-            )
-            metadata: dict[str, Any] = {
-                "sequence_id": intent["sequence_id"],
-                "planning_result": planning,
-            }
-            if planning["status"] == "no_feasible_candidate":
-                if kind == "pick":
-                    metadata.update(
-                        {
-                            "authored_failure_policy": inputs.parameters.get(
-                                "no_feasible_plan_policy",
-                                "pause_for_operator",
-                            ),
-                            "authored_failure_policy_parameter": ("no_feasible_plan_policy"),
-                        }
-                    )
-                snapshot = OwnerTaskSnapshot(
-                    task_id=intent["sequence_id"],
-                    state=OwnerTaskState.FAILED,
-                    metadata=metadata,
-                    reason_code="no_feasible_candidate",
-                    message=self._no_feasible_candidate_message(planning),
-                )
-            elif node_id == "planning.plan_pick_sequence":
-                snapshot = OwnerTaskSnapshot(
-                    task_id=intent["sequence_id"],
-                    state=OwnerTaskState.SUCCEEDED,
-                    output=self._portable_pick_planning_output(
-                        planning,
-                        target_role_id=_text(
-                            inputs.parameters.get("target_role"),
-                            field="target_role",
-                        ),
-                        base_frame_role_id=_text(
-                            inputs.parameters.get("base_frame_role"),
-                            field="base_frame_role",
-                        ),
-                    ),
-                    metadata=metadata,
-                )
-            else:
-                status = _mapping(
-                    response_value.get("sequence_status"),
-                    field="sequence_status",
-                )
-                provisional = _PickPlaceTask(
-                    identity,
-                    node_id,
-                    intent["sequence_id"],
-                    kind,
-                    selected_object_id,
-                    planning,
-                    OwnerTaskSnapshot(
-                        task_id=intent["sequence_id"],
-                        state=OwnerTaskState.ACTIVE,
-                    ),
-                )
-                snapshot = self._sequence_snapshot(provisional, status)
-            task = _PickPlaceTask(
-                identity,
-                node_id,
-                intent["sequence_id"],
-                kind,
-                selected_object_id,
-                planning,
-                snapshot,
-            )
-            with self._lock:
-                current = self._pick_place_tasks.get(task.sequence_id)
-                if current is not None and (
-                    current.identity != identity or current.node_id != node_id
-                ):
-                    raise ProductionPortError("pick/place task identity was reused")
-                if current is None:
-                    if len(self._tasks) + len(self._pick_place_tasks) >= _MAX_TASKS:
-                        raise ProductionPortError("native task retention is full")
-                    self._pick_place_tasks[task.sequence_id] = task
-                else:
-                    task = current
-            return task.snapshot
-
         self._require_scope_open(identity.program_run_id)
-        return admit()
+        response = (
+            self._kernel.plan_pick(intent)
+            if kind == "pick"
+            else self._kernel.plan_place(intent)
+        )
+        response_value = _mapping(response, field="pick/place response")
+        planning = self._validated_planning_result(
+            response_value,
+            sequence_id=intent["sequence_id"],
+            kind=kind,
+            selected_object_id=selected_object_id,
+        )
+        metadata: dict[str, Any] = {
+            "sequence_id": intent["sequence_id"],
+            "planning_result": planning,
+        }
+        if planning["status"] == "no_feasible_candidate":
+            if kind == "pick":
+                metadata.update(
+                    {
+                        "authored_failure_policy": inputs.parameters.get(
+                            "no_feasible_plan_policy", "pause_for_operator"
+                        ),
+                        "authored_failure_policy_parameter": "no_feasible_plan_policy",
+                    }
+                )
+            snapshot = OwnerTaskSnapshot(
+                task_id=intent["sequence_id"],
+                state=OwnerTaskState.FAILED,
+                metadata=metadata,
+                reason_code="no_feasible_candidate",
+                message=self._no_feasible_candidate_message(planning),
+                settlement_proven=True,
+            )
+        else:
+            snapshot = OwnerTaskSnapshot(
+                task_id=intent["sequence_id"],
+                state=OwnerTaskState.SUCCEEDED,
+                output=self._portable_pick_place_planning_output(
+                    planning,
+                    target_role_id=_text(
+                        inputs.parameters.get("target_role"), field="target_role"
+                    ),
+                    base_frame_role_id=_text(
+                        inputs.parameters.get("base_frame_role"),
+                        field="base_frame_role",
+                    ),
+                    tool_position=inputs.parameters.get("tool_position"),
+                ),
+                metadata=metadata,
+                settlement_proven=True,
+            )
+        task = _OperationTask(
+            identity, node_id, intent["sequence_id"], terminal=snapshot
+        )
+        with self._lock:
+            current = self._tasks.get(task.task_id)
+            if current is not None and current != task:
+                raise ProductionPortError("pick/place planning task identity was reused")
+            if current is None:
+                if len(self._tasks) >= _MAX_TASKS:
+                    raise ProductionPortError("native task retention is full")
+                self._tasks[task.task_id] = task
+            else:
+                task = current
+        assert task.terminal is not None
+        return task.terminal
 
     def _start(
         self,
@@ -1499,6 +1529,11 @@ class NativeKernelProgramPort:
             raise TypeError("operation start requires one node-attempt identity")
         if not isinstance(inputs, OwnerNodeInputs):
             raise TypeError("operation start requires immutable owner inputs")
+        if node_id in {
+            "planning.plan_pick_sequence",
+            "planning.plan_place_sequence",
+        }:
+            return self._start_pick_place_planning(node_id, identity, inputs)
         if node_id in _MOTION_NODE_IDS:
             context, target, payload = self._motion_payload(node_id, inputs.parameters, identity)
             capability_id = "execution.trajectory.execute"
@@ -1507,10 +1542,6 @@ class NativeKernelProgramPort:
             capability_id = "tool.gripper.command"
         else:
             raise ProductionPortError(f"Kernel operation port does not implement {node_id!r}")
-        owner_epoch, scene_revision = self._owner_status(context)
-        request_id = _request_identity(
-            "program-node", identity.program_run_id, identity.node_attempt_id
-        )
         span = ActionSpan(
             action_source="program_node",
             action_span_id=identity.node_attempt_id,
@@ -1519,66 +1550,304 @@ class NativeKernelProgramPort:
             node_attempt_id=identity.node_attempt_id,
             parent_node_attempt_id=identity.parent_node_attempt_id,
         )
-
-        def admit() -> OwnerTaskSnapshot:
-            accepted = self._kernel.execute(
-                {
-                    "request_context": {
-                        "request_id": request_id,
-                        "request_owner_epoch": owner_epoch,
-                        "source_label": "manyforge_behavior",
-                        "correlation_id": identity.program_run_id,
-                    },
-                    "program_id": context.capture.program_id,
-                    "program_revision": context.capture.program_revision,
-                    "program_binding_id": context.capture.program_binding_id,
-                    "program_run_id": context.capture.program_run_id,
-                    "expected_graph_revision": context.capture.graph_revision,
-                    "expected_retained_bundle_id": (context.capture.retained_bundle_id),
-                    "expected_scene_revision": scene_revision,
-                    "participants": [
-                        {
-                            "component_role_id": target.component_role_id,
-                            "target_role_id": target.target_role_id,
-                            "required_capability_id": capability_id,
-                            "action_span": span.as_request(),
-                            "execution_scope": {
-                                "node_instance_id": identity.node_instance_id,
-                                "node_attempt_id": identity.node_attempt_id,
-                            },
-                            "payload": payload,
-                        }
-                    ],
-                    "coordination_policy": "independent",
-                }
+        participant = {
+            "component_role_id": target.component_role_id,
+            "target_role_id": target.target_role_id,
+            "required_capability_id": capability_id,
+            "action_span": span.as_request(),
+            "execution_scope": {
+                "node_instance_id": identity.node_instance_id,
+                "node_attempt_id": identity.node_attempt_id,
+            },
+            "payload": payload,
+        }
+        self._require_scope_open(identity.program_run_id)
+        synchronized_group = context.synchronized_node_groups.get(
+            identity.node_instance_id
+        )
+        if synchronized_group is not None:
+            if node_id not in _MOTION_NODE_IDS:
+                raise ProductionPortError(
+                    "only ordinary motion may use synchronized execution"
+                )
+            return self._stage_coordinated_start(
+                context,
+                synchronized_group,
+                identity,
+                node_id,
+                participant,
             )
-            accepted_value = _mapping(accepted.get("accepted"), field="acceptance")
-            operation_id = _text(
-                accepted_value.get("operation_id"),
-                field="accepted.operation_id",
+        owner_epoch, scene_revision = self._owner_status(context)
+        request_id = _request_identity(
+            "program-node", identity.program_run_id, identity.node_attempt_id
+        )
+        operation_intent = self._operation_intent(
+            context,
+            request_id=request_id,
+            owner_epoch=owner_epoch,
+            scene_revision=scene_revision,
+            participants=[participant],
+            coordination_policy="independent",
+        )
+        try:
+            accepted = self._kernel.execute(operation_intent)
+        except KernelOperationAdmissionRejectedError as error:
+            revision = _held_selection_revision(error)
+            if revision is not None:
+                raise OwnerInvocationHeldError(revision) from error
+            raise
+        except Exception as error:
+            # The owner may already have accepted the deterministic request.
+            # Keep that exact intent for destructive Reset reconciliation; a
+            # later fresh attempt must never replace its unknown outcome.
+            task_id = request_id
+            unknown = _UnknownOperationAdmission(
+                request_id,
+                owner_epoch,
+                deepcopy(operation_intent),
+                frozenset({task_id}),
+            )
+            terminal = OwnerTaskSnapshot(
+                task_id=task_id,
+                state=OwnerTaskState.FAILED,
+                reason_code="operation_admission_outcome_unknown",
+                message=str(error),
+                settlement_proven=False,
+                metadata={"request_id": request_id},
+            )
+            task = _OperationTask(
+                identity,
+                node_id,
+                task_id,
+                terminal=terminal,
+                unknown_admission=unknown,
             )
             with self._lock:
-                current = self._tasks.get(operation_id)
-                task = _OperationTask(
-                    identity,
-                    node_id,
-                    operation_id,
-                    owner_epoch,
-                )
-                if current is not None and current != task:
+                if task_id in self._tasks:
                     raise ProductionPortError("native operation identity was reused")
-                if current is None:
-                    if len(self._tasks) >= _MAX_TASKS:
-                        raise ProductionPortError("native operation-task retention is full")
-                    self._tasks[operation_id] = task
-            return OwnerTaskSnapshot(
-                task_id=operation_id,
-                state=OwnerTaskState.ACTIVE,
-                metadata={"operation_id": operation_id},
-            )
+                if len(self._tasks) >= _MAX_TASKS:
+                    raise ProductionPortError("native operation-task retention is full")
+                self._tasks[task_id] = task
+            return terminal
+        accepted_value = _mapping(accepted.get("accepted"), field="acceptance")
+        operation_id = _text(
+            accepted_value.get("operation_id"), field="accepted.operation_id"
+        )
+        shared = _SharedOperation(
+            operation_id,
+            owner_epoch,
+            frozenset({identity.node_attempt_id}),
+            frozenset({operation_id}),
+        )
+        task = _OperationTask(identity, node_id, operation_id, shared)
+        with self._lock:
+            current = self._tasks.get(operation_id)
+            if current is not None and current != task:
+                raise ProductionPortError("native operation identity was reused")
+            if current is None:
+                if len(self._tasks) >= _MAX_TASKS:
+                    raise ProductionPortError("native operation-task retention is full")
+                self._tasks[operation_id] = task
+        return OwnerTaskSnapshot(
+            task_id=operation_id,
+            state=OwnerTaskState.ACTIVE,
+            metadata={"operation_id": operation_id},
+        )
 
-        self._require_scope_open(identity.program_run_id)
-        return admit()
+    @staticmethod
+    def _operation_intent(
+        context: _BoundContext,
+        *,
+        request_id: str,
+        owner_epoch: str,
+        scene_revision: Mapping[str, Any],
+        participants: Sequence[Mapping[str, Any]],
+        coordination_policy: str,
+    ) -> dict[str, Any]:
+        return {
+            "request_context": {
+                "request_id": request_id,
+                "request_owner_epoch": owner_epoch,
+                "source_label": "manyforge_behavior",
+                "correlation_id": context.capture.program_run_id,
+            },
+            "program_id": context.capture.program_id,
+            "program_revision": context.capture.program_revision,
+            "program_binding_id": context.capture.program_binding_id,
+            "program_run_id": context.capture.program_run_id,
+            "expected_graph_revision": context.capture.graph_revision,
+            "expected_retained_bundle_id": context.capture.retained_bundle_id,
+            "expected_scene_revision": dict(scene_revision),
+            "participants": [dict(participant) for participant in participants],
+            "coordination_policy": coordination_policy,
+        }
+
+    def _stage_coordinated_start(
+        self,
+        context: _BoundContext,
+        group_id: str,
+        identity: NodeAttemptIdentity,
+        node_id: str,
+        participant: Mapping[str, Any],
+    ) -> OwnerTaskSnapshot:
+        task_id = _request_identity(
+            "program-coordinated-node",
+            identity.program_run_id,
+            identity.node_attempt_id,
+        )
+        key = (identity.program_run_id, group_id)
+        with self._lock:
+            if task_id in self._tasks:
+                raise ProductionPortError("coordinated node attempt was already staged")
+            if len(self._tasks) >= _MAX_TASKS:
+                raise ProductionPortError("native operation-task retention is full")
+            expected = context.synchronized_groups[group_id]
+            batch = self._coordinated_starts.get(key)
+            if batch is None:
+                batch = _CoordinatedStart(group_id, expected)
+                self._coordinated_starts[key] = batch
+            if batch.expected_node_ids != expected or batch.dispatching:
+                raise ProductionPortError("coordinated start occurrence is already active")
+            if identity.node_instance_id not in expected:
+                raise ProductionPortError("coordinated node is outside its captured group")
+            if identity.node_instance_id in batch.tasks:
+                raise ProductionPortError("coordinated group repeats a node occurrence")
+            task = _OperationTask(identity, node_id, task_id)
+            batch.tasks[identity.node_instance_id] = task
+            batch.participants[identity.node_instance_id] = dict(participant)
+            self._tasks[task_id] = task
+            if len(batch.tasks) != len(expected):
+                return OwnerTaskSnapshot(
+                    task_id=task_id,
+                    state=OwnerTaskState.ACTIVE,
+                    metadata={
+                        "synchronized_group_id": group_id,
+                        "preparation_state": "waiting_for_participants",
+                    },
+                )
+            batch.dispatching = True
+            tasks = tuple(batch.tasks[node] for node in expected)
+            participants = tuple(batch.participants[node] for node in expected)
+
+        request_id = _request_identity(
+            "program-coordinated-operation",
+            identity.program_run_id,
+            group_id,
+            *(task.identity.node_attempt_id for task in tasks),
+        )
+        try:
+            owner_epoch, scene_revision = self._owner_status(context)
+        except Exception as error:
+            # No operation submission was attempted, so this local failure is
+            # conclusively effect-free.
+            with self._lock:
+                self._coordinated_starts.pop(key, None)
+                for staged in tasks:
+                    staged.terminal = OwnerTaskSnapshot(
+                        task_id=staged.task_id,
+                        state=OwnerTaskState.FAILED,
+                        reason_code="coordinated_admission_preflight_failed",
+                        message=str(error),
+                        settlement_proven=True,
+                        metadata={
+                            "request_id": request_id,
+                            "synchronized_group_id": group_id,
+                        },
+                    )
+            assert task.terminal is not None
+            return task.terminal
+
+        operation_intent = self._operation_intent(
+            context,
+            request_id=request_id,
+            owner_epoch=owner_epoch,
+            scene_revision=scene_revision,
+            participants=participants,
+            coordination_policy="coordinated_all",
+        )
+        try:
+            accepted = self._kernel.execute(operation_intent)
+            accepted_value = _mapping(accepted.get("accepted"), field="acceptance")
+            operation_id = _text(
+                accepted_value.get("operation_id"), field="accepted.operation_id"
+            )
+        except KernelOperationAdmissionRejectedError as error:
+            code = error.code
+            revision = _held_selection_revision(error)
+            held = revision is not None
+            with self._lock:
+                self._coordinated_starts.pop(key, None)
+                for staged in tasks:
+                    if held:
+                        staged.held_before_admission = True
+                    else:
+                        staged.terminal = OwnerTaskSnapshot(
+                            task_id=staged.task_id,
+                            state=OwnerTaskState.FAILED,
+                            reason_code=(code or "coordinated_admission_failed"),
+                            message=str(error),
+                            settlement_proven=True,
+                            metadata={
+                                "request_id": request_id,
+                                "synchronized_group_id": group_id,
+                            },
+                        )
+                if held:
+                    self._tasks.pop(task_id, None)
+            if held:
+                raise OwnerInvocationHeldError(revision) from error
+            assert task.terminal is not None
+            return task.terminal
+        except Exception as error:
+            # Delivery, response parsing, and response-identity failures are
+            # outcome-unknown: acceptance may already be durable in the
+            # Kernel. Retain the attempts until Program Stop/Reset reconciles
+            # the run; never turn uncertainty into settlement proof.
+            with self._lock:
+                self._coordinated_starts.pop(key, None)
+                unknown = _UnknownOperationAdmission(
+                    request_id,
+                    owner_epoch,
+                    deepcopy(operation_intent),
+                    frozenset(staged.task_id for staged in tasks),
+                )
+                for staged in tasks:
+                    staged.terminal = OwnerTaskSnapshot(
+                        task_id=staged.task_id,
+                        state=OwnerTaskState.FAILED,
+                        reason_code="coordinated_admission_outcome_unknown",
+                        message=str(error),
+                        settlement_proven=False,
+                        metadata={
+                            "request_id": request_id,
+                            "synchronized_group_id": group_id,
+                        },
+                    )
+                    staged.unknown_admission = unknown
+            assert task.terminal is not None
+            return task.terminal
+
+        shared = _SharedOperation(
+            operation_id,
+            owner_epoch,
+            frozenset(task.identity.node_attempt_id for task in tasks),
+            frozenset(task.task_id for task in tasks),
+        )
+        with self._lock:
+            current = self._coordinated_starts.get(key)
+            if current is not batch:
+                raise ProductionPortError("coordinated start changed during admission")
+            for staged in tasks:
+                staged.operation = shared
+            self._coordinated_starts.pop(key, None)
+        return OwnerTaskSnapshot(
+            task_id=task_id,
+            state=OwnerTaskState.ACTIVE,
+            metadata={
+                "operation_id": operation_id,
+                "synchronized_group_id": group_id,
+            },
+        )
 
     @staticmethod
     def _terminal_error(operation: Mapping[str, Any]) -> tuple[str, str]:
@@ -1607,21 +1876,24 @@ class NativeKernelProgramPort:
         return assessment
 
     def _observation(self, task: _OperationTask) -> tuple[dict[str, Any], OwnerTaskSnapshot]:
+        shared = task.operation
+        if shared is None:
+            raise ProductionPortError("coordinated operation has not been admitted")
         try:
-            envelope = self._kernel.operation(task.operation_id)
+            envelope = self._kernel.operation(shared.operation_id)
         except KernelOperationObservationUnavailableError as exc:
             raise OwnerTaskObservationUnavailableError(
                 "accepted native operation is temporarily unavailable to observe"
             ) from exc
         operation = dict(_mapping(envelope.get("operation"), field="operation"))
         if (
-            operation.get("operation_id") != task.operation_id
+            operation.get("operation_id") != shared.operation_id
             or operation.get("program_run_id") != task.identity.program_run_id
         ):
             raise ProductionPortError("native operation observation changed identity")
         state = operation.get("state")
         metadata = {
-            "operation_id": task.operation_id,
+            "operation_id": shared.operation_id,
             "operation_revision": operation.get("operation_revision"),
         }
         stop_id = operation.get("active_stop_id")
@@ -1636,37 +1908,37 @@ class NativeKernelProgramPort:
             metadata["active_stop_generation"] = stop_generation
         if state in _ACTIVE_STATES:
             snapshot = OwnerTaskSnapshot(
-                task_id=task.operation_id,
+                task_id=task.task_id,
                 state=OwnerTaskState.ACTIVE,
                 metadata=metadata,
             )
         elif state == ExecutionState.COMPLETED.value:
             snapshot = OwnerTaskSnapshot(
-                task_id=task.operation_id,
+                task_id=task.task_id,
                 state=OwnerTaskState.SUCCEEDED,
                 metadata=metadata,
             )
         elif state in _INTERRUPTED_STATES:
-            assessment = self._recovery_assessment(operation, task.operation_id)
+            assessment = self._recovery_assessment(operation, shared.operation_id)
             if assessment is not None:
                 metadata["recovery_assessment"] = assessment
                 if assessment.get("recovery_class") in (PROGRAM_MOTION_STOP_RECOVERY_CLASSES):
                     metadata["authored_failure_policy"] = "pause_for_operator"
                     metadata["authored_failure_policy_parameter"] = "operator_stop_policy"
             snapshot = OwnerTaskSnapshot(
-                task_id=task.operation_id,
+                task_id=task.task_id,
                 state=OwnerTaskState.INTERRUPTED,
                 metadata=metadata,
                 reason_code=f"operation_{state}",
                 message="native operation was interrupted",
             )
         elif state in _FAILED_STATES:
-            assessment = self._recovery_assessment(operation, task.operation_id)
+            assessment = self._recovery_assessment(operation, shared.operation_id)
             if assessment is not None:
                 metadata["recovery_assessment"] = assessment
             reason_code, message = self._terminal_error(operation)
             snapshot = OwnerTaskSnapshot(
-                task_id=task.operation_id,
+                task_id=task.task_id,
                 state=OwnerTaskState.FAILED,
                 metadata=metadata,
                 reason_code=reason_code,
@@ -1763,24 +2035,42 @@ class NativeKernelProgramPort:
         task = self._task(task_id)
         if task.identity != identity:
             raise ProductionPortError("operation recovery changed node attempt")
-        operation, snapshot = self._observation(task)
-        result = self._apply_operation_recovery(
-            task.operation_id,
-            identity,
-            operation,
-            snapshot,
-            action=action,
-            request_id=request_id,
-            reason=reason,
-        )
+        shared = task.operation
+        if shared is None:
+            raise ProductionPortError("unadmitted operation has no recovery action")
+        with self._lock:
+            cached = shared.recovery_result
+            cached_action = shared.recovery_action
+        if cached is None:
+            operation, snapshot = self._observation(task)
+            result = self._apply_operation_recovery(
+                shared.operation_id,
+                identity,
+                operation,
+                snapshot,
+                action=action,
+                request_id=request_id,
+                reason=reason,
+            )
+            if result.get("accepted") is True:
+                with self._lock:
+                    if shared.recovery_result is None:
+                        shared.recovery_result = dict(result)
+                        shared.recovery_action = action
+        else:
+            if cached_action != action:
+                raise ProductionPortError(
+                    "coordinated operation recovery action changed between members"
+                )
+            result = {**cached, "request_id": request_id}
         if result.get("accepted") is True:
-            # Kernel recovery made this stopped occurrence historical.  The
-            # behavior-tree retry owns the fresh attempt, so retaining the old
-            # task would make the shared native backend's next snapshot appear
-            # under both identities and grow Program-scope work per Resume.
             with self._lock:
-                if self._tasks.get(task_id) is task:
-                    self._tasks.pop(task_id, None)
+                shared.recovered_attempt_ids.add(identity.node_attempt_id)
+                if shared.recovered_attempt_ids == set(shared.member_attempt_ids):
+                    for member_task_id in shared.member_task_ids:
+                        member = self._tasks.get(member_task_id)
+                        if member is not None and member.operation is shared:
+                            self._tasks.pop(member_task_id, None)
         return result
 
     def _task(self, task_id: str) -> _OperationTask:
@@ -1790,14 +2080,57 @@ class NativeKernelProgramPort:
             except KeyError as exc:
                 raise ProductionPortError("native operation task is not retained") from exc
 
+    def _run_operation_tasks(
+        self, program_run_id: str
+    ) -> tuple[tuple[_OperationTask, ...], tuple[_OperationTask, ...]]:
+        """Return one representative per native operation plus local staged work."""
+
+        with self._lock:
+            representatives: dict[str, _OperationTask] = {}
+            local: list[_OperationTask] = []
+            for task in self._tasks.values():
+                if task.identity.program_run_id != program_run_id:
+                    continue
+                if task.operation is None:
+                    local.append(task)
+                else:
+                    representatives.setdefault(task.operation.operation_id, task)
+            return tuple(representatives.values()), tuple(local)
+
     def _cancel(self, task: _OperationTask, reason: str | None) -> None:
+        if task.held_before_admission:
+            with self._lock:
+                self._tasks.pop(task.task_id, None)
+            return
+        if task.terminal is not None:
+            return
+        if task.operation is None:
+            # No native effect exists yet.  Remove this sibling from the one
+            # local preparation barrier; the Parallel parent will invalidate
+            # the remaining staged siblings when another child fails.
+            with self._lock:
+                for key, batch in tuple(self._coordinated_starts.items()):
+                    if batch.dispatching:
+                        continue
+                    instance_id = task.identity.node_instance_id
+                    if batch.tasks.get(instance_id) is not task:
+                        continue
+                    batch.tasks.pop(instance_id, None)
+                    batch.participants.pop(instance_id, None)
+                    self._tasks.pop(task.task_id, None)
+                    if not batch.tasks:
+                        self._coordinated_starts.pop(key, None)
+                    return
+            raise ProductionPortError("staged coordinated task is not retained")
         operation, snapshot = self._observation(task)
         if snapshot.state is not OwnerTaskState.ACTIVE:
             return
+        shared = task.operation
+        assert shared is not None
         with self._lock:
-            if task.stop_requested or operation.get("state") == "stopping":
+            if shared.stop_requested or operation.get("state") == "stopping":
                 return
-            task.stop_requested = True
+            shared.stop_requested = True
         revision = operation.get("operation_revision")
         stop_generation = operation.get("active_stop_generation")
         if type(revision) is not int or revision < 1:
@@ -1815,7 +2148,7 @@ class NativeKernelProgramPort:
                         "request_id": _request_identity(
                             "program-stop",
                             task.identity.program_run_id,
-                            task.operation_id,
+                            shared.operation_id,
                         ),
                         "request_owner_epoch": owner_epoch,
                         "source_label": "manyforge_behavior",
@@ -1823,7 +2156,7 @@ class NativeKernelProgramPort:
                     },
                     "operations": [
                         {
-                            "operation_id": task.operation_id,
+                            "operation_id": shared.operation_id,
                             "expected_operation_revision": revision,
                             "expected_stop_generation": stop_generation,
                         }
@@ -1833,7 +2166,7 @@ class NativeKernelProgramPort:
             )
         except Exception:
             with self._lock:
-                task.stop_requested = False
+                shared.stop_requested = False
             raise
 
     def _cancel_task(self, task_id: str, identity: NodeAttemptIdentity) -> None:
@@ -1850,8 +2183,25 @@ class NativeKernelProgramPort:
         task = self._task(task_id)
         if task.identity != identity:
             raise ProductionPortError("operation acknowledgement changed node attempt")
+        if task.terminal is not None:
+            if not task.terminal.settlement_proven:
+                raise ProductionPortError("terminal local task has no settlement proof")
+            with self._lock:
+                self._tasks.pop(task_id, None)
+            return
+        shared = task.operation
+        if shared is None:
+            raise ProductionPortError("unadmitted operation cannot be acknowledged")
         with self._lock:
-            revision = task.completed_revision
+            revision = shared.completed_revision
+            remaining = shared.member_attempt_ids - shared.acknowledged_attempt_ids
+            if identity.node_attempt_id not in remaining:
+                raise ProductionPortError("operation member was already acknowledged")
+            last = len(remaining) == 1
+            if not last:
+                shared.acknowledged_attempt_ids.add(identity.node_attempt_id)
+                self._tasks.pop(task_id, None)
+                return
         if revision is None:
             operation, snapshot = self._observation(task)
             if snapshot.state is not OwnerTaskState.SUCCEEDED:
@@ -1861,17 +2211,17 @@ class NativeKernelProgramPort:
             raise ProductionPortError("native operation revision is invalid")
         try:
             self._kernel.acknowledge_completed(
-                task.operation_id,
+                shared.operation_id,
                 {
                     "request_context": {
                         "request_id": _request_identity(
-                            "program-ack", identity.program_run_id, task.operation_id
+                            "program-ack", identity.program_run_id, shared.operation_id
                         ),
-                        "request_owner_epoch": task.request_owner_epoch,
+                        "request_owner_epoch": shared.request_owner_epoch,
                         "source_label": "manyforge_behavior",
                         "correlation_id": identity.program_run_id,
                     },
-                    "operation_id": task.operation_id,
+                    "operation_id": shared.operation_id,
                     "expected_operation_revision": revision,
                     "reason": "Program node consumed completed evidence",
                 },
@@ -1881,7 +2231,11 @@ class NativeKernelProgramPort:
                 "operation completion is still settling"
             ) from error
         with self._lock:
-            self._tasks.pop(task.operation_id, None)
+            shared.acknowledged_attempt_ids.add(identity.node_attempt_id)
+            for member_task_id in shared.member_task_ids:
+                member = self._tasks.get(member_task_id)
+                if member is not None and member.operation is shared:
+                    self._tasks.pop(member_task_id, None)
 
     def _observe_scope(self, program_run_id: str) -> ProgramRunScopeSnapshot:
         with self._lock:
@@ -1897,16 +2251,7 @@ class NativeKernelProgramPort:
                 return ProgramRunScopeSnapshot(program_run_id, ProgramRunScopeState.ACTIVE, 0)
             scope_stop = stop.active if stop is not None else None
             stop_owner_epoch = stop.owner_epoch if stop is not None else None
-            tasks = tuple(
-                task
-                for task in self._tasks.values()
-                if task.identity.program_run_id == program_run_id
-            )
-            pick_place_tasks = tuple(
-                task
-                for task in self._pick_place_tasks.values()
-                if task.identity.program_run_id == program_run_id
-            )
+        tasks, local_tasks = self._run_operation_tasks(program_run_id)
         if scope_stop is not None:
             stop_id, stop_generation, retained_count = scope_stop
             try:
@@ -1959,13 +2304,28 @@ class NativeKernelProgramPort:
                 active_operation_count=None,
                 reason_code=f"program_run_stop_{state}",
             )
+        uncertain = next(
+            (
+                task.terminal
+                for task in local_tasks
+                if task.terminal is not None and not task.terminal.settlement_proven
+            ),
+            None,
+        )
+        if uncertain is not None:
+            return ProgramRunScopeSnapshot(
+                program_run_id,
+                ProgramRunScopeState.UNKNOWN,
+                None,
+                uncertain.reason_code or "operation_admission_outcome_unknown",
+            )
         try:
             active_count = sum(
                 self._observation(task)[1].state is OwnerTaskState.ACTIVE for task in tasks
             )
             active_count += sum(
-                self._observe_pick_place_task(task.sequence_id).state is OwnerTaskState.ACTIVE
-                for task in pick_place_tasks
+                task.terminal is None and not task.held_before_admission
+                for task in local_tasks
             )
         except Exception as exc:
             return ProgramRunScopeSnapshot(
@@ -1998,21 +2358,12 @@ class NativeKernelProgramPort:
         with self._lock:
             existing_stop = self._scope_stops.get(program_run_id)
             request_owner_epoch = existing_stop.owner_epoch if existing_stop is not None else None
-            tasks = tuple(
-                task
-                for task in self._tasks.values()
-                if task.identity.program_run_id == program_run_id
-            )
-            pick_place_tasks = tuple(
-                task
-                for task in self._pick_place_tasks.values()
-                if task.identity.program_run_id == program_run_id
-            )
+        tasks, local_tasks = self._run_operation_tasks(program_run_id)
         # Every distinct Stop reaches the owner: it refreshes the run fence
         # even when no further physical containment is necessary. A local
         # "already stopped" shortcut could let an older Resume erase a newer
         # Stop. Exact retry/no-effect semantics already belong to the Kernel.
-        retained_count = len(tasks) + len(pick_place_tasks)
+        retained_count = len(tasks) + len(local_tasks)
         # A zero local task count does not prove that the run is idle: its first
         # operation may be crossing the native Execute boundary. Always hand
         # the semantic Program Stop to the Kernel, whose current-run and
@@ -2090,9 +2441,22 @@ class NativeKernelProgramPort:
                     stop.generation = stop_generation
                     stop.active = (stop_id, stop_generation, retained_count)
                     for task in tasks:
-                        task.stop_requested = True
-                    for task in pick_place_tasks:
-                        task.scope_stop_requested = True
+                        assert task.operation is not None
+                        task.operation.stop_requested = True
+                    waiting_task_ids = {
+                        staged.task_id
+                        for (run_id, _group_id), batch in self._coordinated_starts.items()
+                        if run_id == program_run_id and not batch.dispatching
+                        for staged in batch.tasks.values()
+                    }
+                    for task in local_tasks:
+                        if task.task_id in waiting_task_ids:
+                            task.held_before_admission = True
+                    self._coordinated_starts = {
+                        key: batch
+                        for key, batch in self._coordinated_starts.items()
+                        if key[0] != program_run_id or batch.dispatching
+                    }
                 elif stop.active is not None:
                     retained_count = stop.active[2]
                 if (
@@ -2134,8 +2498,10 @@ class NativeKernelProgramPort:
         envelope: Mapping[str, Any],
         task: _OperationTask,
     ) -> tuple[Mapping[str, Any], bool]:
+        if task.operation is None:
+            raise ProductionPortError("unadmitted operation cannot be reset")
         operation = _mapping(envelope.get("operation"), field="native operation")
-        if operation.get("operation_id") != task.operation_id:
+        if operation.get("operation_id") != task.operation.operation_id:
             raise ProductionPortError("native operation changed identity")
         if operation.get("program_run_id") != task.identity.program_run_id:
             raise ProductionPortError("native operation changed Program run")
@@ -2145,22 +2511,13 @@ class NativeKernelProgramPort:
         return operation, resident
 
     def _reset_scope(self, program_run_id: str) -> ProgramRunScopeSnapshot:
-        with self._lock:
-            tasks = tuple(
-                task
-                for task in self._tasks.values()
-                if task.identity.program_run_id == program_run_id
-            )
-        if not tasks:
+        tasks, local_tasks = self._run_operation_tasks(program_run_id)
+        self._reconcile_unknown_admissions_for_reset(program_run_id, local_tasks)
+        tasks, local_tasks = self._run_operation_tasks(program_run_id)
+        if not tasks and not local_tasks:
             settled = self._finish_scope_stop(program_run_id, release_fence=False)
             if settled.state is not ProgramRunScopeState.SETTLED:
                 raise ProductionPortError("Program-run Stop changed during Reset cleanup")
-            with self._lock:
-                self._pick_place_tasks = {
-                    task_id: task
-                    for task_id, task in self._pick_place_tasks.items()
-                    if task.identity.program_run_id != program_run_id
-                }
             return ProgramRunScopeSnapshot(
                 program_run_id,
                 ProgramRunScopeState.SETTLED,
@@ -2170,8 +2527,10 @@ class NativeKernelProgramPort:
         status = _mapping(self._kernel.identity().get("identity"), field="execution identity")
         owner_epoch = _text(status.get("owner_epoch"), field="owner_epoch")
         for task in tasks:
+            assert task.operation is not None
+            operation_id = task.operation.operation_id
             operation, resident = self._resettable_operation(
-                self._kernel.operation(task.operation_id), task
+                self._kernel.operation(operation_id), task
             )
             if resident:
                 state = _text(operation.get("state"), field="operation state")
@@ -2183,17 +2542,17 @@ class NativeKernelProgramPort:
                 if type(revision) is not int or revision < 1:
                     raise ProductionPortError("native operation revision is invalid")
                 self._kernel.reset(
-                    task.operation_id,
+                    operation_id,
                     {
                         "request_context": {
                             "request_id": _request_identity(
-                                "program-reset", program_run_id, task.operation_id
+                                "program-reset", program_run_id, operation_id
                             ),
                             "request_owner_epoch": owner_epoch,
                             "source_label": "manyforge_behavior",
                             "correlation_id": program_run_id,
                         },
-                        "operation_id": task.operation_id,
+                        "operation_id": operation_id,
                         "expected_operation_revision": revision,
                         "reason": "Program-cycle Reset released terminal work",
                     },
@@ -2201,7 +2560,7 @@ class NativeKernelProgramPort:
                 deadline = time.monotonic() + _PROGRAM_RESET_SETTLEMENT_TIMEOUT_S
                 while True:
                     _operation, resident = self._resettable_operation(
-                        self._kernel.operation(task.operation_id), task
+                        self._kernel.operation(operation_id), task
                     )
                     if not resident:
                         break
@@ -2209,23 +2568,127 @@ class NativeKernelProgramPort:
                         raise ProductionPortError("native operation Reset did not settle")
                     time.sleep(_PROGRAM_RESET_SETTLEMENT_POLL_S)
             with self._lock:
-                self._tasks.pop(task.operation_id, None)
+                for member_task_id in task.operation.member_task_ids:
+                    member = self._tasks.get(member_task_id)
+                    if member is not None and member.operation is task.operation:
+                        self._tasks.pop(member_task_id, None)
+
+        with self._lock:
+            for task in local_tasks:
+                self._tasks.pop(task.task_id, None)
+            self._coordinated_starts = {
+                key: batch
+                for key, batch in self._coordinated_starts.items()
+                if key[0] != program_run_id
+            }
 
         settled = self._finish_scope_stop(program_run_id, release_fence=False)
         if settled.state is not ProgramRunScopeState.SETTLED:
             raise ProductionPortError("Program-run Stop changed during Reset cleanup")
-        with self._lock:
-            self._pick_place_tasks = {
-                task_id: task
-                for task_id, task in self._pick_place_tasks.items()
-                if task.identity.program_run_id != program_run_id
-            }
-
         return ProgramRunScopeSnapshot(
             program_run_id,
             ProgramRunScopeState.SETTLED,
             0,
         )
+
+    def _reconcile_unknown_admissions_for_reset(
+        self,
+        program_run_id: str,
+        local_tasks: Sequence[_OperationTask],
+    ) -> None:
+        """Recover exact accepted receipts before destructive task cleanup.
+
+        Reset calls this only behind a settled Program Stop. Exact replay may
+        return an old acceptance, while the Stop fence prevents a missing
+        receipt from becoming a new operation.
+        """
+
+        unknown_by_request: dict[str, _UnknownOperationAdmission] = {}
+        for task in local_tasks:
+            unknown = task.unknown_admission
+            if unknown is not None:
+                retained = unknown_by_request.setdefault(unknown.request_id, unknown)
+                if retained is not unknown:
+                    raise ProductionPortError(
+                        "unknown operation admission request identity was reused"
+                    )
+        if not unknown_by_request:
+            return
+
+        with self._lock:
+            stop = self._scope_stops.get(program_run_id)
+            if stop is None or stop.pending or stop.unresolved is not None:
+                raise ProductionPortError(
+                    "unknown operation admission requires settled Program Stop"
+                )
+            scope_stop = stop.active
+        if scope_stop is None:
+            raise ProductionPortError(
+                "unknown operation admission requires settled Program Stop"
+            )
+        stop_id, stop_generation, _retained_count = scope_stop
+        stop_status = _mapping(
+            self._kernel.stop_status(stop_id).get("stop_status"),
+            field="aggregate Stop status",
+        )
+        if (
+            stop_status.get("state") != "succeeded"
+            or stop_status.get("stop_generation") != stop_generation
+        ):
+            raise ProductionPortError(
+                "unknown operation admission requires settled Program Stop"
+            )
+
+        identity = _mapping(
+            self._kernel.identity().get("identity"), field="execution identity"
+        )
+        owner_epoch = _text(identity.get("owner_epoch"), field="owner_epoch")
+        for unknown in unknown_by_request.values():
+            if unknown.request_owner_epoch != owner_epoch:
+                raise ProductionPortError(
+                    "unknown operation admission belongs to a replaced owner"
+                )
+            try:
+                accepted = self._kernel.execute(unknown.intent)
+            except KernelOperationAdmissionRejectedError as error:
+                # Under the still-active Stop fence, this exact request can be
+                # rejected as new only after the replay ledger proves that no
+                # old acceptance exists. Reset may then retire the local task.
+                if error.details.get("reason") != "motion_admission_closed":
+                    raise ProductionPortError(
+                        "unknown operation admission could not be reconciled"
+                    ) from error
+                continue
+            except Exception as error:
+                raise ProductionPortError(
+                    "unknown operation admission could not be reconciled"
+                ) from error
+
+            accepted_value = _mapping(accepted.get("accepted"), field="acceptance")
+            operation_id = _text(
+                accepted_value.get("operation_id"), field="accepted.operation_id"
+            )
+            member_tasks: list[_OperationTask] = []
+            with self._lock:
+                for task_id in unknown.member_task_ids:
+                    member = self._tasks.get(task_id)
+                    if member is None or member.unknown_admission is not unknown:
+                        raise ProductionPortError(
+                            "unknown operation admission task changed during Reset"
+                        )
+                    member_tasks.append(member)
+                shared = _SharedOperation(
+                    operation_id,
+                    unknown.request_owner_epoch,
+                    frozenset(
+                        member.identity.node_attempt_id for member in member_tasks
+                    ),
+                    unknown.member_task_ids,
+                )
+                for member in member_tasks:
+                    member.operation = shared
+                    member.terminal = None
+                    member.unknown_admission = None
 
     def _finish_scope_stop(
         self,
@@ -2283,6 +2746,12 @@ class NativeKernelProgramPort:
 
     def _observe_task(self, task_id: str) -> OwnerTaskSnapshot:
         task = self._task(task_id)
+        if task.held_before_admission:
+            with self._lock:
+                self._tasks.pop(task_id, None)
+            raise OwnerInvocationHeldError(0)
+        if task.terminal is not None:
+            return task.terminal
         operation, snapshot = self._observation(task)
         if snapshot.state is OwnerTaskState.SUCCEEDED:
             revision = operation.get("operation_revision")
@@ -2290,214 +2759,9 @@ class NativeKernelProgramPort:
                 raise ProductionPortError("native operation revision is invalid")
             with self._lock:
                 current = self._tasks.get(task_id)
-                if current is task:
-                    current.completed_revision = revision
+                if current is task and current.operation is not None:
+                    current.operation.completed_revision = revision
         return snapshot
-
-    def _pick_place_task(self, task_id: str) -> _PickPlaceTask:
-        with self._lock:
-            try:
-                return self._pick_place_tasks[task_id]
-            except KeyError as exc:
-                raise ProductionPortError("native pick/place task is not retained") from exc
-
-    def _observe_pick_place_task(self, task_id: str) -> OwnerTaskSnapshot:
-        task = self._pick_place_task(task_id)
-        with self._lock:
-            if task.snapshot.state is not OwnerTaskState.ACTIVE:
-                return task.snapshot
-        response = self._kernel.pick_place_sequence(task.sequence_id)
-        status = _mapping(
-            _mapping(response, field="pick/place response").get("sequence_status"),
-            field="sequence_status",
-        )
-        snapshot = self._sequence_snapshot(task, status)
-        if task.scope_stop_requested and snapshot.state in {
-            OwnerTaskState.FAILED,
-            OwnerTaskState.INTERRUPTED,
-        }:
-            operation_id = status.get("active_operation_id")
-            if isinstance(operation_id, str) and operation_id:
-                envelope = self._kernel.operation(operation_id)
-                operation = dict(_mapping(envelope.get("operation"), field="operation"))
-                if (
-                    operation.get("operation_id") != operation_id
-                    or operation.get("program_run_id") != task.identity.program_run_id
-                ):
-                    raise ProductionPortError("pick/place stopped operation changed identity")
-                if operation.get("state") in _INTERRUPTED_STATES:
-                    assessment = self._recovery_assessment(operation, operation_id)
-                    if (
-                        assessment is not None
-                        and assessment.get("recovery_class") in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
-                    ):
-                        metadata = dict(snapshot.metadata)
-                        metadata.update(
-                            {
-                                "active_operation_id": operation_id,
-                                "recovery_assessment": assessment,
-                                "authored_failure_policy": "pause_for_operator",
-                                "authored_failure_policy_parameter": ("operator_stop_policy"),
-                            }
-                        )
-                        stop_id = operation.get("active_stop_id")
-                        stop_generation = operation.get("active_stop_generation")
-                        if (
-                            isinstance(stop_id, str)
-                            and stop_id
-                            and type(stop_generation) is int
-                            and stop_generation > 0
-                        ):
-                            metadata["active_stop_id"] = stop_id
-                            metadata["active_stop_generation"] = stop_generation
-                        snapshot = OwnerTaskSnapshot(
-                            task_id=task.sequence_id,
-                            state=OwnerTaskState.INTERRUPTED,
-                            metadata=metadata,
-                            reason_code=(f"operation_{operation.get('state')}"),
-                            message="native pick/place sequence was interrupted",
-                        )
-        with self._lock:
-            current = self._pick_place_tasks.get(task.sequence_id)
-            if current is not task:
-                raise ProductionPortError("pick/place task changed during observation")
-            task.snapshot = snapshot
-            return task.snapshot
-
-    def _recover_pick_place_task(
-        self,
-        task_id: str,
-        identity: NodeAttemptIdentity,
-        *,
-        action: str,
-        request_id: str,
-        reason: str | None,
-    ) -> Mapping[str, Any]:
-        task = self._pick_place_task(task_id)
-        if task.identity != identity:
-            raise ProductionPortError("pick/place recovery changed node attempt")
-        snapshot = self._observe_pick_place_task(task_id)
-        operation_id = snapshot.metadata.get("active_operation_id")
-        if (
-            snapshot.state is not OwnerTaskState.INTERRUPTED
-            or not isinstance(operation_id, str)
-            or not operation_id
-        ):
-            raise ProductionPortError("pick/place recovery is not current")
-        operation = dict(
-            _mapping(
-                self._kernel.operation(operation_id).get("operation"),
-                field="operation",
-            )
-        )
-        result = self._apply_operation_recovery(
-            operation_id,
-            identity,
-            operation,
-            snapshot,
-            action=action,
-            request_id=request_id,
-            reason=reason,
-        )
-        if result.get("accepted") is True:
-            with self._lock:
-                self._pick_place_tasks.pop(task_id, None)
-        return result
-
-    def _cancel_pick_place_task(
-        self,
-        task_id: str,
-        identity: NodeAttemptIdentity,
-        *,
-        reason: str | None = "Program node was invalidated",
-    ) -> None:
-        task = self._pick_place_task(task_id)
-        if task.identity != identity:
-            raise ProductionPortError("pick/place cancellation changed node attempt")
-        with self._lock:
-            if task.scope_stop_requested:
-                return
-        snapshot = self._observe_pick_place_task(task_id)
-        if snapshot.state is not OwnerTaskState.ACTIVE:
-            return
-        status = _mapping(
-            snapshot.metadata.get("sequence_status"),
-            field="sequence_status",
-        )
-        operation_id = status.get("active_operation_id")
-        if not isinstance(operation_id, str) or not operation_id:
-            raise ProductionPortError("active pick/place sequence has no cancellable operation")
-        with self._lock:
-            if task.active_stop_operation_id == operation_id:
-                return
-            task.active_stop_operation_id = operation_id
-        try:
-            operation = dict(
-                _mapping(
-                    self._kernel.operation(operation_id).get("operation"),
-                    field="operation",
-                )
-            )
-            if (
-                operation.get("operation_id") != operation_id
-                or operation.get("program_run_id") != identity.program_run_id
-            ):
-                raise ProductionPortError("pick/place active operation changed identity")
-            if operation.get("state") not in _ACTIVE_STATES:
-                return
-            revision = operation.get("operation_revision")
-            generation = operation.get("active_stop_generation")
-            if type(revision) is not int or revision < 1:
-                raise ProductionPortError("native operation revision is invalid")
-            if generation is None:
-                generation = 0
-            if type(generation) is not int or generation < 0:
-                raise ProductionPortError("native Stop generation is invalid")
-            context = self._context(identity.program_run_id)
-            owner_epoch, _scene = self._owner_status(context)
-            self._kernel.stop(
-                {
-                    "request_context": {
-                        "request_id": _request_identity(
-                            "program-pick-place-stop",
-                            identity.program_run_id,
-                            task.sequence_id,
-                            operation_id,
-                        ),
-                        "request_owner_epoch": owner_epoch,
-                        "source_label": "manyforge_behavior",
-                        "correlation_id": identity.program_run_id,
-                    },
-                    "operations": [
-                        {
-                            "operation_id": operation_id,
-                            "expected_operation_revision": revision,
-                            "expected_stop_generation": generation,
-                        }
-                    ],
-                    "reason": reason,
-                }
-            )
-        except Exception:
-            with self._lock:
-                if task.active_stop_operation_id == operation_id:
-                    task.active_stop_operation_id = None
-            raise
-
-    def _acknowledge_pick_place_task(
-        self,
-        task_id: str,
-        identity: NodeAttemptIdentity,
-    ) -> None:
-        task = self._pick_place_task(task_id)
-        if task.identity != identity:
-            raise ProductionPortError("pick/place acknowledgement changed node attempt")
-        snapshot = self._observe_pick_place_task(task_id)
-        if snapshot.state is not OwnerTaskState.SUCCEEDED:
-            raise ProductionPortError("only successful pick/place work can be acknowledged")
-        with self._lock:
-            self._pick_place_tasks.pop(task_id, None)
-
 
 @dataclass(slots=True)
 class _ControlTask:
@@ -2982,47 +3246,6 @@ class _NativeKernelOperationTaskPort:
         reason: str | None,
     ) -> Mapping[str, Any]:
         return self._owner._recover_task(
-            task_id,
-            identity,
-            action=action,
-            request_id=request_id,
-            reason=reason,
-        )
-
-
-class _NativePickPlaceTaskPort:
-    """OwnerTaskPort view over native pick/place planning and sequencing."""
-
-    def __init__(self, owner: NativeKernelProgramPort) -> None:
-        self._owner = owner
-
-    def start(
-        self,
-        node_id: str,
-        identity: NodeAttemptIdentity,
-        inputs: OwnerNodeInputs,
-    ) -> OwnerTaskSnapshot:
-        return self._owner._start_pick_place(node_id, identity, inputs)
-
-    def observe(self, task_id: str) -> OwnerTaskSnapshot:
-        return self._owner._observe_pick_place_task(task_id)
-
-    def cancel(self, task_id: str, identity: NodeAttemptIdentity) -> None:
-        self._owner._cancel_pick_place_task(task_id, identity)
-
-    def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
-        self._owner._acknowledge_pick_place_task(task_id, identity)
-
-    def recover(
-        self,
-        task_id: str,
-        identity: NodeAttemptIdentity,
-        *,
-        action: str,
-        request_id: str,
-        reason: str | None,
-    ) -> Mapping[str, Any]:
-        return self._owner._recover_pick_place_task(
             task_id,
             identity,
             action=action,

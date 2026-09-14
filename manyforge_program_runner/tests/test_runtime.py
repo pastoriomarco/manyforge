@@ -5126,7 +5126,6 @@ def test_node_availability_marks_only_native_ports_unavailable_without_owner(
         "kernel_controls",
         "kernel_operations",
         "model_queries",
-        "pick_place",
     ):
         assert availability[port_name] == AvailabilityFact(
             False,

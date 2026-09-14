@@ -3,8 +3,8 @@ import type { CatalogCapabilityRequirement } from '../types/api';
 import { supportsRequiredCapabilities } from './deploymentCapabilities';
 
 const requirements: CatalogCapabilityRequirement[] = [
-  { capabilityId: 'motion.plan', scope: 'target' },
-  { capabilityId: 'motion.execute', scope: 'target' },
+  { capabilityId: 'motion.plan', scope: 'target', effectful: false },
+  { capabilityId: 'motion.execute', scope: 'target', effectful: true },
 ];
 
 describe('catalog capability filtering', () => {

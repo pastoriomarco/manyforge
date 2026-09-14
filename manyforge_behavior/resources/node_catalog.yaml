@@ -1,8 +1,8 @@
 # Generated extension composition; edit extension entries in their package descriptor.
 api_version: manyforge.node_catalog.v2
-content_version: 2.1.0
+content_version: 2.3.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:7c16314aeddbdea7942cdab09aa0e2da6c913e2044adcf5c3d99111c6b280ffd
+catalog_digest: sha256:5abe4efe0a00dfb4936ba8dea9cc296ced334d01d3a613adcc569dda41ba5304
 schema_types:
   coordinate_position:
     type: object
@@ -928,6 +928,7 @@ entries:
   - capability_id: execution.trajectory.execute
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
     target_parameter: target_role
@@ -1074,6 +1075,11 @@ entries:
     required: false
     schema:
       type: string
+  - id: contact_scene_resource_id
+    required: false
+    schema:
+      type: string
+      semantic_type: scene_resource
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
@@ -1110,6 +1116,7 @@ entries:
   - capability_id: execution.trajectory.execute
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
     target_parameter: target_role
@@ -1306,6 +1313,11 @@ entries:
     required: false
     schema:
       type: string
+  - id: contact_scene_resource_id
+    required: false
+    schema:
+      type: string
+      semantic_type: scene_resource
   required_capabilities:
   - capability_id: planning.motion.cartesian_path
     scope: target_binding
@@ -1342,6 +1354,7 @@ entries:
   - capability_id: execution.trajectory.execute
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
     target_parameter: target_role
@@ -1447,6 +1460,7 @@ entries:
   - capability_id: execution.trajectory.execute
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
     target_parameter: target_role
@@ -1550,6 +1564,7 @@ entries:
   - capability_id: execution.trajectory.execute
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   - capability_id: execution.feedback.phase_events
     scope: target_binding
     target_parameter: target_role
@@ -1993,6 +2008,7 @@ entries:
   - capability_id: io.gpio.set_output
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   execution:
     blocking: true
     cancellable: true
@@ -2153,6 +2169,7 @@ entries:
   - capability_id: tool.gripper.command
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   - capability_id: tool.gripper.feedback
     scope: target_binding
     target_parameter: target_role
@@ -2659,6 +2676,7 @@ entries:
   - capability_id: execution.stop.soft
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   owner_context:
     kind: current_operation
     required: true
@@ -2726,6 +2744,7 @@ entries:
   - capability_id: execution.pause
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   owner_context:
     kind: current_operation
     required: true
@@ -2765,6 +2784,7 @@ entries:
   - capability_id: execution.resume
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   owner_context:
     kind: current_operation
     required: true
@@ -2804,6 +2824,7 @@ entries:
   - capability_id: execution.reset
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   owner_context:
     kind: current_operation
     required: true
@@ -2850,6 +2871,7 @@ entries:
   - capability_id: execution.runtime_scale.operation_scoped
     scope: target_binding
     target_parameter: target_role
+    effectful: true
   owner_context:
     kind: current_operation
     required: true
@@ -3502,213 +3524,14 @@ entries:
       implementation_id: planning_plan_pick_sequence_v1
   observability:
     event_family: manyforge.program.node
-- id: motion.pick_object
-  name: Pick object
+- id: planning.plan_place_sequence
+  name: Plan place sequence
   category: motion
-  description: Plan and execute one owner-coordinated pick sequence from portable
-    intent.
+  description: Produce a portable validated place-sequence plan for one carried object.
   stability: stable
   tags:
   - motion
   - planning
-  - execution
-  - pick
-  profiles:
-    min_program_profile: composable-cell-v1
-  kind: leaf
-  children:
-    min: 0
-    max: 0
-  parameters:
-  - id: target_role
-    required: true
-    schema:
-      type: string
-      semantic_type: target_role
-  - id: tool_target_role
-    required: true
-    schema:
-      type: string
-      semantic_type: target_role
-  - id: base_frame_role
-    required: true
-    schema:
-      type: string
-      semantic_type: frame_role
-  - id: tcp_frame_role
-    required: true
-    schema:
-      type: string
-      semantic_type: frame_role
-  - id: carrier_frame_role
-    required: true
-    schema:
-      type: string
-      semantic_type: frame_role
-  - id: selected_object_id
-    required: true
-    schema:
-      type: string
-      semantic_type: scene_resource
-  - id: synthesis
-    required: false
-    default:
-      pick_offset_envelope:
-        position_min_m:
-        - 0.0
-        - 0.0
-        - 0.0
-        position_max_m:
-        - 0.0
-        - 0.0
-        - 0.0
-        orientation_rpy_min_deg:
-        - 0.0
-        - 0.0
-        - 0.0
-        orientation_rpy_max_deg:
-        - 0.0
-        - 0.0
-        - 0.0
-      approach_offset_envelope:
-        position_min_m:
-        - 0.0
-        - 0.0
-        - 0.05
-        position_max_m:
-        - 0.0
-        - 0.0
-        - 0.1
-        orientation_rpy_min_deg:
-        - 0.0
-        - 0.0
-        - 0.0
-        orientation_rpy_max_deg:
-        - 0.0
-        - 0.0
-        - 0.0
-    schema_ref: '#/schema_types/pick_synthesis'
-  - id: planning_profile
-    required: false
-    default: first_feasible
-    schema:
-      type: enum
-      values:
-      - first_feasible
-      - balanced
-      - quality_bounded
-  - id: motion_options
-    required: false
-    default: {}
-    schema_ref: '#/schema_types/pick_motion_options'
-  - id: tool_position
-    required: true
-    schema_ref: '#/schema_types/coordinate_position'
-  - id: tool_max_effort
-    required: false
-    schema_ref: '#/schema_types/coordinate_effort_limit'
-  - id: tool_command_duration_s
-    required: false
-    default: 0.0
-    schema:
-      type: float
-      constraints:
-        min_inclusive: 0.0
-  - id: tool_completion_timeout_s
-    required: false
-    default: 30.0
-    schema:
-      type: float
-      constraints:
-        min_exclusive: 0.0
-  - id: contact_policy_id
-    required: true
-    schema:
-      type: string
-  - id: no_feasible_plan_policy
-    required: false
-    default: pause_for_operator
-    schema:
-      type: enum
-      values:
-      - pause_for_operator
-      - condition_failure
-  required_capabilities:
-  - capability_id: planning.motion.pose_goal
-    scope: target_binding
-    target_parameter: target_role
-  - capability_id: planning.motion.cartesian_path
-    scope: target_binding
-    target_parameter: target_role
-  - capability_id: planning.profile.first_feasible
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: first_feasible
-  - capability_id: planning.profile.balanced
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: balanced
-  - capability_id: planning.profile.quality_bounded
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: quality_bounded
-  - capability_id: planning.trajectory.time_parameterized
-    scope: target_binding
-    target_parameter: target_role
-  - capability_id: state.observed.current
-    scope: target_binding
-    target_parameter: target_role
-  - capability_id: validation.trajectory.non_collision
-    scope: target_binding
-    target_parameter: target_role
-  - capability_id: collision.query.pre_execution
-    scope: cell_global
-  - capability_id: execution.trajectory.execute
-    scope: target_binding
-    target_parameter: target_role
-  - capability_id: execution.feedback.phase_events
-    scope: target_binding
-    target_parameter: target_role
-  - capability_id: model.kinematics.fk
-    scope: target_binding
-    target_parameter: target_role
-  - capability_id: tool.gripper.command
-    scope: target_binding
-    target_parameter: tool_target_role
-  - capability_id: tool.gripper.feedback
-    scope: target_binding
-    target_parameter: tool_target_role
-  - capability_id: scene.edit.attach_detach
-    scope: cell_global
-  execution:
-    blocking: true
-    cancellable: true
-    owner_api: kernel.pick_place_sequence
-  outcomes:
-    success: sequence_completed
-    failure: sequence_failed_or_intervention_required
-    interrupted: sequence_terminal
-  runners:
-    py_trees:
-      implementation_id: motion_pick_object_v1
-  observability:
-    event_family: manyforge.program.node
-- id: motion.place_object
-  name: Place object
-  category: motion
-  description: Plan and execute one owner-coordinated place sequence from portable
-    intent.
-  stability: stable
-  tags:
-  - motion
-  - planning
-  - execution
   - place
   profiles:
     min_program_profile: composable-cell-v1
@@ -3777,23 +3600,11 @@ entries:
   - id: tool_position
     required: true
     schema_ref: '#/schema_types/coordinate_position'
-  - id: tool_max_effort
-    required: false
-    schema_ref: '#/schema_types/coordinate_effort_limit'
-  - id: tool_command_duration_s
-    required: false
-    default: 0.0
+  - id: output_key
+    required: true
     schema:
-      type: float
-      constraints:
-        min_inclusive: 0.0
-  - id: tool_completion_timeout_s
-    required: false
-    default: 30.0
-    schema:
-      type: float
-      constraints:
-        min_exclusive: 0.0
+      type: string
+      semantic_type: blackboard_key
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
@@ -3830,12 +3641,6 @@ entries:
     target_parameter: target_role
   - capability_id: collision.query.pre_execution
     scope: cell_global
-  - capability_id: execution.trajectory.execute
-    scope: target_binding
-    target_parameter: target_role
-  - capability_id: execution.feedback.phase_events
-    scope: target_binding
-    target_parameter: target_role
   - capability_id: model.kinematics.fk
     scope: target_binding
     target_parameter: target_role
@@ -3847,17 +3652,22 @@ entries:
     target_parameter: tool_target_role
   - capability_id: scene.edit.attach_detach
     scope: cell_global
+  blackboard:
+    reads: []
+    writes:
+    - key_parameter: output_key
+      value_type: pick_planning_result
   execution:
     blocking: true
     cancellable: true
-    owner_api: kernel.pick_place_sequence
+    owner_api: planning.place_sequence
   outcomes:
-    success: sequence_completed
-    failure: sequence_failed_or_intervention_required
-    interrupted: sequence_terminal
+    success: candidate_planned
+    failure: no_feasible_candidate
+    interrupted: cancelled
   runners:
     py_trees:
-      implementation_id: motion_place_object_v1
+      implementation_id: planning_plan_place_sequence_v1
   observability:
     event_family: manyforge.program.node
 - id: recovery.apply_offered_action

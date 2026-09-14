@@ -424,7 +424,7 @@ if(BUILD_TESTING)
     endif()
     set(
       MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST
-      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/manyforge_native_execution_host_pick_place_fixture")
+      "${_MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_TARGET_ROOT}/manyforge_native_execution_host_pick_place_planning_fixture")
     if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST}")
       message(FATAL_ERROR
         "the compatible replacement native execution host does not exist: "

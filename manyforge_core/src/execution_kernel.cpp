@@ -10,8 +10,8 @@
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
-#include <manyforge_core/detail/motion_resume_intent.hpp>
 #include <manyforge_core/detail/coordinated_motion_preparation.hpp>
+#include <manyforge_core/detail/motion_resume_intent.hpp>
 #include <manyforge_core/execution_admission_support.hpp>
 #include <manyforge_core/execution_collision_support.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
@@ -38,6 +38,9 @@
 
 namespace manyforge::core {
 namespace {
+
+[[nodiscard]] bool resolved_scale_target_matches(const ResolvedRuntimeScaleCommandDTO& command,
+                                                 const ResolvedExecutionBindingDTO& binding);
 
 void resolve_motion_execution_timeout(ExecuteRequestDTO& request, const TrajectoryDTO& trajectory) {
   if (!request.trajectory_relative_timeout) return;
@@ -760,10 +763,9 @@ Result<void> apply_coordinated_candidate_timing(
       return Result<void>::Ok();
   }
   authority.common_timing->cancel();
-  return Result<void>::Err(ErrorDTO{
-      std::string(to_string(ErrorCode::kExecutionRejected)),
-      "Common motion timing preparation failed or was cancelled",
-      {{"reason", "coordinated_time_law_preparation_failed"}}});
+  return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                                    "Common motion timing preparation failed or was cancelled",
+                                    {{"reason", "coordinated_time_law_preparation_failed"}}});
 }
 }  // namespace
 
@@ -5511,9 +5513,10 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       // independently replan after the all-participant timing decision.
       if (!planning_result || !planning_result->trajectory) {
         prepared_session->authority.common_timing->cancel();
-        val_result = Result<CollisionValidationSuccess>::Err(ErrorDTO{
-            kErrorInternalError, "Common timing lost its planning evidence",
-            {{"reason", "coordinated_planning_evidence_missing"}}});
+        val_result = Result<CollisionValidationSuccess>::Err(
+            ErrorDTO{kErrorInternalError,
+                     "Common timing lost its planning evidence",
+                     {{"reason", "coordinated_planning_evidence_missing"}}});
       } else {
         planning_result->trajectory = trajectory;
         val_result = validate_trajectory(trajectory, request, scene_snapshot_lease_inventory,
@@ -5729,10 +5732,12 @@ ExecutionKernel::execute_worker_validate_replan_phase(
   return phase_result;
 }
 
-void ExecutionKernel::store_validated_candidate(
-    const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
-    const ProjectionRevisionDTO& projection_revision,
-    const CollisionWorldRevision& validation_revision, bool revalidated_cache_candidate) {
+void ExecutionKernel::store_validated_candidate(const ExecuteRequestDTO& request,
+                                                std::uint64_t exec_id,
+                                                const TrajectoryDTO& trajectory,
+                                                const ProjectionRevisionDTO& projection_revision,
+                                                const CollisionWorldRevision& validation_revision,
+                                                bool revalidated_cache_candidate) {
   // The exact resolved intent and validation revision remain cache authority;
   // operation-local common timing is deliberately not retained here.
   const auto key = trajectory_cache_key(request);
@@ -6343,62 +6348,85 @@ void ExecutionKernel::execute_worker_finalize_phase(const ExecuteRequestDTO& req
   }
 
   auto prev_state4 = sm_.status().state;
-  CompletionPublicationGuard completion_publication{completion_publication_execution_id_, exec_id};
-  auto completed_transition = commit_terminal(ExecutionState::kCompleted, "terminal_commit");
-  if (completed_transition.committed != ExecutionState::kCompleted) {
-    if (finalize_competing_terminal_authority(
-            request, exec_id, motion_state, "normal_completion_overridden_by_terminal_authority")) {
+  {
+    {
+      std::lock_guard<std::mutex> lock(completion_publication_status_mutex_);
+      completion_publication_previous_status_ = sm_.status();
+    }
+    CompletionPublicationGuard completion_publication{completion_publication_execution_id_,
+                                                      exec_id};
+    auto completed_transition = commit_terminal(ExecutionState::kCompleted, "terminal_commit");
+    if (completed_transition.committed != ExecutionState::kCompleted) {
+      if (finalize_competing_terminal_authority(
+              request, exec_id, motion_state,
+              "normal_completion_overridden_by_terminal_authority")) {
+        return;
+      }
+    }
+    if (!completed_transition.ok()) {
+      if (finalize_competing_terminal_authority(request, exec_id, motion_state,
+                                                "normal_completion_transition_rejected")) {
+        return;
+      }
+      ErrorDTO err{
+          kErrorInternalError,
+          "Execution backend reported completion, but the kernel could not "
+          "commit Completed as terminal authority",
+          {{"reason", "completed_transition_rejected"}, {"from_state", to_string(prev_state4)}}};
+      sm_.set_last_error(error_code_from_dto(err));
+      auto failure_transition =
+          commit_terminal(ExecutionState::kInterventionRequired, "terminal_commit");
+      auto rejected_snapshot = final_snapshot;
+      rejected_snapshot.timestamp_ns = clock_.now();
+      rejected_snapshot.execution_id = exec_id;
+      rejected_snapshot.move_id = request.move_id;
+      rejected_snapshot.state = sm_.status().state;
+      rejected_snapshot.error = err;
+      publish_execution_snapshot(std::move(rejected_snapshot));
+      emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {}, err, err.details});
+      if (failure_transition.ok()) {
+        emit_event({KernelEventType::kStateTransition,
+                    exec_id,
+                    clock_.now(),
+                    prev_state4,
+                    ExecutionState::kInterventionRequired,
+                    std::nullopt,
+                    {{"reason", "completed_transition_rejected"}}});
+      }
+      {
+        std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
+        metrics_.executions_failed++;
+      }
+      finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kFailed, err,
+                                        std::nullopt, "normal_completion_transition_rejected");
       return;
     }
-  }
-  if (!completed_transition.ok()) {
-    if (finalize_competing_terminal_authority(request, exec_id, motion_state,
-                                              "normal_completion_transition_rejected")) {
-      return;
-    }
-    ErrorDTO err{
-        kErrorInternalError,
-        "Execution backend reported completion, but the kernel could not "
-        "commit Completed as terminal authority",
-        {{"reason", "completed_transition_rejected"}, {"from_state", to_string(prev_state4)}}};
-    sm_.set_last_error(error_code_from_dto(err));
-    auto failure_transition =
-        commit_terminal(ExecutionState::kInterventionRequired, "terminal_commit");
-    auto rejected_snapshot = final_snapshot;
-    rejected_snapshot.timestamp_ns = clock_.now();
-    rejected_snapshot.execution_id = exec_id;
-    rejected_snapshot.move_id = request.move_id;
-    rejected_snapshot.state = sm_.status().state;
-    rejected_snapshot.error = err;
-    publish_execution_snapshot(std::move(rejected_snapshot));
-    emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {}, err, err.details});
-    if (failure_transition.ok()) {
-      emit_event({KernelEventType::kStateTransition,
-                  exec_id,
-                  clock_.now(),
-                  prev_state4,
-                  ExecutionState::kInterventionRequired,
-                  std::nullopt,
-                  {{"reason", "completed_transition_rejected"}}});
-    }
+
+    emit_event(
+        {KernelEventType::kExecuteCompleted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
+
+    auto snapshot2 = final_snapshot;
+    snapshot2.timestamp_ns = clock_.now();
+    snapshot2.execution_id = exec_id;
+    snapshot2.move_id = request.move_id;
+    snapshot2.state = ExecutionState::kCompleted;
+    snapshot2.progress = 1.0;
+    publish_execution_snapshot(std::move(snapshot2));
     {
       std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
-      metrics_.executions_failed++;
+      metrics_.executions_completed++;
     }
-    finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kFailed, err,
-                                      std::nullopt, "normal_completion_transition_rejected");
-    return;
+    // Trajectory reached its planned endpoint. Cause is
+    // `completed_normally` for free moves; the finalize helper rewrites
+    // to `no_signal_trip` when the request carried scopes (spec/210
+    // §3.11 invariants).
+    finalize_motion_execution_outcome(motion_state,
+                                      MotionExecutionTerminalCause::kCompletedNormally,
+                                      std::nullopt, std::nullopt, "execution_completed");
   }
-
-  emit_event({KernelEventType::kExecuteCompleted, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
-
-  auto snapshot2 = final_snapshot;
-  snapshot2.timestamp_ns = clock_.now();
-  snapshot2.execution_id = exec_id;
-  snapshot2.move_id = request.move_id;
-  snapshot2.state = ExecutionState::kCompleted;
-  snapshot2.progress = 1.0;
-  publish_execution_snapshot(std::move(snapshot2));
+  // Completed becomes visible to enclosing operation owners only after the
+  // complete terminal snapshot/outcome batch is published. They may then
+  // acknowledge without racing the subordinate's publication guard.
   emit_event({KernelEventType::kStateTransition,
               exec_id,
               clock_.now(),
@@ -6406,16 +6434,6 @@ void ExecutionKernel::execute_worker_finalize_phase(const ExecuteRequestDTO& req
               ExecutionState::kCompleted,
               std::nullopt,
               {}});
-  {
-    std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
-    metrics_.executions_completed++;
-  }
-  // Trajectory reached its planned endpoint. Cause is
-  // `completed_normally` for free moves; the finalize helper rewrites
-  // to `no_signal_trip` when the request carried scopes (spec/210
-  // §3.11 invariants).
-  finalize_motion_execution_outcome(motion_state, MotionExecutionTerminalCause::kCompletedNormally,
-                                    std::nullopt, std::nullopt, "execution_completed");
 }
 
 Result<std::shared_ptr<const PreparedOperationParticipantDTO>>
@@ -6645,7 +6663,8 @@ ExecutionKernel::make_and_prepare_motion_participant(
     if (!common_clock)
       return reject("coordinated_execution_clock_unavailable",
                     "Coordinated preparation was cancelled before clock binding");
-    auto bound = execution_backend_.BindPreparedExecutionClock(*participant, std::move(common_clock));
+    auto bound =
+        execution_backend_.BindPreparedExecutionClock(*participant, std::move(common_clock));
     if (!bound.ok())
       return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(bound.error());
   }
@@ -6879,8 +6898,8 @@ void ExecutionKernel::async_execute_worker(
 
     auto dispatch_phase = execute_worker_dispatch_phase(
         request, exec_id, trajectory, active_trajectory_from_cache, cache_revalidation_candidate,
-        !(prepared_session && prepared_session->authority.common_timing),
-        projection_binding, retained_scene.inventory(), validation_world_revision,
+        !(prepared_session && prepared_session->authority.common_timing), projection_binding,
+        retained_scene.inventory(), validation_world_revision,
         validation_phase.scene_snapshot_lease, std::move(validation_phase.collision_trajectory),
         prepared_participant, motion_state);
     if (dispatch_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
@@ -7358,6 +7377,12 @@ void ExecutionKernel::async_execute_worker(
           // The worker retains the last resolved intent even when the private
           // prepared session has advanced its goal and cleared the old product.
           resume_request.motion = request.motion;
+          if (prepared_resume) {
+            // Resume is a new controller-goal occurrence of the same semantic
+            // motion. Advance the existing correlation and scale identities
+            // together before planning; no new execution owner is introduced.
+            set_active_request_correlation(resume_request);
+          }
           auto finish_resume_interrupted = [&](ExecutionState terminal_state, ErrorDTO error,
                                                const char* reap_reason) {
             sm_.set_last_error(error_code_from_dto(error));
@@ -7531,8 +7556,8 @@ void ExecutionKernel::async_execute_worker(
 
           auto resumed_trajectory = *resume_plan.value().result.trajectory;
           if (prepared_resume) {
-            auto timing = apply_coordinated_candidate_timing(
-                resumed_trajectory, prepared_session->authority, st);
+            auto timing = apply_coordinated_candidate_timing(resumed_trajectory,
+                                                             prepared_session->authority, st);
             if (!timing.ok()) {
               fail_resume_closed(timing.error(), "resume common timing failed",
                                  "resume_common_timing_failed", true, false);
@@ -8415,6 +8440,28 @@ Result<void> ExecutionKernel::PrepareResumeMotion(const std::uint64_t execution_
   updated.ordinary_stop_plan = std::move(request.ordinary_stop_plan);
   updated.fault_stop_plan = std::move(request.fault_stop_plan);
   updated.common_timing = std::move(request.common_timing);
+  if (prior.execution_request.initial_runtime_scale.has_value()) {
+    std::lock_guard scale_lock(resolved_runtime_scale_mutex_);
+    if (!accepted_resolved_runtime_scale_command_.has_value() ||
+        !accepted_resolved_runtime_scale_result_.has_value() ||
+        !resolved_scale_target_matches(*accepted_resolved_runtime_scale_command_, prior_binding)) {
+      return Result<void>::Err(
+          ErrorDTO{kErrorInvariantViolation,
+                   "Prepared Resume lost its retained runtime-scale authority",
+                   {{"reason", "prepared_resume_runtime_scale_authority_missing"}}});
+    }
+    auto scale = *accepted_resolved_runtime_scale_command_;
+    scale.operation_revision = updated.operation_revision;
+    scale.controller_goal_id = updated.execution_request.binding.controller_goal_id;
+    scale.controller_goal_generation = updated.execution_request.binding.controller_goal_generation;
+    auto acceptance = *accepted_resolved_runtime_scale_result_;
+    acceptance.operation_revision = scale.operation_revision;
+    acceptance.controller_goal_id = scale.controller_goal_id;
+    acceptance.controller_goal_generation = scale.controller_goal_generation;
+    accepted_resolved_runtime_scale_command_ = scale;
+    accepted_resolved_runtime_scale_result_ = acceptance;
+    updated.execution_request.initial_runtime_scale = std::move(scale);
+  }
   auto transition = stop_policy_.request_resume();
   if (!transition.ok()) {
     return Result<void>::Err(transition.error());
@@ -11136,12 +11183,19 @@ KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action_impl(
 
 ExecutionStatus ExecutionKernel::get_status() const {
   auto status = sm_.status();
+  if (status.state == ExecutionState::kCompleted &&
+      completion_publication_execution_id_.load(std::memory_order_acquire) == status.execution_id) {
+    std::lock_guard<std::mutex> lock(completion_publication_status_mutex_);
+    if (completion_publication_previous_status_.execution_id == status.execution_id) {
+      status = completion_publication_previous_status_;
+    }
+  }
   status.active_move_id = active_correlation_.move_id();
   return status;
 }
 
 ExecutionSnapshot ExecutionKernel::get_execution_snapshot() const {
-  const auto kernel_status = sm_.status();
+  const auto kernel_status = get_status();
   const auto kernel_state = kernel_status.state;
   // Read the live backend while idle so continuously observed physical state
   // is available before the first plan, and during kStopping/kExecuting where

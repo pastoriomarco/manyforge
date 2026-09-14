@@ -23,7 +23,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = "sha256:7c16314aeddbdea7942cdab09aa0e2da6c913e2044adcf5c3d99111c6b280ffd"
+EXPECTED_CATALOG_DIGEST = "sha256:5abe4efe0a00dfb4936ba8dea9cc296ced334d01d3a613adcc569dda41ba5304"
 
 
 def _catalog_data() -> dict[str, object]:
@@ -51,7 +51,7 @@ def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
     assert catalog.content_version == EXPECTED_CONTENT_VERSION
     assert catalog.catalog_id == "manyforge_builtin"
     assert catalog.catalog_digest == EXPECTED_CATALOG_DIGEST
-    assert len(catalog.entries) == 52
+    assert len(catalog.entries) == 51
     assert (
         len(
             {
@@ -60,7 +60,7 @@ def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
                 for engine_id, implementation_id in entry.runner_implementation_ids.items()
             }
         )
-        == 52
+        == 51
     )
 
 
@@ -77,6 +77,7 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
         "acceleration_scale",
         "base_frame_role",
         "cache_mode",
+        "contact_scene_resource_id",
         "contact_policy_id",
         "execution_timeout_s",
         "goal",
@@ -100,6 +101,38 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
         ("planning.motion.pose_goal", "target_binding"),
         ("execution.trajectory.execute", "target_binding"),
     }
+    assert {
+        requirement.capability_id
+        for requirement in move.required_capabilities
+        if requirement.effectful
+    } == {"execution.trajectory.execute"}
+
+
+def test_effectful_requirements_are_explicit_target_commands() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    expected = {
+        "execution.pause",
+        "execution.reset",
+        "execution.resume",
+        "execution.runtime_scale.operation_scoped",
+        "execution.stop.soft",
+        "execution.trajectory.execute",
+        "io.gpio.set_output",
+        "tool.gripper.command",
+    }
+    declared = {
+        requirement.capability_id
+        for entry in catalog.entries
+        for requirement in entry.required_capabilities
+        if requirement.effectful
+    }
+    assert declared == expected
+    assert all(
+        requirement.scope == "target_binding"
+        for entry in catalog.entries
+        for requirement in entry.required_capabilities
+        if requirement.effectful
+    )
 
 
 def test_profile_comparison_has_no_legacy_profile_family() -> None:
@@ -187,7 +220,7 @@ def test_recomputed_catalog_rejects_unknown_semantic_scope_parameter(
         NodeCatalog(path)
 
 
-def test_translation_catalog_preserves_assistant_and_cpp_pick_place_contracts() -> None:
+def test_catalog_preserves_assistant_and_planning_only_pick_place_contracts() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
 
     query = catalog.get("assistant.query_model")
@@ -201,18 +234,27 @@ def test_translation_catalog_preserves_assistant_and_cpp_pick_place_contracts() 
         "min_confidence",
     } <= {parameter.id for parameter in query.parameters}
 
-    preview = catalog.get("planning.plan_pick_sequence")
-    assert preview.execution.owner_api == "planning.pick_sequence"
-    assert preview.blackboard_writes[0].value_type == "pick_planning_result"
-    selected_object = next(
-        parameter for parameter in preview.parameters if parameter.id == "selected_object_id"
-    )
-    assert catalog.schema_registry.resolve(selected_object.schema).semantic_type == "scene_resource"
+    for node_id, owner_api in (
+        ("planning.plan_pick_sequence", "planning.pick_sequence"),
+        ("planning.plan_place_sequence", "planning.place_sequence"),
+    ):
+        preview = catalog.get(node_id)
+        assert preview.execution.owner_api == owner_api
+        assert preview.blackboard_writes[0].value_type == "pick_planning_result"
+        selected_object = next(
+            parameter
+            for parameter in preview.parameters
+            if parameter.id == "selected_object_id"
+        )
+        assert (
+            catalog.schema_registry.resolve(selected_object.schema).semantic_type
+            == "scene_resource"
+        )
 
-    for node_id in ("motion.pick_object", "motion.place_object"):
-        node = catalog.get(node_id)
-        assert node.execution.owner_api == "kernel.pick_place_sequence"
-        assert node.execution.cancellable is True
+    with pytest.raises(KeyError):
+        catalog.get("motion.pick_object")
+    with pytest.raises(KeyError):
+        catalog.get("motion.place_object")
 
     with pytest.raises(KeyError):
         catalog.get("motion.invalidate_cached_plans")
@@ -334,6 +376,23 @@ def test_recomputed_catalog_rejects_wrong_capability_scope(
 
     path = _write_recomputed(tmp_path, mutate)
     with pytest.raises(CatalogValidationError, match="scope must be 'target_binding'"):
+        NodeCatalog(path)
+
+
+def test_recomputed_catalog_rejects_effectful_non_target_requirement(
+    tmp_path: Path,
+) -> None:
+    def mutate(data: dict[str, object]) -> None:
+        move = next(entry for entry in data["entries"] if entry["id"] == "motion.move_to_pose")
+        collision = next(
+            requirement
+            for requirement in move["required_capabilities"]
+            if requirement["capability_id"] == "collision.query.pre_execution"
+        )
+        collision["effectful"] = True
+
+    path = _write_recomputed(tmp_path, mutate)
+    with pytest.raises(CatalogValidationError, match="valid only for target_binding"):
         NodeCatalog(path)
 
 

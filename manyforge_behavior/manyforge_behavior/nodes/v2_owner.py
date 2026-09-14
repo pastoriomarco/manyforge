@@ -442,10 +442,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         them or pretend the Kernel stopped them.
         """
 
-        if not selected_resume and self._owner_port_name not in {
-            "kernel_operations",
-            "pick_place",
-        }:
+        if not selected_resume and self._owner_port_name != "kernel_operations":
             return "unaffected"
         if self._task is None:
             return "inactive"

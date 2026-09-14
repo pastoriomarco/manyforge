@@ -58,6 +58,7 @@ export interface CatalogParameter {
 export interface CatalogCapabilityRequirement {
   capabilityId: string;
   scope: string;
+  effectful: boolean;
   targetParameter?: string;
   componentParameter?: string;
   whenParameter?: string;
@@ -280,6 +281,7 @@ export interface ProgramDocument {
     keys: BlackboardKeyDeclaration[];
   };
   contact_policies?: JsonValue[];
+  synchronized_execution_groups?: string[];
   tree: ProgramTreeNode;
 }
 

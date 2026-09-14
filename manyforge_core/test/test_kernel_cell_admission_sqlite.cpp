@@ -151,13 +151,18 @@ TEST(KernelCellAdmissionSqlite, ProgramNodeAttributionSurvivesOwnerReplacement) 
   auto claim = Claim();
   claim.intent.claim_kind = CellAdmissionClaimKindDTO::kAuthoredScene;
   claim.intent.owner_role = CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner;
-  claim.intent.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
-      RequestOwnerEpoch("program.owner"), ProgramRunId("run.1"), CellAdmissionClaimGeneration(7U),
-      "attach", std::string(512U, 'a'), "scene.carried_attachment"};
+  claim.intent.program_node_evidence =
+      ProgramNodeAdmissionEvidenceDTO{RequestOwnerEpoch("program.owner"),
+                                      ProgramRunId("run.1"),
+                                      CellAdmissionClaimGeneration(7U),
+                                      "attach",
+                                      std::string(512U, 'a'),
+                                      "scene.carried_attachment"};
   {
     SqliteOperationJournal journal(database, CellId("cell.1"));
     ASSERT_TRUE(journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.1"), 1, 8U, {}).ok());
-    ASSERT_TRUE(journal.RecordCellAdmissionClaimAcquired(RequestOwnerEpoch("kernel.1"), claim).ok());
+    ASSERT_TRUE(
+        journal.RecordCellAdmissionClaimAcquired(RequestOwnerEpoch("kernel.1"), claim).ok());
   }
   SqliteOperationJournal journal(database, CellId("cell.1"));
   const auto recovery = journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.2"), 2, 8U, {});
@@ -204,19 +209,21 @@ TEST(KernelCellAdmissionSqlite, V12ClaimsRetainTheirExactIdentityAfterAttributio
   {
     SqliteOperationJournal journal(database, CellId("cell.1"));
     ASSERT_TRUE(journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.1"), 1, 8U, {}).ok());
-    ASSERT_TRUE(journal.RecordCellAdmissionClaimAcquired(RequestOwnerEpoch("kernel.1"), claim).ok());
+    ASSERT_TRUE(
+        journal.RecordCellAdmissionClaimAcquired(RequestOwnerEpoch("kernel.1"), claim).ok());
   }
   sqlite3* legacy = nullptr;
   ASSERT_EQ(sqlite3_open(database.c_str(), &legacy), SQLITE_OK);
-  const auto downgraded = sqlite3_exec(legacy,
-      "ALTER TABLE cell_admission_claims DROP COLUMN program_node_runner_owner_epoch;"
-      "ALTER TABLE cell_admission_claims DROP COLUMN program_node_run_id;"
-      "ALTER TABLE cell_admission_claims DROP COLUMN program_node_instance_id;"
-      "ALTER TABLE cell_admission_claims DROP COLUMN program_node_attempt_id;"
-      "ALTER TABLE cell_admission_claims DROP COLUMN program_node_owner_api;"
-      "PRAGMA user_version=12; UPDATE journal_metadata SET schema_version=12,"
-      "schema_id='manyforge.internal.execution.operation-journal.o1.5.v12';",
-      nullptr, nullptr, nullptr);
+  const auto downgraded =
+      sqlite3_exec(legacy,
+                   "ALTER TABLE cell_admission_claims DROP COLUMN program_node_runner_owner_epoch;"
+                   "ALTER TABLE cell_admission_claims DROP COLUMN program_node_run_id;"
+                   "ALTER TABLE cell_admission_claims DROP COLUMN program_node_instance_id;"
+                   "ALTER TABLE cell_admission_claims DROP COLUMN program_node_attempt_id;"
+                   "ALTER TABLE cell_admission_claims DROP COLUMN program_node_owner_api;"
+                   "PRAGMA user_version=12; UPDATE journal_metadata SET schema_version=12,"
+                   "schema_id='manyforge.internal.execution.operation-journal.o1.5.v12';",
+                   nullptr, nullptr, nullptr);
   sqlite3_close(legacy);
   ASSERT_EQ(downgraded, SQLITE_OK);
   SqliteOperationJournal journal(database, CellId("cell.1"));
@@ -231,7 +238,12 @@ TEST(KernelCellAdmissionSqlite, V12ClaimsRetainTheirExactIdentityAfterAttributio
 TEST(KernelCellAdmissionSqlite, AcquireAndReleaseCrashWindowsRehydrateExactTruth) {
   TemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);
-  const auto claim = Claim();
+  auto claim = Claim();
+  claim.intent.claim_kind = CellAdmissionClaimKindDTO::kComponentLifecycle;
+  claim.intent.owner_role = CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
+  claim.intent.owner_epoch = RequestOwnerEpoch("cclc.owner.1");
+  claim.intent.owner_transaction_id = "lifecycle.1";
+  claim.intent.request_id = RequestId("lifecycle.request.1");
   {
     SqliteOperationJournal journal(database, CellId("cell.1"));
     ASSERT_TRUE(
@@ -455,6 +467,69 @@ TEST(KernelCellAdmissionSqlite, UncleanKernelReplacementAllowsProvenEmptyProgram
   ASSERT_TRUE(rotated.ok()) << rotated.error().code << ": " << rotated.error().message;
   const auto retired = owner.GetCellAdmissionRecoveryReceipt(
       {predecessor.intent, predecessor, Release(predecessor)});
+  ASSERT_TRUE(retired.ok());
+  EXPECT_EQ(retired.value().status, CellAdmissionRecoveryReceiptStatusDTO::kUnknown);
+  EXPECT_EQ(retired.value().current_owner_epochs, reconcile.current_owner_epochs);
+  EXPECT_EQ(CountRows(database, "cell_admission_request_membership"), 0);
+}
+
+TEST(KernelCellAdmissionSqlite, UncleanKernelReplacementAllowsProvenEmptyManualOwnerRotation) {
+  TemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  FixedClock clock;
+  auto predecessor = Claim();
+  std::optional<CellAdmissionClaimReleaseDTO> predecessor_release;
+  {
+    SqliteOperationJournal journal(database, CellId("cell.1"));
+    auto recovery =
+        journal.BeginOwnerEpoch(RequestOwnerEpoch("kernel.1"), 1, 8U, {ResourceId("resource.1")});
+    ASSERT_TRUE(recovery.ok());
+    KernelCellAdmissionOwner owner(
+        RequestOwnerEpoch("kernel.1"), 8U, clock, journal, {},
+        recovery.value().cell_admission_generation_high_water, {},
+        [](const auto&, const auto&) { return Result<void>::Ok(); }, {}, {}, {},
+        EmptyLivenessSet());
+    ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+    auto intent = Claim().intent;
+    intent.claim_kind = CellAdmissionClaimKindDTO::kManualOperation;
+    intent.owner_role = CellAdmissionOwnerRoleDTO::kManualOperationOwner;
+    intent.owner_epoch = RequestOwnerEpoch("kernel.1");
+    intent.owner_transaction_id = "manual.1";
+    intent.request_id = RequestId("manual.request.1");
+    intent.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
+    auto acquired = owner.AcquireCellAdmissionClaim(intent);
+    ASSERT_TRUE(acquired.ok());
+    predecessor = acquired.value();
+    predecessor_release = Release(predecessor);
+    predecessor_release->settlement.settlement_kind =
+        CellAdmissionSettlementKindDTO::kTerminalEffectsSettled;
+    ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(*predecessor_release).ok());
+  }
+
+  SqliteOperationJournal replacement(database, CellId("cell.1"));
+  auto recovery =
+      replacement.BeginOwnerEpoch(RequestOwnerEpoch("kernel.2"), 2, 8U, {ResourceId("resource.1")});
+  ASSERT_TRUE(recovery.ok());
+  KernelCellAdmissionOwner owner(
+      RequestOwnerEpoch("kernel.2"), 8U, clock, replacement,
+      recovery.value().recovered_cell_admission_claims,
+      recovery.value().cell_admission_generation_high_water, {},
+      [](const auto&, const auto&) { return Result<void>::Ok(); },
+      [](const auto&, const auto&, const auto& reconcile) {
+        return Result<CellAdmissionReconcileValidationDTO>::Ok(RetainAll(reconcile));
+      },
+      recovery.value().recovered_cell_admission_membership,
+      recovery.value().recovered_cell_admission_current_owners, EmptyLivenessSet());
+  const CellAdmissionReconcileDTO reconcile{
+      RequestOwnerEpoch("kernel.2"),
+      {},
+      {{CellAdmissionOwnerRoleDTO::kManualOperationOwner, RequestOwnerEpoch("kernel.2")}},
+      Digest('c')};
+  const auto rotated = owner.ReconcileCellAdmissionClaims(reconcile);
+  ASSERT_TRUE(rotated.ok()) << rotated.error().code << ": " << rotated.error().message;
+  ASSERT_TRUE(predecessor_release.has_value());
+  const auto retired =
+      owner.GetCellAdmissionRecoveryReceipt({predecessor.intent, predecessor, predecessor_release});
   ASSERT_TRUE(retired.ok());
   EXPECT_EQ(retired.value().status, CellAdmissionRecoveryReceiptStatusDTO::kUnknown);
   EXPECT_EQ(retired.value().current_owner_epochs, reconcile.current_owner_epochs);

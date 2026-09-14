@@ -1413,6 +1413,96 @@ def _resolve_execution_selections(
     )
 
 
+_SYNCHRONIZABLE_MOTION_NODE_IDS: Final = frozenset(
+    {
+        "motion.move_to_joint_target",
+        "motion.move_to_pose",
+        "motion.follow_cartesian_path",
+    }
+)
+
+
+def _parse_synchronized_execution_groups(raw: Any, *, path: str) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if (
+        type(raw) is not list
+        or len(raw) > _MAX_EXECUTION_GROUPS
+        or any(
+            type(name) is not str
+            or len(name) > 128
+            or _IDENTIFIER_RE.fullmatch(name) is None
+            or name in {"all", "inherit"}
+            for name in raw
+        )
+        or raw != sorted(raw)
+        or len(set(raw)) != len(raw)
+    ):
+        raise ProgramValidationError(
+            f"{path} must be a canonical sorted set of unique named execution groups"
+        )
+    return tuple(raw)
+
+
+def _resolve_synchronized_execution_selections(
+    tree: ProgramTreeNode,
+    group_names: tuple[str, ...],
+) -> Mapping[str, tuple[str, ...]]:
+    """Validate same-tick motion groups without adding another runtime owner."""
+
+    if not group_names:
+        return MappingProxyType({})
+    selections = _resolve_execution_selections(tree)
+    nodes: dict[str, ProgramTreeNode] = {}
+    parents: dict[str, ProgramTreeNode | None] = {}
+    pending = [(tree, None)]
+    while pending:
+        node, parent = pending.pop()
+        nodes[node.instance_id] = node
+        parents[node.instance_id] = parent
+        pending.extend((child, node) for child in reversed(node.children))
+
+    result: dict[str, tuple[str, ...]] = {}
+    already_synchronized: set[str] = set()
+    for group_name in group_names:
+        members = selections.get(group_name)
+        if members is None or len(members) < 2:
+            raise ProgramValidationError(
+                f"synchronized_execution_groups.{group_name} must select at least two nodes"
+            )
+        member_nodes = [nodes[instance_id] for instance_id in members]
+        if any(node.node_id not in _SYNCHRONIZABLE_MOTION_NODE_IDS for node in member_nodes):
+            raise ProgramValidationError(
+                f"synchronized_execution_groups.{group_name} may contain only ordinary motion nodes"
+            )
+        if any(
+            not isinstance(node.execution_groups, tuple)
+            or group_name not in node.execution_groups
+            for node in member_nodes
+        ):
+            raise ProgramValidationError(
+                f"synchronized_execution_groups.{group_name} must be assigned directly to every member"
+            )
+        parent = parents[members[0]]
+        if (
+            parent is None
+            or parent.node_id != "parallel"
+            or parent.parameters.get("success_policy", "all") != "all"
+            or any(parents[instance_id] is not parent for instance_id in members[1:])
+        ):
+            raise ProgramValidationError(
+                f"synchronized_execution_groups.{group_name} must contain sibling motions under one Success-on-all Parallel"
+            )
+        overlap = already_synchronized.intersection(members)
+        if overlap:
+            raise ProgramValidationError(
+                "a motion node cannot belong to more than one synchronized execution group"
+            )
+        already_synchronized.update(members)
+        result[group_name] = members
+    return MappingProxyType(result)
+
+
 @dataclass(frozen=True, slots=True)
 class ProgramNodePolicy:
     """One complete immutable non-default policy row for a Program node."""
@@ -1757,12 +1847,15 @@ _TOP_LEVEL_FIELDS: Final = frozenset(
         "parameters",
         "blackboard",
         "contact_policies",
+        "synchronized_execution_groups",
         "tree",
     }
 )
 _PROGRAM_PARAMETER_TYPES: Final = frozenset(
     {
         "bool",
+        "cartesian_path",
+        "coordinate_position",
         "float64",
         "int64",
         "model_response",
@@ -3115,14 +3208,24 @@ def _source_type_compatible(
     if destination.schema_type in {"string", "enum"}:
         return source_type == "string"
     if destination.schema_type == "array":
-        if source_type != "string_list" or destination.items is None:
+        if destination.items is None:
             return False
-        return (
-            context.catalog.schema_registry.resolve(destination.items).schema_type
-            == "string"
-        )
-    if destination.schema_type == "object" and source_type == "stored_pose":
-        return {"position_m", "orientation"}.issubset(destination.properties)
+        item = context.catalog.schema_registry.resolve(destination.items)
+        if source_type == "string_list":
+            return item.schema_type == "string"
+        if source_type == "cartesian_path":
+            return item.schema_type == "object" and {
+                "position_m",
+                "orientation",
+            }.issubset(item.properties)
+        return False
+    if destination.schema_type == "object":
+        if source_type == "stored_pose":
+            return {"position_m", "orientation"}.issubset(destination.properties)
+        if source_type == "coordinate_position":
+            return {"kind", "value_m", "value_rad"}.issubset(
+                destination.properties
+            )
     return False
 
 
@@ -3745,8 +3848,22 @@ def _validate_program_document(
         node_budget=[_MAX_TREE_NODES],
         context=context,
     )
+    synchronized_groups = _parse_synchronized_execution_groups(
+        root.get("synchronized_execution_groups"),
+        path=f"{source}.synchronized_execution_groups",
+    )
+    if synchronized_groups and api_version != _PROGRAM_API_VERSION:
+        _program_error(
+            f"{source}.synchronized_execution_groups",
+            "is unavailable in the previous Program contract",
+        )
+    _resolve_synchronized_execution_selections(tree, synchronized_groups)
     normalized_root = deepcopy(root)
     normalized_root["tree"] = tree.to_dict()
+    if synchronized_groups:
+        normalized_root["synchronized_execution_groups"] = list(synchronized_groups)
+    else:
+        normalized_root.pop("synchronized_execution_groups", None)
     try:
         verify_content_identity(
             normalized_root,
@@ -3854,6 +3971,15 @@ class Program:
         self.validated_catalog_digest = catalog.catalog_digest
         self.tree = tree
         self.execution_selections = _resolve_execution_selections(tree)
+        self.synchronized_execution_groups = _parse_synchronized_execution_groups(
+            normalized.get("synchronized_execution_groups"),
+            path=f"{source}.synchronized_execution_groups",
+        )
+        self.synchronized_execution_selections = (
+            _resolve_synchronized_execution_selections(
+                tree, self.synchronized_execution_groups
+            )
+        )
         self.parameters = MappingProxyType(dict(parameters))
         self.blackboard_keys = MappingProxyType(dict(blackboard_keys))
         self.canonical_bytes = canonical

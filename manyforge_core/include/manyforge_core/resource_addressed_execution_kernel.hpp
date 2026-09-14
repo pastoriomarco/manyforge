@@ -673,6 +673,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<OperationControlAcceptedDTO> apply_control(
       const OperationControlRequestDTO& request, OperationControlKind control,
       bool automatic_manual_retirement = false);
+  [[nodiscard]] Result<KernelRecoveryActionResultDTO> apply_coordinated_operation_recovery_action(
+      const OperationId& operation_id, OperationRevision expected_operation_revision,
+      const KernelRecoveryActionRequestDTO& request);
   void CompleteOperationControlEffect(OperationControlEffectResult result) noexcept;
   [[nodiscard]] OperationStateDTO publish_settlement_fault_locked(ActiveOperation& operation);
   [[nodiscard]] Result<void> settle_control_operation_locked(const OperationId& operation_id,

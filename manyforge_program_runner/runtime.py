@@ -356,7 +356,6 @@ class ProgramRuntime:
             gripper_status=self._native.queries,
             scene_transactions=self._scene,
             assistant_requests=self._assistant,
-            pick_place=self._native.pick_place,
             simulator_control=self._simulation_control,
             cclc_lifecycle=self._cclc,
             cclc_routes=self._cclc,
@@ -969,7 +968,6 @@ class ProgramRuntime:
             "kernel_controls",
             "kernel_operations",
             "model_queries",
-            "pick_place",
         }.intersection(availability)
         if not native_ports:
             return availability
@@ -1365,8 +1363,6 @@ class ProgramRuntime:
             "operation_resume": cycle.state in {"idle_after_reset", "running"},
             "operation_reset": cycle.state != "starting",
             "operation_acknowledge_completed": cycle.state != "starting",
-            "pick_sequence_start": cycle.state == "idle_after_reset",
-            "place_sequence_start": cycle.state == "idle_after_reset",
             "cell_full_stop": True,
             "execution_recovery": cycle.state
             in {

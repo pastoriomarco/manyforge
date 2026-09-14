@@ -437,6 +437,18 @@ export function schemaAcceptsProgramType(
   if (programType === 'string_list') {
     return schema.type === 'array' && schema.items?.type === 'string';
   }
+  if (programType === 'cartesian_path') {
+    return schema.type === 'array'
+      && schema.items?.type === 'object'
+      && schema.items.properties?.position_m !== undefined
+      && schema.items.properties?.orientation !== undefined;
+  }
+  if (programType === 'coordinate_position') {
+    return schema.type === 'object'
+      && schema.properties?.kind !== undefined
+      && schema.properties?.value_m !== undefined
+      && schema.properties?.value_rad !== undefined;
+  }
   if (programType === 'stored_pose') {
     return schema.type === 'object'
       && schema.properties?.position_m !== undefined

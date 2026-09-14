@@ -19,7 +19,8 @@ constexpr char kDigest4[] =
 constexpr char kDigest5[] =
     "sha256:5555555555555555555555555555555555555555555555555555555555555555";
 
-[[nodiscard]] SceneObjectSnapshotDTO BoxObject(std::string id, SceneObjectPlacementDTO placement) {
+[[nodiscard]] SceneObjectSnapshotDTO
+BoxObject(std::string id, SceneObjectPlacementDTO placement) {
   return {SceneResourceId(std::move(id)),
           {BoxShapeDTO{Vector3DTO{0.2, 0.3, 0.4}}},
           std::move(placement),
@@ -31,11 +32,14 @@ constexpr char kDigest5[] =
   auto binding = testing::make_test_projection_binding();
   auto logical_scene = *testing::make_test_logical_scene(binding);
   const CarriedObjectAttachmentId attachment_id("attachment:carried-workpiece");
-  const CarriedObjectAttachmentRevision attachment_revision("attachment-revision:1");
+  const CarriedObjectAttachmentRevision attachment_revision(
+      "attachment-revision:1");
   logical_scene.objects = {
-      BoxObject("carried-workpiece",
-                CarriedSceneObjectPlacementDTO{attachment_id, attachment_revision}),
-      BoxObject("workpiece", CellFixedSceneObjectPlacementDTO{CellId("cell:test"), Pose3DTO{}})};
+      BoxObject(
+          "carried-workpiece",
+          CarriedSceneObjectPlacementDTO{attachment_id, attachment_revision}),
+      BoxObject("workpiece", CellFixedSceneObjectPlacementDTO{
+                                 CellId("cell:test"), Pose3DTO{}})};
   logical_scene.carried_object_attachments = {CarriedObjectAttachmentDTO{
       attachment_id,
       attachment_revision,
@@ -43,21 +47,23 @@ constexpr char kDigest5[] =
       ControllableComponentId("component:test"),
       CommandTargetId("target:test"),
       ComponentSceneFrameRefDTO{ControllableComponentId("component:test"),
-                                ModelInstanceId("model:test"), FrameRoleId("frame-role:tcp")},
+                                ModelInstanceId("model:test"),
+                                FrameRoleId("frame-role:tcp")},
       Pose3DTO{{0.0, 0.0, 0.2}, {}},
       {CollisionBodyRoleId("collision-body-role:tool")}}};
   auto world = std::make_shared<CollisionWorldSnapshot>();
   world->publisher_id = "pick-place-process-fixture";
   world->revision = {1U, kDigest3};
-  return {binding,
-          std::make_shared<const LogicalSceneSnapshotDTO>(std::move(logical_scene)),
-          10,
-          {std::move(world),
-           testing::make_test_logical_scene(binding)->configured_collision_policy,
-           {}},
-          1U,
-          1U,
-          {}};
+  return {
+      binding,
+      std::make_shared<const LogicalSceneSnapshotDTO>(std::move(logical_scene)),
+      10,
+      {std::move(world),
+       testing::make_test_logical_scene(binding)->configured_collision_policy,
+       {}},
+      1U,
+      1U,
+      {}};
 }
 
 [[nodiscard]] RuntimeParticipantBindingDTO ArmBinding() {
@@ -75,15 +81,16 @@ constexpr char kDigest5[] =
       {ContactPolicyId("pick.contact"),
        ContactPolicyRevision("contact-policy-revision:1"),
        RuntimeObjectId("selected_object"),
-       {ProgramContactGraspBodyBindingDTO{ComponentRoleId("component-role:tool"),
-                                          TargetRoleId("target-role:tool"),
-                                          ControllableComponentId("component:test"),
-                                          CommandTargetId("target:test"),
-                                          ModelRoleId("tool"),
-                                          CollisionBodyRoleId("collision-body-role:tool"),
-                                          ModelInstanceId("model:test"),
-                                          ModelRevision("model-revision:test"),
-                                          {CollisionBodyId("body:tool")}}},
+       {ProgramContactGraspBodyBindingDTO{
+           ComponentRoleId("component-role:tool"),
+           TargetRoleId("target-role:tool"),
+           ControllableComponentId("component:test"),
+           CommandTargetId("target:test"),
+           ModelRoleId("tool"),
+           CollisionBodyRoleId("collision-body-role:tool"),
+           ModelInstanceId("model:test"),
+           ModelRevision("model-revision:test"),
+           {CollisionBodyId("body:tool")}}},
        0.001,
        0.8}};
   return {ProgramId("program:test"),
@@ -121,32 +128,34 @@ constexpr char kDigest5[] =
 }
 
 class MotionPreviewSession final : public IAddressedMotionPreviewSession {
- public:
-  Result<RuntimeParticipantBindingDTO> resolve_binding(
-      const OperationIntentDTO& operation) const override {
+public:
+  Result<RuntimeParticipantBindingDTO>
+  resolve_binding(const OperationIntentDTO &operation) const override {
     if (operation.participants.size() != 1U) {
       return Result<RuntimeParticipantBindingDTO>::Err(
           ErrorDTO{"invalid_request", "fixture requires one participant", {}});
     }
     return Result<RuntimeParticipantBindingDTO>::Ok(
-        std::holds_alternative<CapabilityCommandIntentDTO>(operation.participants.front().payload)
+        std::holds_alternative<CapabilityCommandIntentDTO>(
+            operation.participants.front().payload)
             ? CarrierBinding()
             : ArmBinding());
   }
 
-  Result<ExecuteRequestDTO> prepare_motion(const OperationIntentDTO& operation) override {
+  Result<ExecuteRequestDTO>
+  prepare_motion(const OperationIntentDTO &operation) override {
     if (operation.participants.size() != 1U) {
       return Result<ExecuteRequestDTO>::Err(
           ErrorDTO{"invalid_request", "fixture requires one participant", {}});
     }
-    const auto* motion =
-        std::get_if<MotionParticipantIntentDTO>(&operation.participants.front().payload);
+    const auto *motion = std::get_if<MotionParticipantIntentDTO>(
+        &operation.participants.front().payload);
     if (motion == nullptr) {
       return Result<ExecuteRequestDTO>::Err(
           ErrorDTO{"invalid_request", "fixture requires motion", {}});
     }
-    auto request =
-        testing::make_test_execute_request({"joint1", "joint2"}, operation.program_run_id.value());
+    auto request = testing::make_test_execute_request(
+        {"joint1", "joint2"}, operation.program_run_id.value());
     request.move_id = motion->move_id.value();
     request.tolerances = motion->tolerances;
     request.speed_profile = motion->speed_profile;
@@ -156,51 +165,57 @@ class MotionPreviewSession final : public IAddressedMotionPreviewSession {
     request.target_mode = motion->target_mode;
     request.target_reference = motion->target_reference;
     request.offset_reference = motion->offset_reference;
-    request.contact_policy_id =
-        motion->contact_policy_id.has_value() ? motion->contact_policy_id->value() : std::string{};
+    request.contact_policy_id = motion->contact_policy_id.has_value()
+                                    ? motion->contact_policy_id->value()
+                                    : std::string{};
     request.runtime_object_bindings = motion->runtime_object_bindings;
-    if (const auto* pose = std::get_if<PoseGoalDTO>(&motion->motion)) {
+    if (const auto *pose = std::get_if<PoseGoalDTO>(&motion->motion)) {
       request.motion = *pose;
-    } else if (const auto* path = std::get_if<CartesianPathDTO>(&motion->motion)) {
+    } else if (const auto *path =
+                   std::get_if<CartesianPathDTO>(&motion->motion)) {
       request.motion = *path;
     } else {
       return Result<ExecuteRequestDTO>::Err(
           ErrorDTO{"invalid_request", "fixture motion is unsupported", {}});
     }
-    if (motion->contact_policy_id.has_value() && !motion->runtime_object_bindings.empty()) {
-      request.resolved_contact_grasp =
-          ResolvedContactGraspBindingDTO{*motion->contact_policy_id,
-                                         ContactPolicyRevision("contact-policy-revision:1"),
-                                         motion->runtime_object_bindings.front().runtime_object_id,
-                                         motion->runtime_object_bindings.front().scene_resource_id,
-                                         {CollisionBodyId("body:tool")},
-                                         0.001,
-                                         0.8};
+    if (motion->contact_policy_id.has_value() &&
+        !motion->runtime_object_bindings.empty()) {
+      request.resolved_contact_grasp = ResolvedContactGraspBindingDTO{
+          *motion->contact_policy_id,
+          ContactPolicyRevision("contact-policy-revision:1"),
+          motion->runtime_object_bindings.front().runtime_object_id,
+          motion->runtime_object_bindings.front().scene_resource_id,
+          {CollisionBodyId("body:tool")},
+          0.001,
+          0.8};
     }
     return Result<ExecuteRequestDTO>::Ok(std::move(request));
   }
 
   Result<RobotStateDTO> current_state() const override {
-    return Result<RobotStateDTO>::Ok(RobotStateDTO{{"joint1", "joint2"}, {0.0, 0.0}, {}});
+    return Result<RobotStateDTO>::Ok(
+        RobotStateDTO{{"joint1", "joint2"}, {0.0, 0.0}, {}});
   }
 
   Result<std::vector<Pose3DTO>> resolve_reference_poses(
-      const OperationIntentDTO&, std::vector<ReferenceDTO> references,
-      const CollisionWorldLeaseInventory&, const RobotStateDTO&,
+      const OperationIntentDTO &, std::vector<ReferenceDTO> references,
+      const CollisionWorldLeaseInventory &, const RobotStateDTO &,
       std::vector<RuntimeObjectReferenceBindingDTO>) override {
     std::vector<Pose3DTO> resolved;
     resolved.reserve(references.size());
-    for (const auto& reference : references) {
-      resolved.push_back(reference.pose.value_or(
-          Pose3DTO{{}, QuaternionDTO{0.0, 0.0, 0.7071067811865475, 0.7071067811865476}}));
+    for (const auto &reference : references) {
+      resolved.push_back(reference.pose.value_or(Pose3DTO{
+          {},
+          QuaternionDTO{0.0, 0.0, 0.7071067811865475, 0.7071067811865476}}));
     }
     return Result<std::vector<Pose3DTO>>::Ok(std::move(resolved));
   }
 
-  Result<MotionPreviewResultDTO> preview_motion(OperationIntentDTO operation,
-                                                CollisionWorldLeaseInventory projection_inventory,
-                                                RobotStateDTO start_state, std::uint32_t,
-                                                std::stop_token) override {
+  Result<MotionPreviewResultDTO>
+  preview_motion(OperationIntentDTO operation,
+                 CollisionWorldLeaseInventory projection_inventory,
+                 RobotStateDTO start_state, std::uint32_t,
+                 std::stop_token) override {
     auto prepared = prepare_motion(operation);
     if (!prepared.ok()) {
       return Result<MotionPreviewResultDTO>::Err(prepared.error());
@@ -211,151 +226,80 @@ class MotionPreviewSession final : public IAddressedMotionPreviewSession {
       return Result<MotionPreviewResultDTO>::Err(
           ErrorDTO{"planning_failed",
                    "fixture candidate is intentionally infeasible",
-                   {{"failure_stage", "planning"}, {"reason", "fixture_no_feasible_candidate"}}});
+                   {{"failure_stage", "planning"},
+                    {"reason", "fixture_no_feasible_candidate"}}});
     }
     std::vector<double> final_positions(start_state.positions_rad.size(),
                                         static_cast<double>(ordinal));
     RobotStateDTO final_state{start_state.joint_names, final_positions, {}};
-    TrajectoryDTO trajectory{request.binding.resources,
-                             start_state.joint_names,
-                             {{0.0, start_state.positions_rad, {}, {}},
-                              {static_cast<double>(ordinal), final_positions, {}, {}}}};
+    TrajectoryDTO trajectory{
+        request.binding.resources,
+        start_state.joint_names,
+        {{0.0, start_state.positions_rad, {}, {}},
+         {static_cast<double>(ordinal), final_positions, {}, {}}}};
     return Result<MotionPreviewResultDTO>::Ok(MotionPreviewResultDTO{
         std::move(trajectory), std::move(start_state), final_state,
         testing::make_test_controlled_state(request.binding, final_positions),
         Pose3DTO{{0.0, 0.0, static_cast<double>(ordinal)}, {}},
-        projection_inventory.projection_binding, projection_inventory.bundle.world->revision, 0U});
+        projection_inventory.projection_binding,
+        projection_inventory.bundle.world->revision, 0U});
   }
 
- private:
+private:
   std::size_t preview_count_{};
 };
 
 class MotionPreviewOwner final : public IAddressedMotionPreviewOwner {
- public:
-  Result<std::unique_ptr<IAddressedMotionPreviewSession>> begin_motion_preview_session(
-      const OperationIntentDTO&) override {
+public:
+  Result<std::unique_ptr<IAddressedMotionPreviewSession>>
+  begin_motion_preview_session(const OperationIntentDTO &) override {
     std::unique_ptr<IAddressedMotionPreviewSession> session =
         std::make_unique<MotionPreviewSession>();
-    return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Ok(std::move(session));
+    return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Ok(
+        std::move(session));
   }
-};
-
-class OperationOwner final : public IAddressedOperationOwner {
- public:
-  Result<OperationAcceptedDTO> execute(const OperationIntentDTO& intent) override {
-    if (active_.has_value()) {
-      return Result<OperationAcceptedDTO>::Err(ErrorDTO{"execution_rejected",
-                                                        "fixture operation owner is busy",
-                                                        {{"reason", "fixture_operation_busy"}}});
-    }
-    const auto id = OperationId("fixture.operation." + std::to_string(++next_id_));
-    fail_active_ = false;
-    if (intent.participants.size() == 1U) {
-      if (const auto* motion =
-              std::get_if<MotionParticipantIntentDTO>(&intent.participants.front().payload)) {
-        fail_active_ = motion->move_id.value().find("fixture_fail") != std::string::npos;
-      }
-    }
-    active_ = OperationStateDTO{id,
-                                OperationRevision(1U),
-                                intent.program_binding_id,
-                                intent.program_run_id,
-                                OperationCoordinationPolicy::kIndependent,
-                                OperationStateKind::kExecuting,
-                                {},
-                                1,
-                                std::nullopt,
-                                std::nullopt,
-                                std::nullopt};
-    return Result<OperationAcceptedDTO>::Ok(
-        OperationAcceptedDTO{intent.request_context.request_id,
-                             RequestReplayStatusDTO::kAcceptedNew,
-                             id,
-                             OperationRevision(1U),
-                             {},
-                             1});
-  }
-
-  Result<OperationControlAcceptedDTO> acknowledge_completed(
-      const OperationControlRequestDTO& request) override {
-    if (!active_.has_value() || active_->operation_id != request.operation_id ||
-        active_->operation_revision != request.expected_operation_revision ||
-        active_->state != OperationStateKind::kCompleted) {
-      return Result<OperationControlAcceptedDTO>::Err(
-          ErrorDTO{"invalid_state_transition",
-                   "fixture completion acknowledgement does not match",
-                   {{"reason", "fixture_completion_mismatch"}}});
-    }
-    const auto accepted = OperationControlAcceptedDTO{
-        request.request_context.request_id,
-        RequestReplayStatusDTO::kAcceptedNew,
-        request.operation_id,
-        request.expected_operation_revision,
-        OperationControlKind::kAcknowledgeCompleted,
-        OperationRevision(request.expected_operation_revision.value() + 1U),
-        2};
-    active_.reset();
-    return Result<OperationControlAcceptedDTO>::Ok(accepted);
-  }
-
-  Result<OperationStateDTO> get_operation_state(const OperationId& operation_id) const override {
-    if (!active_.has_value() || active_->operation_id != operation_id) {
-      return Result<OperationStateDTO>::Err(ErrorDTO{"missing_reference",
-                                                     "fixture operation is absent",
-                                                     {{"reason", "fixture_operation_absent"}}});
-    }
-    return Result<OperationStateDTO>::Ok(*active_);
-  }
-
-  Result<void> reconcile_subordinate_state() override {
-    if (active_.has_value() && active_->state == OperationStateKind::kExecuting) {
-      active_->state = fail_active_ ? OperationStateKind::kFailed : OperationStateKind::kCompleted;
-      active_->operation_revision = OperationRevision(2U);
-    }
-    return Result<void>::Ok();
-  }
-
-  const RequestOwnerEpoch& request_owner_epoch() const noexcept override { return owner_epoch_; }
-
- private:
-  RequestOwnerEpoch owner_epoch_{"kernel.epoch:test"};
-  std::uint64_t next_id_{};
-  bool fail_active_{};
-  std::optional<OperationStateDTO> active_;
 };
 
 class SceneOwner final : public ISceneCandidatePreview, public ISceneAuthority {
- public:
+public:
   explicit SceneOwner(CollisionWorldLeaseInventory predecessor)
       : predecessor_(std::move(predecessor)) {}
 
   Result<SceneCandidatePreviewDTO> PreviewResolvedSceneCandidate(
-      const ResolvedSceneCandidatePreviewRequestDTO& request) const override {
-    const auto* attach = std::get_if<AttachCarriedObjectRequestDTO>(&request.request.operation);
-    const auto* detach = std::get_if<DetachCarriedObjectRequestDTO>(&request.request.operation);
-    if ((attach == nullptr) == (detach == nullptr) || !request.frame_resolution.has_value()) {
+      const ResolvedSceneCandidatePreviewRequestDTO &request) const override {
+    const auto *attach =
+        std::get_if<AttachCarriedObjectRequestDTO>(&request.request.operation);
+    const auto *detach =
+        std::get_if<DetachCarriedObjectRequestDTO>(&request.request.operation);
+    if ((attach == nullptr) == (detach == nullptr) ||
+        !request.frame_resolution.has_value()) {
       return Result<SceneCandidatePreviewDTO>::Err(
           ErrorDTO{"invalid_request", "fixture candidate is incomplete", {}});
     }
 
     auto logical_scene = *predecessor_.logical_scene;
-    const auto selected_id = attach != nullptr ? attach->scene_resource_id : [&]() {
-      const auto found = std::find_if(
-          logical_scene.carried_object_attachments.begin(),
-          logical_scene.carried_object_attachments.end(), [&](const auto& candidate) {
-            return candidate.carried_object_attachment_id == detach->carried_object_attachment_id;
-          });
-      return found == logical_scene.carried_object_attachments.end()
-                 ? SceneResourceId(std::string{})
-                 : found->scene_resource_id;
-    }();
+    const auto selected_id =
+        attach != nullptr ? attach->scene_resource_id : [&]() {
+          const auto found =
+              std::find_if(logical_scene.carried_object_attachments.begin(),
+                           logical_scene.carried_object_attachments.end(),
+                           [&](const auto &candidate) {
+                             return candidate.carried_object_attachment_id ==
+                                    detach->carried_object_attachment_id;
+                           });
+          return found == logical_scene.carried_object_attachments.end()
+                     ? SceneResourceId(std::string{})
+                     : found->scene_resource_id;
+        }();
     const auto selected = std::lower_bound(
         logical_scene.objects.begin(), logical_scene.objects.end(), selected_id,
-        [](const auto& candidate, const auto& id) { return candidate.scene_resource_id < id; });
-    if (selected == logical_scene.objects.end() || selected->scene_resource_id != selected_id) {
-      return Result<SceneCandidatePreviewDTO>::Err(
-          ErrorDTO{"missing_reference", "fixture selected object is absent", {}});
+        [](const auto &candidate, const auto &id) {
+          return candidate.scene_resource_id < id;
+        });
+    if (selected == logical_scene.objects.end() ||
+        selected->scene_resource_id != selected_id) {
+      return Result<SceneCandidatePreviewDTO>::Err(ErrorDTO{
+          "missing_reference", "fixture selected object is absent", {}});
     }
 
     auto proposed = predecessor_.projection_binding.projection_revision;
@@ -366,53 +310,64 @@ class SceneOwner final : public ISceneCandidatePreview, public ISceneAuthority {
     ++logical_scene.topology_epoch;
     std::optional<ResolvedSceneOperationDTO> resolved_operation;
     if (attach != nullptr) {
-      const CarriedObjectAttachmentRevision attachment_revision("attachment-revision:planned");
-      selected->placement =
-          CarriedSceneObjectPlacementDTO{attach->carried_object_attachment_id, attachment_revision};
-      const auto& resolved =
-          std::get<ResolvedComponentModelFrameDTO>(request.frame_resolution->resolved_frame);
+      const CarriedObjectAttachmentRevision attachment_revision(
+          "attachment-revision:planned");
+      selected->placement = CarriedSceneObjectPlacementDTO{
+          attach->carried_object_attachment_id, attachment_revision};
+      const auto &resolved = std::get<ResolvedComponentModelFrameDTO>(
+          request.frame_resolution->resolved_frame);
       CarriedObjectAttachmentDTO attachment{
           attach->carried_object_attachment_id,
           attachment_revision,
           attach->scene_resource_id,
           attach->controllable_component_id,
           attach->command_target_id,
-          ComponentSceneFrameRefDTO{attach->controllable_component_id, resolved.model_instance_id,
+          ComponentSceneFrameRefDTO{attach->controllable_component_id,
+                                    resolved.model_instance_id,
                                     attach->frame_role_id},
           Pose3DTO{},
           attach->touch_body_roles};
       logical_scene.carried_object_attachments.push_back(attachment);
       std::sort(logical_scene.carried_object_attachments.begin(),
                 logical_scene.carried_object_attachments.end(),
-                [](const auto& left, const auto& right) {
-                  return left.carried_object_attachment_id < right.carried_object_attachment_id;
+                [](const auto &left, const auto &right) {
+                  return left.carried_object_attachment_id <
+                         right.carried_object_attachment_id;
                 });
-      resolved_operation.emplace(ResolvedAttachCarriedObjectDTO{*selected, std::move(attachment)});
+      resolved_operation.emplace(
+          ResolvedAttachCarriedObjectDTO{*selected, std::move(attachment)});
     } else {
-      const auto attachment = std::find_if(
-          logical_scene.carried_object_attachments.begin(),
-          logical_scene.carried_object_attachments.end(), [&](const auto& candidate) {
-            return candidate.carried_object_attachment_id == detach->carried_object_attachment_id;
-          });
+      const auto attachment =
+          std::find_if(logical_scene.carried_object_attachments.begin(),
+                       logical_scene.carried_object_attachments.end(),
+                       [&](const auto &candidate) {
+                         return candidate.carried_object_attachment_id ==
+                                detach->carried_object_attachment_id;
+                       });
       if (attachment == logical_scene.carried_object_attachments.end()) {
-        return Result<SceneCandidatePreviewDTO>::Err(
-            ErrorDTO{"missing_reference", "fixture carried attachment is absent", {}});
+        return Result<SceneCandidatePreviewDTO>::Err(ErrorDTO{
+            "missing_reference", "fixture carried attachment is absent", {}});
       }
-      const auto attachment_revision = attachment->carried_object_attachment_revision;
-      selected->placement = CellFixedSceneObjectPlacementDTO{logical_scene.cell_id, detach->pose};
+      const auto attachment_revision =
+          attachment->carried_object_attachment_revision;
+      selected->placement =
+          CellFixedSceneObjectPlacementDTO{logical_scene.cell_id, detach->pose};
       logical_scene.carried_object_attachments.erase(attachment);
       resolved_operation.emplace(ResolvedDetachCarriedObjectDTO{
-          *selected, detach->carried_object_attachment_id, attachment_revision});
+          *selected, detach->carried_object_attachment_id,
+          attachment_revision});
     }
-    auto snapshot = std::make_shared<const LogicalSceneSnapshotDTO>(std::move(logical_scene));
-    SceneCandidatePreviewDTO candidate{ContentDigest(kDigest3),
-                                       predecessor_.projection_binding.projection_revision,
-                                       proposed,
-                                       std::move(snapshot),
-                                       std::move(*resolved_operation),
-                                       predecessor_.bundle.policy.value(),
-                                       SceneUpdateStatusDTO::kGeometryChanged,
-                                       ContentDigest(kDigest5)};
+    auto snapshot = std::make_shared<const LogicalSceneSnapshotDTO>(
+        std::move(logical_scene));
+    SceneCandidatePreviewDTO candidate{
+        ContentDigest(kDigest3),
+        predecessor_.projection_binding.projection_revision,
+        proposed,
+        std::move(snapshot),
+        std::move(*resolved_operation),
+        predecessor_.bundle.policy.value(),
+        SceneUpdateStatusDTO::kGeometryChanged,
+        ContentDigest(kDigest5)};
     if (!candidate.valid()) {
       return Result<SceneCandidatePreviewDTO>::Err(
           ErrorDTO{"invariant_violation", "fixture candidate is invalid", {}});
@@ -421,11 +376,13 @@ class SceneOwner final : public ISceneCandidatePreview, public ISceneAuthority {
     return Result<SceneCandidatePreviewDTO>::Ok(std::move(candidate));
   }
 
-  SceneCommitResultDTO Commit(const SceneTransactionRequestDTO& request) override {
+  SceneCommitResultDTO
+  Commit(const SceneTransactionRequestDTO &request) override {
     if (!last_preview_.has_value() ||
         request.expected_projection_revision !=
             predecessor_.projection_binding.projection_revision ||
-        last_preview_->prior_projection_revision != request.expected_projection_revision) {
+        last_preview_->prior_projection_revision !=
+            request.expected_projection_revision) {
       return {request.request_context.request_id,
               RequestReplayStatusDTO::kAcceptedNew,
               false,
@@ -461,7 +418,8 @@ class SceneOwner final : public ISceneCandidatePreview, public ISceneAuthority {
     return predecessor_.projection_binding.projection_revision;
   }
 
-  std::shared_ptr<const LogicalSceneSnapshotDTO> LogicalSnapshot() const override {
+  std::shared_ptr<const LogicalSceneSnapshotDTO>
+  LogicalSnapshot() const override {
     return predecessor_.logical_scene;
   }
 
@@ -469,54 +427,66 @@ class SceneOwner final : public ISceneCandidatePreview, public ISceneAuthority {
     return predecessor_.logical_scene->objects;
   }
 
-  SceneObjectStateDTO GetObjectState(const SceneResourceId& id) const override {
-    const auto found = std::lower_bound(predecessor_.logical_scene->objects.begin(),
-                                        predecessor_.logical_scene->objects.end(), id,
-                                        [](const auto& candidate, const auto& selected) {
-                                          return candidate.scene_resource_id < selected;
-                                        });
-    if (found == predecessor_.logical_scene->objects.end() || found->scene_resource_id != id) {
+  SceneObjectStateDTO GetObjectState(const SceneResourceId &id) const override {
+    const auto found =
+        std::lower_bound(predecessor_.logical_scene->objects.begin(),
+                         predecessor_.logical_scene->objects.end(), id,
+                         [](const auto &candidate, const auto &selected) {
+                           return candidate.scene_resource_id < selected;
+                         });
+    if (found == predecessor_.logical_scene->objects.end() ||
+        found->scene_resource_id != id) {
       return {id, false, false, std::nullopt, std::nullopt};
     }
-    const auto* carried = std::get_if<CarriedSceneObjectPlacementDTO>(&found->placement);
-    return {id, true, carried != nullptr,
-            carried == nullptr
-                ? std::optional<CarriedObjectAttachmentId>{}
-                : std::optional<CarriedObjectAttachmentId>{carried->carried_object_attachment_id},
-            std::nullopt};
+    const auto *carried =
+        std::get_if<CarriedSceneObjectPlacementDTO>(&found->placement);
+    return {
+        id, true, carried != nullptr,
+        carried == nullptr
+            ? std::optional<CarriedObjectAttachmentId>{}
+            : std::optional<
+                  CarriedObjectAttachmentId>{carried
+                                                 ->carried_object_attachment_id},
+        std::nullopt};
   }
 
-  Result<Pose3DTO> GetObjectPose(const SceneResourceId& id) const override {
-    const auto found = std::lower_bound(predecessor_.logical_scene->objects.begin(),
-                                        predecessor_.logical_scene->objects.end(), id,
-                                        [](const auto& candidate, const auto& selected) {
-                                          return candidate.scene_resource_id < selected;
-                                        });
-    if (found == predecessor_.logical_scene->objects.end() || found->scene_resource_id != id) {
-      return Result<Pose3DTO>::Err(ErrorDTO{"object_not_found", "fixture object is absent", {}});
+  Result<Pose3DTO> GetObjectPose(const SceneResourceId &id) const override {
+    const auto found =
+        std::lower_bound(predecessor_.logical_scene->objects.begin(),
+                         predecessor_.logical_scene->objects.end(), id,
+                         [](const auto &candidate, const auto &selected) {
+                           return candidate.scene_resource_id < selected;
+                         });
+    if (found == predecessor_.logical_scene->objects.end() ||
+        found->scene_resource_id != id) {
+      return Result<Pose3DTO>::Err(
+          ErrorDTO{"object_not_found", "fixture object is absent", {}});
     }
-    if (const auto* fixed = std::get_if<CellFixedSceneObjectPlacementDTO>(&found->placement)) {
+    if (const auto *fixed =
+            std::get_if<CellFixedSceneObjectPlacementDTO>(&found->placement)) {
       return Result<Pose3DTO>::Ok(fixed->pose_in_cell);
     }
     return Result<Pose3DTO>::Ok(Pose3DTO{});
   }
 
- private:
+private:
   mutable CollisionWorldLeaseInventory predecessor_;
   mutable std::optional<SceneCandidatePreviewDTO> last_preview_;
 };
 
 class SceneProjection final : public IPlannerSceneProjection {
- public:
+public:
   explicit SceneProjection(CollisionWorldLeaseInventory predecessor)
       : predecessor_(std::move(predecessor)) {}
 
-  ProjectionCommitResultDTO ApplyTransaction(const SceneTransactionDTO&) override {
+  ProjectionCommitResultDTO
+  ApplyTransaction(const SceneTransactionDTO &) override {
     throw std::logic_error("fixture projection commit is unavailable");
   }
 
-  Result<CollisionWorldLeaseInventory> RetainProjection(const ProjectionRevisionDTO& revision,
-                                                        ProjectionLeaseId lease_id) override {
+  Result<CollisionWorldLeaseInventory>
+  RetainProjection(const ProjectionRevisionDTO &revision,
+                   ProjectionLeaseId lease_id) override {
     if (revision != predecessor_.projection_binding.projection_revision) {
       return Result<CollisionWorldLeaseInventory>::Err(
           ErrorDTO{"stale_revision", "fixture projection is stale", {}});
@@ -527,7 +497,7 @@ class SceneProjection final : public IPlannerSceneProjection {
     return Result<CollisionWorldLeaseInventory>::Ok(std::move(retained));
   }
 
-  void ReleaseProjection(const ProjectionLeaseId& lease_id) override {
+  void ReleaseProjection(const ProjectionLeaseId &lease_id) override {
     if (retained_lease_ == std::optional(lease_id)) {
       retained_lease_.reset();
     }
@@ -536,84 +506,98 @@ class SceneProjection final : public IPlannerSceneProjection {
   ProjectionHealthDTO ProjectionHealth() const override {
     throw std::logic_error("fixture projection health is unavailable");
   }
-  ProjectionCommitResultDTO RebuildProjection(const NativeProjectionRebuildDTO&) override {
+  ProjectionCommitResultDTO
+  RebuildProjection(const NativeProjectionRebuildDTO &) override {
     throw std::logic_error("fixture projection rebuild is unavailable");
   }
   NativeProjectionBootstrapRebuildResultDTO RebuildBootstrapProjection(
-      const NativeProjectionBootstrapRebuildDTO&) override {
+      const NativeProjectionBootstrapRebuildDTO &) override {
     throw std::logic_error("fixture bootstrap projection is unavailable");
   }
   NativeProjectionBootstrapStatusDTO BootstrapProjectionStatus(
-      const NativeProjectionBootstrapStatusQueryDTO&) const override {
+      const NativeProjectionBootstrapStatusQueryDTO &) const override {
     throw std::logic_error("fixture bootstrap status is unavailable");
   }
-  NativeProjectionStageResultDTO StageProjection(const NativeProjectionStageDTO&) override {
+  NativeProjectionStageResultDTO
+  StageProjection(const NativeProjectionStageDTO &) override {
     throw std::logic_error("fixture projection stage is unavailable");
   }
-  NativeProjectionActivationResultDTO ActivateStagedProjection(
-      const NativeProjectionActivationDTO&) override {
+  NativeProjectionActivationResultDTO
+  ActivateStagedProjection(const NativeProjectionActivationDTO &) override {
     throw std::logic_error("fixture projection activation is unavailable");
   }
-  NativeProjectionRetireResultDTO RetireProjection(const NativeProjectionRetireDTO&) override {
+  NativeProjectionRetireResultDTO
+  RetireProjection(const NativeProjectionRetireDTO &) override {
     throw std::logic_error("fixture projection retirement is unavailable");
   }
   NativeProjectionRetireStatusDTO ProjectionRetireStatus(
-      const NativeProjectionRetireStatusQueryDTO&) const override {
+      const NativeProjectionRetireStatusQueryDTO &) const override {
     throw std::logic_error("fixture projection retire status is unavailable");
   }
-  NativeProjectionDiscardResultDTO DiscardStagedProjection(
-      const NativeProjectionDiscardDTO&) override {
+  NativeProjectionDiscardResultDTO
+  DiscardStagedProjection(const NativeProjectionDiscardDTO &) override {
     throw std::logic_error("fixture projection discard is unavailable");
   }
-  NativeProjectionStatusDTO ProjectionStageStatus(
-      const NativeProjectionStatusQueryDTO&) const override {
+  NativeProjectionStatusDTO
+  ProjectionStageStatus(const NativeProjectionStatusQueryDTO &) const override {
     throw std::logic_error("fixture projection stage status is unavailable");
   }
 
-  Result<SceneFrameResolutionReceiptDTO> ResolveSceneFrame(
-      const SceneFrameResolutionQueryDTO& query) const override {
-    if (!query.valid() || !std::holds_alternative<TargetCarrierSceneFrameRefDTO>(query.selector)) {
+  Result<SceneFrameResolutionReceiptDTO>
+  ResolveSceneFrame(const SceneFrameResolutionQueryDTO &query) const override {
+    if (!query.valid() ||
+        !std::holds_alternative<TargetCarrierSceneFrameRefDTO>(
+            query.selector)) {
       return Result<SceneFrameResolutionReceiptDTO>::Err(
           ErrorDTO{"invalid_request", "fixture frame query is invalid", {}});
     }
-    const auto& selector = std::get<TargetCarrierSceneFrameRefDTO>(query.selector);
-    return Result<SceneFrameResolutionReceiptDTO>::Ok(SceneFrameResolutionReceiptDTO{
-        ResolvedComponentModelFrameDTO{
-            selector.controllable_component_id, ModelInstanceId("model:test"),
-            selector.frame_role_id,
-            selector.frame_role_id == FrameRoleId("frame-role:base") ? "base" : "tcp",
-            ModelRevision("model-revision:test")},
-        Pose3DTO{},
-        {},
-        query.projection_binding,
-        std::nullopt,
-        ContentDigest(kDigest5)});
+    const auto &selector =
+        std::get<TargetCarrierSceneFrameRefDTO>(query.selector);
+    return Result<SceneFrameResolutionReceiptDTO>::Ok(
+        SceneFrameResolutionReceiptDTO{
+            ResolvedComponentModelFrameDTO{
+                selector.controllable_component_id,
+                ModelInstanceId("model:test"), selector.frame_role_id,
+                selector.frame_role_id == FrameRoleId("frame-role:base")
+                    ? "base"
+                    : "tcp",
+                ModelRevision("model-revision:test")},
+            Pose3DTO{},
+            {},
+            query.projection_binding,
+            std::nullopt,
+            ContentDigest(kDigest5)});
   }
 
   Result<SceneFrameResolutionReceiptDTO> ResolveCandidateSceneFrame(
-      const CandidateSceneFrameResolutionQueryDTO& query) const override {
-    if (!std::holds_alternative<TargetCarrierSceneFrameRefDTO>(query.selector)) {
-      return Result<SceneFrameResolutionReceiptDTO>::Err(
-          ErrorDTO{"invalid_request", "fixture candidate frame query is invalid", {}});
+      const CandidateSceneFrameResolutionQueryDTO &query) const override {
+    if (!std::holds_alternative<TargetCarrierSceneFrameRefDTO>(
+            query.selector)) {
+      return Result<SceneFrameResolutionReceiptDTO>::Err(ErrorDTO{
+          "invalid_request", "fixture candidate frame query is invalid", {}});
     }
-    const auto& selector = std::get<TargetCarrierSceneFrameRefDTO>(query.selector);
-    return Result<SceneFrameResolutionReceiptDTO>::Ok(SceneFrameResolutionReceiptDTO{
-        ResolvedComponentModelFrameDTO{selector.controllable_component_id,
-                                       ModelInstanceId("model:test"), selector.frame_role_id, "tcp",
-                                       ModelRevision("model-revision:test")},
-        Pose3DTO{},
-        {},
-        query.projection_binding,
-        ContentDigest(kDigest4),
-        ContentDigest(kDigest5)});
+    const auto &selector =
+        std::get<TargetCarrierSceneFrameRefDTO>(query.selector);
+    return Result<SceneFrameResolutionReceiptDTO>::Ok(
+        SceneFrameResolutionReceiptDTO{
+            ResolvedComponentModelFrameDTO{
+                selector.controllable_component_id,
+                ModelInstanceId("model:test"), selector.frame_role_id, "tcp",
+                ModelRevision("model-revision:test")},
+            Pose3DTO{},
+            {},
+            query.projection_binding,
+            ContentDigest(kDigest4),
+            ContentDigest(kDigest5)});
   }
 
-  Result<CollisionWorldLeaseInventory> ProjectSceneCandidate(
-      const SceneCandidatePreviewDTO& candidate,
-      const ProjectionLeaseBindingDTO& predecessor_binding,
-      ProjectionLeaseId candidate_lease_id) const override {
-    if (!candidate.valid() || predecessor_binding.projection_revision !=
-                                  predecessor_.projection_binding.projection_revision) {
+  Result<CollisionWorldLeaseInventory>
+  ProjectSceneCandidate(const SceneCandidatePreviewDTO &candidate,
+                        const ProjectionLeaseBindingDTO &predecessor_binding,
+                        ProjectionLeaseId candidate_lease_id) const override {
+    if (!candidate.valid() ||
+        predecessor_binding.projection_revision !=
+            predecessor_.projection_binding.projection_revision) {
       return Result<CollisionWorldLeaseInventory>::Err(
           ErrorDTO{"invalid_request", "fixture candidate is invalid", {}});
     }
@@ -625,33 +609,29 @@ class SceneProjection final : public IPlannerSceneProjection {
     return Result<CollisionWorldLeaseInventory>::Ok(std::move(projected));
   }
 
- private:
+private:
   CollisionWorldLeaseInventory predecessor_;
   std::optional<ProjectionLeaseId> retained_lease_;
 };
 
 struct Ports final {
-  Ports() : predecessor(CombinedProjection()), scene(predecessor), projection(predecessor) {}
+  Ports()
+      : predecessor(CombinedProjection()), scene(predecessor),
+        projection(predecessor) {}
 
   CollisionWorldLeaseInventory predecessor;
   MotionPreviewOwner motion;
-  OperationOwner operations;
   SceneOwner scene;
   SceneProjection projection;
 };
 
-}  // namespace
+} // namespace
 
 FocusedPickPlacePlanningFixture MakeFocusedPickPlacePlanningFixture() {
   auto ports = std::make_shared<Ports>();
-  auto owner = std::make_unique<AddressedPickPlacePlanningOwner>(ports->motion, ports->scene,
-                                                                 ports->scene, ports->projection);
-  auto sequence_coordinator =
-      std::make_unique<PickPlaceSequenceCoordinator>(ports->operations, ports->scene);
-  auto execution_owner =
-      std::make_unique<AddressedPickPlaceExecutionOwner>(*owner, *sequence_coordinator);
-  return {std::move(ports), std::move(owner), std::move(sequence_coordinator),
-          std::move(execution_owner)};
+  auto owner = std::make_unique<AddressedPickPlacePlanningOwner>(
+      ports->motion, ports->scene, ports->scene, ports->projection);
+  return {std::move(ports), std::move(owner)};
 }
 
-}  // namespace manyforge::roboplan_backend::process_fixture
+} // namespace manyforge::roboplan_backend::process_fixture

@@ -5586,6 +5586,39 @@
               "$ref": "#/$defs/s_4fd148f19a85870f"
             }
           },
+          "s_f4bf3e6791e7a6e7": {
+            "not": {
+              "$ref": "#/$defs/s_f5e1a3e4f4f992ed"
+            }
+          },
+          "s_f5e1a3e4f4f992ed": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "contact_scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "contact_scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_f8ca5adf63dd0336": {
             "not": {
               "$ref": "#/$defs/s_21a07e4c82277387"
@@ -6184,6 +6217,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
+                  },
+                  {
                     "$ref": "#/$defs/s_7a7c8fbffe8c1502"
                   },
                   {
@@ -6483,6 +6519,10 @@
                       "contact_policy_id": {
                         "type": "string"
                       },
+                      "contact_scene_resource_id": {
+                        "type": "string",
+                        "x-manyforge-semantic-type": "scene_resource"
+                      },
                       "execution_timeout_s": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -6594,6 +6634,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "contact_scene_resource_id": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "execution_timeout_s": {
@@ -6860,6 +6903,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
+                  },
+                  {
                     "$ref": "#/$defs/s_7a7c8fbffe8c1502"
                   },
                   {
@@ -6949,6 +6995,10 @@
                       "contact_policy_id": {
                         "type": "string"
                       },
+                      "contact_scene_resource_id": {
+                        "type": "string",
+                        "x-manyforge-semantic-type": "scene_resource"
+                      },
                       "execution_timeout_s": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -7024,6 +7074,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "contact_scene_resource_id": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "execution_timeout_s": {
@@ -8399,6 +8452,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
+                  },
+                  {
                     "$ref": "#/$defs/s_7a7c8fbffe8c1502"
                   },
                   {
@@ -8739,6 +8795,10 @@
                       "contact_policy_id": {
                         "type": "string"
                       },
+                      "contact_scene_resource_id": {
+                        "type": "string",
+                        "x-manyforge-semantic-type": "scene_resource"
+                      },
                       "execution_timeout_s": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -8855,6 +8915,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "contact_scene_resource_id": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "execution_timeout_s": {
@@ -9144,6 +9207,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
+                  },
+                  {
                     "$ref": "#/$defs/s_7a7c8fbffe8c1502"
                   },
                   {
@@ -9274,6 +9340,10 @@
                       "contact_policy_id": {
                         "type": "string"
                       },
+                      "contact_scene_resource_id": {
+                        "type": "string",
+                        "x-manyforge-semantic-type": "scene_resource"
+                      },
                       "execution_timeout_s": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -9354,6 +9424,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "contact_scene_resource_id": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "execution_timeout_s": {
@@ -11683,6 +11756,39 @@
             "not": {
               "$ref": "#/$defs/s_4fd148f19a85870f"
             }
+          },
+          "s_f4bf3e6791e7a6e7": {
+            "not": {
+              "$ref": "#/$defs/s_f5e1a3e4f4f992ed"
+            }
+          },
+          "s_f5e1a3e4f4f992ed": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "contact_scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "contact_scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           },
           "s_f8ca5adf63dd0336": {
             "not": {
@@ -12591,6 +12697,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
+                  },
+                  {
                     "$ref": "#/$defs/s_7a7c8fbffe8c1502"
                   },
                   {
@@ -12931,6 +13040,10 @@
                       "contact_policy_id": {
                         "type": "string"
                       },
+                      "contact_scene_resource_id": {
+                        "type": "string",
+                        "x-manyforge-semantic-type": "scene_resource"
+                      },
                       "execution_timeout_s": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -13047,6 +13160,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "contact_scene_resource_id": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "execution_timeout_s": {
@@ -13336,6 +13452,9 @@
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
                   },
                   {
+                    "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
+                  },
+                  {
                     "$ref": "#/$defs/s_7a7c8fbffe8c1502"
                   },
                   {
@@ -13466,6 +13585,10 @@
                       "contact_policy_id": {
                         "type": "string"
                       },
+                      "contact_scene_resource_id": {
+                        "type": "string",
+                        "x-manyforge-semantic-type": "scene_resource"
+                      },
                       "execution_timeout_s": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -13546,6 +13669,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "contact_scene_resource_id": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "execution_timeout_s": {
@@ -15875,6 +16001,39 @@
             "not": {
               "$ref": "#/$defs/s_4fd148f19a85870f"
             }
+          },
+          "s_f4bf3e6791e7a6e7": {
+            "not": {
+              "$ref": "#/$defs/s_f5e1a3e4f4f992ed"
+            }
+          },
+          "s_f5e1a3e4f4f992ed": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "contact_scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "contact_scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           },
           "s_f8ca5adf63dd0336": {
             "not": {
@@ -17549,6 +17708,39 @@
               "$ref": "#/$defs/s_4fd148f19a85870f"
             }
           },
+          "s_f4bf3e6791e7a6e7": {
+            "not": {
+              "$ref": "#/$defs/s_f5e1a3e4f4f992ed"
+            }
+          },
+          "s_f5e1a3e4f4f992ed": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "contact_scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "contact_scene_resource_id"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
+          },
           "s_f8ca5adf63dd0336": {
             "not": {
               "$ref": "#/$defs/s_21a07e4c82277387"
@@ -18273,6 +18465,9 @@
                 "$ref": "#/$defs/s_a47a9cc21283b82f"
               },
               {
+                "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
+              },
+              {
                 "$ref": "#/$defs/s_7a7c8fbffe8c1502"
               },
               {
@@ -18601,6 +18796,10 @@
                   "contact_policy_id": {
                     "type": "string"
                   },
+                  "contact_scene_resource_id": {
+                    "type": "string",
+                    "x-manyforge-semantic-type": "scene_resource"
+                  },
                   "execution_timeout_s": {
                     "exclusiveMinimum": 0.0,
                     "type": "number"
@@ -18712,6 +18911,9 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "cache_mode": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "contact_scene_resource_id": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "execution_timeout_s": {
@@ -19007,6 +19209,9 @@
                 "$ref": "#/$defs/s_a47a9cc21283b82f"
               },
               {
+                "$ref": "#/$defs/s_f4bf3e6791e7a6e7"
+              },
+              {
                 "$ref": "#/$defs/s_7a7c8fbffe8c1502"
               },
               {
@@ -19125,6 +19330,10 @@
                   "contact_policy_id": {
                     "type": "string"
                   },
+                  "contact_scene_resource_id": {
+                    "type": "string",
+                    "x-manyforge-semantic-type": "scene_resource"
+                  },
                   "execution_timeout_s": {
                     "exclusiveMinimum": 0.0,
                     "type": "number"
@@ -19200,6 +19409,9 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "cache_mode": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "contact_scene_resource_id": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "execution_timeout_s": {

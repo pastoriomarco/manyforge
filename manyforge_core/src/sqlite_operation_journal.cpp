@@ -2604,10 +2604,14 @@ void StoreOperationSnapshotMonotonic(sqlite3* database, const RequestOwnerEpoch&
   }
   if (program_node) {
     Require(!row.IsNull(15), "operation_journal_corrupt", "Program node claim has no parent");
-    intent.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
-        RequestOwnerEpoch(row.Text(24)), ProgramRunId(row.Text(25)),
-        CellAdmissionClaimGeneration(PositiveIdentifier(row.Integer(15), "parent claim generation")),
-        row.Text(26), row.Text(27), row.Text(28)};
+    intent.program_node_evidence =
+        ProgramNodeAdmissionEvidenceDTO{RequestOwnerEpoch(row.Text(24)),
+                                        ProgramRunId(row.Text(25)),
+                                        CellAdmissionClaimGeneration(PositiveIdentifier(
+                                            row.Integer(15), "parent claim generation")),
+                                        row.Text(26),
+                                        row.Text(27),
+                                        row.Text(28)};
   } else if (!intent.intervention_evidence.has_value()) {
     Require(row.IsNull(15), "operation_journal_corrupt", "orphan parent claim attribution");
   }
@@ -2940,10 +2944,11 @@ class SqliteOperationJournal::Impl final {
         Exec(database_,
              "ALTER TABLE operation_participants ADD COLUMN execution_node_attempt_id TEXT");
       }
-      for (const auto column : {"program_node_runner_owner_epoch", "program_node_run_id",
-                                "program_node_instance_id", "program_node_attempt_id",
-                                "program_node_owner_api"}) {
-        Exec(database_, "ALTER TABLE cell_admission_claims ADD COLUMN " + std::string(column) + " TEXT");
+      for (const auto column :
+           {"program_node_runner_owner_epoch", "program_node_run_id", "program_node_instance_id",
+            "program_node_attempt_id", "program_node_owner_api"}) {
+        Exec(database_,
+             "ALTER TABLE cell_admission_claims ADD COLUMN " + std::string(column) + " TEXT");
       }
       Statement snapshots(database_,
                           "SELECT operation_id,journal_capture_order FROM operation_snapshots");
@@ -4473,7 +4478,8 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
       "acquired_admission_generation,accepted_at_ns,draft_program_revision,"
       "applied_program_revision,offering_owner_role,offering_owner_epoch,offer_transaction_id,"
       "offer_digest,parent_program_cycle_claim_generation,program_node_runner_owner_epoch,"
-      "program_node_run_id,program_node_instance_id,program_node_attempt_id,program_node_owner_api) "
+      "program_node_run_id,program_node_instance_id,program_node_attempt_id,program_node_owner_api)"
+      " "
       "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
   insert.Bind(1, static_cast<std::int64_t>(claim.claim_generation.value()));
   insert.Bind(2, owner_epoch.value());
@@ -4510,7 +4516,8 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimAcquired(
   }
   if (claim.intent.program_node_evidence.has_value()) {
     const auto& evidence = *claim.intent.program_node_evidence;
-    insert.Bind(18, static_cast<std::int64_t>(evidence.parent_program_cycle_claim_generation.value()));
+    insert.Bind(18,
+                static_cast<std::int64_t>(evidence.parent_program_cycle_claim_generation.value()));
     insert.Bind(19, evidence.program_runner_owner_epoch.value());
     insert.Bind(20, evidence.program_run_id.value());
     insert.Bind(21, evidence.node_instance_id);
@@ -4903,14 +4910,17 @@ std::uint64_t SqliteOperationJournal::Impl::RecordCellAdmissionClaimsReconciled(
       // The CCLC and Composer validators independently prove that their exact
       // successor journal epoch is active and that no owner-local transaction
       // or physical effect remains unresolved.  The Program-cycle validator
-      // provides the same proof for an idle or exactly released cycle.  Those
-      // proofs can authorize an empty-claim rotation after an unclean
-      // Kernel-host epoch; every other request-owner role still requires a
-      // clean close or an exact held-claim successor settlement.
+      // provides the same proof for an idle or exactly released cycle, and the
+      // Kernel validates its own manual-operation successor against the exact
+      // retained claim inventory.  Those proofs can authorize an empty-claim
+      // rotation after an unclean Kernel-host epoch; every other request-owner
+      // role still requires a clean close or an exact held-claim successor
+      // settlement.
       const bool empty_validated_rotation =
           (current.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
            current.owner_role == CellAdmissionOwnerRoleDTO::kAuthoringOwner ||
-           current.owner_role == CellAdmissionOwnerRoleDTO::kProgramRunner) &&
+           current.owner_role == CellAdmissionOwnerRoleDTO::kProgramRunner ||
+           current.owner_role == CellAdmissionOwnerRoleDTO::kManualOperationOwner) &&
           validation.settlements.empty();
       Require(predecessor_clean || successor_settlement || empty_validated_rotation,
               "operation_journal_owner_close_blocked",

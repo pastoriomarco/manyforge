@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: semantic_shape_pick
-program_revision: sha256:9c345e6817c7e57c8b1663ab9fa6a6949916ef92c52537e73886aa535461b6a1
+program_revision: sha256:10e5bbd90903b5f79f2876e057c13d436dfd81d3f1083092290e1a4ddc61f57a
 program_profile: composable-cell-v1
 name: semantic_shape_pick
 description: >-
@@ -11,7 +11,7 @@ description: >-
   remains visible in the Program.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.1.0
+  content_version: 2.3.0
 compatibility:
   lanes: [manyforge-only]
   assistant: required
@@ -133,9 +133,12 @@ blackboard:
       persistence: run
       fields:
         - {field: approach_pose, type: stored_pose}
+        - {field: descend_path, type: cartesian_path}
         - {field: pick_pose, type: stored_pose}
+        - {field: retreat_path, type: cartesian_path}
         - {field: retreat_pose, type: stored_pose}
         - {field: selected_object_id, type: scene_resource}
+        - {field: tool_position, type: coordinate_position}
     - key: selected_object
       type: scene_resource
       access: read_write

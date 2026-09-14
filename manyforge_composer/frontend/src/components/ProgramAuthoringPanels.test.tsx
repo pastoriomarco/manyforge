@@ -123,7 +123,7 @@ function authoringProgram(
     name: 'Test Program',
     catalog: {
       api_version: 'manyforge.node_catalog.v2',
-      content_version: '2.1.0',
+      content_version: '2.3.0',
     },
     component_roles: { robot: {} },
     target_roles: {},
@@ -411,7 +411,8 @@ describe('Program authoring panels', () => {
       />
     </div>);
 
-    expect(markup).toContain('Pick plan subtree');
+    expect(markup).toContain('Pick subtree');
+    expect(markup).toContain('Place subtree');
     expect(markup).toContain('Contact policies');
     expect(markup).toContain('Object support contacts');
     expect(markup).toContain('Runtime object key');

@@ -24,6 +24,8 @@ import { buildProgramParameterMutation } from './ProgramPropertyEditor';
 
 const PROGRAM_TYPES = [
   'bool',
+  'cartesian_path',
+  'coordinate_position',
   'float64',
   'int64',
   'model_response',

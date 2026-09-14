@@ -31,9 +31,39 @@ inline constexpr char kDigestC[] =
 }
 
 [[nodiscard]] ResolvedStopBasePlanDTO BasePlan() {
-  auto base = DecodeResolvedStopBasePlan(GoldenBytes());
-  EXPECT_TRUE(base.ok());
-  return std::move(base.value());
+  auto decoded = DecodeResolvedStopBasePlan(GoldenBytes());
+  EXPECT_TRUE(decoded.ok());
+  auto base = std::move(decoded.value());
+  const ProviderContractRefDTO motion_contract{
+      ProviderContractRoleId("stop.command"),
+      SchemaId(std::string(kMotionControlledStopContractSchemaId)),
+      SchemaRevision(std::string(kMotionControlledStopContractSchemaRevision))};
+  auto& nominal = base.escalation_stages.front();
+  nominal.containment_command.provider_contract_ref = motion_contract;
+  nominal.command_qualification.controlled_substitution_contract->provider_contract_ref =
+      motion_contract;
+  JsonValueDTO::Array limits;
+  for (const auto& resource : {std::string("joint.1"), std::string("joint.2")}) {
+    limits.emplace_back(JsonObjectDTO{
+        {"resource_id", JsonValueDTO{resource}},
+        {"max_deceleration", JsonValueDTO{JsonObjectDTO{
+                                 {"coordinate_kind", JsonValueDTO{std::string("angular_rad_s2")}},
+                                 {"value_rad_s2", JsonValueDTO{2.0}}}}},
+        {"settle_velocity_threshold",
+         JsonValueDTO{JsonObjectDTO{{"coordinate_kind", JsonValueDTO{std::string("angular_rad_s")}},
+                                    {"value_rad_s", JsonValueDTO{0.02}}}}}});
+  }
+  nominal.default_contract_parameters = JsonObjectDTO{
+      {"stop_mode", JsonValueDTO{std::string("soft_on_path")}},
+      {"jerk_limits_enabled", JsonValueDTO{false}},
+      {"deceleration_time_s", JsonValueDTO{0.5}},
+      {"per_resource_limits", JsonValueDTO{std::move(limits)}},
+      {"allow_natural_completion_on_short_path", JsonValueDTO{true}},
+      {"recoverable_substitution_mode", JsonValueDTO{std::string("spring_back_hold")}}};
+  auto verified = MakeResolvedStopBasePlan(std::move(base));
+  EXPECT_TRUE(verified.ok()) << (verified.ok() ? std::string{}
+                                               : verified.error().details.at("reason"));
+  return std::move(verified.value());
 }
 
 [[nodiscard]] RuntimeParticipantBinding Binding(const ResolvedStopBasePlanDTO& base) {
@@ -97,6 +127,9 @@ inline constexpr char kDigestC[] =
 
 [[nodiscard]] PreparedParticipantStopPlanDTO Plan(const ResolvedStopBasePlanDTO& base,
                                                   const RuntimeParticipantBinding& binding) {
+  const std::vector<HardStopResourceLimitDTO> default_limits{
+      {ResourceId("joint.1"), AngularVelocityDTO{0.02}},
+      {ResourceId("joint.2"), AngularVelocityDTO{0.02}}};
   auto plan = MakePreparedParticipantStopPlan(
       base,
       PreparedParticipantStopPlanContextDTO{
@@ -105,8 +138,8 @@ inline constexpr char kDigestC[] =
           binding.value().program_revision, binding.value().program_binding_id,
           ProgramRunId("program-run.1"), std::nullopt, ParticipantStopProfilePurposeDTO::kOrdinary,
           std::nullopt, MotionInterruptNodeCategory::kGeneric},
-      binding.value().resources, {});
-  EXPECT_TRUE(plan.ok());
+      binding.value().resources, default_limits);
+  EXPECT_TRUE(plan.ok()) << (plan.ok() ? std::string{} : plan.error().message);
   return std::move(plan.value());
 }
 

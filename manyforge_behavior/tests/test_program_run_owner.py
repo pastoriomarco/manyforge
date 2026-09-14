@@ -509,7 +509,6 @@ def _fixture(
         gripper_status=invocation,
         model_queries=invocation,
         assistant_requests=task,
-        pick_place=task,
         simulator_control=task,
         kernel_controls=invocation,
         program_run_scope=scope,

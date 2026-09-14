@@ -349,6 +349,12 @@ def _matches_scalar_type(value: object, declared_type: str) -> bool:
         return isinstance(value, str) and bool(value)
     if declared_type == "string_list":
         return isinstance(value, list) and all(isinstance(item, str) for item in value)
+    if declared_type == "cartesian_path":
+        return isinstance(value, list) and len(value) >= 2 and all(
+            isinstance(item, Mapping) for item in value
+        )
+    if declared_type == "coordinate_position":
+        return isinstance(value, Mapping)
     return isinstance(value, Mapping)
 
 

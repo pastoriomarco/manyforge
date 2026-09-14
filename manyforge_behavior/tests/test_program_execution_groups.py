@@ -70,6 +70,17 @@ def document(*children: dict, groups="inherit") -> dict:
     return identified(result)
 
 
+def motion_leaf(name: str, group: str) -> dict:
+    result = deepcopy(
+        load_strict_json_yaml(
+            ROOT / "examples/pick_and_place_minimal.program.yaml"
+        )["tree"]["children"][0]
+    )
+    result["instance_id"] = name
+    result["execution_groups"] = [group]
+    return result
+
+
 def test_default_all_and_overlapping_inherited_selection(catalog: NodeCatalog) -> None:
     a = {
         "node_id": "sequence",
@@ -123,6 +134,58 @@ def test_all_clears_named_inheritance_without_joining_every_group(
     assert Program.from_dict(document(), catalog).execution_selections == {
         "all": ("root", "wait")
     }
+
+
+def test_explicit_synchronized_group_is_one_parallel_motion_set(
+    catalog: NodeCatalog,
+) -> None:
+    source = document()
+    source["tree"] = {
+        "node_id": "parallel",
+        "instance_id": "paired_motion",
+        "parameters": {"success_policy": "all"},
+        "children": [motion_leaf("arm_a", "cell_pair"), motion_leaf("arm_b", "cell_pair")],
+    }
+    source["synchronized_execution_groups"] = ["cell_pair"]
+    program = Program.from_dict(identified(source), catalog)
+
+    assert program.synchronized_execution_groups == ("cell_pair",)
+    assert program.synchronized_execution_selections == {
+        "cell_pair": ("arm_a", "arm_b")
+    }
+
+
+@pytest.mark.parametrize("mutation", ["inherited", "not_parallel", "non_motion", "overlap"])
+def test_synchronized_groups_reject_ambiguous_or_non_motion_sets(
+    catalog: NodeCatalog, mutation: str
+) -> None:
+    first = motion_leaf("arm_a", "cell_pair")
+    second = motion_leaf("arm_b", "cell_pair")
+    source = document()
+    source["tree"] = {
+        "node_id": "parallel",
+        "instance_id": "paired_motion",
+        "parameters": {"success_policy": "all"},
+        "children": [first, second],
+    }
+    source["synchronized_execution_groups"] = ["cell_pair"]
+    if mutation == "inherited":
+        source["tree"]["execution_groups"] = ["cell_pair"]
+        first.pop("execution_groups")
+        second.pop("execution_groups")
+    elif mutation == "not_parallel":
+        source["tree"]["node_id"] = "sequence"
+        source["tree"]["parameters"] = {}
+    elif mutation == "non_motion":
+        second.clear()
+        second.update(leaf("wait", ["cell_pair"]))
+    else:
+        first["execution_groups"] = ["cell_pair", "other_pair"]
+        second["execution_groups"] = ["cell_pair", "other_pair"]
+        source["synchronized_execution_groups"] = ["cell_pair", "other_pair"]
+
+    with pytest.raises(ProgramValidationError, match="synchronized"):
+        Program.from_dict(identified(source), catalog)
 
 
 @pytest.mark.parametrize(

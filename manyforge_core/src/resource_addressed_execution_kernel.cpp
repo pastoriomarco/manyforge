@@ -1610,6 +1610,8 @@ struct ResourceAddressedExecutionKernel::ActiveOperation final {
   std::optional<SettledStop> settled_stop{};
   std::shared_ptr<const ResolvedManualProgramHandover> manual_handover{};
   std::shared_ptr<detail::CoordinatedMotionPreparation> common_timing{};
+  mutable std::vector<KernelRecoveryAssessmentDTO> recovery_assessment_inputs{};
+  mutable std::uint64_t recovery_assessment_revision{};
 
   [[nodiscard]] std::optional<StopCertificateResultDTO> terminal_stop_result() const noexcept {
     if (settled_stop.has_value() && state.active_stop_id == settled_stop->stop_id &&
@@ -5214,16 +5216,18 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
   } else if (group) {
     const auto shared = active->common_timing ? active->common_timing->execution_clock() : nullptr;
     const auto now = clock_.now();
-    bool ready = active->state.state == OperationStateKind::kExecuting && shared &&
-                 shared->sample_now() && active->runtime_scale_status &&
+    const auto expected_state = active->state.state;
+    bool ready = (expected_state == OperationStateKind::kExecuting ||
+                  expected_state == OperationStateKind::kPaused) &&
+                 shared && shared->sample_now() && active->runtime_scale_status &&
                  active->runtime_scale_status->participants.size() == active->participants.size();
     for (std::size_t index = 0; ready && index < active->participants.size(); ++index) {
       const auto& row = active->runtime_scale_status->participants[index];
       const auto freshness = active->participants[index]
                                  .binding.value()
                                  .control_path->runtime_scale_qualification->freshness_budget_ns;
-      ready = active->state.participants[index].state == OperationStateKind::kExecuting &&
-              row.supported && !row.error && row.acknowledgement_sequence != 0U &&
+      ready = active->state.participants[index].state == expected_state && row.supported &&
+              !row.error && row.acknowledgement_sequence != 0U &&
               row.acknowledgement_timestamp_ns >= 0 && row.acknowledgement_timestamp_ns <= now &&
               now - row.acknowledgement_timestamp_ns <= freshness;
     }
@@ -5279,16 +5283,6 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
 
   {
     std::lock_guard state_lock(state_mutex_);
-    if (motion_admission_closed_) {
-      return reject<OperationAcceptedDTO>(
-          "new motion admission is closed by an active emergency Stop or fault",
-          "motion_admission_closed", ErrorCode::kInvalidStateTransition);
-    }
-    if (emergency_stop_reserve_.find(intent.request_context.request_id.value()).has_value()) {
-      return Result<OperationAcceptedDTO>::Err(
-          error("request_id_conflict", "operation request ID is retained by emergency Stop",
-                "request_id_conflict"));
-    }
     const auto replay =
         std::find_if(replay_ledger_.begin(), replay_ledger_.end(), [&](const ReplayEntry& entry) {
           return entry.intent.request_context.request_id == intent.request_context.request_id;
@@ -5302,6 +5296,19 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       auto accepted = replay->accepted;
       accepted.replay_status = RequestReplayStatusDTO::kReplayedExact;
       return Result<OperationAcceptedDTO>::Ok(std::move(accepted));
+    }
+    // A retained receipt is observation of the original decision, not fresh
+    // motion admission. Keep it readable while Stop/fault fences reject every
+    // request absent from the replay ledger.
+    if (motion_admission_closed_) {
+      return reject<OperationAcceptedDTO>(
+          "new motion admission is closed by an active emergency Stop or fault",
+          "motion_admission_closed", ErrorCode::kInvalidStateTransition);
+    }
+    if (emergency_stop_reserve_.find(intent.request_context.request_id.value()).has_value()) {
+      return Result<OperationAcceptedDTO>::Err(
+          error("request_id_conflict", "operation request ID is retained by emergency Stop",
+                "request_id_conflict"));
     }
     const auto control_request = std::find_if(
         control_replay_ledger_.begin(), control_replay_ledger_.end(),
@@ -6459,6 +6466,41 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     if (const auto scope = validate_program_execution_scope_locked(intent); !scope.ok()) {
       return Result<OperationAcceptedDTO>::Err(scope.error());
     }
+    if (program_cycle_claim_run_ && program_cycle_claim_run_->capture &&
+        program_cycle_claim_run_->program_run_id == intent.program_run_id) {
+      const auto& nodes = program_cycle_claim_run_->capture->table->nodes;
+      for (std::size_t index = 0U; index < intent.participants.size(); ++index) {
+        const auto& scope = *intent.participants[index].execution_scope;
+        const auto node =
+            std::lower_bound(nodes.begin(), nodes.end(), scope.node_instance_id,
+                             [](const auto& row, const auto& id) { return row.instance_id < id; });
+        const auto node_index = static_cast<std::size_t>(node - nodes.begin());
+        if (node_index >= program_cycle_claim_run_->motion_continuations.size()) continue;
+        const auto& pending = program_cycle_claim_run_->motion_continuations[node_index];
+        if (!pending) continue;
+        const auto& admission = admissions[index];
+        if (node == nodes.end() || node->owner_api != "kernel.operation" ||
+            pending->origin.node_instance_id != scope.node_instance_id ||
+            pending->origin.node_attempt_id == scope.node_attempt_id ||
+            admission.payload_kind != OperationParticipantPayloadKind::kMotion ||
+            pending->binding.value() != admission.registration.binding.value() ||
+            !admission.motion_request ||
+            pending->base_frame != admission.motion_request->binding.base_frame ||
+            pending->tcp_frame != admission.motion_request->binding.tcp_frame ||
+            pending->planner_capability !=
+                admission.motion_request->binding.planner_capability_binding ||
+            pending->authored_motion_kind !=
+                std::get<MotionParticipantIntentDTO>(intent.participants[index].payload)
+                    .motion.index()) {
+          return reject<OperationAcceptedDTO>(
+              "new synchronized attempt differs from its retained motion continuation",
+              "program_motion_continuation_mismatch", ErrorCode::kInvalidRequest);
+        }
+        auto& participant = prepared_operation.mapped()->participants[index];
+        participant.continuation = pending->intent;
+        participant.continuation_node_index = node_index;
+      }
+    }
     if (emergency_stop_reserve_.find(intent.request_context.request_id.value()).has_value()) {
       return Result<OperationAcceptedDTO>::Err(
           error("request_id_conflict", "operation request ID became retained by emergency Stop",
@@ -6575,6 +6617,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
   }
 
   for (auto& admission : admissions) {
+    std::shared_ptr<const detail::MotionResumeIntent> continuation;
     {
       std::lock_guard state_lock(state_mutex_);
       auto* operation = find_active_operation_locked(operation_id);
@@ -6590,22 +6633,17 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
         return Result<OperationAcceptedDTO>::Ok(accepted);
       }
       participant->prepare_in_flight = true;
+      continuation = participant->continuation;
     }
     Result<std::uint64_t> prepared = [&]() {
       if (admission.payload_kind == OperationParticipantPayloadKind::kMotion) {
         return admission.registration.prepared_motion_engine->PrepareMotion(
             ResolvedPreparedMotionExecutionRequestDTO{
-                *admission.motion_request,
-                operation_revision,
-                admission.registration.binding,
-                *admission.registration.stop_readiness,
-                *admission.registration.runtime_policy,
+                *admission.motion_request, operation_revision, admission.registration.binding,
+                *admission.registration.stop_readiness, *admission.registration.runtime_policy,
                 admission.registration.retained_default_stop_limits,
-                admission.registration.stop_node_category,
-                admission.stop_plan,
-                admission.fault_stop_plan,
-                {},
-                common_timing});
+                admission.registration.stop_node_category, admission.stop_plan,
+                admission.fault_stop_plan, std::move(continuation), common_timing});
       }
       return admission.registration.prepared_motion_engine->PrepareCapabilityCommand(
           ResolvedPreparedCapabilityCommandExecutionRequestDTO{
@@ -6931,6 +6969,14 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       auto scope =
           validate_program_resume_scope_locked(active_operation->intent, request.execution_scope);
       if (!scope.ok()) return Result<OperationControlAcceptedDTO>::Err(scope.error());
+      if (active_operation->runtime_scale_status.has_value() &&
+          (active_operation->runtime_scale_status->state == RuntimeScaleApplicationState::kFailed ||
+           active_operation->runtime_scale_status->state ==
+               RuntimeScaleApplicationState::kRejected)) {
+        return reject<OperationControlAcceptedDTO>(
+            "Resume requires a valid retained runtime-scale setting",
+            "prepared_resume_runtime_scale_unresolved", ErrorCode::kInvalidStateTransition);
+      }
     }
     if (active_operation->pending_control.has_value() ||
         active_operation->recovery_effect_in_flight ||
@@ -8029,14 +8075,6 @@ ResourceAddressedExecutionKernel::resolve_manual_program_handover(
   }
   auto& result = *captured;
 
-  // Use actual command requirements, not every target-scoped dependency:
-  // feedback/kinematics/input reads do not compete for manual motion. These
-  // are the effectful target commands supported by the captured native lane.
-  const auto produces = [](const CapabilityId& capability) {
-    const auto& id = capability.value();
-    return id == "execution.trajectory.execute" || id == "execution.resume" ||
-           id == "tool.gripper.command" || id == "io.gpio.set_output";
-  };
   std::map<TargetRoleId, bool> conflicts;
   const auto& targets = result.capture.binding->target_role_bindings;
   const auto& nodes = result.capture.table->nodes;
@@ -8044,7 +8082,7 @@ ResourceAddressedExecutionKernel::resolve_manual_program_handover(
   for (std::size_t index = 0U; index < nodes.size(); ++index) {
     bool selected = false;
     for (const auto& effect : nodes[index].target_effects) {
-      if (!produces(effect.capability_id)) continue;
+      if (!effect.effectful) continue;
       auto cached = conflicts.find(effect.target_role_id);
       if (cached == conflicts.end()) {
         const auto target = std::lower_bound(
@@ -8173,6 +8211,7 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
     }
   }
   std::size_t membership_count = 0U;
+  std::set<std::uint32_t> synchronized_nodes;
   for (std::size_t index = 0U; index < capture.table->named_selections.size(); ++index) {
     const auto& selection = capture.table->named_selections[index];
     if (!valid_program_execution_group(selection.group_id) || selection.group_id == "all" ||
@@ -8189,6 +8228,26 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
                           ErrorCode::kInvalidRequest);
     }
     membership_count += selection.node_indices.size();
+    if (selection.synchronized) {
+      if (selection.node_indices.size() < 2U) {
+        return reject<void>("synchronized Program selection is too small",
+                            "program_execution_capture_synchronization_invalid",
+                            ErrorCode::kInvalidRequest);
+      }
+      for (const auto node_index : selection.node_indices) {
+        const auto& node = capture.table->nodes[node_index];
+        if (!synchronized_nodes.insert(node_index).second || node.owner_api != "kernel.operation" ||
+            !std::any_of(
+                node.target_effects.begin(), node.target_effects.end(), [](const auto& effect) {
+                  return effect.effectful &&
+                         effect.capability_id == CapabilityId("execution.trajectory.execute");
+                })) {
+          return reject<void>("synchronized selections overlap or contain non-motion",
+                              "program_execution_capture_synchronization_invalid",
+                              ErrorCode::kInvalidRequest);
+        }
+      }
+    }
   }
 
   const auto coordinates_current = [&] {
@@ -8339,6 +8398,8 @@ Result<void> ResourceAddressedExecutionKernel::validate_program_execution_scope_
     return reject<void>("operation differs from its captured Program/Binding",
                         "program_execution_capture_mismatch", ErrorCode::kInvalidRequest);
   }
+  std::vector<std::uint32_t> scoped_node_indices;
+  scoped_node_indices.reserve(intent.participants.size());
   for (const auto& participant : intent.participants) {
     if (!participant.execution_scope.has_value()) {
       return reject<void>("captured Program effects require their original authored scope",
@@ -8349,16 +8410,12 @@ Result<void> ResourceAddressedExecutionKernel::validate_program_execution_scope_
         capture.table->nodes.begin(), capture.table->nodes.end(), scope.node_instance_id,
         [](const auto& row, const auto& id) { return row.instance_id < id; });
     if (node == capture.table->nodes.end() || node->instance_id != scope.node_instance_id ||
-        (node->owner_api != "kernel.operation" && node->owner_api != "kernel.command_target" &&
-         node->owner_api != "kernel.pick_place_sequence")) {
+        (node->owner_api != "kernel.operation" && node->owner_api != "kernel.command_target")) {
       return reject<void>("operation has no captured effectful node scope",
                           "program_execution_scope_unknown", ErrorCode::kInvalidRequest);
     }
     const auto index = static_cast<std::size_t>(node - capture.table->nodes.begin());
-    if (intent.participants.size() != 1U && index < claim->motion_continuations.size() &&
-        claim->motion_continuations[index])
-      return reject<void>("retained motion requires its original independent producer",
-                          "program_motion_continuation_mismatch", ErrorCode::kInvalidRequest);
+    scoped_node_indices.push_back(static_cast<std::uint32_t>(index));
     const auto fence =
         std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
                      [&](const auto& row) { return row.program_run_id == intent.program_run_id; });
@@ -8374,10 +8431,39 @@ Result<void> ResourceAddressedExecutionKernel::validate_program_execution_scope_
                            return std::tie(row.target_role_id, row.capability_id) < value;
                          });
     if (effect == node->target_effects.end() ||
-        std::tie(effect->target_role_id, effect->capability_id) != key) {
-      return reject<void>("operation target/capability is outside its captured node",
+        std::tie(effect->target_role_id, effect->capability_id) != key || !effect->effectful) {
+      return reject<void>("operation target/capability is not a captured effectful association",
                           "program_execution_scope_effect_mismatch", ErrorCode::kInvalidRequest);
     }
+  }
+  std::sort(scoped_node_indices.begin(), scoped_node_indices.end());
+  if (std::adjacent_find(scoped_node_indices.begin(), scoped_node_indices.end()) !=
+      scoped_node_indices.end()) {
+    return reject<void>("operation repeats an authored node scope",
+                        "program_execution_scope_duplicate", ErrorCode::kInvalidRequest);
+  }
+  const auto synchronized =
+      std::find_if(capture.table->named_selections.begin(), capture.table->named_selections.end(),
+                   [&](const auto& selection) {
+                     return selection.synchronized && selection.node_indices == scoped_node_indices;
+                   });
+  if (intent.coordination_policy == OperationCoordinationPolicy::kCoordinatedAll) {
+    if (synchronized == capture.table->named_selections.end()) {
+      return reject<void>("coordinated operation is not an exact authored synchronized group",
+                          "program_execution_synchronization_mismatch", ErrorCode::kInvalidRequest);
+    }
+  } else if (std::any_of(capture.table->named_selections.begin(),
+                         capture.table->named_selections.end(), [&](const auto& selection) {
+                           return selection.synchronized &&
+                                  std::any_of(scoped_node_indices.begin(),
+                                              scoped_node_indices.end(), [&](const auto index) {
+                                                return std::binary_search(
+                                                    selection.node_indices.begin(),
+                                                    selection.node_indices.end(), index);
+                                              });
+                         })) {
+    return reject<void>("synchronized Program motion cannot be dispatched independently",
+                        "program_execution_synchronization_required", ErrorCode::kInvalidRequest);
   }
   return Result<void>::Ok();
 }
@@ -12763,21 +12849,28 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
               "stale_request_owner_epoch"));
   }
 
-  IResolvedParticipantExecutionEngine* engine = nullptr;
-  std::optional<ResolvedRuntimeScaleCommandDTO> resolved_command;
+  struct ScaleEffectTarget final {
+    IResolvedParticipantExecutionEngine* engine{};
+    ResolvedRuntimeScaleCommandDTO command;
+  };
+  std::vector<ScaleEffectTarget> effect_targets;
   std::shared_ptr<detail::CoordinatedExecutionClock> common_clock;
   const auto shared_participants_ready = [&](const ActiveOperation& operation) {
     const auto now = clock_.now();
     const auto& rows = operation.runtime_scale_status->participants;
+    const auto expected_state = operation.state.state;
+    if (expected_state != OperationStateKind::kExecuting &&
+        expected_state != OperationStateKind::kPaused)
+      return false;
     if (rows.size() != operation.participants.size()) return false;
     for (std::size_t index = 0; index < rows.size(); ++index) {
       const auto& row = rows[index];
       const auto freshness = operation.participants[index]
                                  .binding.value()
                                  .control_path->runtime_scale_qualification->freshness_budget_ns;
-      if (operation.state.participants[index].state != OperationStateKind::kExecuting ||
-          !row.supported || row.error || row.acknowledgement_sequence == 0U ||
-          row.acknowledgement_timestamp_ns < 0 || row.acknowledgement_timestamp_ns > now ||
+      if (operation.state.participants[index].state != expected_state || !row.supported ||
+          row.error || row.acknowledgement_sequence == 0U || row.acknowledgement_timestamp_ns < 0 ||
+          row.acknowledgement_timestamp_ns > now ||
           now - row.acknowledgement_timestamp_ns > freshness)
         return false;
     }
@@ -12853,7 +12946,8 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
       if (active_operation->common_timing)
         common_clock = active_operation->common_timing->execution_clock();
       if (!common_clock || !common_clock->sample_now() ||
-          active_operation->state.state != OperationStateKind::kExecuting)
+          (active_operation->state.state != OperationStateKind::kExecuting &&
+           active_operation->state.state != OperationStateKind::kPaused))
         return reject<RuntimeScaleAcceptedDTO>(
             "coordinated runtime scaling requires a released shared execution clock",
             "coordinated_runtime_scale_not_qualified", ErrorCode::kUnsupportedCapability);
@@ -12946,7 +13040,7 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
     const bool shared_ready = !common_clock || shared_participants_ready(*active_operation);
     active_operation->state = std::move(accepted_state);
     active_operation->runtime_scale_status = std::move(accepted_status);
-    if (common_clock) {
+    if (common_clock && active_operation->state.state == OperationStateKind::kExecuting) {
       // One immutable-law publication, not a loop over effectful participant
       // setters. Stop can freeze this occurrence; it is never reopened here.
       if (!shared_ready ||
@@ -12972,125 +13066,131 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
       // of a common target alone must never claim that either robot applied it.
       return Result<RuntimeScaleAcceptedDTO>::Ok(std::move(accepted));
     }
-    const auto& current_participant = active_operation->participants.front();
-    engine = current_participant.engine;
-    const auto& binding = current_participant.binding.value();
-    const auto& control = *binding.control_path;
-    const auto& qualification = *control.runtime_scale_qualification;
-    const auto& operation_participant = active_operation->state.participants.front();
-    resolved_command =
-        ResolvedRuntimeScaleCommandDTO{request.operation_id,
-                                       request.expected_operation_revision,
-                                       operation_participant.participant_id,
-                                       binding.controllable_component_id,
-                                       binding.command_target_id,
-                                       binding.capability_id,
-                                       control.control_domain_id,
-                                       control.control_domain_revision,
-                                       control.control_binding_id,
-                                       control.control_binding_revision,
-                                       operation_participant.controller_goal_id,
-                                       operation_participant.controller_goal_generation,
-                                       control.controller_topology_id,
-                                       control.topology_revision,
-                                       control.control_route_id,
-                                       qualification.scaling_domain_id,
-                                       qualification.coordinated_barrier_id,
-                                       current_participant.resources,
-                                       control.active_control_configuration_id,
-                                       control.active_control_configuration_generation,
-                                       current_generation,
-                                       next_generation,
-                                       request.scale};
+    effect_targets.reserve(active_operation->participants.size());
+    for (std::size_t index = 0U; index < active_operation->participants.size(); ++index) {
+      const auto& current_participant = active_operation->participants[index];
+      const auto& binding = current_participant.binding.value();
+      const auto& control = *binding.control_path;
+      const auto& qualification = *control.runtime_scale_qualification;
+      const auto& operation_participant = active_operation->state.participants[index];
+      effect_targets.push_back(ScaleEffectTarget{
+          current_participant.engine,
+          ResolvedRuntimeScaleCommandDTO{request.operation_id,
+                                         request.expected_operation_revision,
+                                         operation_participant.participant_id,
+                                         binding.controllable_component_id,
+                                         binding.command_target_id,
+                                         binding.capability_id,
+                                         control.control_domain_id,
+                                         control.control_domain_revision,
+                                         control.control_binding_id,
+                                         control.control_binding_revision,
+                                         operation_participant.controller_goal_id,
+                                         operation_participant.controller_goal_generation,
+                                         control.controller_topology_id,
+                                         control.topology_revision,
+                                         control.control_route_id,
+                                         qualification.scaling_domain_id,
+                                         qualification.coordinated_barrier_id,
+                                         current_participant.resources,
+                                         control.active_control_configuration_id,
+                                         control.active_control_configuration_generation,
+                                         current_generation,
+                                         next_generation,
+                                         request.scale}});
+      if (!common_clock) break;
+    }
     active_operation->runtime_scale_effect_in_flight = true;
   }
 
-  const auto commanded = engine->set_runtime_scale(*resolved_command);
-  if (!commanded.ok()) {
+  const auto mark_failed = [&](IResolvedParticipantExecutionEngine* engine, ErrorDTO failure,
+                               const char* reason) {
     OperationCommitGuard commit(*this, request.operation_id);
     std::unique_lock state_lock(state_mutex_);
     auto* active_operation = find_active_operation_locked(request.operation_id);
-    if (active_operation != nullptr && active_operation->runtime_scale_status.has_value() &&
-        active_operation->state.operation_revision == request.expected_operation_revision &&
-        active_operation->runtime_scale_status->runtime_scale_generation ==
-            accepted.runtime_scale_generation) {
-      auto status = *active_operation->runtime_scale_status;
-      status.state = RuntimeScaleApplicationState::kFailed;
-      status.updated_at_ns = clock_.now();
-      status.participants.front().state = RuntimeScaleApplicationState::kFailed;
-      status.participants.front().error = commanded.error();
-      (void)retain_runtime_scale_observation_locked(
-          state_lock, *active_operation, std::move(status), "runtime_scale_effect_rejected");
+    if (active_operation == nullptr || !active_operation->runtime_scale_status.has_value() ||
+        active_operation->state.operation_revision != request.expected_operation_revision ||
+        active_operation->runtime_scale_status->runtime_scale_generation !=
+            accepted.runtime_scale_generation)
+      return;
+    auto status = *active_operation->runtime_scale_status;
+    status.state = RuntimeScaleApplicationState::kFailed;
+    status.updated_at_ns = clock_.now();
+    const auto participant = active_operation->participant_for(engine);
+    const auto row = std::find_if(
+        status.participants.begin(), status.participants.end(), [&](const auto& candidate) {
+          return participant != nullptr &&
+                 candidate.participant_id == participant->slot_owner.participant_id;
+        });
+    if (row != status.participants.end()) {
+      row->state = RuntimeScaleApplicationState::kFailed;
+      row->error = std::move(failure);
     }
-  } else {
-    const auto& exact = commanded.value();
-    const bool acceptance_matches =
-        exact.operation_id == resolved_command->operation_id &&
-        exact.operation_revision == resolved_command->operation_revision &&
-        exact.participant_id == resolved_command->participant_id &&
-        exact.controllable_component_id == resolved_command->controllable_component_id &&
-        exact.command_target_id == resolved_command->command_target_id &&
-        exact.capability_id == resolved_command->capability_id &&
-        exact.control_domain_id == resolved_command->control_domain_id &&
-        exact.control_domain_revision == resolved_command->control_domain_revision &&
-        exact.control_binding_id == resolved_command->control_binding_id &&
-        exact.control_binding_revision == resolved_command->control_binding_revision &&
-        exact.controller_goal_id == resolved_command->controller_goal_id &&
-        exact.controller_goal_generation == resolved_command->controller_goal_generation &&
-        exact.controller_topology_id == resolved_command->controller_topology_id &&
-        exact.topology_revision == resolved_command->topology_revision &&
-        exact.control_route_id == resolved_command->control_route_id &&
-        exact.scaling_domain_id == resolved_command->scaling_domain_id &&
-        exact.coordinated_barrier_id == resolved_command->coordinated_barrier_id &&
-        exact.resources == resolved_command->resources &&
-        exact.active_control_configuration_id ==
-            resolved_command->active_control_configuration_id &&
-        exact.active_control_configuration_generation ==
-            resolved_command->active_control_configuration_generation &&
-        exact.accepted_generation == resolved_command->requested_runtime_scale_generation &&
-        std::abs(exact.commanded_scale - resolved_command->requested_scale) <= 1e-12;
-    if (!acceptance_matches) {
-      OperationCommitGuard commit(*this, request.operation_id);
-      std::unique_lock state_lock(state_mutex_);
-      auto* active_operation = find_active_operation_locked(request.operation_id);
-      if (active_operation != nullptr && active_operation->runtime_scale_status.has_value() &&
-          active_operation->state.operation_revision == request.expected_operation_revision &&
-          active_operation->runtime_scale_status->runtime_scale_generation ==
-              accepted.runtime_scale_generation) {
-        auto status = *active_operation->runtime_scale_status;
-        status.state = RuntimeScaleApplicationState::kFailed;
-        status.updated_at_ns = clock_.now();
-        status.participants.front().state = RuntimeScaleApplicationState::kFailed;
-        status.participants.front().error =
+    (void)retain_runtime_scale_observation_locked(state_lock, *active_operation, std::move(status),
+                                                  reason);
+  };
+  for (const auto& target : effect_targets) {
+    bool outcome_unknown = false;
+    const auto commanded = [&]() -> Result<ResolvedRuntimeScaleAcceptedDTO> {
+      try {
+        return target.engine->set_runtime_scale(target.command);
+      } catch (...) {
+        outcome_unknown = true;
+        return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(
             error(std::string(to_string(ErrorCode::kInvariantViolation)),
-                  "participant engine returned mismatched runtime-scale acceptance",
-                  "runtime_scale_acceptance_mismatch");
-        (void)retain_runtime_scale_observation_locked(
-            state_lock, *active_operation, std::move(status), "runtime_scale_acceptance_mismatch");
+                  "participant runtime-scale outcome is unknown",
+                  "runtime_scale_effect_outcome_unknown"));
       }
-    } else {
-      const auto observed = engine->runtime_scale_status(resolved_command->operation_id,
-                                                         resolved_command->control_binding_id);
-      if (!observed.ok()) {
-        OperationCommitGuard commit(*this, request.operation_id);
-        std::unique_lock state_lock(state_mutex_);
-        auto* active_operation = find_active_operation_locked(request.operation_id);
-        if (active_operation != nullptr && active_operation->runtime_scale_status.has_value() &&
-            active_operation->state.operation_revision == request.expected_operation_revision &&
-            active_operation->runtime_scale_status->runtime_scale_generation ==
-                accepted.runtime_scale_generation) {
-          auto status = *active_operation->runtime_scale_status;
-          status.state = RuntimeScaleApplicationState::kFailed;
-          status.updated_at_ns = clock_.now();
-          status.participants.front().state = RuntimeScaleApplicationState::kFailed;
-          status.participants.front().error = observed.error();
-          (void)retain_runtime_scale_observation_locked(
-              state_lock, *active_operation, std::move(status), "runtime_scale_status_unavailable");
-        }
-      } else {
-        (void)apply_runtime_scale_status(engine, observed.value());
+    }();
+    if (!commanded.ok()) {
+      if (outcome_unknown) {
+        std::lock_guard state_lock(state_mutex_);
+        motion_admission_closed_ = true;
       }
+      mark_failed(target.engine, commanded.error(), "runtime_scale_effect_rejected");
+      continue;
     }
+    const auto& exact = commanded.value();
+    const auto& resolved_command = target.command;
+    const bool acceptance_matches =
+        exact.operation_id == resolved_command.operation_id &&
+        exact.operation_revision == resolved_command.operation_revision &&
+        exact.participant_id == resolved_command.participant_id &&
+        exact.controllable_component_id == resolved_command.controllable_component_id &&
+        exact.command_target_id == resolved_command.command_target_id &&
+        exact.capability_id == resolved_command.capability_id &&
+        exact.control_domain_id == resolved_command.control_domain_id &&
+        exact.control_domain_revision == resolved_command.control_domain_revision &&
+        exact.control_binding_id == resolved_command.control_binding_id &&
+        exact.control_binding_revision == resolved_command.control_binding_revision &&
+        exact.controller_goal_id == resolved_command.controller_goal_id &&
+        exact.controller_goal_generation == resolved_command.controller_goal_generation &&
+        exact.controller_topology_id == resolved_command.controller_topology_id &&
+        exact.topology_revision == resolved_command.topology_revision &&
+        exact.control_route_id == resolved_command.control_route_id &&
+        exact.scaling_domain_id == resolved_command.scaling_domain_id &&
+        exact.coordinated_barrier_id == resolved_command.coordinated_barrier_id &&
+        exact.resources == resolved_command.resources &&
+        exact.active_control_configuration_id == resolved_command.active_control_configuration_id &&
+        exact.active_control_configuration_generation ==
+            resolved_command.active_control_configuration_generation &&
+        exact.accepted_generation == resolved_command.requested_runtime_scale_generation &&
+        std::abs(exact.commanded_scale - resolved_command.requested_scale) <= 1e-12;
+    if (!acceptance_matches) {
+      mark_failed(target.engine,
+                  error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                        "participant engine returned mismatched runtime-scale acceptance",
+                        "runtime_scale_acceptance_mismatch"),
+                  "runtime_scale_acceptance_mismatch");
+      continue;
+    }
+    const auto observed = target.engine->runtime_scale_status(resolved_command.operation_id,
+                                                              resolved_command.control_binding_id);
+    if (!observed.ok()) {
+      mark_failed(target.engine, observed.error(), "runtime_scale_status_unavailable");
+      continue;
+    }
+    (void)apply_runtime_scale_status(target.engine, observed.value());
   }
   {
     std::lock_guard state_lock(state_mutex_);
@@ -13584,7 +13684,7 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
     return reject<OperationRecoveryProjectionDTO>("operation identity is empty",
                                                   "operation_id_empty", ErrorCode::kInvalidRequest);
   }
-  IResolvedParticipantExecutionEngine* engine = nullptr;
+  std::vector<IResolvedParticipantExecutionEngine*> engines;
   OperationRevision revision(0U);
   std::optional<StopId> stop_id;
   std::optional<StopGeneration> stop_generation;
@@ -13592,18 +13692,21 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
   {
     std::lock_guard state_lock(state_mutex_);
     const auto* operation = find_active_operation_locked(operation_id);
-    if (operation == nullptr || operation->participants.size() != 1U ||
-        operation->participants.front().engine == nullptr || operation->stop_effect_in_flight) {
-      return reject<OperationRecoveryProjectionDTO>(
-          "operation has no single resident recovery owner", "operation_recovery_unavailable",
-          ErrorCode::kInvalidStateTransition);
+    if (operation == nullptr || operation->participants.empty() ||
+        operation->stop_effect_in_flight ||
+        std::any_of(operation->participants.begin(), operation->participants.end(),
+                    [](const auto& participant) { return participant.engine == nullptr; })) {
+      return reject<OperationRecoveryProjectionDTO>("operation has no resident recovery owner",
+                                                    "operation_recovery_unavailable",
+                                                    ErrorCode::kInvalidStateTransition);
     }
-    engine = operation->participants.front().engine;
+    engines.reserve(operation->participants.size());
     revision = operation->state.operation_revision;
     stop_id = operation->state.active_stop_id;
     stop_generation = operation->state.active_stop_generation;
     participants.reserve(operation->participants.size());
     for (const auto& participant : operation->participants) {
+      engines.push_back(participant.engine);
       const auto& binding = participant.binding.value();
       std::optional<CapabilityProviderBindingId> provider;
       if (binding.capability_provider_path.has_value()) {
@@ -13618,9 +13721,10 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
           participant.slot_owner.active_control_configuration_generation, participant.resources});
     }
   }
-  KernelRecoveryAssessmentDTO assessment;
+  std::vector<KernelRecoveryAssessmentDTO> assessments;
+  assessments.reserve(engines.size());
   try {
-    assessment = engine->get_recovery_assessment();
+    for (auto* engine : engines) assessments.push_back(engine->get_recovery_assessment());
   } catch (...) {
     return reject<OperationRecoveryProjectionDTO>("participant recovery assessment is unavailable",
                                                   "operation_recovery_unavailable",
@@ -13632,11 +13736,93 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
     if (operation == nullptr || operation->state.operation_revision != revision ||
         operation->state.active_stop_id != stop_id ||
         operation->state.active_stop_generation != stop_generation ||
-        operation->stop_effect_in_flight || operation->participants.size() != 1U ||
-        operation->participants.front().engine != engine) {
+        operation->stop_effect_in_flight || operation->participants.size() != engines.size() ||
+        !std::equal(operation->participants.begin(), operation->participants.end(), engines.begin(),
+                    [](const auto& participant, const auto* engine) {
+                      return participant.engine == engine;
+                    })) {
       return reject<OperationRecoveryProjectionDTO>(
           "operation changed while its recovery assessment was read", "operation_recovery_stale",
           ErrorCode::kStaleGeneration);
+    }
+    KernelRecoveryAssessmentDTO assessment;
+    if (assessments.size() == 1U) {
+      assessment = assessments.front();
+    } else {
+      if (operation->recovery_assessment_inputs != assessments) {
+        if (operation->recovery_assessment_revision >= kMaximumKernelJsonInteger) {
+          return reject<OperationRecoveryProjectionDTO>(
+              "coordinated recovery assessment revision is exhausted",
+              "operation_recovery_unavailable", ErrorCode::kInternalError);
+        }
+        operation->recovery_assessment_inputs = assessments;
+        ++operation->recovery_assessment_revision;
+      }
+      assessment.schema_version = "manyforge.kernel_recovery_assessment.v1";
+      assessment.assessment_revision = operation->recovery_assessment_revision;
+      assessment.assessed_at_ns =
+          std::max_element(assessments.begin(), assessments.end(),
+                           [](const auto& left, const auto& right) {
+                             return left.assessed_at_ns < right.assessed_at_ns;
+                           })
+              ->assessed_at_ns;
+      assessment.execution_state = assessments.front().execution_state;
+      assessment.recovery_class = assessments.front().recovery_class;
+      if (std::any_of(assessments.begin(), assessments.end(), [&](const auto& row) {
+            return row.execution_state != assessment.execution_state;
+          }))
+        assessment.execution_state = ExecutionState::kInterrupted;
+      if (std::any_of(assessments.begin(), assessments.end(), [&](const auto& row) {
+            return row.recovery_class != assessment.recovery_class;
+          }))
+        assessment.recovery_class = RecoveryClass::kUnknownFault;
+      assessment.stop_owner_active =
+          std::any_of(assessments.begin(), assessments.end(),
+                      [](const auto& row) { return row.stop_owner_active; });
+      assessment.backend_stop_confirmed =
+          std::all_of(assessments.begin(), assessments.end(),
+                      [](const auto& row) { return row.backend_stop_confirmed; });
+      assessment.observed_state_available =
+          std::all_of(assessments.begin(), assessments.end(),
+                      [](const auto& row) { return row.observed_state_available; });
+      assessment.observed_state_fresh =
+          std::all_of(assessments.begin(), assessments.end(),
+                      [](const auto& row) { return row.observed_state_fresh; });
+      assessment.observed_state_at_rest =
+          std::all_of(assessments.begin(), assessments.end(),
+                      [](const auto& row) { return row.observed_state_at_rest; });
+      assessment.observed_state_measured =
+          std::all_of(assessments.begin(), assessments.end(),
+                      [](const auto& row) { return row.observed_state_measured; });
+      assessment.stronger_authority_active =
+          std::any_of(assessments.begin(), assessments.end(),
+                      [](const auto& row) { return row.stronger_authority_active; });
+      assessment.queued_latch_present =
+          std::any_of(assessments.begin(), assessments.end(),
+                      [](const auto& row) { return row.queued_latch_present; });
+      assessment.allowed_actions = assessments.front().allowed_actions;
+      std::erase_if(assessment.allowed_actions, [&](const auto action) {
+        return std::any_of(assessments.begin() + 1, assessments.end(), [&](const auto& row) {
+          return std::find(row.allowed_actions.begin(), row.allowed_actions.end(), action) ==
+                 row.allowed_actions.end();
+        });
+      });
+      assessment.retry_admissible =
+          !assessment.allowed_actions.empty() &&
+          std::all_of(assessments.begin(), assessments.end(),
+                      [](const auto& row) { return row.retry_admissible; });
+      if (assessment.retry_admissible) {
+        assessment.status = RecoveryAssessmentStatus::kRetryReady;
+        assessment.reason_code = "coordinated_operation_recovery_ready";
+      } else if (std::any_of(assessments.begin(), assessments.end(), [](const auto& row) {
+                   return row.status == RecoveryAssessmentStatus::kResetRequired;
+                 })) {
+        assessment.status = RecoveryAssessmentStatus::kResetRequired;
+        assessment.reason_code = "coordinated_operation_reset_required";
+      } else {
+        assessment.status = RecoveryAssessmentStatus::kWaiting;
+        assessment.reason_code = "coordinated_operation_recovery_waiting";
+      }
     }
     if (is_active_stop_fault_latch(active_stop_fault_latch_)) {
       const auto& latch = *active_stop_fault_latch_;
@@ -13659,16 +13845,37 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
             latch.stop_certificate->stop_certificate_revision.value();
       }
     }
+    return Result<OperationRecoveryProjectionDTO>::Ok(
+        OperationRecoveryProjectionDTO{revision, std::move(stop_id), std::move(stop_generation),
+                                       std::move(assessment), std::move(participants)});
   }
-  return Result<OperationRecoveryProjectionDTO>::Ok(
-      OperationRecoveryProjectionDTO{revision, std::move(stop_id), std::move(stop_generation),
-                                     std::move(assessment), std::move(participants)});
+  return reject<OperationRecoveryProjectionDTO>("operation recovery assessment changed",
+                                                "operation_recovery_stale",
+                                                ErrorCode::kStaleGeneration);
 }
 
 Result<KernelRecoveryActionResultDTO>
 ResourceAddressedExecutionKernel::apply_operation_recovery_action(
     const OperationId& operation_id, const OperationRevision expected_operation_revision,
     const KernelRecoveryActionRequestDTO& request) {
+  bool coordinated_recovery = false;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    const auto* operation = find_active_operation_locked(operation_id);
+    if (operation != nullptr && operation->participants.size() > 1U) {
+      if (operation->intent.coordination_policy != OperationCoordinationPolicy::kCoordinatedAll) {
+        return reject<KernelRecoveryActionResultDTO>(
+            "multi-participant recovery requires one coordinated operation",
+            "operation_recovery_invalid", ErrorCode::kInvalidRequest);
+      }
+      coordinated_recovery = true;
+    }
+  }
+  // The helper takes the same operation-level recovery mutex and performs all
+  // effect calls outside Kernel state authority.
+  if (coordinated_recovery)
+    return apply_coordinated_operation_recovery_action(operation_id, expected_operation_revision,
+                                                       request);
   const auto requests_match = [](const KernelRecoveryActionRequestDTO& left,
                                  const KernelRecoveryActionRequestDTO& right) {
     return left.request_id == right.request_id && left.action == right.action &&
@@ -13966,6 +14173,383 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
         OperationRecoveryReplayEntry{operation_id, expected_operation_revision, request, result});
     if (continuation)
       program_cycle_claim_run_->motion_continuations[continuation_index] = std::move(continuation);
+    retain_historical_operation_locked(operation->state);
+    active_operations_.erase(operation_id);
+  }
+  return Result<KernelRecoveryActionResultDTO>::Ok(std::move(result));
+}
+
+Result<KernelRecoveryActionResultDTO>
+ResourceAddressedExecutionKernel::apply_coordinated_operation_recovery_action(
+    const OperationId& operation_id, const OperationRevision expected_operation_revision,
+    const KernelRecoveryActionRequestDTO& request) {
+  const auto requests_match = [](const KernelRecoveryActionRequestDTO& left,
+                                 const KernelRecoveryActionRequestDTO& right) {
+    return left.request_id == right.request_id && left.action == right.action &&
+           left.principal_id == right.principal_id &&
+           left.expected_assessment_revision == right.expected_assessment_revision &&
+           left.expected_control_command_epoch == right.expected_control_command_epoch &&
+           left.expected_execution_id == right.expected_execution_id &&
+           left.expected_latch_id == right.expected_latch_id &&
+           left.expected_stop_certificate_id == right.expected_stop_certificate_id &&
+           left.expected_stop_owner_generation == right.expected_stop_owner_generation &&
+           left.reason == right.reason;
+  };
+  const auto retain_current = [&](OperationRecoveryReplayEntry entry) {
+    std::erase_if(operation_recovery_replay_ledger_,
+                  [&](const OperationRecoveryReplayEntry& current) {
+                    return current.operation_id == entry.operation_id;
+                  });
+    operation_recovery_replay_ledger_.push_back(std::move(entry));
+  };
+  if (operation_id.empty() || expected_operation_revision.value() == 0U ||
+      request.request_id.empty()) {
+    return reject<KernelRecoveryActionResultDTO>("operation recovery request is incomplete",
+                                                 "operation_recovery_invalid",
+                                                 ErrorCode::kInvalidRequest);
+  }
+
+  std::lock_guard recovery_lock(operation_recovery_mutex_);
+  {
+    std::lock_guard state_lock(state_mutex_);
+    const auto replay = std::find_if(operation_recovery_replay_ledger_.begin(),
+                                     operation_recovery_replay_ledger_.end(),
+                                     [&](const OperationRecoveryReplayEntry& entry) {
+                                       return entry.request.request_id == request.request_id;
+                                     });
+    if (replay != operation_recovery_replay_ledger_.end()) {
+      if (replay->operation_id != operation_id ||
+          replay->operation_revision != expected_operation_revision ||
+          !requests_match(replay->request, request)) {
+        return reject<KernelRecoveryActionResultDTO>(
+            "operation recovery request identity was reused", "request_id_conflict",
+            ErrorCode::kInvalidRequest);
+      }
+      if (replay->outcome_unresolved) {
+        return reject<KernelRecoveryActionResultDTO>(
+            "coordinated recovery outcome remains unresolved",
+            "operation_recovery_outcome_unresolved", ErrorCode::kInvariantViolation);
+      }
+      return Result<KernelRecoveryActionResultDTO>::Ok(replay->result);
+    }
+  }
+
+  auto projection = get_operation_recovery_assessment(operation_id);
+  if (!projection.ok()) {
+    return Result<KernelRecoveryActionResultDTO>::Err(projection.error());
+  }
+  const auto& assessment = projection.value().assessment;
+  const bool exact_assessment =
+      projection.value().operation_revision == expected_operation_revision &&
+      request.expected_assessment_revision == assessment.assessment_revision &&
+      request.expected_control_command_epoch == assessment.control_command_epoch &&
+      request.expected_execution_id == assessment.execution_id &&
+      request.expected_latch_id == assessment.latch_id &&
+      request.expected_stop_certificate_id == assessment.stop_certificate_id &&
+      request.expected_stop_owner_generation == assessment.stop_owner_generation;
+  const bool action_allowed =
+      assessment.retry_admissible &&
+      std::find(assessment.allowed_actions.begin(), assessment.allowed_actions.end(),
+                request.action) != assessment.allowed_actions.end() &&
+      request.action != RecoveryAction::kResetCycle;
+  if (!exact_assessment || !action_allowed) {
+    KernelRecoveryActionResultDTO rejected{
+        request.request_id, request.action, false, assessment,
+        ErrorDTO{exact_assessment ? "operation_recovery_invalid" : "operation_recovery_stale",
+                 exact_assessment ? "recovery action is not offered to every participant"
+                                  : "coordinated recovery assessment changed",
+                 {{"reason", exact_assessment ? "recovery_action_not_offered"
+                                              : "recovery_assessment_changed"}}}};
+    {
+      std::lock_guard state_lock(state_mutex_);
+      retain_current(OperationRecoveryReplayEntry{operation_id, expected_operation_revision,
+                                                  request, rejected});
+    }
+    return Result<KernelRecoveryActionResultDTO>::Ok(std::move(rejected));
+  }
+
+  struct Target final {
+    IResolvedParticipantExecutionEngine* engine{};
+    KernelRecoveryAssessmentDTO assessment;
+    IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
+    std::uint64_t preparation_id{};
+    std::size_t continuation_index{};
+    std::shared_ptr<ProgramCycleClaimRun::MotionContinuation> continuation;
+  };
+  std::vector<Target> targets;
+  std::optional<StopId> stop_id;
+  std::optional<StopGeneration> stop_generation;
+  std::optional<ProgramRunExecutionCaptureDTO> continuation_capture;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    auto* operation = find_active_operation_locked(operation_id);
+    if (operation == nullptr ||
+        operation->state.operation_revision != expected_operation_revision ||
+        operation->intent.coordination_policy != OperationCoordinationPolicy::kCoordinatedAll ||
+        operation->participants.size() < 2U ||
+        operation->participants.size() != operation->recovery_assessment_inputs.size() ||
+        operation->stop_effect_in_flight || operation->ordinary_commit_in_flight ||
+        operation->ordinary_acceptance_pending || operation->pending_control.has_value() ||
+        operation->runtime_scale_effect_in_flight || operation->recovery_effect_in_flight ||
+        operation->coordinated_cancellation_in_flight || operation->dispatch_effect_in_flight() ||
+        operation->reconciliation_in_flight() ||
+        std::any_of(operation->participants.begin(), operation->participants.end(),
+                    [](const auto& participant) {
+                      return participant.engine == nullptr || participant.prepare_in_flight ||
+                             participant.prepared_advance_in_flight;
+                    })) {
+      return reject<KernelRecoveryActionResultDTO>(
+          "coordinated operation recovery fence is stale or busy", "operation_recovery_stale",
+          ErrorCode::kStaleGeneration);
+    }
+    if (is_active_stop_fault_latch(active_stop_fault_latch_)) {
+      return Result<KernelRecoveryActionResultDTO>::Err(
+          ErrorDTO{"operation_recovery_blocked_by_stop_fault",
+                   "Program Reset is required before motion can resume",
+                   {{"reason", "active_stop_fault_requires_reset"},
+                    {"latch_id", active_stop_fault_latch_->latch_id.value()}}});
+    }
+    if (!operation->stop_allows_retirement()) {
+      return reject<KernelRecoveryActionResultDTO>(
+          "operation recovery awaits its exact successful Stop certificate",
+          "operation_recovery_busy", ErrorCode::kInvalidStateTransition);
+    }
+    stop_id = operation->state.active_stop_id;
+    stop_generation = operation->state.active_stop_generation;
+    if (program_cycle_claim_run_ && program_cycle_claim_run_->capture &&
+        program_cycle_claim_run_->program_run_id == operation->state.program_run_id) {
+      continuation_capture = *program_cycle_claim_run_->capture;
+    }
+    targets.reserve(operation->participants.size());
+    const bool capture_continuation =
+        request.action == RecoveryAction::kRetryMotionFromCurrentState ||
+        request.action == RecoveryAction::kReplanFromStoppedState ||
+        request.action == RecoveryAction::kAcknowledgeAndContinue ||
+        request.action == RecoveryAction::kRetryAfterSceneRepair;
+    for (std::size_t index = 0U; index < operation->participants.size(); ++index) {
+      auto& participant = operation->participants[index];
+      const auto& public_participant = operation->state.participants[index];
+      Target target{
+          participant.engine, operation->recovery_assessment_inputs[index], nullptr, 0U, 0U, {}};
+      if (capture_continuation &&
+          participant.payload_kind == OperationParticipantPayloadKind::kMotion &&
+          participant.prepared_dispatch_released && participant.prepared_participant &&
+          public_participant.execution_scope && continuation_capture) {
+        const auto& scope = *public_participant.execution_scope;
+        const auto node =
+            std::lower_bound(continuation_capture->table->nodes.begin(),
+                             continuation_capture->table->nodes.end(), scope.node_instance_id,
+                             [](const auto& row, const auto& id) { return row.instance_id < id; });
+        if (node != continuation_capture->table->nodes.end() &&
+            node->instance_id == scope.node_instance_id && node->owner_api == "kernel.operation") {
+          target.continuation_index =
+              static_cast<std::size_t>(node - continuation_capture->table->nodes.begin());
+          const auto& source =
+              std::get<PreparedMotionExecutionDTO>(participant.prepared_participant->payload)
+                  .plan_request;
+          target.continuation = std::make_shared<ProgramCycleClaimRun::MotionContinuation>(
+              ProgramCycleClaimRun::MotionContinuation{
+                  scope,
+                  operation_id,
+                  public_participant.participant_id,
+                  participant.prepared_participant->prepared_contract_digest,
+                  participant.binding,
+                  {},
+                  source.base_frame,
+                  source.tcp_frame,
+                  source.planner_capability_binding,
+                  std::get<MotionParticipantIntentDTO>(
+                      operation->intent.participants[index].payload)
+                      .motion.index()});
+          target.prepared_engine = participant.prepared_motion_engine;
+          target.preparation_id = participant.subordinate_id;
+        }
+      }
+      targets.push_back(std::move(target));
+    }
+    operation->recovery_effect_in_flight = true;
+  }
+
+  const ScopeExit release_recovery_borrow([&] {
+    std::lock_guard state_lock(state_mutex_);
+    if (auto* operation = find_active_operation_locked(operation_id))
+      operation->recovery_effect_in_flight = false;
+  });
+  const auto unresolved_locked = [&](std::string message) {
+    motion_admission_closed_ = true;
+    KernelRecoveryActionResultDTO result{
+        request.request_id, request.action, false, assessment,
+        ErrorDTO{"operation_recovery_outcome_unresolved",
+                 std::move(message),
+                 {{"reason", "operation_recovery_outcome_unresolved"}}}};
+    retain_current(OperationRecoveryReplayEntry{operation_id, expected_operation_revision, request,
+                                                result, true});
+    return reject<KernelRecoveryActionResultDTO>(
+        "coordinated participant recovery outcome is unknown",
+        "operation_recovery_outcome_unresolved", ErrorCode::kInvariantViolation);
+  };
+  const auto unresolved = [&](std::string message) {
+    std::lock_guard state_lock(state_mutex_);
+    return unresolved_locked(std::move(message));
+  };
+
+  try {
+    for (auto& target : targets) {
+      if (!target.continuation) continue;
+      if (target.prepared_engine == nullptr) {
+        return reject<KernelRecoveryActionResultDTO>("motion continuation has no prepared owner",
+                                                     "operation_recovery_invalid",
+                                                     ErrorCode::kInvalidRequest);
+      }
+      auto snapshot = target.prepared_engine->ObservePreparedMotion(target.preparation_id);
+      if (!snapshot.ok()) return Result<KernelRecoveryActionResultDTO>::Err(snapshot.error());
+      const auto& observed = snapshot.value();
+      if (observed.execution_id != target.preparation_id) {
+        return reject<KernelRecoveryActionResultDTO>(
+            "motion continuation changed preparation identity", "operation_recovery_invalid",
+            ErrorCode::kInvalidRequest);
+      }
+      const auto& source = observed.last_dispatched_participant;
+      if (!source &&
+          (observed.state == ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch ||
+           observed.state == ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed)) {
+        target.continuation.reset();
+        continue;
+      }
+      if (!source ||
+          source->prepared_contract_digest != target.continuation->prepared_contract_digest ||
+          source->operation_id != operation_id ||
+          source->participant_id != target.continuation->participant_id ||
+          !std::holds_alternative<PreparedMotionExecutionDTO>(source->payload)) {
+        return reject<KernelRecoveryActionResultDTO>(
+            "motion continuation dispatch identity is unsettled", "operation_recovery_invalid",
+            ErrorCode::kInvalidRequest);
+      }
+      const auto& motion = std::get<PreparedMotionExecutionDTO>(source->payload);
+      target.continuation->base_frame = motion.plan_request.base_frame;
+      target.continuation->tcp_frame = motion.plan_request.tcp_frame;
+      target.continuation->planner_capability = motion.plan_request.planner_capability_binding;
+      auto captured = detail::capture_motion_resume_intent(
+          motion.plan_request.motion, motion.trajectory, observed.stopped_trajectory_time_s);
+      if (!captured.ok()) return Result<KernelRecoveryActionResultDTO>::Err(captured.error());
+      target.continuation->intent =
+          std::make_shared<const detail::MotionResumeIntent>(std::move(captured.value()));
+    }
+  } catch (...) {
+    return reject<KernelRecoveryActionResultDTO>(
+        "motion continuation could not be captured before coordinated recovery",
+        "operation_recovery_invalid", ErrorCode::kInternalError);
+  }
+
+  {
+    std::lock_guard state_lock(state_mutex_);
+    const auto* operation = find_active_operation_locked(operation_id);
+    bool participant_changed =
+        operation == nullptr || operation->participants.size() != targets.size();
+    for (std::size_t index = 0U; !participant_changed && index < targets.size(); ++index) {
+      participant_changed = operation->participants[index].engine != targets[index].engine;
+    }
+    if (operation == nullptr ||
+        operation->state.operation_revision != expected_operation_revision ||
+        operation->state.active_stop_id != stop_id ||
+        operation->state.active_stop_generation != stop_generation ||
+        operation->stop_effect_in_flight || !operation->stop_allows_retirement() ||
+        participant_changed ||
+        (continuation_capture &&
+         (!program_cycle_claim_run_ || !program_cycle_claim_run_->capture ||
+          program_cycle_claim_run_->capture->table != continuation_capture->table ||
+          program_cycle_claim_run_->claim_generation != continuation_capture->claim_generation ||
+          program_cycle_claim_run_->program_run_id != continuation_capture->program_run_id))) {
+      return reject<KernelRecoveryActionResultDTO>(
+          "coordinated operation changed before recovery effects", "operation_recovery_stale",
+          ErrorCode::kStaleGeneration);
+    }
+  }
+
+  std::size_t accepted_count = 0U;
+  std::optional<KernelRecoveryActionResultDTO> rejected;
+  for (auto& target : targets) {
+    auto participant_request = request;
+    participant_request.expected_assessment_revision = target.assessment.assessment_revision;
+    participant_request.expected_control_command_epoch = target.assessment.control_command_epoch;
+    participant_request.expected_execution_id = target.assessment.execution_id;
+    participant_request.expected_latch_id = target.assessment.latch_id;
+    participant_request.expected_stop_certificate_id = target.assessment.stop_certificate_id;
+    participant_request.expected_stop_owner_generation = target.assessment.stop_owner_generation;
+    try {
+      auto result = target.engine->apply_recovery_action(participant_request);
+      if (result.request_id != request.request_id || result.action != request.action) {
+        return unresolved("participant recovery returned a different command identity");
+      }
+      if (!result.accepted) {
+        rejected = std::move(result);
+        break;
+      }
+      ++accepted_count;
+    } catch (...) {
+      return unresolved("participant recovery threw after coordinated acceptance began");
+    }
+  }
+  if (rejected.has_value()) {
+    if (accepted_count != 0U)
+      return unresolved("coordinated participants disagreed after a recovery effect");
+    KernelRecoveryActionResultDTO result{request.request_id, request.action, false, assessment,
+                                         rejected->error};
+    {
+      std::lock_guard state_lock(state_mutex_);
+      retain_current(
+          OperationRecoveryReplayEntry{operation_id, expected_operation_revision, request, result});
+    }
+    return Result<KernelRecoveryActionResultDTO>::Ok(std::move(result));
+  }
+
+  KernelRecoveryActionResultDTO result{request.request_id, request.action, true, {}, std::nullopt};
+  result.resulting_assessment.schema_version = "manyforge.kernel_recovery_assessment.v1";
+  result.resulting_assessment.assessment_revision = assessment.assessment_revision;
+  result.resulting_assessment.reason_code = "coordinated_operation_recovered";
+  {
+    std::lock_guard state_lock(state_mutex_);
+    auto* operation = find_active_operation_locked(operation_id);
+    if (operation == nullptr ||
+        operation->state.operation_revision != expected_operation_revision ||
+        operation->state.active_stop_id != stop_id ||
+        operation->state.active_stop_generation != stop_generation ||
+        operation->participants.size() != targets.size() || !operation->stop_allows_retirement()) {
+      return unresolved_locked("coordinated operation changed while recovery results returned");
+    }
+    if (continuation_capture &&
+        (!program_cycle_claim_run_ || !program_cycle_claim_run_->capture ||
+         program_cycle_claim_run_->capture->table != continuation_capture->table ||
+         program_cycle_claim_run_->claim_generation != continuation_capture->claim_generation ||
+         program_cycle_claim_run_->program_run_id != continuation_capture->program_run_id)) {
+      return unresolved_locked("Program capture changed during coordinated motion retirement");
+    }
+    if (program_cycle_claim_run_ &&
+        std::any_of(targets.begin(), targets.end(), [&](const auto& target) {
+          return target.continuation &&
+                 target.continuation_index >= program_cycle_claim_run_->motion_continuations.size();
+        })) {
+      return unresolved_locked("motion continuation index changed during retirement");
+    }
+    auto owner_rows =
+        retained_owner_rows(operation->participants, resource_slots_->coherent_snapshot());
+    if (!owner_rows.ok())
+      return unresolved_locked("coordinated resource ownership changed during retirement");
+    if (!owner_rows.value().empty()) {
+      auto released = resource_slots_->release_batch(owner_rows.value());
+      if (!released.ok())
+        return unresolved_locked("coordinated resource claims could not be retired");
+    }
+    if (program_cycle_claim_run_) {
+      for (auto& target : targets) {
+        if (target.continuation) {
+          program_cycle_claim_run_->motion_continuations[target.continuation_index] =
+              std::move(target.continuation);
+        }
+      }
+    }
+    retain_current(
+        OperationRecoveryReplayEntry{operation_id, expected_operation_revision, request, result});
     retain_historical_operation_locked(operation->state);
     active_operations_.erase(operation_id);
   }
@@ -15660,13 +16244,11 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     return;
   }
   if (event.type != KernelEventType::kStateTransition &&
-      event.type != KernelEventType::kExecuteStarted &&
-      event.type != KernelEventType::kExecuteCompleted) {
+      event.type != KernelEventType::kExecuteStarted) {
     return;
   }
-  auto state = event.type == KernelEventType::kExecuteStarted     ? OperationStateKind::kExecuting
-               : event.type == KernelEventType::kExecuteCompleted ? OperationStateKind::kCompleted
-                                                                  : operation_state(event.to_state);
+  auto state = event.type == KernelEventType::kExecuteStarted ? OperationStateKind::kExecuting
+                                                              : operation_state(event.to_state);
   std::optional<OperationId> operation_id;
   std::optional<StopControlWorkToken> stop_wakeup;
   bool aggregate_stop_owns_terminal = false;

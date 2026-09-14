@@ -1,10 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/interrupt.hpp>
-
-#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -85,8 +84,7 @@ struct KernelStopCertificateDTO {
   std::string certificate_id;
   /// Strictly increasing publication counter across all certificates.
   std::uint64_t certificate_revision = 0;
-  StopCertificateOutcome completion_result =
-      StopCertificateOutcome::kBackendPreemptFailed;
+  StopCertificateOutcome completion_result = StopCertificateOutcome::kBackendPreemptFailed;
   StopOwnerKind stop_owner = StopOwnerKind::kOperatorStopWorker;
   std::uint64_t stop_owner_generation = 0;
   std::uint64_t execution_id = 0;
@@ -98,8 +96,7 @@ struct KernelStopCertificateDTO {
   std::string executed_stop_mode;
   std::string command_source;
   /// Meaningful for fault-preempt certificates; `kNoneRequired` otherwise.
-  InterruptPreemptionResult preemption_result =
-      InterruptPreemptionResult::kNoneRequired;
+  InterruptPreemptionResult preemption_result = InterruptPreemptionResult::kNoneRequired;
   bool backend_stop_confirmed = false;
   std::uint64_t observed_state_sequence = 0;
   std::string observed_state_source_id;
@@ -154,8 +151,7 @@ struct KernelRecoveryAssessmentDTO {
   std::string latch_id;
   std::string source_id;
   std::string policy_id;
-  InterruptPreemptionResult preemption_result =
-      InterruptPreemptionResult::kNoneRequired;
+  InterruptPreemptionResult preemption_result = InterruptPreemptionResult::kNoneRequired;
   bool stop_owner_active = false;
   std::uint64_t stop_owner_generation = 0;
   bool backend_stop_confirmed = false;
@@ -180,6 +176,9 @@ struct KernelRecoveryAssessmentDTO {
   /// Bounded references to native events / certificate ids backing this
   /// assessment (spec/500 correlation spine).
   std::vector<std::string> evidence_refs;
+
+  friend bool operator==(const KernelRecoveryAssessmentDTO&,
+                         const KernelRecoveryAssessmentDTO&) = default;
 };
 
 /// Request for the single generation-bound kernel recovery command.

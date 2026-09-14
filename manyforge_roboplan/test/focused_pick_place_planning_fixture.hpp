@@ -14,10 +14,9 @@ namespace manyforge::roboplan_backend::process_fixture {
 struct FocusedPickPlacePlanningFixture final {
   std::shared_ptr<void> lifetime;
   std::unique_ptr<core::AddressedPickPlacePlanningOwner> owner;
-  std::unique_ptr<core::PickPlaceSequenceCoordinator> sequence_coordinator;
-  std::unique_ptr<core::AddressedPickPlaceExecutionOwner> execution_owner;
 };
 
-[[nodiscard]] FocusedPickPlacePlanningFixture MakeFocusedPickPlacePlanningFixture();
+[[nodiscard]] FocusedPickPlacePlanningFixture
+MakeFocusedPickPlacePlanningFixture();
 
-}  // namespace manyforge::roboplan_backend::process_fixture
+} // namespace manyforge::roboplan_backend::process_fixture

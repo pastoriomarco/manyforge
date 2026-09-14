@@ -87,15 +87,6 @@ class RecordingTransport:
     def plan_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.client.plan_place(body)
 
-    def start_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.client.start_pick(body)
-
-    def start_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.client.start_place(body)
-
-    def read_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
-        return self.client.pick_place_sequence(sequence_id)
-
     def read(self, operation_id: str) -> dict[str, Any]:
         return self.client.operation(operation_id)
 
@@ -567,6 +558,7 @@ def _wait_terminal(
 
 def _run_native_benchmark_move(
     client: ExecutionCommandClient,
+    admission: CellAdmissionClient,
     *,
     request_id: str,
     positions_rad: list[float],
@@ -613,6 +605,10 @@ def _run_native_benchmark_move(
     # Native manual-control settlement is backend-owned. Keep retirement
     # outside the historical timing sample without a redundant client Ack.
     _wait_retired(client, operation_id)
+    deadline = time.monotonic() + 5.0
+    while not admission.get()["authoring_allowed"]:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
     return elapsed_seconds
 
 
@@ -1122,6 +1118,9 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
     execution_run_root = tmp_path / "execution-run"
     reconciliation_marker = tmp_path / "reconciliation-entered"
     reconciliation_gate = tmp_path / "release-reconciliation"
+    # Let startup establish CCLC readiness, then gate an ordinary reconciliation
+    # iteration. The gate is not allowed to redefine initial route readiness.
+    reconciliation_gate.touch()
     execution_state_root.mkdir()
     execution_run_root.mkdir()
 
@@ -1130,10 +1129,12 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         execution_state_root,
         execution_run_root,
         manifest,
-        host_environment="MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST",
+        host_environment="MANYFORGE_NATIVE_PICK_PLACE_PLANNING_FIXTURE_HOST",
         reconciliation_test_marker=reconciliation_marker,
         reconciliation_test_gate=reconciliation_gate,
     )
+    reconciliation_marker.unlink(missing_ok=True)
+    reconciliation_gate.unlink()
     native = ExecutionCommandClient(execution_run_root, timeout_seconds=0.5)
     raw_api = TestClient(
         create_app(
@@ -1153,6 +1154,7 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         while not reconciliation_marker.exists() and time.monotonic() < deadline:
             time.sleep(0.005)
         assert reconciliation_marker.exists()
+        time.sleep(0.02)
         assert not reconciliation_gate.exists()
 
         status = headless.execution_diagnostics()
@@ -1272,10 +1274,11 @@ def test_reconciliation_exception_uses_caught_host_failure_path(
         execution_state_root,
         execution_run_root,
         manifest,
-        host_environment="MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST",
+        host_environment="MANYFORGE_NATIVE_PICK_PLACE_PLANNING_FIXTURE_HOST",
         reconciliation_test_marker=reconciliation_marker,
         reconciliation_test_gate=reconciliation_gate,
         reconciliation_test_throw=injected_failure,
+        qualify_cclc=False,
     )
 
     try:
@@ -1675,34 +1678,14 @@ def test_internal_program_run_stop_uses_one_exact_priority_request(
             time.sleep(0.01)
         assert stop_events
 
-        recovery = client.operation_recovery(accepted["operation_id"])
-        assessment = recovery["recovery_assessment"]
-        assert assessment["latch_id"] in {None, ""}
-        assert "reset_cycle" in assessment["allowed_actions"]
-        reset = client.reset(
-            OperationControlRequest.model_validate(
-                {
-                    "request_context": {
-                        "request_id": "program-run-stop.reset",
-                        "request_owner_epoch": identity["owner_epoch"],
-                        "source_label": "manyforge_behavior",
-                        "correlation_id": "program-run.stop-process-test",
-                    },
-                    "operation_id": accepted["operation_id"],
-                    "expected_operation_revision": recovery["operation_revision"],
-                    "reason": "process-test Program-cycle Reset",
-                }
-            ),
-            trusted_principal_id=None,
-        )
-        assert reset["accepted"]["control"] == "reset"
-
+        # Releasing the Program-run hold lets the Kernel retire this clean,
+        # already-settled manual operation. Do not invent a second Reset.
+        _wait_retired(client, accepted["operation_id"])
+        admission = CellAdmissionClient(execution_run_root)
         deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            if client.read(accepted["operation_id"])["resident"] is False:
-                break
-            time.sleep(0.01)
-        assert client.read(accepted["operation_id"])["resident"] is False
+        while not admission.get()["authoring_allowed"]:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
 
         next_operation = _direct_control_joint_operation(
             identity,
@@ -1744,7 +1727,7 @@ def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
         execution_state_root,
         execution_run_root,
         manifest,
-        host_environment="MANYFORGE_NATIVE_PICK_PLACE_FIXTURE_HOST",
+        host_environment="MANYFORGE_NATIVE_PICK_PLACE_PLANNING_FIXTURE_HOST",
     )
     native = ExecutionCommandClient(execution_run_root, timeout_seconds=10.0)
     raw_api = TestClient(
@@ -1809,45 +1792,10 @@ def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
         infeasible_request["approach_operation"]["participants"][0]["payload"][
             "move_id"
         ] = "pick.fixture_no_feasible.approach"
-        infeasible = behavior.start_pick(infeasible_request)
+        infeasible = behavior.plan_pick(infeasible_request)
         assert infeasible["planning_result"]["status"] == ("no_feasible_candidate")
         assert infeasible["planning_result"]["attempted_candidate_count"] > 0
         assert infeasible["planning_result"]["last_attempted_candidate"]
-        assert infeasible["sequence_status"] is None
-        assert native.events(owner_epoch, 0)["events"] == before
-
-        execution_request = _pick_planning_request()
-        execution_request["retreat_operation"]["participants"][0]["payload"][
-            "move_id"
-        ] = "pick.fixture_fail.retreat"
-        started = behavior.start_pick(execution_request)
-        assert started["planning_result"]["status"] == "planned"
-        assert started["sequence_status"]["phase"] == "approach"
-
-        deadline = time.monotonic() + 5.0
-        observed = started
-        while observed["sequence_status"]["phase"] not in {
-            "completed",
-            "failed",
-            "intervention_required",
-        }:
-            assert time.monotonic() < deadline
-            time.sleep(0.01)
-            observed = behavior.pick_place_sequence("process-pick-1")
-        status = observed["sequence_status"]
-        # The retreat operation failed after the attach was durably committed.
-        # Scene truth is therefore known (the object remains attached), so this
-        # is an ordinary failed sequence rather than an uncertainty that needs
-        # intervention.
-        assert status["phase"] == "failed"
-        assert status["committed_projection_revision"] is not None
-        assert status["terminal_error"]["details"]["reason"] == (
-            "pick_place_phase_operation_failed"
-        )
-        assert (
-            composer.pick_place_sequence("process-pick-1")["sequence_status"] == status
-        )
-
         assert native.events(owner_epoch, 0)["events"] == before
     finally:
         _stop_host(process)
@@ -2160,17 +2108,6 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
     composer = HeadlessHttpClient("http://composer.test", client=raw_composer)
 
     try:
-        with pytest.raises(HeadlessClientError) as unavailable_start:
-            headless.start_pick(_pick_planning_request())
-        assert unavailable_start.value.code == (
-            "pick_place_execution_owner_unavailable"
-        )
-        with pytest.raises(HeadlessClientError) as unavailable_status:
-            composer.pick_place_sequence("not-started")
-        assert unavailable_status.value.code == (
-            "pick_place_execution_owner_unavailable"
-        )
-
         first_status = headless.execution_diagnostics()["status"]
         assert first_status["program_binding_id"] == manifest["program_binding_id"]
         assert first_status["retained_bundle_id"] == manifest["retained_bundle_id"]
@@ -3598,6 +3535,10 @@ def test_addressed_native_benchmark_preserves_historical_measurements(
         fixture_root, execution_state_root, execution_run_root, manifest
     )
     native = ExecutionCommandClient(execution_run_root, timeout_seconds=5.0)
+    admission = CellAdmissionClient(execution_run_root, timeout_seconds=5.0)
+
+    def run_move(**kwargs: Any) -> float:
+        return _run_native_benchmark_move(native, admission, **kwargs)
 
     goal_a = [0.1, -0.5, 0.5, -0.5, -0.5, 0.0]
     goal_b = [0.3, -0.8, 0.8, -0.3, -0.8, 0.1]
@@ -3617,14 +3558,12 @@ def test_addressed_native_benchmark_preserves_historical_measurements(
             ]
         ]
 
-        _run_native_benchmark_move(
-            native,
+        run_move(
             request_id="benchmark-warmup",
             positions_rad=goal_a,
             cache_mode="default",
         )
-        _run_native_benchmark_move(
-            native,
+        run_move(
             request_id="benchmark-warmup-return",
             positions_rad=origin,
             cache_mode="disable",
@@ -3633,36 +3572,31 @@ def test_addressed_native_benchmark_preserves_historical_measurements(
         single_plan_seconds: list[float] = []
         for index in range(3):
             single_plan_seconds.append(
-                _run_native_benchmark_move(
-                    native,
+                run_move(
                     request_id=f"benchmark-single-{index}",
                     positions_rad=goal_a,
                     cache_mode="disable",
                 )
             )
-            _run_native_benchmark_move(
-                native,
+            run_move(
                 request_id=f"benchmark-single-return-{index}",
                 positions_rad=origin,
                 cache_mode="disable",
             )
 
         shared_cache_move_id = "benchmark-cache-shared-motion"
-        uncached_seconds = _run_native_benchmark_move(
-            native,
+        uncached_seconds = run_move(
             request_id="benchmark-cache-prime",
             positions_rad=goal_b,
             cache_mode="default",
             move_id=shared_cache_move_id,
         )
-        _run_native_benchmark_move(
-            native,
+        run_move(
             request_id="benchmark-cache-return",
             positions_rad=origin,
             cache_mode="disable",
         )
-        cached_seconds = _run_native_benchmark_move(
-            native,
+        cached_seconds = run_move(
             request_id="benchmark-cache-reuse",
             positions_rad=goal_b,
             cache_mode="default",
@@ -3671,8 +3605,7 @@ def test_addressed_native_benchmark_preserves_historical_measurements(
 
         five_started_at = time.perf_counter()
         five_move_seconds = [
-            _run_native_benchmark_move(
-                native,
+            run_move(
                 request_id=f"benchmark-five-{index}",
                 positions_rad=goal,
                 cache_mode="disable",
@@ -3959,149 +3892,6 @@ def test_native_manual_arm_and_gripper_are_exclusive_and_recover_independently(
         _stop_host(process)
 
 
-def test_native_coordinated_planner_failure_cancels_arm_and_gripper_without_motion(
-    tmp_path: Path,
-) -> None:
-    fixture_root = tmp_path / "fixture"
-    shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
-    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
-    state_root, run_root = tmp_path / "state", tmp_path / "run"
-    state_root.mkdir()
-    run_root.mkdir()
-    marker, gate = tmp_path / "planner-entered", tmp_path / "planner-release"
-    os.mkfifo(gate)
-    gate_fd = os.open(gate, os.O_RDWR | os.O_NONBLOCK)
-    process = None
-    try:
-        process = _start_host(
-            fixture_root,
-            state_root,
-            run_root,
-            manifest,
-            candidate_worker=_required_path("MANYFORGE_ROBOPLAN_FAKE_WORKER"),
-            fake_worker_marker=marker,
-            fake_worker_failure_gate=gate,
-        )
-        client = ExecutionCommandClient(run_root, timeout_seconds=3.0)
-        status = client.diagnostics()["status"]
-        with client.open_observation_session() as stream:
-            before = stream.next(None, threading.Event())["observation"]
-        positions = list(status["direct_control"]["observed_state"]["positions_rad"])
-        positions[0] += 0.1
-        intent = _direct_control_joint_operation(
-            status,
-            status["direct_control"],
-            request_id="native-coordinated-failure",
-            positions_rad=positions,
-        )
-        tool = _direct_control_gripper_operation(
-            status,
-            request_id="native-coordinated-failure",
-            position=status["direct_control_gripper"]["resource"]["max_position"],
-        )
-        # Both actual native targets belong to this compiled Program binding.
-        # The panel's separate manual bindings are not coordinated authority.
-        for field in ("program_id", "program_revision", "program_binding_id"):
-            intent[field] = status[field]
-        intent["program_run_id"] = "native-coordinated-failure-run"
-        intent["coordination_policy"] = "coordinated_all"
-        intent["participants"].extend(tool["participants"])
-        for participant, role in zip(intent["participants"], ("arm", "gripper")):
-            participant["component_role_id"] = "robot"
-            participant["target_role_id"] = role
-        # Exercise the native decoder itself, not just the HTTP/Python schema.
-        for participants, policy in (
-            ([], "independent"),
-            (intent["participants"][:1], "coordinated_all"),
-            (intent["participants"], "independent"),
-            (intent["participants"], "invented"),
-        ):
-            rejected = client._exchange(
-                {
-                    "api_version": EXECUTION_COMMAND_VERSION,
-                    "attribution": client._request_attribution(None),
-                    "command": "submit",
-                    "operation": {
-                        **intent,
-                        "participants": participants,
-                        "coordination_policy": policy,
-                    },
-                }
-            )
-            assert rejected["ok"] is False, rejected
-            assert not marker.exists()
-        crossed = copy.deepcopy(intent)
-        crossed["participants"][1]["action_span"] = {
-            "action_source": "system",
-            "action_span_id": "span.wrong-run",
-            "program_run_id": "another-run",
-            "node_instance_id": None,
-            "node_attempt_id": None,
-            "parent_node_attempt_id": None,
-        }
-        rejected = client._exchange(
-            {
-                "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": client._request_attribution(None),
-                "command": "submit",
-                "operation": crossed,
-            }
-        )
-        assert (
-            rejected["error"]["details"]["reason"]
-            == "operation_action_span_run_mismatch"
-        )
-        assert not marker.exists()
-        accepted = client.submit(
-            OperationIntentRequest.model_validate(intent), trusted_principal_id=None
-        )
-        assert accepted["ok"] is True, accepted
-        operation_id = accepted["accepted"]["operation_id"]
-        deadline = time.monotonic() + 2.0
-        while not marker.exists() and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert marker.exists()
-        os.write(gate_fd, b"x")
-        deadline = time.monotonic() + 3.0
-        terminal = client.read(operation_id)["operation"]
-        while terminal["state"] not in TERMINAL_STATES and time.monotonic() < deadline:
-            time.sleep(0.005)
-            terminal = client.read(operation_id)["operation"]
-        assert terminal["state"] == "intervention_required", terminal
-        assert terminal["coordination_policy"] == "coordinated_all"
-        assert len(terminal["participants"]) == 2
-        assert all(row["state"] != "completed" for row in terminal["participants"])
-        errors = [
-            row["terminal_error"]
-            for row in terminal["participants"]
-            if row["terminal_error"] is not None
-        ]
-        assert any(
-            error["details"].get("reason") == "test_planner_failure" for error in errors
-        ), errors
-        with client.open_observation_session() as stream:
-            after = stream.next(None, threading.Event())["observation"]
-        assert [row["positions_si"] for row in after["targets"]] == [
-            row["positions_si"] for row in before["targets"]
-        ]
-    finally:
-        os.close(gate_fd)
-        if process is not None:
-            _stop_host(process)
-    # Reopen the real durable projection after the native owner has shut down.
-    with sqlite3.connect(state_root / "operation-journal.sqlite3") as database:
-        row = database.execute(
-            "SELECT j.payload_json FROM operation_snapshots s "
-            "JOIN journal_records j ON j.sequence=s.snapshot_sequence "
-            "WHERE s.operation_id=?",
-            (operation_id,),
-        ).fetchone()
-    assert row is not None
-    persisted = json.loads(row[0])["operation_state"]
-    assert persisted["state"] == terminal["state"]
-    assert persisted["participants"] == terminal["participants"]
-
-
 def test_planning_stop_and_active_host_replacement_are_bounded(
     tmp_path: Path,
 ) -> None:
@@ -4203,7 +3993,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         )
         restarted = headless.execution_diagnostics()["status"]
         assert restarted["owner_epoch"] != first_epoch
-        cclc_after_loss = _wait_for_cclc_component(execution_run_root)
+        cclc_after_loss = _wait_for_current_cclc_routes(execution_run_root)
         assert cclc_after_loss["component_lifecycle_state"] == "active"
         assert (
             cclc_after_loss["component_lifecycle_generation"]

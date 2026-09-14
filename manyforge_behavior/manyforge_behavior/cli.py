@@ -18,6 +18,9 @@ from manyforge_behavior.node_environment import (
     NodeEnvironmentBuildError,
     build_node_environment,
 )
+from manyforge_behavior.pick_place_migration import (
+    migrate_composite_pick_place_program,
+)
 from manyforge_behavior.program import migrate_program_v1
 
 
@@ -87,13 +90,10 @@ def _nodes_catalog(args: argparse.Namespace) -> int:
     return 0
 
 
-def _program_migrate(args: argparse.Namespace) -> int:
-    """Validate before writing; atomically publish a new, never overwritten file."""
+def _write_program_no_clobber(program, destination_value: str) -> int:
+    """Atomically publish one validated Program without touching an existing file."""
 
-    program = migrate_program_v1(
-        load_strict_json_yaml(args.input), NodeCatalog(BUILTIN_CATALOG_PATH)
-    )
-    destination = Path(args.output)
+    destination = Path(destination_value)
     # A same-directory temporary plus no-clobber link keeps a partial write
     # invisible. No store, backend, active Draft or existing Binding is touched.
     temporary = None
@@ -120,6 +120,24 @@ def _program_migrate(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def _program_migrate(args: argparse.Namespace) -> int:
+    """Explicit v1 conversion; runtime loading never calls this path."""
+
+    program = migrate_program_v1(
+        load_strict_json_yaml(args.input), NodeCatalog(BUILTIN_CATALOG_PATH)
+    )
+    return _write_program_no_clobber(program, args.output)
+
+
+def _program_migrate_pick_place(args: argparse.Namespace) -> int:
+    """Replace current composite Pick/Place nodes in one offline conversion."""
+
+    program = migrate_composite_pick_place_program(
+        load_strict_json_yaml(args.input), NodeCatalog(BUILTIN_CATALOG_PATH)
+    )
+    return _write_program_no_clobber(program, args.output)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -161,6 +179,18 @@ def _parser() -> argparse.ArgumentParser:
         "--output", required=True, help="new path; existing files are never overwritten"
     )
     migrate.set_defaults(handler=_program_migrate)
+    migrate_pick_place = program_commands.add_parser(
+        "migrate-pick-place",
+        help=(
+            "replace catalog-2.2 composite Pick/Place nodes with visible ordinary "
+            "subtrees; never modifies the input or a Binding"
+        ),
+    )
+    migrate_pick_place.add_argument("--input", required=True)
+    migrate_pick_place.add_argument(
+        "--output", required=True, help="new path; existing files are never overwritten"
+    )
+    migrate_pick_place.set_defaults(handler=_program_migrate_pick_place)
     return parser
 
 

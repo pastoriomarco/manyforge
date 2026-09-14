@@ -11,6 +11,7 @@ from manyforge_behavior.kernel_client import (
     ExecutionState,
     KernelClient,
     KernelClientResponseError,
+    KernelOperationAdmissionRejectedError,
     KernelOperationObservationUnavailableError,
     KernelOperationSettlementPendingError,
     LegacyKernelMockUnavailableError,
@@ -65,26 +66,6 @@ class FakeTransport:
         return {
             "ok": True,
             "planning_result": {"kind": "place", "sequence_id": "place-1"},
-        }
-
-    def start_pick(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        self.submitted = body
-        return {
-            "ok": True,
-            "sequence_status": {"kind": "pick", "sequence_id": "pick-1"},
-        }
-
-    def start_place(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        self.submitted = body
-        return {
-            "ok": True,
-            "sequence_status": {"kind": "place", "sequence_id": "place-1"},
-        }
-
-    def read_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "sequence_status": {"sequence_id": sequence_id, "phase": "completed"},
         }
 
     def read(self, operation_id: str) -> dict[str, Any]:
@@ -169,15 +150,6 @@ def test_kernel_client_only_forwards_bounded_headless_operations() -> None:
     assert client.plan_place({"sequence_id": "place-1"})["planning_result"][
         "kind"
     ] == "place"
-    assert client.start_pick({"sequence_id": "pick-1"})["sequence_status"][
-        "kind"
-    ] == "pick"
-    assert client.start_place({"sequence_id": "place-1"})["sequence_status"][
-        "kind"
-    ] == "place"
-    assert client.pick_place_sequence("pick-1")["sequence_status"][
-        "phase"
-    ] == "completed"
     assert client.operation("operation-1")["operation"]["state"] == "completed"
     request = {"expected_operation_revision": 1}
     stop_request = {
@@ -196,6 +168,31 @@ def test_malformed_success_and_legacy_stateful_mock_fail_closed() -> None:
         KernelClient(BadTransport()).identity()
     with pytest.raises(LegacyKernelMockUnavailableError):
         MockKernelClient()
+
+
+def test_execute_preserves_explicit_rejection_and_unknown_transport_failure() -> None:
+    class RejectedTransport(FakeTransport):
+        def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "error": {
+                    "code": "invalid_state_transition",
+                    "message": "Program run is held",
+                    "details": {"reason": "program_run_stop_fence_active"},
+                },
+            }
+
+    with pytest.raises(KernelOperationAdmissionRejectedError) as rejected:
+        KernelClient(RejectedTransport()).execute({"program_id": "program-1"})
+    assert rejected.value.code == "invalid_state_transition"
+    assert rejected.value.details == {"reason": "program_run_stop_fence_active"}
+
+    class LostTransport(FakeTransport):
+        def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            raise TimeoutError("acceptance reply lost")
+
+    with pytest.raises(TimeoutError, match="acceptance reply lost"):
+        KernelClient(LostTransport()).execute({"program_id": "program-1"})
 
 
 def test_only_exact_operation_owner_unavailability_is_typed_for_retry() -> None:

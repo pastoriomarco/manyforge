@@ -233,22 +233,6 @@ class ExecutionPort(Protocol):
         trusted_principal_id: str | None,
     ) -> dict[str, Any]: ...
 
-    def start_pick(
-        self,
-        request: PickSequencePlanningRequest,
-        *,
-        trusted_principal_id: str | None,
-    ) -> dict[str, Any]: ...
-
-    def start_place(
-        self,
-        request: PlaceSequencePlanningRequest,
-        *,
-        trusted_principal_id: str | None,
-    ) -> dict[str, Any]: ...
-
-    def read_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]: ...
-
     def pause(
         self,
         request: OperationControlRequest,
@@ -1669,70 +1653,7 @@ class ExecutionCommandClient:
                     "execution_command_response_identity_mismatch",
                     "pick/place planning result does not match its submitted intent",
                 )
-            if command.startswith("start_"):
-                sequence_status = response.get("sequence_status")
-                if result["status"] == "planned":
-                    self._validate_pick_place_sequence_status(
-                        sequence_status,
-                        sequence_id=request.sequence_id,
-                        expected_kind=expected_kind,
-                    )
-                elif sequence_status is not None:
-                    raise HeadlessApiError(
-                        "execution_command_response_identity_mismatch",
-                        "no-feasible pick/place result unexpectedly began a sequence",
-                    )
         return response
-
-    @staticmethod
-    def _validate_pick_place_sequence_status(
-        value: object,
-        *,
-        sequence_id: str,
-        expected_kind: str | None = None,
-    ) -> dict[str, Any]:
-        phases = {
-            "approach",
-            "descend",
-            "tool_command",
-            "scene_transition",
-            "retreat",
-            "completed",
-            "failed",
-            "intervention_required",
-        }
-        if (
-            not isinstance(value, dict)
-            or value.get("schema_version") != "manyforge.pick_place_sequence_status.v1"
-            or value.get("sequence_id") != sequence_id
-            or value.get("kind") not in {"pick", "place"}
-            or (expected_kind is not None and value.get("kind") != expected_kind)
-            or value.get("phase") not in phases
-            or not isinstance(value.get("selected_object_id"), str)
-            or not value["selected_object_id"]
-            or not isinstance(value.get("completed_operation_ids"), list)
-            or not all(
-                isinstance(operation_id, str) and operation_id
-                for operation_id in value["completed_operation_ids"]
-            )
-            or (
-                value.get("active_operation_id") is not None
-                and not isinstance(value.get("active_operation_id"), str)
-            )
-            or (
-                value.get("committed_projection_revision") is not None
-                and not isinstance(value.get("committed_projection_revision"), dict)
-            )
-            or (
-                value.get("terminal_error") is not None
-                and not isinstance(value.get("terminal_error"), dict)
-            )
-        ):
-            raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "pick/place sequence status does not match its owner-issued contract",
-            )
-        return value
 
     def plan_pick(
         self,
@@ -1757,51 +1678,6 @@ class ExecutionCommandClient:
             request,
             trusted_principal_id=trusted_principal_id,
         )
-
-    def start_pick(
-        self,
-        request: PickSequencePlanningRequest,
-        *,
-        trusted_principal_id: str | None,
-    ) -> dict[str, Any]:
-        return self._plan_pick_place(
-            "start_pick",
-            request,
-            trusted_principal_id=trusted_principal_id,
-        )
-
-    def start_place(
-        self,
-        request: PlaceSequencePlanningRequest,
-        *,
-        trusted_principal_id: str | None,
-    ) -> dict[str, Any]:
-        return self._plan_pick_place(
-            "start_place",
-            request,
-            trusted_principal_id=trusted_principal_id,
-        )
-
-    def read_pick_place_sequence(self, sequence_id: str) -> dict[str, Any]:
-        if not sequence_id or len(sequence_id.encode("utf-8")) > 96:
-            raise ValueError("sequence_id must be bounded non-empty text")
-        response = self._exchange(
-            {
-                "api_version": EXECUTION_COMMAND_VERSION,
-                "command": "read_pick_place_sequence",
-                "sequence_id": sequence_id,
-            }
-        )
-        if response.get("ok") is True:
-            if response.get("command") != "read_pick_place_sequence":
-                raise HeadlessApiError(
-                    "execution_command_response_identity_mismatch",
-                    "pick/place sequence read returned another command",
-                )
-            self._validate_pick_place_sequence_status(
-                response.get("sequence_status"), sequence_id=sequence_id
-            )
-        return response
 
     def _control(
         self,

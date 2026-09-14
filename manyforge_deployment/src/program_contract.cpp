@@ -629,6 +629,31 @@ execution_groups(const CanonicalValue::Object &node, std::string_view path) {
   return groups;
 }
 
+[[nodiscard]] std::set<std::string>
+synchronized_execution_groups(const CanonicalValue::Object &root,
+                              std::string_view path) {
+  const auto *value = find_member(root, "synchronized_execution_groups");
+  if (value == nullptr)
+    return {};
+  const auto group_path = child_path(path, "synchronized_execution_groups");
+  const auto &values = require_array(*value, group_path);
+  if (values.size() > core::kMaxProgramExecutionGroups)
+    fail(group_path + ": exceeds the execution-group bound");
+  std::vector<std::string> ordered;
+  ordered.reserve(values.size());
+  for (const auto &item : values) {
+    const auto &name = require_string(item, group_path);
+    require_program_local_identity(name, group_path);
+    if (name == "all" || name == "inherit")
+      fail(group_path + ": reserved selector cannot name synchronization");
+    ordered.push_back(name);
+  }
+  if (!std::is_sorted(ordered.begin(), ordered.end()) ||
+      std::adjacent_find(ordered.begin(), ordered.end()) != ordered.end())
+    fail(group_path + ": must be duplicate-free and canonical-sorted");
+  return {ordered.begin(), ordered.end()};
+}
+
 [[nodiscard]] CanonicalValue normalize_program_tree(const CanonicalValue &value,
                                                     std::string_view path,
                                                     std::size_t depth,
@@ -1204,6 +1229,11 @@ struct QualifiedExecutionCatalog final {
     const core::TargetRoleId role_id(require_string(*role, path));
     const core::CapabilityId capability(
         require_string(require_member(fields, "capability_id", path), path));
+    const auto *effectful_value = find_member(fields, "effectful");
+    if (effectful_value != nullptr && !effectful_value->is_bool())
+      fail(child_path(path, "effectful") + ": expected boolean");
+    const bool effectful =
+        effectful_value != nullptr && effectful_value->as_bool();
     const auto target =
         std::lower_bound(targets.begin(), targets.end(), role_id,
                          [](const auto &item, const auto &id) {
@@ -1223,7 +1253,7 @@ struct QualifiedExecutionCatalog final {
       fail(std::string(path) +
            ": target role does not declare the node's required capability");
     }
-    effects.push_back({role_id, capability});
+    effects.push_back({role_id, capability, effectful});
   }
   const auto less = [](const auto &a, const auto &b) {
     return std::tie(a.target_role_id, a.capability_id) <
@@ -1237,7 +1267,8 @@ struct QualifiedExecutionCatalog final {
 [[nodiscard]] core::ProgramExecutionTableDTO capture_execution_table(
     const CanonicalValue &tree, const std::set<std::string> &instances,
     const core::RetainedNodeEnvironmentDTO &environment,
-    const std::vector<core::ProgramTargetRoleRequirementDTO> &targets) {
+    const std::vector<core::ProgramTargetRoleRequirementDTO> &targets,
+    const std::set<std::string> &synchronized_groups) {
   const auto &catalog = execution_catalog();
   if (catalog.catalog_id != environment.catalog_id ||
       catalog.content_version != environment.content_version ||
@@ -1251,10 +1282,18 @@ struct QualifiedExecutionCatalog final {
     table.nodes.push_back({core::ProgramNodeInstanceId(instance), {}, {}});
   }
   std::map<std::string, std::vector<std::uint32_t>> selections;
+  struct NodeShape final {
+    std::string node_id;
+    std::string parent_instance_id;
+    std::vector<std::string> direct_groups;
+    bool parallel_success_on_all{};
+  };
+  std::map<std::string, NodeShape> shapes;
   std::size_t membership_count = 0U;
   std::size_t effect_count = 0U;
   const auto visit = [&](auto &&self, const CanonicalValue &value,
-                         const std::vector<std::string> &inherited) -> void {
+                         const std::vector<std::string> &inherited,
+                         const std::string &parent_instance_id) -> void {
     const auto &node = require_object(value, "program.tree");
     const auto &instance = require_string(
         require_member(node, "instance_id", "tree"), "instance_id");
@@ -1281,6 +1320,19 @@ struct QualifiedExecutionCatalog final {
     }
     const auto &node_id =
         require_string(require_member(node, "node_id", path), path);
+    bool parallel_success_on_all = false;
+    if (node_id == "parallel") {
+      const auto &parameters =
+          require_object(require_member(node, "parameters", path), path);
+      const auto *policy = find_member(parameters, "success_policy");
+      parallel_success_on_all =
+          policy == nullptr || require_string(*policy, path) == "all";
+    }
+    shapes.emplace(
+        instance,
+        NodeShape{node_id, parent_instance_id,
+                  authored.has_value() ? *authored : std::vector<std::string>{},
+                  parallel_success_on_all});
     const auto definition = catalog.entries.find(node_id);
     if (definition == catalog.entries.end())
       fail(path + ": node is absent from the qualified catalog");
@@ -1297,13 +1349,57 @@ struct QualifiedExecutionCatalog final {
     effect_count += selected->target_effects.size();
     for (const auto &child :
          require_array(require_member(node, "children", path), path)) {
-      self(self, child, groups);
+      self(self, child, groups, instance);
     }
   };
-  visit(visit, tree, {});
+  visit(visit, tree, {}, {});
+  std::set<std::uint32_t> synchronized_nodes;
   for (auto &[name, indices] : selections) {
     std::sort(indices.begin(), indices.end());
-    table.named_selections.push_back({name, std::move(indices)});
+    const bool synchronized = synchronized_groups.contains(name);
+    if (synchronized) {
+      if (indices.size() < 2U)
+        fail("synchronized execution group must contain at least two nodes: " +
+             name);
+      std::string parent;
+      for (const auto index : indices) {
+        const auto &instance = table.nodes[index].instance_id.value();
+        const auto shape = shapes.find(instance);
+        if (shape == shapes.end() ||
+            (shape->second.node_id != "motion.move_to_joint_target" &&
+             shape->second.node_id != "motion.move_to_pose" &&
+             shape->second.node_id != "motion.follow_cartesian_path") ||
+            std::find(shape->second.direct_groups.begin(),
+                      shape->second.direct_groups.end(),
+                      name) == shape->second.direct_groups.end()) {
+          fail("synchronized execution group contains a non-motion or "
+               "inherited member: " +
+               name);
+        }
+        if (parent.empty())
+          parent = shape->second.parent_instance_id;
+        else if (parent != shape->second.parent_instance_id)
+          fail("synchronized execution group members are not Parallel "
+               "siblings: " +
+               name);
+        if (!synchronized_nodes.insert(index).second)
+          fail("a motion node belongs to more than one synchronized execution "
+               "group");
+      }
+      const auto parent_shape = shapes.find(parent);
+      if (parent.empty() || parent_shape == shapes.end() ||
+          parent_shape->second.node_id != "parallel" ||
+          !parent_shape->second.parallel_success_on_all)
+        fail("synchronized execution group requires one Success-on-all "
+             "Parallel: " +
+             name);
+    }
+    table.named_selections.push_back({name, std::move(indices), synchronized});
+  }
+  for (const auto &name : synchronized_groups) {
+    if (!selections.contains(name))
+      fail("synchronized execution group is not an authored selection: " +
+           name);
   }
   return table;
 }
@@ -1313,13 +1409,13 @@ extract_contract(const CanonicalValue &root_value,
                  const RetainedBundle &retained_bundle,
                  core::ProgramExecutionTableDTO &execution_table) {
   const auto &root = require_object(root_value, "program");
-  require_fields(root,
-                 {"api_version", "program_id", "program_revision",
-                  "program_profile", "name", "catalog", "component_roles",
-                  "target_roles", "tree"},
-                 {"description", "compatibility", "viewer", "scene",
-                  "parameters", "blackboard", "contact_policies"},
-                 "program");
+  require_fields(
+      root,
+      {"api_version", "program_id", "program_revision", "program_profile",
+       "name", "catalog", "component_roles", "target_roles", "tree"},
+      {"description", "compatibility", "viewer", "scene", "parameters",
+       "blackboard", "contact_policies", "synchronized_execution_groups"},
+      "program");
   if (require_string(require_member(root, "api_version", "program"),
                      "program.api_version") != core::kProgramApiVersion) {
     fail("program.api_version: expected manyforge.program.v2");
@@ -1484,7 +1580,8 @@ extract_contract(const CanonicalValue &root_value,
               tree_count, instance_ids, node_policies);
   execution_table = capture_execution_table(
       require_member(root, "tree", "program"), instance_ids,
-      bundle.catalogs.node_environment, targets);
+      bundle.catalogs.node_environment, targets,
+      synchronized_execution_groups(root, "program"));
   std::sort(node_policies.begin(), node_policies.end(),
             [](const auto &left, const auto &right) {
               return left.instance_id < right.instance_id;

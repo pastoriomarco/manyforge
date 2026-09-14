@@ -626,6 +626,7 @@ function parseCapability(
   const requirement: CatalogCapabilityRequirement = {
     capabilityId: stringAt(record.capabilityId, `${path}.capabilityId`),
     scope: stringAt(record.scope, `${path}.scope`),
+    effectful: booleanAt(record.effectful, `${path}.effectful`),
   };
   for (const key of [
     'targetParameter',
@@ -1390,6 +1391,7 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
       'parameters',
       'blackboard',
       'contact_policies',
+      'synchronized_execution_groups',
     ],
     path,
   );
@@ -1515,6 +1517,31 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
       `${path}.contact_policies`,
     ).map((item, index) => jsonValueAt(item, `${path}.contact_policies[${index}]`));
   }
+  if (record.synchronized_execution_groups !== undefined) {
+    const groupPath = `${path}.synchronized_execution_groups`;
+    const groups = boundedArrayAt(
+      record.synchronized_execution_groups,
+      groupPath,
+      4096,
+    ).map((group, index) => stringAt(
+      group,
+      `${groupPath}[${index}]`,
+    ));
+    if (groups.some((group) => (
+      !/^[a-z][a-z0-9_.-]{0,127}$/.test(group)
+      || group === 'all'
+      || group === 'inherit'
+    ))) {
+      return fail(groupPath, 'portable non-reserved execution group IDs');
+    }
+    if (groups.some((group, index) => index > 0 && groups[index - 1] >= group)) {
+      return fail(
+        groupPath,
+        'unique group IDs in canonical sorted order',
+      );
+    }
+    result.synchronized_execution_groups = groups;
+  }
   const declaredFrameRoles = new Set<string>();
   const declaredResourceRoles = new Set<string>();
   for (const target of Object.values(result.target_roles)) {
@@ -1602,6 +1629,7 @@ function parseProgramAuthoringDocument(
       'parameters',
       'blackboard',
       'contact_policies',
+      'synchronized_execution_groups',
     ],
     path,
   );

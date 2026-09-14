@@ -2,7 +2,7 @@
 
 #include <array>
 #include <cstddef>
-#include <manyforge_core/pick_place_sequence.hpp>
+#include <manyforge_core/pick_place_candidate.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <manyforge_core/ports/iplanning_scene_synchronizer.hpp>
@@ -17,6 +17,23 @@
 namespace manyforge::core {
 
 inline constexpr std::size_t kMaxPickPlaceSequenceIdBytes = 96U;
+
+enum class PickPlaceExecutionKindDTO {
+  kPick,
+  kPlace,
+};
+
+/// Exact planning result consumed by ordinary Program nodes. It deliberately
+/// contains no execution phase, task identity, or recovery state.
+struct PickPlacePlanDTO final {
+  PickPlaceExecutionKindDTO kind{PickPlaceExecutionKindDTO::kPick};
+  SceneResourceId selected_object_id{std::string{}};
+  ProjectionRevisionDTO predecessor_projection_revision;
+  ProjectionRevisionDTO preview_successor_projection_revision;
+  MotionSpecDTO approach_motion;
+  MotionSpecDTO descend_motion;
+  MotionSpecDTO retreat_motion;
+};
 
 /// Public, portable subset of deterministic candidate synthesis. Translation
 /// offsets are expressed in the selected arm's logical planning-base frame
@@ -35,8 +52,7 @@ struct PickCandidateSynthesisIntentDTO final {
   bool force_vertical_pick{};
   std::optional<double> min_tcp_z_m;
   std::size_t maximum_candidate_count{4096U};
-  PickCandidateSearchStrategyDTO search_strategy{
-      PickCandidateSearchStrategyDTO::kFirstFeasible};
+  PickCandidateSearchStrategyDTO search_strategy{PickCandidateSearchStrategyDTO::kFirstFeasible};
 };
 
 /// Caller-owned pick-planning intent. All four operations remain ordinary
@@ -73,16 +89,15 @@ enum class PickPlacePlanningStatusDTO {
 };
 
 struct PickPlacePlanningResultDTO final {
-  PickPlacePlanningStatusDTO status{
-      PickPlacePlanningStatusDTO::kNoFeasibleCandidate};
+  PickPlacePlanningStatusDTO status{PickPlacePlanningStatusDTO::kNoFeasibleCandidate};
   SceneResourceId selected_object_id{std::string{}};
   std::size_t attempted_candidate_count{};
   std::vector<PickCandidateReportDTO> reports;
   /// Bounded diagnostic geometry for the final attempted pick candidate.
   /// This remains non-executable; a successful plan is carried only by
-  /// sequence_request with its exact owner-private evidence.
+  /// plan with its exact owner-private evidence.
   std::optional<PickPoseCandidateDTO> last_attempted_pick_candidate;
-  std::optional<PickPlaceSequenceRequestDTO> sequence_request;
+  std::optional<PickPlacePlanDTO> plan;
 };
 
 /// Stateless addressed planning owner. It resolves the exact arm/tool
@@ -102,13 +117,11 @@ class AddressedPickPlacePlanningOwner final {
         projection_(projection),
         planning_scene_synchronizer_(planning_scene_synchronizer) {}
 
-  [[nodiscard]] Result<PickPlacePlanningResultDTO> PlanPick(
-      PickSequencePlanningIntentDTO intent,
-      std::stop_token stop_token = {});
+  [[nodiscard]] Result<PickPlacePlanningResultDTO> PlanPick(PickSequencePlanningIntentDTO intent,
+                                                            std::stop_token stop_token = {});
 
-  [[nodiscard]] Result<PickPlacePlanningResultDTO> PlanPlace(
-      PlaceSequencePlanningIntentDTO intent,
-      std::stop_token stop_token = {});
+  [[nodiscard]] Result<PickPlacePlanningResultDTO> PlanPlace(PlaceSequencePlanningIntentDTO intent,
+                                                             std::stop_token stop_token = {});
 
  private:
   [[nodiscard]] Result<ProjectionRevisionDTO> SynchronizePlanningProjection(
@@ -122,45 +135,22 @@ class AddressedPickPlacePlanningOwner final {
   IPlanningSceneSynchronizer* planning_scene_synchronizer_{};
 };
 
-/// Public admission result for one addressed pick/place execution request.
-/// A no-feasible-candidate result has no sequence status and performs no
-/// effect. A planned result begins only through the existing C++ sequence
-/// coordinator; the planning result remains a bounded diagnostic projection.
-struct PickPlaceSequenceAdmissionResultDTO final {
-  PickPlacePlanningResultDTO planning_result;
-  std::optional<PickPlaceSequenceStatusDTO> sequence_status;
-};
-
-/// Thin effectful join over the stateless planning owner and the sole C++
-/// pick/place sequence coordinator. It adds no phase, operation, gripper, or
-/// scene truth of its own.
-class AddressedPickPlaceExecutionOwner final {
- public:
-  AddressedPickPlaceExecutionOwner(AddressedPickPlacePlanningOwner& planning,
-                                   PickPlaceSequenceCoordinator& sequences)
-      : planning_(planning), sequences_(sequences) {}
-
-  [[nodiscard]] Result<PickPlaceSequenceAdmissionResultDTO> BeginPick(
-      PickSequencePlanningIntentDTO intent, std::stop_token stop_token = {});
-  [[nodiscard]] Result<PickPlaceSequenceAdmissionResultDTO> BeginPlace(
-      PlaceSequencePlanningIntentDTO intent, std::stop_token stop_token = {});
-  [[nodiscard]] Result<PickPlaceSequenceStatusDTO> Reconcile();
-  [[nodiscard]] Result<PickPlaceSequenceStatusDTO> GetStatus(std::string_view sequence_id) const;
-
- private:
-  [[nodiscard]] Result<PickPlaceSequenceAdmissionResultDTO> BeginPlanned(
-      Result<PickPlacePlanningResultDTO> planned);
-
-  AddressedPickPlacePlanningOwner& planning_;
-  PickPlaceSequenceCoordinator& sequences_;
-};
-
 [[nodiscard]] constexpr std::string_view to_string(PickPlacePlanningStatusDTO status) noexcept {
   switch (status) {
     case PickPlacePlanningStatusDTO::kPlanned:
       return "planned";
     case PickPlacePlanningStatusDTO::kNoFeasibleCandidate:
       return "no_feasible_candidate";
+  }
+  return {};
+}
+
+[[nodiscard]] constexpr std::string_view to_string(PickPlaceExecutionKindDTO kind) noexcept {
+  switch (kind) {
+    case PickPlaceExecutionKindDTO::kPick:
+      return "pick";
+    case PickPlaceExecutionKindDTO::kPlace:
+      return "place";
   }
   return {};
 }

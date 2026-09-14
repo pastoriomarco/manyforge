@@ -60,7 +60,7 @@ function programFixture(): Record<string, unknown> {
     name: 'Fixture',
     catalog: {
       api_version: 'manyforge.node_catalog.v2',
-      content_version: '2.1.0',
+      content_version: '2.3.0',
     },
     component_roles: {},
     target_roles: {},
@@ -1100,6 +1100,7 @@ describe('Program workspace parsers', () => {
   it('preserves canonical execution membership without inventing runtime group state', () => {
     const fixture = workspaceFixture();
     const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;
+    const authoring = (fixture.draft as Record<string, unknown>).authoring as Record<string, unknown>;
     const tree = program.tree as Record<string, unknown>;
     tree.execution_groups = ['all_grippers', 'robot_a'];
     expect(parseProgramWorkspaceResponse(fixture).draft.program?.tree.execution_groups)
@@ -1111,6 +1112,18 @@ describe('Program workspace parsers', () => {
       expect(() => parseProgramWorkspaceResponse(fixture)).toThrow();
     }
     delete tree.execution_groups;
+    program.synchronized_execution_groups = ['cell_pair'];
+    authoring.synchronized_execution_groups = ['cell_pair'];
+    const parsed = parseProgramWorkspaceResponse(fixture);
+    expect(parsed.draft.program?.synchronized_execution_groups).toEqual(['cell_pair']);
+    expect(parsed.draft.authoring?.synchronized_execution_groups).toEqual(['cell_pair']);
+    for (const malformed of [null, 'cell_pair', [''], ['all'], ['inherit'], ['a', 'a'], ['z', 'a'], ['UPPER']]) {
+      program.synchronized_execution_groups = malformed;
+      authoring.synchronized_execution_groups = malformed;
+      expect(() => parseProgramWorkspaceResponse(fixture)).toThrow();
+    }
+    delete program.synchronized_execution_groups;
+    delete authoring.synchronized_execution_groups;
     program.api_version = 'manyforge.program.v1';
     expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('manyforge.program.v2');
   });

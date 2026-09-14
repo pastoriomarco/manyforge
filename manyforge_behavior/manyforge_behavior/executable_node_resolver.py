@@ -394,8 +394,8 @@ _TASK_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
         "kernel.stop": "kernel_controls",
         "kernel.full_stop": "kernel_controls",
         "kernel.recovery": "kernel_controls",
-        "kernel.pick_place_sequence": "pick_place",
-        "planning.pick_sequence": "pick_place",
+        "planning.pick_sequence": "kernel_operations",
+        "planning.place_sequence": "kernel_operations",
         "simulator.control": "simulator_control",
     }
 )

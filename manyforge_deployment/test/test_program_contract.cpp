@@ -1013,6 +1013,25 @@ selection_node(std::string instance, CanonicalValue groups,
   return with_program_revision(CanonicalValue(std::move(members)));
 }
 
+[[nodiscard]] CanonicalValue synchronized_motion_node(std::string instance,
+                                                      std::string group) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"node_id", CanonicalValue("motion.move_to_joint_target")},
+      {"instance_id", CanonicalValue(std::move(instance))},
+      {"parameters",
+       CanonicalValue(CanonicalValue::Object{
+           {"target_role", CanonicalValue("arm")},
+           {"base_frame_role", CanonicalValue("base")},
+           {"tcp_frame_role", CanonicalValue("tcp")},
+           {"goal", CanonicalValue(CanonicalValue::Array{
+                        CanonicalValue(CanonicalValue::Object{
+                            {"joint_name", CanonicalValue("joint1")},
+                            {"position_rad", CanonicalValue(0.0)}})})}})},
+      {"execution_groups", text_array({group})},
+      {"children", CanonicalValue(CanonicalValue::Array{})},
+  });
+}
+
 TEST(ProgramContractTest,
      CapturesOverlappingInheritedAndNeverStartedNodeSelections) {
   ScopedTrustedRoot root;
@@ -1053,6 +1072,49 @@ TEST(ProgramContractTest,
             (std::vector<std::uint32_t>{2U, 3U, 5U}));
   for (const auto &node : table.nodes)
     EXPECT_TRUE(node.target_effects.empty());
+}
+
+TEST(ProgramContractTest, CapturesOnlyExplicitParallelSynchronizedMotionSets) {
+  const auto bundle = maintained_motion_bundle();
+  auto options = valid_options(*bundle);
+  options.capability_ids = {"execution.feedback.phase_events",
+                            "execution.trajectory.execute",
+                            "planning.motion.joint_goal",
+                            "planning.profile.balanced",
+                            "planning.trajectory.time_parameterized",
+                            "state.observed.current",
+                            "validation.trajectory.non_collision"};
+  CanonicalValue parallel(CanonicalValue::Object{
+      {"node_id", CanonicalValue("parallel")},
+      {"instance_id", CanonicalValue("paired_motion")},
+      {"parameters", CanonicalValue(CanonicalValue::Object{
+                         {"success_policy", CanonicalValue("all")}})},
+      {"children", CanonicalValue(CanonicalValue::Array{
+                       synchronized_motion_node("arm_a", "cell_pair"),
+                       synchronized_motion_node("arm_b", "cell_pair")})},
+  });
+  auto root = with_tree(options, std::move(parallel)).as_object();
+  root.emplace_back("synchronized_execution_groups", text_array({"cell_pair"}));
+  const auto contract = verify_program_binding_contract(
+      canonical_json(with_program_revision(CanonicalValue(std::move(root)))),
+      *bundle);
+
+  ASSERT_EQ(contract->execution_table().named_selections.size(), 1U);
+  const auto &selection = contract->execution_table().named_selections.front();
+  EXPECT_EQ(selection.group_id, "cell_pair");
+  EXPECT_TRUE(selection.synchronized);
+  ASSERT_EQ(selection.node_indices.size(), 2U);
+  for (const auto index : selection.node_indices) {
+    const auto &node = contract->execution_table().nodes[index];
+    EXPECT_EQ(node.owner_api, "kernel.operation");
+    EXPECT_TRUE(std::any_of(node.target_effects.begin(),
+                            node.target_effects.end(), [](const auto &effect) {
+                              return effect.effectful &&
+                                     effect.capability_id ==
+                                         CapabilityId(
+                                             "execution.trajectory.execute");
+                            }));
+  }
 }
 
 TEST(ProgramContractTest,
@@ -1149,6 +1211,7 @@ TEST(ProgramContractTest, CapturesOnlyCatalogQualifiedNodeTargetAssociations) {
   EXPECT_EQ(node.target_effects.front().target_role_id, TargetRoleId("arm"));
   EXPECT_EQ(node.target_effects.front().capability_id,
             CapabilityId("execution.stop.soft"));
+  EXPECT_TRUE(node.target_effects.front().effectful);
   // Declaring a capability somewhere in the Program does not grant it to
   // every node; an unknown literal role or absent node requirement rejects.
   replace_member(tree, "parameters",
@@ -1210,7 +1273,19 @@ TEST(ProgramContractTest,
       return effect.capability_id == CapabilityId(capability);
     });
   };
+  const auto effectful = [](const auto &table, const char *capability) {
+    const auto &effects = table.nodes.front().target_effects;
+    const auto found =
+        std::find_if(effects.begin(), effects.end(), [&](const auto &effect) {
+          return effect.capability_id == CapabilityId(capability);
+        });
+    return found != effects.end() && found->effectful;
+  };
   EXPECT_TRUE(has(contract->execution_table(), "planning.profile.balanced"));
+  EXPECT_TRUE(
+      effectful(contract->execution_table(), "execution.trajectory.execute"));
+  EXPECT_FALSE(
+      effectful(contract->execution_table(), "state.observed.current"));
   EXPECT_FALSE(
       has(contract->execution_table(), "planning.profile.first_feasible"));
   mutate_object_member(tree, "parameters", [](auto &parameters) {

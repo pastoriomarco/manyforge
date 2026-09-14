@@ -56,6 +56,7 @@ class CatalogCapabilityResponse(BaseModel):
 
     capability_id: str = Field(alias="capabilityId")
     scope: str
+    effectful: bool
     target_parameter: str | None = Field(default=None, alias="targetParameter")
     component_parameter: str | None = Field(
         default=None,

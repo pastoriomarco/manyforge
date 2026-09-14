@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: trocar_lite6_foundationpose_pick
-program_revision: sha256:e65504ce57a226ddf7be7a30d9b44ecd41a551205a79f78742e3fdbedf96e81a
+program_revision: sha256:3606af6f0a7b88bb8384890c195012b1e0af7250e07e35ba079bbc7c94dc6230
 program_profile: composable-cell-v1
 name: trocar_lite6_foundationpose_pick
 description: >-
@@ -10,7 +10,7 @@ description: >-
   sequence using the physical lite-gripper and typed simulator lifecycle.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.1.0
+  content_version: 2.3.0
 compatibility:
   lanes: [isaac-sim]
   assistant: forbidden
@@ -137,9 +137,12 @@ blackboard:
       persistence: run
       fields:
         - {field: approach_pose, type: stored_pose}
+        - {field: descend_path, type: cartesian_path}
         - {field: pick_pose, type: stored_pose}
+        - {field: retreat_path, type: cartesian_path}
         - {field: retreat_pose, type: stored_pose}
         - {field: selected_object_id, type: scene_resource}
+        - {field: tool_position, type: coordinate_position}
     - key: selected_object
       type: scene_resource
       access: read_write
