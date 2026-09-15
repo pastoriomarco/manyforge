@@ -485,7 +485,11 @@ export function ProgramRuntimePanel({
       {commandAllowed('program_reset') && (
         <button
           type="button"
-          disabled={!enabled || state.pending !== null}
+          disabled={
+            !enabled
+            || state.pending !== null
+            || state.controlPending !== null
+          }
           onClick={() => { void reset(); }}
         >
           {cycleState === 'resetting' ? 'Resetting' : 'Reset Program cycle'}
@@ -888,12 +892,14 @@ export function ProgramTransportControls({
           className={canReset ? 'transport-reset meaningful' : 'transport-reset'}
           disabled={!canReset}
           title={canReset
-            ? motionStopSettled
+            ? cycleState === 'recovery_required'
+              ? 'Contain and reconcile the current Program using its exact retained cycle and command evidence.'
+              : motionStopSettled
               ? 'Discard the held Program context and reset the Program cycle.'
               : programFullStopped
               ? 'Discard the Full-stopped tree and rebuild an idle Program cycle.'
               : 'Reset the completed Program cycle.'
-            : 'Reset is available after a terminal run or Full Stop.'}
+            : 'Reset is unavailable in the current backend control state.'}
           onClick={() => {
             void program.reset();
           }}

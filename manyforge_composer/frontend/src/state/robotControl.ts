@@ -183,6 +183,17 @@ export function robotControlHasActiveOperation(
     || state.phase === 'stopping';
 }
 
+/** Candidate presentation follows the backend's manual-control admission.
+ * A retained or active manual operation remains the sole owner of its result. */
+export function robotControlCandidatePresentationAllowed(
+  state: RobotControlState,
+  manualControlAllowed: boolean,
+): boolean {
+  return manualControlAllowed
+    && state.operation === null
+    && !robotControlHasActiveOperation(state);
+}
+
 function arraysEqual<T>(left: T[], right: T[]): boolean {
   return left.length === right.length
     && left.every((value, index) => value === right[index]);

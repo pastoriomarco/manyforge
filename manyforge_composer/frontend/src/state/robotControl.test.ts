@@ -7,6 +7,7 @@ import {
   buildPreviewIntent,
   initialRobotControlState,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
+  robotControlCandidatePresentationAllowed,
   robotControlReducer,
   type ManualMotionSettings,
 } from './robotControl';
@@ -16,6 +17,22 @@ import { poseTupleFromValue, samePose } from '../utils/poseTransforms';
 import { computeCartesianMoveDraft } from '../utils/moveTo';
 
 describe('addressed Robot Control state', () => {
+  it('presents candidates whenever backend manual admission is available and unowned', () => {
+    const ready = readyState();
+    expect(robotControlCandidatePresentationAllowed(ready, true)).toBe(true);
+    expect(robotControlCandidatePresentationAllowed(ready, false)).toBe(false);
+    expect(robotControlCandidatePresentationAllowed(executingState(), true)).toBe(false);
+    expect(robotControlCandidatePresentationAllowed({
+      ...ready,
+      phase: 'completed',
+      operation: {
+        operationId: 'completed-operation', operationRevision: 2, resident: true,
+        state: 'completed', progress: 1, activeStopId: null,
+        activeStopGeneration: null, terminalError: null,
+      },
+    }, true)).toBe(false);
+  });
+
   it('uses one Move To source/offset draft for numeric edits and a released target', () => {
     let state = robotControlReducer(readyState(), { type: 'select_move_source', source: {
       id: 'object:fixture', kind: 'pose', pose: { position: [0.2, 0.3, 0.4], quaternion: [0, 0, Math.SQRT1_2, Math.SQRT1_2] },

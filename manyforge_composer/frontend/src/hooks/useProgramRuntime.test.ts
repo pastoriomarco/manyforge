@@ -563,7 +563,7 @@ describe('Program runtime authority requests', () => {
     )).toBeNull();
   });
 
-  it('resets only the exact terminal cycle and reuses owner terminal evidence', () => {
+  it('builds Reset only from exact backend-authorized cycle evidence', () => {
     const { snapshot } = admissionFixtures();
     const terminalReference = digest('d');
     const terminalSnapshot = {
@@ -578,7 +578,10 @@ describe('Program runtime authority requests', () => {
         executionControlRevision: 1,
         causalCorrelationId: null, causalSessionId: null,
         causalClientSequence: null, currentCommandKind: null,
-        failure: null, resetPhase: null, allowedCommands: [],
+        failure: null, resetPhase: null, allowedCommands: [{
+          commandKind: 'program_reset', semanticTarget: {},
+          allowed: true, disabledReason: null,
+        }],
         run: null, runtimeControls: null,
       },
     };
@@ -601,7 +604,31 @@ describe('Program runtime authority requests', () => {
         ...terminalSnapshot,
         programCycle: {
           ...terminalSnapshot.programCycle,
+          state: 'recovery_required',
           terminalOrSettlementReference: null,
+        },
+      },
+      'composer-program-owner.fixture', 'reset.fixture',
+    )).toEqual({
+      request_id: 'reset.fixture',
+      request_owner_epoch: 'composer-program-owner.fixture',
+      source_label: 'operator_ui',
+      correlation_id: 'reset.fixture',
+      program_run_id: 'run-1',
+      expected_owner_epoch: 'runner.epoch.1',
+      expected_cycle_generation: 4,
+      expected_claim_generation: 12,
+      terminal_reference: null,
+      settlement_evidence_digest: null,
+    });
+    expect(buildProgramResetRequest(
+      {
+        ...terminalSnapshot,
+        programCycle: {
+          ...terminalSnapshot.programCycle,
+          allowedCommands: terminalSnapshot.programCycle.allowedCommands.map(
+            (command) => ({ ...command, allowed: false }),
+          ),
         },
       },
       'composer-program-owner.fixture', 'reset.fixture',

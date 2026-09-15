@@ -318,18 +318,13 @@ export function buildProgramResetRequest(
   requestId: string,
 ): Record<string, JsonValue> | null {
   const cycle = snapshot?.programCycle;
+  const allowed = cycle?.allowedCommands.some(
+    (command) => command.commandKind === 'program_reset' && command.allowed,
+  ) ?? false;
   if (
     cycle === undefined
-    || !['running', 'terminal_awaiting_reset'].includes(cycle.state)
+    || !allowed
     || cycle.programRunId === null
-    || (
-      cycle.state === 'terminal_awaiting_reset'
-      && cycle.terminalOrSettlementReference === null
-    )
-    || (
-      cycle.state === 'running'
-      && cycle.terminalOrSettlementReference !== null
-    )
   ) return null;
   return {
     request_id: requestId,
@@ -799,7 +794,16 @@ export function useProgramRuntime(
     const request = buildProgramResetRequest(
       snapshot, callerEpoch.current, requestId,
     );
-    if (request === null || controlSource === null) return;
+    if (request === null || controlSource === null) {
+      if (mounted.current) setState((current) => ({
+        ...current,
+        error: request === null
+          ? 'Program Reset was not sent because its backend permission or cycle identity changed. Controls were refreshed.'
+          : 'Program Reset was not sent because the execution control connection is unavailable. Controls were refreshed.',
+      }));
+      await refresh();
+      return;
+    }
     beginProgramCommand('reset', requestId);
     try {
       await controlSource.sendExecutionCommand(
@@ -812,7 +816,7 @@ export function useProgramRuntime(
     }
   }, [
     beginProgramCommand, controlSource,
-    recordCommandFailure, snapshot,
+    recordCommandFailure, refresh, snapshot,
   ]);
 
   const stop = useCallback(async () => {

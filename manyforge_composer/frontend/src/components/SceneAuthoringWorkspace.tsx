@@ -63,7 +63,7 @@ import {
 } from '../state/runtimeScenePresentation';
 import {
   quaternionFromRpyDegrees,
-  robotControlHasActiveOperation,
+  robotControlCandidatePresentationAllowed,
   robotControlHasLocalDraft,
 } from '../state/robotControl';
 import type { StructuralResourceState } from '../state/structuralResource';
@@ -1499,6 +1499,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   onSelect,
   ghost,
   ghostStale,
+  candidatePresentationAllowed,
   candidatePoseEditable,
   gizmo,
   onCommitTransform,
@@ -1545,6 +1546,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   onSelect: (selection: SceneSelection) => void;
   ghost: Pose3Value | null;
   ghostStale: boolean;
+  candidatePresentationAllowed: boolean;
   candidatePoseEditable: boolean;
   gizmo: GizmoController;
   onCommitTransform: (
@@ -1718,16 +1720,26 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
         ? null : candidateToolPresentation(
           ghost, robotControl.state.status, sourceValue, readyManifest, measured.linkTransforms,
         );
-    const robot = motionPreview === null || robotControl.state.phase !== 'ready'
+    const robot = !candidatePresentationAllowed
+      || motionPreview === null || robotControl.state.phase !== 'ready'
       || robotControl.state.poseDragging
-      || robotControl.state.operation !== null || programRuntime.cycleState !== 'idle_after_reset'
       ? null : candidateRobotPresentation(
-      motionPreview, readyManifest, motionDescriptor, measured.linkTransforms,
-    );
+        motionPreview, readyManifest, motionDescriptor, measured.linkTransforms,
+      );
     return { robot, tool };
-  }, [executionObservationPresentation, ghost, motionDescriptor, motionPreview, readyManifest,
-    robotControl.state.phase, robotControl.state.status, robotControl.state.operation, robotControl.state.poseDragging,
-    programRuntime.cycleState, source, sourceValue]);
+  }, [
+    candidatePresentationAllowed,
+    executionObservationPresentation,
+    ghost,
+    motionDescriptor,
+    motionPreview,
+    readyManifest,
+    robotControl.state.phase,
+    robotControl.state.status,
+    robotControl.state.poseDragging,
+    source,
+    sourceValue,
+  ]);
   const dragReference = useRef<string | null>(null);
   const readCandidateReference = () => {
     const status = robotControl.currentStatus;
@@ -1750,6 +1762,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     };
   };
   const beginCandidateDrag = () => {
+    if (!candidatePresentationAllowed) return false;
     const reference = readCandidateReference();
     if (reference === null || !robotControl.beginPoseDrag()) return false;
     dragReference.current = reference.key;
@@ -1762,7 +1775,8 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       return;
     }
     const reference = readCandidateReference();
-    const valid = reference !== null && reference.key === dragReference.current;
+    const valid = candidatePresentationAllowed
+      && reference !== null && reference.key === dragReference.current;
     dragReference.current = null;
     if (!valid) {
       robotControl.finishPoseDrag(null);
@@ -1989,7 +2003,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
         robotControl.state.status?.retainedBundleId, robotControl.state.status?.graphRevision,
         robotControl.state.status?.directControl.programBindingId, robotControl.state.status?.sceneRevision,
         robotControl.state.mode, robotControl.state.moveToDraft?.source,
-        programRuntime.cycleState, runtimeEnabled])}
+        candidatePresentationAllowed, runtimeEnabled])}
       gizmo={gizmo}
       candidateRobot={candidates?.robot ?? null}
       candidateTool={candidates?.tool ?? null}
@@ -2266,9 +2280,10 @@ export function SceneAuthoringWorkspace({
         }
   ), [candidateViewerBase]);
   const tcpRole = directControl?.tcpFrameRoleId ?? null;
-  const previewAvailable = robotControl.state.operation === null
-    && !robotControlHasActiveOperation(robotControl.state)
-    && programRuntime.cycleState === 'idle_after_reset';
+  const candidatePresentationAllowed = robotControlCandidatePresentationAllowed(
+    robotControl.state,
+    robotControl.manualControlAllowed,
+  );
   const ghostVisible = tcpRole === null
     || viewer?.frame_role_visibility?.[tcpRole] !== false;
   const previewGhost = robotControl.state.ghost;
@@ -2291,16 +2306,17 @@ export function SceneAuthoringWorkspace({
         candidateTcp,
         candidateViewerBase,
       ), [candidateTcp, candidateViewerBase, directControl, sourceValue]);
-  const ghost = previewAvailable && tcpDraftMode && ghostVisible && cellGhost?.available
+  const ghost = candidatePresentationAllowed
+    && tcpDraftMode && ghostVisible && cellGhost?.available
     ? cellGhost.pose
     : null;
-  const candidatePoseEditable = ghost !== null
+  const candidatePoseEditable = candidatePresentationAllowed
+    && ghost !== null
     && (robotControl.state.mode === 'pose_goal'
       || robotControl.state.mode === 'cartesian_path'
       || (robotControl.state.mode === 'move_to' && robotControl.state.moveToDraft?.source.kind === 'pose'))
     && !robotControl.authoringPending
-    && robotControl.currentStatus !== null
-    && !robotControlHasActiveOperation(robotControl.state);
+    && robotControl.currentStatus !== null;
   const busyDraft = programController.state.status === 'loading'
     || (programController.state.status === 'ready'
       && programController.state.pendingAction !== null);
@@ -2810,6 +2826,7 @@ export function SceneAuthoringWorkspace({
       onSelect={setSelection}
       ghost={ghost}
       ghostStale={robotControl.state.ghostStale || robotControl.state.phase === 'blocked'}
+      candidatePresentationAllowed={candidatePresentationAllowed}
       candidatePoseEditable={candidatePoseEditable}
       gizmo={gizmo}
       onCommitTransform={commitTransform}

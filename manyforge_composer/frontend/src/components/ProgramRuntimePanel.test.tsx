@@ -534,6 +534,12 @@ describe('Program runtime projection', () => {
     expect(transport).toContain('width: 7.5rem;');
     expect(transport).toContain('width: 1.45rem;');
     expect(transport).toContain('width: 6.25rem;');
+    expect(transport).toMatch(
+      /\.viewer-transport \.transport-stop-group > \.transport-stop-primary\s*\{[^}]*border-radius: 0\.35rem 0 0 0\.35rem;/s,
+    );
+    expect(transport).toMatch(
+      /\.viewer-transport \.transport-stop-group > \.transport-stop-disclosure\s*\{[^}]*display: grid;[^}]*place-items: center;[^}]*margin-left: -1px;[^}]*padding: 0;[^}]*border-left-width: 1px;/s,
+    );
   });
 
   it('exposes manual recovery from the owner projection even in another panel/mode', () => {
@@ -588,6 +594,8 @@ describe('Program runtime projection', () => {
     expect(render()).not.toContain('Participant requires reconciliation');
     expect(render()).toContain('Recovery required');
     expect(render()).toContain('Review Program recovery');
+    expect(render()).toMatch(/class="transport-reset meaningful"(?![^>]*disabled)/);
+    expect(render()).toContain('Contain and reconcile the current Program');
     program.cycleState = 'terminal_awaiting_reset';
     expect(render()).toContain('Program finished. Use <strong>Reset</strong>');
     expect(render()).not.toContain('Program recovery required.');

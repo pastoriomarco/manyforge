@@ -511,6 +511,10 @@ describe('viewer failure isolation', () => {
     expect(workspace).toContain("robotControl.state.mode === 'cartesian_path'");
     expect(workspace.includes('onEditCandidateTcpPose={finishCandidateDrag}')).toBe(true);
     expect(workspace).toContain('candidateTcpPoseFromCell(');
+    expect(workspace).toContain('robotControlCandidatePresentationAllowed(');
+    expect(workspace).toContain('candidatePresentationAllowed={candidatePresentationAllowed}');
+    expect(workspace).not.toContain("programRuntime.cycleState === 'idle_after_reset'");
+    expect(workspace).not.toContain("programRuntime.cycleState !== 'idle_after_reset'");
   });
 
   it('suspends only viewer observers while retaining outer presentation state', () => {
