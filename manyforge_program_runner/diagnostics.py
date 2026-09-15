@@ -44,7 +44,7 @@ class ProgramDiagnosticPublisher:
                         (
                             index
                             for index, pending in enumerate(self._pending)
-                            if pending.get("state") == "succeeded"
+                            if pending.get("state") in ("succeeded", "held")
                         ),
                         None,
                     )

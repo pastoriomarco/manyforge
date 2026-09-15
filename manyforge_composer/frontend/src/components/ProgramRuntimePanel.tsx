@@ -35,6 +35,13 @@ function actionLabel(value: string): string {
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
+function cycleFailureMessage(failure: Record<string, JsonValue> | null): string | null {
+  const message = failure?.message;
+  if (typeof message === 'string' && message.length > 0) return message;
+  const code = failure?.code;
+  return typeof code === 'string' ? code.replaceAll('_', ' ') : null;
+}
+
 function parseRuntimeValue(type: string, source: string): JsonValue {
   const trimmed = source.trim();
   if (type === 'string') return source;
@@ -64,6 +71,7 @@ export function ProgramRuntimePanel({
   const {
     state,
     cycleState,
+    cycleFailure,
     commandAllowed,
     refresh,
     run,
@@ -104,6 +112,7 @@ export function ProgramRuntimePanel({
     );
   const controls = state.controls?.runtimeControls ?? null;
   const recoveryOffer = state.controls?.recoveryOffer ?? null;
+  const ordinaryMotionHeld = recoveryOffer?.recoveryClass === 'ordinary_operator_stop';
   const writableKeys = (state.applied?.program.blackboard?.keys ?? []).filter(
     (key) => key.access === 'write' || key.access === 'read_write',
   );
@@ -215,7 +224,15 @@ export function ProgramRuntimePanel({
         </div>
       )}
 
-      {state.run?.reasonCode && (
+      {cycleState === 'recovery_required' && cycleFailure !== null ? (
+        <div className="program-feedback" role="status">
+          <span>{cycleFailureMessage(cycleFailure)}</span>
+        </div>
+      ) : ordinaryMotionHeld ? (
+        <div className="program-feedback" role="status">
+          <span>Program motion stopped and held. Resume Motion replans from current state.</span>
+        </div>
+      ) : state.run?.reasonCode && (
         <div className="program-feedback" role="status">
           <span>
             {state.run.reasonCode}
@@ -543,7 +560,7 @@ export function ProgramTransportControls({
   const [stopMenuOpen, setStopMenuOpen] = useState(false);
   const [selection, setSelection] = useState({ runId: '', groupIds: ['all'] });
   const detailsButton = useRef<HTMLButtonElement>(null);
-  const { state, cycleState } = program;
+  const { state, cycleState, cycleFailure } = program;
   const runId = state.run?.capture.programRunId ?? '';
   const selections = state.controls?.executionSelections.groups ?? [];
   const groupIds = selection.runId === runId ? selection.groupIds : ['all'];
@@ -593,6 +610,7 @@ export function ProgramTransportControls({
       || (robot.controlPending === null && motionActive)
     );
   const canResumeOperatorStop = enabled
+    && cycleState === 'running'
     && !manualResident
     && selectedGroups.length === groupIds.length && groupIds.length > 0
     && selectedGroups.every((group) => group.resumeAllowed)
@@ -643,6 +661,10 @@ export function ProgramTransportControls({
   const cellFault = nativeStatus?.cellStopAction.fault?.state !== 'cleared'
     ? nativeStatus?.cellStopAction.fault : null;
   const recoveryOffer = state.controls?.recoveryOffer;
+  const programRecoveryMessage = cycleFailureMessage(cycleFailure)
+    ?? state.run?.message
+    ?? recoveryOffer?.reasonCode.replaceAll('_', ' ')
+    ?? 'Review the backend recovery requirements before continuing.';
   const programRecovery = cycleState === 'recovery_required'
     || (state.run?.state === 'intervention_required'
       && recoveryOffer != null && recoveryOffer.recoveryClass !== 'ordinary_operator_stop');
@@ -701,9 +723,7 @@ export function ProgramTransportControls({
                 <button type="button" onClick={() => setDetailsOpen(true)}>Review cell status</button>
               </div>}
               {programRecovery ? <div className="transport-guidance-row">
-                <p><strong>Program recovery required.</strong> {state.run?.message
-                  || recoveryOffer?.reasonCode.replaceAll('_', ' ')
-                  || 'Review the backend recovery requirements before continuing.'}</p>
+                <p><strong>Program recovery required.</strong> {programRecoveryMessage}</p>
                 <button type="button" onClick={() => setDetailsOpen(true)}>Review Program recovery</button>
               </div> : resetRequired && <p>Program finished. Use <strong>Reset</strong> below before another Run.</p>}
             </>}
@@ -766,6 +786,8 @@ export function ProgramTransportControls({
               ? 'Sending Run'
               : canResume || canResumeOperatorStop
                 ? 'Resume Motion'
+                : programRecovery
+                  ? 'Recovery required'
                 : programMotionRunning
                   ? 'Running'
                   : 'Run'}

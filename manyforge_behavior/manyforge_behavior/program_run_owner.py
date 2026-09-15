@@ -593,7 +593,9 @@ class ProgramRunOwner:
             record, entry.pending_diagnostic = entry.pending_diagnostic, None
             return record
 
-    def _capture_diagnostic(self, entry: _RunEntry, state: str) -> None:
+    def _capture_diagnostic(
+        self, entry: _RunEntry, state: str, *, message: str | None = None
+    ) -> None:
         # Called only on a tree incident/completion transition, not progress.
         # The immutable capture contains references, never a later scene read.
         capture = entry.run.capture
@@ -607,7 +609,9 @@ class ProgramRunOwner:
             "graph_revision": capture.graph_revision,
             "state": state,
             "reason_code": entry.reason_code,
-            "message": entry.message or f"Program {state}",
+            "message": (
+                message if message is not None else entry.message or f"Program {state}"
+            ),
             **entry.run.diagnostic_snapshot(),
         }
 
@@ -2172,7 +2176,23 @@ class ProgramRunOwner:
                     entry.reason_code = intervention.reason_code
                     entry.message = intervention.message
                     entry.revision += 1
-                    self._capture_diagnostic(entry, "intervention_required")
+                    assessment = intervention.owner_assessment
+                    ordinary_stop = (
+                        intervention.policy_parameter == "operator_stop_policy"
+                        and isinstance(assessment, Mapping)
+                        and assessment.get("recovery_class")
+                        == "ordinary_operator_stop"
+                    )
+                    self._capture_diagnostic(
+                        entry,
+                        "held" if ordinary_stop else "intervention_required",
+                        message=(
+                            "Program motion stopped and held; Resume Motion replans "
+                            "from current state"
+                            if ordinary_stop
+                            else None
+                        ),
+                    )
                     return self._snapshot(entry)
                 if tree_status is py_trees.common.Status.RUNNING:
                     return self._snapshot(entry)

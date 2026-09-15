@@ -1230,7 +1230,7 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
             "Program diagnostic artifact identity is invalid");
   }
   const auto state = text("state");
-  Require(state == "succeeded" || state == "failed" ||
+  Require(state == "succeeded" || state == "failed" || state == "held" ||
               state == "intervention_required",
           code, "Program diagnostic transition is unsupported");
   const auto reason = OptionalStringMember(record, "reason_code");
@@ -1305,7 +1305,8 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
                        CanonicalValue("attributed_program_values"));
   auto event =
       MakeHistorianEvent("manyforge.program_runner", "program_" + state,
-                         state == "succeeded" ? "INFO" : "ERROR", monotonic,
+                         state == "succeeded" || state == "held" ? "INFO" : "ERROR",
+                         monotonic,
                          wall, CanonicalValue(std::move(payload)));
   const auto event_id = event.event_id;
   std::lock_guard lock(mutex_);

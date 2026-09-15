@@ -38,8 +38,9 @@ def test_slow_historian_never_blocks_producer_or_accumulates_unbounded_work():
 
 
 @pytest.mark.parametrize("important_state", ["failed", "intervention_required"])
+@pytest.mark.parametrize("routine_state", ["succeeded", "held"])
 def test_important_capture_evicts_oldest_routine_without_reordering_survivors(
-    important_state,
+    important_state, routine_state,
 ):
     entered, release, drained = Event(), Event(), Event()
     records = []
@@ -57,7 +58,7 @@ def test_important_capture_evicts_oldest_routine_without_reordering_survivors(
         publisher.submit({"state": "succeeded", "label": "in_flight"})
         assert entered.wait(2)
         publisher.submit({"state": "failed", "label": "protected"})
-        publisher.submit({"state": "succeeded", "label": "old_routine"})
+        publisher.submit({"state": routine_state, "label": "old_routine"})
         publisher.submit({"state": "succeeded", "label": "new_routine"})
         publisher.submit({"state": important_state, "label": "incoming"})
         assert publisher.health()["enqueued_count"] == 3

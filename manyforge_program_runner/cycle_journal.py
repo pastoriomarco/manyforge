@@ -2212,19 +2212,26 @@ class ProgramCycleJournal:
             if changed != 1:
                 raise RuntimeError("Program-cycle Reset recovery is stale")
 
-    def require_reconciliation(self, *, expected_generation: int) -> None:
+    def require_reconciliation(
+        self,
+        *,
+        expected_generation: int,
+        failure: Mapping[str, Any] | None = None,
+    ) -> None:
         """Latch an unresolved cross-owner effect without changing owner facts."""
+        retained_failure = self._dump(
+            failure or {"code": "program_cycle_reconciliation_required"}
+        )
         with self._transaction():
             changed = self._database.execute(
                 """
                 UPDATE program_cycle SET reconciliation_required=1,
                     state='recovery_required',
                     execution_control_revision=execution_control_revision+1,
-                    failure_json=COALESCE(failure_json,
-                      '{"code":"program_cycle_reconciliation_required"}')
+                    failure_json=COALESCE(failure_json,?)
                 WHERE singleton=1 AND cycle_generation=?
                 """,
-                (expected_generation,),
+                (retained_failure, expected_generation),
             ).rowcount
             if changed != 1:
                 raise RuntimeError("Program-cycle reconciliation latch is stale")

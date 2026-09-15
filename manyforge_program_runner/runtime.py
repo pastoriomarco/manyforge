@@ -1408,6 +1408,18 @@ class ProgramRuntime:
             }
             for kind, allowed in sorted(allowed_by_state.items())
         ]
+        failure = cycle.failure
+        if (
+            cycle.reconciliation_required
+            and failure == {"code": "program_cycle_reconciliation_required"}
+        ):
+            pending = [
+                row
+                for row in journal.pending_commands()
+                if row["cycle_generation"] == cycle.cycle_generation
+            ]
+            if len(pending) == 1:
+                failure = self._unknown_control_failure(pending[0]["kind"])
         status = ProgramCycleStatusDTO.model_validate(
             {
                 "program_runner_owner_epoch": cycle.owner_epoch,
@@ -1423,7 +1435,7 @@ class ProgramRuntime:
                 "causal_session_id": cycle.causal_session_id,
                 "causal_client_sequence": cycle.causal_client_sequence,
                 "current_command_kind": cycle.current_command_kind,
-                "failure": cycle.failure,
+                "failure": failure,
                 "reset_phase": cycle.reset_phase,
                 "allowed_commands": allowed_commands,
             }
@@ -1635,6 +1647,19 @@ class ProgramRuntime:
     ) -> dict[str, Any] | None:
         if program_run_id is None:
             return None
+        # A node-level recovery offer is valid only while its owning Program
+        # cycle is current and free of unresolved control effects.  Keep this
+        # check here so status, controls, results, and rejection responses
+        # cannot disagree about whether the offer is actionable.
+        if self._journal is not None:
+            cycle = self._journal.read()
+            if not (
+                cycle.state == "running"
+                and not cycle.reconciliation_required
+                and cycle.program_run_id == program_run_id
+                and cycle.cycle_generation == cycle_generation
+            ):
+                return None
         intervention = self._owner.intervention(program_run_id)
         if intervention is None:
             return None
@@ -3220,7 +3245,8 @@ class ProgramRuntime:
             def unresolved(error: Exception) -> NoReturn:
                 try:
                     journal.require_reconciliation(
-                        expected_generation=cycle.cycle_generation
+                        expected_generation=cycle.cycle_generation,
+                        failure=self._unknown_control_failure(kind, error),
                     )
                 except Exception:
                     pass
@@ -3277,6 +3303,25 @@ class ProgramRuntime:
                 # Unexpected exceptions are not a trustworthy no-effect
                 # result: a local transition may already have happened.
                 unresolved(error)
+
+    @staticmethod
+    def _unknown_control_failure(
+        kind: str, error: Exception | None = None
+    ) -> dict[str, Any]:
+        """Describe one uncertain effect without guessing whether it ran."""
+
+        label = kind.replace("_", " ").title()
+        failure = {
+            "code": "program_runtime_control_outcome_unknown",
+            "command_kind": kind,
+            "message": (
+                f"The {label} outcome could not be confirmed. Further execution "
+                "is blocked until the Program is safely reconciled."
+            ),
+        }
+        if error is not None:
+            failure["cause_code"] = getattr(error, "code", type(error).__name__)
+        return failure
 
     def stage_runtime_override(
         self, program_run_id: str, request: RuntimeOverrideStageRequest
@@ -3668,7 +3713,10 @@ class ProgramRuntime:
             def unresolved(error: Exception) -> NoReturn:
                 try:
                     journal.require_reconciliation(
-                        expected_generation=cycle.cycle_generation
+                        expected_generation=cycle.cycle_generation,
+                        failure=self._unknown_control_failure(
+                            "recovery_action", error
+                        ),
                     )
                 except Exception:
                     pass

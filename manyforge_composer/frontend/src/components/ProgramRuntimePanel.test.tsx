@@ -212,6 +212,7 @@ function controller(
       error: null,
     },
     cycleState,
+    cycleFailure: null,
     active: [
       'running', 'intervention_required', 'full_stopping', 'full_stopped',
       'stopping', 'finalizing',
@@ -320,10 +321,14 @@ describe('Program runtime projection', () => {
 
     const settledMotionStop = controller('intervention_required');
     settledMotionStop.state.controls = ordinaryMotionStopControls();
+    settledMotionStop.state.run!.reasonCode = 'operation_stopped';
+    settledMotionStop.state.run!.message = 'native operation was interrupted';
     const settledMotionMarkup = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={settledMotionStop} />,
     );
     expect(settledMotionMarkup).toContain('<strong>Stopped</strong>');
+    expect(settledMotionMarkup).toContain('Program motion stopped and held.');
+    expect(settledMotionMarkup).not.toContain('native operation was interrupted');
 
     const executionStopped = renderToStaticMarkup(
       <ProgramRuntimePanel
@@ -571,10 +576,17 @@ describe('Program runtime projection', () => {
   it('points Program faults to recovery and normal terminal runs to Reset', () => {
     const program = controller('intervention_required', 'recovery_required');
     program.state.run!.message = 'Participant requires reconciliation';
+    program.cycleFailure = {
+      code: 'program_runtime_control_outcome_unknown',
+      command_kind: 'resume_motion',
+      message: 'The Resume Motion outcome could not be confirmed. Reset is required.',
+    };
     const render = () => renderToStaticMarkup(<ProgramTransportControls
       enabled program={program} robot={robotController()} />);
     expect(render()).toContain('Program recovery required.');
-    expect(render()).toContain('Participant requires reconciliation');
+    expect(render()).toContain('The Resume Motion outcome could not be confirmed. Reset is required.');
+    expect(render()).not.toContain('Participant requires reconciliation');
+    expect(render()).toContain('Recovery required');
     expect(render()).toContain('Review Program recovery');
     program.cycleState = 'terminal_awaiting_reset';
     expect(render()).toContain('Program finished. Use <strong>Reset</strong>');

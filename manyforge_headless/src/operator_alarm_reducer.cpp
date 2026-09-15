@@ -63,10 +63,6 @@ void ValidateSafeInteger(const std::int64_t value,
           std::string(label) + " must be a nonnegative int64");
 }
 
-CanonicalValue EmptyObject() {
-  return CanonicalValue(CanonicalValue::Object{});
-}
-
 void ValidateBoundedObject(
     const CanonicalValue &value, const std::string_view label,
     const std::size_t maximum_bytes,
@@ -303,7 +299,7 @@ LifecycleFact(std::string event_type, const OperatorAlarmRecord &record,
       std::move(caller),
       std::move(reason),
       record.correlations,
-      EmptyObject(),
+      record.details,
   };
 }
 

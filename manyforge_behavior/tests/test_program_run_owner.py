@@ -1404,6 +1404,10 @@ def test_motion_stop_holds_the_current_node_and_resume_hands_off_its_exact_fence
 
     held = host.advance_ready_once()[0]
     assert held.state is ProgramRunState.INTERVENTION_REQUIRED
+    diagnostic = owner.take_diagnostic(started.capture.program_run_id)
+    assert diagnostic is not None
+    assert diagnostic["state"] == "held"
+    assert diagnostic["reason_code"] == "operation_stopped"
     intervention = interventions.read(started.capture.program_run_id)
     assert intervention is not None
     assert intervention.policy_parameter == "operator_stop_policy"
@@ -1845,6 +1849,9 @@ def test_motion_stop_retains_escalated_stop_for_backend_recovery() -> None:
 
     held = host.advance_ready_once()[0]
     assert held.state is ProgramRunState.INTERVENTION_REQUIRED
+    diagnostic = owner.take_diagnostic(started.capture.program_run_id)
+    assert diagnostic is not None
+    assert diagnostic["state"] == "intervention_required"
     intervention = interventions.read(started.capture.program_run_id)
     assert intervention is not None
     assert intervention.policy_parameter == "operator_stop_policy"

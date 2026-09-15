@@ -3750,6 +3750,13 @@ def test_tree_refinement_never_widens_reconciliation_permissions(tmp_path) -> No
         program_run_id="program-run.1",
         run_snapshot=running.to_dict(),
     )
+    journal.record_request(
+        owner_epoch="operator.1",
+        request_id="resume.unknown",
+        kind="resume_motion",
+        intent={"program_run_id": "program-run.1"},
+        cycle_generation=1,
+    )
     journal.require_reconciliation(expected_generation=1)
     runtime = ProgramRuntime(
         ProgramRunnerConfig(
@@ -3764,11 +3771,29 @@ def test_tree_refinement_never_widens_reconciliation_permissions(tmp_path) -> No
     runtime._host.shutdown()  # noqa: SLF001
     owner = _Owner()
     owner.rows["program-run.1"] = running
-    runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
 
+    def unexpected_intervention_lookup(_run_id: str) -> None:
+        raise AssertionError("reconciliation must suppress node recovery lookup")
+
+    owner.intervention = unexpected_intervention_lookup  # type: ignore[method-assign]
+    runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
+    assert (
+        runtime._recovery_offer(  # noqa: SLF001
+            "program-run.1", cycle_generation=1
+        )
+        is None
+    )
+    owner.intervention = lambda _run_id: None  # type: ignore[method-assign]
+
+    status = runtime.cycle_status()
+    assert status["recovery_offer"] is None
+    assert status["failure"]["command_kind"] == "resume_motion"
+    assert "blocked until the Program is safely reconciled" in status["failure"][
+        "message"
+    ]
     permissions = {
         command["command_kind"]: command["allowed"]
-        for command in runtime.cycle_status()["allowed_commands"]
+        for command in status["allowed_commands"]
     }
 
     assert {kind for kind, allowed in permissions.items() if allowed} == {
@@ -4399,7 +4424,18 @@ def uncertain_reset_runtime(monkeypatch, tmp_path):
     with pytest.raises(ProgramRunnerError) as unknown:
         runtime.resume_full_stop("program-cycle.1", request)
     assert unknown.value.code == "program_cycle_reconciliation_required"
-    assert journal.read().reconciliation_required
+    retained = journal.read()
+    assert retained.reconciliation_required
+    assert retained.failure == {
+        "cause_code": "ProgramRunOwnerOutcomeUnknownError",
+        "code": "program_runtime_control_outcome_unknown",
+        "command_kind": "resume_full_stop",
+        "message": (
+            "The Resume Full Stop outcome could not be confirmed. Further execution "
+            "is blocked until the Program is safely reconciled."
+        ),
+    }
+    assert runtime.cycle_status()["recovery_offer"] is None
     assert len(journal.pending_commands()) == 1
     try:
         yield runtime, journal, admission, owner, host

@@ -1222,6 +1222,7 @@ export function useProgramRuntime(
     [state.run],
   );
   const cycleState = snapshot?.programCycle?.state ?? null;
+  const cycleFailure = snapshot?.programCycle?.failure ?? null;
   const commandAllowed = useCallback((commandKind: string): boolean => (
     (commandKind !== 'program_run' || buildProgramStartRequest(
       state.applied, state.runnerAvailable, state.pending, snapshot, workspace,
@@ -1235,6 +1236,7 @@ export function useProgramRuntime(
   return useMemo(() => ({
     state,
     cycleState,
+    cycleFailure,
     commandAllowed,
     active,
     refresh,
@@ -1268,6 +1270,7 @@ export function useProgramRuntime(
     applyRecoveryAction,
     clearScenarioSelection,
     dismissError,
+    cycleFailure,
     cycleState,
     commandAllowed,
     refresh,

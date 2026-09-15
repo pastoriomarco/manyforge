@@ -1535,7 +1535,7 @@ TEST(HeadlessApiCore,
   }
 }
 
-TEST(HeadlessApiCore, ProgramDiagnosticRetainsExactProducerValuesAndClock) {
+TEST(HeadlessApiCore, ProgramHeldDiagnosticIsInformationalAndRetainsExactValues) {
   TemporaryDirectory directory;
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
   CanonicalValue record(CanonicalValue::Object{
@@ -1546,9 +1546,9 @@ TEST(HeadlessApiCore, ProgramDiagnosticRetainsExactProducerValuesAndClock) {
       {"program_binding_id", CanonicalValue(Digest('2'))},
       {"retained_bundle_id", CanonicalValue(Digest('3'))},
       {"graph_revision", CanonicalValue(Digest('4'))},
-      {"state", CanonicalValue("failed")},
-      {"reason_code", CanonicalValue("condition_not_met")},
-      {"message", CanonicalValue("Program condition not met")},
+      {"state", CanonicalValue("held")},
+      {"reason_code", CanonicalValue("operation_stopped")},
+      {"message", CanonicalValue("Program motion stopped and held")},
       {"occurred_at_ns", CanonicalValue("9007199254740993")},
       {"occurred_at_wall", CanonicalValue("2026-09-08T00:00:00Z")},
       {"blackboard", CanonicalValue(CanonicalValue::Object{
@@ -1578,7 +1578,8 @@ TEST(HeadlessApiCore, ProgramDiagnosticRetainsExactProducerValuesAndClock) {
   const auto &stored = Array(page, "events").front();
   const auto &event = Member(stored, "event");
   EXPECT_EQ(Text(event, "occurred_at_ns"), "9007199254740993");
-  EXPECT_EQ(Text(event, "severity"), "ERROR");
+  EXPECT_EQ(Text(event, "event_type"), "program_held");
+  EXPECT_EQ(Text(event, "severity"), "INFO");
   EXPECT_EQ(content_identity::canonical_json(
                 Member(Member(event, "payload"), "blackboard")),
             "{\"program_run_id\":\"foreign.run\",\"ready\":false}");

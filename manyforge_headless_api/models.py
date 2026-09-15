@@ -768,7 +768,7 @@ class ProgramDiagnosticRequest(StrictRequest):
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     retained_bundle_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     graph_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    state: Literal["succeeded", "failed", "intervention_required"]
+    state: Literal["succeeded", "failed", "held", "intervention_required"]
     reason_code: str | None
     message: Annotated[str, Field(max_length=4096)]
     occurred_at_ns: Annotated[str, Field(pattern=r"^(0|[1-9][0-9]{0,18})$")]
