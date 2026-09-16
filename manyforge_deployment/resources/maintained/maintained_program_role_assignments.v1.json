@@ -277,6 +277,54 @@
     },
     {
       "component_roles": {
+        "lite6_robot": "lite6_robot",
+        "ur5e_robot": "ur5e_robot"
+      },
+      "deployment_artifact_id": "ur5e_lite6_wall",
+      "deployment_revision": "sha256:5a0636bf01d0fe6981100339049cf2aa36f6ecd86c33d47c3cc8e5e0aa4d238d",
+      "deployment_source": "examples/ur5e_lite6_wall.deployment.yaml",
+      "program_id": "ur5e_lite6_wall_grouped",
+      "program_revision": "sha256:fdfe5ed2947c1d1fc54c884ca598e899bab224dd8c923782c8fa058b1e0d6969",
+      "program_source": "examples/ur5e_lite6_wall_grouped.program.yaml",
+      "scenario_aliases": [],
+      "scenario_id": "ur5e_lite6_wall_grouped",
+      "target_roles": {
+        "lite6_arm": {
+          "command_target_id": "arm",
+          "component_role": "lite6_robot"
+        },
+        "ur5e_arm": {
+          "command_target_id": "arm",
+          "component_role": "ur5e_robot"
+        }
+      }
+    },
+    {
+      "component_roles": {
+        "lite6_robot": "lite6_robot",
+        "ur5e_robot": "ur5e_robot"
+      },
+      "deployment_artifact_id": "ur5e_lite6_wall",
+      "deployment_revision": "sha256:5a0636bf01d0fe6981100339049cf2aa36f6ecd86c33d47c3cc8e5e0aa4d238d",
+      "deployment_source": "examples/ur5e_lite6_wall.deployment.yaml",
+      "program_id": "ur5e_lite6_wall_isolation",
+      "program_revision": "sha256:63df7b25627044b7e1766c9389982fa7044bcfdaecd0fab1e8da99b8869906a8",
+      "program_source": "examples/ur5e_lite6_wall_isolation.program.yaml",
+      "scenario_aliases": [],
+      "scenario_id": "ur5e_lite6_wall_isolation",
+      "target_roles": {
+        "lite6_arm": {
+          "command_target_id": "arm",
+          "component_role": "lite6_robot"
+        },
+        "ur5e_arm": {
+          "command_target_id": "arm",
+          "component_role": "ur5e_robot"
+        }
+      }
+    },
+    {
+      "component_roles": {
         "robot": "ur5_robot",
         "tool": "ur5_robot"
       },

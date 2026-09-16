@@ -712,13 +712,15 @@ def _context() -> ProgramRunPortContext:
     )
 
 
-def _synchronized_context() -> ProgramRunPortContext:
+def _deferred_policy_context() -> ProgramRunPortContext:
     return replace(
         _context(),
         program={
             "program_id": "lite6_program",
             "program_revision": _DIGEST_A,
-            "synchronized_execution_groups": ["cell_pair"],
+            "execution_groups": {
+                "robot_group": {"execution_policy": "common_start"}
+            },
             "tree": {
                 "node_id": "parallel",
                 "instance_id": "paired_motion",
@@ -727,7 +729,7 @@ def _synchronized_context() -> ProgramRunPortContext:
                     {
                         "node_id": "motion.move_to_pose",
                         "instance_id": instance,
-                        "execution_groups": ["cell_pair"],
+                        "execution_groups": ["robot_group"],
                         "parameters": {},
                         "children": [],
                     }
@@ -779,6 +781,16 @@ def _motion_inputs() -> OwnerNodeInputs:
             "contact_policy_id": None,
         }
     )
+
+
+def test_deferred_execution_policy_is_rejected_before_binding_effects() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+
+    with pytest.raises(ProductionPortError, match="unavailable until F2"):
+        port.bind(_deferred_policy_context())
+
+    assert transport.submissions == []
 
 
 @pytest.mark.parametrize(
@@ -955,89 +967,6 @@ def test_relative_pose_submission_uses_capture_and_preserves_portable_roles() ->
     assert "compiled_frame_name" not in repr(request)
 
 
-def test_synchronized_sibling_attempts_submit_and_acknowledge_one_operation() -> None:
-    transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_synchronized_context())
-    first_identity = _identity("arm_b")
-    second_identity = _identity("arm_a")
-
-    first = port.operations.start(
-        "motion.move_to_pose", first_identity, _motion_inputs()
-    )
-    assert first.state is OwnerTaskState.ACTIVE
-    assert transport.submissions == []
-    second = port.operations.start(
-        "motion.move_to_pose", second_identity, _motion_inputs()
-    )
-
-    assert len(transport.submissions) == 1
-    request = transport.submissions[0]
-    assert request["coordination_policy"] == "coordinated_all"
-    assert [
-        participant["execution_scope"]["node_instance_id"]
-        for participant in request["participants"]
-    ] == ["arm_a", "arm_b"]
-    operation_id = second.metadata["operation_id"]
-    transport.operations[operation_id].update(
-        {"state": "completed", "operation_revision": 7}
-    )
-    assert port.operations.observe(first.task_id).state is OwnerTaskState.SUCCEEDED
-    assert port.operations.observe(second.task_id).state is OwnerTaskState.SUCCEEDED
-
-    port.operations.acknowledge(first.task_id, first_identity)
-    assert not [row for row in transport.controls if row[0] == "acknowledge"]
-    port.operations.acknowledge(second.task_id, second_identity)
-    assert [row[0] for row in transport.controls].count("acknowledge") == 1
-    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
-
-
-def test_synchronized_lost_acceptance_reply_remains_unsettled_until_scope_stop() -> None:
-    transport = _LostAcceptanceReplyTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_synchronized_context())
-    identities = (_identity("arm_a"), _identity("arm_b"))
-
-    first = port.operations.start(
-        "motion.move_to_pose", identities[0], _motion_inputs()
-    )
-    second = port.operations.start(
-        "motion.move_to_pose", identities[1], _motion_inputs()
-    )
-
-    assert len(transport.operations) == 1
-    assert second.state is OwnerTaskState.FAILED
-    assert second.reason_code == "coordinated_admission_outcome_unknown"
-    assert second.settlement_proven is False
-    assert second.metadata["request_id"].startswith(
-        "program-coordinated-operation:"
-    )
-    observed_first = port.operations.observe(first.task_id)
-    assert observed_first.reason_code == "coordinated_admission_outcome_unknown"
-    assert observed_first.settlement_proven is False
-    scope = port.scope.observe("program-run.1")
-    assert scope.state is ProgramRunScopeState.UNKNOWN
-    assert scope.reason_code == "coordinated_admission_outcome_unknown"
-
-    with pytest.raises(ProductionPortError, match="no settlement proof"):
-        port.operations.acknowledge(second.task_id, identities[1])
-
-    stopping = port.scope.request_stop(
-        "program-run.1", "stop.unknown-admission", "contain unknown admission"
-    )
-    assert stopping.state is ProgramRunScopeState.ACTIVE
-    transport.stop_states["scope-stop-1"] = "succeeded"
-    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
-    next(iter(transport.operations.values()))["state"] = "stopped"
-
-    reset = port.scope.reset("program-run.1")
-
-    assert reset.state is ProgramRunScopeState.SETTLED
-    assert len(transport.submit_attempts) == 2
-    assert len(transport.operations) == 1
-    assert [control[0] for control in transport.controls].count("reset") == 1
-
-
 def test_independent_lost_acceptance_reply_is_reconciled_by_reset() -> None:
     transport = _LostAcceptanceReplyTransport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -1109,127 +1038,6 @@ def test_reset_does_not_turn_a_pre_acceptance_lost_reply_into_motion() -> None:
     assert transport.submit_attempts == 2
     assert transport.operations == {}
     assert not [control for control in transport.controls if control[0] == "reset"]
-
-
-def test_synchronized_explicit_rejection_is_a_settled_local_failure() -> None:
-    class ExplicitRejection(_Transport):
-        def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
-            return {
-                "ok": False,
-                "error": {
-                    "code": "operation_admission_rejected",
-                    "message": "captured operation is invalid",
-                    "details": {"reason": "operation_contract_invalid"},
-                },
-            }
-
-    transport = ExplicitRejection()
-    port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_synchronized_context())
-    port.operations.start("motion.move_to_pose", _identity("arm_a"), _motion_inputs())
-    rejected = port.operations.start(
-        "motion.move_to_pose", _identity("arm_b"), _motion_inputs()
-    )
-
-    assert rejected.state is OwnerTaskState.FAILED
-    assert rejected.reason_code == "operation_admission_rejected"
-    assert rejected.settlement_proven is True
-    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
-
-
-def test_staged_synchronized_sibling_cancels_without_a_native_effect() -> None:
-    transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_synchronized_context())
-    identity = _identity("arm_a")
-
-    task = port.operations.start("motion.move_to_pose", identity, _motion_inputs())
-    port.operations.cancel(task.task_id, identity)
-
-    assert transport.submissions == []
-    assert transport.controls == []
-    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
-
-
-def test_synchronized_member_cancel_and_recovery_are_operation_scoped_once() -> None:
-    transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_synchronized_context())
-    identities = (_identity("arm_a"), _identity("arm_b"))
-    tasks = tuple(
-        port.operations.start("motion.move_to_pose", identity, _motion_inputs())
-        for identity in identities
-    )
-    operation_id = tasks[-1].metadata["operation_id"]
-    operation = transport.operations[operation_id]
-    operation.update(
-        {
-            "state": "executing",
-            "operation_revision": 1,
-            "active_stop_id": None,
-            "active_stop_generation": None,
-        }
-    )
-
-    port.operations.cancel(tasks[0].task_id, identities[0])
-    port.operations.cancel(tasks[1].task_id, identities[1])
-    assert [row[0] for row in transport.controls].count("stop") == 1
-
-    operation.update(
-        {
-            "state": "stopped",
-            "operation_revision": 2,
-            "active_stop_id": "stop.1",
-            "active_stop_generation": 1,
-        }
-    )
-    assessment = {
-        "recovery_class": "ordinary_operator_stop",
-        "assessment_revision": 3,
-        "control_command_epoch": "control.epoch.1",
-        "execution_id": "execution.1",
-        "latch_id": "",
-        "stop_certificate_id": "certificate.1",
-        "stop_owner_generation": 1,
-    }
-    transport.operation_recovery = lambda _operation_id: {
-        "ok": True,
-        "operation_revision": 2,
-        "participants": [
-            {"operation_participant_id": "participant.arm_a"},
-            {"operation_participant_id": "participant.arm_b"},
-        ],
-        "recovery_assessment": assessment,
-        "stop_generation": 1,
-        "stop_id": "stop.1",
-    }
-    recoveries: list[Mapping[str, Any]] = []
-
-    def recover(_operation_id: str, _revision: int, body: Mapping[str, Any]):
-        recoveries.append(deepcopy(body))
-        return {
-            "ok": True,
-            "result": {
-                "request_id": body["request_id"],
-                "action": body["action"],
-                "accepted": True,
-                "resulting_assessment": {"recovery_class": "recovered"},
-            },
-        }
-
-    transport.apply_operation_recovery = recover
-    for index, (task, identity) in enumerate(zip(tasks, identities, strict=True)):
-        result = port.operations.recover(
-            task.task_id,
-            identity,
-            action="replan_from_stopped_state",
-            request_id=f"coordinated-recovery.{index}",
-            reason="operator Resume Motion",
-        )
-        assert result["accepted"] is True
-        assert result["request_id"] == f"coordinated-recovery.{index}"
-    assert len(recoveries) == 1
-    assert port.scope.observe("program-run.1").state is ProgramRunScopeState.SETTLED
 
 
 def test_completed_operation_is_acknowledged_with_exact_revision() -> None:

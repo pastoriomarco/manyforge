@@ -629,29 +629,50 @@ execution_groups(const CanonicalValue::Object &node, std::string_view path) {
   return groups;
 }
 
-[[nodiscard]] std::set<std::string>
-synchronized_execution_groups(const CanonicalValue::Object &root,
-                              std::string_view path) {
-  const auto *value = find_member(root, "synchronized_execution_groups");
+[[nodiscard]] core::ProgramExecutionPolicy execution_policy(
+    std::string_view value, std::string_view path) {
+  if (value == "independent")
+    return core::ProgramExecutionPolicy::kIndependent;
+  if (value == "common_start")
+    return core::ProgramExecutionPolicy::kCommonStart;
+  if (value == "common_start_and_finish")
+    return core::ProgramExecutionPolicy::kCommonStartAndFinish;
+  if (value == "sync_offset_traj")
+    return core::ProgramExecutionPolicy::kSyncOffsetTrajectory;
+  fail(std::string(path) + ": unsupported execution policy");
+}
+
+[[nodiscard]] std::map<std::string, core::ProgramExecutionPolicy>
+execution_group_policies(const CanonicalValue::Object &root,
+                         std::string_view path) {
+  const auto *value = find_member(root, "execution_groups");
   if (value == nullptr)
     return {};
-  const auto group_path = child_path(path, "synchronized_execution_groups");
-  const auto &values = require_array(*value, group_path);
-  if (values.size() > core::kMaxProgramExecutionGroups)
+  const auto group_path = child_path(path, "execution_groups");
+  const auto &definitions = require_object(*value, group_path);
+  if (definitions.size() > core::kMaxProgramExecutionGroups)
     fail(group_path + ": exceeds the execution-group bound");
-  std::vector<std::string> ordered;
-  ordered.reserve(values.size());
-  for (const auto &item : values) {
-    const auto &name = require_string(item, group_path);
+  std::map<std::string, core::ProgramExecutionPolicy> result;
+  std::string previous;
+  for (const auto &[name, definition] : definitions) {
     require_program_local_identity(name, group_path);
     if (name == "all" || name == "inherit")
-      fail(group_path + ": reserved selector cannot name synchronization");
-    ordered.push_back(name);
+      fail(group_path + ": reserved selector cannot name a group");
+    if (!previous.empty() && previous >= name)
+      fail(group_path + ": keys must be duplicate-free and canonical-sorted");
+    const auto definition_path = child_path(group_path, name);
+    const auto &fields = require_object(definition, definition_path);
+    require_fields(fields, {"execution_policy"}, {}, definition_path);
+    result.emplace(
+        name,
+        execution_policy(require_string(
+                             require_member(fields, "execution_policy",
+                                            definition_path),
+                             child_path(definition_path, "execution_policy")),
+                         child_path(definition_path, "execution_policy")));
+    previous = name;
   }
-  if (!std::is_sorted(ordered.begin(), ordered.end()) ||
-      std::adjacent_find(ordered.begin(), ordered.end()) != ordered.end())
-    fail(group_path + ": must be duplicate-free and canonical-sorted");
-  return {ordered.begin(), ordered.end()};
+  return result;
 }
 
 [[nodiscard]] CanonicalValue normalize_program_tree(const CanonicalValue &value,
@@ -1268,7 +1289,7 @@ struct QualifiedExecutionCatalog final {
     const CanonicalValue &tree, const std::set<std::string> &instances,
     const core::RetainedNodeEnvironmentDTO &environment,
     const std::vector<core::ProgramTargetRoleRequirementDTO> &targets,
-    const std::set<std::string> &synchronized_groups) {
+    const std::map<std::string, core::ProgramExecutionPolicy> &group_policies) {
   const auto &catalog = execution_catalog();
   if (catalog.catalog_id != environment.catalog_id ||
       catalog.content_version != environment.content_version ||
@@ -1353,13 +1374,16 @@ struct QualifiedExecutionCatalog final {
     }
   };
   visit(visit, tree, {}, {});
-  std::set<std::uint32_t> synchronized_nodes;
+  std::set<std::uint32_t> coordinated_nodes;
   for (auto &[name, indices] : selections) {
     std::sort(indices.begin(), indices.end());
-    const bool synchronized = synchronized_groups.contains(name);
-    if (synchronized) {
+    const auto declared = group_policies.find(name);
+    if (declared == group_policies.end())
+      fail("execution group is used but not declared: " + name);
+    const auto policy = declared->second;
+    if (policy != core::ProgramExecutionPolicy::kIndependent) {
       if (indices.size() < 2U)
-        fail("synchronized execution group must contain at least two nodes: " +
+        fail("coordinated execution group must contain at least two nodes: " +
              name);
       std::string parent;
       for (const auto index : indices) {
@@ -1372,34 +1396,33 @@ struct QualifiedExecutionCatalog final {
             std::find(shape->second.direct_groups.begin(),
                       shape->second.direct_groups.end(),
                       name) == shape->second.direct_groups.end()) {
-          fail("synchronized execution group contains a non-motion or "
+          fail("coordinated execution group contains a non-motion or "
                "inherited member: " +
                name);
         }
         if (parent.empty())
           parent = shape->second.parent_instance_id;
         else if (parent != shape->second.parent_instance_id)
-          fail("synchronized execution group members are not Parallel "
+          fail("coordinated execution group members are not Parallel "
                "siblings: " +
                name);
-        if (!synchronized_nodes.insert(index).second)
-          fail("a motion node belongs to more than one synchronized execution "
+        if (!coordinated_nodes.insert(index).second)
+          fail("a motion node belongs to more than one coordinated execution "
                "group");
       }
       const auto parent_shape = shapes.find(parent);
       if (parent.empty() || parent_shape == shapes.end() ||
           parent_shape->second.node_id != "parallel" ||
           !parent_shape->second.parallel_success_on_all)
-        fail("synchronized execution group requires one Success-on-all "
+        fail("coordinated execution group requires one Success-on-all "
              "Parallel: " +
              name);
     }
-    table.named_selections.push_back({name, std::move(indices), synchronized});
+    table.named_selections.push_back({name, std::move(indices), policy});
   }
-  for (const auto &name : synchronized_groups) {
+  for (const auto &[name, _policy] : group_policies) {
     if (!selections.contains(name))
-      fail("synchronized execution group is not an authored selection: " +
-           name);
+      fail("execution group is declared but not used: " + name);
   }
   return table;
 }
@@ -1414,7 +1437,7 @@ extract_contract(const CanonicalValue &root_value,
       {"api_version", "program_id", "program_revision", "program_profile",
        "name", "catalog", "component_roles", "target_roles", "tree"},
       {"description", "compatibility", "viewer", "scene", "parameters",
-       "blackboard", "contact_policies", "synchronized_execution_groups"},
+       "blackboard", "contact_policies", "execution_groups"},
       "program");
   if (require_string(require_member(root, "api_version", "program"),
                      "program.api_version") != core::kProgramApiVersion) {
@@ -1581,7 +1604,7 @@ extract_contract(const CanonicalValue &root_value,
   execution_table = capture_execution_table(
       require_member(root, "tree", "program"), instance_ids,
       bundle.catalogs.node_environment, targets,
-      synchronized_execution_groups(root, "program"));
+      execution_group_policies(root, "program"));
   std::sort(node_policies.begin(), node_policies.end(),
             [](const auto &left, const auto &right) {
               return left.instance_id < right.instance_id;

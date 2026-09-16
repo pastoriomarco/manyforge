@@ -575,7 +575,7 @@ def test_program_settings_mutation_is_validated_and_draft_only(
                     "requires": ["scene.mutable"],
                     "tags": ["pick"],
                 },
-                "synchronized_execution_groups": [],
+                "execution_groups": {},
             },
         },
     )

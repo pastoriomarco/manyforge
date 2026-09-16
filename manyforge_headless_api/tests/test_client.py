@@ -302,7 +302,7 @@ def test_client_sends_group_runtime_scale_selector_as_one_json_query_parameter()
     client = HeadlessHttpClient("http://unused.test", client=raw)
     selector = {
         "program_binding_id": "binding-1",
-        "synchronized_targets": [
+        "group_targets": [
             {"component_role_id": "robot-a", "target_role_id": "arm"},
             {"component_role_id": "robot-b", "target_role_id": "arm"},
         ],
@@ -313,8 +313,8 @@ def test_client_sends_group_runtime_scale_selector_as_one_json_query_parameter()
         raw.close()
     assert dict(requests[0].url.params)["program_binding_id"] == "binding-1"
     assert (
-        json.loads(dict(requests[0].url.params)["synchronized_targets"])
-        == selector["synchronized_targets"]
+        json.loads(dict(requests[0].url.params)["group_targets"])
+        == selector["group_targets"]
     )
 
 

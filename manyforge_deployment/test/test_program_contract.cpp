@@ -1032,6 +1032,17 @@ selection_node(std::string instance, CanonicalValue groups,
   });
 }
 
+[[nodiscard]] CanonicalValue execution_group_definitions(
+    std::initializer_list<std::pair<std::string, std::string>> definitions) {
+  CanonicalValue::Object result;
+  for (const auto &[name, policy] : definitions) {
+    result.emplace_back(
+        name, CanonicalValue(CanonicalValue::Object{
+                  {"execution_policy", CanonicalValue(policy)}}));
+  }
+  return CanonicalValue(std::move(result));
+}
+
 TEST(ProgramContractTest,
      CapturesOverlappingInheritedAndNeverStartedNodeSelections) {
   ScopedTrustedRoot root;
@@ -1056,7 +1067,14 @@ TEST(ProgramContractTest,
                   selection_node("logical_all", CanonicalValue("all")),
               }),
       });
-  const auto program = with_tree(valid_options(*bundle), tree);
+  auto program_root = with_tree(valid_options(*bundle), tree).as_object();
+  program_root.emplace_back(
+      "execution_groups",
+      execution_group_definitions({{"all_grippers", "independent"},
+                                   {"robot_a", "independent"},
+                                   {"robot_b", "independent"}}));
+  const auto program =
+      with_program_revision(CanonicalValue(std::move(program_root)));
   const auto contract =
       verify_program_binding_contract(canonical_json(program), *bundle);
   const auto &table = contract->execution_table();
@@ -1074,7 +1092,7 @@ TEST(ProgramContractTest,
     EXPECT_TRUE(node.target_effects.empty());
 }
 
-TEST(ProgramContractTest, CapturesOnlyExplicitParallelSynchronizedMotionSets) {
+TEST(ProgramContractTest, CapturesOnlyExplicitParallelCoordinatedMotionSets) {
   const auto bundle = maintained_motion_bundle();
   auto options = valid_options(*bundle);
   options.capability_ids = {"execution.feedback.phase_events",
@@ -1094,7 +1112,9 @@ TEST(ProgramContractTest, CapturesOnlyExplicitParallelSynchronizedMotionSets) {
                        synchronized_motion_node("arm_b", "cell_pair")})},
   });
   auto root = with_tree(options, std::move(parallel)).as_object();
-  root.emplace_back("synchronized_execution_groups", text_array({"cell_pair"}));
+  root.emplace_back(
+      "execution_groups",
+      execution_group_definitions({{"cell_pair", "common_start"}}));
   const auto contract = verify_program_binding_contract(
       canonical_json(with_program_revision(CanonicalValue(std::move(root)))),
       *bundle);
@@ -1102,7 +1122,8 @@ TEST(ProgramContractTest, CapturesOnlyExplicitParallelSynchronizedMotionSets) {
   ASSERT_EQ(contract->execution_table().named_selections.size(), 1U);
   const auto &selection = contract->execution_table().named_selections.front();
   EXPECT_EQ(selection.group_id, "cell_pair");
-  EXPECT_TRUE(selection.synchronized);
+  EXPECT_EQ(selection.execution_policy,
+            core::ProgramExecutionPolicy::kCommonStart);
   ASSERT_EQ(selection.node_indices.size(), 2U);
   for (const auto index : selection.node_indices) {
     const auto &node = contract->execution_table().nodes[index];

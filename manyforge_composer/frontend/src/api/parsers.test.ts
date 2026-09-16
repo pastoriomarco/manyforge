@@ -1112,18 +1112,18 @@ describe('Program workspace parsers', () => {
       expect(() => parseProgramWorkspaceResponse(fixture)).toThrow();
     }
     delete tree.execution_groups;
-    program.synchronized_execution_groups = ['cell_pair'];
-    authoring.synchronized_execution_groups = ['cell_pair'];
+    program.execution_groups = { robot_group: { execution_policy: 'independent' } };
+    authoring.execution_groups = { robot_group: { execution_policy: 'independent' } };
     const parsed = parseProgramWorkspaceResponse(fixture);
-    expect(parsed.draft.program?.synchronized_execution_groups).toEqual(['cell_pair']);
-    expect(parsed.draft.authoring?.synchronized_execution_groups).toEqual(['cell_pair']);
-    for (const malformed of [null, 'cell_pair', [''], ['all'], ['inherit'], ['a', 'a'], ['z', 'a'], ['UPPER']]) {
-      program.synchronized_execution_groups = malformed;
-      authoring.synchronized_execution_groups = malformed;
+    expect(parsed.draft.program?.execution_groups).toEqual({ robot_group: { execution_policy: 'independent' } });
+    expect(parsed.draft.authoring?.execution_groups).toEqual({ robot_group: { execution_policy: 'independent' } });
+    for (const malformed of [null, 'robot_group', [], { all: { execution_policy: 'independent' } }, { robot_group: {} }, { robot_group: { execution_policy: 'unknown' } }]) {
+      program.execution_groups = malformed;
+      authoring.execution_groups = malformed;
       expect(() => parseProgramWorkspaceResponse(fixture)).toThrow();
     }
-    delete program.synchronized_execution_groups;
-    delete authoring.synchronized_execution_groups;
+    delete program.execution_groups;
+    delete authoring.execution_groups;
     program.api_version = 'manyforge.program.v1';
     expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('manyforge.program.v2');
   });
@@ -1951,7 +1951,7 @@ describe('addressed Robot Control parsers', () => {
   it('parses synchronized runtime-scale status only when its member set and scopes agree', () => {
     const selector = {
       program_binding_id: 'binding-program-1',
-      synchronized_targets: [
+      group_targets: [
         { component_role_id: 'robot', target_role_id: 'arm' },
         { component_role_id: 'robot', target_role_id: 'gripper' },
       ],
@@ -1978,14 +1978,14 @@ describe('addressed Robot Control parsers', () => {
         control_domain_id: null, control_domain_revision: null, control_generation: 1,
         effective_scale: null, frozen: false, reason: null, requested_scale: 0.5,
         scaling_domain_id: null, selector, supported: true,
-        synchronized_members: [
+        group_members: [
           member('arm'), member('gripper'),
         ],
       },
     };
     expect(parseRuntimeScaleControlStatus(response).selector).toEqual({
       kind: 'group', programBindingId: 'binding-program-1',
-      synchronizedTargets: [
+      groupTargets: [
         { componentRoleId: 'robot', targetRoleId: 'arm' },
         { componentRoleId: 'robot', targetRoleId: 'gripper' },
       ],
@@ -2004,14 +2004,14 @@ describe('addressed Robot Control parsers', () => {
       ...response,
       runtime_scale_control: {
         ...response.runtime_scale_control,
-        synchronized_members: [member('arm'), member('arm')],
+        group_members: [member('arm'), member('arm')],
       },
     })).toThrow();
     expect(() => parseRuntimeScaleControlStatus({
       ...response,
       runtime_scale_control: {
         ...response.runtime_scale_control,
-        synchronized_members: [member('arm'), member('other')],
+        group_members: [member('arm'), member('other')],
       },
     })).toThrow();
     expect(() => parseRuntimeScaleControlStatus({
@@ -2020,12 +2020,12 @@ describe('addressed Robot Control parsers', () => {
         ...response.runtime_scale_control,
         selector: {
           program_binding_id: 'binding-program-1',
-          synchronized_targets: [
+          group_targets: [
             { component_role_id: 'a', target_role_id: 'b\u0000c' },
             { component_role_id: 'a\u0000b', target_role_id: 'c' },
           ],
         },
-        synchronized_members: [
+        group_members: [
           memberFor('a', 'b\u0000c'), memberFor('a\u0000b', 'c'),
         ],
       },
@@ -2044,7 +2044,7 @@ describe('addressed Robot Control parsers', () => {
       ...response,
       runtime_scale_control: {
         ...response.runtime_scale_control,
-        synchronized_members: [{
+        group_members: [{
           ...member('arm'), active_control_configuration_generation: -1,
         }, member('gripper')],
       },
@@ -2053,7 +2053,7 @@ describe('addressed Robot Control parsers', () => {
       ...response,
       runtime_scale_control: {
         ...response.runtime_scale_control,
-        synchronized_members: [{
+        group_members: [{
           ...member('arm'), control_domain_id: '',
         }, member('gripper')],
       },
@@ -2357,12 +2357,12 @@ describe('addressed Robot Control parsers', () => {
       scaling_domain_id: null,
       selector: {
         program_binding_id: 'sha256:binding',
-        synchronized_targets: [
+        group_targets: [
           { component_role_id: 'controlled_component', target_role_id: 'command_target' },
           { component_role_id: 'controlled_component', target_role_id: 'gripper_target' },
         ],
       },
-      synchronized_members: [
+      group_members: [
         {
           active_control_configuration_generation: 1,
           active_control_configuration_id: 'active-motion',
@@ -2381,7 +2381,10 @@ describe('addressed Robot Control parsers', () => {
         },
       ],
     };
-    expect(() => parseExecutionControlStatus(targetsResponse, groupedControlResponse)).toThrow();
+    expect(
+      parseExecutionControlStatus(targetsResponse, groupedControlResponse)
+        .runtimeScaleControl?.selector,
+    ).toMatchObject({ kind: 'group', programBindingId: 'sha256:binding' });
     const retired = {
       resident: false, operation: {
         program_run_id: motionTarget.program_run_id, operation_id: 'manual-1', operation_revision: 2,

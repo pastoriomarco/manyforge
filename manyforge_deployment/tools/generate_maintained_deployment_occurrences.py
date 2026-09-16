@@ -31,6 +31,17 @@ ZERO_DIGEST: Final = "sha256:" + "0" * 64
 DESCRIPTION_API: Final = "manyforge.maintained_deployment_sources.v1"
 ASSISTANT_API: Final = "manyforge.maintained_assistant_profiles.v1"
 ROLE_ASSIGNMENTS_API: Final = "manyforge.maintained_program_role_assignments.v1"
+UI6I_DUAL_DEPLOYMENT_SOURCE: Final = "examples/ur5e_lite6_wall.deployment.yaml"
+UI6I_DUAL_PROGRAM_ASSIGNMENTS: Final = (
+    (
+        "ur5e_lite6_wall_grouped",
+        "examples/ur5e_lite6_wall_grouped.program.yaml",
+    ),
+    (
+        "ur5e_lite6_wall_isolation",
+        "examples/ur5e_lite6_wall_isolation.program.yaml",
+    ),
+)
 CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1\0"
 NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.native_execution.v1"
@@ -2142,6 +2153,23 @@ def domain_id(occurrence: str, target: str) -> str:
     return f"{occurrence}.{target}.control"
 
 
+def native_lite6_lifecycle_enabled(
+    deployment: dict[str, Any], *, family_id: str, ros2_control: bool
+) -> bool:
+    """Select the optional native Lite6 lifecycle product.
+
+    Native simulated compositions may deliberately use the generic fixed
+    direct-control product instead. Existing maintained Lite6 deployments
+    keep lifecycle management by default.
+    """
+
+    return (
+        not ros2_control
+        and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
+        and deployment.get("native_lifecycle_management", True) is not False
+    )
+
+
 def graph_and_applicability(
     deployment: dict[str, Any],
     family: dict[str, Any],
@@ -2155,8 +2183,8 @@ def graph_and_applicability(
         "ros2_control_runtime" if ros2_control else "native_runtime"
     ]
     key_prefix = "ros2_control:" if ros2_control else ""
-    native_lite6_lifecycle = (
-        not ros2_control and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
+    native_lite6_lifecycle = native_lite6_lifecycle_enabled(
+        deployment, family_id=family_id, ros2_control=ros2_control
     )
     component_ref = refs[
         f"component:{'fixed_scale:' if ros2_control else ''}{family_id}"
@@ -2765,8 +2793,8 @@ def deployment_candidate(
         refs,
     )
     family_id = family["model_family_id"]
-    native_lite6_lifecycle = (
-        not ros2_control and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
+    native_lite6_lifecycle = native_lite6_lifecycle_enabled(
+        deployment, family_id=family_id, ros2_control=ros2_control
     )
     catalog_keys = {
         *(
@@ -2942,6 +2970,39 @@ def role_assignments(
                     "target_roles": copy.deepcopy(assignment["target_roles"]),
                 }
             )
+    dual_deployment = read_yaml(
+        root / UI6I_DUAL_DEPLOYMENT_SOURCE, "UI6-I dual Deployment"
+    )
+    for scenario_id, program_source in UI6I_DUAL_PROGRAM_ASSIGNMENTS:
+        program = read_yaml(root / program_source, "UI6-I dual Program")
+        rows.append(
+            {
+                "scenario_id": scenario_id,
+                "scenario_aliases": [],
+                "deployment_artifact_id": dual_deployment[
+                    "deployment_artifact_id"
+                ],
+                "deployment_revision": dual_deployment["deployment_revision"],
+                "deployment_source": UI6I_DUAL_DEPLOYMENT_SOURCE,
+                "program_id": program["program_id"],
+                "program_revision": program["program_revision"],
+                "program_source": program_source,
+                "component_roles": {
+                    "lite6_robot": "lite6_robot",
+                    "ur5e_robot": "ur5e_robot",
+                },
+                "target_roles": {
+                    "lite6_arm": {
+                        "component_role": "lite6_robot",
+                        "command_target_id": "arm",
+                    },
+                    "ur5e_arm": {
+                        "component_role": "ur5e_robot",
+                        "command_target_id": "arm",
+                    },
+                },
+            }
+        )
     rows.sort(key=lambda row: (row["deployment_source"], row["program_source"]))
     return {"api_version": ROLE_ASSIGNMENTS_API, "assignments": rows}
 

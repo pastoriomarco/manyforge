@@ -1770,9 +1770,18 @@ class ProgramRuntime:
                 node_attempt_id=node_attempt_id,
                 node_id=node_id,
             )
+        target_binding = context.get("target_binding")
+        if not isinstance(target_binding, Mapping):
+            return self._runtime_override_candidate_unavailable(
+                program_run_id,
+                reason_code="program_attempt_context_unavailable",
+                reason="The held node has no captured execution target binding.",
+                node_instance_id=node_instance_id,
+                node_attempt_id=node_attempt_id,
+                node_id=node_id,
+            )
         try:
-            targets_projection = self._kernel.targets()
-            control_projection = self._kernel.control_state()
+            observation_projection = self._kernel.observation()
         except Exception as error:
             return self._runtime_override_candidate_unavailable(
                 program_run_id,
@@ -1782,32 +1791,15 @@ class ProgramRuntime:
                 node_attempt_id=node_attempt_id,
                 node_id=node_id,
             )
-        targets = targets_projection.get("targets")
-        control = control_projection.get("control_state")
-        identity = targets_projection.get("identity")
-        direct = targets.get("direct_control") if isinstance(targets, Mapping) else None
-        observed = (
-            control.get("observed_motion") if isinstance(control, Mapping) else None
-        )
+        observation = observation_projection.get("observation")
         capture = live.capture
         if (
-            targets_projection.get("ok") is not True
-            or control_projection.get("ok") is not True
-            or identity != control_projection.get("identity")
-            or not isinstance(identity, Mapping)
-            or not isinstance(direct, Mapping)
-            or not isinstance(observed, Mapping)
-            or identity.get("graph_revision") != capture.graph_revision
-            or identity.get("retained_bundle_id") != capture.retained_bundle_id
-            or direct.get("program_binding_id") != capture.program_binding_id
-            or direct.get("target_role_id") != parameters.get("target_role")
-            or direct.get("base_frame_role_id") != parameters.get("base_frame_role")
-            or direct.get("tcp_frame_role_id") != parameters.get("tcp_frame_role")
-            or observed.get("complete") is not True
-            or not isinstance(observed.get("source_epoch"), str)
-            or not observed["source_epoch"]
-            or type(observed.get("sequence")) is not int
-            or observed["sequence"] < 1
+            observation_projection.get("ok") is not True
+            or not isinstance(observation, Mapping)
+            or observation.get("graph_revision") != capture.graph_revision
+            or observation.get("retained_bundle_id") != capture.retained_bundle_id
+            or not isinstance(observation.get("owner_epoch"), str)
+            or not observation["owner_epoch"]
         ):
             return self._runtime_override_candidate_unavailable(
                 program_run_id,
@@ -1821,8 +1813,35 @@ class ProgramRuntime:
                 node_id=node_id,
             )
         if node_id == "motion.move_to_joint_target":
+            rows = observation.get("targets")
+            observed_targets = (
+                [
+                    row
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and row.get("controllable_component_id")
+                    == target_binding.get("controllable_component_id")
+                    and row.get("command_target_id")
+                    == target_binding.get("command_target_id")
+                ]
+                if isinstance(rows, list)
+                else []
+            )
+            observed = observed_targets[0] if len(observed_targets) == 1 else None
+            if not isinstance(observed, Mapping):
+                return self._runtime_override_candidate_unavailable(
+                    program_run_id,
+                    reason_code="robot_observation_identity_mismatch",
+                    reason=(
+                        "The execution owner has no unique Robot observation "
+                        "for this exact Program target."
+                    ),
+                    node_instance_id=node_instance_id,
+                    node_attempt_id=node_attempt_id,
+                    node_id=node_id,
+                )
             names = observed.get("source_joint_names")
-            positions = observed.get("positions_rad")
+            positions = observed.get("positions_si")
             if (
                 not isinstance(names, list)
                 or not isinstance(positions, list)
@@ -1849,7 +1868,29 @@ class ProgramRuntime:
                 for name, position in zip(names, positions, strict=True)
             ]
         else:
-            pose = observed.get("current_tcp_pose")
+            try:
+                target_projection = self._kernel.query_target(
+                    {
+                        "schema_version": "manyforge.target_observation_query.v1",
+                        "owner_epoch": observation["owner_epoch"],
+                        "program_binding_id": capture.program_binding_id,
+                        "target_role_id": parameters["target_role"],
+                        "kind": "frame_pose",
+                        "frame_role_id": parameters["tcp_frame_role"],
+                        "relative_to_frame_role_id": parameters["base_frame_role"],
+                    }
+                )
+            except Exception as error:
+                return self._runtime_override_candidate_unavailable(
+                    program_run_id,
+                    reason_code="robot_observation_unavailable",
+                    reason=str(error) or "The current Robot observation is unavailable.",
+                    node_instance_id=node_instance_id,
+                    node_attempt_id=node_attempt_id,
+                    node_id=node_id,
+                )
+            observed = target_projection.get("target_observation")
+            pose = observed.get("value") if isinstance(observed, Mapping) else None
             position = pose.get("position_m") if isinstance(pose, Mapping) else None
             orientation = pose.get("orientation") if isinstance(pose, Mapping) else None
             if not isinstance(position, Mapping) or not isinstance(
@@ -1898,6 +1939,23 @@ class ProgramRuntime:
             authored_goal = parameters.get("goal")
             if isinstance(authored_goal, Mapping) and "frame_ref" in authored_goal:
                 value["frame_ref"] = deepcopy(authored_goal["frame_ref"])
+        if (
+            not isinstance(observed.get("source_epoch"), str)
+            or not observed["source_epoch"]
+            or type(observed.get("source_sequence")) is not int
+            or observed["source_sequence"] < 1
+        ):
+            return self._runtime_override_candidate_unavailable(
+                program_run_id,
+                reason_code="robot_observation_identity_mismatch",
+                reason=(
+                    "The execution owner has no complete Robot observation "
+                    "for this exact Program target."
+                ),
+                node_instance_id=node_instance_id,
+                node_attempt_id=node_attempt_id,
+                node_id=node_id,
+            )
         try:
             validated = self._owner.validate_runtime_override(
                 program_run_id,
@@ -1927,7 +1985,7 @@ class ProgramRuntime:
             "parameter_id": "goal",
             "value": validated,
             "source_observation_id": observed["source_epoch"],
-            "source_owner_generation": observed["sequence"],
+            "source_owner_generation": observed["source_sequence"],
         }
 
     @staticmethod

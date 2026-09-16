@@ -455,7 +455,7 @@ describe('Program runtime projection', () => {
     if (group) {
       robot.runtimeScaleStatus.selector = {
         kind: 'group', programBindingId: `sha256:${'c'.repeat(64)}`,
-        synchronizedTargets: [
+        groupTargets: [
           { componentRoleId: 'left', targetRoleId: 'arm' },
           { componentRoleId: 'right', targetRoleId: 'arm' },
         ],

@@ -14,15 +14,14 @@ inline constexpr std::string_view kStructuralModelPreparationApiVersion =
     "manyforge.structural_model_preparation.v1";
 inline constexpr std::string_view kStructuralModelPreparationGeneratorId =
     "manyforge.structural_model_preparation";
-inline constexpr std::string_view
-    kStructuralModelPreparationGeneratorVersion = "1.0.0";
+inline constexpr std::string_view kStructuralModelPreparationGeneratorVersion =
+    "1.2.0";
 inline constexpr std::string_view
     kStructuralModelPreparationConfigurationIdentityDomain =
         "structural-model-preparation-receipt";
 
-class StructuralModelPreparationError final
-    : public std::invalid_argument {
- public:
+class StructuralModelPreparationError final : public std::invalid_argument {
+public:
   using std::invalid_argument::invalid_argument;
 };
 
@@ -38,25 +37,25 @@ class StructuralModelPreparationError final
 /// This value proves an exact build/configuration/input/output relationship.
 /// It deliberately does not attest that a particular process invocation ran.
 class BuildQualifiedStructuralModelPreparation final {
- public:
+public:
   BuildQualifiedStructuralModelPreparation(
-      const BuildQualifiedStructuralModelPreparation&) noexcept = default;
-  BuildQualifiedStructuralModelPreparation& operator=(
-      const BuildQualifiedStructuralModelPreparation&) noexcept = default;
+      const BuildQualifiedStructuralModelPreparation &) noexcept = default;
+  BuildQualifiedStructuralModelPreparation &operator=(
+      const BuildQualifiedStructuralModelPreparation &) noexcept = default;
 
-  [[nodiscard]] const core::RetainedGeneratorRecordDTO&
+  [[nodiscard]] const core::RetainedGeneratorRecordDTO &
   generator_record() const noexcept {
     return generator_record_;
   }
-  [[nodiscard]] const SourceVerifiedModelAsset& verified_model_asset()
-      const noexcept {
+  [[nodiscard]] const SourceVerifiedModelAsset &
+  verified_model_asset() const noexcept {
     return verified_model_asset_;
   }
   [[nodiscard]] std::string_view canonical_receipt_bytes() const noexcept {
     return canonical_receipt_bytes_;
   }
 
- private:
+private:
   BuildQualifiedStructuralModelPreparation(
       core::RetainedGeneratorRecordDTO generator_record,
       SourceVerifiedModelAsset verified_model_asset,
@@ -71,9 +70,8 @@ class BuildQualifiedStructuralModelPreparation final {
 
   friend BuildQualifiedStructuralModelPreparation
   verify_build_qualified_structural_model_preparation(
-      std::string_view, std::string_view,
-      std::optional<std::string_view>,
-      const SourceVerifiedModelAsset&);
+      std::string_view, std::string_view, std::optional<std::string_view>,
+      const SourceVerifiedModelAsset &);
 };
 
 /// Qualifies one exact preparation receipt without executing a resolver.
@@ -88,6 +86,6 @@ verify_build_qualified_structural_model_preparation(
     std::string_view canonical_receipt_bytes,
     std::string_view original_urdf_bytes,
     std::optional<std::string_view> original_srdf_bytes,
-    const SourceVerifiedModelAsset& verified_model_asset);
+    const SourceVerifiedModelAsset &verified_model_asset);
 
-}  // namespace manyforge::deployment
+} // namespace manyforge::deployment

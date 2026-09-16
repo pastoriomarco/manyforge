@@ -121,11 +121,17 @@ class ProcessStack:
         # A copied immutable fixture remains the selected Manager package.
         # The environment path names its source metadata, not a second root.
         _required_path(package_environment)
+        self.prepare_native_package(self.manager_admission_filename)
+
+    def prepare_native_package(self, admission_filename: str) -> None:
+        """Install one exact retained package's native process executables."""
+
+        self.manager_admission_filename = admission_filename
         self.manager_package_root = self.package_root
-        assert (self.manager_package_root / self.manager_admission_filename).is_file()
+        assert (self.manager_package_root / admission_filename).is_file()
 
         installed_root = self.root / "installed-targets"
-        installed_root.mkdir()
+        installed_root.mkdir(exist_ok=True)
         installed_sources = {
             "manyforge_manager_daemon": self.manager_executable,
             "manyforge_native_execution_host": _required_path("MANYFORGE_NATIVE_EXECUTION_HOST"),

@@ -54,6 +54,9 @@ set(
 set(
   MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR
   "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_maintained_deployment_occurrences.py")
+set(
+  MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR
+  "${_MANYFORGE_WORKSPACE_ROOT}/scripts/qualification/generate_ui6i_dual_robot_scenario.py")
 if(NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}" OR
    NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_CHECK}" OR
    NOT EXISTS "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}" OR
@@ -63,7 +66,8 @@ if(NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}" OR
    NOT EXISTS "${MANYFORGE_ASSISTANT_INSTRUMENT_SOURCE}" OR
    NOT EXISTS "${MANYFORGE_ASSISTANT_INSTRUMENT_GENERATOR}" OR
    NOT EXISTS "${MANYFORGE_NODE_CATALOG_SOURCE}" OR
-   NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}")
+   NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}" OR
+   NOT EXISTS "${MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR}")
   message(FATAL_ERROR
     "manyforge_deployment production retention requires the node-environment "
     "closure, structural-model preparation tool, and maintained N6 source "
@@ -113,7 +117,8 @@ set_property(
   "${MANYFORGE_ASSISTANT_INSTRUMENT_SOURCE}"
   "${MANYFORGE_ASSISTANT_INSTRUMENT_GENERATOR}"
   "${MANYFORGE_NODE_CATALOG_SOURCE}"
-  "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}")
+  "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}"
+  "${MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR}")
 
 file(READ
   "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
@@ -1033,6 +1038,29 @@ if(BUILD_TESTING)
     MaintainedDeploymentOccurrenceSources
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_test(
+    NAME Ui6iDualRobotScenarioSources
+    COMMAND
+      "${Python3_EXECUTABLE}"
+      "${MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR}"
+      --check
+      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
+      --deployment-revision-tool "$<TARGET_FILE:manyforge_deployment_revision>"
+      --program-revision-tool "$<TARGET_FILE:manyforge_program_revision>")
+  set_tests_properties(
+    Ui6iDualRobotScenarioSources
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_test(
+    NAME Ui6iDualRobotScenarioSemantics
+    COMMAND "${CMAKE_COMMAND}" -E env
+      "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT}"
+      "${Python3_EXECUTABLE}" -m pytest -q -p no:cacheprovider
+      "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior/tests/test_ui6i_dual_robot_scenario.py")
+  set_tests_properties(
+    Ui6iDualRobotScenarioSemantics
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   function(manyforge_try_public_header result_variable source_file)
     unset(${result_variable} CACHE)
     set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
@@ -1373,152 +1401,142 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_model_asset_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  set(
-    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT
-    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
-  set(
-    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural")
-  file(
-    GLOB_RECURSE
-    MANYFORGE_LITE6_STRUCTURAL_RESOURCE_INPUTS
-    CONFIGURE_DEPENDS
-    LIST_DIRECTORIES false
-    "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/meshes/*")
-  file(MAKE_DIRECTORY "${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}")
-  execute_process(
-    COMMAND
-      "${Python3_EXECUTABLE}"
+  function(manyforge_prepare_maintained_model
+      family_id label urdf_path srdf_path package_prefix
+      resource_root output_variable)
+    set(fixture_root
+      "${CMAKE_CURRENT_BINARY_DIR}/generated/${family_id}_structural")
+    file(GLOB_RECURSE resource_inputs CONFIGURE_DEPENDS LIST_DIRECTORIES false
+      "${resource_root}/meshes/*")
+    file(MAKE_DIRECTORY "${fixture_root}")
+    execute_process(
+      COMMAND
+        "${Python3_EXECUTABLE}"
+        "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
+        --urdf "${urdf_path}"
+        --srdf "${srdf_path}"
+        --model-asset-id "${family_id}"
+        --accepted-package-uri-prefix "${package_prefix}"
+        --resource-root "${resource_root}"
+        --output-directory "${fixture_root}"
+      RESULT_VARIABLE preparation_result
+      OUTPUT_VARIABLE preparation_output
+      ERROR_VARIABLE preparation_error)
+    if(NOT preparation_result EQUAL 0)
+      message(FATAL_ERROR
+        "${label} structural-model qualification preparation failed:\n"
+        "${preparation_output}${preparation_error}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
       "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
-      --urdf
-      "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.urdf"
-      --srdf
-      "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.srdf"
-      --model-asset-id
-      lite6_lite_gripper
-      --accepted-package-uri-prefix
-      "package://manyforge_example_models/models/lite6_lite_gripper/"
-      --resource-root
-      "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}"
-      --output-directory
-      "${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
-    RESULT_VARIABLE MANYFORGE_LITE6_STRUCTURAL_PREPARATION_RESULT
-    OUTPUT_VARIABLE MANYFORGE_LITE6_STRUCTURAL_PREPARATION_OUTPUT
-    ERROR_VARIABLE MANYFORGE_LITE6_STRUCTURAL_PREPARATION_ERROR)
-  if(NOT MANYFORGE_LITE6_STRUCTURAL_PREPARATION_RESULT EQUAL 0)
-    message(FATAL_ERROR
-      "Lite6 structural-model qualification preparation failed:\n"
-      "${MANYFORGE_LITE6_STRUCTURAL_PREPARATION_OUTPUT}"
-      "${MANYFORGE_LITE6_STRUCTURAL_PREPARATION_ERROR}")
-  endif()
-  set_property(
-    DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
+      "${urdf_path}"
+      "${srdf_path}"
+      ${resource_inputs}
+      ${ARGN})
+    set(${output_variable} "${fixture_root}" PARENT_SCOPE)
+  endfunction()
+
+  set(MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
+  set(MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/ur10e_robotiq_2f_140")
+  set(MANYFORGE_UF850_XARM_STRUCTURAL_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/uf850_xarm_gripper")
+  set(MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/ur5e_robotiq_2f_85")
+  set(MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/model_sources/ur5_roboplan")
+  set(MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../.docker/roboplan/roboplan_example_models/models/ur_robot_model")
+
+  manyforge_prepare_maintained_model(
+    lite6_lite_gripper "Lite6"
     "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.urdf"
     "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.srdf"
-    ${MANYFORGE_LITE6_STRUCTURAL_RESOURCE_INPUTS})
-
-  set(
-    MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT
-    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/ur10e_robotiq_2f_140")
-  set(
-    MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/ur10e_robotiq_2f_140_structural")
-  file(
-    GLOB_RECURSE
-    MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_RESOURCE_INPUTS
-    CONFIGURE_DEPENDS
-    LIST_DIRECTORIES false
-    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/meshes/*")
-  file(MAKE_DIRECTORY
-    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}")
-  execute_process(
-    COMMAND
-      "${Python3_EXECUTABLE}"
-      "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
-      --urdf
-      "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.structural.urdf"
-      --srdf
-      "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.structural.srdf"
-      --model-asset-id
-      ur10e_robotiq_2f_140
-      --accepted-package-uri-prefix
-      "package://manyforge_example_models/models/ur10e_robotiq_2f_140/"
-      --resource-root
-      "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}"
-      --output-directory
-      "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
-    RESULT_VARIABLE MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_PREPARATION_RESULT
-    OUTPUT_VARIABLE MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_PREPARATION_OUTPUT
-    ERROR_VARIABLE MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_PREPARATION_ERROR)
-  if(NOT MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_PREPARATION_RESULT EQUAL 0)
-    message(FATAL_ERROR
-      "UR10e/Robotiq structural-model qualification preparation failed:\n"
-      "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_PREPARATION_OUTPUT}"
-      "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_PREPARATION_ERROR}")
-  endif()
-  set_property(
-    DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
-    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.urdf"
+    "package://manyforge_example_models/models/lite6_lite_gripper/"
+    "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT)
+  manyforge_prepare_maintained_model(
+    uf850_xarm_gripper "UF850/xArm gripper"
+    "${MANYFORGE_UF850_XARM_STRUCTURAL_SOURCE_ROOT}/uf850_xarm_gripper.urdf"
+    "${MANYFORGE_UF850_XARM_STRUCTURAL_SOURCE_ROOT}/uf850_xarm_gripper.srdf"
+    "package://manyforge_example_models/models/uf850_xarm_gripper/"
+    "${MANYFORGE_UF850_XARM_STRUCTURAL_SOURCE_ROOT}"
+    MANYFORGE_UF850_XARM_STRUCTURAL_FIXTURE_ROOT)
+  manyforge_prepare_maintained_model(
+    ur10e_robotiq_2f_140 "UR10e/Robotiq"
     "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.structural.urdf"
-    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.srdf"
     "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.structural.srdf"
-    ${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_RESOURCE_INPUTS})
-
-  set(
-    MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT
-    "${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/model_sources/ur5_roboplan")
-  set(
-    MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT
-    "${CMAKE_CURRENT_SOURCE_DIR}/../.docker/roboplan/roboplan_example_models/models/ur_robot_model")
-  set(
-    MANYFORGE_UR5_ROBOPLAN_RESOURCE_ROOT
-    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}")
-  set(
-    MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/ur5_roboplan_structural")
-  file(
-    GLOB_RECURSE
-    MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_RESOURCE_INPUTS
-    CONFIGURE_DEPENDS
-    LIST_DIRECTORIES false
-    "${MANYFORGE_UR5_ROBOPLAN_RESOURCE_ROOT}/meshes/*")
-  file(MAKE_DIRECTORY
-    "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}")
-  execute_process(
-    COMMAND
-      "${Python3_EXECUTABLE}"
-      "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
-      --urdf
-      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT}/ur5_gripper.structural.urdf"
-      --srdf
-      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT}/ur5_gripper.structural.srdf"
-      --model-asset-id
-      ur5_roboplan
-      --accepted-package-uri-prefix
-      "package://roboplan_example_models/models/ur_robot_model/"
-      --resource-root
-      "${MANYFORGE_UR5_ROBOPLAN_RESOURCE_ROOT}"
-      --output-directory
-      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}"
-    RESULT_VARIABLE MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_RESULT
-    OUTPUT_VARIABLE MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_OUTPUT
-    ERROR_VARIABLE MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_ERROR)
-  if(NOT MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_RESULT EQUAL 0)
-    message(FATAL_ERROR
-      "UR5/RoboPlan structural-model qualification preparation failed:\n"
-      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_OUTPUT}"
-      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_PREPARATION_ERROR}")
-  endif()
-  set_property(
-    DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
-    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/ur5_gripper.urdf"
-    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/ur5_gripper.srdf"
+    "package://manyforge_example_models/models/ur10e_robotiq_2f_140/"
+    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}"
+    MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT
+    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.urdf"
+    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.srdf")
+  manyforge_prepare_maintained_model(
+    ur5_roboplan "UR5/RoboPlan"
     "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT}/ur5_gripper.structural.urdf"
     "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT}/ur5_gripper.structural.srdf"
-    ${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_RESOURCE_INPUTS})
+    "package://roboplan_example_models/models/ur_robot_model/"
+    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}"
+    MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT
+    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/ur5_gripper.urdf"
+    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/ur5_gripper.srdf")
+  manyforge_prepare_maintained_model(
+    ur5e_robotiq_2f_85 "UR5e/Robotiq"
+    "${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur5e_robotiq_2f_85.urdf"
+    "${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur5e_robotiq_2f_85.srdf"
+    "package://manyforge_example_models/models/ur5e_robotiq_2f_85/"
+    "${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}"
+    MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT)
+
+  # UI6-I T3 consumes the exact maintained Scenario closure through the real
+  # Manager/Composer/Runner process stack.  Materialize that package with the
+  # production occurrence compiler instead of maintaining a second test-only
+  # Deployment or Program compiler.
+  set(MANYFORGE_UI6I_DUAL_SCENARIO_FIXTURE_ROOT
+    "${CMAKE_CURRENT_BINARY_DIR}/ui6i-dual-scenario-fixture")
+  set(MANYFORGE_UI6I_DUAL_SCENARIO_PACKAGE_ROOT
+    "${MANYFORGE_UI6I_DUAL_SCENARIO_FIXTURE_ROOT}/retained-package")
+  set(MANYFORGE_UI6I_DUAL_SCENARIO_STAMP
+    "${MANYFORGE_UI6I_DUAL_SCENARIO_FIXTURE_ROOT}/materialized.stamp")
+  file(GLOB_RECURSE MANYFORGE_UI6I_DUAL_SCENARIO_INPUTS
+    CONFIGURE_DEPENDS LIST_DIRECTORIES false
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/*"
+    "${_MANYFORGE_WORKSPACE_ROOT}/examples/*.deployment.yaml"
+    "${_MANYFORGE_WORKSPACE_ROOT}/examples/*.program.yaml")
+  add_custom_command(
+    OUTPUT "${MANYFORGE_UI6I_DUAL_SCENARIO_STAMP}"
+    COMMAND "${CMAKE_COMMAND}" -E remove_directory
+      "${MANYFORGE_UI6I_DUAL_SCENARIO_FIXTURE_ROOT}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+      "${MANYFORGE_UI6I_DUAL_SCENARIO_PACKAGE_ROOT}"
+    COMMAND "$<TARGET_FILE:manyforge_maintained_deployment_occurrences>"
+      --check
+      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
+      --package-root "${MANYFORGE_UI6I_DUAL_SCENARIO_PACKAGE_ROOT}"
+      --prepared
+      "lite6_lite_gripper=${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
+      "uf850_xarm_gripper=${MANYFORGE_UF850_XARM_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
+      "ur10e_robotiq_2f_140=${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
+      "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
+      "ur5e_robotiq_2f_85=${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
+    COMMAND "${CMAKE_COMMAND}" -E touch
+      "${MANYFORGE_UI6I_DUAL_SCENARIO_STAMP}"
+    DEPENDS
+      manyforge_maintained_deployment_occurrences
+      ${MANYFORGE_UI6I_DUAL_SCENARIO_INPUTS}
+      "${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
+      "${MANYFORGE_UF850_XARM_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
+      "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
+      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
+      "${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
+    VERBATIM)
+  add_custom_target(manyforge_ui6i_dual_scenario_package
+    DEPENDS "${MANYFORGE_UI6I_DUAL_SCENARIO_STAMP}")
 
   target_compile_definitions(test_cell_structure PRIVATE
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
@@ -1536,9 +1554,13 @@ if(BUILD_TESTING)
       --prepared
       "lite6_lite_gripper=${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
       --prepared
+      "uf850_xarm_gripper=${MANYFORGE_UF850_XARM_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
       "ur10e_robotiq_2f_140=${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
       --prepared
-      "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}")
+      "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
+      "ur5e_robotiq_2f_85=${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}")
 
   add_test(
     NAME MaintainedDeploymentOccurrenceCompilation
@@ -1549,9 +1571,13 @@ if(BUILD_TESTING)
       --prepared
       "lite6_lite_gripper=${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
       --prepared
+      "uf850_xarm_gripper=${MANYFORGE_UF850_XARM_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
       "ur10e_robotiq_2f_140=${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
       --prepared
-      "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}")
+      "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}"
+      --prepared
+      "ur5e_robotiq_2f_85=${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}")
 
   add_executable(test_model_source
     test/test_model_source.cpp)

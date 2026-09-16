@@ -2763,12 +2763,12 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_DOUBLE_EQ(initial.value().requested_scale, 1.0);
     EXPECT_EQ(initial.value().control_generation, RuntimeScaleControlGeneration(0U));
     EXPECT_FALSE(initial.value().control_binding_id);
-    ASSERT_EQ(initial.value().synchronized_members.size(), 2U);
+    ASSERT_EQ(initial.value().group_members.size(), 2U);
     if (configured) {
       ASSERT_TRUE(kernel.set_runtime_scale_control(group_request).ok());
     }
     auto reversed = group_request.selector;
-    std::reverse(reversed.synchronized_targets.begin(), reversed.synchronized_targets.end());
+    std::reverse(reversed.group_targets.begin(), reversed.group_targets.end());
     const auto alias = kernel.get_runtime_scale_control(reversed);
     ASSERT_TRUE(alias.ok());
     EXPECT_DOUBLE_EQ(alias.value().requested_scale, configured ? 0.35 : 1.0);
@@ -2824,11 +2824,11 @@ TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleGroupRejectsMalformedOrCl
     auto request = runtime_scale_control_request("scale.bad." + std::to_string(malformed), 0U, 0.5);
     request.selector = runtime_scale_group_selector();
     if (malformed == 0) request.selector.component_role_id = ComponentRoleId("robot");
-    if (malformed == 1) request.selector.synchronized_targets.pop_back();
+    if (malformed == 1) request.selector.group_targets.pop_back();
     if (malformed == 2)
-      request.selector.synchronized_targets[1] = request.selector.synchronized_targets[0];
+      request.selector.group_targets[1] = request.selector.group_targets[0];
     if (malformed == 3)
-      request.selector.synchronized_targets[1].target_role_id = TargetRoleId("missing");
+      request.selector.group_targets[1].target_role_id = TargetRoleId("missing");
     const auto status = kernel.get_runtime_scale_control(request.selector);
     ASSERT_TRUE(status.ok());
     EXPECT_FALSE(status.value().supported);
@@ -2846,6 +2846,135 @@ TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleGroupRejectsMalformedOrCl
   EXPECT_FALSE(kernel.set_runtime_scale_control(request).ok());
   EXPECT_EQ(first_engine.runtime_scale_calls, 0);
   EXPECT_EQ(second_engine.runtime_scale_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     IndependentProgramGroupProjectsAndAppliesOneSettingToBothOperations) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine first_engine, second_engine;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 32U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine),
+       registration(coordinated_occurrence(first, "2"), second_engine)},
+      clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  auto capture = program_execution_capture();
+  auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
+  auto second_target = binding->target_role_bindings.front();
+  second_target.component_role_id = ComponentRoleId("robot_2");
+  second_target.target_role_id = TargetRoleId("arm_2");
+  second_target.controllable_component_id = ControllableComponentId("robot_2");
+  second_target.command_target_id = CommandTargetId("arm");
+  binding->target_role_bindings.push_back(std::move(second_target));
+  capture.binding = std::move(binding);
+  auto table = std::make_shared<ProgramExecutionTableDTO>();
+  table->nodes = {
+      {ProgramNodeInstanceId("a"),
+       "kernel.operation",
+       {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}},
+      {ProgramNodeInstanceId("b"),
+       "kernel.operation",
+       {{TargetRoleId("arm_2"), CapabilityId("execution.trajectory.execute"), true}}}};
+  table->named_selections = {
+      {"robot_group", {0U, 1U}, ProgramExecutionPolicy::kIndependent}};
+  capture.table = table;
+  ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+
+  auto first_intent = motion_operation("group.scale.first");
+  first_intent.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("a"), "attempt.a"};
+  ASSERT_TRUE(kernel.execute(first_intent).ok());
+  auto second_intent = motion_operation("group.scale.second");
+  second_intent.participants.front().component_role_id = ComponentRoleId("robot_2");
+  second_intent.participants.front().target_role_id = TargetRoleId("arm_2");
+  second_intent.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("b"), "attempt.b"};
+  ASSERT_TRUE(kernel.execute(second_intent).ok());
+  first_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  second_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  first_engine.runtime_scale.active = true;
+  second_engine.runtime_scale.active = true;
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+
+  const auto projected =
+      kernel.present_runtime_scale_control(runtime_scale_control_selector());
+  ASSERT_TRUE(projected.ok()) << projected.error().message;
+  EXPECT_EQ(projected.value().selector, runtime_scale_group_selector());
+  EXPECT_FALSE(projected.value().frozen);
+  const auto first_calls = first_engine.runtime_scale_calls.load();
+  const auto second_calls = second_engine.runtime_scale_calls.load();
+  auto request = runtime_scale_control_request("group.scale.set", 0U, 0.4);
+  request.selector = projected.value().selector;
+  const auto accepted = kernel.set_runtime_scale_control(request);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_EQ(first_engine.runtime_scale_calls, first_calls + 1);
+  EXPECT_EQ(second_engine.runtime_scale_calls, second_calls + 1);
+  ASSERT_TRUE(first_engine.last_runtime_scale_command);
+  ASSERT_TRUE(second_engine.last_runtime_scale_command);
+  EXPECT_DOUBLE_EQ(first_engine.last_runtime_scale_command->requested_scale, 0.4);
+  EXPECT_DOUBLE_EQ(second_engine.last_runtime_scale_command->requested_scale, 0.4);
+  EXPECT_DOUBLE_EQ(
+      kernel.get_runtime_scale_control(request.selector).value().requested_scale,
+      0.4);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RuntimeScaleResolvesCapturedProgramRolesToPhysicalRegistrations) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine first_engine, second_engine;
+  const auto first =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second = coordinated_occurrence(first, "2");
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 32U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first, first_engine), registration(second, second_engine)},
+      clock, scheduler, journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+
+  auto capture = program_execution_capture();
+  const ProgramBindingId authored_binding(test_digest('a'));
+  capture.program_binding_id = authored_binding;
+  auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
+  binding->program_binding_id = authored_binding;
+  auto second_target = binding->target_role_bindings.front();
+  second_target.component_role_id = ComponentRoleId("robot_2");
+  second_target.target_role_id = TargetRoleId("arm_2");
+  second_target.controllable_component_id = second.value().controllable_component_id;
+  second_target.command_target_id = second.value().command_target_id;
+  binding->target_role_bindings.push_back(std::move(second_target));
+  capture.binding = std::move(binding);
+  capture.table = std::make_shared<ProgramExecutionTableDTO>(
+      ProgramExecutionTableDTO{
+          {{ProgramNodeInstanceId("a"),
+            "kernel.operation",
+            {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}},
+           {ProgramNodeInstanceId("b"),
+            "kernel.operation",
+            {{TargetRoleId("arm_2"), CapabilityId("execution.trajectory.execute"), true}}}},
+          {{"robot_group", {0U, 1U}, ProgramExecutionPolicy::kIndependent}}});
+  ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+
+  RuntimeScaleControlSelectorDTO selector{
+      authored_binding,
+      ComponentRoleId(""),
+      TargetRoleId(""),
+      {{ComponentRoleId("robot"), TargetRoleId("arm")},
+       {ComponentRoleId("robot_2"), TargetRoleId("arm_2")}}};
+  const auto status = kernel.get_runtime_scale_control(selector);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_TRUE(status.value().supported);
+  ASSERT_EQ(status.value().group_members.size(), 2U);
+  EXPECT_EQ(status.value().selector, selector);
 }
 
 TEST(ResourceAddressedExecutionKernelTest, ManualAdmissionExcludesHeldProgramAndAuthoringClaims) {
@@ -4226,8 +4355,8 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_EQ(timeline, before);
     auto group_alias = group_request;
     group_alias.request_context.request_id = RequestId("scale.shared.group.stale-alias");
-    std::reverse(group_alias.selector.synchronized_targets.begin(),
-                 group_alias.selector.synchronized_targets.end());
+    std::reverse(group_alias.selector.group_targets.begin(),
+                 group_alias.selector.group_targets.end());
     EXPECT_FALSE(kernel.set_runtime_scale_control(group_alias).ok());
     EXPECT_DOUBLE_EQ(
         kernel.get_runtime_scale_control(runtime_scale_control_selector()).value().requested_scale,
@@ -4276,7 +4405,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto presented = kernel.present_runtime_scale_control(runtime_scale_control_selector());
   ASSERT_TRUE(presented.ok());
   EXPECT_EQ(presented.value().selector, runtime_scale_group_selector());
-  EXPECT_EQ(presented.value().synchronized_members.size(), 2U);
+  EXPECT_EQ(presented.value().group_members.size(), 2U);
   EXPECT_EQ(presented.value().active_operation_id, accepted.value().operation_id);
   EXPECT_TRUE(presented.value().frozen);  // Group readiness is still authoritative.
   const auto explicit_group = kernel.get_runtime_scale_control(runtime_scale_group_selector());
@@ -6749,7 +6878,10 @@ TEST(ResourceAddressedExecutionKernelTest,
                   {ProgramNodeInstanceId("c"),
                    "kernel.operation",
                    {{TargetRoleId("arm_3"), CapabilityId("execution.trajectory.execute"), true}}}};
-  table->named_selections = {{"a", {0U}}, {"both_arms", {0U, 1U}, true}, {"c", {2U}}};
+  table->named_selections = {
+      {"a", {0U}},
+      {"both_arms", {0U, 1U}, ProgramExecutionPolicy::kCommonStart},
+      {"c", {2U}}};
   capture.table = table;
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
   auto incomplete = motion_operation("execute.synchronized.member.alone");

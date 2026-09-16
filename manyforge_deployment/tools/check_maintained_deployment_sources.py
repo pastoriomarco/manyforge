@@ -171,6 +171,24 @@ _RUNTIME_RESTORATION_ACCEPTANCE: Final = [
         "acceptance_steps": ["N6-a3", "N7", "I8/P5"],
     },
 ]
+_UI6I_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
+    {
+        "obligation_id": "retained_native_initial_state_and_execution_cadence",
+        "acceptance_steps": ["UI6-I/T3"],
+    },
+    {
+        "obligation_id": "retained_native_planner_seed",
+        "acceptance_steps": ["UI6-I/T3"],
+    },
+    {
+        "obligation_id": "retained_native_stop_profiles",
+        "acceptance_steps": ["UI6-I/T4"],
+    },
+    {
+        "obligation_id": "retained_runtime_collision_monitor_period",
+        "acceptance_steps": ["UI6-I/T3", "UI6-I/T4"],
+    },
+]
 _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
     "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
     "default_fault_stop_profile": (
@@ -261,6 +279,9 @@ _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
     "ur5_native_simulated_v0": (
         "4657afd224d18c83d40955e4cd7a2c1f556c83934e568e775255b4ced385c85b"
     ),
+    "ur5e_robotiq_native_simulated_v0": (
+        "790a592d040a8141288f9f626d7262e54dff047a9fc0786e4685762431eba7e0"
+    ),
 }
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
     "lite6_isaac_commanded_v0": "lite6_lite_gripper",
@@ -270,6 +291,7 @@ _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
     "ur10e_robotiq_isaac_commanded_v0": "ur10e_robotiq_2f_140",
     "ur10e_robotiq_native_simulated_v0": "ur10e_robotiq_2f_140",
     "ur5_native_simulated_v0": "ur5_roboplan",
+    "ur5e_robotiq_native_simulated_v0": "ur5e_robotiq_2f_85",
 }
 _EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS: Final = {
     "examples/assistant_modes_scene_authoring.deployment.yaml": (
@@ -600,6 +622,51 @@ _EXPECTED_MODEL_FAMILIES: Final = {
             "urdf_projection_kind": "identity",
         },
     },
+    "uf850_xarm_gripper": {
+        "frames": {
+            "base": "link_base",
+            "flange": "link_eef",
+            "gripper_tcp": "link_tcp",
+            "root": "world",
+            "tcp": "link_tcp",
+        },
+        "groups": {"arm": "uf850", "gripper": "uf850_gripper"},
+        "resources": {
+            "arm_joints": ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6"),
+            "fingers": ("drive_joint",),
+        },
+        "collisions": {
+            "arm_collision": (
+                "link1",
+                "link2",
+                "link3",
+                "link4",
+                "link5",
+                "link6",
+                "link_base",
+            ),
+            "gripper_collision": (
+                "left_finger",
+                "left_inner_knuckle",
+                "left_outer_knuckle",
+                "right_finger",
+                "right_inner_knuckle",
+                "right_outer_knuckle",
+                "xarm_gripper_base_link",
+            ),
+        },
+        "root": "root",
+        "source": {
+            "accepted_package_uri_prefix": "package://manyforge_example_models/models/uf850_xarm_gripper/",
+            "historical_srdf_path": "manyforge_example_models/models/uf850_xarm_gripper/uf850_xarm_gripper.srdf",
+            "historical_urdf_path": "manyforge_example_models/models/uf850_xarm_gripper/uf850_xarm_gripper.urdf",
+            "resource_root": "manyforge_example_models/models/uf850_xarm_gripper",
+            "srdf_path": "manyforge_example_models/models/uf850_xarm_gripper/uf850_xarm_gripper.srdf",
+            "srdf_projection_kind": "identity",
+            "urdf_path": "manyforge_example_models/models/uf850_xarm_gripper/uf850_xarm_gripper.urdf",
+            "urdf_projection_kind": "identity",
+        },
+    },
     "ur10e_robotiq_2f_140": {
         "frames": {
             "base": "base_link",
@@ -698,6 +765,61 @@ _EXPECTED_MODEL_FAMILIES: Final = {
             "srdf_projection_kind": "remove_hpp_gripper_extension",
             "urdf_path": "manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/ur5_gripper.structural.urdf",
             "urdf_projection_kind": "remove_unused_xacro_namespace",
+        },
+    },
+    "ur5e_robotiq_2f_85": {
+        "frames": {
+            "base": "base_link",
+            "flange": "flange",
+            "gripper_tcp": "robotiq_85_base_link",
+            "root": "world",
+            "tcp": "tool0",
+            "tool_mount": "tool0",
+        },
+        "groups": {"arm": "ur_manipulator", "gripper": "robotiq_2f_85_gripper"},
+        "resources": {
+            "arm_joints": (
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint",
+            ),
+            "fingers": ("robotiq_85_left_knuckle_joint",),
+        },
+        "collisions": {
+            "arm_collision": (
+                "base_link_inertia",
+                "forearm_link",
+                "shoulder_link",
+                "upper_arm_link",
+                "wrist_1_link",
+                "wrist_2_link",
+                "wrist_3_link",
+            ),
+            "gripper_collision": (
+                "robotiq_85_base_link",
+                "robotiq_85_left_finger_link",
+                "robotiq_85_left_finger_tip_link",
+                "robotiq_85_left_inner_knuckle_link",
+                "robotiq_85_left_knuckle_link",
+                "robotiq_85_right_finger_link",
+                "robotiq_85_right_finger_tip_link",
+                "robotiq_85_right_inner_knuckle_link",
+                "robotiq_85_right_knuckle_link",
+            ),
+        },
+        "root": "root",
+        "source": {
+            "accepted_package_uri_prefix": "package://manyforge_example_models/models/ur5e_robotiq_2f_85/",
+            "historical_srdf_path": "manyforge_example_models/models/ur5e_robotiq_2f_85/ur5e_robotiq_2f_85.srdf",
+            "historical_urdf_path": "manyforge_example_models/models/ur5e_robotiq_2f_85/ur5e_robotiq_2f_85.urdf",
+            "resource_root": "manyforge_example_models/models/ur5e_robotiq_2f_85",
+            "srdf_path": "manyforge_example_models/models/ur5e_robotiq_2f_85/ur5e_robotiq_2f_85.srdf",
+            "srdf_projection_kind": "identity",
+            "urdf_path": "manyforge_example_models/models/ur5e_robotiq_2f_85/ur5e_robotiq_2f_85.urdf",
+            "urdf_projection_kind": "identity",
         },
     },
 }
@@ -1783,10 +1905,10 @@ def validate(source: Path, root: Path) -> None:
     if (
         family_ids != sorted(family_ids)
         or len(set(family_ids)) != len(family_ids)
-        or len(family_ids) != 3
+        or set(family_ids) != set(_EXPECTED_MODEL_FAMILIES)
     ):
         raise SourceDescriptionError(
-            "$.model_families must contain the three canonical-sorted families"
+            "$.model_families must contain the canonical-sorted maintained families"
         )
 
     runtime_profile_ids: list[str] = []
@@ -1807,11 +1929,7 @@ def validate(source: Path, root: Path) -> None:
                     "runtime_restoration_profile_id",
                     "model_family_id",
                     "source_fields",
-                    (
-                        "ros2_control_runtime"
-                        if is_ros2_control
-                        else "native_runtime"
-                    ),
+                    ("ros2_control_runtime" if is_ros2_control else "native_runtime"),
                     "stop_profiles",
                     "acceptance_obligations",
                 }
@@ -1855,6 +1973,8 @@ def validate(source: Path, root: Path) -> None:
             if is_ros2_control
             else _RUNTIME_RESTORATION_ACCEPTANCE
         )
+        if profile_id == "ur5e_robotiq_native_simulated_v0":
+            expected_acceptance = _UI6I_RUNTIME_RESTORATION_ACCEPTANCE
         if profile["acceptance_obligations"] != expected_acceptance:
             raise SourceDescriptionError(
                 f"{path}.acceptance_obligations changes the deferred owner gates"
@@ -1875,8 +1995,8 @@ def validate(source: Path, root: Path) -> None:
         runtime_profile_ids
     ) != set(_EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS):
         raise SourceDescriptionError(
-            "$.runtime_restoration_profiles must exactly cover the seven "
-            "canonical-sorted historical profiles"
+            "$.runtime_restoration_profiles must exactly cover the "
+            "canonical-sorted pinned profiles"
         )
 
     deployment_sources: list[str] = []
@@ -1977,9 +2097,7 @@ def validate(source: Path, root: Path) -> None:
                 f"{path}.historical_blob changes the pinned I0 source"
             )
         if is_i9:
-            historical_program = _EXPECTED_I9_HISTORICAL_PROGRAMS[
-                deployment_source
-            ]
+            historical_program = _EXPECTED_I9_HISTORICAL_PROGRAMS[deployment_source]
             if (
                 row["historical_program_source"] != historical_program["source"]
                 or row["historical_program_blob"] != historical_program["blob"]

@@ -1735,7 +1735,7 @@ def create_app(
         target_role_id: Annotated[
             str | None, Query(min_length=1, max_length=256)
         ] = None,
-        synchronized_targets: Annotated[
+        group_targets: Annotated[
             str | None, Query(max_length=MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES)
         ] = None,
     ) -> JSONResponse:
@@ -1743,13 +1743,13 @@ def create_app(
             "program_binding_id",
             "component_role_id",
             "target_role_id",
-            "synchronized_targets",
+            "group_targets",
         )
         if any(len(request.query_params.getlist(key)) > 1 for key in selector_keys):
             raise HTTPException(
                 422, "runtime-scale selector query keys must be singular"
             )
-        if synchronized_targets is None:
+        if group_targets is None:
             payload = {
                 "program_binding_id": program_binding_id,
                 "component_role_id": component_role_id,
@@ -1761,12 +1761,12 @@ def create_app(
             try:
                 payload = {
                     "program_binding_id": program_binding_id,
-                    "synchronized_targets": decode_runtime_scale_selector_query(
-                        synchronized_targets
+                    "group_targets": decode_runtime_scale_selector_query(
+                        group_targets
                     ),
                 }
             except ValueError:
-                raise HTTPException(422, "synchronized_targets must be strict JSON")
+                raise HTTPException(422, "group_targets must be strict JSON")
         try:
             selector = RuntimeScaleControlSelectorRequest.model_validate(payload)
         except ValueError as exc:

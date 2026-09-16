@@ -33,6 +33,11 @@ def _response(query, coordinate_kind="angular_rad"):
             "command_id": 1,
             "generation": 2,
             "revision": 3,
+            "active_control_configuration_id": "configuration.1",
+            "active_control_configuration_generation": 4,
+            "source_id": "gripper.provider.1",
+            "source_revision": "sha256:" + "b" * 64,
+            "source_epoch": "source.1",
             "grasp_confirmed": None,
             "observed_position": {
                 "kind": coordinate_kind,
@@ -88,6 +93,15 @@ def test_query_has_one_exact_read_and_preserves_typed_owner_evidence(kind, coord
     ]
 
 
+def test_frame_query_may_request_an_exact_relative_frame():
+    query = {**_query(), "relative_to_frame_role_id": "base"}
+    response = _response(query)
+    client, requests = _client(response)
+
+    assert client.query_target(TargetObservationQuery.model_validate(query)) == response
+    assert requests[0]["query"] == query
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -110,6 +124,13 @@ def test_gripper_query_cannot_name_an_arbitrary_frame():
     with pytest.raises(ValidationError):
         TargetObservationQuery.model_validate(
             {**_query("gripper_status"), "frame_role_id": "tcp"}
+        )
+    with pytest.raises(ValidationError):
+        TargetObservationQuery.model_validate(
+            {
+                **_query("gripper_status"),
+                "relative_to_frame_role_id": "base",
+            }
         )
 
 

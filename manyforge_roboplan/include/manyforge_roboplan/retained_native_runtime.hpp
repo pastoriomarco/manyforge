@@ -32,10 +32,9 @@ class GripperParticipantEngine;
 
 namespace manyforge::roboplan_backend {
 
-// This native host supports one motion participant and one optional scalar
-// gripper. Reserve both Stop lanes before ingress, including while CCLC has
-// not yet published either route. Capability/Program aliases do not add lanes.
-inline constexpr std::size_t kNativeMaximumLiveStopParticipants = 2U;
+// One execution cell may contain multiple independently controlled robots.
+// This is a hard construction bound, not a configured group size.
+inline constexpr std::size_t kNativeMaximumLiveStopParticipants = 64U;
 
 struct RetainedNativeRuntimeConfig final {
   core::RequestOwnerEpoch request_owner_epoch;
@@ -202,6 +201,8 @@ struct RetainedNativeRuntimeInput final {
   std::optional<
       deployment::native_execution_runtime_contract::OrdinaryMotionJerkSettings>
       ordinary_motion_jerk{};
+  /// Cell-wide render wake shared by independently owned robot channels.
+  std::shared_ptr<RetainedObservationWake> observation_wake{};
 };
 
 /// Owning native composition root. Destruction order is deliberate: the public
@@ -286,6 +287,12 @@ struct RetainedNativeRuntime final
   std::unique_ptr<RetainedStopSurveillanceOwner> stop_surveillance_owner;
   std::unique_ptr<core::SqliteOperationJournal> operation_journal;
   std::unique_ptr<core::ResourceAddressedExecutionKernel> addressed_kernel;
+  core::ResourceAddressedExecutionKernel *cell_addressed_kernel{};
+  /// Non-owning root used only to assemble complete cell-level route updates.
+  RetainedNativeRuntime *cell_runtime_root{};
+  /// Additional independently built robot engines owned by this cell-level
+  /// runtime. Only the primary owns the addressed Kernel and durable journal.
+  std::vector<std::shared_ptr<RetainedNativeRuntime>> participant_peers;
 
   [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
   ReadCurrentPhysicalParticipants(
@@ -321,9 +328,6 @@ struct RetainedNativeRuntime final
   [[nodiscard]] core::Result<core::GripperCommandStatusDTO>
   ReadGripperStatus(const core::RuntimeParticipantBinding &source) const;
 
-  /// Publish the exact route facts already sealed into a direct native
-  /// runtime. Maintained products without a lifecycle owner call this once
-  /// after installation; lifecycle-managed products publish through CCLC.
 private:
   // Caller holds route_publication_mutex_. No owner read or write escapes it.
   [[nodiscard]] bool
@@ -341,6 +345,14 @@ create_retained_native_runtime_participants(
     RetainedNativeRuntimeInput input, RetainedNativeRuntimeConfig config,
     std::shared_ptr<WallClock> shared_clock = {},
     std::shared_ptr<SimpleScheduler> shared_scheduler = {});
+
+/// Join independently planned robot engines beneath one cell-level addressed
+/// Kernel. The participants must share the same clock, scheduler and retained
+/// product; this function adds no timing synchronization policy.
+void join_retained_native_runtime_participants(
+    const std::shared_ptr<RetainedNativeRuntime> &primary,
+    std::vector<std::shared_ptr<RetainedNativeRuntime>> peers,
+    RetainedRuntimeParticipantResolverFactory participant_resolver_factory);
 
 /// Resolve current Stop-recovery facts for either a directly attached owner
 /// or the process-stable managed owner. This is one product-facts adapter;

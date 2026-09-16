@@ -67,7 +67,9 @@ public:
       const VerifiedRetainedPlanningModel &planning_model,
       const core::RuntimeUnitId &local_runtime_unit_id,
       const core::RuntimeEpoch &local_runtime_epoch,
-      std::vector<RetainedSceneFrameStateSourceInput> provided_state_sources) {
+      std::vector<RetainedSceneFrameStateSourceInput> provided_state_sources,
+      std::optional<core::ControllableComponentId> local_component_id =
+          std::nullopt) {
     if (!verify_retained_bundle_identity(retained_bundle)) {
       throw std::invalid_argument(
           "scene-frame resolver received an unverifiable retained bundle");
@@ -242,13 +244,17 @@ public:
         throw std::invalid_argument(
             "scene-frame state binding has no exact component/domain");
       }
+      const bool component_selected =
+          !local_component_id.has_value() ||
+          graph_binding->controllable_component_id == *local_component_id;
       const bool local =
-          std::find(component->runtime_unit_ids.begin(),
-                    component->runtime_unit_ids.end(), local_runtime_unit_id) !=
-              component->runtime_unit_ids.end() ||
-          std::find(domain->runtime_unit_ids.begin(),
-                    domain->runtime_unit_ids.end(),
-                    local_runtime_unit_id) != domain->runtime_unit_ids.end();
+          component_selected &&
+          (std::find(component->runtime_unit_ids.begin(),
+                     component->runtime_unit_ids.end(), local_runtime_unit_id) !=
+               component->runtime_unit_ids.end() ||
+           std::find(domain->runtime_unit_ids.begin(),
+                     domain->runtime_unit_ids.end(), local_runtime_unit_id) !=
+               domain->runtime_unit_ids.end());
       const auto desired = std::find_if(
           value.desired_control_configurations.begin(),
           value.desired_control_configurations.end(),

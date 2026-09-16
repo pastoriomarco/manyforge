@@ -230,6 +230,16 @@ export interface ProgramTreeNode {
   execution_groups?: 'inherit' | 'all' | string[];
 }
 
+export type ProgramExecutionPolicy =
+  | 'independent'
+  | 'common_start'
+  | 'common_start_and_finish'
+  | 'sync_offset_traj';
+
+export interface ProgramExecutionGroupDefinition {
+  execution_policy: ProgramExecutionPolicy;
+}
+
 export interface ProgramParameterDeclaration {
   parameter_id: string;
   type: string;
@@ -281,7 +291,7 @@ export interface ProgramDocument {
     keys: BlackboardKeyDeclaration[];
   };
   contact_policies?: JsonValue[];
-  synchronized_execution_groups?: string[];
+  execution_groups?: Record<string, ProgramExecutionGroupDefinition>;
   tree: ProgramTreeNode;
 }
 

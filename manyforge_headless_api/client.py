@@ -1071,18 +1071,18 @@ class HeadlessHttpClient:
     def runtime_scale_control(self, selector: Mapping[str, Any]) -> dict[str, Any]:
         validated = RuntimeScaleControlSelectorRequest.model_validate(selector)
         normalized = validated.model_dump(mode="json")
-        if validated.synchronized_targets is not None:
+        if validated.group_targets is not None:
             encoded = json.dumps(
-                normalized["synchronized_targets"],
+                normalized["group_targets"],
                 ensure_ascii=False,
                 separators=(",", ":"),
                 allow_nan=False,
             )
             if len(encoded.encode("utf-8")) > MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES:
-                raise ValueError("runtime-scale synchronized target list is too large")
+                raise ValueError("runtime-scale group target list is too large")
             params = (
                 ("program_binding_id", normalized["program_binding_id"]),
-                ("synchronized_targets", encoded),
+                ("group_targets", encoded),
             )
         else:
             params = tuple(

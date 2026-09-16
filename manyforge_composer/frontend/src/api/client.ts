@@ -239,7 +239,7 @@ function runtimeScaleSelectorQuery(selector: RuntimeScaleControlSelector): strin
     parameters.set('component_role_id', selector.componentRoleId);
     parameters.set('target_role_id', selector.targetRoleId);
   } else {
-    parameters.set('synchronized_targets', JSON.stringify(selector.synchronizedTargets.map((target) => ({
+    parameters.set('group_targets', JSON.stringify(selector.groupTargets.map((target) => ({
       component_role_id: target.componentRoleId,
       target_role_id: target.targetRoleId,
     }))));
@@ -261,8 +261,8 @@ function sameRuntimeScaleSelector(
   const identity = (target: { componentRoleId: string; targetRoleId: string }) => (
     JSON.stringify([target.componentRoleId, target.targetRoleId])
   );
-  const requestedTargets = new Set(requested.synchronizedTargets.map(identity));
-  const returnedTargets = new Set(returned.synchronizedTargets.map(identity));
+  const requestedTargets = new Set(requested.groupTargets.map(identity));
+  const returnedTargets = new Set(returned.groupTargets.map(identity));
   return requestedTargets.size === returnedTargets.size
     && [...requestedTargets].every((target) => returnedTargets.has(target));
 }
@@ -891,7 +891,7 @@ export const api = {
         ? { ...selector }
         : {
             ...selector,
-            synchronizedTargets: selector.synchronizedTargets.map((target) => ({ ...target })),
+            groupTargets: selector.groupTargets.map((target) => ({ ...target })),
           };
       return requestJson(
         `/api/execution/runtime-scale-control?${runtimeScaleSelectorQuery(requestedSelector)}`,

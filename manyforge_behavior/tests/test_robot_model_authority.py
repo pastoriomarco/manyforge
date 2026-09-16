@@ -19,6 +19,7 @@ from manyforge_behavior.robot_model_authority import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODEL_ROOT = REPO_ROOT / "manyforge_example_models" / "models"
 
+
 def _write_model(
     tmp_path: Path,
     urdf_body: str,
@@ -61,12 +62,8 @@ def test_lite6_canonical_mimic_and_gripper_metadata():
     assert not authority.joints["left_finger_joint"].is_commandable
     assert authority.joints["right_finger_joint"].is_commandable
     assert authority.joints["right_finger_joint"].is_mimic_master
-    assert authority.group_commandable_joints("lite_gripper") == (
-        "right_finger_joint",
-    )
-    assert authority.grippers["lite_gripper"].derived_joints == (
-        "left_finger_joint",
-    )
+    assert authority.group_commandable_joints("lite_gripper") == ("right_finger_joint",)
+    assert authority.grippers["lite_gripper"].derived_joints == ("left_finger_joint",)
     assert authority.grippers["lite_gripper"].presets == {
         "open": 0.0081,
         "close": 0.0,
@@ -164,6 +161,52 @@ def test_robotiq_gripper_mimics_are_model_derived():
         multiplier=-1.0,
         offset=0.0,
     )
+
+
+@pytest.mark.parametrize(
+    ("model_name", "group_id", "command_joint", "expected_derived", "presets"),
+    (
+        (
+            "ur5e_robotiq_2f_85",
+            "robotiq_2f_85_gripper",
+            "robotiq_85_left_knuckle_joint",
+            5,
+            {"open": 0.0, "closed": 0.8},
+        ),
+        (
+            "uf850_xarm_gripper",
+            "uf850_gripper",
+            "drive_joint",
+            5,
+            {"open": 0.0, "close": 0.85, "closed": 0.85},
+        ),
+    ),
+)
+def test_new_supported_grippers_use_one_model_derived_command_joint(
+    model_name: str,
+    group_id: str,
+    command_joint: str,
+    expected_derived: int,
+    presets: dict[str, float],
+) -> None:
+    model_dir = MODEL_ROOT / model_name
+    authority = load_robot_model_authority(
+        urdf_path=model_dir / f"{model_name}.urdf",
+        srdf_path=model_dir / f"{model_name}.srdf",
+        package_paths=(str(REPO_ROOT),),
+        model_name=model_name,
+        grippers={
+            "gripper": RobotModelGripperConfig(
+                group_id=group_id,
+                joint_name=command_joint,
+            )
+        },
+    )
+
+    assert authority.group_commandable_joints(group_id) == (command_joint,)
+    assert authority.joints[command_joint].is_mimic_master
+    assert authority.grippers["gripper"].presets == presets
+    assert len(authority.grippers["gripper"].derived_joints) == expected_derived
 
 
 def test_robotiq_roboplan_import_view_keeps_safe_canonical_names():
@@ -304,12 +347,16 @@ def test_two_instance_same_asset_views_are_globally_unique_and_deterministic():
         mount_parent_frame="cell",
     )
 
-    left_names = set(left.links.generated_to_canonical) | set(
-        left.joints.generated_to_canonical
-    ) | set(left.groups.generated_to_canonical)
-    right_names = set(right.links.generated_to_canonical) | set(
-        right.joints.generated_to_canonical
-    ) | set(right.groups.generated_to_canonical)
+    left_names = (
+        set(left.links.generated_to_canonical)
+        | set(left.joints.generated_to_canonical)
+        | set(left.groups.generated_to_canonical)
+    )
+    right_names = (
+        set(right.links.generated_to_canonical)
+        | set(right.joints.generated_to_canonical)
+        | set(right.groups.generated_to_canonical)
+    )
 
     assert left_names.isdisjoint(right_names)
     assert left.instance_fingerprint == left_repeat.instance_fingerprint

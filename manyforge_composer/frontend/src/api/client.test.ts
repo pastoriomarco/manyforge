@@ -42,7 +42,7 @@ describe('runtime-scale control reads', () => {
         kind: 'singular', programBindingId: 'binding/1', componentRoleId: 'robot', targetRoleId: 'arm',
       })))
       .mockResolvedValueOnce(response(runtimeScaleResponse({
-        kind: 'group', programBindingId: 'binding/1', synchronizedTargets: [
+        kind: 'group', programBindingId: 'binding/1', groupTargets: [
           { componentRoleId: 'robot', targetRoleId: 'arm' },
           { componentRoleId: 'robot', targetRoleId: 'gripper' },
         ],
@@ -53,7 +53,7 @@ describe('runtime-scale control reads', () => {
       kind: 'singular', programBindingId: 'binding/1', componentRoleId: 'robot', targetRoleId: 'arm',
     });
     await api.execution.runtimeScaleControl({
-      kind: 'group', programBindingId: 'binding/1', synchronizedTargets: [
+      kind: 'group', programBindingId: 'binding/1', groupTargets: [
         { componentRoleId: 'robot', targetRoleId: 'arm' },
         { componentRoleId: 'robot', targetRoleId: 'gripper' },
       ],
@@ -63,7 +63,7 @@ describe('runtime-scale control reads', () => {
       '/api/execution/runtime-scale-control?program_binding_id=binding%2F1&component_role_id=robot&target_role_id=arm',
     );
     expect(fetchMock.mock.calls[1]?.[0]).toContain(
-      'program_binding_id=binding%2F1&synchronized_targets=%5B%7B%22component_role_id%22%3A%22robot%22%2C%22target_role_id%22%3A%22arm%22%7D%2C%7B%22component_role_id%22%3A%22robot%22%2C%22target_role_id%22%3A%22gripper%22%7D%5D',
+      'program_binding_id=binding%2F1&group_targets=%5B%7B%22component_role_id%22%3A%22robot%22%2C%22target_role_id%22%3A%22arm%22%7D%2C%7B%22component_role_id%22%3A%22robot%22%2C%22target_role_id%22%3A%22gripper%22%7D%5D',
     );
   });
 
@@ -81,7 +81,7 @@ describe('runtime-scale control reads', () => {
 
   it('rejects crossed group members and bindings', async () => {
     const selector = {
-      kind: 'group' as const, programBindingId: 'binding-1', synchronizedTargets: [
+      kind: 'group' as const, programBindingId: 'binding-1', groupTargets: [
         { componentRoleId: 'robot', targetRoleId: 'arm' },
         { componentRoleId: 'robot', targetRoleId: 'gripper' },
       ],
@@ -89,8 +89,8 @@ describe('runtime-scale control reads', () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(runtimeScaleResponse({
         ...selector,
-        synchronizedTargets: [
-          selector.synchronizedTargets[0],
+        groupTargets: [
+          selector.groupTargets[0],
           { componentRoleId: 'robot', targetRoleId: 'camera' },
         ],
       })))
@@ -104,7 +104,7 @@ describe('runtime-scale control reads', () => {
 
   it('validates a deferred response against a selector snapshot', async () => {
     const selector = {
-      kind: 'group' as const, programBindingId: 'binding-1', synchronizedTargets: [
+      kind: 'group' as const, programBindingId: 'binding-1', groupTargets: [
         { componentRoleId: 'robot', targetRoleId: 'arm' },
         { componentRoleId: 'robot', targetRoleId: 'gripper' },
       ],
@@ -115,9 +115,9 @@ describe('runtime-scale control reads', () => {
     })));
     const pending = api.execution.runtimeScaleControl(selector);
     selector.programBindingId = 'binding-crossed';
-    selector.synchronizedTargets[0].targetRoleId = 'camera';
+    selector.groupTargets[0].targetRoleId = 'camera';
     resolveResponse?.(response(runtimeScaleResponse({
-      kind: 'group', programBindingId: 'binding-1', synchronizedTargets: [
+      kind: 'group', programBindingId: 'binding-1', groupTargets: [
         { componentRoleId: 'robot', targetRoleId: 'arm' },
         { componentRoleId: 'robot', targetRoleId: 'gripper' },
       ],
@@ -127,12 +127,12 @@ describe('runtime-scale control reads', () => {
 
   it('accepts a group response whose target order differs', async () => {
     const selector = {
-      kind: 'group' as const, programBindingId: 'binding-1', synchronizedTargets: [
+      kind: 'group' as const, programBindingId: 'binding-1', groupTargets: [
         { componentRoleId: 'robot', targetRoleId: 'arm' },
         { componentRoleId: 'robot', targetRoleId: 'gripper' },
       ],
     };
-    const returned = { ...selector, synchronizedTargets: [...selector.synchronizedTargets].reverse() };
+    const returned = { ...selector, groupTargets: [...selector.groupTargets].reverse() };
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(runtimeScaleResponse(returned))));
     await expect(api.execution.runtimeScaleControl(selector)).resolves.toMatchObject({ selector: { kind: 'group' } });
   });
@@ -185,14 +185,14 @@ function runtimeScaleResponse(selector: RuntimeScaleControlSelector): Record<str
       target_role_id: selector.targetRoleId,
     } : {
       program_binding_id: selector.programBindingId,
-      synchronized_targets: selector.synchronizedTargets.map((target) => ({
+      group_targets: selector.groupTargets.map((target) => ({
         component_role_id: target.componentRoleId,
         target_role_id: target.targetRoleId,
       })),
     },
     supported: true,
     ...(selector.kind === 'group'
-      ? { synchronized_members: selector.synchronizedTargets.map(member) }
+      ? { group_members: selector.groupTargets.map(member) }
       : {}),
   };
   return {

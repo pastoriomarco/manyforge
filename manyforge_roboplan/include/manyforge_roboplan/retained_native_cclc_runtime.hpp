@@ -6,6 +6,7 @@
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <functional>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
@@ -17,6 +18,14 @@ struct RetainedNativeCCLCRuntimeConfig final {
 
   [[nodiscard]] bool locally_valid() const noexcept;
 };
+
+/// Derive the canonical state-authority projection shared by lifecycle-managed
+/// and fixed direct native routes. Every resource is tied to the exact retained
+/// control bindings that may publish its observations.
+[[nodiscard]] core::Result<
+    std::vector<core::KinematicResourceSourceProjectionDTO>>
+DeriveRetainedNativeStateSourceProjections(
+    std::span<const core::RuntimeParticipantBinding> physical_bindings);
 
 /// Construct the CCLC owner and verified observation sources without starting
 /// workers or request admission. The caller explicitly invokes Start.

@@ -709,7 +709,7 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
     assert RuntimeScaleControlRequest.model_validate(scale_control).scale == 0.4
     group_selector = {
         "program_binding_id": "binding-1",
-        "synchronized_targets": [
+        "group_targets": [
             {"component_role_id": "robot-a", "target_role_id": "arm"},
             {"component_role_id": "robot-b", "target_role_id": "arm"},
         ],
@@ -731,7 +731,7 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
                 **scale_control,
                 "selector": {
                     **group_selector,
-                    "synchronized_targets": [
+                    "group_targets": [
                         {"component_role_id": "robot-a", "target_role_id": "arm"},
                         {"component_role_id": "robot-a", "target_role_id": "arm"},
                     ],
@@ -770,7 +770,7 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
         ("target_role_id", "e\u0301"),
     ):
         invalid_group = deepcopy(group_selector)
-        invalid_group["synchronized_targets"][0][field] = value
+        invalid_group["group_targets"][0][field] = value
         with pytest.raises(ValidationError):
             RuntimeScaleControlRequest.model_validate(
                 {**scale_control, "selector": invalid_group}

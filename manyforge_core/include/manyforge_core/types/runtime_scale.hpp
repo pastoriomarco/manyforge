@@ -31,9 +31,10 @@ struct RuntimeScaleControlSelectorDTO final {
   ProgramBindingId program_binding_id;
   ComponentRoleId component_role_id;
   TargetRoleId target_role_id;
-  /// Alternative to the singular roles: the complete synchronized motion set.
-  /// This selects control scopes, not Program membership or Run authority.
-  std::vector<RuntimeScaleControlTargetDTO> synchronized_targets{};
+  /// Alternative to the singular roles: the complete execution-group target
+  /// set published by the Kernel. This selects control scopes, not Program
+  /// membership or Run authority, and does not imply synchronized timing.
+  std::vector<RuntimeScaleControlTargetDTO> group_targets{};
 
   friend bool operator==(const RuntimeScaleControlSelectorDTO&,
                          const RuntimeScaleControlSelectorDTO&) = default;
@@ -99,7 +100,7 @@ struct RuntimeScaleControlStatusDTO final {
   std::optional<double> effective_scale;
   std::optional<RuntimeScaleApplicationState> application_state;
   std::optional<ErrorDTO> reason;
-  std::vector<RuntimeScaleControlMemberDTO> synchronized_members{};
+  std::vector<RuntimeScaleControlMemberDTO> group_members{};
 };
 
 [[nodiscard]] constexpr const char* to_string(

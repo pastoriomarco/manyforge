@@ -651,7 +651,7 @@ export function ProgramTransportControls({
     ?? robot.runtimeScaleStatus?.reason
     ?? 'The addressed target does not currently expose qualified runtime velocity control.';
   const velocityGroup = robot.runtimeScaleStatus?.selector.kind === 'group'
-    ? robot.runtimeScaleStatus.selector.synchronizedTargets : null;
+    ? robot.runtimeScaleStatus.selector.groupTargets : null;
   const fullCellStop = robot.state.status?.cellStopAction ?? null;
   const fullStopReason = fullCellStop === null
     ? 'The current execution owner status is unavailable.'

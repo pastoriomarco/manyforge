@@ -200,6 +200,15 @@ void write_exact_file(const std::filesystem::path &path,
            {"robot", CanonicalValue(CanonicalValue::Object{})},
        })},
       {"target_roles", CanonicalValue(std::move(target_roles))},
+      {"execution_groups",
+       CanonicalValue(CanonicalValue::Object{
+           {"selection.a",
+            CanonicalValue(CanonicalValue::Object{
+                {"execution_policy", CanonicalValue("independent")}})},
+           {"selection.b",
+            CanonicalValue(CanonicalValue::Object{
+                {"execution_policy", CanonicalValue("independent")}})},
+       })},
       {"tree", CanonicalValue(CanonicalValue::Object{
                    {"node_id", CanonicalValue("sequence")},
                    {"instance_id", CanonicalValue("root")},

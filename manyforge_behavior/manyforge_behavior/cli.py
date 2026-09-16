@@ -21,7 +21,10 @@ from manyforge_behavior.node_environment import (
 from manyforge_behavior.pick_place_migration import (
     migrate_composite_pick_place_program,
 )
-from manyforge_behavior.program import migrate_program_v1
+from manyforge_behavior.program import (
+    migrate_program_execution_groups,
+    migrate_program_v1,
+)
 
 
 def _build(_args: argparse.Namespace):
@@ -140,6 +143,13 @@ def _program_migrate_pick_place(args: argparse.Namespace) -> int:
     return _write_program_no_clobber(program, args.output)
 
 
+def _program_migrate_execution_groups(args: argparse.Namespace) -> int:
+    program = migrate_program_execution_groups(
+        load_strict_json_yaml(args.input), NodeCatalog(BUILTIN_CATALOG_PATH)
+    )
+    return _write_program_no_clobber(program, args.output)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="manyforge")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -179,6 +189,15 @@ def _parser() -> argparse.ArgumentParser:
         "--output", required=True, help="new path; existing files are never overwritten"
     )
     migrate.set_defaults(handler=_program_migrate)
+    migrate_groups = program_commands.add_parser(
+        "migrate-execution-groups",
+        help="replace the former v2 synchronization list with policy definitions",
+    )
+    migrate_groups.add_argument("--input", required=True)
+    migrate_groups.add_argument(
+        "--output", required=True, help="new path; existing files are never overwritten"
+    )
+    migrate_groups.set_defaults(handler=_program_migrate_execution_groups)
     migrate_pick_place = program_commands.add_parser(
         "migrate-pick-place",
         help=(

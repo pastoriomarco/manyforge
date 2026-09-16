@@ -62,13 +62,34 @@ struct ProgramExecutionNodeDTO final {
   friend bool operator==(const ProgramExecutionNodeDTO&, const ProgramExecutionNodeDTO&) = default;
 };
 
+enum class ProgramExecutionPolicy {
+  kIndependent,
+  kCommonStart,
+  kCommonStartAndFinish,
+  kSyncOffsetTrajectory,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(const ProgramExecutionPolicy value) noexcept {
+  switch (value) {
+    case ProgramExecutionPolicy::kIndependent:
+      return "independent";
+    case ProgramExecutionPolicy::kCommonStart:
+      return "common_start";
+    case ProgramExecutionPolicy::kCommonStartAndFinish:
+      return "common_start_and_finish";
+    case ProgramExecutionPolicy::kSyncOffsetTrajectory:
+      return "sync_offset_traj";
+  }
+  return "independent";
+}
+
 struct ProgramExecutionSelectionDTO final {
   std::string group_id;
   // Sorted indices into ProgramExecutionTableDTO::nodes; names are stored once.
   std::vector<std::uint32_t> node_indices;
-  /// True only when this exact authored group is an optional coordinated
-  /// execution set. Ordinary overlapping control groups remain independent.
-  bool synchronized{};
+  /// One authored execution policy. UI6-I qualifies kIndependent; later
+  /// synchronized policies remain explicit and fail before effects until F2.
+  ProgramExecutionPolicy execution_policy{ProgramExecutionPolicy::kIndependent};
 
   friend bool operator==(const ProgramExecutionSelectionDTO&,
                          const ProgramExecutionSelectionDTO&) = default;

@@ -667,10 +667,30 @@ struct DerivedRuntimeClosure final {
   }
   result.brand_ports = std::move(brand_ports);
 
+  auto projections =
+      DeriveRetainedNativeStateSourceProjections(physical_bindings);
+  if (!projections.ok()) {
+    return core::Result<DerivedRuntimeClosure>::Err(projections.error());
+  }
+  result.source_projections = std::move(projections.value());
+  return core::Result<DerivedRuntimeClosure>::Ok(std::move(result));
+}
+
+} // namespace
+
+core::Result<std::vector<core::KinematicResourceSourceProjectionDTO>>
+DeriveRetainedNativeStateSourceProjections(
+    const std::span<const core::RuntimeParticipantBinding> physical_bindings) {
   std::map<core::ResourceId, core::KinematicResourceSourceProjectionDTO>
       projections;
   for (const auto &physical : physical_bindings) {
     const auto &participant = physical.value();
+    if (!participant.control_path.has_value()) {
+      return reject<
+          std::vector<core::KinematicResourceSourceProjectionDTO>>(
+          "native_state_source_path_missing",
+          "native state-source projection has no retained control path");
+    }
     const auto &path = *participant.control_path;
     for (const auto &resource : participant.resources) {
       const core::KinematicControlBindingSourceDTO source{
@@ -697,17 +717,19 @@ struct DerivedRuntimeClosure final {
             projection.publication_source !=
                 publication_source(path.state_authority_class))) ||
           std::find(projection.contributing_control_bindings.begin(),
-                    projection.contributing_control_bindings.end(),
-                    source) != projection.contributing_control_bindings.end()) {
-        return reject<DerivedRuntimeClosure>(
-            "native_cclc_source_projection_ambiguous",
+                    projection.contributing_control_bindings.end(), source) !=
+              projection.contributing_control_bindings.end()) {
+        return reject<
+            std::vector<core::KinematicResourceSourceProjectionDTO>>(
+            "native_state_source_projection_ambiguous",
             "one native resource has conflicting or duplicate state-source "
             "authority");
       }
       projection.contributing_control_bindings.push_back(source);
     }
   }
-  result.source_projections.reserve(projections.size());
+  std::vector<core::KinematicResourceSourceProjectionDTO> result;
+  result.reserve(projections.size());
   for (auto &[resource_id, projection] : projections) {
     (void)resource_id;
     std::sort(projection.contributing_control_bindings.begin(),
@@ -718,12 +740,12 @@ struct DerivedRuntimeClosure final {
                        std::tie(rhs.control_binding_id,
                                 rhs.control_binding_revision);
               });
-    result.source_projections.push_back(std::move(projection));
+    result.push_back(std::move(projection));
   }
-  return core::Result<DerivedRuntimeClosure>::Ok(std::move(result));
+  return core::Result<
+      std::vector<core::KinematicResourceSourceProjectionDTO>>::Ok(
+      std::move(result));
 }
-
-} // namespace
 
 bool RetainedNativeCCLCRuntimeConfig::locally_valid() const noexcept {
   return composition.locally_valid() && controller_observation_freshness_ns > 0;

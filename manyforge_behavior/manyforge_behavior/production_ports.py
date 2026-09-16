@@ -371,8 +371,6 @@ class _BoundContext:
     targets: Mapping[str, _TargetBinding]
     contact_grasps: Mapping[str, _ContactGraspBinding]
     request_owner_epoch: str
-    synchronized_groups: Mapping[str, tuple[str, ...]]
-    synchronized_node_groups: Mapping[str, str]
 
 
 class _SceneProgramTransport(Protocol):
@@ -446,15 +444,6 @@ class _UnknownOperationAdmission:
 
 
 @dataclass(slots=True)
-class _CoordinatedStart:
-    group_id: str
-    expected_node_ids: tuple[str, ...]
-    tasks: dict[str, _OperationTask] = field(default_factory=dict)
-    participants: dict[str, Mapping[str, Any]] = field(default_factory=dict)
-    dispatching: bool = False
-
-
-@dataclass(slots=True)
 class _ProgramScopeStop:
     owner_epoch: str
     pending: int = 0
@@ -480,7 +469,6 @@ class NativeKernelProgramPort:
         self._current_owner_epoch = current_owner_epoch
         self._contexts: dict[str, _BoundContext] = {}
         self._tasks: dict[str, _OperationTask] = {}
-        self._coordinated_starts: dict[tuple[str, str], _CoordinatedStart] = {}
         self._scope_stops: dict[str, _ProgramScopeStop] = {}
         self._lock = RLock()
         self.operations = _NativeKernelOperationTaskPort(self)
@@ -489,46 +477,25 @@ class NativeKernelProgramPort:
         self.scope = _NativeKernelProgramScopePort(self)
 
     @staticmethod
-    def _synchronized_groups(
-        program: Mapping[str, Any],
-    ) -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
-        selected = program.get("synchronized_execution_groups", ())
-        if not isinstance(selected, (list, tuple)):
-            raise ProductionPortError("synchronized execution groups are invalid")
-        group_names = tuple(selected)
-        if any(not isinstance(name, str) or not name for name in group_names):
-            raise ProductionPortError("synchronized execution group identity is invalid")
-        members: dict[str, list[str]] = {name: [] for name in group_names}
-        tree = program.get("tree")
-        if not group_names:
-            return {}, {}
-        if not isinstance(tree, Mapping):
-            raise ProductionPortError("synchronized Program has no tree")
-        pending = [tree]
-        while pending:
-            node = pending.pop()
-            instance_id = _text(node.get("instance_id"), field="tree.instance_id")
-            groups = node.get("execution_groups", "inherit")
-            if isinstance(groups, (list, tuple)):
-                for group_name in group_names:
-                    if group_name in groups:
-                        members[group_name].append(instance_id)
-            children = node.get("children", ())
-            if not isinstance(children, (list, tuple)) or any(
-                not isinstance(child, Mapping) for child in children
-            ):
-                raise ProductionPortError("synchronized Program tree is invalid")
-            pending.extend(reversed(children))
-        exact = {name: tuple(sorted(values)) for name, values in members.items()}
-        by_node: dict[str, str] = {}
-        for group_name, values in exact.items():
-            if len(values) < 2:
-                raise ProductionPortError("synchronized execution group is incomplete")
-            for instance_id in values:
-                if instance_id in by_node:
-                    raise ProductionPortError("synchronized execution groups overlap")
-                by_node[instance_id] = group_name
-        return exact, by_node
+    def _validate_execution_group_policies(program: Mapping[str, Any]) -> None:
+        definitions = program.get("execution_groups", {})
+        if not isinstance(definitions, Mapping):
+            raise ProductionPortError("execution group definitions are invalid")
+        for name, raw_definition in definitions.items():
+            if not isinstance(name, str) or not name or not isinstance(raw_definition, Mapping):
+                raise ProductionPortError("execution group definition is invalid")
+            policy = raw_definition.get("execution_policy")
+            if policy == "independent":
+                continue
+            if policy not in {
+                "common_start",
+                "common_start_and_finish",
+                "sync_offset_traj",
+            }:
+                raise ProductionPortError("execution group policy is invalid")
+            raise ProductionPortError(
+                f"execution policy {policy!r} is declared but unavailable until F2"
+            )
 
     @staticmethod
     def _parse_context(
@@ -598,16 +565,12 @@ class NativeKernelProgramPort:
                 policy_id,
                 runtime_object_id,
             )
-        synchronized_groups, synchronized_node_groups = (
-            NativeKernelProgramPort._synchronized_groups(context.program)
-        )
+        NativeKernelProgramPort._validate_execution_group_policies(context.program)
         return _BoundContext(
             context,
             targets,
             contact_grasps,
             _text(request_owner_epoch, field="request_owner_epoch"),
-            synchronized_groups,
-            synchronized_node_groups,
         )
 
     def bind(self, context: ProgramRunPortContext) -> None:
@@ -644,16 +607,11 @@ class NativeKernelProgramPort:
         tasks, local_tasks = self._run_operation_tasks(program_run_id)
         if any(task.terminal is None and not task.held_before_admission for task in local_tasks):
             raise ProductionPortError(
-                "cannot unbind a Program run with a staged coordinated operation"
+                "cannot unbind a Program run with an unresolved local operation"
             )
         with self._lock:
             for task in local_tasks:
                 self._tasks.pop(task.task_id, None)
-            self._coordinated_starts = {
-                key: batch
-                for key, batch in self._coordinated_starts.items()
-                if key[0] != program_run_id
-            }
         completed: list[_OperationTask] = []
         for task in tasks:
             _operation, snapshot = self._observation(task)
@@ -1562,21 +1520,6 @@ class NativeKernelProgramPort:
             "payload": payload,
         }
         self._require_scope_open(identity.program_run_id)
-        synchronized_group = context.synchronized_node_groups.get(
-            identity.node_instance_id
-        )
-        if synchronized_group is not None:
-            if node_id not in _MOTION_NODE_IDS:
-                raise ProductionPortError(
-                    "only ordinary motion may use synchronized execution"
-                )
-            return self._stage_coordinated_start(
-                context,
-                synchronized_group,
-                identity,
-                node_id,
-                participant,
-            )
         owner_epoch, scene_revision = self._owner_status(context)
         request_id = _request_identity(
             "program-node", identity.program_run_id, identity.node_attempt_id
@@ -1682,174 +1625,6 @@ class NativeKernelProgramPort:
             "coordination_policy": coordination_policy,
         }
 
-    def _stage_coordinated_start(
-        self,
-        context: _BoundContext,
-        group_id: str,
-        identity: NodeAttemptIdentity,
-        node_id: str,
-        participant: Mapping[str, Any],
-    ) -> OwnerTaskSnapshot:
-        task_id = _request_identity(
-            "program-coordinated-node",
-            identity.program_run_id,
-            identity.node_attempt_id,
-        )
-        key = (identity.program_run_id, group_id)
-        with self._lock:
-            if task_id in self._tasks:
-                raise ProductionPortError("coordinated node attempt was already staged")
-            if len(self._tasks) >= _MAX_TASKS:
-                raise ProductionPortError("native operation-task retention is full")
-            expected = context.synchronized_groups[group_id]
-            batch = self._coordinated_starts.get(key)
-            if batch is None:
-                batch = _CoordinatedStart(group_id, expected)
-                self._coordinated_starts[key] = batch
-            if batch.expected_node_ids != expected or batch.dispatching:
-                raise ProductionPortError("coordinated start occurrence is already active")
-            if identity.node_instance_id not in expected:
-                raise ProductionPortError("coordinated node is outside its captured group")
-            if identity.node_instance_id in batch.tasks:
-                raise ProductionPortError("coordinated group repeats a node occurrence")
-            task = _OperationTask(identity, node_id, task_id)
-            batch.tasks[identity.node_instance_id] = task
-            batch.participants[identity.node_instance_id] = dict(participant)
-            self._tasks[task_id] = task
-            if len(batch.tasks) != len(expected):
-                return OwnerTaskSnapshot(
-                    task_id=task_id,
-                    state=OwnerTaskState.ACTIVE,
-                    metadata={
-                        "synchronized_group_id": group_id,
-                        "preparation_state": "waiting_for_participants",
-                    },
-                )
-            batch.dispatching = True
-            tasks = tuple(batch.tasks[node] for node in expected)
-            participants = tuple(batch.participants[node] for node in expected)
-
-        request_id = _request_identity(
-            "program-coordinated-operation",
-            identity.program_run_id,
-            group_id,
-            *(task.identity.node_attempt_id for task in tasks),
-        )
-        try:
-            owner_epoch, scene_revision = self._owner_status(context)
-        except Exception as error:
-            # No operation submission was attempted, so this local failure is
-            # conclusively effect-free.
-            with self._lock:
-                self._coordinated_starts.pop(key, None)
-                for staged in tasks:
-                    staged.terminal = OwnerTaskSnapshot(
-                        task_id=staged.task_id,
-                        state=OwnerTaskState.FAILED,
-                        reason_code="coordinated_admission_preflight_failed",
-                        message=str(error),
-                        settlement_proven=True,
-                        metadata={
-                            "request_id": request_id,
-                            "synchronized_group_id": group_id,
-                        },
-                    )
-            assert task.terminal is not None
-            return task.terminal
-
-        operation_intent = self._operation_intent(
-            context,
-            request_id=request_id,
-            owner_epoch=owner_epoch,
-            scene_revision=scene_revision,
-            participants=participants,
-            coordination_policy="coordinated_all",
-        )
-        try:
-            accepted = self._kernel.execute(operation_intent)
-            accepted_value = _mapping(accepted.get("accepted"), field="acceptance")
-            operation_id = _text(
-                accepted_value.get("operation_id"), field="accepted.operation_id"
-            )
-        except KernelOperationAdmissionRejectedError as error:
-            code = error.code
-            revision = _held_selection_revision(error)
-            held = revision is not None
-            with self._lock:
-                self._coordinated_starts.pop(key, None)
-                for staged in tasks:
-                    if held:
-                        staged.held_before_admission = True
-                    else:
-                        staged.terminal = OwnerTaskSnapshot(
-                            task_id=staged.task_id,
-                            state=OwnerTaskState.FAILED,
-                            reason_code=(code or "coordinated_admission_failed"),
-                            message=str(error),
-                            settlement_proven=True,
-                            metadata={
-                                "request_id": request_id,
-                                "synchronized_group_id": group_id,
-                            },
-                        )
-                if held:
-                    self._tasks.pop(task_id, None)
-            if held:
-                raise OwnerInvocationHeldError(revision) from error
-            assert task.terminal is not None
-            return task.terminal
-        except Exception as error:
-            # Delivery, response parsing, and response-identity failures are
-            # outcome-unknown: acceptance may already be durable in the
-            # Kernel. Retain the attempts until Program Stop/Reset reconciles
-            # the run; never turn uncertainty into settlement proof.
-            with self._lock:
-                self._coordinated_starts.pop(key, None)
-                unknown = _UnknownOperationAdmission(
-                    request_id,
-                    owner_epoch,
-                    deepcopy(operation_intent),
-                    frozenset(staged.task_id for staged in tasks),
-                )
-                for staged in tasks:
-                    staged.terminal = OwnerTaskSnapshot(
-                        task_id=staged.task_id,
-                        state=OwnerTaskState.FAILED,
-                        reason_code="coordinated_admission_outcome_unknown",
-                        message=str(error),
-                        settlement_proven=False,
-                        metadata={
-                            "request_id": request_id,
-                            "synchronized_group_id": group_id,
-                        },
-                    )
-                    staged.unknown_admission = unknown
-            assert task.terminal is not None
-            return task.terminal
-
-        shared = _SharedOperation(
-            operation_id,
-            owner_epoch,
-            frozenset(task.identity.node_attempt_id for task in tasks),
-            frozenset(task.task_id for task in tasks),
-        )
-        with self._lock:
-            current = self._coordinated_starts.get(key)
-            if current is not batch:
-                raise ProductionPortError("coordinated start changed during admission")
-            for staged in tasks:
-                staged.operation = shared
-            self._coordinated_starts.pop(key, None)
-        return OwnerTaskSnapshot(
-            task_id=task_id,
-            state=OwnerTaskState.ACTIVE,
-            metadata={
-                "operation_id": operation_id,
-                "synchronized_group_id": group_id,
-            },
-        )
-
-    @staticmethod
     def _terminal_error(operation: Mapping[str, Any]) -> tuple[str, str]:
         participants = operation.get("participants")
         if isinstance(participants, list):
@@ -2105,23 +1880,7 @@ class NativeKernelProgramPort:
         if task.terminal is not None:
             return
         if task.operation is None:
-            # No native effect exists yet.  Remove this sibling from the one
-            # local preparation barrier; the Parallel parent will invalidate
-            # the remaining staged siblings when another child fails.
-            with self._lock:
-                for key, batch in tuple(self._coordinated_starts.items()):
-                    if batch.dispatching:
-                        continue
-                    instance_id = task.identity.node_instance_id
-                    if batch.tasks.get(instance_id) is not task:
-                        continue
-                    batch.tasks.pop(instance_id, None)
-                    batch.participants.pop(instance_id, None)
-                    self._tasks.pop(task.task_id, None)
-                    if not batch.tasks:
-                        self._coordinated_starts.pop(key, None)
-                    return
-            raise ProductionPortError("staged coordinated task is not retained")
+            raise ProductionPortError("local operation has no native effect or terminal result")
         operation, snapshot = self._observation(task)
         if snapshot.state is not OwnerTaskState.ACTIVE:
             return
@@ -2443,20 +2202,6 @@ class NativeKernelProgramPort:
                     for task in tasks:
                         assert task.operation is not None
                         task.operation.stop_requested = True
-                    waiting_task_ids = {
-                        staged.task_id
-                        for (run_id, _group_id), batch in self._coordinated_starts.items()
-                        if run_id == program_run_id and not batch.dispatching
-                        for staged in batch.tasks.values()
-                    }
-                    for task in local_tasks:
-                        if task.task_id in waiting_task_ids:
-                            task.held_before_admission = True
-                    self._coordinated_starts = {
-                        key: batch
-                        for key, batch in self._coordinated_starts.items()
-                        if key[0] != program_run_id or batch.dispatching
-                    }
                 elif stop.active is not None:
                     retained_count = stop.active[2]
                 if (
@@ -2576,11 +2321,6 @@ class NativeKernelProgramPort:
         with self._lock:
             for task in local_tasks:
                 self._tasks.pop(task.task_id, None)
-            self._coordinated_starts = {
-                key: batch
-                for key, batch in self._coordinated_starts.items()
-                if key[0] != program_run_id
-            }
 
         settled = self._finish_scope_stop(program_run_id, release_fence=False)
         if settled.state is not ProgramRunScopeState.SETTLED:

@@ -2221,19 +2221,19 @@ class ComposerDraftSession:
             "description",
             "program_profile",
             "compatibility",
-            "synchronized_execution_groups",
+            "execution_groups",
         }
         if set(arguments) != required:
             _error(
                 "draft_arguments_invalid",
                 "program_draft_update_settings requires exactly name, description, "
-                "program_profile, compatibility, and synchronized_execution_groups",
+                "program_profile, compatibility, and execution_groups",
             )
         name = arguments["name"]
         description = arguments["description"]
         program_profile = arguments["program_profile"]
         compatibility = arguments["compatibility"]
-        synchronized_groups = arguments["synchronized_execution_groups"]
+        execution_groups = arguments["execution_groups"]
         if type(name) is not str or not name.strip():
             _error("draft_arguments_invalid", "Program name must be non-empty text")
         if type(description) is not str:
@@ -2242,14 +2242,24 @@ class ComposerDraftSession:
             _error("draft_arguments_invalid", "Program profile must be text")
         if type(compatibility) is not dict:
             _error("draft_arguments_invalid", "Program compatibility must be an object")
-        if (
-            type(synchronized_groups) is not list
-            or any(type(group) is not str for group in synchronized_groups)
-        ):
+        if type(execution_groups) is not dict:
             _error(
                 "draft_arguments_invalid",
-                "synchronized_execution_groups must be an array of group IDs",
+                "execution_groups must be an object",
             )
+        for group_id, definition in execution_groups.items():
+            if (
+                type(group_id) is not str
+                or type(definition) is not dict
+                or set(definition) != {"execution_policy"}
+                or definition["execution_policy"] not in {
+                    "independent",
+                    "common_start",
+                    "common_start_and_finish",
+                    "sync_offset_traj",
+                }
+            ):
+                _error("draft_arguments_invalid", "execution group definition is invalid")
 
         document["name"] = name.strip()
         document["program_profile"] = program_profile
@@ -2261,10 +2271,12 @@ class ComposerDraftSession:
             document["compatibility"] = deepcopy(compatibility)
         else:
             document.pop("compatibility", None)
-        if synchronized_groups:
-            document["synchronized_execution_groups"] = deepcopy(synchronized_groups)
+        if execution_groups:
+            document["execution_groups"] = {
+                key: deepcopy(execution_groups[key]) for key in sorted(execution_groups)
+            }
         else:
-            document.pop("synchronized_execution_groups", None)
+            document.pop("execution_groups", None)
         return {"updated": True}
 
     @staticmethod

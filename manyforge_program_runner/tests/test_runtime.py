@@ -3415,6 +3415,140 @@ def test_runtime_controls_are_state_conditioned_and_restore_current_projection(
     restored.shutdown()
 
 
+@pytest.mark.parametrize(
+    "node_id",
+    ["motion.move_to_joint_target", "motion.move_to_pose"],
+)
+def test_runtime_override_uses_the_held_multi_robot_target(node_id: str) -> None:
+    program_run_id = "program-run.multi.1"
+    intervention = SimpleNamespace(
+        identity=SimpleNamespace(
+            node_instance_id="move.ur5e",
+            node_attempt_id="attempt.ur5e.1",
+        )
+    )
+    capture = SimpleNamespace(
+        graph_revision=_DIGEST_A,
+        retained_bundle_id=_DIGEST_B,
+        program_binding_id="sha256:" + "c" * 64,
+    )
+    parameters = {
+        "target_role": "ur5e_arm",
+        "base_frame_role": "base",
+        "tcp_frame_role": "tcp",
+        "target_mode": "absolute",
+        "goal": {},
+    }
+
+    class Owner:
+        def intervention(self, selected_run_id):
+            assert selected_run_id == program_run_id
+            return intervention
+
+        def read(self, selected_run_id):
+            assert selected_run_id == program_run_id
+            return SimpleNamespace(capture=capture)
+
+        def runtime_override_source_context(self, selected_run_id, **selection):
+            assert selected_run_id == program_run_id
+            assert selection == {"node_instance_id": "move.ur5e"}
+            return {
+                "node_id": node_id,
+                "parameters": parameters,
+                "target_binding": {
+                    "target_role_id": "ur5e_arm",
+                    "controllable_component_id": "ur5e_robot",
+                    "command_target_id": "arm",
+                },
+            }
+
+        def validate_runtime_override(self, selected_run_id, **candidate):
+            assert selected_run_id == program_run_id
+            return candidate["value"]
+
+    class Kernel:
+        queries: list[dict[str, Any]] = []
+
+        def observation(self):
+            return {
+                "ok": True,
+                "observation": {
+                    "owner_epoch": "kernel.1",
+                    "graph_revision": _DIGEST_A,
+                    "retained_bundle_id": _DIGEST_B,
+                    "targets": [
+                        {
+                            "controllable_component_id": "lite6_robot",
+                            "command_target_id": "arm",
+                            "source_joint_names": ["joint1"],
+                            "positions_si": [0.1],
+                            "source_epoch": "lite6.source.1",
+                            "source_sequence": 3,
+                        },
+                        {
+                            "controllable_component_id": "ur5e_robot",
+                            "command_target_id": "arm",
+                            "source_joint_names": ["shoulder_pan_joint"],
+                            "positions_si": [-0.4],
+                            "source_epoch": "ur5e.source.1",
+                            "source_sequence": 7,
+                        },
+                    ],
+                },
+            }
+
+        def query_target(self, query):
+            self.queries.append(deepcopy(query))
+            return {
+                "ok": True,
+                "target_observation": {
+                    **query,
+                    "source_epoch": "ur5e.source.1",
+                    "source_sequence": 7,
+                    "value": {
+                        "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
+                        "orientation": {
+                            "x": 0.0,
+                            "y": 0.0,
+                            "z": 0.0,
+                            "w": 1.0,
+                        },
+                    },
+                },
+            }
+
+    runtime = object.__new__(ProgramRuntime)
+    runtime._owner = Owner()  # type: ignore[attr-defined]
+    runtime._kernel = Kernel()  # type: ignore[attr-defined]
+
+    candidate = runtime._runtime_override_observation_candidate(program_run_id)
+
+    assert candidate["available"] is True
+    assert candidate["source_observation_id"] == "ur5e.source.1"
+    assert candidate["source_owner_generation"] == 7
+    if node_id == "motion.move_to_joint_target":
+        assert candidate["value"] == [
+            {"joint_name": "shoulder_pan_joint", "position_rad": -0.4}
+        ]
+        assert runtime._kernel.queries == []  # type: ignore[attr-defined]
+    else:
+        assert candidate["value"] == {
+            "position_m": [0.1, 0.2, 0.3],
+            "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+        }
+        assert runtime._kernel.queries == [  # type: ignore[attr-defined]
+            {
+                "schema_version": "manyforge.target_observation_query.v1",
+                "owner_epoch": "kernel.1",
+                "program_binding_id": "sha256:" + "c" * 64,
+                "target_role_id": "ur5e_arm",
+                "kind": "frame_pose",
+                "frame_role_id": "tcp",
+                "relative_to_frame_role_id": "base",
+            }
+        ]
+
+
 def test_replacement_owner_remains_fail_closed_for_later_reconciliation_owner(
     tmp_path,
 ) -> None:

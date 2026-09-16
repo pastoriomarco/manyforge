@@ -514,7 +514,7 @@ export interface RuntimeScaleControlSingularSelector {
 export interface RuntimeScaleControlGroupSelector {
   kind: 'group';
   programBindingId: string;
-  synchronizedTargets: RuntimeScaleControlTarget[];
+  groupTargets: RuntimeScaleControlTarget[];
 }
 
 export interface RuntimeScaleControlTarget {
@@ -546,7 +546,7 @@ export interface RuntimeScaleControlStatus {
   effectiveScale: number | null;
   applicationState: RuntimeScaleApplicationState | null;
   reason: string | null;
-  synchronizedMembers?: RuntimeScaleControlMember[];
+  groupMembers?: RuntimeScaleControlMember[];
 }
 
 export interface RuntimeScaleControlMember extends RuntimeScaleControlTarget {

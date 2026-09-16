@@ -17,11 +17,7 @@ PACKAGE_PREFIX = "package://qualified_models/example/"
 
 
 def _minimal_urdf(*children: str) -> bytes:
-    return (
-        '<robot name="qualified">'
-        + "".join(children)
-        + "</robot>"
-    ).encode()
+    return ('<robot name="qualified">' + "".join(children) + "</robot>").encode()
 
 
 def _prepare(
@@ -66,11 +62,15 @@ def test_preparation_is_deterministic_resolver_free_and_structural() -> None:
         "ros2_control": 1,
         "transmission": 1,
     }
+    assert dict(first.removed_nested_elements) == {
+        "collision.surface": 0,
+    }
+    assert dict(first.removed_duplicate_srdf_elements) == {
+        "disable_collisions": 0,
+    }
     assert first.resources == (
         subject.PreparedResourceReference(
-            asset_uri=(
-                "asset://qualified_model/meshes/missing.stl"
-            ),
+            asset_uri=("asset://qualified_model/meshes/missing.stl"),
             kind="mesh",
             occurrence_count=1,
             original_package_uri=(
@@ -82,10 +82,7 @@ def test_preparation_is_deterministic_resolver_free_and_structural() -> None:
     assert b"ros2_control" not in first.urdf_bytes
     assert b"transmission" not in first.urdf_bytes
     assert b"gazebo" not in first.urdf_bytes
-    assert (
-        b'filename="asset://qualified_model/meshes/missing.stl"'
-        in first.urdf_bytes
-    )
+    assert b'filename="asset://qualified_model/meshes/missing.stl"' in first.urdf_bytes
     assert first.srdf_bytes is not None
     assert ET.fromstring(first.srdf_bytes).find("./group") is not None
 
@@ -96,11 +93,53 @@ def test_runtime_only_elements_are_rejected_when_nested(tag: str) -> None:
         subject.StructuralModelPreparationError,
         match="must be a direct <robot> child",
     ):
-        _prepare(
-            _minimal_urdf(
-                f'<link name="base"><{tag}/></link>'
-            )
+        _prepare(_minimal_urdf(f'<link name="base"><{tag}/></link>'))
+
+
+def test_simulator_collision_surface_is_removed_and_recorded() -> None:
+    prepared = _prepare(
+        _minimal_urdf(
+            '<link name="base"><collision><geometry><box size="1 1 1"/>'
+            "</geometry><surface><contact><ode><min_depth>0.001</min_depth>"
+            "</ode></contact></surface></collision></link>"
         )
+    )
+
+    assert b"surface" not in prepared.urdf_bytes
+    assert b"min_depth" not in prepared.urdf_bytes
+    prepared_root = ET.fromstring(prepared.urdf_bytes)
+    collision = prepared_root.find("./link[@name='base']/collision")
+    assert collision is not None
+    box = collision.find("./geometry/box")
+    assert box is not None
+    assert box.attrib == {"size": "1 1 1"}
+    assert dict(prepared.removed_nested_elements) == {
+        "collision.surface": 1,
+    }
+
+
+def test_duplicate_srdf_disabled_collision_is_removed_and_recorded() -> None:
+    srdf = (
+        '<robot name="qualified">'
+        '<disable_collisions link1="arm" link2="tool" reason="Adjacent"/>'
+        '<disable_collisions link1="tool" link2="arm" reason="Adjacent"/>'
+        "</robot>"
+    ).encode()
+
+    prepared = _prepare(_minimal_urdf('<link name="base"/>'), srdf)
+
+    assert prepared.srdf_bytes is not None
+    prepared_srdf = ET.fromstring(prepared.srdf_bytes)
+    rows = prepared_srdf.findall("./disable_collisions")
+    assert len(rows) == 1
+    assert rows[0].attrib == {
+        "link1": "arm",
+        "link2": "tool",
+        "reason": "Adjacent",
+    }
+    assert dict(prepared.removed_duplicate_srdf_elements) == {
+        "disable_collisions": 1,
+    }
 
 
 @pytest.mark.parametrize(
@@ -248,9 +287,7 @@ def test_uri_outside_mesh_or_texture_is_rejected() -> None:
         match="appears outside",
     ):
         _prepare(
-            _minimal_urdf(
-                '<link name="package://qualified_models/example/base"/>'
-            )
+            _minimal_urdf('<link name="package://qualified_models/example/base"/>')
         )
 
 
@@ -345,12 +382,15 @@ def test_qualified_receipt_binds_exact_configuration_inputs_and_closure(
     assert qualified == repeated
     assert qualified.manifest_bytes() == repeated.manifest_bytes()
     manifest = json.loads(qualified.manifest_bytes())
-    assert qualified.manifest_bytes() == json.dumps(
-        manifest,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
+    assert (
+        qualified.manifest_bytes()
+        == json.dumps(
+            manifest,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    )
     assert manifest["build_digest"] == (
         "sha256:"
         + hashlib.sha256(
@@ -383,26 +423,19 @@ def test_qualified_receipt_binds_exact_configuration_inputs_and_closure(
     assert manifest["original_source"] == {
         "srdf": {
             "byte_size": len(srdf),
-            "content_digest": (
-                "sha256:" + hashlib.sha256(srdf).hexdigest()
-            ),
+            "content_digest": ("sha256:" + hashlib.sha256(srdf).hexdigest()),
         },
         "urdf": {
             "byte_size": len(urdf),
-            "content_digest": (
-                "sha256:" + hashlib.sha256(urdf).hexdigest()
-            ),
+            "content_digest": ("sha256:" + hashlib.sha256(urdf).hexdigest()),
         },
     }
     artifacts = {
-        row["logical_uri"]: row
-        for row in manifest["prepared_source"]["artifacts"]
+        row["logical_uri"]: row for row in manifest["prepared_source"]["artifacts"]
     }
     assert artifacts["asset://qualified_model/meshes/tool.stl"] == {
         "byte_size": len(mesh_bytes),
-        "content_digest": (
-            "sha256:" + hashlib.sha256(mesh_bytes).hexdigest()
-        ),
+        "content_digest": ("sha256:" + hashlib.sha256(mesh_bytes).hexdigest()),
         "logical_uri": "asset://qualified_model/meshes/tool.stl",
         "media_type": "model/stl",
     }
@@ -450,15 +483,9 @@ def test_qualified_receipt_rejects_missing_or_symlinked_resources(
 
 def test_checked_lite6_articulated_gripper_qualification_fixture() -> None:
     model_root = (
-        _repo_root()
-        / "manyforge_example_models"
-        / "models"
-        / "lite6_lite_gripper"
+        _repo_root() / "manyforge_example_models" / "models" / "lite6_lite_gripper"
     )
-    prefix = (
-        "package://manyforge_example_models/models/"
-        "lite6_lite_gripper/"
-    )
+    prefix = "package://manyforge_example_models/models/" "lite6_lite_gripper/"
     prepared = subject.prepare_structural_model(
         (model_root / "lite6_lite_gripper.urdf").read_bytes(),
         (model_root / "lite6_lite_gripper.srdf").read_bytes(),
@@ -493,30 +520,31 @@ def test_checked_lite6_articulated_gripper_qualification_fixture() -> None:
         "multiplier": "1",
         "offset": "0",
     }
-    assert {
-        group.attrib["name"] for group in srdf_root.findall("./group")
-    } == {"lite6", "lite_gripper"}
+    assert {group.attrib["name"] for group in srdf_root.findall("./group")} == {
+        "lite6",
+        "lite_gripper",
+    }
     assert len(srdf_root.findall("./disable_collisions")) == 29
     assert dict(prepared.removed_top_level_elements) == {
         "gazebo": 7,
         "ros2_control": 2,
         "transmission": 6,
     }
+    assert dict(prepared.removed_nested_elements) == {
+        "collision.surface": 0,
+    }
+    assert dict(prepared.removed_duplicate_srdf_elements) == {
+        "disable_collisions": 0,
+    }
 
     qualified = subject.qualify_structural_model_preparation(
         prepared,
-        original_urdf_bytes=(
-            model_root / "lite6_lite_gripper.urdf"
-        ).read_bytes(),
-        original_srdf_bytes=(
-            model_root / "lite6_lite_gripper.srdf"
-        ).read_bytes(),
+        original_urdf_bytes=(model_root / "lite6_lite_gripper.urdf").read_bytes(),
+        original_srdf_bytes=(model_root / "lite6_lite_gripper.srdf").read_bytes(),
         resource_root=model_root,
     )
     manifest = json.loads(qualified.manifest_bytes())
     assert len(manifest["prepared_source"]["artifacts"]) == 20
     assert len(manifest["resource_rewrites"]) == 18
     assert len(qualified.resource_bytes) == 18
-    assert {
-        row["media_type"] for row in manifest["resource_rewrites"]
-    } == {"model/stl"}
+    assert {row["media_type"] for row in manifest["resource_rewrites"]} == {"model/stl"}

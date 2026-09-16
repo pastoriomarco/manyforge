@@ -1,0 +1,230 @@
+api_version: manyforge.program.v2
+program_id: ur5e_lite6_wall_grouped
+program_revision: sha256:fdfe5ed2947c1d1fc54c884ca598e899bab224dd8c923782c8fa058b1e0d6969
+program_profile: composable-cell-v1
+name: ur5e_lite6_wall_grouped
+description: Two independent joint trajectories in the UR5e + Lite6 wall cell, in one shared control group
+  without synchronized timing.
+catalog:
+  api_version: manyforge.node_catalog.v2
+  content_version: 2.3.0
+compatibility:
+  lanes:
+  - manyforge-only
+  assistant: forbidden
+  requires: []
+  tags:
+  - dual-robot
+  - lite6
+  - ur5e
+component_roles:
+  lite6_robot:
+    required_component_type_tags:
+    - articulated-arm
+    required_model_roles:
+    - arm_model
+  ur5e_robot:
+    required_component_type_tags:
+    - articulated-arm
+    required_model_roles:
+    - arm_model
+target_roles:
+  lite6_arm:
+    component_role: lite6_robot
+    required_capabilities:
+    - capability_id: execution.feedback.phase_events
+      parameters: {}
+      disposition: required
+    - capability_id: execution.trajectory.execute
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.joint_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.pose_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.profile.balanced
+      parameters: {}
+      disposition: required
+    - capability_id: planning.trajectory.time_parameterized
+      parameters: {}
+      disposition: required
+    - capability_id: state.observed.current
+      parameters: {}
+      disposition: required
+    - capability_id: validation.trajectory.non_collision
+      parameters: {}
+      disposition: required
+    required_frame_roles:
+    - base
+    - tcp
+    required_resource_roles:
+    - arm_joints
+    required_collision_body_roles:
+    - arm_collision
+    required_model_roles:
+    - arm_model
+  ur5e_arm:
+    component_role: ur5e_robot
+    required_capabilities:
+    - capability_id: execution.feedback.phase_events
+      parameters: {}
+      disposition: required
+    - capability_id: execution.trajectory.execute
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.joint_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.motion.pose_goal
+      parameters: {}
+      disposition: required
+    - capability_id: planning.profile.balanced
+      parameters: {}
+      disposition: required
+    - capability_id: planning.trajectory.time_parameterized
+      parameters: {}
+      disposition: required
+    - capability_id: state.observed.current
+      parameters: {}
+      disposition: required
+    - capability_id: validation.trajectory.non_collision
+      parameters: {}
+      disposition: required
+    required_frame_roles:
+    - base
+    - tcp
+    required_resource_roles:
+    - arm_joints
+    required_collision_body_roles:
+    - arm_collision
+    required_model_roles:
+    - arm_model
+scene:
+- scene_resource_id: ground
+  shape:
+    type: box
+    box_dimensions_m:
+    - 0.8
+    - 2.0
+    - 0.1
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - 0.0
+    - 0.5
+    - -0.051
+    orientation:
+      rpy_deg:
+      - 0.0
+      - 0.0
+      - 0.0
+- scene_resource_id: separation_wall
+  shape:
+    type: box
+    box_dimensions_m:
+    - 0.8
+    - 0.02
+    - 0.8
+  pose:
+    frame_ref:
+      kind: cell_frame
+    position_m:
+    - 0.0
+    - 0.5
+    - 0.4
+    orientation:
+      rpy_deg:
+      - 0.0
+      - 0.0
+      - 0.0
+parameters:
+- parameter_id: acceleration_scale
+  type: float64
+  default: 0.5
+  constraints:
+    min_exclusive: 0.0
+    max_inclusive: 1.0
+  runtime_mutability: before_run
+  description: Acceleration scale shared by the two planned motions.
+- parameter_id: velocity_scale
+  type: float64
+  default: 0.35
+  constraints:
+    min_exclusive: 0.0
+    max_inclusive: 1.0
+  runtime_mutability: before_run
+  description: Velocity scale shared by the two planned motions.
+execution_groups:
+  robot_group:
+    execution_policy: independent
+tree:
+  node_id: parallel
+  instance_id: paired_joint_motion
+  parameters:
+    success_policy: all
+  children:
+  - node_id: motion.move_to_joint_target
+    instance_id: lite6_joint_motion
+    parameters:
+      target_role: lite6_arm
+      base_frame_role: base
+      tcp_frame_role: tcp
+      goal:
+      - joint_name: joint1
+        position_rad: 0.3
+      - joint_name: joint2
+        position_rad: -0.55
+      - joint_name: joint3
+        position_rad: 1.05
+      - joint_name: joint4
+        position_rad: 0.0
+      - joint_name: joint5
+        position_rad: 1.35
+      - joint_name: joint6
+        position_rad: 0.0
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    value_sources:
+      acceleration_scale:
+        kind: program_parameter
+        reference: acceleration_scale
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+    execution_groups:
+    - robot_group
+    children: []
+  - node_id: motion.move_to_joint_target
+    instance_id: ur5e_joint_motion
+    parameters:
+      target_role: ur5e_arm
+      base_frame_role: base
+      tcp_frame_role: tcp
+      goal:
+      - joint_name: shoulder_pan_joint
+        position_rad: -0.45
+      - joint_name: shoulder_lift_joint
+        position_rad: -1.35
+      - joint_name: elbow_joint
+        position_rad: 1.2
+      - joint_name: wrist_1_joint
+        position_rad: -1.4
+      - joint_name: wrist_2_joint
+        position_rad: -1.57
+      - joint_name: wrist_3_joint
+        position_rad: 0.25
+      planning_timeout_s: 10.0
+      execution_timeout_s: 30.0
+    value_sources:
+      acceleration_scale:
+        kind: program_parameter
+        reference: acceleration_scale
+      velocity_scale:
+        kind: program_parameter
+        reference: velocity_scale
+    execution_groups:
+    - robot_group
+    children: []

@@ -53,7 +53,7 @@ function runtimeScaleSelectorIdentity(selector: RuntimeScaleControlStatus['selec
   };
   return selector.kind === 'singular'
     ? JSON.stringify(['singular', selector.programBindingId, selector.componentRoleId, selector.targetRoleId])
-    : JSON.stringify(['group', selector.programBindingId, ...selector.synchronizedTargets
+    : JSON.stringify(['group', selector.programBindingId, ...selector.groupTargets
       .map((target) => [target.componentRoleId, target.targetRoleId])
       .sort(compareTuples)]);
 }
@@ -99,7 +99,7 @@ export function runtimeScaleControlScopeFence(
   status: RuntimeScaleControlStatus,
 ): string {
   const memberScope = status.selector.kind === 'group'
-    ? (status.synchronizedMembers ?? []).map((member) => [
+    ? (status.groupMembers ?? []).map((member) => [
       member.componentRoleId,
       member.targetRoleId,
       member.controlDomainId,
@@ -614,7 +614,7 @@ export function useRobotControl(
         {
           selector: observed.selector.kind === 'group' ? {
             program_binding_id: observed.selector.programBindingId,
-            synchronized_targets: observed.selector.synchronizedTargets.map((target) => ({
+            group_targets: observed.selector.groupTargets.map((target) => ({
               component_role_id: target.componentRoleId,
               target_role_id: target.targetRoleId,
             })),

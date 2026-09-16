@@ -95,12 +95,12 @@ describe('persistent runtime-scale transport cadence', () => {
       selector: {
         kind: 'group' as const,
         programBindingId: 'binding-1',
-        synchronizedTargets: [
+        groupTargets: [
           { componentRoleId: 'robot', targetRoleId: 'arm' },
           { componentRoleId: 'robot', targetRoleId: 'gripper' },
         ],
       },
-      synchronizedMembers: [
+      groupMembers: [
         {
           componentRoleId: 'robot', targetRoleId: 'arm',
           controlDomainId: 'domain-arm', controlDomainRevision: 'rev-arm',
@@ -119,7 +119,7 @@ describe('persistent runtime-scale transport cadence', () => {
     };
     const differentGroup = {
       ...group,
-      selector: { ...group.selector, synchronizedTargets: [
+      selector: { ...group.selector, groupTargets: [
         { componentRoleId: 'robot', targetRoleId: 'arm' },
         { componentRoleId: 'robot', targetRoleId: 'camera' },
       ] },
@@ -132,7 +132,7 @@ describe('persistent runtime-scale transport cadence', () => {
       selector: {
         kind: 'group' as const,
         programBindingId: 'binding-1',
-        synchronizedTargets: [
+        groupTargets: [
           { componentRoleId: 'a', targetRoleId: 'b\u0000c' },
           { componentRoleId: 'a\u0000b', targetRoleId: 'c' },
         ],
@@ -141,13 +141,13 @@ describe('persistent runtime-scale transport cadence', () => {
     expect(runtimeScaleControlScopeFence('owner-1', group)).not.toBe(
       runtimeScaleControlScopeFence('owner-1', delimiterCollisionGroup),
     );
-    const reordered = { ...group, synchronizedMembers: [...group.synchronizedMembers].reverse() };
+    const reordered = { ...group, groupMembers: [...group.groupMembers].reverse() };
     expect(runtimeScaleControlScopeFence('owner-1', group)).toBe(
       runtimeScaleControlScopeFence('owner-1', reordered),
     );
     const changedMember = {
       ...group,
-      synchronizedMembers: group.synchronizedMembers.map((member) => (
+      groupMembers: group.groupMembers.map((member) => (
         member.targetRoleId === 'arm'
           ? { ...member, activeControlConfigurationGeneration: 2 }
           : member

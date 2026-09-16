@@ -18,6 +18,7 @@ from manyforge_behavior.program import (
     ProgramValidationError,
     TreeNode,
     apply_tree_param_overrides,
+    migrate_program_execution_groups,
     migrate_program_v1,
     tree_node_from_dict,
 )
@@ -67,6 +68,18 @@ def document(*children: dict, groups="inherit") -> dict:
     }
     if groups != "inherit":
         result["tree"]["execution_groups"] = groups
+    names: set[str] = set()
+    pending = [result["tree"]]
+    while pending:
+        node = pending.pop()
+        selected = node.get("execution_groups")
+        if isinstance(selected, list):
+            names.update(name for name in selected if isinstance(name, str))
+        pending.extend(node["children"])
+    if names:
+        result["execution_groups"] = {
+            name: {"execution_policy": "independent"} for name in sorted(names)
+        }
     return identified(result)
 
 
@@ -136,7 +149,7 @@ def test_all_clears_named_inheritance_without_joining_every_group(
     }
 
 
-def test_explicit_synchronized_group_is_one_parallel_motion_set(
+def test_explicit_common_start_group_is_one_parallel_motion_set(
     catalog: NodeCatalog,
 ) -> None:
     source = document()
@@ -146,17 +159,19 @@ def test_explicit_synchronized_group_is_one_parallel_motion_set(
         "parameters": {"success_policy": "all"},
         "children": [motion_leaf("arm_a", "cell_pair"), motion_leaf("arm_b", "cell_pair")],
     }
-    source["synchronized_execution_groups"] = ["cell_pair"]
+    source["execution_groups"] = {
+        "cell_pair": {"execution_policy": "common_start"}
+    }
     program = Program.from_dict(identified(source), catalog)
 
-    assert program.synchronized_execution_groups == ("cell_pair",)
-    assert program.synchronized_execution_selections == {
+    assert program.execution_group_policies == {"cell_pair": "common_start"}
+    assert program.coordinated_execution_selections == {
         "cell_pair": ("arm_a", "arm_b")
     }
 
 
 @pytest.mark.parametrize("mutation", ["inherited", "not_parallel", "non_motion", "overlap"])
-def test_synchronized_groups_reject_ambiguous_or_non_motion_sets(
+def test_coordinated_groups_reject_ambiguous_or_non_motion_sets(
     catalog: NodeCatalog, mutation: str
 ) -> None:
     first = motion_leaf("arm_a", "cell_pair")
@@ -168,7 +183,9 @@ def test_synchronized_groups_reject_ambiguous_or_non_motion_sets(
         "parameters": {"success_policy": "all"},
         "children": [first, second],
     }
-    source["synchronized_execution_groups"] = ["cell_pair"]
+    source["execution_groups"] = {
+        "cell_pair": {"execution_policy": "common_start"}
+    }
     if mutation == "inherited":
         source["tree"]["execution_groups"] = ["cell_pair"]
         first.pop("execution_groups")
@@ -182,9 +199,12 @@ def test_synchronized_groups_reject_ambiguous_or_non_motion_sets(
     else:
         first["execution_groups"] = ["cell_pair", "other_pair"]
         second["execution_groups"] = ["cell_pair", "other_pair"]
-        source["synchronized_execution_groups"] = ["cell_pair", "other_pair"]
+        source["execution_groups"] = {
+            "cell_pair": {"execution_policy": "common_start"},
+            "other_pair": {"execution_policy": "common_start"},
+        }
 
-    with pytest.raises(ProgramValidationError, match="synchronized"):
+    with pytest.raises(ProgramValidationError, match="coordinated|execution_groups"):
         Program.from_dict(identified(source), catalog)
 
 
@@ -294,6 +314,45 @@ def test_v1_migration_does_not_ignore_new_or_unknown_fields(
     previous["api_version"] = "manyforge.program.v1"
     with pytest.raises(ProgramValidationError, match="unknown fields"):
         migrate_program_v1(identified(previous), catalog)
+
+
+def test_execution_group_migration_preserves_independent_and_common_start_intent(
+    catalog: NodeCatalog,
+) -> None:
+    first = motion_leaf("arm_a", "robot_group")
+    second = motion_leaf("arm_b", "robot_group")
+    legacy = document()
+    legacy["tree"] = {
+        "node_id": "parallel",
+        "instance_id": "paired_motion",
+        "parameters": {"success_policy": "all"},
+        "children": [first, second],
+    }
+    legacy.pop("execution_groups", None)
+    legacy["synchronized_execution_groups"] = ["robot_group"]
+    legacy = identified(legacy)
+
+    migrated = migrate_program_execution_groups(legacy, catalog)
+
+    assert migrated.execution_group_policies == {"robot_group": "common_start"}
+    assert migrated.coordinated_execution_selections == {
+        "robot_group": ("arm_a", "arm_b")
+    }
+    assert "synchronized_execution_groups" not in migrated.to_dict()
+
+
+def test_execution_group_migration_rejects_unknown_or_already_current_input(
+    catalog: NodeCatalog,
+) -> None:
+    legacy = document(leaf("wait", ["robot_group"]))
+    legacy.pop("execution_groups")
+    legacy["synchronized_execution_groups"] = ["missing_group"]
+    with pytest.raises(ProgramValidationError, match="unused"):
+        migrate_program_execution_groups(identified(legacy), catalog)
+    current = document()
+    current["execution_groups"] = {}
+    with pytest.raises(ProgramValidationError, match="already uses"):
+        migrate_program_execution_groups(current, catalog)
 
 
 def test_offline_migration_cli_never_overwrites_and_cleans_temporary_files(

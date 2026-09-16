@@ -29,6 +29,7 @@
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
+#include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
 #include <manyforge_core/pick_place_planning_owner.hpp>
@@ -46,10 +47,12 @@
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/retained_runtime_policy.hpp>
+#include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <manyforge_deployment/stop_evidence_policy_codec.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <manyforge_deployment/verified_controller_lifecycle_expected_domain.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
 #include <manyforge_roboplan/retained_collision_world_projector.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
@@ -72,6 +75,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <roboplan/core/scene.hpp>
 #include <set>
@@ -1205,6 +1209,83 @@ private:
   mutable std::mutex mutex_;
 };
 
+struct ManagedComponentProjectionSet final {
+  core::ProjectionRevisionDTO projection_revision;
+  std::map<core::ControllableComponentId,
+           std::shared_ptr<RetainedPlannerSceneProjection>> by_component;
+};
+
+[[nodiscard]] std::optional<ManagedComponentProjectionSet>
+SelectManagedComponentProjections(
+    const ManagedRuntimeChildConfig &config,
+    const deployment::RetainedBundle &bundle,
+    const ManagedProjectionRegistry &projections,
+    const core::ProjectionRevisionDTO &expected,
+    const bool allow_current_scene_revision) {
+  ManagedComponentProjectionSet selected;
+  bool revision_selected = false;
+  for (const auto &provider : bundle.value().capability_provider_bindings) {
+    if (provider.capability_id.value() != "planning.motion.joint_goal" ||
+        !core::RequiresNativeSceneProjection(
+            provider.capability_id, provider.capability_definition_revision)) {
+      continue;
+    }
+    std::set<core::RuntimeUnitId> runtime_sources;
+    for (const auto &endpoint : provider.endpoint_bindings) {
+      if (endpoint.source_kind !=
+          core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+        continue;
+      }
+      const auto *runtime =
+          std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+      Require(runtime != nullptr && !runtime->empty(),
+              "managed joint planner has a malformed runtime endpoint");
+      runtime_sources.insert(*runtime);
+    }
+    if (runtime_sources.size() != 1U ||
+        runtime_sources.begin()->value() != config.runtime_unit_id) {
+      continue;
+    }
+    const auto *target =
+        std::get_if<core::TargetBindingCapabilityProviderTargetDTO>(
+            &provider.target);
+    Require(target != nullptr,
+            "managed joint planner is not bound to one robot target");
+    const core::ProjectionNativeRuntimeBindingDTO binding{
+        provider.capability_provider_binding_id,
+        provider.capability_provider_binding_revision,
+        core::RuntimeUnitId(config.runtime_unit_id),
+        core::RuntimeEpoch(config.runtime_epoch)};
+    auto revision = expected;
+    auto projection = projections.FindActiveProjection(revision, binding);
+    if (projection == nullptr && allow_current_scene_revision) {
+      const auto current =
+          projections.FindCurrentProjectionRevision(expected, binding);
+      if (!current.has_value())
+        return std::nullopt;
+      revision = *current;
+      projection = projections.FindActiveProjection(revision, binding);
+    }
+    if (projection == nullptr)
+      return std::nullopt;
+    if (!revision_selected) {
+      selected.projection_revision = revision;
+      revision_selected = true;
+    } else {
+      if (selected.projection_revision != revision)
+        return std::nullopt;
+    }
+    Require(selected.by_component
+                .emplace(target->controllable_component_id,
+                         std::move(projection))
+                .second,
+            "managed robot has multiple joint-planner projections");
+  }
+  Require(revision_selected && !selected.by_component.empty(),
+          "managed product has no native joint-planner projection");
+  return selected;
+}
+
 [[nodiscard]] int
 RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config);
 void RequireExactObjectSize(const CanonicalValue &value, std::size_t size,
@@ -2070,28 +2151,28 @@ DecodeStopFaultRecoveryIntent(const CanonicalValue &value) {
 
 [[nodiscard]] core::RuntimeScaleControlSelectorDTO
 DecodeRuntimeScaleControlSelector(const CanonicalValue &value) {
-  if (value.find_object_member("synchronized_targets") == nullptr) {
+  if (value.find_object_member("group_targets") == nullptr) {
     RequireExactObjectSize(value, 3U, "runtime-scale control selector");
     return core::RuntimeScaleControlSelectorDTO{
         core::ProgramBindingId(Text(value, "program_binding_id")),
         core::ComponentRoleId(Text(value, "component_role_id")),
         core::TargetRoleId(Text(value, "target_role_id"))};
   }
-  RequireExactObjectSize(value, 2U, "runtime-scale synchronized selector");
-  const auto &targets = Array(value, "synchronized_targets");
+  RequireExactObjectSize(value, 2U, "runtime-scale group selector");
+  const auto &targets = Array(value, "group_targets");
   Require(targets.size() >= 2U &&
               targets.size() <= core::kMaxOperationParticipants,
-          "runtime-scale synchronized selector target count is out of bounds");
+          "runtime-scale group selector target count is out of bounds");
   std::vector<core::RuntimeScaleControlTargetDTO> decoded;
   decoded.reserve(targets.size());
   for (const auto &target : targets) {
-    RequireExactObjectSize(target, 2U, "runtime-scale synchronized target");
+    RequireExactObjectSize(target, 2U, "runtime-scale group target");
     core::RuntimeScaleControlTargetDTO item{
         core::ComponentRoleId(Text(target, "component_role_id")),
         core::TargetRoleId(Text(target, "target_role_id"))};
     Require(std::none_of(decoded.begin(), decoded.end(),
                          [&](const auto &prior) { return prior == item; }),
-            "runtime-scale synchronized selector contains duplicate targets");
+            "runtime-scale group selector contains duplicate targets");
     decoded.push_back(std::move(item));
   }
   return core::RuntimeScaleControlSelectorDTO{
@@ -2209,6 +2290,7 @@ struct TargetObservationQuery final {
   core::ProgramBindingId program_binding_id;
   core::TargetRoleId target_role_id;
   std::optional<core::FrameRoleId> frame_role_id;
+  std::optional<core::FrameRoleId> relative_to_frame_role_id;
   bool grasp_confirmation{};
 };
 
@@ -2395,11 +2477,20 @@ struct Command final {
     Require(kind == "frame_pose" || kind == "gripper_status" ||
                 kind == "gripper_confirmation",
             "target observation kind is unsupported");
-    RequireExactObjectSize(query, kind == "frame_pose" ? 6U : 5U,
-                           "target observation query");
+    if (kind == "frame_pose") {
+      Require(query.as_object().size() == 6U || query.as_object().size() == 7U,
+              "target observation query has an unexpected field count");
+    } else {
+      RequireExactObjectSize(query, 5U, "target observation query");
+    }
     Require(Text(query, "schema_version") ==
                 "manyforge.target_observation_query.v1",
             "target observation query schema is unsupported");
+    const auto relative_frame = std::find_if(
+        query.as_object().begin(), query.as_object().end(),
+        [](const auto &member) {
+          return member.first == "relative_to_frame_role_id";
+        });
     Command decoded{CommandKind::kQueryTarget};
     decoded.target_query = TargetObservationQuery{
         core::RequestOwnerEpoch(Text(query, "owner_epoch")),
@@ -2407,6 +2498,10 @@ struct Command final {
         core::TargetRoleId(Text(query, "target_role_id")),
         kind == "frame_pose"
             ? std::optional(core::FrameRoleId(Text(query, "frame_role_id")))
+            : std::nullopt,
+        kind == "frame_pose" && relative_frame != query.as_object().end()
+            ? std::optional(core::FrameRoleId(
+                  Text(query, "relative_to_frame_role_id")))
             : std::nullopt,
         kind == "gripper_confirmation"};
     return decoded;
@@ -2769,9 +2864,9 @@ private:
     const core::MotionPreviewResultDTO &preview,
     const core::OperationIntentDTO &intent,
     const core::ContentDigest &intent_digest,
-    const core::RuntimeParticipantBinding &direct_control_binding,
+    const core::RuntimeParticipantBindingDTO &direct_control_binding,
     const core::RequestOwnerEpoch &owner_epoch) {
-  const auto &binding = direct_control_binding.value();
+  const auto &binding = direct_control_binding;
   const auto &final_state = preview.final_controlled_state;
   Require(
       final_state.resources.size() == binding.resources.size() &&
@@ -4689,7 +4784,7 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
 
 [[nodiscard]] CanonicalValue RuntimeScaleControlSelectorValue(
     const core::RuntimeScaleControlSelectorDTO &value) {
-  if (value.synchronized_targets.empty()) {
+  if (value.group_targets.empty()) {
     return CanonicalValue(CanonicalValue::Object{
         {"component_role_id", CanonicalValue(value.component_role_id.value())},
         {"program_binding_id",
@@ -4698,8 +4793,8 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
     });
   }
   CanonicalValue::Array targets;
-  targets.reserve(value.synchronized_targets.size());
-  for (const auto &target : value.synchronized_targets) {
+  targets.reserve(value.group_targets.size());
+  for (const auto &target : value.group_targets) {
     targets.emplace_back(CanonicalValue::Object{
         {"component_role_id", CanonicalValue(target.component_role_id.value())},
         {"target_role_id", CanonicalValue(target.target_role_id.value())},
@@ -4707,7 +4802,7 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
   }
   return CanonicalValue(CanonicalValue::Object{
       {"program_binding_id", CanonicalValue(value.program_binding_id.value())},
-      {"synchronized_targets", CanonicalValue(std::move(targets))},
+      {"group_targets", CanonicalValue(std::move(targets))},
   });
 }
 
@@ -4742,10 +4837,10 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
 
 [[nodiscard]] CanonicalValue RuntimeScaleControlStatusValue(
     const core::RuntimeScaleControlStatusDTO &value) {
-  CanonicalValue::Array synchronized_members;
-  synchronized_members.reserve(value.synchronized_members.size());
-  for (const auto &member : value.synchronized_members) {
-    synchronized_members.emplace_back(CanonicalValue::Object{
+  CanonicalValue::Array group_members;
+  group_members.reserve(value.group_members.size());
+  for (const auto &member : value.group_members) {
+    group_members.emplace_back(CanonicalValue::Object{
         {"active_control_configuration_generation",
          CanonicalValue(static_cast<double>(
              member.active_control_configuration_generation.value()))},
@@ -4825,9 +4920,9 @@ RecoveryActionResultValue(const core::KernelRecoveryActionResultDTO &value) {
       {"selector", RuntimeScaleControlSelectorValue(value.selector)},
       {"supported", CanonicalValue(value.supported)},
   };
-  if (!synchronized_members.empty()) {
-    object.emplace_back("synchronized_members",
-                        CanonicalValue(std::move(synchronized_members)));
+  if (!group_members.empty()) {
+    object.emplace_back("group_members",
+                        CanonicalValue(std::move(group_members)));
   }
   return CanonicalValue(std::move(object));
 }
@@ -6546,6 +6641,7 @@ struct Composition final {
   std::atomic_bool cclc_attached{false};
   std::atomic_bool cclc_route_recovery_pending{false};
   bool direct_control_mode_selected{};
+  std::vector<std::unique_ptr<Composition>> participant_compositions;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   std::unique_ptr<RetainedRos2ControlAdmissionOwner>
       ros2_control_admission_owner;
@@ -6641,6 +6737,9 @@ struct ExecutionCompositionAccess final {
     // publication. Wake the old channel once, never poll for replacement.
     if (current != nullptr && current != replacement) {
       current->runtime->motion_state_channel->notify_composition_replaced();
+      for (const auto &participant : current->participant_compositions) {
+        participant->runtime->motion_state_channel->notify_composition_replaced();
+      }
     }
     current = replacement;
   }
@@ -6703,6 +6802,11 @@ struct CompositionBuildInput final {
   std::filesystem::path program_cycle_journal;
   std::filesystem::path authoring_transaction_journal;
   std::shared_ptr<RetainedPlannerSceneProjection> planner_scene_projection;
+  std::optional<core::ControllableComponentId> selected_component_id{};
+  std::shared_ptr<RetainedObservationWake> observation_wake{};
+  std::map<core::ControllableComponentId,
+           std::shared_ptr<RetainedPlannerSceneProjection>>
+      component_planner_scene_projections{};
 };
 
 [[nodiscard]] core::CellAdmissionSettlementValidator
@@ -6841,7 +6945,7 @@ BuildOwnerReconciliationValidator(
 }
 
 [[nodiscard]] std::unique_ptr<Composition>
-BuildProductComposition(CompositionBuildInput input) {
+BuildSingleProductComposition(CompositionBuildInput input) {
   Require(input.bundle != nullptr &&
               input.bundle->value().cell_graph.cell_id == input.cell_id &&
               (!input.runtime_unit_id.has_value() ||
@@ -6875,13 +6979,31 @@ BuildProductComposition(CompositionBuildInput input) {
   auto direct_control_inventory =
       deployment::compile_direct_control_program_binding_inventory(
           *input.bundle, input.model_map, catalog_store);
-  Require(direct_control_inventory.motion.size() == 1U &&
-              direct_control_inventory.gripper.size() == 1U,
-          "N7-a4 native composition requires one physical motion and one "
-          "physical gripper target");
-  auto direct_control_binding = direct_control_inventory.motion.front();
+  const auto select_binding = [&](const auto &bindings,
+                                  const std::string_view capability_id) {
+    std::shared_ptr<const deployment::ProgramBinding> selected;
+    for (const auto &binding : bindings) {
+      const auto target = deployment::resolve_runtime_program_target(
+          *binding,
+          core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+          core::CapabilityId(std::string(capability_id)), *input.bundle,
+          input.model_map);
+      if (input.selected_component_id.has_value() &&
+          target.component().controllable_component_id !=
+              *input.selected_component_id)
+        continue;
+      Require(selected == nullptr,
+              "native composition selection has multiple matching targets");
+      selected = binding;
+    }
+    Require(selected != nullptr,
+            "native composition selection has no matching target");
+    return selected;
+  };
+  auto direct_control_binding = select_binding(
+      direct_control_inventory.motion, "execution.trajectory.execute");
   auto direct_control_gripper_program_binding =
-      direct_control_inventory.gripper.front();
+      select_binding(direct_control_inventory.gripper, "tool.gripper.command");
   const auto direct_control_motion_target =
       deployment::resolve_runtime_program_target(
           *direct_control_binding,
@@ -7083,10 +7205,56 @@ BuildProductComposition(CompositionBuildInput input) {
           "native Deployment has no limit for the exact motion target");
   deployment_motion_target_limit = motion_limit->maximum_tcp_linear_speed_mps;
 #endif
-  Require(retained_runtime_configuration.initial_joint_positions_rad.size() ==
-              direct_control_motion_binding.value().value().resources.size(),
-          "native execution initial state differs from the exact motion "
-          "resource order");
+  auto selected_initial_joint_positions =
+      retained_runtime_configuration.initial_joint_positions_rad;
+  const auto selected_resource_count =
+      direct_control_motion_binding.value().value().resources.size();
+  if (selected_initial_joint_positions.size() != selected_resource_count) {
+    struct InitialPositionSlice final {
+      core::ControllableComponentId component_id;
+      std::size_t count{};
+    };
+    std::vector<InitialPositionSlice> slices;
+    for (const auto &binding : direct_control_inventory.motion) {
+      const auto target = deployment::resolve_runtime_program_target(
+          *binding,
+          core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+          core::CapabilityId("execution.trajectory.execute"), *input.bundle,
+          input.model_map);
+      const auto verified = core::verify_runtime_participant_binding(
+          deployment::build_runtime_participant_binding_dto(
+              target, ActiveFacts(target, {}, input.runtime_epoch,
+                                  core::ActiveControlConfigurationId(
+                                      "active.i6.native.arm"))));
+      Require(verified.ok(), "native initial-state target is invalid");
+      slices.push_back({target.component().controllable_component_id,
+                        verified.value().value().resources.size()});
+    }
+    std::sort(slices.begin(), slices.end(), [](const auto &left, const auto &right) {
+      return left.component_id < right.component_id;
+    });
+    const auto total = std::accumulate(
+        slices.begin(), slices.end(), std::size_t{0},
+        [](const auto sum, const auto &slice) { return sum + slice.count; });
+    Require(total == selected_initial_joint_positions.size() &&
+                input.selected_component_id.has_value(),
+            "native execution initial state differs from the cell motion "
+            "resource order");
+    std::size_t offset = 0U;
+    for (const auto &slice : slices) {
+      if (slice.component_id == *input.selected_component_id) {
+        selected_initial_joint_positions = std::vector<double>(
+            retained_runtime_configuration.initial_joint_positions_rad.begin() +
+                static_cast<std::ptrdiff_t>(offset),
+            retained_runtime_configuration.initial_joint_positions_rad.begin() +
+                static_cast<std::ptrdiff_t>(offset + slice.count));
+        break;
+      }
+      offset += slice.count;
+    }
+    Require(selected_initial_joint_positions.size() == selected_resource_count,
+            "native execution initial-state slice is unavailable");
+  }
   const auto execution_tick_period_ns = static_cast<core::Duration>(
       std::llround(1'000'000'000.0 /
                    static_cast<double>(
@@ -7229,6 +7397,7 @@ BuildProductComposition(CompositionBuildInput input) {
   const auto reference_collision_model = collision_model;
   const auto reference_runtime_unit_id = *local_runtime_unit_id;
   const auto reference_runtime_epoch = input.runtime_epoch;
+  const auto reference_component_id = input.selected_component_id;
   RetainedNativeRuntimeInput runtime_input{
       direct_control_motion_binding.value(),
       direct_control_gripper_binding.value(),
@@ -7243,7 +7412,7 @@ BuildProductComposition(CompositionBuildInput input) {
       collision_model,
       std::move(planner),
       [&, reference_collision_model, reference_runtime_unit_id,
-       reference_runtime_epoch](const auto &channels) {
+       reference_runtime_epoch, reference_component_id](const auto &channels) {
         std::vector<RetainedSceneFrameStateSourceInput> state_sources;
         state_sources.reserve(channels.size());
         for (const auto &channel : channels) {
@@ -7270,7 +7439,7 @@ BuildProductComposition(CompositionBuildInput input) {
         return RetainedSceneFrameResolver::create_verified(
             reference_collision_model, *input.bundle, input.model_map,
             *retained_model, reference_runtime_unit_id, reference_runtime_epoch,
-            std::move(state_sources));
+            std::move(state_sources), reference_component_id);
       },
       std::move(participant_resolver),
       participant_resolver_factory,
@@ -7284,6 +7453,7 @@ BuildProductComposition(CompositionBuildInput input) {
       {}};
   runtime_input.control_binding_representatives =
       std::move(control_binding_representatives);
+  runtime_input.observation_wake = std::move(input.observation_wake);
   runtime_input.deployment_maximum_tcp_linear_speed_mps =
       deployment_motion_target_limit;
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
@@ -7401,7 +7571,7 @@ BuildProductComposition(CompositionBuildInput input) {
       std::move(execution_config),
       SimpleSchedulerConfig::from_environment(),
       execution_tick_period_ns,
-      retained_runtime_configuration.initial_joint_positions_rad,
+      std::move(selected_initial_joint_positions),
       std::nullopt,
       kMaintainedNativeStopSurveillancePolicy,
       {},
@@ -7536,6 +7706,118 @@ BuildProductComposition(CompositionBuildInput input) {
   }
 #endif
   return composition;
+}
+
+[[nodiscard]] std::unique_ptr<Composition>
+BuildProductComposition(CompositionBuildInput input) {
+  const deployment::FilesystemVerifiedCatalogArtifactSource catalog_store(
+      input.package_root);
+  const auto inventory =
+      deployment::compile_direct_control_program_binding_inventory(
+          *input.bundle, input.model_map, catalog_store);
+  if (inventory.motion.size() == 1U && inventory.gripper.size() == 1U) {
+    return BuildSingleProductComposition(std::move(input));
+  }
+  Require(input.runtime_unit_id.has_value() && !input.attach_addressed_owner &&
+              !input.component_planner_scene_projections.empty() &&
+              input.shared_clock != nullptr && input.shared_scheduler != nullptr &&
+              input.status_program == nullptr &&
+              input.status_program_binding == nullptr,
+          "multi-robot native composition requires the managed shared-owner path");
+
+  std::vector<core::ControllableComponentId> component_ids;
+  for (const auto &binding : inventory.motion) {
+    const auto target = deployment::resolve_runtime_program_target(
+        *binding,
+        core::TargetRoleId(std::string(deployment::kDirectControlTargetRoleId)),
+        core::CapabilityId("execution.trajectory.execute"), *input.bundle,
+        input.model_map);
+    component_ids.push_back(target.component().controllable_component_id);
+  }
+  std::sort(component_ids.begin(), component_ids.end());
+  component_ids.erase(std::unique(component_ids.begin(), component_ids.end()),
+                      component_ids.end());
+  Require(component_ids.size() == inventory.motion.size() &&
+              component_ids.size() == inventory.gripper.size(),
+          "multi-robot native composition requires one motion/gripper pair per robot");
+
+  std::vector<std::unique_ptr<Composition>> compositions;
+  compositions.reserve(component_ids.size());
+  if (input.observation_wake == nullptr)
+    input.observation_wake = std::make_shared<RetainedObservationWake>();
+  for (const auto &component_id : component_ids) {
+    auto selected = input;
+    selected.selected_component_id = component_id;
+    const auto projection =
+        selected.component_planner_scene_projections.find(component_id);
+    Require(projection != selected.component_planner_scene_projections.end() &&
+                projection->second != nullptr,
+            "multi-robot native composition has no projection for one robot");
+    selected.collision_publisher = projection->second;
+    selected.collision_shared_model =
+        projection->second->collision_shared_model();
+    selected.planner_scene_projection = projection->second;
+    const auto retain_component = [&](auto &aliases) {
+      std::erase_if(aliases, [&](const auto &binding) {
+        return binding.value().controllable_component_id != component_id;
+      });
+    };
+    retain_component(selected.motion_program_aliases);
+    retain_component(selected.gripper_program_aliases);
+    compositions.push_back(BuildSingleProductComposition(std::move(selected)));
+  }
+
+  std::vector<core::ProgramBindingId> intrinsic_direct_bindings;
+  intrinsic_direct_bindings.reserve(inventory.motion.size() +
+                                    inventory.gripper.size());
+  for (const auto &binding : inventory.motion)
+    intrinsic_direct_bindings.push_back(binding->program_binding_id());
+  for (const auto &binding : inventory.gripper)
+    intrinsic_direct_bindings.push_back(binding->program_binding_id());
+  std::sort(intrinsic_direct_bindings.begin(), intrinsic_direct_bindings.end());
+  intrinsic_direct_bindings.erase(
+      std::unique(intrinsic_direct_bindings.begin(), intrinsic_direct_bindings.end()),
+      intrinsic_direct_bindings.end());
+  const auto make_resolver =
+      [package_root = input.package_root, bundle = input.bundle,
+       model_map = input.model_map,
+       intrinsic_direct_bindings = std::move(intrinsic_direct_bindings)](
+          std::vector<core::RuntimeParticipantBinding> physical_bindings) {
+        return std::make_shared<ProductBackedRuntimeParticipantResolver>(
+            package_root, bundle, model_map, std::move(physical_bindings),
+            intrinsic_direct_bindings);
+      };
+  RetainedRuntimeParticipantResolverFactory resolver_factory =
+      [make_resolver](std::vector<core::RuntimeParticipantBinding> bindings) {
+        auto resolver = make_resolver(std::move(bindings));
+        return RetainedRuntimeParticipantResolver{
+            [resolver](const core::OperationIntentDTO &operation,
+                       const std::size_t participant_index) {
+              return resolver->ResolveExecutionParticipant(operation,
+                                                           participant_index);
+            }};
+      };
+
+  auto primary = std::move(compositions.front());
+  compositions.erase(compositions.begin());
+  std::vector<std::shared_ptr<RetainedNativeRuntime>> peers;
+  peers.reserve(compositions.size());
+  for (const auto &composition : compositions) peers.push_back(composition->runtime);
+  join_retained_native_runtime_participants(primary->runtime, std::move(peers),
+                                            resolver_factory);
+  std::vector<core::RuntimeParticipantBinding> physical_bindings;
+  physical_bindings.reserve(component_ids.size() * 2U);
+  physical_bindings.push_back(primary->runtime->motion_binding);
+  if (primary->runtime->gripper_binding.has_value())
+    physical_bindings.push_back(*primary->runtime->gripper_binding);
+  for (const auto &composition : compositions) {
+    physical_bindings.push_back(composition->runtime->motion_binding);
+    if (composition->runtime->gripper_binding.has_value())
+      physical_bindings.push_back(*composition->runtime->gripper_binding);
+  }
+  primary->target_resolver = make_resolver(std::move(physical_bindings));
+  primary->participant_compositions = std::move(compositions);
+  return primary;
 }
 
 [[nodiscard]] std::unique_ptr<Composition>
@@ -7755,7 +8037,25 @@ PhysicalControlBindings(const Composition &composition) {
   if (composition.runtime->gripper_binding.has_value()) {
     physical_bindings.push_back(*composition.runtime->gripper_binding);
   }
+  for (const auto &participant : composition.participant_compositions) {
+    auto nested = PhysicalControlBindings(*participant);
+    physical_bindings.insert(physical_bindings.end(),
+                             std::make_move_iterator(nested.begin()),
+                             std::make_move_iterator(nested.end()));
+  }
   return physical_bindings;
+}
+
+[[nodiscard]] std::vector<core::RuntimeParticipantBinding>
+CellControlBindingRepresentatives(const Composition &composition) {
+  auto representatives = composition.runtime->control_binding_representatives;
+  for (const auto &participant : composition.participant_compositions) {
+    auto nested = CellControlBindingRepresentatives(*participant);
+    representatives.insert(representatives.end(),
+                           std::make_move_iterator(nested.begin()),
+                           std::make_move_iterator(nested.end()));
+  }
+  return representatives;
 }
 
 [[nodiscard]] bool RetainedProductDeclaresLifecycle(
@@ -7807,13 +8107,151 @@ void SelectDirectNativeControlMode(Composition &composition,
                                        physical_bindings)) {
     return;
   }
-  // This product has no CCLC-issued readiness to publish. Its exact direct
-  // bindings were already installed with the addressed Kernel; selecting the
-  // retained direct mode must not fabricate an ActiveControlConfiguration or
-  // Stop-readiness certificate.
+  // This product has no lifecycle transition owner. Select its fixed direct
+  // bindings here; attachment publishes their exact observed route and
+  // artifact-backed Stop readiness without changing controllers.
   composition.direct_control_mode_selected = true;
   composition.cclc_route_recovery_pending.store(false,
                                                 std::memory_order_release);
+}
+
+void PublishDirectNativeControlRoutes(
+    Composition &composition, const std::filesystem::path &package_root,
+    const std::filesystem::path &execution_run_root) {
+  Require(composition.direct_control_mode_selected &&
+              composition.runtime != nullptr &&
+              composition.runtime->addressed_kernel != nullptr,
+          "direct route publication requires the selected stable runtime");
+
+  const deployment::FilesystemVerifiedRetainedProductArtifactSource
+      artifact_source(package_root);
+  core::FilesystemResolvedStopBasePlanRepository plan_repository(
+      execution_run_root);
+  const auto cell_representatives =
+      CellControlBindingRepresentatives(composition);
+
+  for (const auto &desired :
+       composition.bundle->value().desired_control_configurations) {
+    std::vector<core::RuntimeParticipantBinding> representatives;
+    representatives.reserve(desired.binding_routes.size());
+    const core::RuntimeControlPathDTO *source_path = nullptr;
+    for (const auto &route : desired.binding_routes) {
+      const auto representative = std::find_if(
+          cell_representatives.begin(), cell_representatives.end(),
+          [&](const auto &candidate) {
+            return candidate.value().control_path.has_value() &&
+                   candidate.value().control_path->control_domain_id ==
+                       desired.control_domain_id &&
+                   candidate.value().control_path->control_binding_id ==
+                       route.control_binding_id &&
+                   candidate.value().control_path->control_binding_revision ==
+                       route.control_binding_revision;
+          });
+      Require(representative !=
+                  cell_representatives.end(),
+              "direct route publication has no exact physical representative");
+      const auto &path = *representative->value().control_path;
+      if (source_path == nullptr) {
+        source_path = &path;
+      } else {
+        Require(source_path->provider_runtime_unit_id ==
+                        path.provider_runtime_unit_id &&
+                    source_path->provider_runtime_epoch ==
+                        path.provider_runtime_epoch &&
+                    source_path->active_control_configuration_id ==
+                        path.active_control_configuration_id &&
+                    source_path->active_control_configuration_generation ==
+                        path.active_control_configuration_generation,
+                "direct route publication sources disagree within one domain");
+      }
+      representatives.push_back(*representative);
+    }
+    Require(source_path != nullptr,
+            "direct route publication has an empty desired domain");
+
+    std::vector<core::ActiveControlConfigurationBindingRouteDTO>
+        active_routes;
+    active_routes.reserve(desired.binding_routes.size());
+    for (const auto &route : desired.binding_routes) {
+      active_routes.push_back({route.control_binding_id,
+                               route.control_binding_revision,
+                               route.control_route_id});
+    }
+    std::sort(active_routes.begin(), active_routes.end(),
+              core::CanonicalActiveControlConfigurationBindingRouteLess);
+    core::ActiveControlConfigurationDTO configuration{
+        source_path->active_control_configuration_id,
+        desired.control_domain_id,
+        desired.control_domain_revision,
+        std::move(active_routes),
+        desired.activation_set_id,
+        desired.controller_topology_id,
+        desired.topology_revision,
+        source_path->provider_runtime_unit_id,
+        source_path->provider_runtime_epoch,
+        composition.publication_generation.value(),
+        {},
+        source_path->active_control_configuration_generation,
+        core::ActiveControlConfigurationStateDTO::kReconciled};
+    auto source_projections =
+        DeriveRetainedNativeStateSourceProjections(representatives);
+    if (!source_projections.ok()) {
+      Fail("direct route state-source projection could not be derived: " +
+           source_projections.error().message);
+    }
+    configuration.kinematic_resource_source_projections =
+        std::move(source_projections.value());
+    Require(configuration.locally_valid(),
+            "direct route publication produced an invalid configuration");
+
+    const auto current = composition.runtime->addressed_kernel
+                             ->current_runtime_route_configuration(
+                                 desired.control_domain_id);
+    Require(current.ok(), "direct route publication readback failed");
+    if (current.value().has_value() &&
+        current.value()->active_configuration == configuration &&
+        current.value()->operation_admission_open) {
+      continue;
+    }
+
+    const auto expected =
+        deployment::load_verified_controller_lifecycle_expected_domain(
+            *composition.bundle, artifact_source, desired,
+            source_path->provider_runtime_unit_id,
+            source_path->provider_runtime_epoch);
+    std::vector<core::RouteSelectionComponentExpectationDTO>
+        component_expectations;
+    component_expectations.reserve(representatives.size());
+    for (const auto &representative : representatives) {
+      const auto component_id =
+          representative.value().controllable_component_id;
+      if (std::none_of(component_expectations.begin(),
+                       component_expectations.end(), [&](const auto &row) {
+                         return row.controllable_component_id == component_id;
+                       })) {
+        component_expectations.push_back(
+            {component_id,
+             core::ComponentLifecycleGeneration(
+                 composition.publication_generation.value()),
+             core::ComponentLifecycleStateDTO::kActive});
+      }
+    }
+    std::sort(component_expectations.begin(), component_expectations.end(),
+              core::CanonicalRouteSelectionComponentExpectationLess);
+    auto participants =
+        deployment::resolve_store_and_verify_route_readiness_batch(
+            *composition.bundle, artifact_source, expected, configuration,
+            component_expectations, representatives, plan_repository);
+    if (!participants.ok()) {
+      Fail("direct route Stop readiness could not be resolved: " +
+           participants.error().message);
+    }
+    const auto published =
+        composition.runtime->PublishAndReadBackRouteConfiguration(
+            configuration, std::move(participants.value()));
+    Require(published.ok() && published.value().operation_admission_open,
+            "direct route publication did not establish admission");
+  }
 }
 
 void DetachRetainedCCLC(Composition &composition);
@@ -7833,6 +8271,8 @@ void AttachRetainedNativeCCLC(Composition &composition,
   // there is no CCLC service or recovery barrier to start.
   SelectDirectNativeControlMode(composition, config.package_root);
   if (composition.direct_control_mode_selected) {
+    PublishDirectNativeControlRoutes(composition, config.package_root,
+                                     config.execution_run_root);
     Require(kernel.SetRouteRecoveryPending(false).ok(),
             "direct native control mode could not release recovery "
             "admission");
@@ -7984,6 +8424,8 @@ void TryAttachManagedCCLC(Composition &composition,
   if (composition.cclc_attached.load(std::memory_order_acquire))
     return;
   if (composition.direct_control_mode_selected) {
+    PublishDirectNativeControlRoutes(composition, config.package_root,
+                                     config.execution_run_root);
     Require(kernel.SetRouteRecoveryPending(false).ok(),
             "completed route attachment could not release admission");
     return;
@@ -8014,6 +8456,8 @@ void TryAttachManagedCCLC(Composition &composition,
   attachment_config.cell_id = config.cell_id;
   SelectDirectNativeControlMode(composition, config.package_root);
   if (composition.direct_control_mode_selected) {
+    PublishDirectNativeControlRoutes(composition, config.package_root,
+                                     config.execution_run_root);
     Require(kernel.SetRouteRecoveryPending(false).ok(),
             "direct route attachment could not release admission");
     return;
@@ -8070,59 +8514,14 @@ TryBuildCurrentManagedCompositionInput(
     return std::nullopt;
   }
 
-  const core::CapabilityProviderBindingDTO *joint_planner = nullptr;
-  for (const auto &provider : bundle->value().capability_provider_bindings) {
-    if (provider.capability_id.value() != "planning.motion.joint_goal" ||
-        !core::RequiresNativeSceneProjection(
-            provider.capability_id, provider.capability_definition_revision)) {
-      continue;
-    }
-    std::set<core::RuntimeUnitId> runtime_sources;
-    for (const auto &endpoint : provider.endpoint_bindings) {
-      if (endpoint.source_kind !=
-          core::CapabilityEndpointSourceKind::kRuntimeUnit) {
-        continue;
-      }
-      const auto *runtime =
-          std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
-      Require(runtime != nullptr && !runtime->empty(),
-              "managed joint planner has a malformed runtime endpoint");
-      runtime_sources.insert(*runtime);
-    }
-    if (runtime_sources.size() == 1U &&
-        runtime_sources.begin()->value() == config.runtime_unit_id) {
-      Require(joint_planner == nullptr,
-              "managed product has ambiguous joint-planner projections");
-      joint_planner = &provider;
-    }
-  }
-  Require(joint_planner != nullptr,
-          "managed product has no native joint-planner projection");
-  const core::ProjectionNativeRuntimeBindingDTO joint_projection_binding{
-      joint_planner->capability_provider_binding_id,
-      joint_planner->capability_provider_binding_revision,
-      core::RuntimeUnitId(config.runtime_unit_id),
-      core::RuntimeEpoch(config.runtime_epoch),
-  };
-  auto projection = projections.FindActiveProjection(
-      receipt.request.candidate_projection_revision, joint_projection_binding);
-  auto projection_revision = receipt.request.candidate_projection_revision;
-  if (!projection) {
-    // The active publication stores a historical projection revision when only
-    // logical-scene state advanced; rebuild against the same durable binding.
-    const auto current_projection = projections.FindCurrentProjectionRevision(
-        receipt.request.candidate_projection_revision,
-        joint_projection_binding);
-    if (!current_projection.has_value()) {
-      return std::nullopt;
-    }
-    projection_revision = *current_projection;
-    projection = projections.FindActiveProjection(projection_revision,
-                                                  joint_projection_binding);
-  }
-  if (projection == nullptr) {
+  auto component_projections = SelectManagedComponentProjections(
+      config, *bundle, projections,
+      receipt.request.candidate_projection_revision, true);
+  if (!component_projections.has_value())
     return std::nullopt;
-  }
+  const auto projection_revision =
+      component_projections->projection_revision;
+  auto projection = component_projections->by_component.begin()->second;
   // Pending Apply still publishes the predecessor. Do not reload its model
   // map on every Manager RPC while this child has no usable projection.
   // The exact map remains mandatory before a composition can be built.
@@ -8172,6 +8571,9 @@ TryBuildCurrentManagedCompositionInput(
       config.program_cycle_journal,
       config.authoring_transaction_journal,
       std::move(planner_scene_projection),
+      {},
+      {},
+      std::move(component_projections->by_component),
   };
 }
 
@@ -8333,45 +8735,12 @@ struct ManagedBootstrapStopProduct final {
   Require(model_map.has_value(),
           "managed active retained model map is absent or invalid");
 
-  const core::CapabilityProviderBindingDTO *joint_planner = nullptr;
-  for (const auto &provider : bundle->value().capability_provider_bindings) {
-    if (provider.capability_id.value() != "planning.motion.joint_goal" ||
-        !core::RequiresNativeSceneProjection(
-            provider.capability_id, provider.capability_definition_revision)) {
-      continue;
-    }
-    std::set<core::RuntimeUnitId> runtime_sources;
-    for (const auto &endpoint : provider.endpoint_bindings) {
-      if (endpoint.source_kind !=
-          core::CapabilityEndpointSourceKind::kRuntimeUnit) {
-        continue;
-      }
-      const auto *runtime =
-          std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
-      Require(runtime != nullptr && !runtime->empty(),
-              "managed joint planner has a malformed runtime endpoint");
-      runtime_sources.insert(*runtime);
-    }
-    if (runtime_sources.size() == 1U &&
-        runtime_sources.begin()->value() == config.runtime_unit_id) {
-      Require(joint_planner == nullptr,
-              "managed product has ambiguous joint-planner projections");
-      joint_planner = &provider;
-    }
-  }
-  Require(joint_planner != nullptr,
-          "managed product has no native joint-planner projection");
-  const core::ProjectionNativeRuntimeBindingDTO joint_projection_binding{
-      joint_planner->capability_provider_binding_id,
-      joint_planner->capability_provider_binding_revision,
-      core::RuntimeUnitId(config.runtime_unit_id),
-      core::RuntimeEpoch(config.runtime_epoch),
-  };
-  auto projection = projections.FindActiveProjection(
-      request.candidate_projection_revision, joint_projection_binding);
-  Require(projection != nullptr,
-          "managed selected projection is not active at the candidate "
-          "revision");
+  auto component_projections = SelectManagedComponentProjections(
+      config, *bundle, projections, request.candidate_projection_revision,
+      false);
+  Require(component_projections.has_value(),
+          "managed selected robot projections are not active at the candidate revision");
+  auto projection = component_projections->by_component.begin()->second;
   auto collision_model = projection->collision_shared_model();
   Require(collision_model != nullptr,
           "managed active projection has no collision model");
@@ -8412,6 +8781,9 @@ struct ManagedBootstrapStopProduct final {
       config.program_cycle_journal,
       config.authoring_transaction_journal,
       std::move(planner_scene_projection),
+      {},
+      {},
+      std::move(component_projections->by_component),
   };
 }
 
@@ -8548,6 +8920,19 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           *detached_owner_clock, *detached_owner_scheduler,
           *detached_operation_journal, std::move(bootstrap_kernel_config));
   auto *const stable_kernel_owner = detached_addressed_kernel.get();
+  const auto bind_stable_kernel_to_runtime =
+      [&](RetainedNativeRuntime &runtime) {
+        runtime.cell_addressed_kernel = stable_kernel_owner;
+        runtime.addressed_request_owner_epoch =
+            core::RequestOwnerEpoch("kernel-owner-" + config.runtime_epoch);
+        runtime.addressed_cell_id = core::CellId(config.cell_id);
+        for (const auto &peer : runtime.participant_peers) {
+          peer->cell_addressed_kernel = stable_kernel_owner;
+          peer->addressed_request_owner_epoch =
+              runtime.addressed_request_owner_epoch;
+          peer->addressed_cell_id = runtime.addressed_cell_id;
+        }
+      };
   stop_recovery_kernel.store(stable_kernel_owner, std::memory_order_release);
   admission_gate.BindResourceTable(
       detached_addressed_kernel->resource_admission_table());
@@ -8787,6 +9172,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   std::move(detached_operation_journal);
               built->runtime->addressed_kernel =
                   std::move(detached_addressed_kernel);
+              bind_stable_kernel_to_runtime(*built->runtime);
               detached_owner_clock.reset();
               detached_owner_scheduler.reset();
               SelectDirectNativeControlMode(*built, config.package_root);
@@ -9150,6 +9536,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 detached_owner_clock.reset();
                 detached_owner_scheduler.reset();
               }
+              bind_stable_kernel_to_runtime(*prepared->runtime);
             }
             Require(
                 prepared->runtime->addressed_kernel
@@ -10044,6 +10431,71 @@ private:
     });
   }
 
+  [[nodiscard]] Composition *
+  FindTargetComposition(const core::ProgramBindingId &program_binding_id,
+                        const core::TargetRoleId &target_role_id,
+                        const bool motion, Composition &composition) const {
+    Composition *match = nullptr;
+    bool ambiguous = false;
+    const auto inspect = [&](Composition &candidate) {
+      const auto matches = [&](const auto &binding) {
+        return binding.value().program_binding_id == program_binding_id &&
+               binding.value().target_role_id == target_role_id;
+      };
+      const auto &aliases = motion
+                                ? candidate.runtime->motion_binding_aliases
+                                : candidate.runtime->gripper_binding_aliases;
+      const bool physical =
+          motion ? matches(candidate.runtime->motion_binding)
+                 : candidate.runtime->gripper_binding.has_value() &&
+                       matches(*candidate.runtime->gripper_binding);
+      const auto owns_target =
+          physical || std::any_of(aliases.begin(), aliases.end(), matches);
+      if (!owns_target) {
+        return;
+      }
+      if (match != nullptr) {
+        ambiguous = true;
+        return;
+      }
+      match = &candidate;
+    };
+    inspect(composition);
+    for (const auto &participant : composition.participant_compositions) {
+      inspect(*participant);
+    }
+    return ambiguous ? nullptr : match;
+  }
+
+  [[nodiscard]] Composition *FindBindingComposition(
+      const core::RuntimeParticipantBindingDTO &binding,
+      Composition &composition) const {
+    Composition *match = nullptr;
+    bool ambiguous = false;
+    const auto inspect = [&](Composition &candidate) {
+      const auto same_target = [&](const auto &owned) {
+        return owned.value().controllable_component_id ==
+                   binding.controllable_component_id &&
+               owned.value().command_target_id == binding.command_target_id;
+      };
+      const bool owns_target =
+          same_target(candidate.runtime->motion_binding) ||
+          (candidate.runtime->gripper_binding.has_value() &&
+           same_target(*candidate.runtime->gripper_binding));
+      if (!owns_target)
+        return;
+      if (match != nullptr) {
+        ambiguous = true;
+        return;
+      }
+      match = &candidate;
+    };
+    inspect(composition);
+    for (const auto &participant : composition.participant_compositions)
+      inspect(*participant);
+    return ambiguous ? nullptr : match;
+  }
+
   [[nodiscard]] CanonicalValue
   QueryTargetResponse(const TargetObservationQuery &query,
                       Composition &composition) const {
@@ -10051,22 +10503,29 @@ private:
       return ErrorResponse("execution_target_owner_stale",
                            "target query names a replaced owner");
     const bool frame_query = query.frame_role_id.has_value();
+    auto *const target_composition = FindTargetComposition(
+        query.program_binding_id, query.target_role_id, frame_query,
+        composition);
+    if (target_composition == nullptr)
+      return ErrorResponse("execution_target_observation_unavailable",
+                           "target has no unique qualified observation owner");
+    auto &selected = *target_composition;
     const auto &channel = frame_query
-                              ? composition.runtime->motion_state_channel
-                              : composition.runtime->gripper_state_channel;
+                              ? selected.runtime->motion_state_channel
+                              : selected.runtime->gripper_state_channel;
     if (!channel)
       return ErrorResponse("execution_target_observation_unavailable",
                            "target has no qualified observation channel");
     const auto observed_binding = channel->binding();
     const auto &binding = observed_binding.value();
     const auto configuration =
-        composition.runtime->ReadCurrentPublishedRouteConfiguration(
+        selected.runtime->ReadCurrentPublishedRouteConfiguration(
             binding.control_path->control_domain_id);
     if (!configuration.ok() || !configuration.value())
       return ErrorResponse("execution_target_observation_unavailable",
                            "target has no current route configuration");
     const auto representatives =
-        composition.runtime->ReadCurrentPhysicalParticipants(
+        selected.runtime->ReadCurrentPhysicalParticipants(
             *configuration.value());
     if (!representatives.ok())
       return ErrorResponse("execution_target_observation_unavailable",
@@ -10082,11 +10541,11 @@ private:
       return ErrorResponse(resolved.error().code, resolved.error().message);
     const auto &target = resolved.value().target.target_role();
     if (query.grasp_confirmation) {
-      if (!composition.operator_confirmation_validity_ns)
+      if (!selected.operator_confirmation_validity_ns)
         return ErrorResponse(
             "grasp_confirmation_unavailable",
             "target has no explicit operator confirmation policy");
-      const auto current = composition.runtime->ReadGripperStatus(
+      const auto current = selected.runtime->ReadGripperStatus(
           resolved.value().observation_binding);
       if (!current.ok())
         return ErrorResponse(current.error().code, current.error().message);
@@ -10099,7 +10558,7 @@ private:
       const bool fresh =
           status.grasp_evidence &&
           core::gripper_grasp_evidence_is_fresh(
-              *status.grasp_evidence, composition.runtime->clock->now());
+              *status.grasp_evidence, selected.runtime->clock->now());
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("query_target")},
@@ -10153,12 +10612,12 @@ private:
       });
     }
     const auto observed =
-        channel->current_state(composition.runtime->clock->now());
+        channel->current_state(selected.runtime->clock->now());
     if (!observed.ok())
       return ErrorResponse(observed.error().code, observed.error().message);
     const auto &state = observed.value();
     const auto current_configuration =
-        composition.runtime->ReadCurrentPublishedRouteConfiguration(
+        selected.runtime->ReadCurrentPublishedRouteConfiguration(
             state.control_domain_id);
     if (!current_configuration.ok() || !current_configuration.value() ||
         !target_observation_source_is_current(
@@ -10209,20 +10668,37 @@ private:
         return ErrorResponse(
             "execution_target_frame_state_unavailable",
             "frame depends on coordinates outside the qualified observation");
-      // Empty base means the composed model root, i.e. the logical cell frame.
-      const auto pose = composition.runtime->kinematics->forward_kinematics(
+      std::string base_frame;
+      if (query.relative_to_frame_role_id.has_value()) {
+        const auto base = std::find_if(
+            target.frame_role_bindings.begin(), target.frame_role_bindings.end(),
+            [&](const auto &row) {
+              return row.frame_role_id == *query.relative_to_frame_role_id;
+            });
+        if (base == target.frame_role_bindings.end())
+          return ErrorResponse(
+              "execution_target_frame_unavailable",
+              "relative frame role is not declared by the target binding");
+        if (!composition.target_resolver->FrameObservationCovered(
+                *base, observed_binding))
+          return ErrorResponse(
+              "execution_target_frame_state_unavailable",
+              "relative frame depends on coordinates outside the qualified observation");
+        base_frame = base->compiled_frame_name;
+      }
+      // Empty base retains the existing logical-cell-frame query semantics.
+      const auto pose = selected.runtime->kinematics->forward_kinematics(
           core::FkRequestDTO{
               core::RobotStateDTO{state.joint_names, std::move(positions), {}},
-              frame->compiled_frame_name,
-              {}});
+              frame->compiled_frame_name, std::move(base_frame)});
       if (!pose.ok())
         return ErrorResponse(pose.error().code, pose.error().message);
       value = PoseValue(pose.value());
     } else {
-      if (!composition.runtime->gripper || binding.resources.size() != 1U)
+      if (!selected.runtime->gripper || binding.resources.size() != 1U)
         return ErrorResponse("gripper_feedback_unavailable",
                              "target has no qualified gripper feedback");
-      const auto current = composition.runtime->ReadGripperStatus(
+      const auto current = selected.runtime->ReadGripperStatus(
           resolved.value().observation_binding);
       if (!current.ok())
         return ErrorResponse(current.error().code, current.error().message);
@@ -10268,6 +10744,10 @@ private:
     if (frame_query)
       result.emplace_back("frame_role_id",
                           CanonicalValue(query.frame_role_id->value()));
+    if (query.relative_to_frame_role_id.has_value())
+      result.emplace_back(
+          "relative_to_frame_role_id",
+          CanonicalValue(query.relative_to_frame_role_id->value()));
     return CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("query_target")},
@@ -10304,21 +10784,28 @@ private:
     if (command.context.request_owner_epoch != owner_epoch_)
       return ErrorResponse("stale_request_owner_epoch",
                            "confirmation names a replaced native owner");
-    if (!composition.operator_confirmation_validity_ns ||
-        !composition.runtime->gripper_state_channel)
+    auto *const target_composition = FindTargetComposition(
+        command.program_binding_id, command.target_role_id, false,
+        composition);
+    if (target_composition == nullptr)
+      return ErrorResponse("grasp_confirmation_unavailable",
+                           "target has no unique qualified gripper owner");
+    auto &selected = *target_composition;
+    if (!selected.operator_confirmation_validity_ns ||
+        !selected.runtime->gripper_state_channel)
       return ErrorResponse(
           "grasp_confirmation_unavailable",
           "target has no explicitly configured operator source");
-    const auto physical = composition.runtime->gripper_state_channel->binding();
+    const auto physical = selected.runtime->gripper_state_channel->binding();
     const auto configuration =
-        composition.runtime->ReadCurrentPublishedRouteConfiguration(
+        selected.runtime->ReadCurrentPublishedRouteConfiguration(
             physical.value().control_path->control_domain_id);
     if (!configuration.ok() || !configuration.value())
       return ErrorResponse(
           "grasp_confirmation_source_stale",
           "operator source has no current route configuration");
     const auto representatives =
-        composition.runtime->ReadCurrentPhysicalParticipants(
+        selected.runtime->ReadCurrentPhysicalParticipants(
             *configuration.value());
     if (!representatives.ok())
       return ErrorResponse(representatives.error().code,
@@ -10331,9 +10818,9 @@ private:
       return ErrorResponse(source.error().code, source.error().message);
     auto observation = command.observation;
     observation.gripper_id = physical.value().command_target_id.value();
-    const auto recorded = composition.runtime->RecordGraspObservation(
+    const auto recorded = selected.runtime->RecordGraspObservation(
         source.value().observation_binding, observation,
-        *composition.operator_confirmation_validity_ns,
+        *selected.operator_confirmation_validity_ns,
         command.admission_deadline_ns);
     if (!recorded.ok())
       return ErrorResponse(recorded.error().code, recorded.error().message);
@@ -10719,12 +11206,24 @@ private:
     const auto cell_stop_action =
         composition.runtime->addressed_kernel->cell_stop_action_projection();
     CanonicalValue::Array observed_targets;
-    observed_targets.reserve(2U);
+    observed_targets.reserve(
+        2U * (1U + composition.participant_compositions.size()));
     observed_targets.push_back(ObservedTargetValue(
         composition.status_motion_target_role_id, current.motion));
     if (current.gripper.has_value()) {
       observed_targets.push_back(ObservedTargetValue(
           composition.status_gripper_target_role_id, *current.gripper));
+    }
+    for (const auto &participant : composition.participant_compositions) {
+      const auto participant_state = ReadCurrentControlState(*participant);
+      observed_targets.push_back(ObservedTargetValue(
+          participant->status_motion_target_role_id,
+          participant_state.motion));
+      if (participant_state.gripper.has_value()) {
+        observed_targets.push_back(ObservedTargetValue(
+            participant->status_gripper_target_role_id,
+            *participant_state.gripper));
+      }
     }
     auto status = IdentityFields(composition, projection);
     status.emplace_back("cell_stop_action",
@@ -10936,6 +11435,14 @@ private:
     if (composition.runtime->gripper_state_channel)
       append_target(composition.runtime->gripper_state_channel,
                     composition.direct_control_gripper_binding);
+    for (const auto &participant : composition.participant_compositions) {
+      append_target(participant->runtime->motion_state_channel,
+                    participant->direct_control_motion_binding);
+      if (participant->runtime->gripper_state_channel) {
+        append_target(participant->runtime->gripper_state_channel,
+                      participant->direct_control_gripper_binding);
+      }
+    }
     const auto stream_epoch =
         "render." + std::to_string(channel->render_incarnation());
     const auto &bundle = *composition.bundle;
@@ -11328,7 +11835,14 @@ private:
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
             {"error", ErrorValue(preview.error())},
             {"ok", CanonicalValue(false)},
-        });
+          });
+      }
+      auto *const target_composition =
+          FindBindingComposition(preview.value().binding, composition);
+      if (target_composition == nullptr) {
+        return ErrorResponse(
+            "execution_target_observation_unavailable",
+            "capability preview has no unique qualified target owner");
       }
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -11337,7 +11851,8 @@ private:
           {"preview_receipt",
            CapabilityCommandPreviewReceiptValue(
                preview.value(), *command.operation, *command.operation_digest,
-               composition.runtime->gripper_position_limits, owner_epoch_)},
+               target_composition->runtime->gripper_position_limits,
+               owner_epoch_)},
       });
     }
     if (command.kind == CommandKind::kReadManualHandover) {
@@ -11439,6 +11954,14 @@ private:
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
             {"error", ErrorValue(session.error())},
             {"ok", CanonicalValue(false)},
+          });
+      }
+      auto preview_binding = session.value()->resolve_binding(preview_intent);
+      if (!preview_binding.ok()) {
+        return CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"error", ErrorValue(preview_binding.error())},
+            {"ok", CanonicalValue(false)},
         });
       }
       auto start_state = session.value()->current_state();
@@ -11466,7 +11989,7 @@ private:
           {"preview_receipt",
            MotionPreviewReceiptValue(
                preview.value(), *command.operation, *command.operation_digest,
-               composition.direct_control_motion_binding, owner_epoch_)},
+               preview_binding.value(), owner_epoch_)},
       });
     }
     if (command.kind == CommandKind::kPlanPick ||

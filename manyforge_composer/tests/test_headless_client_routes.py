@@ -1596,7 +1596,7 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
                 "/api/execution/runtime-scale-control",
                 params={
                     "program_binding_id": "binding-1",
-                    "synchronized_targets": (
+                    "group_targets": (
                         '[{"component_role_id":"robot-a","target_role_id":"arm"},'
                         '{"component_role_id":"robot-b","target_role_id":"arm"}]'
                     ),
@@ -1609,7 +1609,7 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
                 "/api/execution/runtime-scale-control",
                 params={
                     "program_binding_id": "binding-1",
-                    "synchronized_targets": (
+                    "group_targets": (
                         '[{"component_role_id":"robot","component_role_id":"other",'
                         '"target_role_id":"arm"}]'
                     ),
@@ -1626,8 +1626,8 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
                 "/api/execution/runtime-scale-control",
                 params=[
                     ("program_binding_id", "binding-1"),
-                    ("synchronized_targets", "not-json"),
-                    ("synchronized_targets", valid_group),
+                    ("group_targets", "not-json"),
+                    ("group_targets", valid_group),
                 ],
             ).status_code
             == 422
@@ -1651,7 +1651,7 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
                 "/api/execution/runtime-scale-control",
                 params={
                     "program_binding_id": "binding-1",
-                    "synchronized_targets": "[" * 2000 + "]" * 2000,
+                    "group_targets": "[" * 2000 + "]" * 2000,
                 },
             ).status_code
             == 422
@@ -1692,7 +1692,7 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
     assert forwarded[9]["method"] == "GET"
     assert forwarded[10]["method"] == "GET"
     assert json.loads(
-        dict(parse_qsl(forwarded[10]["query"]))["synchronized_targets"]
+        dict(parse_qsl(forwarded[10]["query"]))["group_targets"]
     ) == [
         {"component_role_id": "robot-a", "target_role_id": "arm"},
         {"component_role_id": "robot-b", "target_role_id": "arm"},

@@ -319,6 +319,7 @@ class ProgramRunSnapshot:
 @dataclass(slots=True)
 class _RunEntry:
     run: ExecutableProgramRun
+    program_binding: Mapping[str, Any]
     state: ProgramRunState = ProgramRunState.RUNNING
     revision: int = 1
     tree_status: str = "invalid"
@@ -557,7 +558,11 @@ class ProgramRunOwner:
                     program_parameter_values=admission.program_parameter_values,
                 )
                 run.refresh_operator_stop_scope()
-                entry = _RunEntry(run=run, node_statuses=run.node_statuses)
+                entry = _RunEntry(
+                    run=run,
+                    program_binding=admission.program_binding,
+                    node_statuses=run.node_statuses,
+                )
                 if interventions is not None:
                     interventions.register_run(
                         admitted_program_run_id, entry.node_statuses.keys()
@@ -804,10 +809,43 @@ class ProgramRunOwner:
         with self._lock:
             entry = self._entry(program_run_id)
             store = entry.run.runtime_overrides
+            program_binding = entry.program_binding
         try:
-            return store.node_context(node_instance_id)
+            context = store.node_context(node_instance_id)
         except ProgramValueError as error:
             raise ProgramRunOwnerError(str(error)) from error
+        parameters = context.get("parameters")
+        target_role = (
+            parameters.get("target_role")
+            if isinstance(parameters, Mapping)
+            else None
+        )
+        if not isinstance(target_role, str) or not target_role:
+            return context
+        target_binding = next(
+            (
+                row
+                for row in program_binding.get("target_role_bindings", ())
+                if isinstance(row, Mapping)
+                and row.get("target_role_id") == target_role
+            ),
+            None,
+        )
+        if target_binding is None:
+            raise ProgramRunOwnerError(
+                "captured Program Binding has no binding for the node target"
+            )
+        return {
+            **context,
+            "target_binding": {
+                key: deepcopy(target_binding[key])
+                for key in (
+                    "target_role_id",
+                    "controllable_component_id",
+                    "command_target_id",
+                )
+            },
+        }
 
     def clear_runtime_override(
         self,

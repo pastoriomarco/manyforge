@@ -61,6 +61,14 @@ function initialCompatibility(program: ProgramAuthoringDocument) {
   };
 }
 
+function independentExecutionGroups(program: ProgramAuthoringDocument): string {
+  return Object.entries(program.execution_groups ?? {})
+    .filter(([, definition]) => definition.execution_policy === 'independent')
+    .map(([name]) => name)
+    .sort()
+    .join(', ');
+}
+
 type MotionDefaults = ProgramMotionValues;
 
 interface MotionHistory {
@@ -89,8 +97,8 @@ export function ProgramSettingsEditor({
   const [name, setName] = useState(program.name);
   const [description, setDescription] = useState(program.description ?? '');
   const [compatibility, setCompatibility] = useState(() => initialCompatibility(program));
-  const [synchronizedGroups, setSynchronizedGroups] = useState(
-    () => (program.synchronized_execution_groups ?? []).join(', '),
+  const [executionGroups, setExecutionGroups] = useState(
+    () => independentExecutionGroups(program),
   );
   const [error, setError] = useState<string | null>(null);
   const [errorTarget, setErrorTarget] = useState('program-settings-name');
@@ -118,7 +126,7 @@ export function ProgramSettingsEditor({
     setName(program.name);
     setDescription(program.description ?? '');
     setCompatibility(initialCompatibility(program));
-    setSynchronizedGroups((program.synchronized_execution_groups ?? []).join(', '));
+    setExecutionGroups(independentExecutionGroups(program));
     setError(null);
     setErrorTarget('program-settings-name');
     setComponentRoleId('');
@@ -158,7 +166,7 @@ export function ProgramSettingsEditor({
     || compatibility.assistant !== original.assistant
     || compatibility.requires !== original.requires
     || compatibility.tags !== original.tags
-    || synchronizedGroups !== (program.synchronized_execution_groups ?? []).join(', ');
+    || executionGroups !== independentExecutionGroups(program);
   const settingsDiagnostics = diagnostics.filter((diagnostic) =>
     diagnostic.path.startsWith('program')
     && !diagnostic.path.startsWith('program.parameters')
@@ -175,21 +183,32 @@ export function ProgramSettingsEditor({
       const lanes = LANES.filter((lane) => compatibility.lanes.includes(lane));
       const requires = parseIdentifierList(compatibility.requires, 'Requirements');
       const tags = parseIdentifierList(compatibility.tags, 'Tags');
-      const coordinated = parseIdentifierList(
-        synchronizedGroups,
-        'Synchronized motion groups',
+      const groups = parseIdentifierList(
+        executionGroups,
+        'Execution groups',
       );
       const nextCompatibility: Record<string, JsonValue> = {};
       if (lanes.length > 0) nextCompatibility.lanes = lanes;
       if (compatibility.assistant) nextCompatibility.assistant = compatibility.assistant;
       if (requires.length > 0) nextCompatibility.requires = requires;
       if (tags.length > 0) nextCompatibility.tags = tags;
+      const preservedDeferredGroups = Object.fromEntries(
+        Object.entries(program.execution_groups ?? {}).filter(
+          ([, definition]) => definition.execution_policy !== 'independent',
+        ),
+      );
       onMutate('program_draft_update_settings', {
         name: name.trim(),
         description: description.trim(),
         program_profile: program.program_profile,
         compatibility: nextCompatibility,
-        synchronized_execution_groups: coordinated,
+        execution_groups: {
+          ...preservedDeferredGroups,
+          ...Object.fromEntries(groups.map((group) => [
+            group,
+            { execution_policy: 'independent' },
+          ])),
+        },
       });
       setError(null);
     } catch (caught) {
@@ -200,8 +219,8 @@ export function ProgramSettingsEditor({
           ? 'program-settings-requires'
           : message.startsWith('Tags')
             ? 'program-settings-tags'
-            : message.startsWith('Synchronized motion groups')
-              ? 'program-settings-synchronized-groups'
+            : message.startsWith('Execution groups')
+              ? 'program-settings-execution-groups'
             : 'program-settings-name',
       );
     }
@@ -212,15 +231,15 @@ export function ProgramSettingsEditor({
       if (!name.trim()) throw new Error('Program name is required.');
       parseIdentifierList(compatibility.requires, 'Requirements');
       parseIdentifierList(compatibility.tags, 'Tags');
-      parseIdentifierList(synchronizedGroups, 'Synchronized motion groups');
+      parseIdentifierList(executionGroups, 'Execution groups');
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : 'Program settings are invalid.';
       const target = message.startsWith('Requirements')
         ? 'program-settings-requires'
         : message.startsWith('Tags')
           ? 'program-settings-tags'
-          : message.startsWith('Synchronized motion groups')
-            ? 'program-settings-synchronized-groups'
+          : message.startsWith('Execution groups')
+            ? 'program-settings-execution-groups'
           : 'program-settings-name';
       event.preventDefault();
       setError(message);
@@ -411,7 +430,7 @@ export function ProgramSettingsEditor({
               setName(program.name);
               setDescription(program.description ?? '');
               setCompatibility(initialCompatibility(program));
-              setSynchronizedGroups((program.synchronized_execution_groups ?? []).join(', '));
+              setExecutionGroups(independentExecutionGroups(program));
               setComponentRoleId('');
               setComponentTypeTags('');
               setComponentModelRoles('');
@@ -459,14 +478,14 @@ export function ProgramSettingsEditor({
       <section className="program-settings-section">
         <h3>Execution timing</h3>
         <label>
-          Synchronized motion groups
+          Control groups
           <input
-            id="program-settings-synchronized-groups"
-            value={synchronizedGroups}
+            id="program-settings-execution-groups"
+            value={executionGroups}
             disabled={busy}
             placeholder="group_a, group_b"
-            title="Optional named execution groups whose sibling motion nodes start on one shared clock. Other Parallel branches remain independent."
-            onChange={(event) => setSynchronizedGroups(event.target.value)}
+            title="Named groups for Run, Stop, Resume and velocity scaling. Members plan and execute independently. Synchronized policies are added in F2."
+            onChange={(event) => setExecutionGroups(event.target.value)}
           />
         </label>
       </section>

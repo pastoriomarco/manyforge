@@ -51,7 +51,7 @@ def decode_runtime_scale_selector_query(value: str) -> Any:
     """Decode the grouped selector query using the public JSON strictness rules."""
     if len(value.encode("utf-8")) > MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES:
         raise ValueError(
-            "synchronized_targets exceeds the runtime-scale selector byte bound"
+            "group_targets exceeds the runtime-scale selector byte bound"
         )
 
     def reject_constant(token: str) -> None:
@@ -72,7 +72,7 @@ def decode_runtime_scale_selector_query(value: str) -> Any:
             object_pairs_hook=reject_duplicate_keys,
         )
     except RecursionError as exc:
-        raise ValueError("synchronized_targets JSON nesting is too deep") from exc
+        raise ValueError("group_targets JSON nesting is too deep") from exc
 
 
 class StrictRequest(BaseModel):
@@ -90,8 +90,11 @@ class TargetObservationQuery(StrictRequest):
     target_role_id: str
     kind: Literal["frame_pose", "gripper_status", "gripper_confirmation"]
     frame_role_id: str | None = None
+    relative_to_frame_role_id: str | None = None
 
-    @field_validator("owner_epoch", "target_role_id", "frame_role_id")
+    @field_validator(
+        "owner_epoch", "target_role_id", "frame_role_id", "relative_to_frame_role_id"
+    )
     @classmethod
     def validate_identity(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -102,8 +105,11 @@ class TargetObservationQuery(StrictRequest):
 
     @model_validator(mode="after")
     def exact_query(self) -> "TargetObservationQuery":
-        if (self.kind == "frame_pose") != (self.frame_role_id is not None):
+        frame_query = self.kind == "frame_pose"
+        if frame_query != (self.frame_role_id is not None):
             raise ValueError("only a frame-pose query names a frame role")
+        if not frame_query and self.relative_to_frame_role_id is not None:
+            raise ValueError("only a frame-pose query names a relative frame role")
         return self
 
 
@@ -2798,7 +2804,7 @@ class RuntimeScaleControlSelectorRequest(StrictRequest):
     program_binding_id: str
     component_role_id: str | None = None
     target_role_id: str | None = None
-    synchronized_targets: Annotated[
+    group_targets: Annotated[
         list[RuntimeScaleControlTargetRequest] | None,
         Field(min_length=2, max_length=MAX_OPERATION_PARTICIPANTS),
     ] = None
@@ -2819,7 +2825,7 @@ class RuntimeScaleControlSelectorRequest(StrictRequest):
     @model_validator(mode="after")
     def validate_form(self) -> "RuntimeScaleControlSelectorRequest":
         singular = self.component_role_id is not None or self.target_role_id is not None
-        group = self.synchronized_targets is not None
+        group = self.group_targets is not None
         if singular == group or (
             singular and (self.component_role_id is None or self.target_role_id is None)
         ):
@@ -2829,17 +2835,17 @@ class RuntimeScaleControlSelectorRequest(StrictRequest):
         if group:
             targets = [
                 (x.component_role_id, x.target_role_id)
-                for x in self.synchronized_targets or []
+                for x in self.group_targets or []
             ]
             if len(set(targets)) != len(targets):
-                raise ValueError("synchronized runtime-scale targets must be unique")
+                raise ValueError("group runtime-scale targets must be unique")
         return self
 
     @model_serializer(mode="wrap")
     def serialize_form(self, handler) -> dict[str, Any]:
         result = handler(self)
-        if self.synchronized_targets is None:
-            result.pop("synchronized_targets", None)
+        if self.group_targets is None:
+            result.pop("group_targets", None)
         else:
             result.pop("component_role_id", None)
             result.pop("target_role_id", None)

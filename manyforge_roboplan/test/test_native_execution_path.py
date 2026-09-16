@@ -3446,7 +3446,7 @@ def test_native_runtime_scale_selector_codec_preserves_singular_scope(
                 "command": "get_runtime_scale_control",
                 "selector": {
                     "program_binding_id": binding,
-                    "synchronized_targets": [
+                    "group_targets": [
                         {
                             "component_role_id": "robot",
                             "target_role_id": manifest["target_role_id"],
@@ -3470,7 +3470,7 @@ def test_native_runtime_scale_selector_codec_preserves_singular_scope(
         malformed_selectors = [
             {
                 **singular_selector,
-                "synchronized_targets": [
+                "group_targets": [
                     {
                         "component_role_id": "robot",
                         "target_role_id": manifest["target_role_id"],
@@ -3483,7 +3483,7 @@ def test_native_runtime_scale_selector_codec_preserves_singular_scope(
             },
             {
                 "program_binding_id": binding,
-                "synchronized_targets": [
+                "group_targets": [
                     {
                         "component_role_id": "robot",
                         "target_role_id": manifest["target_role_id"],

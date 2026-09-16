@@ -113,6 +113,10 @@ constexpr std::array<Scenario, 12U> kScenarios{{
      false, ""},
 }};
 
+constexpr std::array<Scenario, 1U> kComposedScenarios{{
+    {"examples/ur5e_lite6_wall.deployment.yaml", "", false, false, ""},
+}};
+
 [[nodiscard]] Options parse_options(int argc, char **argv) {
   if (argc < 3 || (std::string_view(argv[1]) != "--check" &&
                    std::string_view(argv[1]) != "--compile-candidate")) {
@@ -150,8 +154,7 @@ constexpr std::array<Scenario, 12U> kScenarios{{
       index += 2;
       continue;
     }
-    if (option == "--base-package-root" &&
-        result.base_package_root.empty()) {
+    if (option == "--base-package-root" && result.base_package_root.empty()) {
       result.base_package_root = value;
       index += 2;
       continue;
@@ -200,9 +203,9 @@ constexpr std::array<Scenario, 12U> kScenarios{{
     throw std::invalid_argument(
         "invalid or repeated maintained qualification option");
   }
-  if (result.workspace_root.empty() || result.prepared_roots.size() != 3U) {
+  if (result.workspace_root.empty() || result.prepared_roots.empty()) {
     throw std::invalid_argument("maintained qualification requires one "
-                                "workspace root and three prepared families");
+                                "workspace root and prepared families");
   }
   if (result.mode == Options::Mode::kCheck) {
     if (!result.base_package_root.empty() ||
@@ -416,9 +419,9 @@ struct FamilySource final {
         prepared->second.lexically_normal(),
     });
   }
-  if (result.size() != 3U) {
+  if (result.size() != options.prepared_roots.size()) {
     throw std::invalid_argument(
-        "maintained description must contain three model families");
+        "prepared family set differs from the maintained description");
   }
   return result;
 }
@@ -556,25 +559,33 @@ struct ScenarioProduct final {
 void verify_gripper_resource_semantics(
     const Scenario &scenario, const core::CellGraphDTO &graph,
     const deployment::VerifiedRetainedModelMap &model_map) {
-  if (graph.controllable_components.size() != 1U) {
+  if (graph.controllable_components.empty()) {
     throw std::logic_error(
-        "maintained gripper proof requires one controllable component");
+        "maintained gripper proof requires a controllable component");
   }
-  const auto &component_id =
-      graph.controllable_components.front().controllable_component_id;
-  const core::ResourceId expected_local_id(component_id.value() +
-                                           ".gripper.logical_position");
-  bool found = false;
+  std::set<core::ControllableComponentId> found_components;
   for (const auto &binding : model_map.control_bindings()) {
-    if (binding.controllable_component_id != component_id ||
-        binding.command_target_id.value() != "gripper") {
+    if (binding.command_target_id.value() != "gripper") {
       continue;
     }
+    const auto component = std::find_if(
+        graph.controllable_components.begin(),
+        graph.controllable_components.end(), [&](const auto &candidate) {
+          return candidate.controllable_component_id ==
+                 binding.controllable_component_id;
+        });
+    if (component == graph.controllable_components.end()) {
+      throw std::logic_error(
+          "maintained gripper binding names an unknown component");
+    }
+    const core::ResourceId expected_local_id(
+        binding.controllable_component_id.value() +
+        ".gripper.logical_position");
     for (const auto &resource : binding.resources) {
       if (resource.resource_role_id.value() != "fingers") {
         continue;
       }
-      found = true;
+      found_components.insert(binding.controllable_component_id);
       if (scenario.family_id == std::string_view("ur5_roboplan")) {
         if (resource.resource_id != expected_local_id ||
             !resource.coordinates.empty() ||
@@ -594,9 +605,10 @@ void verify_gripper_resource_semantics(
       }
     }
   }
-  if (!found) {
+  if (found_components.size() != graph.controllable_components.size()) {
     throw std::logic_error(
-        "maintained deployment has no retained gripper resource proof");
+        "maintained deployment lacks one retained gripper resource proof per "
+        "component");
   }
 }
 
@@ -641,10 +653,9 @@ materialize_scenarios(const std::filesystem::path &root,
           "scenario cannot select its exact deployment runtime profile");
     }
     const auto verified = deployment::verify_deployment_artifact_revision(
-        deployment::parse_strict_json_model_yaml(
-            read_file(deployment_override.has_value()
-                          ? *deployment_override
-                          : root / scenario.source)),
+        deployment::parse_strict_json_model_yaml(read_file(
+            deployment_override.has_value() ? *deployment_override
+                                            : root / scenario.source)),
         envelope_profiles);
     std::set<CatalogKey> selected_records;
     for (const auto &reference : verified.catalog_records()) {
@@ -725,7 +736,7 @@ materialize_scenarios(const std::filesystem::path &root,
               value.value().stop_evidence_policy_revision.value()};
         });
 
-    if (model_assets.size() != 1U || component_types.size() != 1U ||
+    if (model_assets.empty() || component_types.empty() ||
         profiles.size() != 1U) {
       throw std::logic_error(
           "scenario cannot select its exact structural/runtime closure");
@@ -794,22 +805,26 @@ materialize_scenarios(const std::filesystem::path &root,
     const auto qualified = deployment::qualify_deployment_for_retention(
         verified, deployment::compile_cell_ir(applicability));
 
-    const auto preparation = std::find_if(
-        catalog.structural_preparations.begin(),
-        catalog.structural_preparations.end(), [&](const auto &value) {
-          return value.verified_model_asset().value().model_asset_id ==
-                     model_assets.front().value().model_asset_id &&
-                 value.verified_model_asset().value().model_revision ==
-                     model_assets.front().value().model_revision;
-        });
-    if (preparation == catalog.structural_preparations.end()) {
-      throw std::logic_error("scenario has no exact structural preparation");
+    std::vector<deployment::BuildQualifiedStructuralModelPreparation>
+        selected_preparations;
+    selected_preparations.reserve(model_assets.size());
+    for (const auto &model_asset : model_assets) {
+      const auto preparation = std::find_if(
+          catalog.structural_preparations.begin(),
+          catalog.structural_preparations.end(), [&](const auto &value) {
+            return value.verified_model_asset().value().model_asset_id ==
+                       model_asset.value().model_asset_id &&
+                   value.verified_model_asset().value().model_revision ==
+                       model_asset.value().model_revision;
+          });
+      if (preparation == catalog.structural_preparations.end()) {
+        throw std::logic_error("scenario has no exact structural preparation");
+      }
+      selected_preparations.push_back(*preparation);
     }
-    const std::array<deployment::BuildQualifiedStructuralModelPreparation, 1U>
-        selected_preparation{*preparation};
     auto bundle = deployment::detail::RetainedBundleMaterializer::
         materialize_store_and_reload_production(
-            qualified, manifest_repository, input_source, selected_preparation,
+            qualified, manifest_repository, input_source, selected_preparations,
             catalog_store, raw_store, bundle_repository);
     if (bundle == nullptr ||
         bundle->value().compiled_products.symbol_role_maps.size() != 1U) {
@@ -850,15 +865,12 @@ materialize_scenarios(const std::filesystem::path &root,
           std::span<const deployment::BuildQualifiedValueSchemaEntry>{},
           std::span<const deployment::QualifiedCommissioningEvidenceRef>{},
           empty_overlay);
-      const auto empty_qualified =
-          deployment::qualify_deployment_for_retention(
-              empty_deployment,
-              deployment::compile_cell_ir(empty_applicability));
-      const auto empty_bundle =
-          deployment::detail::RetainedBundleMaterializer::
-              materialize_store_and_reload_production(
-                  empty_qualified, manifest_repository, input_source, {},
-                  catalog_store, raw_store, bundle_repository);
+      const auto empty_qualified = deployment::qualify_deployment_for_retention(
+          empty_deployment, deployment::compile_cell_ir(empty_applicability));
+      const auto empty_bundle = deployment::detail::RetainedBundleMaterializer::
+          materialize_store_and_reload_production(
+              empty_qualified, manifest_repository, input_source, {},
+              catalog_store, raw_store, bundle_repository);
       if (empty_bundle == nullptr ||
           empty_bundle->value().cell_graph.runtime_units !=
               bundle->value().cell_graph.runtime_units ||
@@ -1047,7 +1059,7 @@ void verify_resolved_program_binding(
       require_array(require_member(parsed.root(), "assignments",
                                    "maintained role assignments"),
                     "maintained role assignments.assignments");
-  if (rows.size() != 13U || products.size() != 12U) {
+  if (rows.size() != 15U || products.size() != 13U) {
     throw std::invalid_argument(
         "maintained Program/deployment assignment set has the wrong size");
   }
@@ -1166,7 +1178,7 @@ void verify_resolved_program_binding(
           program_source.generic_string(), binding->program_binding_id(),
           binding->value().program_id, binding->value().program_revision});
     }
-    if (repository.size() != 13U) {
+    if (repository.size() != 15U) {
       throw std::logic_error(
           "durable maintained Program-Binding repository has the wrong size");
     }
@@ -1216,12 +1228,12 @@ void verify_resolved_program_binding(
                ? 0U
                : program_bundles.at(record->program_revision.value()).size();
   };
-  if (binding_ids.size() != 13U || program_revisions.size() != 11U ||
-      reopened.size() != 13U || program_reopened.size() != 11U ||
+  if (binding_ids.size() != 15U || program_revisions.size() != 13U ||
+      reopened.size() != 15U || program_reopened.size() != 13U ||
       reused_bundle_count("pick_and_place_ur10e_robotiq_demo") != 2U ||
       reused_bundle_count("isaac_manipulator_scene_light") != 2U) {
     throw std::logic_error(
-        "maintained Program-Binding set loses its eleven-to-thirteen closure");
+        "maintained Program-Binding set loses its thirteen-to-fifteen closure");
   }
   return stored;
 }
@@ -1341,9 +1353,9 @@ void publish_and_verify_scenario_catalog(
     const std::map<std::string, ScenarioProduct, std::less<>> &products,
     const std::vector<StoredProgramBinding> &bindings,
     const std::filesystem::path &package_root) {
-  if (bindings.size() != 13U) {
+  if (bindings.size() != 15U) {
     throw std::logic_error(
-        "maintained scenario catalog requires thirteen Program Bindings");
+        "maintained scenario catalog requires fifteen Program Bindings");
   }
   std::map<std::string, std::filesystem::path, std::less<>> staged;
   std::vector<deployment::ScenarioCatalogRowDTO> rows;
@@ -1601,7 +1613,10 @@ qualify_catalog(const std::filesystem::path &root,
     throw std::logic_error(
         "maintained component closure has the wrong target-capability count");
   }
-  for (const auto &path : source_files(catalog_root / "component_type", 5U)) {
+  constexpr std::size_t kFixedScaleComponentTypeCount = 2U;
+  for (const auto &path :
+       source_files(catalog_root / "component_type",
+                    families.size() + kFixedScaleComponentTypeCount)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ComponentTypeCatalogRecordRefDTO>(bytes);
@@ -1766,7 +1781,10 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
-  for (const auto &path : source_files(catalog_root / "runtime_policy", 12U)) {
+  // One generated policy per single-robot occurrence plus the bounded UI6-I
+  // dual-robot qualification policy.
+  for (const auto &path :
+       source_files(catalog_root / "runtime_policy", kScenarios.size() + 1U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::RuntimePolicyCatalogRecordRefDTO>(bytes);
@@ -1897,8 +1915,17 @@ qualify_catalog(const std::filesystem::path &root,
     result.model_assets.push_back(std::move(verified));
     result.structural_preparations.push_back(std::move(preparation));
   }
-  if (result.records.size() != 86U || result.runtime_profiles.size() != 2U ||
-      result.runtime_policies.size() != 12U) {
+  const std::size_t expected_record_count =
+      result.command_schemas.size() + result.component_types.size() +
+      result.capabilities.size() + result.contracts.size() +
+      result.topologies.size() + result.provider_manifests.size() +
+      result.runtime_policies.size() + result.runtime_profiles.size() +
+      result.stop_policies.size() + result.model_assets.size();
+  if (result.records.size() != expected_record_count ||
+      result.model_assets.size() != families.size() ||
+      result.structural_preparations.size() != families.size() ||
+      result.runtime_profiles.size() != 2U ||
+      result.runtime_policies.size() != kScenarios.size() + 1U) {
     throw std::logic_error("maintained exact catalog closure is incomplete");
   }
   return result;
@@ -2204,7 +2231,8 @@ void verify_scenarios(const std::filesystem::path &root,
         if (trajectory_binding) {
           if (binding.runtime_scale_route_qualifications.size() != 1U) {
             throw std::invalid_argument(
-                "native trajectory binding does not retain one exact runtime-scale route: " +
+                "native trajectory binding does not retain one exact "
+                "runtime-scale route: " +
                 std::string(scenario.source));
           }
           const auto &qualification =
@@ -2221,14 +2249,15 @@ void verify_scenarios(const std::filesystem::path &root,
                   core::RuntimeScaleAcknowledgementKind::kAppliedState ||
               qualification.maximum_slew_per_second != 4.0 ||
               qualification.freshness_budget_ns != 100'000'000) {
-            throw std::invalid_argument(
-                "native trajectory binding has the wrong runtime-scale qualification: " +
-                std::string(scenario.source));
+            throw std::invalid_argument("native trajectory binding has the "
+                                        "wrong runtime-scale qualification: " +
+                                        std::string(scenario.source));
           }
           ++native_runtime_scale_binding_count;
         } else if (!binding.runtime_scale_route_qualifications.empty()) {
           throw std::invalid_argument(
-              "native non-trajectory binding unexpectedly advertises runtime scaling: " +
+              "native non-trajectory binding unexpectedly advertises runtime "
+              "scaling: " +
               std::string(scenario.source));
         }
       }
@@ -2327,15 +2356,15 @@ void verify_scenarios(const std::filesystem::path &root,
       throw std::invalid_argument(
           "same-family profiles select different models");
     }
-    }
+  }
   if (family_identities.size() != 5U || family_models.size() != 3U) {
     throw std::logic_error("maintained scenarios do not cover three families");
   }
 }
 
-[[nodiscard]] const Scenario &candidate_scenario_definition(
-    const std::filesystem::path &workspace_root,
-    const std::string_view scenario_id) {
+[[nodiscard]] const Scenario &
+candidate_scenario_definition(const std::filesystem::path &workspace_root,
+                              const std::string_view scenario_id) {
   const auto assignments = deployment::parse_strict_json_model_yaml(read_file(
       workspace_root / "manyforge_deployment/resources/maintained/"
                        "maintained_program_role_assignments.v1.json"));
@@ -2360,15 +2389,23 @@ void verify_scenarios(const std::filesystem::path &root,
   const auto &deployment_source = require_text(
       require_member(*selected, "deployment_source", "role assignment"),
       "role assignment.deployment_source");
-  const auto found = std::find_if(
+  const auto historical = std::find_if(
       kScenarios.begin(), kScenarios.end(), [&](const auto &scenario) {
         return scenario.source == deployment_source;
       });
-  if (found == kScenarios.end()) {
+  if (historical != kScenarios.end()) {
+    return *historical;
+  }
+  const auto composed =
+      std::find_if(kComposedScenarios.begin(), kComposedScenarios.end(),
+                   [&](const auto &scenario) {
+                     return scenario.source == deployment_source;
+                   });
+  if (composed == kComposedScenarios.end()) {
     throw std::logic_error(
         "candidate Scenario has no maintained Deployment definition");
   }
-  return *found;
+  return *composed;
 }
 
 [[nodiscard]] core::ProgramRoleAssignmentDTO
@@ -2388,9 +2425,9 @@ assignment_from(const deployment::ProgramBinding &binding) {
   return result;
 }
 
-[[nodiscard]] deployment::ScenarioCatalogRowDTO &require_scenario_row(
-    std::vector<deployment::ScenarioCatalogRowDTO> &rows,
-    const std::string_view scenario_id) {
+[[nodiscard]] deployment::ScenarioCatalogRowDTO &
+require_scenario_row(std::vector<deployment::ScenarioCatalogRowDTO> &rows,
+                     const std::string_view scenario_id) {
   auto found = std::find_if(rows.begin(), rows.end(), [&](const auto &row) {
     return row.scenario_id == scenario_id;
   });
@@ -2401,16 +2438,17 @@ assignment_from(const deployment::ProgramBinding &binding) {
   return *found;
 }
 
-[[nodiscard]] deployment::CanonicalValue compile_candidate(
-    const Options &options, const QualifiedCatalogClosure &catalog,
-    const ExactCompilerInputSource &input_source) {
+[[nodiscard]] deployment::CanonicalValue
+compile_candidate(const Options &options,
+                  const QualifiedCatalogClosure &catalog,
+                  const ExactCompilerInputSource &input_source) {
   const auto candidate_catalog_path =
       options.candidate_package_root / "maintained.scenario-catalog.yaml";
   const bool has_candidate_catalog =
       std::filesystem::is_regular_file(candidate_catalog_path) &&
       !std::filesystem::is_symlink(candidate_catalog_path);
-  const auto publication_expected = [&]()
-      -> std::optional<core::ScenarioCatalogRevision> {
+  const auto publication_expected =
+      [&]() -> std::optional<core::ScenarioCatalogRevision> {
     if (!has_candidate_catalog) {
       return std::nullopt;
     }
@@ -2423,8 +2461,7 @@ assignment_from(const deployment::ProgramBinding &binding) {
     return current->revision();
   }();
   const deployment::FilesystemScenarioApplyCandidateSource source(
-      options.base_package_root, "maintained",
-      options.candidate_package_root);
+      options.base_package_root, "maintained", options.candidate_package_root);
   const core::ScenarioCatalogRevision expected_catalog_revision(
       options.expected_scenario_catalog_revision);
   const auto source_catalog = deployment::verify_scenario_catalog_artifact(
@@ -2445,10 +2482,10 @@ assignment_from(const deployment::ProgramBinding &binding) {
   const auto &scenario = candidate_scenario_definition(
       options.workspace_root, options.candidate_scenario_id);
   const std::array<Scenario, 1U> selected_scenarios{scenario};
-  const auto products = materialize_scenarios(
-      options.workspace_root, catalog, input_source,
-      options.candidate_package_root, selected_scenarios,
-      options.candidate_deployment_path, false);
+  const auto products =
+      materialize_scenarios(options.workspace_root, catalog, input_source,
+                            options.candidate_package_root, selected_scenarios,
+                            options.candidate_deployment_path, false);
   const auto product = products.find(std::string(scenario.source));
   if (product == products.end()) {
     throw std::logic_error(
@@ -2466,29 +2503,25 @@ assignment_from(const deployment::ProgramBinding &binding) {
   const auto source_bundle =
       source_bundles.get_verified(source_selection.retained_bundle_id);
   if (source_bundle == nullptr) {
-    throw std::logic_error(
-        "candidate source retained bundle is unavailable");
+    throw std::logic_error("candidate source retained bundle is unavailable");
   }
   const deployment::FilesystemVerifiedRetainedModelMapSource source_maps(
       source_package_root);
-  const auto source_model_map = source_maps.get_verified(
-      deployment::RetainedModelMapQuery{
+  const auto source_model_map =
+      source_maps.get_verified(deployment::RetainedModelMapQuery{
           source_selection.retained_bundle_id,
           source_bundle->value()
               .compiled_products.symbol_role_maps.front()
               .product_id});
   if (!source_model_map.has_value()) {
-    throw std::logic_error(
-        "candidate source model map is unavailable");
+    throw std::logic_error("candidate source model map is unavailable");
   }
   const deployment::FilesystemVerifiedProgramBindingSource source_bindings(
       source_package_root);
   const auto baseline = source_bindings.get_verified(
-      source_selection.program_binding_id, *source_bundle,
-      *source_model_map);
+      source_selection.program_binding_id, *source_bundle, *source_model_map);
   if (baseline == nullptr) {
-    throw std::logic_error(
-        "candidate source Program Binding is unavailable");
+    throw std::logic_error("candidate source Program Binding is unavailable");
   }
 
   const auto program_bytes = read_file(options.candidate_program_path);
@@ -2509,8 +2542,8 @@ assignment_from(const deployment::ProgramBinding &binding) {
       options.candidate_package_root);
   static_cast<void>(
       program_repository.put_if_absent(program, *candidate.bundle));
-  static_cast<void>(binding_repository.put_if_absent(
-      binding, *candidate.bundle, candidate.model_map));
+  static_cast<void>(binding_repository.put_if_absent(binding, *candidate.bundle,
+                                                     candidate.model_map));
 
   auto rows = source_catalog->rows();
   auto &row = require_scenario_row(rows, options.candidate_scenario_id);
@@ -2525,7 +2558,8 @@ assignment_from(const deployment::ProgramBinding &binding) {
       options.candidate_package_root, "maintained");
   const auto published =
       repository.compare_and_set(publication_expected, authored_catalog);
-  if (published == deployment::ScenarioCatalogPublishResult::kRevisionConflict) {
+  if (published ==
+      deployment::ScenarioCatalogPublishResult::kRevisionConflict) {
     throw std::runtime_error(
         "candidate scenario catalog changed during publication");
   }
@@ -2606,15 +2640,22 @@ int main(int argc, char **argv) {
     }
     verify_scenarios(root, catalog);
     TemporaryPackage package(options.package_root);
-    const auto products =
+    auto products =
         materialize_scenarios(root, catalog, input_source, package.path());
+    auto composed_products = materialize_scenarios(
+        root, catalog, input_source, package.path(), kComposedScenarios);
+    products.merge(composed_products);
+    if (!composed_products.empty()) {
+      throw std::logic_error("composed scenario product source is duplicated");
+    }
     const auto bindings =
         verify_program_bindings(root, products, package.path());
     publish_and_verify_scenario_catalog(root, products, bindings,
                                         package.path());
-    std::cout << "12 deployments, 3 shared families, 36 historical facilities, "
-                 "verified exact catalog referents, 13 durable Program Bindings, "
-                 "and 13 scenario closures validated\n";
+    std::cout
+        << "13 deployments, 5 shared families, 36 historical facilities, "
+           "verified exact catalog referents, 15 durable Program Bindings, "
+           "and 15 scenario closures validated\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "manyforge_maintained_deployment_occurrences: " << error.what()

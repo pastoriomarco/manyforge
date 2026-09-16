@@ -1413,7 +1413,7 @@ def _resolve_execution_selections(
     )
 
 
-_SYNCHRONIZABLE_MOTION_NODE_IDS: Final = frozenset(
+_COORDINATABLE_MOTION_NODE_IDS: Final = frozenset(
     {
         "motion.move_to_joint_target",
         "motion.move_to_pose",
@@ -1422,37 +1422,70 @@ _SYNCHRONIZABLE_MOTION_NODE_IDS: Final = frozenset(
 )
 
 
-def _parse_synchronized_execution_groups(raw: Any, *, path: str) -> tuple[str, ...]:
+_EXECUTION_POLICIES: Final = frozenset(
+    {
+        "independent",
+        "common_start",
+        "common_start_and_finish",
+        "sync_offset_traj",
+    }
+)
+
+
+def _parse_execution_group_policies(raw: Any, *, path: str) -> Mapping[str, str]:
     if raw is None:
-        return ()
-    if (
-        type(raw) is not list
-        or len(raw) > _MAX_EXECUTION_GROUPS
-        or any(
+        return MappingProxyType({})
+    if type(raw) is not dict:
+        raise ProgramValidationError(f"{path} must be a mapping")
+    if len(raw) > _MAX_EXECUTION_GROUPS:
+        raise ProgramValidationError(f"{path} groups exceed the supported limit")
+    if list(raw) != sorted(raw):
+        raise ProgramValidationError(f"{path} keys must be canonical-sorted")
+    result: dict[str, str] = {}
+    for name, definition in raw.items():
+        if (
             type(name) is not str
             or len(name) > 128
             or _IDENTIFIER_RE.fullmatch(name) is None
             or name in {"all", "inherit"}
-            for name in raw
-        )
-        or raw != sorted(raw)
-        or len(set(raw)) != len(raw)
-    ):
-        raise ProgramValidationError(
-            f"{path} must be a canonical sorted set of unique named execution groups"
-        )
-    return tuple(raw)
+        ):
+            raise ProgramValidationError(f"{path} contains an invalid group ID")
+        if type(definition) is not dict or set(definition) != {"execution_policy"}:
+            raise ProgramValidationError(
+                f"{path}.{name} must contain only execution_policy"
+            )
+        policy = definition["execution_policy"]
+        if type(policy) is not str or policy not in _EXECUTION_POLICIES:
+            raise ProgramValidationError(
+                f"{path}.{name}.execution_policy is unsupported"
+            )
+        result[name] = policy
+    return MappingProxyType(result)
 
 
-def _resolve_synchronized_execution_selections(
+def _validate_execution_group_policies(
     tree: ProgramTreeNode,
-    group_names: tuple[str, ...],
+    policies: Mapping[str, str],
 ) -> Mapping[str, tuple[str, ...]]:
-    """Validate same-tick motion groups without adding another runtime owner."""
+    """Validate declarations and coordinated shapes without adding an owner."""
 
-    if not group_names:
-        return MappingProxyType({})
     selections = _resolve_execution_selections(tree)
+    authored_names = set(selections) - {"all"}
+    declared_names = set(policies)
+    if authored_names != declared_names:
+        missing = sorted(authored_names - declared_names)
+        unused = sorted(declared_names - authored_names)
+        details = []
+        if missing:
+            details.append(f"undeclared groups {missing}")
+        if unused:
+            details.append(f"unused declarations {unused}")
+        raise ProgramValidationError("execution_groups has " + " and ".join(details))
+    coordinated_names = tuple(
+        name for name, policy in policies.items() if policy != "independent"
+    )
+    if not coordinated_names:
+        return MappingProxyType({})
     nodes: dict[str, ProgramTreeNode] = {}
     parents: dict[str, ProgramTreeNode | None] = {}
     pending = [(tree, None)]
@@ -1463,17 +1496,19 @@ def _resolve_synchronized_execution_selections(
         pending.extend((child, node) for child in reversed(node.children))
 
     result: dict[str, tuple[str, ...]] = {}
-    already_synchronized: set[str] = set()
-    for group_name in group_names:
+    already_coordinated: set[str] = set()
+    for group_name in coordinated_names:
         members = selections.get(group_name)
         if members is None or len(members) < 2:
             raise ProgramValidationError(
-                f"synchronized_execution_groups.{group_name} must select at least two nodes"
+                f"execution_groups.{group_name} must select at least two nodes for "
+                f"{policies[group_name]}"
             )
         member_nodes = [nodes[instance_id] for instance_id in members]
-        if any(node.node_id not in _SYNCHRONIZABLE_MOTION_NODE_IDS for node in member_nodes):
+        if any(node.node_id not in _COORDINATABLE_MOTION_NODE_IDS for node in member_nodes):
             raise ProgramValidationError(
-                f"synchronized_execution_groups.{group_name} may contain only ordinary motion nodes"
+                f"execution_groups.{group_name} may contain only ordinary motion nodes "
+                f"for {policies[group_name]}"
             )
         if any(
             not isinstance(node.execution_groups, tuple)
@@ -1481,7 +1516,8 @@ def _resolve_synchronized_execution_selections(
             for node in member_nodes
         ):
             raise ProgramValidationError(
-                f"synchronized_execution_groups.{group_name} must be assigned directly to every member"
+                f"execution_groups.{group_name} must be assigned directly to every "
+                "coordinated member"
             )
         parent = parents[members[0]]
         if (
@@ -1491,14 +1527,15 @@ def _resolve_synchronized_execution_selections(
             or any(parents[instance_id] is not parent for instance_id in members[1:])
         ):
             raise ProgramValidationError(
-                f"synchronized_execution_groups.{group_name} must contain sibling motions under one Success-on-all Parallel"
+                f"execution_groups.{group_name} must contain sibling motions under one "
+                "Success-on-all Parallel for coordinated execution"
             )
-        overlap = already_synchronized.intersection(members)
+        overlap = already_coordinated.intersection(members)
         if overlap:
             raise ProgramValidationError(
-                "a motion node cannot belong to more than one synchronized execution group"
+                "a motion node cannot belong to more than one coordinated execution group"
             )
-        already_synchronized.update(members)
+        already_coordinated.update(members)
         result[group_name] = members
     return MappingProxyType(result)
 
@@ -1847,7 +1884,7 @@ _TOP_LEVEL_FIELDS: Final = frozenset(
         "parameters",
         "blackboard",
         "contact_policies",
-        "synchronized_execution_groups",
+        "execution_groups",
         "tree",
     }
 )
@@ -3848,22 +3885,25 @@ def _validate_program_document(
         node_budget=[_MAX_TREE_NODES],
         context=context,
     )
-    synchronized_groups = _parse_synchronized_execution_groups(
-        root.get("synchronized_execution_groups"),
-        path=f"{source}.synchronized_execution_groups",
+    execution_group_policies = _parse_execution_group_policies(
+        root.get("execution_groups"),
+        path=f"{source}.execution_groups",
     )
-    if synchronized_groups and api_version != _PROGRAM_API_VERSION:
+    if execution_group_policies and api_version != _PROGRAM_API_VERSION:
         _program_error(
-            f"{source}.synchronized_execution_groups",
+            f"{source}.execution_groups",
             "is unavailable in the previous Program contract",
         )
-    _resolve_synchronized_execution_selections(tree, synchronized_groups)
+    _validate_execution_group_policies(tree, execution_group_policies)
     normalized_root = deepcopy(root)
     normalized_root["tree"] = tree.to_dict()
-    if synchronized_groups:
-        normalized_root["synchronized_execution_groups"] = list(synchronized_groups)
+    if execution_group_policies:
+        normalized_root["execution_groups"] = {
+            name: {"execution_policy": policy}
+            for name, policy in execution_group_policies.items()
+        }
     else:
-        normalized_root.pop("synchronized_execution_groups", None)
+        normalized_root.pop("execution_groups", None)
     try:
         verify_content_identity(
             normalized_root,
@@ -3971,14 +4011,12 @@ class Program:
         self.validated_catalog_digest = catalog.catalog_digest
         self.tree = tree
         self.execution_selections = _resolve_execution_selections(tree)
-        self.synchronized_execution_groups = _parse_synchronized_execution_groups(
-            normalized.get("synchronized_execution_groups"),
-            path=f"{source}.synchronized_execution_groups",
+        self.execution_group_policies = _parse_execution_group_policies(
+            normalized.get("execution_groups"),
+            path=f"{source}.execution_groups",
         )
-        self.synchronized_execution_selections = (
-            _resolve_synchronized_execution_selections(
-                tree, self.synchronized_execution_groups
-            )
+        self.coordinated_execution_selections = _validate_execution_group_policies(
+            tree, self.execution_group_policies
         )
         self.parameters = MappingProxyType(dict(parameters))
         self.blackboard_keys = MappingProxyType(dict(blackboard_keys))
@@ -4019,6 +4057,87 @@ def migrate_program_v1(data: dict[str, Any], catalog: NodeCatalog) -> Program:
     return Program.from_dict(normalized, catalog)
 
 
+def migrate_program_execution_groups(
+    data: dict[str, Any], catalog: NodeCatalog
+) -> Program:
+    """Explicitly replace the former synchronization list in one v2 Program."""
+
+    if type(data) is not dict or data.get("api_version") != _PROGRAM_API_VERSION:
+        raise ProgramValidationError("execution-group migration requires a v2 Program")
+    if "execution_groups" in data:
+        raise ProgramValidationError("Program already uses execution group definitions")
+    try:
+        verify_content_identity(
+            data,
+            own_field="program_revision",
+            identity_domain="program-revision",
+            api_version=_PROGRAM_API_VERSION,
+            label="execution-group migration input",
+        )
+    except StrictArtifactError as exc:
+        raise ProgramValidationError(str(exc)) from exc
+    selected = data.get("synchronized_execution_groups", [])
+    synchronized = _parse_synchronized_execution_groups_legacy(
+        selected, path="synchronized_execution_groups"
+    )
+    migrated = deepcopy(data)
+    migrated.pop("synchronized_execution_groups", None)
+    names: set[str] = set()
+    pending = [migrated.get("tree")]
+    while pending:
+        node = pending.pop()
+        if type(node) is not dict:
+            raise ProgramValidationError("Program tree is invalid")
+        memberships = node.get("execution_groups")
+        if type(memberships) is list:
+            names.update(memberships)
+        children = node.get("children", [])
+        if type(children) is not list:
+            raise ProgramValidationError("Program tree children are invalid")
+        pending.extend(children)
+    unknown = set(synchronized) - names
+    if unknown:
+        raise ProgramValidationError(
+            f"synchronized execution groups are unused: {sorted(unknown)}"
+        )
+    if names:
+        migrated["execution_groups"] = {
+            name: {
+                "execution_policy": (
+                    "common_start" if name in synchronized else "independent"
+                )
+            }
+            for name in sorted(names)
+        }
+    migrated["program_revision"] = compute_content_identity(
+        migrated,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version=_PROGRAM_API_VERSION,
+    )
+    return Program.from_dict(migrated, catalog)
+
+
+def _parse_synchronized_execution_groups_legacy(
+    raw: Any, *, path: str
+) -> tuple[str, ...]:
+    if (
+        type(raw) is not list
+        or len(raw) > _MAX_EXECUTION_GROUPS
+        or raw != sorted(raw)
+        or len(set(raw)) != len(raw)
+        or any(
+            type(name) is not str
+            or len(name) > 128
+            or _IDENTIFIER_RE.fullmatch(name) is None
+            or name in {"all", "inherit"}
+            for name in raw
+        )
+    ):
+        raise ProgramValidationError(f"{path} is invalid")
+    return tuple(raw)
+
+
 __all__ = [
     "BlackboardKey",
     "BlackboardFieldDeclaration",
@@ -4034,6 +4153,7 @@ __all__ = [
     "find_tree_node_by_name",
     "merge_param_patch",
     "migrate_program_v1",
+    "migrate_program_execution_groups",
     "program_node_policies",
     "require_exact_program_binding_node_policies",
     "tree_node_from_dict",

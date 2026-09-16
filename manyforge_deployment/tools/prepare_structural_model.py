@@ -38,17 +38,14 @@ MAX_SOURCE_CLOSURE_BYTES = 512 * 1024 * 1024
 
 PREPARATION_API_VERSION = "manyforge.structural_model_preparation.v1"
 GENERATOR_ID = "manyforge.structural_model_preparation"
-GENERATOR_VERSION = "1.0.0"
-CONFIGURATION_IDENTITY_DOMAIN = (
-    "structural-model-preparation-receipt"
-)
+GENERATOR_VERSION = "1.2.0"
+CONFIGURATION_IDENTITY_DOMAIN = "structural-model-preparation-receipt"
 CONTENT_IDENTITY_PREFIX = "manyforge.content-identity.v1"
 
 _PORTABLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
-_RUNTIME_ONLY_TOP_LEVEL = frozenset(
-    {"gazebo", "ros2_control", "transmission"}
-)
+_RUNTIME_ONLY_TOP_LEVEL = frozenset({"gazebo", "ros2_control", "transmission"})
+_RUNTIME_ONLY_NESTED = frozenset({("collision", "surface")})
 _URDF_STRUCTURAL_TOP_LEVEL = frozenset({"joint", "link", "material"})
 _SRDF_STRUCTURAL_TOP_LEVEL = frozenset(
     {
@@ -90,6 +87,8 @@ class PreparedStructuralModel:
     srdf_bytes: bytes | None
     resources: tuple[PreparedResourceReference, ...]
     removed_top_level_elements: tuple[tuple[str, int], ...]
+    removed_nested_elements: tuple[tuple[str, int], ...]
+    removed_duplicate_srdf_elements: tuple[tuple[str, int], ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -161,9 +160,7 @@ class _StrictXmlBuilder:
             attribute_value = raw_attributes[index + 1]
             _require_plain_xml_name(attribute_name, self._kind)
             if attribute_name in seen:
-                self.fail(
-                    f"contains duplicate attribute {attribute_name!r}"
-                )
+                self.fail(f"contains duplicate attribute {attribute_name!r}")
             seen.add(attribute_name)
             self._budget.attributes += 1
             if self._budget.attributes > MAX_XML_ATTRIBUTES:
@@ -203,9 +200,7 @@ class _StrictXmlBuilder:
         self.fail("contains a forbidden processing instruction")
 
     def fail(self, reason: str) -> None:
-        raise StructuralModelPreparationError(
-            f"{self._kind} XML {reason}"
-        )
+        raise StructuralModelPreparationError(f"{self._kind} XML {reason}")
 
     def finish(self) -> _ParsedXml:
         if self._root is None or self._stack:
@@ -316,10 +311,7 @@ def _read_bounded_plain_resource(
             raise StructuralModelPreparationError(
                 f"resource is not a plain file: {relative_path!r}"
             )
-        if (
-            metadata.st_size <= 0
-            or metadata.st_size > MAX_OPAQUE_ARTIFACT_BYTES
-        ):
+        if metadata.st_size <= 0 or metadata.st_size > MAX_OPAQUE_ARTIFACT_BYTES:
             raise StructuralModelPreparationError(
                 "resource size is outside the qualified source bound: "
                 f"{relative_path!r}"
@@ -359,17 +351,13 @@ def _read_bounded_plain_resource(
 
 
 def _require_plain_xml_name(name: str, kind: str) -> None:
-    if not name or ":" in name or name == "xmlns" or name.startswith(
-        "xmlns:"
-    ):
+    if not name or ":" in name or name == "xmlns" or name.startswith("xmlns:"):
         raise StructuralModelPreparationError(
             f"{kind} XML namespaces are not supported"
         )
 
 
-def _parse_strict_xml(
-    value: bytes, *, kind: str, budget: _XmlBudget
-) -> _ParsedXml:
+def _parse_strict_xml(value: bytes, *, kind: str, budget: _XmlBudget) -> _ParsedXml:
     if not isinstance(value, bytes):
         raise TypeError(f"{kind} input must be bytes")
     if len(value) > MAX_XML_ENTRYPOINT_BYTES:
@@ -387,9 +375,7 @@ def _parse_strict_xml(
     parser.StartDoctypeDeclHandler = builder.reject_doctype
     parser.EntityDeclHandler = builder.reject_entity
     parser.ExternalEntityRefHandler = builder.reject_external_entity
-    parser.ProcessingInstructionHandler = (
-        builder.reject_processing_instruction
-    )
+    parser.ProcessingInstructionHandler = builder.reject_processing_instruction
     parser.CommentHandler = lambda _comment: None
     try:
         parser.Parse(value, True)
@@ -426,9 +412,7 @@ def _require_safe_relative_path(value: str, *, field: str) -> None:
     try:
         encoded = value.encode("ascii")
     except UnicodeEncodeError as error:
-        raise StructuralModelPreparationError(
-            f"{field} must be ASCII"
-        ) from error
+        raise StructuralModelPreparationError(f"{field} must be ASCII") from error
     if (
         not value
         or len(encoded) > MAX_LOGICAL_URI_BYTES
@@ -464,9 +448,7 @@ def _validate_package_prefix(prefix: str) -> None:
         raise StructuralModelPreparationError(
             "accepted package URI prefix is ambiguous"
         )
-    _require_safe_relative_path(
-        remainder, field="accepted package URI prefix"
-    )
+    _require_safe_relative_path(remainder, field="accepted package URI prefix")
 
 
 def _reject_unresolved_templates(parsed: _ParsedXml, *, kind: str) -> None:
@@ -476,11 +458,7 @@ def _reject_unresolved_templates(parsed: _ParsedXml, *, kind: str) -> None:
                 f"{kind} contains an unresolved xacro element"
             )
         for name, value in element.attrib.items():
-            if (
-                "xacro" in name.casefold()
-                or "${" in value
-                or "$(" in value
-            ):
+            if "xacro" in name.casefold() or "${" in value or "$(" in value:
                 raise StructuralModelPreparationError(
                     f"{kind} contains an unresolved template expression"
                 )
@@ -504,8 +482,7 @@ def _remove_runtime_only_top_level(
                 continue
             if parent is not root:
                 raise StructuralModelPreparationError(
-                    f"URDF runtime-only <{tag}> must be a direct <robot> "
-                    "child"
+                    f"URDF runtime-only <{tag}> must be a direct <robot> " "child"
                 )
             removable.append(child)
             counts[tag] += 1
@@ -514,22 +491,53 @@ def _remove_runtime_only_top_level(
     return tuple(counts.items())
 
 
-def _require_structural_document(
-    parsed: _ParsedXml, *, kind: str
-) -> None:
+def _remove_runtime_only_nested(
+    parsed: _ParsedXml,
+) -> tuple[tuple[str, int], ...]:
+    """Remove only explicitly qualified nested simulator extensions."""
+
+    counts = {f"{parent}.{child}": 0 for parent, child in sorted(_RUNTIME_ONLY_NESTED)}
+    for parent in parsed.root.iter():
+        for child in list(parent):
+            selector = (str(parent.tag), str(child.tag))
+            if selector not in _RUNTIME_ONLY_NESTED:
+                continue
+            parent.remove(child)
+            counts[".".join(selector)] += 1
+    return tuple(counts.items())
+
+
+def _remove_duplicate_srdf_disable_collisions(
+    parsed: _ParsedXml,
+) -> tuple[tuple[str, int], ...]:
+    """Collapse repeated unordered disabled-collision pairs."""
+
+    seen: set[tuple[str, str]] = set()
+    removed = 0
+    for element in list(parsed.root):
+        if element.tag != "disable_collisions":
+            continue
+        pair = tuple(
+            sorted((element.attrib.get("link1", ""), element.attrib.get("link2", "")))
+        )
+        if pair in seen:
+            parsed.root.remove(element)
+            removed += 1
+        else:
+            seen.add(pair)
+    return (("disable_collisions", removed),)
+
+
+def _require_structural_document(parsed: _ParsedXml, *, kind: str) -> None:
     root = parsed.root
     if root.tag != "robot":
-        raise StructuralModelPreparationError(
-            f"{kind} root element must be <robot>"
-        )
+        raise StructuralModelPreparationError(f"{kind} root element must be <robot>")
     if not root.attrib.get("name"):
         raise StructuralModelPreparationError(
             f"{kind} <robot> requires a non-empty name"
         )
     allowed = (
-        _URDF_STRUCTURAL_TOP_LEVEL
-        if kind == "URDF"
-        else _SRDF_STRUCTURAL_TOP_LEVEL
+        _URDF_STRUCTURAL_TOP_LEVEL if kind == "URDF" else _SRDF_STRUCTURAL_TOP_LEVEL
     )
     for child in root:
         tag = str(child.tag)
@@ -560,12 +568,8 @@ def _rewrite_resource_uris(
     model_asset_id: str,
     package_prefix: str,
 ) -> tuple[PreparedResourceReference, ...]:
-    occurrences: dict[
-        str, tuple[str, str, str, int]
-    ] = {}
-    casefold_paths = {
-        path.casefold(): path for path in _RESERVED_OUTPUT_PATHS
-    }
+    occurrences: dict[str, tuple[str, str, str, int]] = {}
+    casefold_paths = {path.casefold(): path for path in _RESERVED_OUTPUT_PATHS}
 
     for element in parsed.root.iter():
         tag = str(element.tag)
@@ -582,18 +586,14 @@ def _rewrite_resource_uris(
             continue
         original = element.attrib.get("filename")
         if original is None:
-            raise StructuralModelPreparationError(
-                f"URDF <{tag}> requires a filename"
-            )
+            raise StructuralModelPreparationError(f"URDF <{tag}> requires a filename")
         if not original.startswith(package_prefix):
             raise StructuralModelPreparationError(
                 f"URDF <{tag}> filename must use exactly the accepted "
                 f"package prefix {package_prefix!r}: {original!r}"
             )
         relative_path = original[len(package_prefix) :]
-        _require_safe_relative_path(
-            relative_path, field=f"URDF <{tag}> resource path"
-        )
+        _require_safe_relative_path(relative_path, field=f"URDF <{tag}> resource path")
         asset_uri = f"asset://{model_asset_id}/{relative_path}"
         if len(asset_uri.encode("ascii")) > MAX_LOGICAL_URI_BYTES:
             raise StructuralModelPreparationError(
@@ -607,10 +607,7 @@ def _rewrite_resource_uris(
                 f"resource path {relative_path!r} collides with a "
                 "reserved preparation output"
             )
-        if (
-            previous_spelling is not None
-            and previous_spelling != relative_path
-        ):
+        if previous_spelling is not None and previous_spelling != relative_path:
             raise StructuralModelPreparationError(
                 "resource paths collide under portable case folding: "
                 f"{previous_spelling!r} and {relative_path!r}"
@@ -658,9 +655,7 @@ def _rewrite_resource_uris(
     )
 
 
-def _reject_non_resource_uris(
-    parsed: _ParsedXml, *, kind: str
-) -> None:
+def _reject_non_resource_uris(parsed: _ParsedXml, *, kind: str) -> None:
     for element in parsed.root.iter():
         for attribute_name, attribute_value in element.attrib.items():
             if _looks_like_uri(attribute_value):
@@ -681,9 +676,7 @@ def _escape_attribute(value: str) -> str:
     )
 
 
-def _serialize_element(
-    element: ET.Element, *, depth: int, output: list[str]
-) -> None:
+def _serialize_element(element: ET.Element, *, depth: int, output: list[str]) -> None:
     indent = "  " * depth
     attributes = "".join(
         f' {name}="{_escape_attribute(value)}"'
@@ -733,7 +726,13 @@ def prepare_structural_model(
     if srdf is not None:
         _reject_unresolved_templates(srdf, kind="SRDF")
 
-    removed = _remove_runtime_only_top_level(urdf)
+    removed_top_level = _remove_runtime_only_top_level(urdf)
+    removed_nested = _remove_runtime_only_nested(urdf)
+    removed_duplicate_srdf = (
+        (("disable_collisions", 0),)
+        if srdf is None
+        else _remove_duplicate_srdf_disable_collisions(srdf)
+    )
     _require_structural_document(urdf, kind="URDF")
     if srdf is not None:
         _require_structural_document(srdf, kind="SRDF")
@@ -753,11 +752,11 @@ def prepare_structural_model(
         model_asset_id=model_asset_id,
         accepted_package_uri_prefix=accepted_package_uri_prefix,
         urdf_bytes=_serialize_document(urdf.root),
-        srdf_bytes=(
-            None if srdf is None else _serialize_document(srdf.root)
-        ),
+        srdf_bytes=(None if srdf is None else _serialize_document(srdf.root)),
         resources=resources,
-        removed_top_level_elements=removed,
+        removed_top_level_elements=removed_top_level,
+        removed_nested_elements=removed_nested,
+        removed_duplicate_srdf_elements=removed_duplicate_srdf,
     )
 
 
@@ -777,9 +776,7 @@ def qualify_structural_model_preparation(
 
     if not isinstance(original_urdf_bytes, bytes):
         raise TypeError("original URDF input must be bytes")
-    if original_srdf_bytes is not None and not isinstance(
-        original_srdf_bytes, bytes
-    ):
+    if original_srdf_bytes is not None and not isinstance(original_srdf_bytes, bytes):
         raise TypeError("original SRDF input must be bytes or None")
     if (prepared.srdf_bytes is None) != (original_srdf_bytes is None):
         raise StructuralModelPreparationError(
@@ -796,9 +793,8 @@ def qualify_structural_model_preparation(
             raise StructuralModelPreparationError(
                 f"could not inspect resource root: {error}"
             ) from error
-        if (
-            not stat.S_ISDIR(root_metadata.st_mode)
-            or stat.S_ISLNK(root_metadata.st_mode)
+        if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(
+            root_metadata.st_mode
         ):
             raise StructuralModelPreparationError(
                 "resource_root must be one plain directory"
@@ -806,9 +802,7 @@ def qualify_structural_model_preparation(
 
     artifacts: list[PreparedSourceArtifact] = [
         PreparedSourceArtifact(
-            logical_uri=(
-                f"asset://{prepared.model_asset_id}/model.urdf"
-            ),
+            logical_uri=(f"asset://{prepared.model_asset_id}/model.urdf"),
             media_type="application/xml",
             byte_size=len(prepared.urdf_bytes),
             content_digest=_sha256(prepared.urdf_bytes),
@@ -817,9 +811,7 @@ def qualify_structural_model_preparation(
     if prepared.srdf_bytes is not None:
         artifacts.append(
             PreparedSourceArtifact(
-                logical_uri=(
-                    f"asset://{prepared.model_asset_id}/model.srdf"
-                ),
+                logical_uri=(f"asset://{prepared.model_asset_id}/model.srdf"),
                 media_type="application/xml",
                 byte_size=len(prepared.srdf_bytes),
                 content_digest=_sha256(prepared.srdf_bytes),
@@ -830,9 +822,7 @@ def qualify_structural_model_preparation(
     resource_rewrites: list[dict[str, object]] = []
     for reference in prepared.resources:
         assert resource_root is not None
-        value = _read_bounded_plain_resource(
-            resource_root, reference.relative_path
-        )
+        value = _read_bounded_plain_resource(resource_root, reference.relative_path)
         media_type = _resource_media_type(reference)
         identity = _source_identity(value)
         artifacts.append(
@@ -851,9 +841,7 @@ def qualify_structural_model_preparation(
                 "kind": reference.kind,
                 "media_type": media_type,
                 "occurrence_count": reference.occurrence_count,
-                "original_package_uri": (
-                    reference.original_package_uri
-                ),
+                "original_package_uri": (reference.original_package_uri),
                 "relative_path": reference.relative_path,
             }
         )
@@ -873,22 +861,16 @@ def qualify_structural_model_preparation(
         )
 
     prepared_source: dict[str, object] = {
-        "artifacts": [
-            dataclasses.asdict(artifact) for artifact in artifacts
-        ],
+        "artifacts": [dataclasses.asdict(artifact) for artifact in artifacts],
         "srdf_logical_uri": (
             None
             if prepared.srdf_bytes is None
             else f"asset://{prepared.model_asset_id}/model.srdf"
         ),
-        "urdf_logical_uri": (
-            f"asset://{prepared.model_asset_id}/model.urdf"
-        ),
+        "urdf_logical_uri": (f"asset://{prepared.model_asset_id}/model.urdf"),
     }
     manifest: dict[str, object] = {
-        "accepted_package_uri_prefix": (
-            prepared.accepted_package_uri_prefix
-        ),
+        "accepted_package_uri_prefix": (prepared.accepted_package_uri_prefix),
         "api_version": PREPARATION_API_VERSION,
         "build_digest": _tool_build_digest(),
         "configuration_digest": "sha256:" + "0" * 64,
@@ -905,8 +887,13 @@ def qualify_structural_model_preparation(
         },
         "prepared_source": prepared_source,
         "removed_top_level_elements": {
-            name: count
-            for name, count in prepared.removed_top_level_elements
+            name: count for name, count in prepared.removed_top_level_elements
+        },
+        "removed_nested_elements": {
+            name: count for name, count in prepared.removed_nested_elements
+        },
+        "removed_duplicate_srdf_elements": {
+            name: count for name, count in prepared.removed_duplicate_srdf_elements
         },
         "resource_rewrites": resource_rewrites,
     }
@@ -936,8 +923,7 @@ def _atomic_write(path: Path, value: bytes) -> None:
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Prepare expanded URDF/SRDF as a bounded closure-local "
-            "structural model"
+            "Prepare expanded URDF/SRDF as a bounded closure-local " "structural model"
         )
     )
     parser.add_argument("--urdf", required=True, type=Path)
@@ -969,16 +955,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         urdf_bytes = arguments.urdf.read_bytes()
-        srdf_bytes = (
-            None if arguments.srdf is None else arguments.srdf.read_bytes()
-        )
+        srdf_bytes = None if arguments.srdf is None else arguments.srdf.read_bytes()
         prepared = prepare_structural_model(
             urdf_bytes,
             srdf_bytes,
             model_asset_id=arguments.model_asset_id,
-            accepted_package_uri_prefix=(
-                arguments.accepted_package_uri_prefix
-            ),
+            accepted_package_uri_prefix=(arguments.accepted_package_uri_prefix),
         )
         qualified = qualify_structural_model_preparation(
             prepared,
@@ -998,9 +980,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         outputs = {
             output_directory / "model.urdf": prepared.urdf_bytes,
-            output_directory / "preparation-manifest.json": (
-                qualified.manifest_bytes()
-            ),
+            output_directory
+            / "preparation-manifest.json": (qualified.manifest_bytes()),
         }
         if prepared.srdf_bytes is not None:
             outputs[output_directory / "model.srdf"] = prepared.srdf_bytes
