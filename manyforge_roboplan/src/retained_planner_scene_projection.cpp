@@ -290,8 +290,16 @@ RetainedPlannerSceneProjection::BuildPublisher(
         "native projection clock returned a negative timestamp",
         "native_projection_clock_invalid");
   }
+  if (next_publisher_incarnation_ ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    return projection_error<std::shared_ptr<RetainedCollisionWorldPublisher>>(
+        "native projection publisher incarnations are exhausted",
+        "native_projection_publisher_incarnation_exhausted");
+  }
+  const auto publisher_id = config_.publisher_id + ".incarnation." +
+                            std::to_string(next_publisher_incarnation_++);
   return RetainedCollisionWorldPublisher::create(
-      projector, config_.publisher_id, snapshot,
+      projector, publisher_id, snapshot,
       RetainedCollisionWorldPublicationContext{
           source, {}, observed_at, {}, std::move(source_label), std::nullopt},
       clock_, config_.collision_ledger_capacity);

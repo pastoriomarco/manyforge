@@ -28,6 +28,7 @@ from manyforge_headless_api.app import (
     create_app,
 )
 from manyforge_headless_api.cell_admission import CellAdmissionError
+from manyforge_headless_api.control_state import HeadlessControlStateSource
 from manyforge_headless_api.models import (
     ManagerApplyRequest,
     ProgramCycleResetRequest,
@@ -215,6 +216,19 @@ def _scenario_selection(
     }
 
 
+def _scenario_load_selection(
+    *,
+    scenario_id: str = "cell-pick",
+) -> dict[str, Any]:
+    selection = _scenario_selection(scenario_id=scenario_id)
+    selection["schema_version"] = "manyforge.scenario_load_selection.v1"
+    selection["deployment"] = {
+        "deployment_artifact_id": selection["deployment_artifact_id"],
+        "deployment_revision": selection["deployment_revision"],
+    }
+    return selection
+
+
 def _remove_program_tree_with_valid_identity(value: dict[str, Any]) -> None:
     value["program"].pop("tree")
     value["program"]["program_revision"] = compute_content_identity(
@@ -294,7 +308,7 @@ def test_scenario_load_selection_uses_effect_free_package_projection() -> None:
     response = client.get("/api/scenarios/cell-pick/load-selection")
 
     assert response.status_code == 200
-    assert response.json() == _scenario_selection()
+    assert response.json() == _scenario_load_selection()
 
 
 @pytest.mark.parametrize(
@@ -561,8 +575,14 @@ class FakeCore:
 
     def scenario_load_selection(self, scenario_id: str) -> dict[str, Any]:
         if self.scenario_selection_override is not None:
-            return copy.deepcopy(self.scenario_selection_override)
-        return _scenario_selection(scenario_id=scenario_id)
+            selection = copy.deepcopy(self.scenario_selection_override)
+            selection["schema_version"] = "manyforge.scenario_load_selection.v1"
+            selection["deployment"] = {
+                "deployment_artifact_id": selection["deployment_artifact_id"],
+                "deployment_revision": selection["deployment_revision"],
+            }
+            return selection
+        return _scenario_load_selection(scenario_id=scenario_id)
 
     def prepare_program_apply(
         self,
@@ -1996,7 +2016,7 @@ def test_node_environment_rejects_a_stale_runner_applied_identity() -> None:
     with pytest.raises(HeadlessApiError) as stale:
         service.node_environment()
 
-    assert stale.value.code == "program_runner_response_invalid"
+    assert stale.value.code == "program_node_availability_stale"
 
 
 def test_manager_status_and_diff_preserve_offer_digest_fields() -> None:
@@ -2664,6 +2684,46 @@ def test_bulk_acknowledgement_uses_one_common_owner_epoch_fence() -> None:
     assert mutation["request_owner_epoch"] == "client.epoch.1"
     assert mutation["expected_generation"] == 3
     assert "expected_owner_epoch" not in mutation
+
+
+def test_alarm_acknowledgements_wake_the_control_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wakes: list[None] = []
+    monkeypatch.setattr(
+        HeadlessControlStateSource,
+        "notify_cold",
+        lambda _source: wakes.append(None),
+    )
+    client, _core, _manager = _client()
+    exact = {
+        **_caller(),
+        "activation_id": "activation.1",
+        "expected_record_revision": 2,
+        "reason": None,
+        "confirmed": True,
+    }
+    bulk = {
+        **_caller(),
+        "members": [],
+        "expected_generation": 3,
+        "reason": None,
+        "confirmed": True,
+    }
+    with client:
+        wake_count = len(wakes)
+        exact_response = client.post(
+            "/api/execution/alarms/condition-aaaaaaaaaaaaaaaaaaaaaaaa/acknowledge",
+            json=exact,
+        )
+        bulk_response = client.post(
+            "/api/execution/alarms/acknowledge-all",
+            json=bulk,
+        )
+
+    assert exact_response.status_code == 200
+    assert bulk_response.status_code == 200
+    assert len(wakes) == wake_count + 2
 
 
 def test_historian_reconciliation_is_an_attributed_public_mutation() -> None:

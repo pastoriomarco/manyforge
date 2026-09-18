@@ -1049,13 +1049,13 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_lite6_lite_gripper_pick_and_place/73c37e378432025c6bef9040fef743b1160d3453da701417b0599a4937277b8d",
-        "content_digest": "sha256:c08ba2bdbd0947796e4e80a98721f30b10a69612639420c057768469f98514a6",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_lite6_lite_gripper_pick_and_place/956a522250c10fa4a348f21070c26990aea8fbbe1eb38e58dbd31a6f676ab535",
+        "content_digest": "sha256:c0ad047787ed3d07b9469835c10bc8f0e662b3b6ab922afe013369e9ce6ef7d2",
         "record_id": "manyforge.runtime_motion.isaac_lite6_lite_gripper_pick_and_place",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:73c37e378432025c6bef9040fef743b1160d3453da701417b0599a4937277b8d",
+        "record_revision": "sha256:956a522250c10fa4a348f21070c26990aea8fbbe1eb38e58dbd31a6f676ab535",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/434fcba1ae9687c7dc7fb2031b06210f1b6cc9a18934b6551abf519c7cf3750b",
@@ -1100,7 +1100,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_lite6_lite_gripper_pick_and_place",
-  "deployment_revision": "sha256:83f5b01ce9808ff6ca4680f3566a73096e278a5138a98ddffe86ac1e4224a396",
+  "deployment_revision": "sha256:660ad9577ee963da8861ee2dec78bf48205f4f17b02f88928edf578f88759408",
   "description": "Retained Isaac commanded-simulation pick-and-place deployment for UFACTORY Lite6 with the articulated lite pneumatic gripper and the source-matched ROS 2 control execution product.",
   "desired_control_configurations": [
     {
@@ -1987,13 +1987,13 @@
     "interrupt_sources": [],
     "retained_policy_records": [
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_lite6_lite_gripper_pick_and_place/73c37e378432025c6bef9040fef743b1160d3453da701417b0599a4937277b8d",
-        "content_digest": "sha256:c08ba2bdbd0947796e4e80a98721f30b10a69612639420c057768469f98514a6",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_lite6_lite_gripper_pick_and_place/956a522250c10fa4a348f21070c26990aea8fbbe1eb38e58dbd31a6f676ab535",
+        "content_digest": "sha256:c0ad047787ed3d07b9469835c10bc8f0e662b3b6ab922afe013369e9ce6ef7d2",
         "record_id": "manyforge.runtime_motion.isaac_lite6_lite_gripper_pick_and_place",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:73c37e378432025c6bef9040fef743b1160d3453da701417b0599a4937277b8d",
+        "record_revision": "sha256:956a522250c10fa4a348f21070c26990aea8fbbe1eb38e58dbd31a6f676ab535",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       }
     ],
     "stop_stage_parameters": [

@@ -171,6 +171,7 @@ def _meaningful_execution_control_key(control_response: Any) -> str:
         state = dict(state)
         state.pop("observed_motion", None)
         state.pop("observed_gripper", None)
+        state.pop("observed_target_states", None)
         control["control_state"] = state
     return json.dumps(control, sort_keys=True, separators=(",", ":"))
 

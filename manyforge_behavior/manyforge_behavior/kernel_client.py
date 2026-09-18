@@ -44,6 +44,10 @@ class ExecutionTransport(Protocol):
         self, body: Mapping[str, Any], expected_selection_revision: int
     ) -> dict[str, Any]: ...
 
+    def start_program_selection(
+        self, body: Mapping[str, Any], expected_selection_revision: int
+    ) -> dict[str, Any]: ...
+
     def read(self, operation_id: str) -> dict[str, Any]: ...
 
     def operation_recovery(self, operation_id: str) -> dict[str, Any]: ...
@@ -463,6 +467,27 @@ class KernelClient:
         ):
             raise KernelClientResponseError(
                 "Program selection Resume omitted its scope"
+            )
+        return scope
+
+    def start_program_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        response = self._successful(
+            self._transport.start_program_selection(
+                request, expected_selection_revision
+            ),
+            label="Program selection initial Run",
+        )
+        scope = response.get("scope")
+        if (
+            response.get("command") != "start_program_selection"
+            or not isinstance(scope, Mapping)
+            or type(scope.get("selection_revision")) is not int
+            or scope["selection_revision"] != expected_selection_revision + 1
+        ):
+            raise KernelClientResponseError(
+                "Program selection initial Run omitted its scope"
             )
         return scope
 

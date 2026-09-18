@@ -485,19 +485,27 @@ def build_component_overview(
         targets_response_error
     )
     direct_control = _mapping(targets.get("direct_control"))
+    direct_control_rows = [
+        _mapping(row)
+        for row in _sequence(targets.get("direct_control_targets"))
+        if isinstance(row, Mapping)
+    ]
+    if not direct_control_rows and direct_control:
+        direct_control_rows = [direct_control]
     planning_capabilities = {
         value
-        for value in _sequence(direct_control.get("planning_capability_ids"))
+        for row in direct_control_rows
+        for value in _sequence(row.get("planning_capability_ids"))
         if isinstance(value, str)
     }
-    target_status = _HEALTHY if direct_control else _OFFLINE
+    target_status = _HEALTHY if direct_control_rows else _OFFLINE
     target_reason: str | None = None
     if targets_error:
         target_status = _error_status(targets_error)
         target_reason = _bounded_reason(
             targets_error.get("code"), "execution_target_unavailable"
         )
-    elif not direct_control:
+    elif not direct_control_rows:
         target_reason = "execution_target_unavailable"
     components.append(
         _component(
@@ -505,7 +513,12 @@ def build_component_overview(
             "Execution target",
             target_status,
             (
-                f"{direct_control.get('controllable_component_id')} / {direct_control.get('command_target_id')}"
+                (
+                    f"{len(direct_control_rows)} addressed motion targets available"
+                    if len(direct_control_rows) > 1
+                    else f"{direct_control_rows[0].get('controllable_component_id')} / "
+                    f"{direct_control_rows[0].get('command_target_id')}"
+                )
                 if target_status == _HEALTHY
                 else "no addressed motion target is currently offered"
             ),

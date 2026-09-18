@@ -1199,13 +1199,13 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_manipulator_scene_light_assistant/f815b2938dd808f4ae2f0b16c0e66a5f4b41d2205fd679cbbf0a5240801294d8",
-        "content_digest": "sha256:2acbf79ae521e74c00cc58d2e5e438750b632af7ec62a36e267f795bb5506aa6",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_manipulator_scene_light_assistant/149ef1820892616375e372c8968e41febb8f2b2b5422b7adeca32b1ee182db76",
+        "content_digest": "sha256:4c2013c2ef7c65b5c3549282fcb3074cdf0d58230636c7a15a76b0cd92acdd33",
         "record_id": "manyforge.runtime_motion.isaac_manipulator_scene_light_assistant",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:f815b2938dd808f4ae2f0b16c0e66a5f4b41d2205fd679cbbf0a5240801294d8",
+        "record_revision": "sha256:149ef1820892616375e372c8968e41febb8f2b2b5422b7adeca32b1ee182db76",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/434fcba1ae9687c7dc7fb2031b06210f1b6cc9a18934b6551abf519c7cf3750b",
@@ -1253,7 +1253,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
-  "deployment_revision": "sha256:5e569c0f180c321ec540e6605d4b2d1fa34ee3e40530fc73e5ceb6df4a40afaa",
+  "deployment_revision": "sha256:13c689c8a2db23a9631825c15f093e4cda51158f7794315acdfcca9587ed0f27",
   "description": "Retained Isaac UR10e light-scene deployment with the ROS 2 control execution product and the finite assistant scene-authoring overlay; simulator mutation remains operator-approved.",
   "desired_control_configurations": [
     {
@@ -2168,13 +2168,13 @@
     "interrupt_sources": [],
     "retained_policy_records": [
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_manipulator_scene_light_assistant/f815b2938dd808f4ae2f0b16c0e66a5f4b41d2205fd679cbbf0a5240801294d8",
-        "content_digest": "sha256:2acbf79ae521e74c00cc58d2e5e438750b632af7ec62a36e267f795bb5506aa6",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.isaac_manipulator_scene_light_assistant/149ef1820892616375e372c8968e41febb8f2b2b5422b7adeca32b1ee182db76",
+        "content_digest": "sha256:4c2013c2ef7c65b5c3549282fcb3074cdf0d58230636c7a15a76b0cd92acdd33",
         "record_id": "manyforge.runtime_motion.isaac_manipulator_scene_light_assistant",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:f815b2938dd808f4ae2f0b16c0e66a5f4b41d2205fd679cbbf0a5240801294d8",
+        "record_revision": "sha256:149ef1820892616375e372c8968e41febb8f2b2b5422b7adeca32b1ee182db76",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       }
     ],
     "stop_stage_parameters": [

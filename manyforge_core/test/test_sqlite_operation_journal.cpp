@@ -683,17 +683,22 @@ TEST(SqliteOperationJournalTest,
       Digest('1'),
       MoveId("move.pick"),
       {"joint1"},
-      TrajectoryValidationMetricsDTO{2.5, {0.4}, {1.2}, 0.15},
+      TrajectoryValidationMetricsDTO{
+          2.5,
+          {0.4},
+          {1.2},
+          0.15,
+          CartesianFidelityMetricsDTO{0.005, 0.05, 0.001, 0.01, 0.0005, 0.002, 0.0015, 0.012, 0.01,
+                                      0.005, 2U}},
       PreparedRuntimePolicyRefDTO{
           RuntimePolicyCatalogRecordRefDTO{
               RuntimePolicyId("manyforge.runtime_motion.cell"),
               RuntimePolicyRevision(Digest('2').value()), SchemaId("manyforge.runtime_policy.v1"),
               SchemaRevision(Digest('3').value()), Digest('4'),
-              ContentAddressedStoreKey("catalog/runtime-policy/cell/record")},
-          RuntimeMotionSpeedLimitDTO{
-              RuntimePolicyCommandTargetScopeDTO{ControllableComponentId("robot.1"),
-                                                 CommandTargetId("arm")},
-              0.15}}}};
+              ContentAddressedStoreKey("catalog/runtime-policy/cell/record")}},
+      0.12,
+      0.15,
+      0.12}};
   const auto recorded = journal.RecordOperationState(epoch, state, nullptr,
                                                      "subordinate_motion_prepared", diagnostics);
   ASSERT_TRUE(recorded.ok()) << recorded.error().message;
@@ -718,13 +723,19 @@ TEST(SqliteOperationJournalTest,
   EXPECT_NE(payload.find("\"peak_abs_joint_velocity_rad_s\":[0.4]"), std::string::npos);
   EXPECT_NE(payload.find("\"peak_abs_joint_acceleration_rad_s2\":[1.2]"), std::string::npos);
   EXPECT_NE(payload.find("\"peak_tcp_linear_speed_mps\":0.15"), std::string::npos);
+  EXPECT_NE(payload.find("\"cartesian_fidelity_metrics\":{"), std::string::npos);
+  EXPECT_NE(payload.find("\"certified_max_translation_error_m\":0.0015"), std::string::npos);
+  EXPECT_NE(payload.find("\"accepted_max_blend_deviation_rad\":0.005"), std::string::npos);
+  EXPECT_NE(payload.find("\"planning_attempt_count\":2"), std::string::npos);
   EXPECT_NE(payload.find("\"runtime_policy_id\":\"manyforge.runtime_motion.cell\""),
             std::string::npos);
   EXPECT_NE(payload.find("\"content_addressed_store_key\":"
                          "\"catalog/runtime-policy/cell/record\""),
             std::string::npos);
-  EXPECT_NE(payload.find("\"scope_kind\":\"command_target\""), std::string::npos);
-  EXPECT_NE(payload.find("\"maximum_tcp_linear_speed_mps\":0.15"), std::string::npos);
+  EXPECT_NE(payload.find("\"requested_tcp_linear_speed_mps\":0.12"), std::string::npos);
+  EXPECT_NE(payload.find("\"deployment_maximum_tcp_linear_speed_mps\":0.15"),
+            std::string::npos);
+  EXPECT_NE(payload.find("\"admitted_tcp_linear_speed_mps\":0.12"), std::string::npos);
 
   const auto reopened = [&]() {
     journal.Close();
@@ -1555,9 +1566,9 @@ TEST(SqliteOperationJournalTest,
 }
 
 TEST(SqliteOperationJournalTest, CleanExecutionCloseRetainsIndependentAuthoringClaims) {
-  for (const auto kind : {CellAdmissionClaimKindDTO::kAuthoringMutation,
-                          CellAdmissionClaimKindDTO::kManagerApply,
-                          CellAdmissionClaimKindDTO::kManualOperation}) {
+  for (const auto kind :
+       {CellAdmissionClaimKindDTO::kAuthoringMutation, CellAdmissionClaimKindDTO::kManagerApply,
+        CellAdmissionClaimKindDTO::kManualOperation}) {
     ScopedTemporaryDirectory temporary;
     const auto database = temporary.path() / std::string(kOperationJournalFilename);
     const RequestOwnerEpoch epoch("execution-host.epoch.clean-apply");

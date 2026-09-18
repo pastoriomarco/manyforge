@@ -1022,13 +1022,13 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur10e_robotiq_pick_place_preview/288709f9e08bcb26b8771266deb512558de3f9734a1cea6f85bbe68674fe72ae",
-        "content_digest": "sha256:6869f7a9bc72966053fc9948e833d81a64092ccbb7df89df7f448fc8d690a813",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur10e_robotiq_pick_place_preview/d4a04655dad84022262e53a3623a3f8178d4609cfa098a0b8a5e8d2ac6738e6b",
+        "content_digest": "sha256:fb3abfd2bbda31c30e6bcdd6aee0c5dc85aa32c736ca36dcdf1dea448069caf4",
         "record_id": "manyforge.runtime_motion.ur10e_robotiq_pick_place_preview",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:288709f9e08bcb26b8771266deb512558de3f9734a1cea6f85bbe68674fe72ae",
+        "record_revision": "sha256:d4a04655dad84022262e53a3623a3f8178d4609cfa098a0b8a5e8d2ac6738e6b",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/7016c53470a155760287cdd2186a783a2185d63bb3ac2e455e49f1d80130a00b",
@@ -1072,7 +1072,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_pick_place_preview",
-  "deployment_revision": "sha256:ce1c72519400d15d93669b8700ff4ea2e2a4926dda5849f9ecc536639ad324ff",
+  "deployment_revision": "sha256:6a686654ecdc8fed92f27f82792b487f0771646a1f144d614077e1eed64d3997",
   "description": "Preview deployment for UR10e + Robotiq 2F-140 native RoboPlan pick-and-place demo.",
   "desired_control_configurations": [
     {
@@ -2060,13 +2060,13 @@
     "interrupt_sources": [],
     "retained_policy_records": [
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur10e_robotiq_pick_place_preview/288709f9e08bcb26b8771266deb512558de3f9734a1cea6f85bbe68674fe72ae",
-        "content_digest": "sha256:6869f7a9bc72966053fc9948e833d81a64092ccbb7df89df7f448fc8d690a813",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur10e_robotiq_pick_place_preview/d4a04655dad84022262e53a3623a3f8178d4609cfa098a0b8a5e8d2ac6738e6b",
+        "content_digest": "sha256:fb3abfd2bbda31c30e6bcdd6aee0c5dc85aa32c736ca36dcdf1dea448069caf4",
         "record_id": "manyforge.runtime_motion.ur10e_robotiq_pick_place_preview",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:288709f9e08bcb26b8771266deb512558de3f9734a1cea6f85bbe68674fe72ae",
+        "record_revision": "sha256:d4a04655dad84022262e53a3623a3f8178d4609cfa098a0b8a5e8d2ac6738e6b",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       }
     ],
     "stop_stage_parameters": [

@@ -432,6 +432,56 @@ TEST(NativeProjectionTransition,
 }
 
 TEST(NativeProjectionTransition,
+     UnavailableNamedApplyAggregateUsesExactWithdrawalPerBinding) {
+  const auto predecessor =
+      NativeBundle("bundle.predecessor", "graph.predecessor");
+  const auto candidate = NativeBundle("bundle.candidate", "graph.candidate");
+  auto health = HealthyPredecessor("epoch.old");
+  const ErrorDTO unavailable{"missing_reference", "old process is gone", {}};
+  health.state = ProjectionHealthState::kUnavailable;
+  health.error = unavailable;
+  ProjectionAggregateHealthDTO aggregate{
+      NamedApplyProjectionSetSourceDTO{
+          ApplyId("apply.predecessor"), ApplyGeneration(1U),
+          ProjectionStageGeneration(1U), PredecessorRevision()},
+      ProjectionHealthState::kUnavailable,
+      {health},
+      unavailable,
+  };
+  ASSERT_TRUE(aggregate.valid());
+  ASSERT_TRUE(aggregate.matches_named_apply(
+      ApplyId("apply.predecessor"), ApplyGeneration(1U),
+      ProjectionStageGeneration(1U), PredecessorRevision()));
+  ASSERT_FALSE(aggregate.healthy_for_target(PredecessorRevision()));
+
+  auto ready = StagedReady({StagedRuntime("runtime.native", "epoch.new")});
+  auto &runtime = ready.runtime_units.front();
+  runtime.candidate_disposition =
+      RuntimeUnitCandidateDisposition::kRetainedExact;
+  runtime.predecessor_withdrawal =
+      ManagedRuntimeWithdrawalDTO{ready.apply_id,
+                                  ready.apply_generation,
+                                  ready.runtime_convergence_intent_digest,
+                                  runtime.runtime_unit_id,
+                                  RuntimeEpoch("epoch.old"),
+                                  ContentDigest(std::string(kDigestOne)),
+                                  ContentDigest(std::string(kDigestTwo)),
+                                  "manager-supervisor",
+                                  12U};
+
+  const auto rows = DeriveNativeProjectionTransitionRows(
+      predecessor, candidate, PredecessorRevision(),
+      aggregate.native_projection_health, ready);
+  ASSERT_EQ(rows.size(), 2U);
+  const auto removed =
+      std::find_if(rows.begin(), rows.end(), [](const auto &row) {
+        return row.disposition == ProjectionTransitionDisposition::kRemoved;
+      });
+  ASSERT_NE(removed, rows.end());
+  EXPECT_EQ(removed->managed_withdrawal, runtime.predecessor_withdrawal);
+}
+
+TEST(NativeProjectionTransition,
      PredecessorEpochMustComeFromExactFinalizedOwnerHealth) {
   const auto predecessor =
       NativeBundle("bundle.predecessor", "graph.predecessor");

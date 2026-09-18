@@ -2156,7 +2156,10 @@ public:
                              kLaunchEnvironmentContract)},
             [this] { return ElapsedNs(); },
             [] { return core::ApplyId(RandomToken("apply-")); },
-            [this] { RequireCurrentPackageGeneration(); }),
+            [this] { RequireCurrentPackageGeneration(); },
+            [this](const component_manager::ManagerApplyIntentDTO &) {
+              TryPublishApplyTransition();
+            }),
         scene_runtime_owner_([] { return HostMonotonicNs(); },
                              [] { return RandomToken("scene-init-"); }),
         manager_channel_(config_.projection_root,
@@ -3133,6 +3136,32 @@ private:
             BuildSceneRuntimeSourcePayload(admission_.cell_id().value(),
                                            scene_runtime_owner_.Snapshot()))
         .source_generation;
+  }
+
+  void TryPublishApplyTransition() noexcept {
+    try {
+      if (!last_runtime_.has_value() || last_active_bundle_ == nullptr) {
+        return;
+      }
+      const auto observed_at = static_cast<std::int64_t>(ElapsedNs());
+      static_cast<void>(manager_channel_.Publish(
+          "component_manager", manager_owner_id_, manager_owner_epoch_,
+          observed_at,
+          BuildManagerSourcePayload(
+              *last_active_bundle_, *last_runtime_, stores_.apply_journal(),
+              kernel_apply_available_
+                  ? ManagerApplyMutationAvailability::kAvailable
+                  : ManagerApplyMutationAvailability::
+                        kKernelOwnerUnavailable)));
+      static_cast<void>(PublishLogicalScene(observed_at));
+      static_cast<void>(PublishSceneRuntime(observed_at));
+    } catch (const std::exception &error) {
+      std::cerr << "Manager daemon Apply-transition publication failed: "
+                << error.what() << '\n';
+    } catch (...) {
+      std::cerr << "Manager daemon Apply-transition publication failed with "
+                   "an unknown error\n";
+    }
   }
 
   void TryPeriodicReconcile() noexcept {

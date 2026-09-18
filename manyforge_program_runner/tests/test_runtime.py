@@ -29,6 +29,7 @@ from manyforge_headless_api.models import (
     ProgramManualHandoverRequest,
     ProgramRunStopRequest,
     ProgramScenePreparationRequest,
+    ProgramSelectionStartRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
     RuntimeOverridePromotionRequest,
@@ -392,6 +393,7 @@ class _Host:
         self.scheduled: list[str] = []
         self.stop_calls: list[tuple[str, str | None]] = []
         self.motion_stop_calls: list[tuple[str, str | None]] = []
+        self.motion_start_calls: list[tuple[str, object, int, int, str]] = []
         self.full_stop_calls: list[tuple[str, str | None]] = []
         self.full_stop_resume_calls: list[tuple[str, str | None]] = []
         self.reset_calls: list[str] = []
@@ -484,6 +486,40 @@ class _Host:
         )
         self.owner.rows[program_run_id] = snapshot
         return snapshot
+
+    def start_motion(
+        self,
+        program_run_id: str,
+        *,
+        expected_run_revision: int,
+        expected_selection_revision: int,
+        request_id: str,
+        group_id: str | list[str] = "all",
+        reason: str | None = None,
+    ) -> object:
+        del reason
+        self.motion_start_calls.append(
+            (
+                program_run_id,
+                group_id,
+                expected_run_revision,
+                expected_selection_revision,
+                request_id,
+            )
+        )
+        current = self.owner.rows[program_run_id]
+        snapshot = _Snapshot(
+            program_run_id,
+            owner_id=self.owner_id,
+            owner_epoch=self.owner_epoch,
+            state="running",
+            revision=current.run_revision + 1,
+        )
+        self.owner.rows[program_run_id] = snapshot
+        return SimpleNamespace(
+            state=SimpleNamespace(value="running"),
+            run_revision=snapshot.run_revision,
+        )
 
     def full_stop(
         self,
@@ -2405,6 +2441,26 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             )
         )
     assert changed_repeated_intent.value.code == "program_cycle_reset_required"
+
+    motion_start = ProgramSelectionStartRequest.model_validate(
+        {
+            "request_id": "request.motion-start.1",
+            "request_owner_epoch": "composer.epoch.1",
+            "source_label": "operator_ui",
+            "correlation_id": None,
+            "program_run_id": "program-cycle.1",
+            "expected_owner_epoch": runtime.owner_epoch,
+            "expected_run_revision": started["run_revision"],
+            "expected_selection_revision": 0,
+            "group_ids": ["robot_group"],
+            "reason": "initial operator motion Run",
+        }
+    )
+    motion_started = runtime.start_motion("program-cycle.1", motion_start)
+    assert motion_started["state"] == "running"
+    assert host.motion_start_calls == [
+        ("program-cycle.1", ["robot_group"], 1, 0, "request.motion-start.1")
+    ]
 
     motion_stop = ProgramSelectionStopRequest.model_validate(
         {

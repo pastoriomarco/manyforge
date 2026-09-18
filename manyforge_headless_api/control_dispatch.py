@@ -33,6 +33,7 @@ from .models import (
     ProgramRunStartRequest,
     ProgramRunStopRequest,
     ProgramSelectionStopRequest,
+    ProgramSelectionStartRequest,
     ProgramSelectionResumeRequest,
     ProgramManualHandoverRequest,
     RuntimeScaleControlRequest,
@@ -116,7 +117,10 @@ class HeadlessExecutionControlDispatch:
             or identity.get("owner_epoch")
             != request.payload.get(_EXPECTED_EXECUTION_OWNER_FIELD)
             or not isinstance(state, Mapping)
-            or state.get("schema_version") != "manyforge.execution_control_state.v4"
+            or state.get("schema_version") not in {
+                "manyforge.execution_control_state.v4",
+                "manyforge.execution_control_state.v5",
+            }
             or request.payload.get("execution_scope") is not None
         ):
             return "manual_operation_scope_stale"
@@ -401,12 +405,19 @@ class HeadlessExecutionControlDispatch:
                     )
                 else:
                     result = self._service.program_run_stop(model.program_run_id, model)
-            elif kind == "program_motion_resume":
-                model = ProgramSelectionResumeRequest.model_validate(
+            elif kind in {"program_motion_start", "program_motion_resume"}:
+                model_type = (
+                    ProgramSelectionStartRequest
+                    if kind == "program_motion_start"
+                    else ProgramSelectionResumeRequest
+                )
+                model = model_type.model_validate(
                     {**payload, **context}
                 )
-                result = self._service.program_run_motion_resume(
-                    model.program_run_id, model
+                result = (
+                    self._service.program_run_motion_start(model.program_run_id, model)
+                    if kind == "program_motion_start"
+                    else self._service.program_run_motion_resume(model.program_run_id, model)
                 )
             elif kind == "program_manual_handover":
                 model = ProgramManualHandoverRequest.model_validate(

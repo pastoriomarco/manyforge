@@ -797,9 +797,9 @@ template <typename StrongId>
               {"kind", CanonicalValue("cartesian_path")},
               {"max_angular_acceleration_rad_s2",
                CanonicalValue(value.max_angular_acceleration_rad_s2)},
+              {"max_blend_deviation_rad", CanonicalValue(value.max_blend_deviation_rad)},
               {"max_angular_speed_rad_s", CanonicalValue(value.max_angular_speed_rad_s)},
               {"max_linear_acceleration_mps2", CanonicalValue(value.max_linear_acceleration_mps2)},
-              {"max_linear_speed_mps", CanonicalValue(value.max_linear_speed_mps)},
               {"max_rotation_step_rad", CanonicalValue(value.max_rotation_step_rad)},
               {"max_translation_step_m", CanonicalValue(value.max_translation_step_m)},
               {"speed_mode", CanonicalValue("bounded")},
@@ -1097,23 +1097,6 @@ void AddExecutionScope(CanonicalValue::Object& row,
 
 [[nodiscard]] CanonicalValue PreparedRuntimePolicyValue(const PreparedRuntimePolicyRefDTO& policy) {
   const auto& source = policy.source_artifact;
-  CanonicalValue::Object selected{
-      {"maximum_tcp_linear_speed_mps",
-       CanonicalValue(policy.selected_motion_speed_limit.maximum_tcp_linear_speed_mps)}};
-  std::visit(
-      [&](const auto& scope) {
-        using Scope = std::decay_t<decltype(scope)>;
-        if constexpr (std::is_same_v<Scope, RuntimePolicyCellScopeDTO>) {
-          selected.emplace_back("scope_kind", CanonicalValue("cell"));
-        } else {
-          selected.emplace_back("command_target_id",
-                                CanonicalValue(scope.command_target_id.value()));
-          selected.emplace_back("controllable_component_id",
-                                CanonicalValue(scope.controllable_component_id.value()));
-          selected.emplace_back("scope_kind", CanonicalValue("command_target"));
-        }
-      },
-      policy.selected_motion_speed_limit.scope);
   return CanonicalValue(CanonicalValue::Object{
       {"source_artifact",
        CanonicalValue(CanonicalValue::Object{
@@ -1123,8 +1106,7 @@ void AddExecutionScope(CanonicalValue::Object& row,
            {"runtime_policy_id", CanonicalValue(source.record_id.value())},
            {"runtime_policy_revision", CanonicalValue(source.record_revision.value())},
            {"schema_id", CanonicalValue(source.schema_id.value())},
-           {"schema_revision", CanonicalValue(source.schema_revision.value())}})},
-      {"selected_motion_speed_limit", CanonicalValue(std::move(selected))}});
+           {"schema_revision", CanonicalValue(source.schema_revision.value())}})}});
 }
 
 [[nodiscard]] CanonicalValue PreparedMotionDiagnosticsValue(
@@ -1159,7 +1141,9 @@ void AddExecutionScope(CanonicalValue::Object& row,
                 std::all_of(metrics.peak_abs_joint_acceleration_rad_s2.begin(),
                             metrics.peak_abs_joint_acceleration_rad_s2.end(), finite_nonnegative) &&
                 (!metrics.peak_tcp_linear_speed_mps.has_value() ||
-                 finite_nonnegative(*metrics.peak_tcp_linear_speed_mps)),
+                 finite_nonnegative(*metrics.peak_tcp_linear_speed_mps)) &&
+                (!metrics.cartesian_fidelity_metrics.has_value() ||
+                 valid_cartesian_fidelity_metrics(*metrics.cartesian_fidelity_metrics)),
             "operation_journal_record_invalid",
             "prepared-motion diagnostics do not match the exact prepared participant");
     std::set<std::string> joint_names;
@@ -1170,25 +1154,20 @@ void AddExecutionScope(CanonicalValue::Object& row,
             "prepared-motion diagnostics contain invalid joint names");
 
     const auto& source = diagnostic.runtime_policy.source_artifact;
-    const auto& selected = diagnostic.runtime_policy.selected_motion_speed_limit;
-    bool scope_matches = false;
-    std::visit(
-        [&](const auto& scope) {
-          using Scope = std::decay_t<decltype(scope)>;
-          if constexpr (std::is_same_v<Scope, RuntimePolicyCellScopeDTO>) {
-            scope_matches = true;
-          } else {
-            scope_matches =
-                scope.controllable_component_id == state_row->controllable_component_id &&
-                scope.command_target_id == state_row->command_target_id;
-          }
-        },
-        selected.scope);
     Require(!source.record_id.empty() && !source.record_revision.empty() &&
                 !source.schema_id.empty() && !source.schema_revision.empty() &&
                 !source.content_digest.empty() && !source.content_addressed_store_key.empty() &&
-                std::isfinite(selected.maximum_tcp_linear_speed_mps) &&
-                selected.maximum_tcp_linear_speed_mps > 0.0 && scope_matches,
+                std::isfinite(diagnostic.deployment_maximum_tcp_linear_speed_mps) &&
+                diagnostic.deployment_maximum_tcp_linear_speed_mps > 0.0 &&
+                std::isfinite(diagnostic.admitted_tcp_linear_speed_mps) &&
+                diagnostic.admitted_tcp_linear_speed_mps > 0.0 &&
+                diagnostic.admitted_tcp_linear_speed_mps <=
+                    diagnostic.deployment_maximum_tcp_linear_speed_mps &&
+                (!diagnostic.requested_tcp_linear_speed_mps.has_value() ||
+                 (std::isfinite(*diagnostic.requested_tcp_linear_speed_mps) &&
+                  *diagnostic.requested_tcp_linear_speed_mps > 0.0 &&
+                  *diagnostic.requested_tcp_linear_speed_mps <=
+                      diagnostic.deployment_maximum_tcp_linear_speed_mps)),
             "operation_journal_record_invalid",
             "prepared-motion diagnostics contain invalid runtime-policy provenance");
 
@@ -1205,22 +1184,57 @@ void AddExecutionScope(CanonicalValue::Object& row,
       }
       return CanonicalValue(std::move(result));
     };
+    const auto fidelity_value = [](const auto& value) {
+      return CanonicalValue(CanonicalValue::Object{
+          {"accepted_max_blend_deviation_rad",
+           CanonicalValue(value->accepted_max_blend_deviation_rad)},
+          {"certified_max_rotation_error_rad",
+           CanonicalValue(value->certified_max_rotation_error_rad)},
+          {"certified_max_translation_error_m",
+           CanonicalValue(value->certified_max_translation_error_m)},
+          {"measured_max_rotation_error_rad",
+           CanonicalValue(value->measured_max_rotation_error_rad)},
+          {"measured_max_translation_error_m",
+           CanonicalValue(value->measured_max_translation_error_m)},
+          {"planning_attempt_count",
+           CanonicalValue(static_cast<double>(value->planning_attempt_count))},
+          {"requested_max_blend_deviation_rad",
+           CanonicalValue(value->requested_max_blend_deviation_rad)},
+          {"requested_rotation_tolerance_rad",
+           CanonicalValue(value->requested_rotation_tolerance_rad)},
+          {"requested_translation_tolerance_m",
+           CanonicalValue(value->requested_translation_tolerance_m)},
+          {"unsampled_rotation_bound_rad", CanonicalValue(value->unsampled_rotation_bound_rad)},
+          {"unsampled_translation_bound_m", CanonicalValue(value->unsampled_translation_bound_m)},
+      });
+    };
+    CanonicalValue::Object metric_fields{
+        {"peak_abs_joint_acceleration_rad_s2",
+         numeric_array(metrics.peak_abs_joint_acceleration_rad_s2)},
+        {"peak_abs_joint_velocity_rad_s", numeric_array(metrics.peak_abs_joint_velocity_rad_s)},
+        {"peak_tcp_linear_speed_mps", metrics.peak_tcp_linear_speed_mps.has_value()
+                                          ? CanonicalValue(*metrics.peak_tcp_linear_speed_mps)
+                                          : CanonicalValue(nullptr)},
+        {"trajectory_duration_s", CanonicalValue(metrics.trajectory_duration_s)}};
+    if (metrics.cartesian_fidelity_metrics) {
+      metric_fields.emplace_back("cartesian_fidelity_metrics",
+                                 fidelity_value(metrics.cartesian_fidelity_metrics));
+    }
     rows.emplace_back(CanonicalValue::Object{
+        {"admitted_tcp_linear_speed_mps",
+         CanonicalValue(diagnostic.admitted_tcp_linear_speed_mps)},
+        {"deployment_maximum_tcp_linear_speed_mps",
+         CanonicalValue(diagnostic.deployment_maximum_tcp_linear_speed_mps)},
         {"joint_names", CanonicalValue(std::move(names))},
         {"move_id", CanonicalValue(diagnostic.move_id.value())},
         {"participant_id", CanonicalValue(diagnostic.participant_id.value())},
         {"prepared_contract_digest", CanonicalValue(diagnostic.prepared_contract_digest.value())},
+        {"requested_tcp_linear_speed_mps",
+         diagnostic.requested_tcp_linear_speed_mps.has_value()
+             ? CanonicalValue(*diagnostic.requested_tcp_linear_speed_mps)
+             : CanonicalValue(nullptr)},
         {"runtime_policy", PreparedRuntimePolicyValue(diagnostic.runtime_policy)},
-        {"trajectory_metrics",
-         CanonicalValue(CanonicalValue::Object{
-             {"peak_abs_joint_acceleration_rad_s2",
-              numeric_array(metrics.peak_abs_joint_acceleration_rad_s2)},
-             {"peak_abs_joint_velocity_rad_s",
-              numeric_array(metrics.peak_abs_joint_velocity_rad_s)},
-             {"peak_tcp_linear_speed_mps", metrics.peak_tcp_linear_speed_mps.has_value()
-                                               ? CanonicalValue(*metrics.peak_tcp_linear_speed_mps)
-                                               : CanonicalValue(nullptr)},
-             {"trajectory_duration_s", CanonicalValue(metrics.trajectory_duration_s)}})}});
+        {"trajectory_metrics", CanonicalValue(std::move(metric_fields))}});
   }
   return CanonicalValue(std::move(rows));
 }

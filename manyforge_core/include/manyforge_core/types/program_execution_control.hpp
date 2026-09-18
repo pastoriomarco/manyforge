@@ -19,7 +19,13 @@ struct ProgramExecutionSelectionRequestDTO final {
                          const ProgramExecutionSelectionRequestDTO&) = default;
 };
 
-enum class ProgramNodeHoldStateDTO : std::uint8_t { kRunning, kHeld, kStopping, kFaulted };
+enum class ProgramNodeHoldStateDTO : std::uint8_t {
+  kRunning,
+  kReady,
+  kHeld,
+  kStopping,
+  kFaulted
+};
 
 struct ProgramNodeHoldDTO final {
   std::uint32_t node_index;

@@ -79,6 +79,41 @@ def test_qualified_operator_confirmation_uses_current_native_command(tmp_path: P
             }
         )
         run_id = started["capture"]["program_run_id"]
+        def current_motion_controls():
+            cycle = headless.program_cycle_status()
+            controls = cycle.get("runtime_controls")
+            selections = (
+                None if controls is None else controls.get("execution_selections")
+            )
+            if (
+                cycle.get("program_run_id") == run_id
+                and isinstance(selections, dict)
+            ):
+                return cycle, selections
+            return None
+
+        cycle, selections = workbench._wait_until(
+            "current motion controls",
+            current_motion_controls,
+            processes,
+            timeout_seconds=5.0,
+        )
+        motion_started = headless.program_run_motion_start(
+            run_id,
+            {
+                "request_id": "confirmation.motion-start.1",
+                "request_owner_epoch": "qualification.client",
+                "source_label": "native_confirmation_qualification",
+                "correlation_id": "confirmation.motion-start.1",
+                "program_run_id": run_id,
+                "expected_owner_epoch": cycle["program_runner_owner_epoch"],
+                "expected_run_revision": cycle["run"]["run_revision"],
+                "expected_selection_revision": selections["selection_revision"],
+                "reason": "initial operator motion Run",
+                "group_ids": ["all"],
+            },
+        )
+        assert motion_started["state"] == "running"
 
         def waiting():
             run = headless.program_run(run_id)

@@ -18,7 +18,6 @@ robot_config:
   srdf_path: __MANYFORGE_RESOLVED_MODEL_SRDF__
   package_paths:
     - __MANYFORGE_RESOLVED_XARM_PACKAGE_ROOT__
-  global_max_tcp_linear_speed_mps: 0.05
   # Absolute planning caps for attended commissioning. The UI velocity scale
   # can only reduce these; it cannot raise them.
   robot_control_joint_limits:

@@ -11,6 +11,7 @@
 #include <manyforge_deployment/deployment_applicability_codec.hpp>
 #include <manyforge_deployment/runtime_policy_codec.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
+#include <algorithm>
 #include <array>
 #include <span>
 #include <string>
@@ -22,55 +23,34 @@ namespace manyforge::deployment {
 namespace {
 
 constexpr std::string_view kSchemaRevision =
-    "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f";
+    "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4";
 
 static_assert(!std::is_aggregate_v<QualifiedRuntimePolicy>);
 static_assert(!std::is_default_constructible_v<QualifiedRuntimePolicy>);
 
 [[nodiscard]] CanonicalValue policy_without_revision(
-    bool reverse_limits = false, bool duplicate_cell = false,
+    bool reverse_interrupts = false, bool duplicate_acknowledgement = false,
     bool include_target = true,
     std::string_view policy_id = "runtime.default") {
-  CanonicalValue::Array limits;
-  const CanonicalValue cell(CanonicalValue::Object{
-      {"scope_kind", CanonicalValue("cell")},
-      {"maximum_tcp_linear_speed_mps", CanonicalValue(0.5)}});
-  const CanonicalValue target(CanonicalValue::Object{
-      {"scope_kind", CanonicalValue("command_target")},
+  const CanonicalValue acknowledgement(CanonicalValue::Object{
       {"controllable_component_id", CanonicalValue("robot_a")},
-      {"command_target_id", CanonicalValue("arm")},
-      {"maximum_tcp_linear_speed_mps", CanonicalValue(0.25)}});
-  if (!include_target) {
-    limits = {cell};
-  } else if (reverse_limits) {
-    limits = {target, cell};
-  } else {
-    limits = {cell, target};
-  }
-  if (duplicate_cell) {
-    limits.push_back(cell);
-  }
+      {"command_target_id", CanonicalValue("gripper")},
+      {"environment", CanonicalValue("simulation")},
+      {"allowed", CanonicalValue(true)}});
+  CanonicalValue::Array acknowledgements;
+  if (include_target) acknowledgements.push_back(acknowledgement);
+  if (duplicate_acknowledgement) acknowledgements.push_back(acknowledgement);
+  CanonicalValue::Array interrupt_ids{
+      CanonicalValue("fault.stop"), CanonicalValue("probe.trip")};
+  if (reverse_interrupts) std::reverse(interrupt_ids.begin(), interrupt_ids.end());
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(core::kRuntimePolicyApiVersion))},
       {"runtime_policy_id", CanonicalValue(std::string(policy_id))},
       {"description", CanonicalValue("Maintained native policy")},
-      {"interrupt_policy_ids",
-       CanonicalValue(CanonicalValue::Array{CanonicalValue("fault.stop"),
-                                            CanonicalValue("probe.trip")})},
-      {"motion_speed_limits", CanonicalValue(std::move(limits))},
+      {"interrupt_policy_ids", CanonicalValue(std::move(interrupt_ids))},
       {"open_loop_grasp_acknowledgements",
-       CanonicalValue(include_target
-                          ? CanonicalValue::Array{CanonicalValue(
-                                CanonicalValue::Object{
-                                    {"controllable_component_id",
-                                     CanonicalValue("robot_a")},
-                                    {"command_target_id",
-                                     CanonicalValue("gripper")},
-                                    {"environment",
-                                     CanonicalValue("simulation")},
-                                    {"allowed", CanonicalValue(true)}})}
-                          : CanonicalValue::Array{})}});
+       CanonicalValue(std::move(acknowledgements))}});
 }
 
 [[nodiscard]] std::string document(CanonicalValue value) {
@@ -130,12 +110,6 @@ TEST(RuntimePolicyCodec, ResolvesExactTypedPolicyAndMaterializedDefaults) {
 
   EXPECT_EQ(qualified.reference(), reference);
   EXPECT_EQ(qualified.value().runtime_policy_id.value(), "runtime.default");
-  ASSERT_EQ(qualified.value().motion_speed_limits.size(), 2U);
-  EXPECT_TRUE(std::holds_alternative<core::RuntimePolicyCellScopeDTO>(
-      qualified.value().motion_speed_limits[0].scope));
-  EXPECT_TRUE(
-      std::holds_alternative<core::RuntimePolicyCommandTargetScopeDTO>(
-          qualified.value().motion_speed_limits[1].scope));
   ASSERT_EQ(qualified.value().interrupt_policy_ids.size(), 2U);
   EXPECT_EQ(qualified.value().interrupt_policy_ids[0].value(), "fault.stop");
   ASSERT_EQ(qualified.value().open_loop_grasp_acknowledgements.size(), 1U);
@@ -143,7 +117,7 @@ TEST(RuntimePolicyCodec, ResolvesExactTypedPolicyAndMaterializedDefaults) {
       qualified.value().open_loop_grasp_acknowledgements[0].allowed);
 }
 
-TEST(RuntimePolicyCodec, RejectsNoncanonicalAndDuplicateMotionScopes) {
+TEST(RuntimePolicyCodec, RejectsNoncanonicalInterruptsAndDuplicateAcknowledgements) {
   for (const auto& candidate :
        {policy_without_revision(true, false),
         policy_without_revision(false, true)}) {

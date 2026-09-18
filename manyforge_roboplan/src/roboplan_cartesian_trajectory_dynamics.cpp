@@ -408,14 +408,9 @@ measure_cartesian_frame_dynamics_envelope(
 
   // Non-Cartesian moves can also have a TCP linear-speed ceiling. Qualify
   // that same continuous curve without inventing angular/acceleration caps.
-  double linear_speed_limit =
-      path ? path->max_linear_speed_mps
-           : request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
-  if (request.speed_profile.max_tcp_linear_speed_mps.has_value()) {
-    linear_speed_limit = std::min(
-        linear_speed_limit, *request.speed_profile.max_tcp_linear_speed_mps);
-  }
-  linear_speed_limit *= request.speed_profile.velocity_scale;
+  const double linear_speed_limit =
+      request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0) *
+      request.speed_profile.velocity_scale;
   const double angular_speed_limit =
       path
           ? path->max_angular_speed_rad_s * request.speed_profile.velocity_scale

@@ -465,6 +465,12 @@ class ProgramRunScopePort(Protocol):
         """Release only that selection after its accepted effects are retired."""
         ...
 
+    def start_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        """Release only the selected initial Ready nodes."""
+        ...
+
     def capture_stop(self, program_run_id: str) -> tuple[str, int] | None:
         """Capture the Program Stop; None means no Program-scope fence."""
         ...

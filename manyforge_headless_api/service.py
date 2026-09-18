@@ -47,6 +47,7 @@ from .models import (
     ProgramRunStartRequest,
     ProgramRunStopRequest,
     ProgramSelectionStopRequest,
+    ProgramSelectionStartRequest,
     ProgramSelectionResumeRequest,
     ProgramManualHandoverRequest,
     ProgramFullStopResetRequest,
@@ -82,6 +83,7 @@ from .program_binding_projection import (
     validate_applied_program_selection,
     validate_program_apply_result,
     validate_scenario_program_selection,
+    validate_scenario_load_selection,
 )
 
 
@@ -953,35 +955,12 @@ class HeadlessService:
                 "retained_bundle_id",
                 "scenario_id",
             }
-            or runner_source.get("node_environment_digest")
-            != projection.get("environment_digest")
-            or runner_source.get("retained_bundle_id")
-            != projection.get("retained_bundle_id")
-            or runner_source.get("graph_revision") != projection.get("graph_revision")
             or runner_source.get("content_digest") != expected_availability_digest
             or not isinstance(applied_source, dict)
-            or any(
-                runner_source.get(field) != applied.get(field)
-                for field in (
-                    "graph_revision",
-                    "node_environment_digest",
-                    "program_binding_id",
-                    "program_id",
-                    "program_revision",
-                    "retained_bundle_id",
-                    "scenario_id",
-                )
-            )
-            or runner_source.get("applied_record_digest")
-            != applied_source.get("record_digest")
             or type(runner_source.get("admission_generation")) is not int
             or type(runner_source.get("cycle_generation")) is not int
             or runner_availability.get("schema_version")
             != "manyforge.node_execution_availability.v1"
-            or runner_availability.get("environment_digest")
-            != projection.get("environment_digest")
-            or runner_availability.get("program_binding_id")
-            != runner_source.get("program_binding_id")
             or not isinstance(implementations, list)
             or not isinstance(core_implementations, list)
             or len(implementations) != len(core_implementations)
@@ -989,6 +968,58 @@ class HeadlessService:
             raise HeadlessApiError(
                 "program_runner_response_invalid",
                 "Program node availability does not identify the active environment",
+            )
+        stale_fields = {
+            field
+            for field, expected in (
+                ("graph_revision", projection.get("graph_revision")),
+                (
+                    "node_environment_digest",
+                    projection.get("environment_digest"),
+                ),
+                ("retained_bundle_id", projection.get("retained_bundle_id")),
+            )
+            if runner_source.get(field) != expected
+        }
+        stale_fields.update(
+            field
+            for field in (
+                "graph_revision",
+                "node_environment_digest",
+                "program_binding_id",
+                "program_id",
+                "program_revision",
+                "retained_bundle_id",
+                "scenario_id",
+            )
+            if runner_source.get(field) != applied.get(field)
+        )
+        if runner_source.get("applied_record_digest") != applied_source.get(
+            "record_digest"
+        ):
+            stale_fields.add("applied_record_digest")
+        if runner_availability.get("environment_digest") != projection.get(
+            "environment_digest"
+        ):
+            stale_fields.add("availability.environment_digest")
+        if runner_availability.get("program_binding_id") != runner_source.get(
+            "program_binding_id"
+        ):
+            stale_fields.add("availability.program_binding_id")
+        if stale_fields:
+            ordered_stale_fields = sorted(stale_fields)
+            raise HeadlessApiError(
+                "program_node_availability_stale",
+                "Program node availability has not reached the active environment: "
+                + ", ".join(ordered_stale_fields),
+                details={
+                    "mismatched_fields": ordered_stale_fields,
+                    "node_environment_digest": {
+                        "active": projection.get("environment_digest"),
+                        "applied": applied.get("node_environment_digest"),
+                        "runner": runner_source.get("node_environment_digest"),
+                    },
+                },
             )
         projected_rows: list[dict[str, Any]] = []
         for runner_row, core_row in zip(implementations, core_implementations):
@@ -1137,10 +1168,9 @@ class HeadlessService:
                 "native core returned an unsupported Scenario Load selection",
             )
         try:
-            validate_scenario_program_selection(
+            validate_scenario_load_selection(
                 projection,
                 scenario_id=scenario_id,
-                label="scenario_load_selection",
             )
         except (ProgramBindingTransportError, TypeError, ValueError) as error:
             raise HeadlessApiError(
@@ -1446,6 +1476,10 @@ class HeadlessService:
                 "program_run_draft_applied_mismatch",
                 "authoritative Draft and Applied Program revisions differ",
             )
+        # Verify the exact Applied/Runner/environment join before the effect.
+        # A transition may leave a well-formed older Runner offer briefly
+        # visible; rejecting it here keeps retry entirely pre-admission.
+        current_environment = self.node_environment()
         try:
             projection = self._program_runner().start_run(
                 request.model_dump(mode="json")
@@ -1455,7 +1489,6 @@ class HeadlessService:
         snapshot = self._validate_program_run_snapshot(projection)
         capture = snapshot["capture"]
         binding = applied.get("program_binding")
-        current_environment = self.node_environment()
         applied_node_policies = (
             binding.get("node_policies") if isinstance(binding, dict) else None
         )
@@ -1604,6 +1637,24 @@ class HeadlessService:
     ) -> dict[str, Any]:
         try:
             projection = self._program_runner().resume_motion(
+                program_run_id,
+                request.model_dump(mode="json"),
+            )
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+        return self._validate_program_run_snapshot(
+            projection,
+            expected_program_run_id=program_run_id,
+            expected_owner_epoch=request.expected_owner_epoch,
+        )
+
+    def program_run_motion_start(
+        self,
+        program_run_id: str,
+        request: ProgramSelectionStartRequest,
+    ) -> dict[str, Any]:
+        try:
+            projection = self._program_runner().start_motion(
                 program_run_id,
                 request.model_dump(mode="json"),
             )

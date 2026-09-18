@@ -485,6 +485,23 @@ CanonicalValue WithField(const CanonicalValue &value,
   return CanonicalValue(std::move(fields));
 }
 
+CanonicalValue ManagerPayloadWithIncompleteApply() {
+  return WithField(
+      ManagerPayload(), "apply",
+      CanonicalValue(CanonicalValue::Object{
+          {"mutation_available", CanonicalValue(true)},
+          {"records",
+           CanonicalValue(CanonicalValue::Array{
+               CanonicalValue(CanonicalValue::Object{
+                   {"apply_generation", CanonicalValue(1.0)},
+                   {"apply_id", CanonicalValue("apply-transition-1")},
+                   {"incomplete", CanonicalValue(true)},
+               }),
+           })},
+          {"unavailable_reason_code", CanonicalValue(nullptr)},
+      }));
+}
+
 CanonicalValue CurrentStopFaultLatch() {
   return CanonicalValue(CanonicalValue::Object{
       {"captured_operation_ids", CanonicalValue(CanonicalValue::Array{
@@ -630,6 +647,14 @@ void PublishHealthySources(const TemporaryDirectory &directory,
       runtime.Publish("scene_runtime", "scene-runtime." + std::string(kCellId),
                       "scene-runtime.epoch.1", 1,
                       SceneRuntimePayload(scene_state, scene_generation)));
+}
+
+void PublishManagerApplyTransition(const TemporaryDirectory &directory) {
+  AtomicSourceSnapshotChannel manager(directory.publications(),
+                                      "manager-source.json");
+  static_cast<void>(manager.Publish(
+      "component_manager", "component-manager." + std::string(kCellId),
+      "manager.epoch.1", 2, ManagerPayloadWithIncompleteApply()));
 }
 
 const CanonicalValue &OnlyAlarm(const CanonicalValue &snapshot) {
@@ -791,6 +816,90 @@ TEST(HeadlessApiCore,
     std::this_thread::yield();
   }
   EXPECT_GE(HistoryCount(core), 2U);
+}
+
+TEST(HeadlessApiCore, BoundedManagerApplyTransitionDoesNotCreateProviderAlarm) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  auto wall_time = std::make_shared<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count() +
+      1'000'000'000LL);
+  auto monotonic = std::make_shared<std::int64_t>(1000);
+  HeadlessApiCoreClocks clocks{
+      [wall_time]() { return *wall_time; },
+      [monotonic]() { return *monotonic; },
+      []() { return "2026-08-05T00:00:00Z"; },
+  };
+  auto config = Config(directory, "api.epoch.1");
+  config.runtime_transition_alarm_grace_ns = 15'000'000'000LL;
+  HeadlessApiCore core(std::move(config), std::move(clocks));
+  EXPECT_TRUE(
+      std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+
+  PublishManagerApplyTransition(directory);
+  EXPECT_TRUE(
+      std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+
+  *wall_time += 20'000'000'000LL;
+  *monotonic += 5'000'000'000LL;
+  EXPECT_FALSE(
+      std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+  auto alarms = core.AlarmSnapshot();
+  EXPECT_TRUE(Array(alarms, "alarms").empty());
+  EXPECT_FALSE(std::get<bool>(Member(alarms, "reconciled").storage()));
+
+  PublishHealthySources(directory, "open", 2U);
+  *wall_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+  EXPECT_TRUE(
+      std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+  alarms = core.AlarmSnapshot();
+  EXPECT_TRUE(Array(alarms, "alarms").empty());
+  const auto &domains = Array(alarms, "domains");
+  const auto runtime_health =
+      std::find_if(domains.begin(), domains.end(), [](const auto &domain) {
+        return Text(domain, "domain") == "runtime_health";
+      });
+  ASSERT_NE(runtime_health, domains.end());
+  EXPECT_TRUE(std::get<bool>(Member(*runtime_health, "reconciled").storage()));
+}
+
+TEST(HeadlessApiCore, StalledManagerApplyTransitionProducesProviderAlarm) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  auto wall_time = std::make_shared<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count() +
+      1'000'000'000LL);
+  auto monotonic = std::make_shared<std::int64_t>(1000);
+  HeadlessApiCoreClocks clocks{
+      [wall_time]() { return *wall_time; },
+      [monotonic]() { return *monotonic; },
+      []() { return "2026-08-05T00:00:00Z"; },
+  };
+  auto config = Config(directory, "api.epoch.1");
+  config.runtime_transition_alarm_grace_ns = 5'000'000'000LL;
+  HeadlessApiCore core(std::move(config), std::move(clocks));
+  EXPECT_TRUE(
+      std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+
+  PublishManagerApplyTransition(directory);
+  EXPECT_TRUE(
+      std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+
+  *wall_time += 20'000'000'000LL;
+  *monotonic += 5'000'000'001LL;
+  EXPECT_FALSE(
+      std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+  const auto alarms = core.AlarmSnapshot();
+  const auto &provider = OnlyAlarm(alarms);
+  EXPECT_EQ(Text(provider, "definition_id"),
+            "manyforge.runtime.provider_unavailable");
+  EXPECT_EQ(Text(provider, "lifecycle_state"), "active_unacknowledged");
 }
 
 TEST(HeadlessApiCore,
@@ -1080,8 +1189,15 @@ TEST(HeadlessApiCore,
   config.cell_id = cell_id;
   HeadlessApiCore core(std::move(config), Clocks());
   const auto load_selection = core.ScenarioLoadSelection(selection.scenario_id);
+  EXPECT_EQ(Text(load_selection, "schema_version"),
+            kScenarioLoadSelectionSchemaVersion);
   EXPECT_EQ(Text(load_selection, "program_binding_id"),
             selection.program_binding_id.value());
+  EXPECT_EQ(
+      Text(Member(load_selection, "deployment"), "deployment_artifact_id"),
+      selection.deployment_artifact_id.value());
+  EXPECT_EQ(Text(Member(load_selection, "deployment"), "deployment_revision"),
+            selection.deployment_revision.value());
   EXPECT_TRUE(Array(load_selection, "owner_identities").empty());
   EXPECT_FALSE(
       std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
@@ -1535,7 +1651,8 @@ TEST(HeadlessApiCore,
   }
 }
 
-TEST(HeadlessApiCore, ProgramHeldDiagnosticIsInformationalAndRetainsExactValues) {
+TEST(HeadlessApiCore,
+     ProgramHeldDiagnosticIsInformationalAndRetainsExactValues) {
   TemporaryDirectory directory;
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
   CanonicalValue record(CanonicalValue::Object{

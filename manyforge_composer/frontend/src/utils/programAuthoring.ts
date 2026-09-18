@@ -41,7 +41,13 @@ export interface BlackboardUsage extends ProgramParameterUsage {
 export const PROGRAM_MOTION_FIELDS = [
   'velocity_scale',
   'acceleration_scale',
-  'max_tcp_linear_speed_mps',
+  'translation_tol_m',
+  'max_blend_deviation_rad',
+] as const;
+
+export const PROGRAM_MOTION_CEILING_FIELDS = [
+  'velocity_scale',
+  'acceleration_scale',
 ] as const;
 
 export type ProgramMotionField = typeof PROGRAM_MOTION_FIELDS[number];
@@ -49,7 +55,8 @@ export type ProgramMotionField = typeof PROGRAM_MOTION_FIELDS[number];
 export interface ProgramMotionValues {
   velocity_scale: number;
   acceleration_scale: number;
-  max_tcp_linear_speed_mps: number;
+  translation_tol_m: number;
+  max_blend_deviation_rad: number;
 }
 
 export interface ProgramMotionConfiguration {
@@ -102,6 +109,9 @@ export function deriveProgramMotionConfiguration(
     PROGRAM_MOTION_FIELDS.map((field) => [field, 0]),
   ) as Record<ProgramMotionField, number>;
   const unknownNodes = new Set<string>();
+  const declarations = new Map(
+    (program.parameters ?? []).map((parameter) => [parameter.parameter_id, parameter]),
+  );
 
   for (const { node } of flattenProgramForest(program.forest)) {
     const entry = catalog.get(node.node_id);
@@ -127,7 +137,7 @@ export function deriveProgramMotionConfiguration(
     };
   }
   const missingFields = PROGRAM_MOTION_FIELDS.filter(
-    (field) => applicableCounts[field] === 0,
+    (field) => applicableCounts[field] === 0 && !declarations.has(field),
   );
   if (missingFields.length > 0) {
     return {
@@ -139,6 +149,10 @@ export function deriveProgramMotionConfiguration(
   const bindings = {} as Record<ProgramMotionField, string>;
   for (const field of PROGRAM_MOTION_FIELDS) {
     const candidates = references.get(field) ?? new Set<string>();
+    if (candidates.size === 0 && applicableCounts[field] === 0 && declarations.has(field)) {
+      bindings[field] = field;
+      continue;
+    }
     if (candidates.size !== 1) {
       return {
         available: false,
@@ -152,13 +166,10 @@ export function deriveProgramMotionConfiguration(
   if (new Set(Object.values(bindings)).size !== PROGRAM_MOTION_FIELDS.length) {
     return {
       available: false,
-      reason: 'Velocity, acceleration, and TCP ceilings must use distinct Program parameters.',
+      reason: 'Program motion defaults must use distinct Program parameters.',
     };
   }
 
-  const declarations = new Map(
-    (program.parameters ?? []).map((parameter) => [parameter.parameter_id, parameter]),
-  );
   const values = {} as ProgramMotionValues;
   for (const field of PROGRAM_MOTION_FIELDS) {
     const declaration = declarations.get(bindings[field]);

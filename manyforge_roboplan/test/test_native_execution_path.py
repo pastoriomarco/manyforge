@@ -18,7 +18,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
-from manyforge_behavior.kernel_client import KernelClient
+from manyforge_behavior.kernel_client import (
+    KernelClient,
+    KernelOperationAdmissionRejectedError,
+)
 from manyforge_behavior.runner import OrchestratorRunner
 from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_composer.backend.state import ComposerState
@@ -983,7 +986,6 @@ def _cartesian_path(start_z_m: float, end_z_m: float) -> dict[str, Any]:
         "max_translation_step_m": 0.01,
         "max_rotation_step_rad": 0.1,
         "speed_mode": "bounded",
-        "max_linear_speed_mps": 0.1,
         "max_angular_speed_rad_s": 0.2,
         "max_linear_acceleration_mps2": 0.3,
         "max_angular_acceleration_rad_s2": 0.4,
@@ -1189,12 +1191,40 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         )
         assert targets["command"] == "targets"
         assert targets["targets"]["schema_version"] == (
-            "manyforge.execution_targets.v1"
+            "manyforge.execution_targets.v2"
         )
+        assert targets["targets"]["direct_control_targets"] == [
+            targets["targets"]["direct_control"]
+        ]
+        assert targets["targets"]["direct_control_gripper_targets"] == [
+            targets["targets"]["direct_control_gripper"]
+        ]
         assert control_state["command"] == "control_state"
         assert control_state["control_state"]["schema_version"] == (
-            "manyforge.execution_control_state.v4"
+            "manyforge.execution_control_state.v5"
         )
+        observed_target_states = control_state["control_state"][
+            "observed_target_states"
+        ]
+        assert [
+            (row["controllable_component_id"], row["command_target_id"])
+            for row in observed_target_states
+        ] == [
+            (
+                targets["targets"]["direct_control"]["controllable_component_id"],
+                targets["targets"]["direct_control"]["command_target_id"],
+            ),
+            (
+                targets["targets"]["direct_control_gripper"][
+                    "controllable_component_id"
+                ],
+                targets["targets"]["direct_control_gripper"]["command_target_id"],
+            ),
+        ]
+        assert observed_target_states[0]["motion"] is not None
+        assert observed_target_states[0]["gripper"] is None
+        assert observed_target_states[1]["motion"] is None
+        assert observed_target_states[1]["gripper"] is not None
         assert control_state["control_state"]["manual_operations"] == []
         manual_operations = resident_control_state["control_state"]["manual_operations"]
         # This is a real manual operation, not a fabricated captured Program.
@@ -1234,7 +1264,10 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
             }.items()
         }
         assert encoded_sizes["identity"] < 2 * 1024
-        assert encoded_sizes["targets"] < 16 * 1024
+        # v2 carries the complete addressed target inventory alongside the
+        # compatibility primary target. Keep the projection bounded while the
+        # singular compatibility fields remain supported.
+        assert encoded_sizes["targets"] < 32 * 1024
         assert encoded_sizes["control_state"] < 4 * 1024
         assert encoded_sizes["observation"] < 2 * 1024
         assert encoded_sizes["diagnostics"] < 32 * 1024
@@ -2417,7 +2450,6 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
                 "max_translation_step_m": 0.005,
                 "max_rotation_step_rad": 0.05,
                 "speed_mode": "bounded",
-                "max_linear_speed_mps": 0.1,
                 "max_angular_speed_rad_s": 0.5,
                 "max_linear_acceleration_mps2": 0.5,
                 "max_angular_acceleration_rad_s2": 2.5,
@@ -2507,7 +2539,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
 
         # Public callers cannot impersonate a captured Program effect. Keep
         # that boundary check separate from payload validation below.
-        with pytest.raises(HeadlessClientError) as forged:
+        with pytest.raises(KernelOperationAdmissionRejectedError) as forged:
             _unclaimed_program_submission(
                 runner,
                 request_id="reject-public-program-origin",
@@ -2515,7 +2547,6 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
                 positions=(0.05,),
             )
         assert forged.value.code == "invalid_request"
-        assert forged.value.status_code == 400
         assert recording.last_submission is not None
         raw_forged = raw_api.post(
             "/api/execution/operations", json=recording.last_submission
@@ -2650,7 +2681,11 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         assert gripper_terminal["participants"][0]["payload_kind"] == (
             "capability_command"
         )
-        assert composer.operation(gripper_id)["operation"] == gripper_terminal
+        durable_gripper = composer.operation(gripper_id)["operation"]
+        for bookkeeping_field in ("operation_revision", "updated_at_ns"):
+            durable_gripper.pop(bookkeeping_field)
+            gripper_terminal.pop(bookkeeping_field)
+        assert durable_gripper == gripper_terminal
         gripper_status = headless.execution_diagnostics()["status"]
         gripper_observed = next(
             target
@@ -3040,13 +3075,16 @@ def test_target_queries_cannot_borrow_undeclared_capabilities(tmp_path: Path) ->
         # This fixture declares command/planning capabilities only. Merely
         # possessing its exact binding must not grant model/feedback access.
         for change, code in [
-            ({}, "execution_target_binding_unavailable"),
+            ({}, "execution_target_observation_unavailable"),
             ({"owner_epoch": "old.owner"}, "execution_target_owner_stale"),
             (
                 {"program_binding_id": "sha256:" + "0" * 64},
-                "execution_target_binding_unavailable",
+                "execution_target_observation_unavailable",
             ),
-            ({"target_role_id": "unknown"}, "execution_target_binding_unavailable"),
+            (
+                {"target_role_id": "unknown"},
+                "execution_target_observation_unavailable",
+            ),
         ]:
             with pytest.raises(HeadlessApiError) as caught:
                 client.query_target({**query, **change})
@@ -3059,7 +3097,7 @@ def test_target_queries_cannot_borrow_undeclared_capabilities(tmp_path: Path) ->
         )
         with pytest.raises(HeadlessApiError) as caught:
             client.query_target(gripper_query)
-        assert caught.value.code == "execution_target_binding_unavailable"
+        assert caught.value.code == "execution_target_observation_unavailable"
         assert client.events(identity["owner_epoch"], 0) == before
     finally:
         _stop_host(process)
@@ -3206,7 +3244,7 @@ def test_gripper_only_motion_updates_the_shared_native_observation_stream(
             assert terminal["operation"]["state"] == "completed", terminal
             assert terminal["resident"] is False, terminal
             control = client.control_state()["control_state"]
-            assert control["schema_version"] == "manyforge.execution_control_state.v4"
+            assert control["schema_version"] == "manyforge.execution_control_state.v5"
             results = control["manual_operations"]
             assert len(results) == 1
             assert results[0]["resident"] is False

@@ -282,7 +282,6 @@ def _cartesian_path() -> dict[str, object]:
         "max_translation_step_m": 0.01,
         "max_rotation_step_rad": 0.1,
         "speed_mode": "bounded",
-        "max_linear_speed_mps": 0.1,
         "max_angular_speed_rad_s": 0.2,
         "max_linear_acceleration_mps2": 0.3,
         "max_angular_acceleration_rad_s2": 0.4,

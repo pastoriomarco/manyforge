@@ -750,11 +750,15 @@ class NativeKernelProgramPort:
                 "max_translation_step_m": parameters["max_translation_step_m"],
                 "max_rotation_step_rad": parameters["max_rotation_step_rad"],
                 "speed_mode": "bounded",
-                "max_linear_speed_mps": parameters["max_linear_speed_mps"],
+                # CartesianPathDTO still carries the planner's numerical
+                # bound, but it is not an authored second speed knob. The
+                # admitted SpeedProfile supplies the exact Deployment/request
+                # value and the planner takes the stricter value.
                 "max_angular_speed_rad_s": parameters["max_angular_speed_rad_s"],
                 "max_linear_acceleration_mps2": parameters["max_linear_acceleration_mps2"],
                 "max_angular_acceleration_rad_s2": parameters["max_angular_acceleration_rad_s2"],
                 "fallback_policy": parameters["fallback_policy"],
+                "max_blend_deviation_rad": parameters["max_blend_deviation_rad"],
             }
         raise ProductionPortError(f"unsupported Kernel motion node {node_id!r}")
 
@@ -1039,11 +1043,11 @@ class NativeKernelProgramPort:
             "max_translation_step_m": 0.005,
             "max_rotation_step_rad": 0.05,
             "speed_mode": "bounded",
-            "max_linear_speed_mps": 0.1,
             "max_angular_speed_rad_s": 0.5,
             "max_linear_acceleration_mps2": 0.5,
             "max_angular_acceleration_rad_s2": 2.5,
             "fallback_policy": "fail_closed",
+            "max_blend_deviation_rad": 0.01,
         }
 
     @staticmethod
@@ -1888,6 +1892,18 @@ class NativeKernelProgramPort:
         assert shared is not None
         with self._lock:
             if shared.stop_requested or operation.get("state") == "stopping":
+                return
+            scope_stop = self._scope_stops.get(task.identity.program_run_id)
+            if (
+                scope_stop is not None
+                and scope_stop.active is not None
+                and scope_stop.unresolved is None
+            ):
+                # The Kernel's accepted Program-run fence owns operations that
+                # crossed admission before their local task was retained.
+                # Issuing a second operation Stop here would overlap that
+                # containment and can promote an ordinary Stop into a fault.
+                shared.stop_requested = True
                 return
             shared.stop_requested = True
         revision = operation.get("operation_revision")
@@ -3029,6 +3045,11 @@ class _NativeKernelProgramScopePort:
         self, request: Mapping[str, Any], expected_selection_revision: int
     ) -> Mapping[str, Any]:
         return self._owner._kernel.release_program_selection(request, expected_selection_revision)
+
+    def start_selection(
+        self, request: Mapping[str, Any], expected_selection_revision: int
+    ) -> Mapping[str, Any]:
+        return self._owner._kernel.start_program_selection(request, expected_selection_revision)
 
     def capture_stop(self, program_run_id: str) -> tuple[str, int] | None:
         with self._owner._lock:

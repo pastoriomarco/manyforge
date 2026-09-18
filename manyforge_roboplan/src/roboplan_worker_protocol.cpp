@@ -417,11 +417,11 @@ void write_motion(Encoder& encoder,
           encoder.floating(value.max_translation_step_m);
           encoder.floating(value.max_rotation_step_rad);
           encoder.u8(static_cast<std::uint8_t>(value.speed_mode));
-          encoder.floating(value.max_linear_speed_mps);
           encoder.floating(value.max_angular_speed_rad_s);
           encoder.floating(value.max_linear_acceleration_mps2);
           encoder.floating(value.max_angular_acceleration_rad_s2);
           encoder.u8(static_cast<std::uint8_t>(value.fallback_policy));
+          encoder.floating(value.max_blend_deviation_rad);
         }
       },
       motion);
@@ -449,7 +449,6 @@ void write_motion(Encoder& encoder,
         fail("Cartesian speed-mode tag is invalid");
       }
       value.speed_mode = core::CartesianSpeedModeDTO::kBounded;
-      value.max_linear_speed_mps = decoder.floating();
       value.max_angular_speed_rad_s = decoder.floating();
       value.max_linear_acceleration_mps2 = decoder.floating();
       value.max_angular_acceleration_rad_s2 = decoder.floating();
@@ -461,6 +460,7 @@ void write_motion(Encoder& encoder,
       }
       value.fallback_policy =
           static_cast<core::CartesianFallbackPolicyDTO>(fallback);
+      value.max_blend_deviation_rad = decoder.floating();
       return value;
     }
     default:
@@ -643,6 +643,20 @@ void write_trajectory(Encoder& encoder, const core::TrajectoryDTO& value) {
                                   });
                    });
   write_double_vector(encoder, value.cartesian_waypoint_times_s);
+  encoder.optional(value.cartesian_fidelity_metrics,
+                   [](Encoder& out, const auto& metrics) {
+                     out.floating(metrics.requested_translation_tolerance_m);
+                     out.floating(metrics.requested_rotation_tolerance_rad);
+                     out.floating(metrics.measured_max_translation_error_m);
+                     out.floating(metrics.measured_max_rotation_error_rad);
+                     out.floating(metrics.unsampled_translation_bound_m);
+                     out.floating(metrics.unsampled_rotation_bound_rad);
+                     out.floating(metrics.certified_max_translation_error_m);
+                     out.floating(metrics.certified_max_rotation_error_rad);
+                     out.floating(metrics.requested_max_blend_deviation_rad);
+                     out.floating(metrics.accepted_max_blend_deviation_rad);
+                     out.u32(metrics.planning_attempt_count);
+                   });
 }
 
 [[nodiscard]] core::TrajectoryDTO read_trajectory(Decoder& decoder) {
@@ -665,6 +679,14 @@ void write_trajectory(Encoder& encoder, const core::TrajectoryDTO& value) {
                                                          })};
           });
   value.cartesian_waypoint_times_s = read_double_vector(decoder);
+  value.cartesian_fidelity_metrics =
+      decoder.optional<core::CartesianFidelityMetricsDTO>([](Decoder& input) {
+        return core::CartesianFidelityMetricsDTO{
+            input.floating(), input.floating(), input.floating(),
+            input.floating(), input.floating(), input.floating(),
+            input.floating(), input.floating(), input.floating(),
+            input.floating(), input.u32()};
+      });
   return value;
 }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,9 @@ from manyforge_headless_api.client import HeadlessClientError
 
 _ROOT = Path(__file__).resolve().parents[2]
 _PROGRAM_PATH = _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml"
+_DEPLOYMENT_PATH = (
+    _ROOT / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
+)
 
 
 def _selection(program: dict[str, Any]) -> dict[str, Any]:
@@ -42,6 +46,7 @@ def _selection(program: dict[str, Any]) -> dict[str, Any]:
         "program": deepcopy(program),
         "program_binding": {"program_binding_id": "sha256:" + "6" * 64},
         "typed_parameter_overrides": {},
+        "deployment": json.loads(_DEPLOYMENT_PATH.read_text(encoding="utf-8")),
     }
 
 

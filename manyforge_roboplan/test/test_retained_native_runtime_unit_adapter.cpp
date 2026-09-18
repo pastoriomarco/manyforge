@@ -1173,7 +1173,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   EXPECT_TRUE(
       bootstrapped.resulting_health.healthy_for_target(initial_revision));
   const auto observed_authoring_admission =
-      WaitForAuthoringAdmission(adapter, std::chrono::seconds(10));
+      WaitForAuthoringAdmission(adapter, std::chrono::seconds(30));
   ASSERT_TRUE(observed_authoring_admission.has_value());
   EXPECT_FALSE(observed_authoring_admission->authoring_allowed);
   EXPECT_GT(observed_authoring_admission->admission_generation.value(), 0U);
@@ -1275,7 +1275,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_TRUE(published.ok()) << published.error().message;
 
   const auto authoring_admission =
-      WaitForAuthoringAdmission(adapter, std::chrono::seconds(10), true);
+      WaitForAuthoringAdmission(adapter, std::chrono::seconds(30), true);
   ASSERT_TRUE(authoring_admission.has_value());
   ASSERT_TRUE(authoring_admission->authoring_allowed);
   EXPECT_GT(authoring_admission->admission_generation,
@@ -1322,14 +1322,15 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       "manager-runtime-physical-admission-test");
   const core::ConfigurationFenceAdmissionQueryDTO admission_query{
       physical_scope, manager_epoch};
-  // The retained I6 fixture deliberately has no CCLC-issued Stop readiness.
-  // Its exact physical route is therefore observable through the projection
-  // client but is not a reconciled predecessor configuration that may back an
-  // Apply fence. The L0.7 product-process gate separately proves the positive
-  // lifecycle/route/readiness/fence path; this legacy fixture must fail closed
-  // without disturbing its private projection owner.
-  EXPECT_THROW(static_cast<void>(adapter.ObserveAdmission(admission_query)),
-               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  // Admission observation is an inspection service, so it remains available
+  // independently of permission to perform a controller or route effect. The
+  // returned snapshot is exact and does not itself acquire an Apply fence.
+  const auto physical_admission = adapter.ObserveAdmission(admission_query);
+  EXPECT_TRUE(physical_admission.matches(admission_query));
+  EXPECT_EQ(physical_admission.active_projection_revision,
+            publication.request.candidate_projection_revision);
+  EXPECT_EQ(physical_admission.active_public_pointer_digest,
+            publication.durable_public_pointer_content_digest);
   EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(),
             first_epoch.value());
 

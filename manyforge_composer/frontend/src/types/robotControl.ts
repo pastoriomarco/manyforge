@@ -59,7 +59,7 @@ export interface ManualControlContracts {
 }
 
 export interface ManualControlMotionDescriptor {
-  schemaVersion: 'manyforge.manual_control_motion_descriptor.v4';
+  schemaVersion: 'manyforge.manual_control_motion_descriptor.v5';
   controllableComponentId: string;
   commandTargetId: string;
   componentRoleId: string;
@@ -90,13 +90,7 @@ export interface ManualControlMotionDescriptor {
     }>;
   } | null;
   operationalLimit: {
-    catalogPolicyMaximumTcpLinearSpeedMps: number;
-    deploymentMaximumTcpLinearSpeedMps: number | null;
-    effectiveMaximumTcpLinearSpeedMps: number;
-    policyId: string;
-    policyRevision: string;
-    selectedScope: 'cell' | 'command_target';
-    sourceContentDigest: string;
+    maximumTcpLinearSpeedMps: number;
   } | null;
   contracts: ManualControlContracts;
 }
@@ -199,6 +193,10 @@ export interface ObservedMotionTarget {
 }
 
 export interface ObservedGripperTarget {
+  /** Identity is present for multi-target projections; optional for old peers. */
+  targetRoleId?: string;
+  controllableComponentId?: string;
+  commandTargetId?: string;
   sequence: number;
   sourceEpoch: string;
   sourceCoordinateName: string;
@@ -270,8 +268,14 @@ export interface ExecutionOwnerStatus {
   sceneRevision: SceneRevisionValue;
   directControl: DirectControlMotionStatus;
   directControlGripper: DirectControlGripperStatus;
+  /** All addressed manual targets. The singular fields above remain the
+   * compatibility/primary aliases for older projections. */
+  directControlTargets?: DirectControlMotionStatus[];
+  directControlGripperTargets?: DirectControlGripperStatus[];
   observedMotion: ObservedMotionTarget;
   observedGripper: ObservedGripperTarget | null;
+  observedMotions?: ObservedMotionTarget[];
+  observedGrippers?: ObservedGripperTarget[];
   manualOperations: (OperationObservation & { programRunId: string })[];
   cellStopAction: CellStopActionStatus;
   runtimeScaleControl: RuntimeScaleControlStatus | null;
@@ -310,11 +314,11 @@ export type DirectControlMotionSpec =
       max_translation_step_m: number;
       max_rotation_step_rad: number;
       speed_mode: 'bounded';
-      max_linear_speed_mps: number;
       max_angular_speed_rad_s: number;
       max_linear_acceleration_mps2: number;
       max_angular_acceleration_rad_s2: number;
       fallback_policy: 'fail_closed';
+      max_blend_deviation_rad: number;
     };
 
 export interface MotionParticipantPayload {
@@ -496,6 +500,11 @@ export interface OperationObservation {
   activeStopId: string | null;
   activeStopGeneration: number | null;
   terminalError: string | null;
+  /** Exact target identity when the owner exposes operation participants. */
+  componentRoleId?: string;
+  targetRoleId?: string;
+  controllableComponentId?: string;
+  commandTargetId?: string;
 }
 
 export type RuntimeScaleApplicationState =

@@ -48,7 +48,7 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
         },
       ],
       targetDescriptor: {
-        schemaVersion: 'manyforge.manual_control_motion_descriptor.v4',
+        schemaVersion: 'manyforge.manual_control_motion_descriptor.v5',
         ordinaryJerk: null,
         controllableComponentId: 'robot-a',
         commandTargetId: 'arm',

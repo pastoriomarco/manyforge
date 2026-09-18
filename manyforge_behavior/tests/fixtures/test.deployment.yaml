@@ -6,7 +6,6 @@ robot_config:
   robot_id: ur5
   group_id: arm
   urdf_path: package://test.urdf
-  global_max_tcp_linear_speed_mps: 0.25
 adapters:
   planning:
     adapter_id: planning.test

@@ -63,6 +63,8 @@ static_assert(ExposesPublish<IActiveBundlePublicationStore>);
 
 using StageSignature = ProjectionApplyStageResultDTO (IManagerSceneProjectionHandoffPort::*)(
     const ProjectionApplyStageDTO&);
+using CurrentProjectionRevisionSignature = ProjectionRevisionDTO (
+    IManagerSceneProjectionHandoffPort::*)() const;
 using ActivateSignature = ProjectionApplyActivationResultDTO (
     IManagerSceneProjectionHandoffPort::*)(const ProjectionApplyActivationDTO&);
 using DiscardSignature = ProjectionApplyDiscardResultDTO (IManagerSceneProjectionHandoffPort::*)(
@@ -77,6 +79,10 @@ using ReconcileActiveProjectionSignature =
         const ActiveProjectionRuntimeSetDTO&);
 using ActiveProjectionHealthSignature = ProjectionAggregateHealthDTO (
     IManagerSceneProjectionHandoffPort::*)() const;
+static_assert(
+    std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::
+                                CurrentProjectionRevision),
+                   CurrentProjectionRevisionSignature>);
 static_assert(
     std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::StageCandidateProjection),
                    StageSignature>);

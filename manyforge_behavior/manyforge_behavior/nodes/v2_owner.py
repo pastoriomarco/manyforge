@@ -468,6 +468,11 @@ class OwnerTaskAdapter(_OwnerAdapter):
             task = observed
         return self._control_state(task)
 
+    def cached_control_state(self) -> str:
+        """Project the last retained owner fact without performing owner I/O."""
+
+        return self._control_state(self._task)
+
     def _control_state(self, task: OwnerTaskSnapshot | None) -> str:
         if task is None:
             return "inactive"
@@ -578,6 +583,9 @@ class OwnerInvocationAdapter(_OwnerAdapter):
 
     def observe_control_state(self) -> str:
         return "active" if self.has_active_task else "settled" if self._invoked else "inactive"
+
+    def cached_control_state(self) -> str:
+        return self.observe_control_state()
 
     def reconcile_full_stop_task(self, *, selected_resume: bool = False) -> str:
         # A selected Resume must not reopen admission while a previously sent

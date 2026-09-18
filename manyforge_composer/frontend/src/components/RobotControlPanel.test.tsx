@@ -38,7 +38,7 @@ const controller = vi.hoisted(() => ({
           maxAccelerationRadS2: 3,
         }],
         targetDescriptor: {
-          schemaVersion: 'manyforge.manual_control_motion_descriptor.v4',
+          schemaVersion: 'manyforge.manual_control_motion_descriptor.v5',
           ordinaryJerk: null,
           controllableComponentId: 'robot-1', commandTargetId: 'arm',
           componentRoleId: 'controlled_component', targetRoleId: 'command_target',
@@ -137,7 +137,9 @@ const controller = vi.hoisted(() => ({
     },
     draftGripperPosition: 0.02,
     motionSettings: { velocityScale: 1, accelerationScale: 1, tcpLinearSpeedMps: 0.1,
-      tcpAngularSpeedRadS: 0.5, tcpLinearAccelerationMps2: 0.5, tcpAngularAccelerationRadS2: 2.5, jointLimits: {} },
+      tcpAngularSpeedRadS: 0.5, tcpLinearAccelerationMps2: 0.5, tcpAngularAccelerationRadS2: 2.5,
+      cartesianTranslationToleranceM: 0.005, cartesianRotationToleranceRad: 0.05,
+      cartesianMaxBlendDeviationRad: 0.01, jointLimits: {} },
     generation: 1,
     intent: {},
     preview: {},
@@ -153,6 +155,10 @@ const controller = vi.hoisted(() => ({
   runtimeScaleError: null,
   fullStopPending: false,
   fullStopError: null,
+  motionTargets: [] as Array<Record<string, unknown>>,
+  gripperTargets: [] as Array<Record<string, unknown>>,
+  selectRobot: vi.fn(),
+  selectTool: vi.fn(),
   selectMode: vi.fn(),
   editJoint: vi.fn(),
   editPose: vi.fn(),
@@ -172,10 +178,34 @@ const controller = vi.hoisted(() => ({
 
 vi.mock('../hooks/useRobotControl', () => ({
   useRobotControl: () => ({ ...controller, currentStatus: controller.state.status,
+    selectedStatus: controller.state.status,
+    motionTargets: controller.motionTargets.length === 0
+      ? [controller.state.status.directControl] : controller.motionTargets,
+    gripperTargets: controller.gripperTargets.length === 0
+      ? [controller.state.status.directControlGripper] : controller.gripperTargets,
     manualControlAllowed: true, manualControlUnavailableReason: null }),
 }));
 
 describe('RobotControlPanel layout', () => {
+  it('shows a compact robot selector only when the owner offers multiple targets', () => {
+    const second = structuredClone(controller.state.status.directControl) as Record<string, unknown>;
+    second.controllableComponentId = 'robot-2';
+    controller.motionTargets.push(
+      controller.state.status.directControl as unknown as Record<string, unknown>,
+      second,
+    );
+    try {
+      const markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+      expect(markup).toContain('aria-label="Robot target"');
+      expect(markup).toContain('robot-1 · arm');
+      expect(markup).toContain('robot-2 · arm');
+    } finally {
+      controller.motionTargets.length = 0;
+    }
+    expect(renderToStaticMarkup(<RobotControlPanel enabled />))
+      .not.toContain('aria-label="Robot target"');
+  });
+
   it('presents an expected target rejection locally without calling the robot blocked', () => {
     const state = controller.state as unknown as Record<string, unknown>;
     const previous = { ...state };
@@ -225,6 +255,26 @@ describe('RobotControlPanel layout', () => {
     expect(markup).toContain('>Stop operation</button>');
     expect(markup).toContain('title="Discard only the local no-motion preview."');
     expect(markup).not.toContain('Revert only discards the local preview.');
+  });
+
+  it('keeps common motion settings compact and Cartesian fidelity controls advanced', () => {
+    const state = controller.state as unknown as Record<string, unknown>;
+    const previousMode = state.mode;
+    try {
+      state.mode = 'cartesian_path';
+      const markup = renderToStaticMarkup(<RobotControlPanel enabled />);
+      expect(markup).toContain('robot-control-motion-settings-grid');
+      expect(markup).toContain('Vel. (%)');
+      expect(markup).toContain('Acc. (%)');
+      expect(markup).toContain('TCP Sp. (m/s)');
+      expect(markup).toContain('<summary title="Cartesian path fidelity, smoothing and optional tighter per-joint limits.">Advanced</summary>');
+      expect(markup).toContain('Lin. Tol. (m)');
+      expect(markup).toContain('Blend (rad)');
+      expect(markup).toContain('aria-label="Manual Cartesian linear path tolerance (m)"');
+      expect(markup).toContain('aria-label="Manual Maximum Cartesian joint-path blend deviation (rad); zero disables blending"');
+    } finally {
+      state.mode = previousMode;
+    }
   });
 
   it('renders exact-operation Pause, Resume, and eligible Reset controls', () => {

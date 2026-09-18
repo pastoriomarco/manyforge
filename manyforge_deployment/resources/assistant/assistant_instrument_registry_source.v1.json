@@ -6322,7 +6322,7 @@
                           "properties": {
                             "parameters": {
                               "required": [
-                                "max_linear_acceleration_mps2"
+                                "max_blend_deviation_rad"
                               ]
                             }
                           },
@@ -6334,7 +6334,7 @@
                           "properties": {
                             "value_sources": {
                               "required": [
-                                "max_linear_acceleration_mps2"
+                                "max_blend_deviation_rad"
                               ]
                             }
                           },
@@ -6352,7 +6352,7 @@
                           "properties": {
                             "parameters": {
                               "required": [
-                                "max_linear_speed_mps"
+                                "max_linear_acceleration_mps2"
                               ]
                             }
                           },
@@ -6364,7 +6364,7 @@
                           "properties": {
                             "value_sources": {
                               "required": [
-                                "max_linear_speed_mps"
+                                "max_linear_acceleration_mps2"
                               ]
                             }
                           },
@@ -6546,11 +6546,11 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
-                      "max_linear_acceleration_mps2": {
-                        "exclusiveMinimum": 0.0,
+                      "max_blend_deviation_rad": {
+                        "minimum": 0.0,
                         "type": "number"
                       },
-                      "max_linear_speed_mps": {
+                      "max_linear_acceleration_mps2": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
@@ -6654,10 +6654,10 @@
                       "max_angular_speed_rad_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
-                      "max_linear_acceleration_mps2": {
+                      "max_blend_deviation_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
-                      "max_linear_speed_mps": {
+                      "max_linear_acceleration_mps2": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_rotation_step_rad": {
@@ -8557,7 +8557,7 @@
                           "properties": {
                             "parameters": {
                               "required": [
-                                "max_linear_acceleration_mps2"
+                                "max_blend_deviation_rad"
                               ]
                             }
                           },
@@ -8569,7 +8569,7 @@
                           "properties": {
                             "value_sources": {
                               "required": [
-                                "max_linear_acceleration_mps2"
+                                "max_blend_deviation_rad"
                               ]
                             }
                           },
@@ -8587,7 +8587,7 @@
                           "properties": {
                             "parameters": {
                               "required": [
-                                "max_linear_speed_mps"
+                                "max_linear_acceleration_mps2"
                               ]
                             }
                           },
@@ -8599,7 +8599,7 @@
                           "properties": {
                             "value_sources": {
                               "required": [
-                                "max_linear_speed_mps"
+                                "max_linear_acceleration_mps2"
                               ]
                             }
                           },
@@ -8822,11 +8822,11 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
-                      "max_linear_acceleration_mps2": {
-                        "exclusiveMinimum": 0.0,
+                      "max_blend_deviation_rad": {
+                        "minimum": 0.0,
                         "type": "number"
                       },
-                      "max_linear_speed_mps": {
+                      "max_linear_acceleration_mps2": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
@@ -8935,10 +8935,10 @@
                       "max_angular_speed_rad_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
-                      "max_linear_acceleration_mps2": {
+                      "max_blend_deviation_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
-                      "max_linear_speed_mps": {
+                      "max_linear_acceleration_mps2": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_rotation_step_rad": {
@@ -12802,7 +12802,7 @@
                           "properties": {
                             "parameters": {
                               "required": [
-                                "max_linear_acceleration_mps2"
+                                "max_blend_deviation_rad"
                               ]
                             }
                           },
@@ -12814,7 +12814,7 @@
                           "properties": {
                             "value_sources": {
                               "required": [
-                                "max_linear_acceleration_mps2"
+                                "max_blend_deviation_rad"
                               ]
                             }
                           },
@@ -12832,7 +12832,7 @@
                           "properties": {
                             "parameters": {
                               "required": [
-                                "max_linear_speed_mps"
+                                "max_linear_acceleration_mps2"
                               ]
                             }
                           },
@@ -12844,7 +12844,7 @@
                           "properties": {
                             "value_sources": {
                               "required": [
-                                "max_linear_speed_mps"
+                                "max_linear_acceleration_mps2"
                               ]
                             }
                           },
@@ -13067,11 +13067,11 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
-                      "max_linear_acceleration_mps2": {
-                        "exclusiveMinimum": 0.0,
+                      "max_blend_deviation_rad": {
+                        "minimum": 0.0,
                         "type": "number"
                       },
-                      "max_linear_speed_mps": {
+                      "max_linear_acceleration_mps2": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
@@ -13180,10 +13180,10 @@
                       "max_angular_speed_rad_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
-                      "max_linear_acceleration_mps2": {
+                      "max_blend_deviation_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
-                      "max_linear_speed_mps": {
+                      "max_linear_acceleration_mps2": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_rotation_step_rad": {
@@ -18570,7 +18570,7 @@
                       "properties": {
                         "parameters": {
                           "required": [
-                            "max_linear_acceleration_mps2"
+                            "max_blend_deviation_rad"
                           ]
                         }
                       },
@@ -18582,7 +18582,7 @@
                       "properties": {
                         "value_sources": {
                           "required": [
-                            "max_linear_acceleration_mps2"
+                            "max_blend_deviation_rad"
                           ]
                         }
                       },
@@ -18600,7 +18600,7 @@
                       "properties": {
                         "parameters": {
                           "required": [
-                            "max_linear_speed_mps"
+                            "max_linear_acceleration_mps2"
                           ]
                         }
                       },
@@ -18612,7 +18612,7 @@
                       "properties": {
                         "value_sources": {
                           "required": [
-                            "max_linear_speed_mps"
+                            "max_linear_acceleration_mps2"
                           ]
                         }
                       },
@@ -18823,11 +18823,11 @@
                     "exclusiveMinimum": 0.0,
                     "type": "number"
                   },
-                  "max_linear_acceleration_mps2": {
-                    "exclusiveMinimum": 0.0,
+                  "max_blend_deviation_rad": {
+                    "minimum": 0.0,
                     "type": "number"
                   },
-                  "max_linear_speed_mps": {
+                  "max_linear_acceleration_mps2": {
                     "exclusiveMinimum": 0.0,
                     "type": "number"
                   },
@@ -18931,10 +18931,10 @@
                   "max_angular_speed_rad_s": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
-                  "max_linear_acceleration_mps2": {
+                  "max_blend_deviation_rad": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
-                  "max_linear_speed_mps": {
+                  "max_linear_acceleration_mps2": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "max_rotation_step_rad": {

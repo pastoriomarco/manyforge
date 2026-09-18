@@ -1,10 +1,10 @@
 #pragma once
 
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <optional>
 
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -74,11 +74,10 @@ struct ScenarioProgramSelection final {
 /// value, writes a repository, or exposes compiler functionality.
 class FilesystemScenarioApplyCandidateSource final {
 public:
-  FilesystemScenarioApplyCandidateSource(std::filesystem::path package_root,
-                                         std::string catalog_name,
-                                         std::optional<std::filesystem::path>
-                                             candidate_package_root =
-                                                 std::nullopt);
+  FilesystemScenarioApplyCandidateSource(
+      std::filesystem::path package_root, std::string catalog_name,
+      std::optional<std::filesystem::path> candidate_package_root =
+          std::nullopt);
 
   [[nodiscard]] ScenarioApplyCandidateSelection
   ResolveExact(const ScenarioApplyCandidateQuery &query) const;
@@ -92,13 +91,19 @@ public:
   [[nodiscard]] ScenarioProgramSelection
   LoadExactProgramSelection(std::string_view scenario_id) const;
 
+  /// Load the exact normalized authored Deployment named by a previously
+  /// verified Scenario selection. This is an authoring projection only: it
+  /// never compiles, publishes, selects, or activates a Deployment.
+  [[nodiscard]] CanonicalValue
+  LoadExactDeploymentDocument(const ScenarioProgramSelection &selection) const;
+
   /// Resolve one Scenario from the exact immutable catalog revision named by
   /// an addressed request.  Candidate publication never changes the meaning
   /// of the unqualified lookup above.
   [[nodiscard]] ScenarioProgramSelection LoadExactProgramSelectionForCatalog(
       std::string_view scenario_id,
-      const manyforge::core::ScenarioCatalogRevision
-          &scenario_catalog_revision) const;
+      const manyforge::core::ScenarioCatalogRevision &scenario_catalog_revision)
+      const;
 
   /// Return the Scenario occurrence whose retained Deployment is the exact
   /// active Manager selection, or no value when this Scenario names another
@@ -112,8 +117,8 @@ public:
   [[nodiscard]] std::filesystem::path catalog_path() const;
 
   [[nodiscard]] std::filesystem::path catalog_path_for_revision(
-      const manyforge::core::ScenarioCatalogRevision
-          &scenario_catalog_revision) const;
+      const manyforge::core::ScenarioCatalogRevision &scenario_catalog_revision)
+      const;
 
 private:
   [[nodiscard]] ScenarioProgramSelection LoadExactProgramSelectionFrom(

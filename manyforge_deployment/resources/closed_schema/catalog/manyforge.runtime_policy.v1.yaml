@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.runtime_policy.v1
-schema_revision: sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f
+schema_revision: sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4
 schema_purpose: artifact_document
 root_definition_id: runtime_policy
 definitions:
@@ -62,17 +62,6 @@ definitions:
               constraints:
                 - kind: string_format
                   value: portable_id
-        - field_id: motion_speed_limits
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: array
-            min_items: 1
-            max_items: 256
-            collection: {kind: ordered}
-            item_schema:
-              kind: local_ref
-              definition_id: motion_speed_limit
         - field_id: open_loop_grasp_acknowledgements
           presence: optional
           default:
@@ -91,85 +80,6 @@ definitions:
             item_schema:
               kind: local_ref
               definition_id: open_loop_grasp_acknowledgement
-  - definition_id: motion_speed_limit
-    value_schema:
-      kind: tagged_union
-      tag_field: scope_kind
-      alternatives:
-        - tag_value: cell
-          value_schema:
-            kind: local_ref
-            definition_id: cell_motion_speed_limit
-        - tag_value: command_target
-          value_schema:
-            kind: local_ref
-            definition_id: target_motion_speed_limit
-  - definition_id: cell_motion_speed_limit
-    value_schema:
-      kind: object
-      fields:
-        - field_id: scope_kind
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: enum
-                values: [cell]
-        - field_id: maximum_tcp_linear_speed_mps
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: number
-            constraints:
-              - kind: exclusive_minimum
-                value: 0
-              - kind: maximum
-                value: 1000
-  - definition_id: target_motion_speed_limit
-    value_schema:
-      kind: object
-      fields:
-        - field_id: scope_kind
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: enum
-                values: [command_target]
-        - field_id: controllable_component_id
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: string_format
-                value: portable_id
-        - field_id: command_target_id
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: string_format
-                value: portable_id
-        - field_id: maximum_tcp_linear_speed_mps
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: number
-            constraints:
-              - kind: exclusive_minimum
-                value: 0
-              - kind: maximum
-                value: 1000
   - definition_id: open_loop_grasp_acknowledgement
     value_schema:
       kind: object

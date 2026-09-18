@@ -37,9 +37,13 @@ def test_program_runner_client_preserves_paths_queries_and_bodies() -> None:
             "program run:1",
             {"request_id": "request.3"},
         ) == {"ok": True}
-        assert client.prepare_manual_handover(
+        assert client.start_motion(
             "program run:1",
             {"request_id": "request.4"},
+        ) == {"ok": True}
+        assert client.prepare_manual_handover(
+            "program run:1",
+            {"request_id": "request.5"},
         ) == {"ok": True}
     finally:
         raw.close()
@@ -50,6 +54,7 @@ def test_program_runner_client_preserves_paths_queries_and_bodies() -> None:
         "/api/program/runs/program run:1",
         "/api/program/runs/program run:1/stop",
         "/api/program/runs/program run:1/motion-stop",
+        "/api/program/runs/program run:1/motion-start",
         "/api/program/runs/program run:1/manual-handover",
     ]
     assert dict(requests[0].url.params) == {
@@ -60,6 +65,7 @@ def test_program_runner_client_preserves_paths_queries_and_bodies() -> None:
     assert json.loads(requests[3].content) == {"request_id": "request.2"}
     assert json.loads(requests[4].content) == {"request_id": "request.3"}
     assert json.loads(requests[5].content) == {"request_id": "request.4"}
+    assert json.loads(requests[6].content) == {"request_id": "request.5"}
 
 
 def test_program_runner_client_preserves_stable_remote_errors() -> None:

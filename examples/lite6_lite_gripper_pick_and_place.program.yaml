@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: lite6_lite_gripper_pick_and_place
-program_revision: sha256:0c7051bb9029d6560d6acb6b36c17d07ad2fe3f100d22aa7da3746207ebcd954
+program_revision: sha256:c7465c5e7d065976cf439daef4a4e6ae3292f37b8cd03fa9488c5ad3998f1910
 program_profile: composable-cell-v1
 name: lite6_lite_gripper_pick_and_place
 description: >-
@@ -102,12 +102,24 @@ parameters:
     constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
     runtime_mutability: before_run
     description: Acceleration scale for all Lite6 pick-and-place moves.
+  - parameter_id: max_blend_deviation_rad
+    type: float64
+    default: 0.01
+    constraints: {min_inclusive: 0.0}
+    runtime_mutability: before_run
+    description: Default maximum Cartesian blend deviation.
   - parameter_id: max_tcp_linear_speed_mps
     type: float64
     default: 0.15
     constraints: {min_exclusive: 0.0}
     runtime_mutability: before_run
     description: Maximum TCP linear speed for all Lite6 pick-and-place moves.
+  - parameter_id: translation_tol_m
+    type: float64
+    default: 0.005
+    constraints: {min_exclusive: 0.0}
+    runtime_mutability: before_run
+    description: Default Cartesian translation tolerance for motion nodes.
   - parameter_id: velocity_scale
     type: float64
     default: 0.4
@@ -149,6 +161,9 @@ tree:
         max_tcp_linear_speed_mps:
           kind: program_parameter
           reference: max_tcp_linear_speed_mps
+        translation_tol_m:
+          kind: program_parameter
+          reference: translation_tol_m
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -174,6 +189,9 @@ tree:
         max_tcp_linear_speed_mps:
           kind: program_parameter
           reference: max_tcp_linear_speed_mps
+        translation_tol_m:
+          kind: program_parameter
+          reference: translation_tol_m
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -199,6 +217,9 @@ tree:
         max_tcp_linear_speed_mps:
           kind: program_parameter
           reference: max_tcp_linear_speed_mps
+        translation_tol_m:
+          kind: program_parameter
+          reference: translation_tol_m
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -239,6 +260,9 @@ tree:
         max_tcp_linear_speed_mps:
           kind: program_parameter
           reference: max_tcp_linear_speed_mps
+        translation_tol_m:
+          kind: program_parameter
+          reference: translation_tol_m
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -262,6 +286,9 @@ tree:
         max_tcp_linear_speed_mps:
           kind: program_parameter
           reference: max_tcp_linear_speed_mps
+        translation_tol_m:
+          kind: program_parameter
+          reference: translation_tol_m
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -285,6 +312,9 @@ tree:
         max_tcp_linear_speed_mps:
           kind: program_parameter
           reference: max_tcp_linear_speed_mps
+        translation_tol_m:
+          kind: program_parameter
+          reference: translation_tol_m
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -322,6 +352,9 @@ tree:
         max_tcp_linear_speed_mps:
           kind: program_parameter
           reference: max_tcp_linear_speed_mps
+        translation_tol_m:
+          kind: program_parameter
+          reference: translation_tol_m
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale
@@ -348,6 +381,9 @@ tree:
         max_tcp_linear_speed_mps:
           kind: program_parameter
           reference: max_tcp_linear_speed_mps
+        translation_tol_m:
+          kind: program_parameter
+          reference: translation_tol_m
         velocity_scale:
           kind: program_parameter
           reference: velocity_scale

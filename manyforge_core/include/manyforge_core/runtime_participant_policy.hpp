@@ -28,16 +28,14 @@ struct OrdinaryMotionJerkPolicy final {
 /// Exact private runtime-policy projection for one sealed participant.
 ///
 /// Deployment independently qualifies the catalog bytes and then supplies the
-/// complete immutable DTO. This seal rechecks the closed shape, exact binding
-/// scope, and effective motion ceiling; it performs no catalog lookup and
+/// complete immutable DTO. This seal rechecks the closed shape and exact
+/// binding scope; it performs no catalog lookup and
 /// mints no catalog identity.
 struct RuntimeParticipantPolicySelectionDTO final {
   ControllableComponentId controllable_component_id;
   CommandTargetId command_target_id;
   RuntimePolicyCatalogRecordRefDTO source_artifact;
   RuntimePolicyDTO policy;
-  RuntimeMotionSpeedLimitDTO selected_motion_speed_limit;
-  double effective_maximum_tcp_linear_speed_mps{};
   std::optional<OrdinaryMotionJerkPolicy> ordinary_motion_jerk{};
 
   friend bool operator==(const RuntimeParticipantPolicySelectionDTO&,
@@ -64,25 +62,16 @@ class RuntimeParticipantPolicySelection final {
 
   friend Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_selection(
       RuntimePolicyCatalogRecordRefDTO, RuntimePolicyDTO, const RuntimeParticipantBinding&);
-  friend Result<RuntimeParticipantPolicySelection> apply_deployment_motion_speed_ceiling(
-      const RuntimeParticipantPolicySelection&, double);
   friend Result<RuntimeParticipantPolicySelection> apply_deployment_motion_jerk_policy(
       const RuntimeParticipantPolicySelection&, const RuntimeParticipantBinding&,
       OrdinaryMotionJerkPolicy);
 };
 
 /// Seal one already-qualified retained runtime policy against one exact
-/// participant binding and derive the effective cell/target speed ceiling.
+/// participant binding.
 [[nodiscard]] Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_selection(
     RuntimePolicyCatalogRecordRefDTO source_artifact, RuntimePolicyDTO policy,
     const RuntimeParticipantBinding& participant);
-
-/// Add one independently authored Deployment ceiling without changing the
-/// identity or contents of the immutable runtime-policy artifact.  The result
-/// can only tighten the catalog-selected ceiling.
-[[nodiscard]] Result<RuntimeParticipantPolicySelection> apply_deployment_motion_speed_ceiling(
-    const RuntimeParticipantPolicySelection& selection,
-    double deployment_maximum_tcp_linear_speed_mps);
 
 /// Seal the independently compiled ordinary-motion profile against its exact
 /// target and source-joint scope. Required equipment limits cannot be disabled.
@@ -90,15 +79,15 @@ class RuntimeParticipantPolicySelection final {
     const RuntimeParticipantPolicySelection& selection, const RuntimeParticipantBinding& binding,
     OrdinaryMotionJerkPolicy profile);
 
-/// Shared Program/manual preview and execution admission. Omitted requested
-/// caps acquire the enabled policy limit; a caller cannot weaken or bypass it.
+/// Apply the non-speed ordinary-motion jerk policy selected by Deployment.
 [[nodiscard]] Result<PerJointDynamicsLimitsDTO> apply_runtime_participant_motion_jerk_policy(
     const RuntimeParticipantPolicySelection& selection, PerJointDynamicsLimitsDTO requested);
 
-/// Apply the sealed runtime ceiling to an already public-boundary-validated
-/// speed profile. The result always carries a finite positive maximum.
-[[nodiscard]] Result<SpeedProfileDTO> apply_runtime_participant_motion_speed_policy(
-    const RuntimeParticipantPolicySelection& selection, SpeedProfileDTO requested);
+/// Resolve one optional operation request against the exact applied
+/// Deployment maximum. Omission selects the Deployment value; an excessive
+/// request is rejected rather than silently clipped.
+[[nodiscard]] Result<SpeedProfileDTO> apply_deployment_motion_speed_limit(
+    double deployment_maximum_tcp_linear_speed_mps, SpeedProfileDTO requested);
 
 /// Require every requested move-scoped interrupt policy to belong to the same
 /// sealed runtime-policy revision. No source lookup or arming occurs here.

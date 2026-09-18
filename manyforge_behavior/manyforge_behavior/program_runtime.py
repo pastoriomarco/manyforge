@@ -48,6 +48,14 @@ from manyforge_behavior.nodes.stop_policy import (
 
 PROGRAM_RUN_CAPTURE_API: Final = "manyforge.program_run_capture.v1"
 
+_MOTION_TARGET_NODE_IDS: Final = frozenset(
+    {
+        "motion.move_to_joint_target",
+        "motion.move_to_pose",
+        "motion.follow_cartesian_path",
+    }
+)
+
 
 class ProgramRuntimeError(RuntimeError):
     """A Program run cannot be built or advanced truthfully."""
@@ -289,6 +297,23 @@ class ExecutableProgramRun:
         self._program = program
         self._environment = environment
         self._capture = capture
+        motion_target_by_node: dict[str, str] = {}
+        pending_nodes = [program.tree]
+        while pending_nodes:
+            node = pending_nodes.pop()
+            if node.node_id in _MOTION_TARGET_NODE_IDS:
+                target_role = node.parameters.get("target_role")
+                if isinstance(target_role, str) and target_role:
+                    motion_target_by_node[node.instance_id] = target_role
+            pending_nodes.extend(node.children)
+        self._selection_motion_target_roles = MappingProxyType({
+            group_id: tuple(sorted({
+                motion_target_by_node[node_id]
+                for node_id in node_ids
+                if node_id in motion_target_by_node
+            }))
+            for group_id, node_ids in program.execution_selections.items()
+        })
         self._resolver = build_executable_node_resolver(environment)
         self._required_node_ids = _program_node_ids(program.tree)
         self._availability = project_node_execution_availability(
@@ -496,7 +521,11 @@ class ExecutableProgramRun:
         )
 
     def task_control_states(
-        self, *, node_ids: frozenset[str] | None = None, settle: bool = False
+        self,
+        *,
+        node_ids: frozenset[str] | None = None,
+        settle: bool = False,
+        observe: bool = True,
     ) -> dict[str, str]:
         """Read current tasks; only explicit reconciliation may settle them.
 
@@ -511,7 +540,13 @@ class ExecutableProgramRun:
                     continue
                 read = getattr(
                     behaviour,
-                    "reconcile_full_stop_task" if settle else "observe_control_state",
+                    (
+                        "reconcile_full_stop_task"
+                        if settle
+                        else "observe_control_state"
+                        if observe
+                        else "cached_control_state"
+                    ),
                     None,
                 )
                 if callable(read):
@@ -541,7 +576,7 @@ class ExecutableProgramRun:
         )
         if (
             not isinstance(scope, Mapping)
-            or scope.get("schema_version") != "manyforge.program_execution_scope.v1"
+            or scope.get("schema_version") != "manyforge.program_execution_scope.v2"
             or scope.get("program_run_id") != self._capture.program_run_id
             or runner_epoch is None
             or scope.get("program_runner_owner_epoch") != runner_epoch
@@ -565,6 +600,7 @@ class ExecutableProgramRun:
         held: set[str] = set()
         phases: dict[str, frozenset[str]] = {}
         for field in (
+            "ready_node_indices",
             "held_node_indices",
             "stopping_node_indices",
             "faulted_node_indices",
@@ -596,6 +632,7 @@ class ExecutableProgramRun:
             frozenset(held),
             phases["stopping_node_indices"],
             phases["faulted_node_indices"],
+            phases["ready_node_indices"],
         )
 
     def refresh_pending_stop_settlement(self) -> None:
@@ -652,6 +689,9 @@ class ExecutableProgramRun:
     def operator_stop_scope(self) -> OperatorMotionStopSnapshot:
         return self._operator_stop_state.snapshot()
 
+    def initial_ready_nodes(self) -> frozenset[str]:
+        return self._operator_stop_state.initial_ready_nodes()
+
     def scope_node_ids(self, indices: Sequence[int]) -> frozenset[str]:
         """Translate indices from an already validated captured scope."""
         return frozenset(self._scope_node_ids[index] for index in indices)
@@ -693,6 +733,23 @@ class ExecutableProgramRun:
     @property
     def execution_selections(self) -> Mapping[str, tuple[str, ...]]:
         return self._program.execution_selections
+
+    def execution_selection_motion_target_roles(
+        self, group_id: str
+    ) -> tuple[str, ...]:
+        """Return captured motion target roles in one execution selection.
+
+        The selection is resolved from the immutable Program captured for this
+        run.  It is presentation metadata only: command admission still uses
+        the original group id and the Kernel's own target resolution.
+        """
+
+        try:
+            return self._selection_motion_target_roles[group_id]
+        except KeyError as error:
+            raise ProgramRuntimeError(
+                "execution selection is not in this capture"
+            ) from error
 
     def execution_selection_request(
         self, group_id: str | list[str], request_id: str

@@ -53,6 +53,7 @@ MAXIMUM_SOURCE_LABEL_BYTES = 128
 
 ExecutionCommandKind = Literal[
     "program_run",
+    "program_motion_start",
     "program_motion_stop",
     "program_motion_resume",
     "program_full_stop",

@@ -110,6 +110,44 @@ def _digest(value: object, *, field: str) -> str:
     return text
 
 
+def _runtime_scale_selector_for_group(
+    run: ExecutableProgramRun,
+    program_binding: Mapping[str, Any],
+    group_id: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Project one captured group to the exact runtime-scale selector."""
+
+    target_roles = run.execution_selection_motion_target_roles(group_id)
+    bindings = {
+        row.get("target_role_id"): row
+        for row in program_binding.get("target_role_bindings", ())
+        if isinstance(row, Mapping) and isinstance(row.get("target_role_id"), str)
+    }
+    targets: set[tuple[str, str]] = set()
+    for target_role in target_roles:
+        binding = bindings.get(target_role)
+        if not isinstance(binding, Mapping):
+            return None, "captured_motion_target_binding_unavailable"
+        component_role = binding.get("component_role_id")
+        if not isinstance(component_role, str) or not component_role:
+            return None, "captured_motion_target_binding_invalid"
+        targets.add((component_role, target_role))
+    if not targets:
+        return None, "selection_has_no_motion_targets"
+    ordered = [
+        {"component_role_id": component, "target_role_id": target}
+        for component, target in sorted(targets)
+    ]
+    selector: dict[str, Any] = {
+        "program_binding_id": run.capture.program_binding_id,
+    }
+    if len(ordered) == 1:
+        selector.update(ordered[0])
+    else:
+        selector["group_targets"] = ordered
+    return selector, None
+
+
 @dataclass(frozen=True, slots=True)
 class ProgramRunAdmission:
     """One exact verified scenario closure admitted before tree construction."""
@@ -638,11 +676,13 @@ class ProgramRunOwner:
         return port.read(program_run_id)
 
     def operator_stop_observation_required(self, program_run_id: str) -> bool:
-        """Whether a held run must keep observing owner-issued Stop state.
+        """Whether accepted Stop work still needs an observation tick.
 
         Ordinary recovery interventions are dormant until an explicit action.
-        Operator Stop is different: continue branches and already-accepted
-        owner tasks must remain observable while motion is contained.
+        A retained intervention is therefore not itself pending work.  Keep
+        ticking only while the captured Stop projection is unsettled, its
+        observation is unavailable, or a selected owner task is still active.
+        An explicit recovery command schedules the run again.
         """
 
         with self._lock:
@@ -650,26 +690,7 @@ class ProgramRunOwner:
             if entry.state is not ProgramRunState.INTERVENTION_REQUIRED:
                 return False
             run = entry.run
-        port = self._ports.program_interventions
-        return (
-            port is not None and port.has_operator_stop(program_run_id)
-        ) or run.pending_selected_observation()
-
-    def refresh_operator_stop_intervention(self, program_run_id: str) -> None:
-        """Refresh one held Stop assessment only when its offer is read."""
-
-        intervention = self.intervention(program_run_id)
-        if (
-            intervention is None
-            or intervention.policy_parameter != "operator_stop_policy"
-        ):
-            return
-        try:
-            self._refresh_stop_assessment(intervention)
-        except Exception:
-            # Presentation may retain the prior offer; explicit Resume always
-            # requires fresh exact facts for every selected attempt.
-            return
+        return run.pending_selected_observation()
 
     def _refresh_stop_assessment(self, intervention):
         if intervention.owner_port_name is None or intervention.owner_task_id is None:
@@ -1234,9 +1255,14 @@ class ProgramRunOwner:
         selected: frozenset[str],
         *,
         settle: bool = True,
+        refresh_assessments: bool = True,
     ) -> tuple[tuple[Any, ...], dict[str, str]]:
-        """One fresh assessment per held attempt, shared by display and Resume."""
-        states = run.task_control_states(node_ids=selected, settle=settle)
+        """Resolve held attempts; commands may require a fresh owner assessment."""
+        states = run.task_control_states(
+            node_ids=selected,
+            settle=settle,
+            observe=refresh_assessments,
+        )
         blocked = {
             node_id: (
                 "selected_owner_work_pending"
@@ -1257,11 +1283,12 @@ class ProgramRunOwner:
             node_id = item.identity.node_instance_id
             if node_id not in selected:
                 continue
-            try:
-                item = self._refresh_stop_assessment(item)
-            except Exception:
-                blocked[node_id] = "selected_owner_assessment_unavailable"
-                continue
+            if refresh_assessments:
+                try:
+                    item = self._refresh_stop_assessment(item)
+                except Exception:
+                    blocked[node_id] = "selected_owner_assessment_unavailable"
+                    continue
             if (
                 states.get(node_id) != "held"
                 or item.policy_parameter != "operator_stop_policy"
@@ -1292,39 +1319,51 @@ class ProgramRunOwner:
     def read_selection_controls(
         self, program_run_id: str
     ) -> tuple[ProgramRunSnapshot, dict[str, Any]]:
-        """Derive one bounded control projection; no per-group state is retained."""
+        """Atomically derive one Run/control projection from retained facts."""
         with self._lock:
-            entry = self._entry(program_run_id)
-            run, transition_lock = entry.run, entry.transition_lock
+            transition_lock = self._entry(program_run_id).transition_lock
         with transition_lock:
             with self._lock:
-                current = self._entry(program_run_id)
-                live = self._snapshot(current)
-                eligible = current.run is run and current.state in {
+                entry = self._entry(program_run_id)
+                run = entry.run
+                live = self._snapshot(entry)
+                eligible = entry.state in {
                     ProgramRunState.RUNNING,
                     ProgramRunState.INTERVENTION_REQUIRED,
                 }
                 snapshot = run.operator_stop_scope()
-            held = snapshot.held_nodes
-            stopping, faulted = snapshot.stopping_nodes, snapshot.faulted_nodes
+                program_binding = entry.program_binding
             unavailable = (
                 run.stop_observation_error if eligible else "program_run_not_running"
             )
             blocked = {}
-            if eligible and held:
+            ordinary_held = snapshot.held_nodes - snapshot.ready_nodes
+            if eligible and ordinary_held:
                 try:
                     _batch, blocked = self._selection_recovery_candidates(
-                        run, held, settle=False
+                        run,
+                        ordinary_held,
+                        settle=False,
+                        refresh_assessments=False,
                     )
-                    if run.operator_stop_scope() != snapshot:
-                        raise ProgramRunOwnerError(
-                            "selection changed during projection"
-                        )
                 except Exception:
                     unavailable = "program_selection_observation_unavailable"
+
+            held = snapshot.held_nodes
+            ready = snapshot.ready_nodes
+            initially_effectful = run.initial_ready_nodes()
+            stopping, faulted = snapshot.stopping_nodes, snapshot.faulted_nodes
             groups = []
             for group_id, nodes in run.execution_selections.items():
+                scale_selector, scale_reason = _runtime_scale_selector_for_group(
+                    run, program_binding, group_id
+                )
                 selected_held = [node for node in nodes if node in held]
+                selected_ready = [node for node in nodes if node in ready]
+                selected_effectful = [node for node in nodes if node in initially_effectful]
+                selected_ordinary_held = [
+                    node for node in selected_held if node not in ready
+                ]
                 reason = unavailable
                 if reason is not None:
                     state = "unavailable"
@@ -1332,11 +1371,21 @@ class ProgramRunOwner:
                     state, reason = "faulted", "selected_stop_fault_requires_recovery"
                 elif any(node in stopping for node in selected_held):
                     state, reason = "stopping", "selected_motion_is_stopping"
+                elif selected_ready:
+                    state = (
+                        "ready"
+                        if len(selected_ready) == len(selected_effectful)
+                        and not selected_ordinary_held
+                        else "mixed"
+                    )
+                    reason = "selection_not_stopped"
                 else:
                     state = (
                         "running"
                         if not selected_held
-                        else "held" if len(selected_held) == len(nodes) else "mixed"
+                        else "held"
+                        if len(selected_ordinary_held) == len(nodes)
+                        else "mixed"
                     )
                     reason = next(
                         (blocked[node] for node in selected_held if node in blocked),
@@ -1350,9 +1399,16 @@ class ProgramRunOwner:
                         "node_count": len(nodes),
                         "held_node_count": len(selected_held),
                         "state": state,
-                        "stop_allowed": eligible,
+                        "stop_allowed": eligible and state not in {"ready", "held"},
+                        "start_allowed": eligible and state == "ready",
+                        "start_unavailable_reason": (
+                            None if eligible and state == "ready" else
+                            "selection_not_ready"
+                        ),
                         "resume_allowed": reason is None,
                         "resume_unavailable_reason": reason,
+                        "runtime_scale_selector": scale_selector,
+                        "runtime_scale_unavailable_reason": scale_reason,
                     }
                 )
             return live, {
@@ -1379,6 +1435,76 @@ class ProgramRunOwner:
             group_id=group_id,
             reason=reason,
         )
+
+    def start_motion(
+        self,
+        program_run_id: str,
+        *,
+        expected_run_revision: int,
+        expected_selection_revision: int,
+        request_id: str,
+        group_id: str | list[str] = "all",
+        reason: str | None = None,
+    ) -> ProgramRunSnapshot:
+        """Release one initial Ready selection without recovery side effects."""
+
+        del reason
+        _text(request_id, field="request_id")
+        with self._lock:
+            transition_lock = self._entry(program_run_id).transition_lock
+        with transition_lock:
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if (
+                    type(expected_run_revision) is not int
+                    or entry.revision != expected_run_revision
+                ):
+                    raise ProgramRunOwnerStaleRevisionError(
+                        expected_run_revision, entry.revision
+                    )
+                if entry.state is not ProgramRunState.RUNNING:
+                    raise ProgramRunOwnerError(
+                        "initial motion Run requires a current running Program"
+                    )
+                run = entry.run
+            selected = run.execution_selection(group_id)
+            scope = run.read_operator_stop_scope()
+            if (
+                type(expected_selection_revision) is not int
+                or scope["selection_revision"] != expected_selection_revision
+            ):
+                raise ProgramRunOwnerError(
+                    "initial motion Run identifies a stale selection"
+                )
+            ready = run.scope_node_ids(scope["ready_node_indices"])
+            selected &= ready
+            if not selected:
+                raise ProgramRunOwnerError("selected scope is not Ready")
+            try:
+                released = self._scope.start_selection(
+                    run.execution_selection_request(group_id, request_id),
+                    expected_selection_revision,
+                )
+                run.publish_operator_stop_scope(
+                    released,
+                    expected_revision=expected_selection_revision + 1,
+                    released_nodes=selected,
+                    notify_observation=False,
+                )
+            except ProgramSelectionReleaseRejectedError as error:
+                raise ProgramRunOwnerError(str(error)) from error
+            except Exception as error:
+                raise ProgramRunOwnerOutcomeUnknownError(
+                    f"initial selection release outcome is unconfirmed: {error}"
+                ) from error
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.run is not run or entry.state is not ProgramRunState.RUNNING:
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "Program changed after initial selection release"
+                    )
+                entry.revision += 1
+                return self._snapshot(entry)
 
     def prepare_manual_handover(
         self,
@@ -1948,8 +2074,9 @@ class ProgramRunOwner:
                         None,
                         "reset_containment_outcome_unknown",
                     )
+                detail = str(error) or type(error).__name__
                 raise ProgramRunOwnerOutcomeUnknownError(
-                    "Reset containment outcome is unknown"
+                    f"Reset containment outcome is unknown: {detail}"
                 ) from error
             with self._lock:
                 entry.reset_containment = scope

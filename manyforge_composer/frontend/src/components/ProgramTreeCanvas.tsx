@@ -912,134 +912,140 @@ export function ProgramTreeCanvas({
             className="program-tree-actions"
             aria-label={`Topology actions for ${selectedRow.node.instance_id}`}
           >
-            <label className="inline-select-label program-topology-node-type">
-              Node type
-              <select
-                value={topologyCatalogId}
-                disabled={authoringDisabled || topologyEntries.length === 0}
-                onChange={(event) => setTopologyCatalogId(event.target.value)}
-              >
-                <option value="">Choose a node type</option>
-                {topologyEntries.map((entry) => (
-                  <option key={entry.id} value={entry.id}>{entry.name}</option>
-                ))}
-              </select>
-            </label>
-            <button
-              type="button"
-              disabled={authoringDisabled || topologyEntry === undefined || !childInsertionAvailable}
-              title={childInsertionAvailable
-                ? 'Insert the chosen type as the final child and open its Properties.'
-                : 'The selected node cannot accept another child.'}
-              onClick={() => { void insertTopologyNode('child'); }}
-            >
-              Add child
-            </button>
-            <button
-              type="button"
-              disabled={authoringDisabled || topologyEntry === undefined || !siblingInsertionAvailable}
-              title={siblingInsertionAvailable
-                ? 'Insert the chosen type immediately after the selected node.'
-                : 'The selected node parent cannot accept another child.'}
-              onClick={() => { void insertTopologyNode('after'); }}
-            >
-              Add after
-            </button>
-            <button
-              type="button"
-              disabled={authoringDisabled || topologyEntry === undefined || !wrapperAvailable}
-              title={wrapperAvailable
-                ? 'Wrap the selected subtree atomically with the chosen type.'
-                : 'Choose a node type that accepts exactly one initial child.'}
-              onClick={() => { void wrapSelected(); }}
-            >
-              Wrap
-            </button>
-            <button
-              type="button"
-              disabled={authoringDisabled || !kindReplacementAvailable}
-              title={kindReplacementAvailable
-                ? 'Change type while retaining every compatible authored parameter and all children.'
-                : 'Choose another type compatible with the current children and authored parameters.'}
-              onClick={() => { void changeSelectedKind(); }}
-            >
-              Change type
-            </button>
-            <button
-              type="button"
-              disabled={
-                authoringDisabled
-                || selectedRow.parentId === null
-                || selectedRow.index === 0
-              }
-              onClick={() => {
-                if (selectedRow.parentId !== null) {
-                  void moveSelected(selectedRow.parentId, selectedRow.index - 1);
+            {topologyEntry !== undefined && (
+              <div className="program-tree-action-row program-tree-action-row-type-commands">
+                <button
+                  type="button"
+                  disabled={authoringDisabled || !childInsertionAvailable}
+                  title={childInsertionAvailable
+                    ? 'Insert the chosen type as the final child and open its Properties.'
+                    : 'The selected node cannot accept another child.'}
+                  onClick={() => { void insertTopologyNode('child'); }}
+                >
+                  Add child
+                </button>
+                <button
+                  type="button"
+                  disabled={authoringDisabled || !siblingInsertionAvailable}
+                  title={siblingInsertionAvailable
+                    ? 'Insert the chosen type immediately after the selected node.'
+                    : 'The selected node parent cannot accept another child.'}
+                  onClick={() => { void insertTopologyNode('after'); }}
+                >
+                  Add after
+                </button>
+                <button
+                  type="button"
+                  disabled={authoringDisabled || !wrapperAvailable}
+                  title={wrapperAvailable
+                    ? 'Wrap the selected subtree atomically with the chosen type.'
+                    : 'The chosen node type cannot wrap one child.'}
+                  onClick={() => { void wrapSelected(); }}
+                >
+                  Wrap
+                </button>
+                <button
+                  type="button"
+                  disabled={authoringDisabled || !kindReplacementAvailable}
+                  title={kindReplacementAvailable
+                    ? 'Change type while retaining every compatible authored parameter and all children.'
+                    : 'The chosen type is not compatible with the current children and authored parameters.'}
+                  onClick={() => { void changeSelectedKind(); }}
+                >
+                  Change type
+                </button>
+              </div>
+            )}
+            <div className="program-tree-action-row program-tree-action-row-placement">
+              <label className="inline-select-label program-topology-node-type">
+                Node type
+                <select
+                  value={topologyCatalogId}
+                  disabled={authoringDisabled || topologyEntries.length === 0}
+                  onChange={(event) => setTopologyCatalogId(event.target.value)}
+                >
+                  <option value="">Choose a node type</option>
+                  {topologyEntries.map((entry) => (
+                    <option key={entry.id} value={entry.id}>{entry.name}</option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                disabled={
+                  authoringDisabled
+                  || selectedRow.parentId === null
+                  || selectedRow.index === 0
                 }
-              }}
-            >
-              Move earlier
-            </button>
-            <button
-              type="button"
-              disabled={
-                authoringDisabled
-                || selectedRow.parentId === null
-                || selectedRow.index >= (
-                  flat.find((row) => row.node.instance_id === selectedRow.parentId)
-                    ?.node.children.length ?? 1
-                ) - 1
-              }
-              onClick={() => {
-                if (selectedRow.parentId !== null) {
-                  void moveSelected(selectedRow.parentId, selectedRow.index + 1);
-                }
-              }}
-            >
-              Move later
-            </button>
-            <label className="inline-select-label">
-              {selectedRow.parentId === null ? 'Parent' : 'Reparent'}
-              <select
-                value=""
-                disabled={authoringDisabled || parentOptions.length === 0}
-                onChange={(event) => {
-                  const parent = parentOptions.find(
-                    (row) => row.node.instance_id === event.target.value,
-                  );
-                  if (!parent) return;
-                  const result = authoringMoveIntent(
-                    laidOut,
-                    edges,
-                    parent.node.instance_id,
-                    selectedRow.node.instance_id,
-                  );
-                  if (result.intent) {
-                    const mutation = programMoveMutation(
-                      result.intent.instance_id,
-                      result.intent.new_parent_instance_id,
-                      result.intent.index,
-                    );
-                    onMutate(mutation.mutation, mutation.args);
+                onClick={() => {
+                  if (selectedRow.parentId !== null) {
+                    void moveSelected(selectedRow.parentId, selectedRow.index - 1);
                   }
                 }}
               >
-                <option value="" disabled>Choose parent</option>
-                {parentOptions.map((row) => (
-                  <option key={row.node.instance_id} value={row.node.instance_id}>
-                    {row.node.instance_id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button
-              type="button"
-              className="danger-button"
-              disabled={authoringDisabled}
-              onClick={() => deleteSelectedNode()}
-            >
-              Delete
-            </button>
+                Move earlier
+              </button>
+              <button
+                type="button"
+                disabled={
+                  authoringDisabled
+                  || selectedRow.parentId === null
+                  || selectedRow.index >= (
+                    flat.find((row) => row.node.instance_id === selectedRow.parentId)
+                      ?.node.children.length ?? 1
+                  ) - 1
+                }
+                onClick={() => {
+                  if (selectedRow.parentId !== null) {
+                    void moveSelected(selectedRow.parentId, selectedRow.index + 1);
+                  }
+                }}
+              >
+                Move later
+              </button>
+              <label className="inline-select-label">
+                {selectedRow.parentId === null ? 'Parent' : 'Reparent'}
+                <select
+                  value=""
+                  disabled={authoringDisabled || parentOptions.length === 0}
+                  onChange={(event) => {
+                    const parent = parentOptions.find(
+                      (row) => row.node.instance_id === event.target.value,
+                    );
+                    if (!parent) return;
+                    const result = authoringMoveIntent(
+                      laidOut,
+                      edges,
+                      parent.node.instance_id,
+                      selectedRow.node.instance_id,
+                    );
+                    if (result.intent) {
+                      const mutation = programMoveMutation(
+                        result.intent.instance_id,
+                        result.intent.new_parent_instance_id,
+                        result.intent.index,
+                      );
+                      onMutate(mutation.mutation, mutation.args);
+                    }
+                  }}
+                >
+                  <option value="" disabled>Choose parent</option>
+                  {parentOptions.map((row) => (
+                    <option key={row.node.instance_id} value={row.node.instance_id}>
+                      {row.node.instance_id}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                type="button"
+                className="danger-button"
+                disabled={authoringDisabled}
+                onClick={() => deleteSelectedNode()}
+              >
+                Delete
+              </button>
+            </div>
           </div>
         )}
       </div>

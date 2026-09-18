@@ -44,8 +44,12 @@ def program_cycle_event_class(
                     "group_id",
                     "state",
                     "stop_allowed",
+                    "start_allowed",
+                    "start_unavailable_reason",
                     "resume_allowed",
                     "resume_unavailable_reason",
+                    "runtime_scale_selector",
+                    "runtime_scale_unavailable_reason",
                 )
             )
             for group in selections.get("groups", ())

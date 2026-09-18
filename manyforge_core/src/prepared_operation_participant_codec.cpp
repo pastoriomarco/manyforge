@@ -650,44 +650,6 @@ template <class Id>
           std::move(stop.value())};
 }
 
-[[nodiscard]] CanonicalValue runtime_motion_speed_limit_value(
-    const RuntimeMotionSpeedLimitDTO& value) {
-  CanonicalValue::Object fields{
-      {"maximum_tcp_linear_speed_mps", CanonicalValue(value.maximum_tcp_linear_speed_mps)}};
-  std::visit(
-      [&](const auto& scope) {
-        using Scope = std::decay_t<decltype(scope)>;
-        if constexpr (std::is_same_v<Scope, RuntimePolicyCellScopeDTO>) {
-          fields.emplace_back("scope_kind", CanonicalValue("cell"));
-        } else {
-          fields.emplace_back("command_target_id", CanonicalValue(scope.command_target_id.value()));
-          fields.emplace_back("controllable_component_id",
-                              CanonicalValue(scope.controllable_component_id.value()));
-          fields.emplace_back("scope_kind", CanonicalValue("command_target"));
-        }
-      },
-      value.scope);
-  return CanonicalValue(std::move(fields));
-}
-
-[[nodiscard]] RuntimeMotionSpeedLimitDTO parse_runtime_motion_speed_limit(
-    const CanonicalValue& value) {
-  const auto scope_kind = text(member(value, "scope_kind"));
-  RuntimePolicyMotionScopeDTO scope = RuntimePolicyCellScopeDTO{};
-  if (scope_kind == "cell") {
-    exact(value, {"maximum_tcp_linear_speed_mps", "scope_kind"});
-  } else if (scope_kind == "command_target") {
-    exact(value, {"command_target_id", "controllable_component_id", "maximum_tcp_linear_speed_mps",
-                  "scope_kind"});
-    scope = RuntimePolicyCommandTargetScopeDTO{
-        ControllableComponentId(text(member(value, "controllable_component_id"))),
-        CommandTargetId(text(member(value, "command_target_id")))};
-  } else {
-    fail("runtime_policy_motion_scope_invalid");
-  }
-  return {std::move(scope), finite_number(member(value, "maximum_tcp_linear_speed_mps"))};
-}
-
 [[nodiscard]] CanonicalValue runtime_policy_ref_value(const PreparedRuntimePolicyRefDTO& value) {
   const auto& source = value.source_artifact;
   return CanonicalValue(CanonicalValue::Object{
@@ -699,13 +661,11 @@ template <class Id>
            {"runtime_policy_id", CanonicalValue(source.record_id.value())},
            {"runtime_policy_revision", CanonicalValue(source.record_revision.value())},
            {"schema_id", CanonicalValue(source.schema_id.value())},
-           {"schema_revision", CanonicalValue(source.schema_revision.value())}})},
-      {"selected_motion_speed_limit",
-       runtime_motion_speed_limit_value(value.selected_motion_speed_limit)}});
+           {"schema_revision", CanonicalValue(source.schema_revision.value())}})}});
 }
 
 [[nodiscard]] PreparedRuntimePolicyRefDTO parse_runtime_policy_ref(const CanonicalValue& value) {
-  exact(value, {"selected_motion_speed_limit", "source_artifact"});
+  exact(value, {"source_artifact"});
   const auto& source = member(value, "source_artifact");
   exact(source, {"content_addressed_store_key", "content_digest", "runtime_policy_id",
                  "runtime_policy_revision", "schema_id", "schema_revision"});
@@ -715,8 +675,7 @@ template <class Id>
               SchemaId(text(member(source, "schema_id"))),
               SchemaRevision(text(member(source, "schema_revision"))),
               ContentDigest(text(member(source, "content_digest"))),
-              ContentAddressedStoreKey(text(member(source, "content_addressed_store_key")))},
-          parse_runtime_motion_speed_limit(member(value, "selected_motion_speed_limit"))};
+              ContentAddressedStoreKey(text(member(source, "content_addressed_store_key")))}};
 }
 
 [[nodiscard]] CanonicalValue motion_payload_value(
@@ -740,6 +699,12 @@ template <class Id>
        embedded(EncodePreparedMotionValidationEvidence(value.validation_evidence),
                 "prepared_validation_evidence_encoding_invalid")},
       {"runtime_policy", runtime_policy_ref_value(value.runtime_policy)},
+      {"requested_tcp_linear_speed_mps",
+       value.requested_tcp_linear_speed_mps.has_value()
+           ? CanonicalValue(*value.requested_tcp_linear_speed_mps)
+           : CanonicalValue(nullptr)},
+      {"deployment_maximum_tcp_linear_speed_mps",
+       CanonicalValue(value.deployment_maximum_tcp_linear_speed_mps)},
       {"interrupt_scopes", CanonicalValue(std::move(scopes))},
       {"execution_timeout_s", CanonicalValue(value.execution_timeout_s)}};
   if (value.contact_policy) {
@@ -758,11 +723,12 @@ template <class Id>
     std::span<const RuntimeResourceBindingDTO> resources,
     std::span<const HardStopResourceLimitDTO> defaults) {
   const bool contact = value.find_object_member("contact_policy") != nullptr;
-  if (!value.is_object() || value.as_object().size() != (contact ? 10U : 9U))
+  if (!value.is_object() || value.as_object().size() != (contact ? 12U : 11U))
     fail("motion_payload_fields_invalid");
   for (const auto name :
        {"move_id", "plan_request", "trajectory", "start_state", "planning_evidence",
-        "validation_evidence", "runtime_policy", "interrupt_scopes", "execution_timeout_s"})
+        "validation_evidence", "runtime_policy", "requested_tcp_linear_speed_mps",
+        "deployment_maximum_tcp_linear_speed_mps", "interrupt_scopes", "execution_timeout_s"})
     static_cast<void>(member(value, name));
   auto request =
       DecodePreparedPlanRequest(content_identity::canonical_json(member(value, "plan_request")));
@@ -785,6 +751,11 @@ template <class Id>
         ContactPolicyRevision(text(member(ref, "contact_policy_revision")))};
   }
   auto runtime_policy = parse_runtime_policy_ref(member(value, "runtime_policy"));
+  std::optional<double> requested_speed;
+  const auto& requested_speed_value = member(value, "requested_tcp_linear_speed_mps");
+  if (!requested_speed_value.is_null()) {
+    requested_speed = finite_number(requested_speed_value);
+  }
   const auto& scopes = member(value, "interrupt_scopes");
   if (!scopes.is_array() || scopes.as_array().size() > kMaximumScopes)
     fail("interrupt_scopes_invalid");
@@ -799,6 +770,8 @@ template <class Id>
           std::move(validation.value()),
           std::move(contact_policy),
           std::move(runtime_policy),
+          requested_speed,
+          finite_number(member(value, "deployment_maximum_tcp_linear_speed_mps")),
           std::move(parsed_scopes),
           finite_number(member(value, "execution_timeout_s"))};
 }
@@ -1046,10 +1019,10 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
                              const RuntimeParticipantStopReadinessDTO& readiness,
                              const RuntimeParticipantPolicySelectionDTO& runtime_policy,
                              std::span<const HardStopResourceLimitDTO> defaults) {
+  const auto* cartesian_path = std::get_if<CartesianPathDTO>(&motion.plan_request.motion);
   if (!motion.trajectory.cartesian_waypoint_times_s.empty()) {
-    const auto* path = std::get_if<CartesianPathDTO>(&motion.plan_request.motion);
-    if (path == nullptr ||
-        path->waypoints.size() != motion.trajectory.cartesian_waypoint_times_s.size())
+    if (cartesian_path == nullptr ||
+        cartesian_path->waypoints.size() != motion.trajectory.cartesian_waypoint_times_s.size())
       fail("prepared_cartesian_waypoint_milestones_mismatch");
   }
   const auto metrics_valid = [](const std::vector<double>& values) {
@@ -1099,14 +1072,32 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
       motion.plan_request.resources != enclosing.resources ||
       motion.start_state != motion.plan_request.start_state ||
       motion.runtime_policy.source_artifact != runtime_policy.source_artifact ||
-      motion.runtime_policy.selected_motion_speed_limit !=
-          runtime_policy.selected_motion_speed_limit ||
+      !std::isfinite(motion.deployment_maximum_tcp_linear_speed_mps) ||
+      motion.deployment_maximum_tcp_linear_speed_mps <= 0.0 ||
+      (motion.requested_tcp_linear_speed_mps.has_value() &&
+       (!std::isfinite(*motion.requested_tcp_linear_speed_mps) ||
+        *motion.requested_tcp_linear_speed_mps <= 0.0 ||
+        *motion.requested_tcp_linear_speed_mps >
+            motion.deployment_maximum_tcp_linear_speed_mps)) ||
       !motion.plan_request.speed_profile.max_tcp_linear_speed_mps.has_value() ||
       !std::isfinite(*motion.plan_request.speed_profile.max_tcp_linear_speed_mps) ||
       *motion.plan_request.speed_profile.max_tcp_linear_speed_mps <= 0.0 ||
       *motion.plan_request.speed_profile.max_tcp_linear_speed_mps >
-          runtime_policy.effective_maximum_tcp_linear_speed_mps ||
+          motion.deployment_maximum_tcp_linear_speed_mps ||
+      *motion.plan_request.speed_profile.max_tcp_linear_speed_mps !=
+          motion.requested_tcp_linear_speed_mps.value_or(
+              motion.deployment_maximum_tcp_linear_speed_mps) ||
       trajectory_metrics == nullptr || motion.trajectory.waypoints.empty() ||
+      motion.trajectory.cartesian_fidelity_metrics !=
+          trajectory_metrics->cartesian_fidelity_metrics ||
+      (trajectory_metrics->cartesian_fidelity_metrics.has_value() &&
+       (cartesian_path == nullptr ||
+        trajectory_metrics->cartesian_fidelity_metrics->requested_translation_tolerance_m !=
+            motion.plan_request.tolerances.translation_tol_m ||
+        trajectory_metrics->cartesian_fidelity_metrics->requested_rotation_tolerance_rad !=
+            motion.plan_request.tolerances.rotation_tol_rad ||
+        trajectory_metrics->cartesian_fidelity_metrics->requested_max_blend_deviation_rad !=
+            cartesian_path->max_blend_deviation_rad)) ||
       !std::isfinite(trajectory_metrics->trajectory_duration_s) ||
       trajectory_metrics->trajectory_duration_s !=
           motion.trajectory.waypoints.back().time_from_start_s ||

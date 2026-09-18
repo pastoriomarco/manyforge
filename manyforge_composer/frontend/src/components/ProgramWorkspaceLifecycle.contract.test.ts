@@ -147,8 +147,9 @@ describe('Program workspace lifecycle controls', () => {
     );
     expect(source).toContain('Apply this Program Draft to');
     expect(source).toContain('Its Deployment will not change.');
-    expect(source).toContain('Load activates this Scenario’s exact Deployment');
-    expect(source).toContain('loadScenario(selectedScenario.scenarioId');
+    expect(source).toContain('A complete setup is activated atomically');
+    expect(source).toContain('loadScenarioDocument(');
+    expect(source).not.toContain('loadScenario(');
     expect(source).toContain('currentScenarioProjection?.currentScenario');
     expect(source).not.toContain('applyDraft(selectedScenario');
     expect(source).not.toContain('Load and Apply Program');

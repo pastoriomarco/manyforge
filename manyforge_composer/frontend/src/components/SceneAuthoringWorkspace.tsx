@@ -55,6 +55,7 @@ import {
 } from '../state/sceneAuthoring';
 import {
   candidateRobotPresentation,
+  candidateGripperPresentation,
   candidateToolPresentation,
   createExecutionRobotPresentationReader,
   executionRobotPresentation,
@@ -1681,7 +1682,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       placement: { ...object.placement, pose_in_cell: livePose },
     };
   }), [livePose, liveShape, selectedSceneResourceId, selection?.kind, visibleObjects]);
-  const motionDescriptor = robotControl.state.status?.directControl.targetDescriptor ?? null;
+  const motionDescriptor = robotControl.selectedStatus?.directControl.targetDescriptor ?? null;
   const sceneRuntimePresentation = useMemo(() => runtimeScenePresentation(
     presentationFacts?.sceneRuntime ?? null,
     presentationFacts?.logicalScene ?? null,
@@ -1690,10 +1691,10 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     motionDescriptor,
   ), [motionDescriptor, presentationFacts, readyManifest, sourceValue]);
   const executionPresentation = useMemo(() => executionRobotPresentation(
-    robotControl.state.status,
+    robotControl.selectedStatus,
     sourceValue,
     readyManifest,
-  ), [readyManifest, robotControl.state.status, sourceValue]);
+  ), [readyManifest, robotControl.selectedStatus, sourceValue]);
   const runtimePresentation = useMemo(() => (
     executionPresentation !== null && sceneRuntimePresentation.measuredRobot === null
       ? { ...sceneRuntimePresentation, measuredRobot: executionPresentation }
@@ -1713,19 +1714,34 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     const observation = source.getLatestExecutionObservation();
     // The cold arm-only bootstrap defaults other joints to neutral. A target
     // ghost needs actual tool coverage, not that presentation-only fallback.
-    if (candidateObservationEpoch(observation, robotControl.state.status) === null) return null;
+    if (candidateObservationEpoch(observation, robotControl.selectedStatus) === null) return null;
     const measured = executionObservationPresentation.readMeasuredRobotPresentation();
     if (measured === null) return null;
-    const tool = ghost === null || robotControl.state.status === null || sourceValue === null
+    const tool = ghost === null || robotControl.selectedStatus === null || sourceValue === null
         ? null : candidateToolPresentation(
-          ghost, robotControl.state.status, sourceValue, readyManifest, measured.linkTransforms,
+          ghost, robotControl.selectedStatus, sourceValue, readyManifest, measured.linkTransforms,
         );
+    const capabilityPreview = robotControl.state.preview?.schemaVersion
+      === 'manyforge.direct_control_capability_command_preview.v1'
+      ? robotControl.state.preview
+      : null;
     const robot = !candidatePresentationAllowed
-      || motionPreview === null || robotControl.state.phase !== 'ready'
+      || robotControl.state.phase !== 'ready'
       || robotControl.state.poseDragging
-      ? null : candidateRobotPresentation(
-        motionPreview, readyManifest, motionDescriptor, measured.linkTransforms,
-      );
+      ? null
+      : motionPreview !== null
+        ? candidateRobotPresentation(
+          motionPreview, readyManifest, motionDescriptor, measured.linkTransforms,
+        )
+        : capabilityPreview !== null && robotControl.selectedStatus !== null && sourceValue !== null
+          ? candidateGripperPresentation(
+            capabilityPreview,
+            robotControl.selectedStatus,
+            sourceValue,
+            readyManifest,
+            measured.linkTransforms,
+          )
+          : null;
     return { robot, tool };
   }, [
     candidatePresentationAllowed,
@@ -1735,14 +1751,15 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     motionPreview,
     readyManifest,
     robotControl.state.phase,
-    robotControl.state.status,
+    robotControl.state.preview,
+    robotControl.selectedStatus,
     robotControl.state.poseDragging,
     source,
     sourceValue,
   ]);
   const dragReference = useRef<string | null>(null);
   const readCandidateReference = () => {
-    const status = robotControl.currentStatus;
+    const status = robotControl.selectedStatus;
     if (status === null || sourceValue === null) return null;
     const observationEpoch = candidateObservationEpoch(source.getLatestExecutionObservation(), status);
     if (observationEpoch === null) return null;
@@ -1999,9 +2016,9 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       candidateTcpEditable={candidatePoseEditable}
       onEditCandidateTcpPose={finishCandidateDrag}
       onBeginCandidateTcpDrag={beginCandidateDrag}
-      candidateContextKey={JSON.stringify([robotControl.state.status?.ownerEpoch,
-        robotControl.state.status?.retainedBundleId, robotControl.state.status?.graphRevision,
-        robotControl.state.status?.directControl.programBindingId, robotControl.state.status?.sceneRevision,
+      candidateContextKey={JSON.stringify([robotControl.selectedStatus?.ownerEpoch,
+        robotControl.selectedStatus?.retainedBundleId, robotControl.selectedStatus?.graphRevision,
+        robotControl.selectedStatus?.directControl.programBindingId, robotControl.selectedStatus?.sceneRevision,
         robotControl.state.mode, robotControl.state.moveToDraft?.source,
         candidatePresentationAllowed, runtimeEnabled])}
       gizmo={gizmo}
@@ -2114,9 +2131,9 @@ export function SceneAuthoringWorkspace({
       facts?.logicalScene ?? null,
       sourceValue,
       manifest.status === 'ready' ? manifest.data : null,
-      robotControl.state.status?.directControl.targetDescriptor ?? null,
+      robotControl.selectedStatus?.directControl.targetDescriptor ?? null,
     ).status,
-    [facts, manifest, robotControl.state.status, sourceValue],
+    [facts, manifest, robotControl.selectedStatus, sourceValue],
   );
   const [selectedOccurrenceId, setSelectedOccurrenceId] = useState<string | null>(null);
   const [activeSceneTool, setActiveSceneTool] = useState<SceneWorkspaceTool>('hierarchy');
@@ -2228,13 +2245,13 @@ export function SceneAuthoringWorkspace({
     selectedObjectShapeKey,
   ]);
 
-  const directControl = robotControl.state.status?.directControl ?? null;
+  const directControl = robotControl.selectedStatus?.directControl ?? null;
   const controlManifest = manifest.status === 'ready' ? manifest.data : null;
   const observedRobotForControl = useMemo(() => executionRobotPresentation(
-    robotControl.state.status,
+    robotControl.selectedStatus,
     sourceValue,
     controlManifest,
-  ), [controlManifest, robotControl.state.status, sourceValue]);
+  ), [controlManifest, robotControl.selectedStatus, sourceValue]);
   const baseDescriptor = directControl?.targetDescriptor.frames.find(
     (frame) => frame.frameRoleId === directControl.baseFrameRoleId,
   ) ?? null;
@@ -2294,7 +2311,7 @@ export function SceneAuthoringWorkspace({
   const candidateTcp = tcpDraftMode
       ? robotControlHasLocalDraft(robotControl.state)
         ? robotControl.state.draftPose
-        : robotControl.state.status?.observedMotion.currentTcpPose ?? null
+        : robotControl.selectedStatus?.observedMotion.currentTcpPose ?? null
       : previewGhost?.finalTcpPose ?? null;
   const cellGhost = useMemo(() => candidateTcp === null
     ? null

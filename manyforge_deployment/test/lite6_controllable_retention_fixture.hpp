@@ -701,21 +701,6 @@ qualify_control_catalog(bool chained, bool native_motion = false,
             {"description",
              CanonicalValue("Qualified Lite6 native motion policy")},
             {"interrupt_policy_ids", CanonicalValue(CanonicalValue::Array{})},
-            {"motion_speed_limits",
-             CanonicalValue(CanonicalValue::Array{
-                 CanonicalValue(CanonicalValue::Object{
-                     {"scope_kind", CanonicalValue("cell")},
-                     {"maximum_tcp_linear_speed_mps", CanonicalValue(0.5)},
-                 }),
-                 CanonicalValue(CanonicalValue::Object{
-                     {"scope_kind", CanonicalValue("command_target")},
-                     {"controllable_component_id",
-                      CanonicalValue(
-                          std::string(kLite6ControllableComponentId))},
-                     {"command_target_id",
-                      CanonicalValue(std::string(kLite6ArmTargetId))},
-                     {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
-                 })})},
             {"open_loop_grasp_acknowledgements",
              CanonicalValue(CanonicalValue::Array{})},
         }),

@@ -6,6 +6,7 @@ import type {
   CatalogEntry,
   CatalogParameter,
   DraftMutationResponse,
+  DeploymentWorkspaceResponse,
   JsonValue,
   ProgramAuthoringDiagnostic,
   ProgramAuthoringDocument,
@@ -17,12 +18,14 @@ import type {
   ProgramValueSource,
   SourceModelProjection,
 } from '../types/api';
+import type { ManualControlMotionDescriptor } from '../types/robotControl';
 import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
 import {
   catalogFieldAcceptsValueSource,
   deriveProgramMotionConfiguration,
   flattenProgramForest,
   inheritedProgramExecutionGroups,
+  PROGRAM_MOTION_CEILING_FIELDS,
   PROGRAM_MOTION_FIELDS,
   programDiagnosticNodeId,
   resolveProgramParameterLiteralValue,
@@ -47,6 +50,8 @@ interface ProgramPropertyEditorProps {
   appliedProgram?: AppliedProgramSelection | null;
   sourceModel?: SourceModelProjection | null;
   sourceModelUnavailableReason?: string | null;
+  deploymentWorkspace?: DeploymentWorkspaceResponse | null;
+  motionDescriptors?: ManualControlMotionDescriptor[];
   busy: boolean;
   onMutate: (
     mutation: string,
@@ -72,6 +77,12 @@ interface SourceChoice {
 
 function isProgramMotionField(field: string): field is ProgramMotionField {
   return PROGRAM_MOTION_FIELDS.includes(field as ProgramMotionField);
+}
+
+function isProgramMotionCeilingField(field: string): boolean {
+  return PROGRAM_MOTION_CEILING_FIELDS.includes(
+    field as typeof PROGRAM_MOTION_CEILING_FIELDS[number],
+  );
 }
 
 export type ProgramParameterTransition =
@@ -136,7 +147,7 @@ function sourceChoices(
     && catalogFieldAcceptsValueSource(entry, fieldName, programMotionDefault.type)
   ) {
     return [{
-      label: `Program limit · ${programMotionDefault.parameter_id}`,
+      label: `Program default · ${programMotionDefault.parameter_id}`,
       source: {
         kind: 'program_parameter',
         reference: programMotionDefault.parameter_id,
@@ -184,6 +195,8 @@ export function ProgramPropertyEditor({
   appliedProgram = null,
   sourceModel = null,
   sourceModelUnavailableReason = null,
+  deploymentWorkspace = null,
+  motionDescriptors = [],
   busy,
   onMutate,
   onCreateReference,
@@ -219,6 +232,27 @@ export function ProgramPropertyEditor({
   const selectedDiagnostics = useMemo(() => diagnostics.filter((diagnostic) =>
     programDiagnosticNodeId(roots, diagnostic.path) === selectedId,
   ), [diagnostics, roots, selectedId]);
+  const selectedDeploymentSpeed = useMemo(() => {
+    if (selected === null || deploymentWorkspace?.binding == null) return null;
+    const binding = deploymentWorkspace.binding;
+    const targetRole = selected.parameters.target_role;
+    if (typeof targetRole !== 'string') return null;
+    const target = binding.target_role_bindings.find(
+      (row) => row.target_role_id === targetRole,
+    );
+    if (target === undefined) return null;
+    const descriptor = motionDescriptors.find(
+      (candidate) => candidate.controllableComponentId === target.controllable_component_id
+        && candidate.commandTargetId === target.command_target_id,
+    );
+    if (descriptor?.operationalLimit === null || descriptor?.operationalLimit === undefined) {
+      return null;
+    }
+    return {
+      target: `${target.controllable_component_id}/${target.command_target_id}`,
+      maximum: descriptor.operationalLimit.maximumTcpLinearSpeedMps,
+    };
+  }, [deploymentWorkspace, motionDescriptors, selected]);
   const sourceJointInventory = useMemo(() => selected === null
     ? null
     : programSourceJointInventory(
@@ -308,7 +342,7 @@ export function ProgramPropertyEditor({
     const motionBinding = isProgramMotionField(parameter.id)
       ? motionBindings?.[parameter.id] ?? null
       : null;
-    const ceiling = motionBinding !== null
+    const ceiling = motionBinding !== null && isProgramMotionCeilingField(parameter.id)
       ? programParameters.find((row) => row.parameter_id === motionBinding)?.default
       : undefined;
     const ceilingMessage = typeof ceiling === 'number'
@@ -316,7 +350,13 @@ export function ProgramPropertyEditor({
       && value > ceiling
       ? `${parameter.id}=${value} exceeds Program ${parameter.id}=${ceiling}.`
       : null;
-    const message = ceilingMessage
+    const deploymentMessage = parameter.id === 'max_tcp_linear_speed_mps'
+      && selectedDeploymentSpeed !== null
+      && typeof value === 'number'
+      && value > selectedDeploymentSpeed.maximum
+      ? `TCP speed ${value} m/s exceeds Deployment target ${selectedDeploymentSpeed.target} maximum ${selectedDeploymentSpeed.maximum} m/s.`
+      : null;
+    const message = deploymentMessage ?? ceilingMessage
       ?? firstCatalogParameterValidationMessage(parameter, value);
     if (message) {
       setErrors((current) => ({ ...current, [parameter.id]: message }));
@@ -527,10 +567,19 @@ export function ProgramPropertyEditor({
             >
               <div className="program-property-heading">
                 <label htmlFor={`property-${selected.instance_id}-${parameter.id}`}>
-                  {parameter.id}
+                  {parameter.id === 'max_tcp_linear_speed_mps'
+                    ? 'TCP speed (m/s)'
+                    : parameter.id}
                 </label>
                 <span>{parameter.required ? 'required' : 'optional'}</span>
               </div>
+              {parameter.id === 'max_tcp_linear_speed_mps' && (
+                <p className="muted">
+                  {selectedDeploymentSpeed === null
+                    ? 'Optional operation request; Apply validates it against the selected Deployment target.'
+                    : `Optional operation request for ${selectedDeploymentSpeed.target}; Deployment maximum ${selectedDeploymentSpeed.maximum} m/s.`}
+                </p>
+              )}
               {(choices.length > 0 || source !== undefined) && (
                 <label className="program-source-select">
                   Value source
@@ -641,7 +690,7 @@ export function ProgramPropertyEditor({
                 >
                   {isProgramMotionField(parameter.id)
                     && motionBindings?.[parameter.id] !== undefined
-                    ? 'Use Program limit'
+                    ? 'Use Program default'
                     : 'Use catalog default / omit'}
                 </button>
               )}

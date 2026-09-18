@@ -6,7 +6,6 @@
 #include <optional>
 #include <string>
 #include <tuple>
-#include <type_traits>
 #include <utility>
 
 namespace manyforge::core {
@@ -37,41 +36,10 @@ template <typename Id>
   return bounded_nfc(value.value(), 1024U);
 }
 
-using MotionScopeKey = std::tuple<std::string_view, std::string_view, std::string_view>;
-
-[[nodiscard]] MotionScopeKey motion_scope_key(const RuntimePolicyMotionScopeDTO& scope) noexcept {
-  return std::visit(
-      [](const auto& value) -> MotionScopeKey {
-        using Value = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<Value, RuntimePolicyCellScopeDTO>) {
-          return {"cell", {}, {}};
-        } else {
-          return {"command_target", value.controllable_component_id.value(),
-                  value.command_target_id.value()};
-        }
-      },
-      scope);
-}
-
 [[nodiscard]] std::tuple<std::string_view, std::string_view, std::uint8_t> acknowledgement_key(
     const RuntimeOpenLoopGraspAcknowledgementDTO& value) noexcept {
   return {value.controllable_component_id.value(), value.command_target_id.value(),
           static_cast<std::uint8_t>(value.environment)};
-}
-
-[[nodiscard]] bool matches(const RuntimePolicyMotionScopeDTO& scope,
-                           const RuntimeParticipantBindingDTO& binding) noexcept {
-  return std::visit(
-      [&](const auto& value) {
-        using Value = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<Value, RuntimePolicyCellScopeDTO>) {
-          return true;
-        } else {
-          return value.controllable_component_id == binding.controllable_component_id &&
-                 value.command_target_id == binding.command_target_id;
-        }
-      },
-      scope);
 }
 
 }  // namespace
@@ -168,55 +136,6 @@ Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_sele
         "runtime policy identity, description, or interrupt-policy set is invalid",
         "runtime_policy_shape_invalid");
   }
-  if (policy.motion_speed_limits.empty() ||
-      policy.motion_speed_limits.size() > kMaxRuntimePolicyRules ||
-      !std::is_sorted(policy.motion_speed_limits.begin(), policy.motion_speed_limits.end(),
-                      [](const auto& left, const auto& right) {
-                        return motion_scope_key(left.scope) < motion_scope_key(right.scope);
-                      }) ||
-      std::adjacent_find(policy.motion_speed_limits.begin(), policy.motion_speed_limits.end(),
-                         [](const auto& left, const auto& right) {
-                           return motion_scope_key(left.scope) == motion_scope_key(right.scope);
-                         }) != policy.motion_speed_limits.end()) {
-    return invalid<RuntimeParticipantPolicySelection>(
-        "runtime policy motion limits are empty, over-bound, duplicate, or noncanonical",
-        "runtime_policy_motion_limits_invalid");
-  }
-
-  std::optional<double> cell_limit;
-  std::optional<double> exact_target_limit;
-  std::optional<RuntimeMotionSpeedLimitDTO> cell_limit_row;
-  std::optional<RuntimeMotionSpeedLimitDTO> exact_target_limit_row;
-  for (const auto& limit : policy.motion_speed_limits) {
-    if (!std::isfinite(limit.maximum_tcp_linear_speed_mps) ||
-        limit.maximum_tcp_linear_speed_mps <= 0.0 || limit.maximum_tcp_linear_speed_mps > 1000.0) {
-      return invalid<RuntimeParticipantPolicySelection>(
-          "runtime policy motion limit is outside the closed finite range",
-          "runtime_policy_motion_limit_value_invalid");
-    }
-    if (std::holds_alternative<RuntimePolicyCellScopeDTO>(limit.scope)) {
-      cell_limit = limit.maximum_tcp_linear_speed_mps;
-      cell_limit_row = limit;
-      continue;
-    }
-    const auto& target = std::get<RuntimePolicyCommandTargetScopeDTO>(limit.scope);
-    if (!bounded_id(target.controllable_component_id) || !bounded_id(target.command_target_id)) {
-      return invalid<RuntimeParticipantPolicySelection>(
-          "runtime policy contains an invalid target-scoped motion limit",
-          "runtime_policy_motion_limit_scope_invalid");
-    }
-    if (matches(limit.scope, participant.value())) {
-      exact_target_limit = limit.maximum_tcp_linear_speed_mps;
-      exact_target_limit_row = limit;
-    }
-  }
-  if (cell_limit.has_value() && exact_target_limit.has_value() &&
-      *exact_target_limit > *cell_limit) {
-    return invalid<RuntimeParticipantPolicySelection>(
-        "target-scoped runtime limit weakens the cell-wide ceiling",
-        "runtime_policy_target_limit_weakens_cell");
-  }
-
   if (policy.open_loop_grasp_acknowledgements.size() > kMaxRuntimePolicyRules ||
       !std::is_sorted(policy.open_loop_grasp_acknowledgements.begin(),
                       policy.open_loop_grasp_acknowledgements.end(),
@@ -241,58 +160,34 @@ Result<RuntimeParticipantPolicySelection> verify_runtime_participant_policy_sele
         "runtime_policy_open_loop_acknowledgements_invalid");
   }
 
-  if (!cell_limit.has_value() && !exact_target_limit.has_value()) {
-    return invalid<RuntimeParticipantPolicySelection>(
-        "runtime policy has no speed limit matching the exact participant",
-        "runtime_policy_participant_scope_unmatched");
-  }
-  const double effective =
-      cell_limit.has_value()
-          ? (exact_target_limit.has_value() ? std::min(*cell_limit, *exact_target_limit)
-                                            : *cell_limit)
-          : *exact_target_limit;
-  const auto& selected_limit =
-      exact_target_limit_row.has_value() ? *exact_target_limit_row : *cell_limit_row;
   return Result<RuntimeParticipantPolicySelection>::Ok(
       RuntimeParticipantPolicySelection(RuntimeParticipantPolicySelectionDTO{
           participant.value().controllable_component_id, participant.value().command_target_id,
-          std::move(source_artifact), std::move(policy), selected_limit, effective}));
+          std::move(source_artifact), std::move(policy)}));
 }
 
-Result<SpeedProfileDTO> apply_runtime_participant_motion_speed_policy(
-    const RuntimeParticipantPolicySelection& selection, SpeedProfileDTO requested) {
+Result<SpeedProfileDTO> apply_deployment_motion_speed_limit(
+    const double deployment_maximum_tcp_linear_speed_mps, SpeedProfileDTO requested) {
   if ((requested.max_tcp_linear_speed_mps.has_value() &&
        (!std::isfinite(*requested.max_tcp_linear_speed_mps) ||
         *requested.max_tcp_linear_speed_mps <= 0.0)) ||
-      !std::isfinite(selection.value().effective_maximum_tcp_linear_speed_mps) ||
-      selection.value().effective_maximum_tcp_linear_speed_mps <= 0.0) {
-    return invalid<SpeedProfileDTO>("motion speed profile or sealed runtime ceiling is invalid",
-                                    "runtime_policy_speed_profile_invalid");
+      !std::isfinite(deployment_maximum_tcp_linear_speed_mps) ||
+      deployment_maximum_tcp_linear_speed_mps <= 0.0 ||
+      deployment_maximum_tcp_linear_speed_mps > 1000.0) {
+    return invalid<SpeedProfileDTO>(
+        "motion speed request or applied Deployment maximum is invalid",
+        "deployment_motion_speed_invalid");
+  }
+  if (requested.max_tcp_linear_speed_mps.has_value() &&
+      *requested.max_tcp_linear_speed_mps > deployment_maximum_tcp_linear_speed_mps) {
+    return invalid<SpeedProfileDTO>(
+        "requested TCP linear speed exceeds the applied Deployment maximum",
+        "deployment_motion_speed_exceeded");
   }
   requested.max_tcp_linear_speed_mps =
-      std::min(requested.max_tcp_linear_speed_mps.value_or(
-                   selection.value().effective_maximum_tcp_linear_speed_mps),
-               selection.value().effective_maximum_tcp_linear_speed_mps);
+      requested.max_tcp_linear_speed_mps.value_or(
+          deployment_maximum_tcp_linear_speed_mps);
   return Result<SpeedProfileDTO>::Ok(std::move(requested));
-}
-
-Result<RuntimeParticipantPolicySelection> apply_deployment_motion_speed_ceiling(
-    const RuntimeParticipantPolicySelection& selection,
-    const double deployment_maximum_tcp_linear_speed_mps) {
-  if (!std::isfinite(deployment_maximum_tcp_linear_speed_mps) ||
-      deployment_maximum_tcp_linear_speed_mps <= 0.0 ||
-      deployment_maximum_tcp_linear_speed_mps > 1000.0 ||
-      !std::isfinite(selection.value().effective_maximum_tcp_linear_speed_mps) ||
-      selection.value().effective_maximum_tcp_linear_speed_mps <= 0.0) {
-    return invalid<RuntimeParticipantPolicySelection>(
-        "Deployment motion ceiling is outside the closed finite range",
-        "deployment_motion_limit_value_invalid");
-  }
-  auto value = selection.value();
-  value.effective_maximum_tcp_linear_speed_mps = std::min(
-      value.effective_maximum_tcp_linear_speed_mps, deployment_maximum_tcp_linear_speed_mps);
-  return Result<RuntimeParticipantPolicySelection>::Ok(
-      RuntimeParticipantPolicySelection(std::move(value)));
 }
 
 Result<void> validate_runtime_participant_interrupt_policy_selection(

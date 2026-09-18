@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 2.3.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:5abe4efe0a00dfb4936ba8dea9cc296ced334d01d3a613adcc569dda41ba5304
+catalog_digest: sha256:07fbfcadc5ea5fab59cdb1bf3cf61baa35c482453a1c92d0deef64d691083f8a
 schema_types:
   coordinate_position:
     type: object
@@ -1204,13 +1204,6 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
-  - id: max_linear_speed_mps
-    required: false
-    default: 0.1
-    schema:
-      type: float
-      constraints:
-        min_exclusive: 0.0
   - id: max_angular_speed_rad_s
     required: false
     default: 0.5
@@ -1232,6 +1225,13 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
+  - id: max_blend_deviation_rad
+    required: false
+    default: 0.01
+    schema:
+      type: float
+      constraints:
+        min_inclusive: 0.0
   - id: fallback_policy
     required: false
     default: fail_closed
@@ -1403,6 +1403,12 @@ entries:
       - first_feasible
       - balanced
       - quality_bounded
+  - id: max_tcp_linear_speed_mps
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
   - id: interrupt_policy_id
     required: true
     schema:
@@ -1512,6 +1518,12 @@ entries:
       - first_feasible
       - balanced
       - quality_bounded
+  - id: max_tcp_linear_speed_mps
+    required: false
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
   - id: interrupt_policy_id
     required: true
     schema:

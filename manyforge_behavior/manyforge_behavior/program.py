@@ -52,8 +52,16 @@ _CATALOG_API_VERSION: Final = "manyforge.node_catalog.v2"
 _IDENTIFIER_RE: Final = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _MAX_PROGRAM_ROLES: Final = 4096
 _MAX_PROGRAM_DECLARATIONS: Final = 100_000
+_PROGRAM_MOTION_DEFAULTS: Final = frozenset(
+    {
+        "velocity_scale",
+        "acceleration_scale",
+        "translation_tol_m",
+        "max_blend_deviation_rad",
+    }
+)
 _PROGRAM_MOTION_CEILINGS: Final = frozenset(
-    {"velocity_scale", "acceleration_scale", "max_tcp_linear_speed_mps"}
+    {"velocity_scale", "acceleration_scale"}
 )
 
 
@@ -3660,7 +3668,7 @@ def _validate_program_tree(
                 destination_schema=catalog_parameter.schema,
             )
 
-    for parameter_id in sorted(_PROGRAM_MOTION_CEILINGS & set(catalog_parameters)):
+    for parameter_id in sorted(_PROGRAM_MOTION_DEFAULTS & set(catalog_parameters)):
         declaration = context.parameters.get(parameter_id)
         if declaration is None:
             continue
@@ -3668,11 +3676,14 @@ def _validate_program_tree(
         if type(ceiling) not in {int, float} or not math.isfinite(float(ceiling)):
             _program_error(
                 f"program.parameters.{parameter_id}.default",
-                "must be one finite global motion ceiling",
+                "must be one finite Program motion default",
             )
         if parameter_id in parameters:
             value = parameters[parameter_id]
-            if type(value) not in {int, float} or float(value) > float(ceiling):
+            if (
+                parameter_id in _PROGRAM_MOTION_CEILINGS
+                and (type(value) not in {int, float} or float(value) > float(ceiling))
+            ):
                 _program_error(
                     f"{path}.parameters.{parameter_id}",
                     f"must not exceed Program {parameter_id}={float(ceiling):g}",

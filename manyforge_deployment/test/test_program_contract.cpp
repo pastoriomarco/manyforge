@@ -1036,9 +1036,9 @@ selection_node(std::string instance, CanonicalValue groups,
     std::initializer_list<std::pair<std::string, std::string>> definitions) {
   CanonicalValue::Object result;
   for (const auto &[name, policy] : definitions) {
-    result.emplace_back(
-        name, CanonicalValue(CanonicalValue::Object{
-                  {"execution_policy", CanonicalValue(policy)}}));
+    result.emplace_back(name,
+                        CanonicalValue(CanonicalValue::Object{
+                            {"execution_policy", CanonicalValue(policy)}}));
   }
   return CanonicalValue(std::move(result));
 }
@@ -1112,9 +1112,8 @@ TEST(ProgramContractTest, CapturesOnlyExplicitParallelCoordinatedMotionSets) {
                        synchronized_motion_node("arm_b", "cell_pair")})},
   });
   auto root = with_tree(options, std::move(parallel)).as_object();
-  root.emplace_back(
-      "execution_groups",
-      execution_group_definitions({{"cell_pair", "common_start"}}));
+  root.emplace_back("execution_groups", execution_group_definitions(
+                                            {{"cell_pair", "common_start"}}));
   const auto contract = verify_program_binding_contract(
       canonical_json(with_program_revision(CanonicalValue(std::move(root)))),
       *bundle);
@@ -1123,7 +1122,7 @@ TEST(ProgramContractTest, CapturesOnlyExplicitParallelCoordinatedMotionSets) {
   const auto &selection = contract->execution_table().named_selections.front();
   EXPECT_EQ(selection.group_id, "cell_pair");
   EXPECT_EQ(selection.execution_policy,
-            core::ProgramExecutionPolicy::kCommonStart);
+            manyforge::core::ProgramExecutionPolicy::kCommonStart);
   ASSERT_EQ(selection.node_indices.size(), 2U);
   for (const auto index : selection.node_indices) {
     const auto &node = contract->execution_table().nodes[index];
@@ -1153,7 +1152,14 @@ TEST(ProgramContractTest,
   EXPECT_EQ(contract->normalized_program_root(), program);
   EXPECT_EQ(contract->execution_table().nodes.size(), 1U);
   EXPECT_TRUE(contract->execution_table().named_selections.empty());
-  program = with_tree(options, selection_node("root", text_array({"a", "z"})));
+  auto grouped_program =
+      with_tree(options, selection_node("root", text_array({"a", "z"})))
+          .as_object();
+  grouped_program.emplace_back(
+      "execution_groups",
+      execution_group_definitions(
+          {{"a", "independent"}, {"z", "independent"}}));
+  program = with_program_revision(CanonicalValue(std::move(grouped_program)));
   source = program.as_object();
   mutate_object_member(source, "tree", [](auto &tree) {
     replace_member(tree, "execution_groups", text_array({"z", "a"}));
@@ -1224,8 +1230,19 @@ TEST(ProgramContractTest, CapturesOnlyCatalogQualifiedNodeTargetAssociations) {
   replace_member(tree, "parameters",
                  CanonicalValue(CanonicalValue::Object{
                      {"target_role", CanonicalValue("arm")}}));
+  const auto program_with_robot_a_group =
+      [&options](CanonicalValue grouped_tree) {
+        auto grouped_program =
+            with_tree(options, std::move(grouped_tree)).as_object();
+        grouped_program.emplace_back(
+            "execution_groups",
+            execution_group_definitions({{"robot_a", "independent"}}));
+        return with_program_revision(
+            CanonicalValue(std::move(grouped_program)));
+      };
   const auto verified = verify_program_binding_contract(
-      canonical_json(with_tree(options, CanonicalValue(tree))), *bundle);
+      canonical_json(program_with_robot_a_group(CanonicalValue(tree))),
+      *bundle);
   const auto &node = verified->execution_table().nodes.front();
   EXPECT_EQ(node.owner_api, "kernel.stop");
   ASSERT_EQ(node.target_effects.size(), 1U);
@@ -1240,7 +1257,8 @@ TEST(ProgramContractTest, CapturesOnlyCatalogQualifiedNodeTargetAssociations) {
                      {"target_role", CanonicalValue("unrelated")}}));
   EXPECT_THROW(
       static_cast<void>(verify_program_binding_contract(
-          canonical_json(with_tree(options, CanonicalValue(tree))), *bundle)),
+          canonical_json(program_with_robot_a_group(CanonicalValue(tree))),
+          *bundle)),
       ProgramContractError);
   replace_member(tree, "parameters",
                  CanonicalValue(CanonicalValue::Object{
@@ -1248,12 +1266,14 @@ TEST(ProgramContractTest, CapturesOnlyCatalogQualifiedNodeTargetAssociations) {
   options.capability_ids = {"state.observed.current"};
   EXPECT_THROW(
       static_cast<void>(verify_program_binding_contract(
-          canonical_json(with_tree(options, CanonicalValue(tree))), *bundle)),
+          canonical_json(program_with_robot_a_group(CanonicalValue(tree))),
+          *bundle)),
       ProgramContractError);
   replace_member(tree, "node_id", CanonicalValue("not_in_catalog"));
   EXPECT_THROW(
       static_cast<void>(verify_program_binding_contract(
-          canonical_json(with_tree(options, CanonicalValue(tree))), *bundle)),
+          canonical_json(program_with_robot_a_group(CanonicalValue(tree))),
+          *bundle)),
       ProgramContractError);
 }
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '../api/client';
-import { useDeploymentWorkspace } from '../hooks/useDeploymentWorkspace';
+import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type {
   ManagerApplyRequest,
   ManagerApplyResponse,
@@ -16,7 +16,6 @@ import type { ComposerHeadlessState } from '../types/headless';
 import { CCLCPanel } from './CCLCPanel';
 import { useOperationalErrorMirror } from '../state/operationalErrors';
 import { DeploymentBindingProjection } from './DeploymentBindingProjection';
-import { DeploymentDocumentControls } from './DeploymentDocumentControls';
 import { DeploymentDocumentEditor } from './DeploymentDocumentEditor';
 import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
 import { ComponentOverview } from './ComponentOverview';
@@ -44,12 +43,13 @@ export interface ComponentOverviewInput {
 }
 
 interface DeploymentCompositionPanelProps {
+  controller: DeploymentWorkspaceController;
   enabled: boolean;
   snapshot: ComposerHeadlessState | null;
   componentOverview: ComponentOverviewInput;
   sourceModel: StructuralResourceState<SourceModelProjection>;
-  motionDescriptor: ManualControlMotionDescriptor | null;
-  gripperDescriptor: ManualControlGripperDescriptor | null;
+  motionDescriptors: ManualControlMotionDescriptor[];
+  gripperDescriptors: ManualControlGripperDescriptor[];
 }
 
 interface DeploymentReadModel {
@@ -144,20 +144,14 @@ function applyReceiptMessage(response: ManagerApplyResponse): string {
 }
 
 export function DeploymentCompositionPanel({
+  controller: deploymentController,
   enabled,
   snapshot,
   componentOverview,
   sourceModel,
-  motionDescriptor,
-  gripperDescriptor,
+  motionDescriptors,
+  gripperDescriptors,
 }: DeploymentCompositionPanelProps) {
-  const deploymentController = useDeploymentWorkspace(enabled, snapshot);
-  useOperationalErrorMirror({
-    source: 'composer.deployment_workspace',
-    title: 'Deployment command or response failed',
-    message: deploymentController.error,
-    onDismiss: deploymentController.dismissError,
-  });
   const refreshDeploymentWorkspace = deploymentController.refresh;
   const [readModel, setReadModel] = useState<DeploymentReadModel | null>(null);
   const [selectedScenarioId, setSelectedScenarioId] = useState('');
@@ -377,12 +371,35 @@ export function DeploymentCompositionPanel({
 
       <p className="panel-intro">
         Edit and save a compiler-validated Deployment Draft independently from
-        Program and Manager Applied state. Manager Apply remains deliberate.
+        Program and Manager Applied state. The header Apply command validates
+        and activates this Draft.
       </p>
+
+      {deploymentController.mutationUnavailableReason && (
+        <div className="authoring-unavailable-notice">
+          {deploymentController.mutationUnavailableReason}
+        </div>
+      )}
+      {!deploymentController.workspace?.runAdmission.ready
+        && deploymentController.workspace?.runAdmission.reason && (
+        <div className="deployment-run-gate" role="status">
+          {deploymentController.workspace.runAdmission.reason}. Run remains
+          disabled until Manager Applied matches this Draft.
+        </div>
+      )}
+      {deploymentController.feedback && (
+        <div className="program-feedback" role="status">
+          {deploymentController.feedback}
+          <button
+            type="button"
+            className="quiet-button"
+            onClick={deploymentController.clearFeedback}
+          >Dismiss</button>
+        </div>
+      )}
 
       <ComponentOverview {...componentOverview} />
 
-      <DeploymentDocumentControls controller={deploymentController} />
       {deploymentController.workspace !== null && (
         <DeploymentBindingProjection workspace={deploymentController.workspace} />
       )}
@@ -393,8 +410,8 @@ export function DeploymentCompositionPanel({
           <DeploymentFocusedEditor
             controller={deploymentController}
             sourceModel={sourceModel}
-            motionDescriptor={motionDescriptor}
-            gripperDescriptor={gripperDescriptor}
+            motionDescriptors={motionDescriptors}
+            gripperDescriptors={gripperDescriptors}
           />
           <details className="deployment-advanced-document">
             <summary>Advanced compiled Deployment artifact</summary>

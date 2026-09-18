@@ -103,6 +103,16 @@ def _client_scenario_selection() -> dict[str, object]:
     }
 
 
+def _client_scenario_load_selection() -> dict[str, object]:
+    selection = _client_scenario_selection()
+    selection["schema_version"] = "manyforge.scenario_load_selection.v1"
+    selection["deployment"] = {
+        "deployment_artifact_id": selection["deployment_artifact_id"],
+        "deployment_revision": selection["deployment_revision"],
+    }
+    return selection
+
+
 def _sized_context_payload(size: int, *, native: bool = False) -> bytes:
     prefix = b'{"ok":true,"value":' if native else b""
     prefix += (
@@ -503,8 +513,10 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path.endswith(("/program-selection", "/load-selection")):
+        if request.url.path.endswith("/program-selection"):
             payload = _client_scenario_selection()
+        elif request.url.path.endswith("/load-selection"):
+            payload = _client_scenario_load_selection()
         elif request.url.path == "/api/program/applied":
             payload = _client_applied()
         else:

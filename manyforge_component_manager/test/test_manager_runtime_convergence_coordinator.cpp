@@ -859,8 +859,23 @@ private:
 
 class ScriptedSceneOwner final : public IManagerSceneProjectionHandoffPort {
 public:
-  explicit ScriptedSceneOwner(SqliteManagerApplyJournal &independent_reader)
-      : independent_reader_(independent_reader) {}
+  explicit ScriptedSceneOwner(
+      SqliteManagerApplyJournal &independent_reader,
+      std::optional<ProjectionRevisionDTO> current_projection = std::nullopt)
+      : independent_reader_(independent_reader),
+        current_projection_(std::move(current_projection)) {}
+
+  [[nodiscard]] ProjectionRevisionDTO
+  CurrentProjectionRevision() const override {
+    if (current_projection_.has_value()) {
+      return *current_projection_;
+    }
+    if (finalization_result_.has_value()) {
+      return finalization_result_->candidate_projection_revision;
+    }
+    throw std::runtime_error(
+        "current projection is outside this focused scene fixture");
+  }
 
   [[nodiscard]] ProjectionApplyStageResultDTO
   StageCandidateProjection(const ProjectionApplyStageDTO &request) override {
@@ -1158,6 +1173,7 @@ public:
 
 private:
   SqliteManagerApplyJournal &independent_reader_;
+  std::optional<ProjectionRevisionDTO> current_projection_;
   std::optional<ProjectionApplyStageResultDTO> staged_result_;
   std::optional<ProjectionApplyActivationResultDTO> activation_result_;
   std::optional<ProjectionApplyFinalizeResultDTO> finalization_result_;
@@ -2219,7 +2235,19 @@ TEST(ManagerNamedApplyCoordinator,
                        *package.bundle, *package.artifact_source, "linux",
                        {"posix.1-2017"}));
   ScriptedRuntimePorts runtime_ports(independent_reader);
-  ScriptedSceneOwner scene_owner(independent_reader);
+  ScriptedSceneOwner scene_owner(
+      independent_reader,
+      ProjectionRevisionDTO{
+          predecessor.request.candidate_retained_bundle_id,
+          predecessor.request.candidate_graph_revision,
+          SceneRevision{
+              predecessor.request.candidate_projection_revision.scene_revision
+                  .scene_id,
+              predecessor.request.candidate_projection_revision.scene_revision
+                      .revision_id +
+                  2U,
+              ContentDigest(std::string(kDigestTwo)),
+          }});
   AggregateFencePort kernel_fence(independent_reader, predecessor);
   ScriptedRuntimeCompositionPort runtime_composition;
   ScriptedCellAdmissionPort cell_admission;
@@ -2246,6 +2274,14 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_FALSE(applied.request_replayed);
   ASSERT_TRUE(applied.terminal_outcome.has_value());
   EXPECT_EQ(applied.apply_id, ApplyId("apply.aggregate.1"));
+  const auto captured_intent = journal.ReadIntent(
+      ApplyId("apply.aggregate.1"), ApplyGeneration(1U));
+  ASSERT_TRUE(captured_intent.has_value());
+  EXPECT_EQ(captured_intent->intent.expected_active_projection_revision
+                .scene_revision.revision_id,
+            predecessor.request.candidate_projection_revision.scene_revision
+                    .revision_id +
+                2U);
   EXPECT_EQ(kernel_fence.observe_admission_calls, 1);
   EXPECT_EQ(kernel_fence.acquire_calls, 1);
   EXPECT_EQ(kernel_fence.release_calls, 1);

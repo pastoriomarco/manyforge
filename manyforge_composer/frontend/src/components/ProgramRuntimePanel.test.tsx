@@ -5,6 +5,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type { CycleRecoveryOffer, ProgramRunStateName } from '../types/api';
+import type {
+  RuntimeScaleControlSelector,
+  RuntimeScaleControlStatus,
+} from '../types/robotControl';
 import { statusFixture } from '../testFixtures/robotControl';
 import { ProgramRuntimePanel, ProgramTransportControls } from './ProgramRuntimePanel';
 
@@ -74,7 +78,16 @@ function ordinaryMotionStopControls(): NonNullable<
     executionSelections: {
       selectionRevision: 1,
       groups: [{ groupId: 'all', nodeCount: 1, heldNodeCount: 1,
-        state: 'held', stopAllowed: true, resumeAllowed: true, resumeUnavailableReason: null }],
+        state: 'held', stopAllowed: false,
+        startAllowed: false, startUnavailableReason: 'selection_not_ready',
+        resumeAllowed: true, resumeUnavailableReason: null,
+        runtimeScaleSelector: {
+          kind: 'singular',
+          programBindingId: `sha256:${'c'.repeat(64)}`,
+          componentRoleId: 'robot',
+          targetRoleId: 'arm',
+        },
+        runtimeScaleUnavailableReason: null }],
     },
   } as unknown as NonNullable<ProgramRuntimeController['state']['controls']>;
 }
@@ -100,6 +113,32 @@ function robotController(): RobotControlController {
     setRuntimeScale: vi.fn(),
     commitRuntimeScale: vi.fn(),
   } as unknown as RobotControlController;
+}
+
+function runtimeScaleStatus(
+  selector: RuntimeScaleControlSelector,
+  requestedScale = 0.5,
+): RuntimeScaleControlStatus {
+  return {
+    selector,
+    controlGeneration: 2,
+    requestedScale,
+    supported: true,
+    frozen: false,
+    controlDomainId: 'domain-1',
+    controlDomainRevision: `sha256:${'d'.repeat(64)}`,
+    controlBindingId: 'binding-1',
+    controlBindingRevision: `sha256:${'e'.repeat(64)}`,
+    scalingDomainId: 'scaling-1',
+    activeControlConfigurationId: 'active-1',
+    activeControlConfigurationGeneration: 1,
+    activeOperationId: null,
+    activeOperationRevision: null,
+    activeOperationScaleGeneration: null,
+    effectiveScale: null,
+    applicationState: null,
+    reason: null,
+  };
 }
 
 function controller(
@@ -208,6 +247,7 @@ function controller(
       loading: false,
       observationError: null,
       pending: null,
+      selectionPending: [],
       controlPending: null,
       error: null,
     },
@@ -224,6 +264,7 @@ function controller(
     dismissError: vi.fn(),
     run: vi.fn(),
     stopMotion: vi.fn(),
+    startMotion: vi.fn(),
     resumeMotion: vi.fn(),
     fullStop: vi.fn(),
     resumeFullStop: vi.fn(),
@@ -238,6 +279,9 @@ function controller(
     promotionMaterializationReason: vi.fn(() => null),
     writeRuntimeBlackboard: vi.fn(),
     stageManualResult: vi.fn(),
+    groupRuntimeScales: {},
+    setGroupRuntimeScale: vi.fn(),
+    commitGroupRuntimeScale: vi.fn(),
   };
 }
 
@@ -259,7 +303,7 @@ describe('Program runtime projection', () => {
     expect(markup).toContain('never sends Stop implicitly');
   });
 
-  it('enables Run only after the terminal cycle has been reset to Idle', () => {
+  it('enables Execute only after the terminal cycle has been reset to Idle', () => {
     const active = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={controller()} />,
     );
@@ -273,20 +317,20 @@ describe('Program runtime projection', () => {
       />,
     );
 
-    expect(active).toMatch(/disabled=""[^>]*>Run Applied Program/);
-    expect(terminal).toMatch(/disabled=""[^>]*>Run Applied Program/);
+    expect(active).toMatch(/disabled=""[^>]*>Execute Applied Program/);
+    expect(terminal).toMatch(/disabled=""[^>]*>Execute Applied Program/);
     expect(terminal).toContain('Reset Program cycle');
-    expect(resetIdle).not.toMatch(/disabled=""[^>]*>Run Applied Program/);
+    expect(resetIdle).not.toMatch(/disabled=""[^>]*>Execute Applied Program/);
   });
 
-  it('offers the same Run recovery from Full Stop in the detailed panel', () => {
+  it('offers the same Execute recovery from Program Halt in the detailed panel', () => {
     const fullStopped = controller('full_stopped');
     const markup = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={fullStopped} />,
     );
 
-    expect(markup).toContain('>Run</button>');
-    expect(markup).not.toMatch(/disabled=""[^>]*>Run<\/button>/);
+    expect(markup).toContain('>Execute</button>');
+    expect(markup).not.toMatch(/disabled=""[^>]*>Execute<\/button>/);
     expect(markup).toContain('Reset Program cycle');
   });
 
@@ -366,23 +410,78 @@ describe('Program runtime projection', () => {
       />,
     );
 
-    expect(markup).toMatch(/class="transport-run"[^>]*>Resume Motion<\/button>/);
-    expect(markup).not.toMatch(/class="transport-run"[^>]*disabled=/);
+    expect(markup).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
     expect(markup).toMatch(
-      /class="danger-button transport-stop-primary"[^>]*disabled=""[^>]*>Stopped<\/button>/,
+      /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopped<\/button>/,
     );
-    expect(markup).toMatch(/class="transport-reset meaningful"[^>]*>Reset<\/button>/);
-    expect(markup).not.toMatch(/class="transport-reset meaningful"[^>]*disabled=/);
+    expect(markup).toMatch(/class="transport-reset transport-unique-control meaningful"(?![^>]*disabled)[^>]*>Reset<\/button>/);
   });
 
-  it('keeps Stop callable while a selected Stop receipt is pending, but blocks Resume', () => {
+  it('projects Execute as active while initial motion is Ready for deliberate Run', () => {
+    const executing = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    const group = controls.executionSelections.groups[0];
+    group.state = 'ready';
+    group.stopAllowed = false;
+    group.startAllowed = true;
+    group.startUnavailableReason = null;
+    group.resumeAllowed = false;
+    group.resumeUnavailableReason = 'selection_not_stopped';
+    executing.state.controls = controls;
+    const selector = group.runtimeScaleSelector!;
+    const status = runtimeScaleStatus(selector, 0.4);
+    executing.groupRuntimeScales = {
+      all: { selector, status, draft: 0.4, pending: false, error: null },
+    };
+
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={executing} robot={robotController()} />,
+    );
+
+    expect(markup).toMatch(
+      /class="transport-group-resume"(?![^>]*disabled)[^>]*>Run<\/button>/,
+    );
+    expect(markup).toMatch(
+      /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopped<\/button>/,
+    );
+    expect(markup).toMatch(/type="range"[^>]*value="0.4"/);
+    expect(markup).not.toMatch(/type="range"[^>]*disabled=/);
+    expect(markup).toMatch(
+      /class="transport-run transport-unique-control"[^>]*disabled=""[^>]*>Executing<\/button>/,
+    );
+    expect(markup).toMatch(
+      /class="danger-button transport-full-stop transport-unique-control"(?![^>]*disabled)[^>]*>Halt<\/button>/,
+    );
+  });
+
+  it('keeps Halt disabled until a Program is executing', () => {
+    const idle = controller('succeeded', 'idle_after_reset');
+    idle.state.run = null;
+    idle.state.controls = null;
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={idle} robot={robotController()} />,
+    );
+
+    expect(markup).toMatch(
+      /class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*>Execute<\/button>/,
+    );
+    expect(markup).toMatch(
+      /class="danger-button transport-full-stop transport-unique-control"[^>]*disabled=""[^>]*>Halt<\/button>/,
+    );
+  });
+
+  it('keeps paired commands disabled through Execute and selected-Stop transitions', () => {
     const starting = controller('succeeded', 'idle_after_reset');
     starting.state.pending = 'run';
     const startingMarkup = renderToStaticMarkup(
       <ProgramTransportControls enabled program={starting} robot={robotController()} />,
     );
     expect(startingMarkup).toMatch(
-      /class="transport-run"[^>]*disabled=""[^>]*>Sending Run<\/button>/,
+      /class="transport-run transport-unique-control"[^>]*disabled=""[^>]*>Executing<\/button>/,
+    );
+    expect(startingMarkup).toMatch(
+      /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stop<\/button>/,
     );
 
     const running = controller('running');
@@ -390,18 +489,24 @@ describe('Program runtime projection', () => {
       <ProgramTransportControls enabled program={running} robot={robotController()} />,
     );
     expect(runningMarkup).toMatch(
-      /class="transport-run"[^>]*disabled=""[^>]*>Running<\/button>/,
+      /class="transport-run transport-unique-control"[^>]*disabled=""[^>]*>Executing<\/button>/,
     );
 
-    running.state.pending = 'motion-stop';
+    running.state.selectionPending = [{
+      kind: 'motion-stop',
+      groupIds: ['all'],
+      requestId: 'stop-request.1',
+      ownerEpoch: 'program-runner.epoch.1',
+      programRunId: 'program-run.1',
+    }];
     const stoppingMarkup = renderToStaticMarkup(
       <ProgramTransportControls enabled program={running} robot={robotController()} />,
     );
     expect(stoppingMarkup).toMatch(
-      /class="danger-button transport-stop-primary"(?![^>]*disabled)[^>]*>Sending Stop<\/button>/,
+      /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopping<\/button>/,
     );
     expect(stoppingMarkup).toMatch(
-      /class="transport-run"[^>]*disabled=""[^>]*>Running<\/button>/,
+      /class="transport-run transport-unique-control"[^>]*disabled=""[^>]*>Executing<\/button>/,
     );
   });
 
@@ -410,57 +515,44 @@ describe('Program runtime projection', () => {
     running.state.controls = ordinaryMotionStopControls();
     const group = running.state.controls.executionSelections!.groups[0];
     group.state = state;
+    group.stopAllowed = state === 'mixed';
     group.resumeAllowed = false;
     const markup = renderToStaticMarkup(
       <ProgramTransportControls enabled program={running} robot={robotController()} />,
     );
     if (state === 'stopping') {
-      expect(markup).toMatch(/class="danger-button transport-stop-primary"[^>]*disabled=""[^>]*>Stopping<\/button>/);
+      expect(markup).toMatch(/class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopping<\/button>/);
     } else {
-      expect(markup).toMatch(/class="danger-button transport-stop-primary"(?![^>]*disabled)[^>]*>Stop<\/button>/);
+      expect(markup).toMatch(/class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stop<\/button>/);
     }
-    expect(markup).toMatch(/class="transport-run"[^>]*disabled=""/);
+    expect(markup).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""/);
   });
 
   it.each([false, true])('shows the owner velocity scope while Run is starting (group=%s)', (group) => {
     const starting = controller('succeeded', 'idle_after_reset');
     starting.state.pending = 'run';
+    starting.state.controls = ordinaryMotionStopControls();
+    starting.state.controls.executionSelections.groups[0].state = 'running';
     const robot = robotController();
-    robot.runtimeScaleStatus = {
-      selector: {
-        kind: 'singular',
-        programBindingId: `sha256:${'c'.repeat(64)}`,
-        componentRoleId: 'controlled_component',
-        targetRoleId: 'command_target',
-      },
-      controlGeneration: 2,
-      requestedScale: 0.5,
-      supported: true,
-      frozen: false,
-      controlDomainId: 'domain-1',
-      controlDomainRevision: `sha256:${'d'.repeat(64)}`,
-      controlBindingId: 'binding-1',
-      controlBindingRevision: `sha256:${'e'.repeat(64)}`,
-      scalingDomainId: 'scaling-1',
-      activeControlConfigurationId: 'active-1',
-      activeControlConfigurationGeneration: 1,
-      activeOperationId: null,
-      activeOperationRevision: null,
-      activeOperationScaleGeneration: null,
-      effectiveScale: null,
-      applicationState: null,
-      reason: null,
-    };
-    robot.runtimeScaleDraft = 0.5;
-    if (group) {
-      robot.runtimeScaleStatus.selector = {
+    const selector: RuntimeScaleControlSelector = group
+      ? {
         kind: 'group', programBindingId: `sha256:${'c'.repeat(64)}`,
         groupTargets: [
           { componentRoleId: 'left', targetRoleId: 'arm' },
           { componentRoleId: 'right', targetRoleId: 'arm' },
         ],
+      }
+      : {
+        kind: 'singular',
+        programBindingId: `sha256:${'c'.repeat(64)}`,
+        componentRoleId: 'controlled_component',
+        targetRoleId: 'command_target',
       };
-    }
+    const status = runtimeScaleStatus(selector);
+    starting.state.controls.executionSelections.groups[0].runtimeScaleSelector = status.selector;
+    starting.groupRuntimeScales = {
+      all: { selector: status.selector, status, draft: 0.5, pending: false, error: null },
+    };
 
     const markup = renderToStaticMarkup(
       <ProgramTransportControls enabled program={starting} robot={robot} />,
@@ -468,8 +560,45 @@ describe('Program runtime projection', () => {
 
     expect(markup).toMatch(/type="range"[^>]*value="0.5"/);
     expect(markup).not.toMatch(/type="range"[^>]*disabled=/);
-    expect(markup).toContain(group ? 'Group velocity' : '>Velocity<');
-    if (group) expect(markup).toContain('One shared velocity for left/arm, right/arm.');
+    expect(markup).toContain('>Velocity<');
+    expect(markup).toContain('Scale current and subsequent moves for all.');
+  });
+
+  it('keeps group velocity disabled until Execute creates a captured owner target', () => {
+    const idle = controller('succeeded', 'idle_after_reset');
+    idle.state.run = null;
+    idle.state.controls = null;
+    idle.state.applied!.program.tree = {
+      node_id: 'motion.move_to_joint_target',
+      instance_id: 'root-motion',
+      parameters: { target_role: 'arm' },
+      children: [],
+    };
+    idle.state.applied!.program.target_roles = { arm: {} };
+    idle.state.applied!.programBinding.target_role_bindings = [{
+      target_role_id: 'arm', component_role_id: 'robot',
+      controllable_component_id: 'robot', command_target_id: 'arm',
+      frame_role_bindings: [], resource_role_bindings: [],
+      collision_body_role_bindings: [], capability_bindings: [],
+    }];
+    const selector: RuntimeScaleControlSelector = {
+      kind: 'singular',
+      programBindingId: idle.state.applied!.programBindingId,
+      componentRoleId: 'robot',
+      targetRoleId: 'arm',
+    };
+    const status = runtimeScaleStatus(selector, 0.35);
+    idle.groupRuntimeScales = {
+      all: { selector, status, draft: 0.35, pending: false, error: null },
+    };
+
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={idle} robot={robotController()} />,
+    );
+
+    expect(markup).toContain('title="all"');
+    expect(markup).toMatch(/type="range"[^>]*value="0.35"/);
+    expect(markup).toMatch(/type="range"[^>]*disabled=/);
   });
 
   it('blocks Program Resume for a resident manual operation in the other editor mode', () => {
@@ -484,10 +613,10 @@ describe('Program runtime projection', () => {
     }];
     expect(robot.state.operation).toBeNull();
     const blocked = renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robot} />);
-    expect(blocked).toMatch(/class="transport-run"[^>]*disabled=""/);
+    expect(blocked).toMatch(/class="transport-group-resume"[^>]*disabled=""/);
     robot.currentStatus!.manualOperations[0].resident = false;
     const released = renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robot} />);
-    expect(released).not.toMatch(/class="transport-run"[^>]*disabled=""/);
+    expect(released).toMatch(/class="transport-group-resume"(?![^>]*disabled)/);
   });
 
   it('does not delay Run while a coalesced velocity update is pending', () => {
@@ -499,13 +628,13 @@ describe('Program runtime projection', () => {
       <ProgramTransportControls enabled program={idle} robot={robot} />,
     );
 
-    expect(markup).toContain('class="transport-run"');
+    expect(markup).toContain('class="transport-run transport-unique-control"');
     expect(markup).not.toMatch(
-      /class="transport-run"[^>]*disabled=""[^>]*>Run<\/button>/,
+      /class="transport-run transport-unique-control"[^>]*disabled=""[^>]*>Run<\/button>/,
     );
   });
 
-  it('keeps Stop available while Program Run is still starting', () => {
+  it('keeps motion Stop disabled while Program Execute is still starting', () => {
     const starting = controller('succeeded', 'starting');
     starting.state.run = null;
     starting.state.pending = 'run';
@@ -519,26 +648,113 @@ describe('Program runtime projection', () => {
     );
 
     expect(markup).toMatch(
-      /class="danger-button transport-stop-primary"(?![^>]*disabled)[^>]*>Stop<\/button>/,
+      /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stop<\/button>/,
     );
   });
 
-  it('keeps fixed transport geometry and lets the Full Stop menu escape the bar', () => {
+  it('renders physically separate left group and right unique-control panels', () => {
+    const idle = controller('succeeded', 'idle_after_reset');
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={idle} robot={robotController()} />,
+    );
+    expect(markup).toContain('class="transport-motion-panel"');
+    expect(markup).toMatch(/class="transport-motion-panel"[^>]*>[\s\S]*class="transport-panel-title">Motion<\/h3>/);
+    expect(markup).toMatch(/class="transport-unique-column"[^>]*>[\s\S]*class="transport-panel-title">Program<\/h3>/);
+
+    const resumeIndex = markup.indexOf('class="transport-group-resume"');
+    const stopIndex = markup.indexOf('class="danger-button transport-group-stop"');
+    const groupNameIndex = markup.indexOf('class="transport-group-name"');
+    const velocityIndex = markup.indexOf('class="transport-group-scale"');
+    expect(resumeIndex).toBeGreaterThan(-1);
+    expect(resumeIndex).toBeLessThan(stopIndex);
+    expect(stopIndex).toBeLessThan(velocityIndex);
+    expect(velocityIndex).toBeLessThan(groupNameIndex);
+    expect(markup).toContain('>Halt</button>');
+
     const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
     const transport = css.slice(
       css.indexOf('.viewer-transport {'),
       css.indexOf('.transport-velocity {'),
     );
     expect(transport).toContain('overflow: visible;');
-    expect(transport).toContain('width: 9rem;');
-    expect(transport).toContain('width: 7.5rem;');
-    expect(transport).toContain('width: 1.45rem;');
-    expect(transport).toContain('width: 6.25rem;');
+    expect(transport).toMatch(/\.viewer-transport \{[^}]*padding: 0;[^}]*overflow: visible;/s);
+    expect(transport).not.toMatch(/\.viewer-transport \{[^}]*(?:border|background):/s);
     expect(transport).toMatch(
-      /\.viewer-transport \.transport-stop-group > \.transport-stop-primary\s*\{[^}]*border-radius: 0\.35rem 0 0 0\.35rem;/s,
+      /\.viewer-transport \{[^}]*grid-template-columns:[^;]*var\(--viewer-transport-motion-panel-width\)[^;]*minmax\(0, 1fr\)[^;]*var\(--viewer-transport-column-width\);[^}]*column-gap: 1\.25rem;/s,
     );
     expect(transport).toMatch(
-      /\.viewer-transport \.transport-stop-group > \.transport-stop-disclosure\s*\{[^}]*display: grid;[^}]*place-items: center;[^}]*margin-left: -1px;[^}]*padding: 0;[^}]*border-left-width: 1px;/s,
+      /\.transport-guidance \{[^}]*grid-row: 1;[^}]*grid-column: 2;[^}]*align-self: end;/s,
+    );
+    expect(transport).toMatch(/\.transport-control-layout \{[^}]*display: contents;/s);
+    expect(transport).toMatch(
+      /\.transport-motion-panel \{[^}]*border: 1px solid #365463;[^}]*background: rgb\(8 23 32 \/ 94%\);/s,
+    );
+    expect(transport).toMatch(
+      /\.transport-motion-panel \{[^}]*width: var\(--viewer-transport-motion-panel-width\);/s,
+    );
+    expect(transport).toMatch(
+      /\.transport-group-grid \{[^}]*justify-content: flex-start;[^}]*padding: 0;[^}]*overflow-x: auto;/s,
+    );
+    expect(transport).toMatch(
+      /\.transport-group-column \{[^}]*padding: 0;[^}]*border: 0;[^}]*background: transparent;/s,
+    );
+    expect(transport).toMatch(
+      /\.transport-group-scale \{[^}]*border: 1px solid #385061;[^}]*border-radius: 0\.45rem;/s,
+    );
+    expect(transport).toMatch(
+      /\.transport-unique-column \{[^}]*border: 1px solid #365463;[^}]*background: rgb\(8 23 32 \/ 94%\);[^}]*margin-left: auto;/s,
+    );
+  });
+
+  it('splits Info and group Settings when the Applied Program has a named group', () => {
+    const idle = controller('succeeded', 'idle_after_reset');
+    idle.state.run = null;
+    idle.state.controls = null;
+    idle.state.applied!.program.execution_groups = {
+      robot_group: { execution_policy: 'independent' },
+    };
+    idle.state.applied!.program.tree.execution_groups = ['robot_group'];
+
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={idle} robot={robotController()} />,
+    );
+
+    expect(markup).toContain('aria-label="Program run information"');
+    expect(markup).toMatch(/aria-label="Open control settings(?:; [^"]+)?"/);
+    expect(markup).toContain('class="transport-unique-icons"');
+    expect(markup).toContain('robot_group controls');
+    expect(markup).toContain('transport-hidden-group-count');
+
+    const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
+    expect(css).toMatch(
+      /\.transport-unique-icons \{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s,
+    );
+    expect(css).toMatch(
+      /\.transport-group-settings > button \{[^}]*width: 100%;[^}]*height: 100%;/s,
+    );
+    expect(css).toMatch(
+      /\.transport-group-scale \{[^}]*font-size: 0\.84rem;/s,
+    );
+    expect(css).toMatch(
+      /\.transport-settings-glyph \{[^}]*font-size: 1\.3rem;/s,
+    );
+    expect(css).toMatch(
+      /\.transport-group-settings-menu \.transport-settings-option \{[^}]*grid-template-columns: 1rem minmax\(0, 1fr\);[^}]*opacity: 1;/s,
+    );
+    expect(css).toMatch(
+      /\.viewer-transport \.transport-run:hover:not\(:disabled\),[\s\S]*\.transport-group-resume:hover:not\(:disabled\)/,
+    );
+    expect(css).toMatch(
+      /\.viewer-transport \.danger-button:hover:not\(:disabled\)/,
+    );
+    expect(css).toMatch(
+      /\.transport-group-scale:has\(input:not\(:disabled\)\):hover/,
+    );
+    expect(css).toMatch(
+      /\.transport-group-scale span \{[^}]*padding-left: 0\.18rem;/s,
+    );
+    expect(css).toMatch(
+      /\.transport-group-scale output \{[^}]*padding-right: 0\.18rem;/s,
     );
   });
 
@@ -562,7 +778,7 @@ describe('Program runtime projection', () => {
     expect(markup).toContain('Execution timeout exceeded');
     expect(markup).toContain('Open gripper recovery');
     expect(markup).toContain('Robot control → Reset operation');
-    expect(markup).toMatch(/class="transport-run"[^>]*disabled=""/);
+    expect(markup).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""/);
     expect(render(false)).toContain('Control status unavailable.');
     expect(render(false)).not.toContain('Manual gripper recovery required');
     robot.currentStatus = null;
@@ -592,10 +808,9 @@ describe('Program runtime projection', () => {
     expect(render()).toContain('Program recovery required.');
     expect(render()).toContain('The Resume Motion outcome could not be confirmed. Reset is required.');
     expect(render()).not.toContain('Participant requires reconciliation');
-    expect(render()).toContain('Recovery required');
+    expect(render()).toContain('Program recovery required.');
     expect(render()).toContain('Review Program recovery');
-    expect(render()).toMatch(/class="transport-reset meaningful"(?![^>]*disabled)/);
-    expect(render()).toContain('Contain and reconcile the current Program');
+    expect(render()).toMatch(/class="transport-reset transport-unique-control meaningful"(?![^>]*disabled)/);
     program.cycleState = 'terminal_awaiting_reset';
     expect(render()).toContain('Program finished. Use <strong>Reset</strong>');
     expect(render()).not.toContain('Program recovery required.');

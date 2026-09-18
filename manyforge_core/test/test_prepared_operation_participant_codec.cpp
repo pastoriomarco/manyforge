@@ -246,7 +246,6 @@ struct SealedInputs final {
                             RuntimePolicyRevision(Digest('2')),
                             std::nullopt,
                             {},
-                            {RuntimeMotionSpeedLimitDTO{RuntimePolicyCellScopeDTO{}, 0.5}},
                             {}};
     const auto policy_reference = PolicyReference(policy);
     auto selected =
@@ -463,8 +462,9 @@ struct SealedInputs final {
                                TrajectoryValidationMetricsDTO{1.0, {0.5, 0.5}, {0.0, 0.0}, 0.1}},
            world, CollisionPolicyRevision{1U, Digest('1')}, decision},
           std::nullopt,
-          {inputs.runtime_policy->value().source_artifact,
-           inputs.runtime_policy->value().selected_motion_speed_limit},
+          {inputs.runtime_policy->value().source_artifact},
+          0.5,
+          0.5,
           {},
           3.0};
 }
@@ -532,10 +532,9 @@ TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
   EXPECT_EQ(decoded_payload.runtime_policy.source_artifact.record_revision.value(), Digest('2'));
   EXPECT_EQ(decoded_payload.runtime_policy.source_artifact.content_addressed_store_key.value(),
             "catalog/runtime-policy/runtime.policy.json");
-  EXPECT_TRUE(std::holds_alternative<RuntimePolicyCellScopeDTO>(
-      decoded_payload.runtime_policy.selected_motion_speed_limit.scope));
-  EXPECT_DOUBLE_EQ(
-      decoded_payload.runtime_policy.selected_motion_speed_limit.maximum_tcp_linear_speed_mps, 0.5);
+  ASSERT_TRUE(decoded_payload.requested_tcp_linear_speed_mps.has_value());
+  EXPECT_DOUBLE_EQ(*decoded_payload.requested_tcp_linear_speed_mps, 0.5);
+  EXPECT_DOUBLE_EQ(decoded_payload.deployment_maximum_tcp_linear_speed_mps, 0.5);
 }
 
 TEST(PreparedOperationParticipantCodecTest, RejectsCartesianMilestonesForAnotherIntent) {
@@ -642,7 +641,7 @@ TEST(PreparedOperationParticipantCodecTest,
 }
 
 TEST(PreparedOperationParticipantCodecTest,
-     MotionRequiresExactSealedRuntimePolicyReferentAndEffectiveCeiling) {
+     MotionRequiresExactSealedRuntimePolicyReferentAndDeploymentMaximum) {
   const auto base = BasePlan();
   auto inputs = Inputs(base, false);
   const auto candidate = Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs));
@@ -671,16 +670,6 @@ TEST(PreparedOperationParticipantCodecTest,
       DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_FALSE(wrong_source_result.ok());
   EXPECT_EQ(wrong_source_result.error().details.at("reason"), "motion_payload_join_invalid");
-
-  auto wrong_scope = candidate;
-  std::get<PreparedMotionExecutionDTO>(wrong_scope.payload)
-      .runtime_policy.selected_motion_speed_limit.scope = RuntimePolicyCommandTargetScopeDTO{
-      ControllableComponentId("robot.1"), CommandTargetId("other")};
-  auto wrong_scope_result = MakePreparedOperationParticipant(
-      std::move(wrong_scope), inputs.binding, inputs.readiness, &*inputs.runtime_policy,
-      DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
-  ASSERT_FALSE(wrong_scope_result.ok());
-  EXPECT_EQ(wrong_scope_result.error().details.at("reason"), "motion_payload_join_invalid");
 
   auto weaker = candidate;
   std::get<PreparedMotionExecutionDTO>(weaker.payload)

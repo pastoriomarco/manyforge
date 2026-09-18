@@ -720,11 +720,16 @@ class _Coordinator:
 
 
 class _Headless:
+    applied_deployment: dict[str, Any] | None = None
+
     def scenarios(self):
         return {"scenario_catalog_revision": _DIGEST, "scenarios": []}
 
     def scenario_program_selection(self, _scenario_id: str):
         return {"program_binding": {"program_binding_id": _DIGEST}}
+
+    def scenario_load_selection(self, _scenario_id: str):
+        return {"deployment": deepcopy(self.applied_deployment)}
 
 
 def _request(workspace: dict[str, Any], **extra: Any) -> dict[str, Any]:
@@ -774,6 +779,8 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     workspace = response.json()
     assert workspace["draft"]["deploymentArtifactId"] == "cell_a"
     assert workspace["draft"]["differsFromSaved"] is False
+    applied = deepcopy(workspace["draft"]["document"])
+    applied_revision = workspace["draft"]["deploymentRevision"]
 
     response = client.post(
         "/api/deployment/draft/mutations",
@@ -802,12 +809,22 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
         json=_request(workspace, path=["name"], value="Unsaved"),
     )
     workspace = response.json()
+    assert applied is not None
+    state.headless_client.applied_deployment = applied  # type: ignore[attr-defined]
+    state.current_scenario = lambda: {  # type: ignore[method-assign]
+        "ready": True,
+        "current_scenario": {
+            "scenario_id": "cell_a",
+            "deployment_revision": applied_revision,
+        },
+        "unavailable_reasons": [],
+    }
     response = client.post(
         "/api/deployment/discard",
         json=_request(workspace, kind="discard"),
     )
     assert response.status_code == 200, response.text
-    assert response.json()["draft"]["document"]["name"] == "Edited cell"
+    assert response.json()["draft"]["document"]["name"] == applied["name"]
     assert (
         state.authoring_retained_state()["schema_version"]
         == "manyforge.composer_authoring_workspace.v2"
@@ -859,7 +876,7 @@ def test_invalid_or_stale_deployment_mutation_never_changes_the_draft(
     )
 
 
-def test_authored_deployment_preview_then_apply_preserves_the_exact_program(
+def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_program(
     tmp_path: Path,
 ) -> None:
     client, state = _client(tmp_path)
@@ -927,6 +944,8 @@ def test_authored_deployment_preview_then_apply_preserves_the_exact_program(
     }
     effects: list[tuple[dict[str, Any], bool]] = []
 
+    confirmation_token = "sha256:" + "c" * 64
+
     def execute_candidate(intent, _claim, *, apply):
         effects.append((deepcopy(intent), apply))
         compilation = {
@@ -941,6 +960,19 @@ def test_authored_deployment_preview_then_apply_preserves_the_exact_program(
             "program_revision": program["program_revision"],
             "program_binding_id": "sha256:" + "b" * 64,
         }
+        if apply and intent.get("confirmation_token") != confirmation_token:
+            return {
+                "status": "confirmation_required",
+                "confirmation_token": confirmation_token,
+                "compilation": compilation,
+                "candidate_preview": {"diff": {"runtime_units": {"changed": ["runtime"]}}},
+                "manager_apply": None,
+                "selection": {
+                    key: value
+                    for key, value in compilation.items()
+                    if key != "schema_version"
+                },
+            }
         if apply:
             current.update(
                 {
@@ -951,6 +983,7 @@ def test_authored_deployment_preview_then_apply_preserves_the_exact_program(
             )
         return {
             "status": "applied" if apply else "previewed",
+            "confirmation_token": None,
             "compilation": compilation,
             "candidate_preview": None,
             "manager_apply": None,
@@ -967,12 +1000,13 @@ def test_authored_deployment_preview_then_apply_preserves_the_exact_program(
         (kwargs["request_owner_epoch"], kwargs["request_id"])
     )
 
-    preview = client.post(
-        "/api/deployment/draft/preview",
-        json=_request(edited, kind="preview"),
+    confirmation = client.post(
+        "/api/deployment/draft/apply",
+        json=_request(edited, kind="apply"),
     )
-    assert preview.status_code == 200, preview.text
-    assert preview.json()["result"]["status"] == "previewed"
+    assert confirmation.status_code == 200, confirmation.text
+    assert confirmation.json()["result"]["status"] == "confirmation_required"
+    assert confirmation.json()["result"]["confirmation_token"] == confirmation_token
     assert current["deployment_revision"] == base_revision
     assert effects[-1][0]["program"] == program
     assert effects[-1][0]["deployment"] == edited["draft"]["document"]
@@ -980,13 +1014,17 @@ def test_authored_deployment_preview_then_apply_preserves_the_exact_program(
 
     applied = client.post(
         "/api/deployment/draft/apply",
-        json=_request(edited, kind="apply"),
+        json=_request(
+            edited,
+            kind="apply-confirmed",
+            confirmationToken=confirmation_token,
+        ),
     )
     assert applied.status_code == 200, applied.text
     assert applied.json()["result"]["status"] == "applied"
     assert applied.json()["workspace"]["runAdmission"]["ready"] is True
     assert current["program_revision"] == program["program_revision"]
-    assert prepared == [("browser-test", "request-2-apply")]
+    assert prepared == [("browser-test", "request-2-apply-confirmed")]
 
 
 def test_focused_motion_target_limit_updates_one_exact_target_atomically(

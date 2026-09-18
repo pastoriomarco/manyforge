@@ -1340,13 +1340,13 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5e_lite6_wall/71cbf14976e575be7b1e04ff19f85af9b480ed9aad4fe401242b730987587e26",
-        "content_digest": "sha256:610c7a32191922765682e41a6fa06de7979af46d9be8d5c6a3f283dee09f2da5",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5e_lite6_wall/45f5962e1d77d36f0a2ab48ca7ee8919b94cbcd6a0af6bc2c76245f88e4d2605",
+        "content_digest": "sha256:b05883bbba217b8926c221d7f5eb23f1625e8a385eac22135123aca874565867",
         "record_id": "manyforge.runtime_motion.ur5e_lite6_wall",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:71cbf14976e575be7b1e04ff19f85af9b480ed9aad4fe401242b730987587e26",
+        "record_revision": "sha256:45f5962e1d77d36f0a2ab48ca7ee8919b94cbcd6a0af6bc2c76245f88e4d2605",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/7016c53470a155760287cdd2186a783a2185d63bb3ac2e455e49f1d80130a00b",
@@ -1392,7 +1392,7 @@
     ]
   },
   "deployment_artifact_id": "ur5e_lite6_wall",
-  "deployment_revision": "sha256:5a0636bf01d0fe6981100339049cf2aa36f6ecd86c33d47c3cc8e5e0aa4d238d",
+  "deployment_revision": "sha256:235dfb1fbb8b20d5b0d1d46d577d6a191065702cd140febe0777be294bc3f827",
   "description": "Minimal native UR5e and Lite6 qualification cell derived from the simple ManyMove dual-robot wall layout. The robots plan independently; both are owned by one cell execution Kernel and remain independently planned.",
   "desired_control_configurations": [
     {
@@ -3282,6 +3282,32 @@
                 "lite_gripper_left_finger",
                 "lite_gripper_right_finger"
               ]
+            },
+            {
+              "actuation_kind": "position_commanded",
+              "attach_frame": "robotiq_85_base_link",
+              "auxiliary_frames": [
+                "robotiq_85_base_link"
+              ],
+              "closed_state_ref": "closed",
+              "command_duration_s": 1,
+              "command_target_id": "gripper",
+              "controllable_component_id": "ur5e_robot",
+              "description": "Native simulated Robotiq 2F-85 gripper.",
+              "mount_frame": "tool0",
+              "open_state_ref": "open",
+              "tcp_frame": "robotiq_85_base_link",
+              "touch_links": [
+                "robotiq_85_base_link",
+                "robotiq_85_left_finger_link",
+                "robotiq_85_left_finger_tip_link",
+                "robotiq_85_left_inner_knuckle_link",
+                "robotiq_85_left_knuckle_link",
+                "robotiq_85_right_finger_link",
+                "robotiq_85_right_finger_tip_link",
+                "robotiq_85_right_inner_knuckle_link",
+                "robotiq_85_right_knuckle_link"
+              ]
             }
           ],
           "initial_joint_positions_rad": [
@@ -3343,13 +3369,13 @@
     "interrupt_sources": [],
     "retained_policy_records": [
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5e_lite6_wall/71cbf14976e575be7b1e04ff19f85af9b480ed9aad4fe401242b730987587e26",
-        "content_digest": "sha256:610c7a32191922765682e41a6fa06de7979af46d9be8d5c6a3f283dee09f2da5",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5e_lite6_wall/45f5962e1d77d36f0a2ab48ca7ee8919b94cbcd6a0af6bc2c76245f88e4d2605",
+        "content_digest": "sha256:b05883bbba217b8926c221d7f5eb23f1625e8a385eac22135123aca874565867",
         "record_id": "manyforge.runtime_motion.ur5e_lite6_wall",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:71cbf14976e575be7b1e04ff19f85af9b480ed9aad4fe401242b730987587e26",
+        "record_revision": "sha256:45f5962e1d77d36f0a2ab48ca7ee8919b94cbcd6a0af6bc2c76245f88e4d2605",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       }
     ],
     "stop_stage_parameters": [

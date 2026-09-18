@@ -520,13 +520,17 @@ TEST(TrajectoryCacheIntentTest, DynamicsAndCartesianOptionsChangeIdentity) {
           capped.binding.model_group_binding.compiled_joint_names.front(),
           limit});
   auto slower_cartesian = baseline;
-  std::get<CartesianPathDTO>(slower_cartesian.motion).max_linear_speed_mps =
-      0.05;
+  slower_cartesian.speed_profile.max_tcp_linear_speed_mps = 0.05;
+  auto tighter_blend = baseline;
+  std::get<CartesianPathDTO>(tighter_blend.motion).max_blend_deviation_rad =
+      0.005;
 
   const auto baseline_identity = trajectory_cache_intent_identity(baseline);
   EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(capped));
   EXPECT_NE(baseline_identity,
             trajectory_cache_intent_identity(slower_cartesian));
+  EXPECT_NE(baseline_identity,
+            trajectory_cache_intent_identity(tighter_blend));
 }
 
 TEST(TrajectoryCacheIntentTest,

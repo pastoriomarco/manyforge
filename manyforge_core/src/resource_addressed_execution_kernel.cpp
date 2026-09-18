@@ -497,7 +497,8 @@ select_disable_active_configurations(
 
 [[nodiscard]] StopStaticFacts derive_stop_static_facts(
     const std::vector<RuntimeParticipantExecutionRegistration>& registrations,
-    const ResourceAddressedExecutionKernelConfig& config) {
+    const ResourceAddressedExecutionKernelConfig& config,
+    const std::optional<StopDeadlineBudgetDTO>* selected_deadline_budget = nullptr) {
   std::optional<GraphRevision> graph_revision =
       registrations.empty() ? config.empty_runtime_graph_revision : config.graph_revision;
   std::optional<RetainedBundleId> retained_bundle_id;
@@ -514,7 +515,9 @@ select_disable_active_configurations(
     }
     retained_bundle_id = config.empty_runtime_retained_bundle_id;
   }
-  std::optional<StopDeadlineBudgetDTO> deadline_budget = config.cell_stop_deadline_budget;
+  std::optional<StopDeadlineBudgetDTO> deadline_budget = selected_deadline_budget == nullptr
+                                                             ? config.cell_stop_deadline_budget
+                                                             : *selected_deadline_budget;
   if (deadline_budget.has_value()) {
     deadline_budget->phases.clear();
   }
@@ -854,8 +857,28 @@ select_disable_active_configurations(
   ExecuteRequestDTO request(std::move(exact_binding));
   request.move_id = motion.move_id.value();
   request.tolerances = motion.tolerances;
-  auto effective_speed =
-      apply_runtime_participant_motion_speed_policy(runtime_policy, motion.speed_profile);
+  if (!registration.deployment_maximum_tcp_linear_speed_mps.has_value()) {
+    return reject<ExecuteRequestDTO>(
+        "motion target has no applied Deployment TCP linear-speed maximum",
+        "deployment_motion_speed_missing", ErrorCode::kMissingReference);
+  }
+  if (motion.speed_profile.max_tcp_linear_speed_mps.has_value() &&
+      *motion.speed_profile.max_tcp_linear_speed_mps >
+          *registration.deployment_maximum_tcp_linear_speed_mps) {
+    return Result<ExecuteRequestDTO>::Err(ErrorDTO{
+        std::string(to_string(ErrorCode::kExecutionRejected)),
+        "requested TCP linear speed exceeds the applied Deployment maximum",
+        {{"reason", "deployment_motion_speed_exceeded"},
+         {"controllable_component_id", binding.controllable_component_id.value()},
+         {"command_target_id", binding.command_target_id.value()},
+         {"requested_tcp_linear_speed_mps",
+          std::to_string(*motion.speed_profile.max_tcp_linear_speed_mps)},
+         {"deployment_maximum_tcp_linear_speed_mps",
+          std::to_string(*registration.deployment_maximum_tcp_linear_speed_mps)}}});
+  }
+  auto effective_speed = apply_deployment_motion_speed_limit(
+      *registration.deployment_maximum_tcp_linear_speed_mps,
+      motion.speed_profile);
   if (!effective_speed.ok()) {
     return Result<ExecuteRequestDTO>::Err(effective_speed.error());
   }
@@ -1109,7 +1132,10 @@ select_disable_active_configurations(
   return Result<PreparedMotionDiagnosticsDTO>::Ok(PreparedMotionDiagnosticsDTO{
       participant.participant_id, participant.prepared_contract_digest, motion->move_id,
       motion->trajectory.joint_names,
-      *motion->validation_evidence.noncollision_result.trajectory_metrics, motion->runtime_policy});
+      *motion->validation_evidence.noncollision_result.trajectory_metrics,
+      motion->runtime_policy, motion->requested_tcp_linear_speed_mps,
+      motion->deployment_maximum_tcp_linear_speed_mps,
+      *motion->plan_request.speed_profile.max_tcp_linear_speed_mps});
 }
 
 [[nodiscard]] Result<PreparedOperationParticipantDTO> build_prepared_capability_command_participant(
@@ -3813,7 +3839,15 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants(
     std::vector<RuntimeParticipantExecutionRegistration> registrations,
     RuntimeParticipantAdmissionResolver participant_resolver) {
   return reconfigure_runtime_participants_impl(std::move(registrations),
-                                               std::move(participant_resolver), false);
+                                               std::move(participant_resolver), false, nullptr);
+}
+
+Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_product(
+    std::vector<RuntimeParticipantExecutionRegistration> registrations,
+    RuntimeParticipantAdmissionResolver participant_resolver,
+    std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget) {
+  return reconfigure_runtime_participants_impl(
+      std::move(registrations), std::move(participant_resolver), false, &cell_stop_deadline_budget);
 }
 
 Result<void>
@@ -3894,7 +3928,8 @@ ResourceAddressedExecutionKernel::stage_current_runtime_configuration_facts_unde
 Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_impl(
     std::vector<RuntimeParticipantExecutionRegistration> registrations,
     RuntimeParticipantAdmissionResolver participant_resolver,
-    const bool retain_unready_configuration_facts) {
+    const bool retain_unready_configuration_facts,
+    const std::optional<StopDeadlineBudgetDTO>* replacement_stop_deadline_budget) {
   if (qualified_execution_engine_count(registrations) > prequalified_max_live_stop_participants_) {
     return Result<void>::Err(
         error(std::string(to_string(ErrorCode::kInvalidRequest)),
@@ -3942,10 +3977,19 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
                 return lhs.control_domain_id < rhs.control_domain_id;
               });
     if (registrations.empty()) {
-      candidate_stop_facts.emplace(StopStaticFacts{
-          *stop_retained_bundle_id_, *stop_graph_revision_, cell_stop_deadline_budget_, {}});
+      candidate_stop_facts.emplace(StopStaticFacts{*stop_retained_bundle_id_,
+                                                   *stop_graph_revision_,
+                                                   replacement_stop_deadline_budget == nullptr
+                                                       ? cell_stop_deadline_budget_
+                                                       : *replacement_stop_deadline_budget,
+                                                   {}});
     } else {
-      candidate_stop_facts.emplace(derive_stop_static_facts(registrations, config_));
+      if (replacement_stop_deadline_budget == nullptr) {
+        candidate_stop_facts.emplace(derive_stop_static_facts(registrations, config_));
+      } else {
+        candidate_stop_facts.emplace(
+            derive_stop_static_facts(registrations, config_, replacement_stop_deadline_budget));
+      }
     }
   } catch (const std::exception& exception) {
     return Result<void>::Err(error(
@@ -4121,6 +4165,9 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
       stop_retained_bundle_id_ = std::move(candidate_stop_facts->retained_bundle_id);
       stop_graph_revision_ = std::move(candidate_stop_facts->graph_revision);
       cell_stop_deadline_budget_ = std::move(candidate_stop_facts->deadline_budget);
+      if (replacement_stop_deadline_budget != nullptr) {
+        config_.cell_stop_deadline_budget = *replacement_stop_deadline_budget;
+      }
       stop_component_scope_ = std::move(candidate_stop_facts->components);
       config_.participant_resolver = std::move(participant_resolver);
       engine_subscriptions_.insert(engine_subscriptions_.end(),
@@ -4228,8 +4275,8 @@ ResourceAddressedExecutionKernel::adopt_runtime_route_configuration_predecessor(
   }
   auto staged_node = staged.extract(staged.begin());
 
-  auto reconfigured = reconfigure_runtime_participants_impl(std::move(registrations),
-                                                            std::move(participant_resolver), true);
+  auto reconfigured = reconfigure_runtime_participants_impl(
+      std::move(registrations), std::move(participant_resolver), true, nullptr);
   if (!reconfigured.ok()) {
     return Result<RuntimeRouteConfigurationReadbackDTO>::Err(reconfigured.error());
   }
@@ -4917,16 +4964,16 @@ ResourceAddressedExecutionKernel::resolve_runtime_scale_control_target_locked(
   // authored Program. Resolve a captured Program role through its immutable
   // binding to that same physical target instead of installing aliases for
   // every saved Program in the execution host.
-  if (!selected.has_value() && program_cycle_claim_run_ &&
-      program_cycle_claim_run_->capture && program_cycle_claim_run_->capture->binding &&
+  if (!selected.has_value() && program_cycle_claim_run_ && program_cycle_claim_run_->capture &&
+      program_cycle_claim_run_->capture->binding &&
       program_cycle_claim_run_->capture->program_binding_id == selector.program_binding_id) {
     const auto& capture = *program_cycle_claim_run_->capture;
-    const auto target = std::find_if(
-        capture.binding->target_role_bindings.begin(),
-        capture.binding->target_role_bindings.end(), [&](const auto& binding) {
-          return binding.component_role_id == selector.component_role_id &&
-                 binding.target_role_id == selector.target_role_id;
-        });
+    const auto target =
+        std::find_if(capture.binding->target_role_bindings.begin(),
+                     capture.binding->target_role_bindings.end(), [&](const auto& binding) {
+                       return binding.component_role_id == selector.component_role_id &&
+                              binding.target_role_id == selector.target_role_id;
+                     });
     if (target != capture.binding->target_role_bindings.end()) {
       target_found = true;
       for (const auto& registration : registrations_) {
@@ -4938,16 +4985,15 @@ ResourceAddressedExecutionKernel::resolve_runtime_scale_control_target_locked(
           continue;
         const auto& control = *binding.control_path;
         const auto& qualification = *control.runtime_scale_qualification;
-        RuntimeScaleControlResolution candidate{
-            selector,
-            control.control_domain_id,
-            control.control_domain_revision,
-            control.control_binding_id,
-            control.control_binding_revision,
-            qualification.scaling_domain_id,
-            control.active_control_configuration_id,
-            control.active_control_configuration_generation,
-            qualification.coordinated_barrier_id};
+        RuntimeScaleControlResolution candidate{selector,
+                                                control.control_domain_id,
+                                                control.control_domain_revision,
+                                                control.control_binding_id,
+                                                control.control_binding_revision,
+                                                qualification.scaling_domain_id,
+                                                control.active_control_configuration_id,
+                                                control.active_control_configuration_generation,
+                                                qualification.coordinated_barrier_id};
         if (selected && *selected != candidate) {
           return reject<RuntimeScaleControlResolution>(
               "captured runtime-scale target resolves to more than one control scope",
@@ -4995,9 +5041,9 @@ ResourceAddressedExecutionKernel::resolve_runtime_scale_control_locked(
     if (std::adjacent_find(scope.members.begin(), scope.members.end(),
                            [](const auto& a, const auto& b) { return a.same_control_scope(b); }) !=
         scope.members.end()) {
-      return reject<RuntimeScaleControlScope>(
-          "group velocity targets alias the same control scope",
-          "runtime_scale_group_member_duplicate", ErrorCode::kInvalidRequest);
+      return reject<RuntimeScaleControlScope>("group velocity targets alias the same control scope",
+                                              "runtime_scale_group_member_duplicate",
+                                              ErrorCode::kInvalidRequest);
     }
   }
   return Result<RuntimeScaleControlScope>::Ok(std::move(scope));
@@ -5075,6 +5121,16 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
                               : setting->generation;
   const auto requested_scale =
       setting == runtime_scale_control_settings_.end() ? 1.0 : setting->requested_scale;
+  const auto member_effective_scale = [&](const RuntimeScaleControlResolution& member) {
+    const auto effective = std::find_if(
+        runtime_scale_control_settings_.begin(), runtime_scale_control_settings_.end(),
+        [&](const RuntimeScaleControlSetting& candidate) {
+          return candidate.resolution.members.size() == 1U &&
+                 candidate.resolution.members.front().same_control_scope(member);
+        });
+    return effective == runtime_scale_control_settings_.end() ? 1.0
+                                                              : effective->requested_scale;
+  };
 
   const auto matches_scope = [&](const RuntimeParticipantBindingDTO& binding) {
     if (!binding.control_path || !binding.control_path->runtime_scale_qualification) return false;
@@ -5119,15 +5175,15 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
   if (present_group && !group && active.size() == 1U &&
       active.front()->intent.coordination_policy == OperationCoordinationPolicy::kCoordinatedAll &&
       active.front()->participants.size() > 1U &&
-      std::all_of(active.front()->participants.begin(), active.front()->participants.end(), [](const auto& row) {
-        return row.payload_kind == OperationParticipantPayloadKind::kMotion;
-      })) {
+      std::all_of(active.front()->participants.begin(), active.front()->participants.end(),
+                  [](const auto& row) {
+                    return row.payload_kind == OperationParticipantPayloadKind::kMotion;
+                  })) {
     RuntimeScaleControlSelectorDTO group_selector{active.front()->intent.program_binding_id,
                                                   ComponentRoleId(""), TargetRoleId("")};
     for (const auto& participant : active.front()->participants) {
       const auto& binding = participant.binding.value();
-      group_selector.group_targets.push_back(
-          {binding.component_role_id, binding.target_role_id});
+      group_selector.group_targets.push_back({binding.component_role_id, binding.target_role_id});
     }
     return runtime_scale_control_locked(group_selector, false);
   }
@@ -5136,8 +5192,8 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
   // its one authoritative velocity setting when the selected target belongs
   // to exactly one current multi-motion group. The target set is derived from
   // the sealed Program capture; the browser never invents group membership.
-  if (present_group && !group && program_cycle_claim_run_ &&
-      program_cycle_claim_run_->capture && !active.empty()) {
+  if (present_group && !group && program_cycle_claim_run_ && program_cycle_claim_run_->capture &&
+      !active.empty()) {
     const auto& capture = *program_cycle_claim_run_->capture;
     std::optional<std::uint32_t> selected_node;
     for (const auto* operation : active) {
@@ -5152,10 +5208,10 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
         const auto& execution_scope =
             operation->intent.participants[participant_index].execution_scope;
         if (!execution_scope) continue;
-        const auto node = std::lower_bound(
-            capture.table->nodes.begin(), capture.table->nodes.end(),
-            execution_scope->node_instance_id,
-            [](const auto& row, const auto& id) { return row.instance_id < id; });
+        const auto node =
+            std::lower_bound(capture.table->nodes.begin(), capture.table->nodes.end(),
+                             execution_scope->node_instance_id,
+                             [](const auto& row, const auto& id) { return row.instance_id < id; });
         if (node != capture.table->nodes.end() &&
             node->instance_id == execution_scope->node_instance_id) {
           selected_node = static_cast<std::uint32_t>(node - capture.table->nodes.begin());
@@ -5178,8 +5234,8 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
       }
     }
     if (selected_group != nullptr) {
-      RuntimeScaleControlSelectorDTO group_selector{capture.program_binding_id,
-                                                    ComponentRoleId(""), TargetRoleId("")};
+      RuntimeScaleControlSelectorDTO group_selector{capture.program_binding_id, ComponentRoleId(""),
+                                                    TargetRoleId("")};
       for (const auto node_index : selected_group->node_indices) {
         const auto& node = capture.table->nodes[node_index];
         for (const auto& effect : node.target_effects) {
@@ -5188,9 +5244,8 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
             continue;
           const auto target = std::find_if(
               capture.binding->target_role_bindings.begin(),
-              capture.binding->target_role_bindings.end(), [&](const auto& binding) {
-                return binding.target_role_id == effect.target_role_id;
-              });
+              capture.binding->target_role_bindings.end(),
+              [&](const auto& binding) { return binding.target_role_id == effect.target_role_id; });
           if (target == capture.binding->target_role_bindings.end()) continue;
           group_selector.group_targets.push_back(
               {target->component_role_id, target->target_role_id});
@@ -5247,6 +5302,16 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
            member.active_control_configuration_id,
            member.active_control_configuration_generation});
     }
+    const auto first_effective = member_effective_scale(scope.members.front());
+    if (std::all_of(scope.members.begin(), scope.members.end(), [&](const auto& member) {
+          return std::abs(member_effective_scale(member) - first_effective) <= 1e-12;
+        })) {
+      status.effective_scale = first_effective;
+    } else {
+      // A null effective value with an applied state explicitly means that
+      // the member settings are mixed, not that evidence is unavailable.
+      status.application_state = RuntimeScaleApplicationState::kApplied;
+    }
   }
   if (!group && active.size() > 1U) {
     status.frozen = true;
@@ -5265,14 +5330,17 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
       status.application_state = active.front()->runtime_scale_status->state;
     }
   } else if (group && !active.empty()) {
-    const auto first_scale = active.front()->runtime_scale_status
-                                 ? std::optional(active.front()->runtime_scale_status->effective_scale)
-                                 : std::nullopt;
+    const auto first_scale =
+        active.front()->runtime_scale_status
+            ? std::optional(active.front()->runtime_scale_status->effective_scale)
+            : std::nullopt;
     if (first_scale && std::all_of(active.begin(), active.end(), [&](const auto* operation) {
           return operation->runtime_scale_status &&
                  std::abs(operation->runtime_scale_status->effective_scale - *first_scale) <= 1e-12;
         }))
       status.effective_scale = *first_scale;
+    else
+      status.effective_scale.reset();
     if (std::any_of(active.begin(), active.end(), [](const auto* operation) {
           return operation->runtime_scale_status &&
                  operation->runtime_scale_status->state == RuntimeScaleApplicationState::kFailed;
@@ -5285,8 +5353,8 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
              }))
       status.application_state = RuntimeScaleApplicationState::kRejected;
     else if (std::any_of(active.begin(), active.end(), [](const auto* operation) {
-               return operation->runtime_scale_status &&
-                      operation->runtime_scale_status->state == RuntimeScaleApplicationState::kPending;
+               return operation->runtime_scale_status && operation->runtime_scale_status->state ==
+                                                             RuntimeScaleApplicationState::kPending;
              }))
       status.application_state = RuntimeScaleApplicationState::kPending;
     else
@@ -5325,7 +5393,8 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
                           "runtime-scale control is frozen while Stop is active",
                           "runtime_scale_control_stop_active");
   } else if (!group &&
-             active.front()->intent.coordination_policy == OperationCoordinationPolicy::kCoordinatedAll &&
+             active.front()->intent.coordination_policy ==
+                 OperationCoordinationPolicy::kCoordinatedAll &&
              active.front()->participants.size() > 1U) {
     status.frozen = true;
     status.reason = error(std::string(to_string(ErrorCode::kInvalidStateTransition)),
@@ -5344,15 +5413,18 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
                           "velocity group overlaps a different active execution scope",
                           "runtime_scale_group_scope_busy");
   } else if (group && active.size() == 1U &&
-             active.front()->intent.coordination_policy == OperationCoordinationPolicy::kCoordinatedAll) {
+             active.front()->intent.coordination_policy ==
+                 OperationCoordinationPolicy::kCoordinatedAll) {
     const auto* coordinated = active.front();
-    const auto shared = coordinated->common_timing ? coordinated->common_timing->execution_clock() : nullptr;
+    const auto shared =
+        coordinated->common_timing ? coordinated->common_timing->execution_clock() : nullptr;
     const auto now = clock_.now();
     const auto expected_state = coordinated->state.state;
-    bool ready = (expected_state == OperationStateKind::kExecuting ||
-                  expected_state == OperationStateKind::kPaused) &&
-                 shared && shared->sample_now() && coordinated->runtime_scale_status &&
-                 coordinated->runtime_scale_status->participants.size() == coordinated->participants.size();
+    bool ready =
+        (expected_state == OperationStateKind::kExecuting ||
+         expected_state == OperationStateKind::kPaused) &&
+        shared && shared->sample_now() && coordinated->runtime_scale_status &&
+        coordinated->runtime_scale_status->participants.size() == coordinated->participants.size();
     for (std::size_t index = 0; ready && index < coordinated->participants.size(); ++index) {
       const auto& row = coordinated->runtime_scale_status->participants[index];
       const auto freshness = coordinated->participants[index]
@@ -5691,9 +5763,12 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                   control.active_control_configuration_generation,
                                   control.containment_granularity};
   std::optional<ExecuteRequestDTO> motion_request;
+  std::optional<double> requested_tcp_linear_speed_mps;
   std::optional<GripperCommandRequestDTO> command_request;
   if (payload_kind == OperationParticipantPayloadKind::kMotion) {
     const auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
+    requested_tcp_linear_speed_mps =
+        motion.speed_profile.max_tcp_linear_speed_mps;
     double initial_runtime_scale = 1.0;
     {
       std::lock_guard state_lock(state_mutex_);
@@ -6071,6 +6146,8 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
         resolved.value().binding,
         *resolved.value().stop_readiness,
         *resolved.value().runtime_policy,
+        requested_tcp_linear_speed_mps,
+        *resolved.value().deployment_maximum_tcp_linear_speed_mps,
         resolved.value().retained_default_stop_limits,
         resolved.value().stop_node_category,
         retained_stop_plan,
@@ -6243,6 +6320,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     RuntimeParticipantExecutionRegistration registration;
     OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
     std::optional<ExecuteRequestDTO> motion_request;
+    std::optional<double> requested_tcp_linear_speed_mps;
     std::optional<GripperCommandRequestDTO> command_request;
     std::shared_ptr<const PreparedOperationParticipantDTO> prepared_command_product;
     std::shared_ptr<const PreparedParticipantStopPlanDTO> stop_plan;
@@ -6273,8 +6351,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     RuntimeScaleControlSelectorDTO selector{intent.program_binding_id, ComponentRoleId(""),
                                             TargetRoleId("")};
     for (const auto& participant : intent.participants) {
-      selector.group_targets.push_back(
-          {participant.component_role_id, participant.target_role_id});
+      selector.group_targets.push_back({participant.component_role_id, participant.target_role_id});
     }
     std::lock_guard state_lock(state_mutex_);
     auto scope = resolve_runtime_scale_control_locked(selector);
@@ -6370,9 +6447,12 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     const ControllerGoalGeneration controller_goal_generation(1U);
     const auto& participant_intent = intent.participants[index];
     std::optional<ExecuteRequestDTO> motion_request;
+    std::optional<double> requested_tcp_linear_speed_mps;
     std::optional<GripperCommandRequestDTO> command_request;
     if (payload_kind == OperationParticipantPayloadKind::kMotion) {
       const auto& motion = std::get<MotionParticipantIntentDTO>(participant_intent.payload);
+      requested_tcp_linear_speed_mps =
+          motion.speed_profile.max_tcp_linear_speed_mps;
       double initial_runtime_scale = 1.0;
       {
         std::lock_guard state_lock(state_mutex_);
@@ -6522,6 +6602,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     reservation_rows.push_back(reservation);
     admissions.push_back(
         PreparedAdmission{std::move(registration), payload_kind, std::move(motion_request),
+                          requested_tcp_linear_speed_mps,
                           std::move(command_request), std::move(prepared_command_product),
                           std::move(retained_stop_plan), std::move(retained_fault_stop_plan)});
   }
@@ -6785,6 +6866,8 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
             ResolvedPreparedMotionExecutionRequestDTO{
                 *admission.motion_request, operation_revision, admission.registration.binding,
                 *admission.registration.stop_readiness, *admission.registration.runtime_policy,
+                admission.requested_tcp_linear_speed_mps,
+                *admission.registration.deployment_maximum_tcp_linear_speed_mps,
                 admission.registration.retained_default_stop_limits,
                 admission.registration.stop_node_category, admission.stop_plan,
                 admission.fault_stop_plan, std::move(continuation), common_timing});
@@ -8406,8 +8489,15 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
            program_cycle_claim_run_->program_revision == capture.program_revision;
   };
   std::optional<ProgramRunExecutionCaptureDTO> previous;
-  std::vector<ProgramNodeHoldStateDTO> node_states(capture.table->nodes.size(),
-                                                   ProgramNodeHoldStateDTO::kRunning);
+  std::vector<ProgramNodeHoldStateDTO> node_states;
+  node_states.reserve(capture.table->nodes.size());
+  for (const auto& node : capture.table->nodes) {
+    const bool effectful = std::any_of(
+        node.target_effects.begin(), node.target_effects.end(),
+        [](const auto& effect) { return effect.effectful; });
+    node_states.push_back(effectful ? ProgramNodeHoldStateDTO::kReady
+                                    : ProgramNodeHoldStateDTO::kRunning);
+  }
   std::vector<std::shared_ptr<const ProgramCycleClaimRun::MotionContinuation>> continuations(
       capture.table->nodes.size());
   {
@@ -9128,6 +9218,55 @@ void ResourceAddressedExecutionKernel::reduce_program_selection_stop_locked(
   }
 }
 
+Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::start_program_selection(
+    const ProgramExecutionSelectionRequestDTO& request,
+    const std::uint64_t expected_selection_revision) {
+  std::unique_lock admission_lock(*admission_mutex_, std::try_to_lock);
+  if (!admission_lock.owns_lock()) {
+    return reject<ProgramExecutionScopeStateDTO>("ordinary admission is still in flight",
+                                                 "program_run_admission_in_flight",
+                                                 ErrorCode::kInvalidStateTransition);
+  }
+  std::lock_guard state_lock(state_mutex_);
+  auto selection = resolve_program_selection_locked(request);
+  if (!selection.ok()) return Result<ProgramExecutionScopeStateDTO>::Err(selection.error());
+  auto fence =
+      std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
+                   [&](const auto& row) { return row.program_run_id == request.program_run_id; });
+  if (fence == program_run_stop_fences_.end() ||
+      fence->selection_revision != expected_selection_revision ||
+      fence->selection_revision >= kMaximumKernelJsonInteger) {
+    return reject<ProgramExecutionScopeStateDTO>(
+        "Program selection changed after initial Run was prepared",
+        "program_selection_revision_stale", ErrorCode::kInvalidStateTransition);
+  }
+  if (motion_admission_closed_ || motion_admission_unreconciled_ ||
+      pending_program_run_admission_ == request.program_run_id || fence->stop_id.has_value()) {
+    return reject<ProgramExecutionScopeStateDTO>("Program admission or containment has not settled",
+                                                 "program_selection_not_releasable",
+                                                 ErrorCode::kInvalidStateTransition);
+  }
+  std::erase_if(selection.value(), [&](const auto index) {
+    return fence->node_states[index] == ProgramNodeHoldStateDTO::kRunning;
+  });
+  if (selection.value().empty()) {
+    return reject<ProgramExecutionScopeStateDTO>("Selected scope is not Ready",
+                                                 "program_selection_not_ready",
+                                                 ErrorCode::kInvalidStateTransition);
+  }
+  if (std::any_of(selection.value().begin(), selection.value().end(), [&](const auto index) {
+        return fence->node_states[index] != ProgramNodeHoldStateDTO::kReady;
+      })) {
+    return reject<ProgramExecutionScopeStateDTO>(
+        "Initial Run accepts only Ready Program nodes", "program_selection_not_ready",
+        ErrorCode::kInvalidStateTransition);
+  }
+  for (const auto index : selection.value())
+    fence->node_states[index] = ProgramNodeHoldStateDTO::kRunning;
+  ++fence->selection_revision;
+  return Result<ProgramExecutionScopeStateDTO>::Ok(program_execution_scope_locked(*fence));
+}
+
 Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_program_selection(
     const ProgramExecutionSelectionRequestDTO& request,
     const std::uint64_t expected_selection_revision) {
@@ -9174,11 +9313,10 @@ Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_
                                                  ErrorCode::kInvalidStateTransition);
   }
   for (const auto index : selection.value()) {
-    if (fence->node_states[index] == ProgramNodeHoldStateDTO::kStopping ||
-        fence->node_states[index] == ProgramNodeHoldStateDTO::kFaulted) {
-      return reject<ProgramExecutionScopeStateDTO>("Selected effects are unresolved or faulted",
-                                                   "program_selection_not_releasable",
-                                                   ErrorCode::kInvalidStateTransition);
+    if (fence->node_states[index] != ProgramNodeHoldStateDTO::kHeld) {
+      return reject<ProgramExecutionScopeStateDTO>(
+          "Resume accepts only settled ordinary-Stop holds",
+          "program_selection_not_releasable", ErrorCode::kInvalidStateTransition);
     }
   }
   const auto& nodes = program_cycle_claim_run_->capture->table->nodes;
@@ -13425,26 +13563,6 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
     const auto current_generation = setting == runtime_scale_control_settings_.end()
                                         ? RuntimeScaleControlGeneration(0U)
                                         : setting->generation;
-    if (setting == runtime_scale_control_settings_.end() &&
-        runtime_scale_control_settings_.size() >=
-            registrations_.size() + kMaxProgramExecutionGroups) {
-      return reject<RuntimeScaleControlAcceptedDTO>(
-          "runtime-scale control setting capacity is exhausted",
-          "runtime_scale_control_capacity_exhausted", ErrorCode::kInvalidStateTransition);
-    }
-    if (setting == runtime_scale_control_settings_.end()) {
-      auto remaining_members = kMaxProgramExecutionMemberships - resolved.value().members.size();
-      for (const auto& retained : runtime_scale_control_settings_) {
-        // The same portable selector replaces its stale resolved setting below.
-        if (retained.resolution.selector == request.selector) continue;
-        if (retained.resolution.members.size() > remaining_members) {
-          return reject<RuntimeScaleControlAcceptedDTO>(
-              "runtime-scale control membership capacity is exhausted",
-              "runtime_scale_control_capacity_exhausted", ErrorCode::kInvalidStateTransition);
-        }
-        remaining_members -= retained.resolution.members.size();
-      }
-    }
     if (current_generation != request.expected_control_generation) {
       return reject<RuntimeScaleControlAcceptedDTO>("runtime-scale control generation is stale",
                                                     "runtime_scale_control_generation_stale");
@@ -13453,6 +13571,58 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
       return reject<RuntimeScaleControlAcceptedDTO>(
           "runtime-scale control generation space is exhausted",
           "runtime_scale_control_generation_exhausted", ErrorCode::kInternalError);
+    }
+
+    // Validate the exact scope setting plus the per-member effective settings
+    // as one bounded atomic update. Aggregate selectors retain their own
+    // generation for replay while writing through to the singular settings
+    // used to seed later independent motions.
+    std::vector<RuntimeScaleControlScope> target_settings;
+    target_settings.reserve(resolved.value().members.size() + 1U);
+    target_settings.push_back(resolved.value());
+    if (resolved.value().members.size() > 1U) {
+      for (const auto& member : resolved.value().members) {
+        target_settings.push_back(RuntimeScaleControlScope{member.selector, {member}});
+      }
+    }
+    auto projected_setting_count = runtime_scale_control_settings_.size();
+    auto projected_memberships = std::accumulate(
+        runtime_scale_control_settings_.begin(), runtime_scale_control_settings_.end(),
+        std::size_t{0U}, [](const std::size_t total, const RuntimeScaleControlSetting& retained) {
+          return total + retained.resolution.members.size();
+        });
+    for (const auto& target : target_settings) {
+      const auto same_scope = std::find_if(
+          runtime_scale_control_settings_.begin(), runtime_scale_control_settings_.end(),
+          [&](const RuntimeScaleControlSetting& retained) {
+            return retained.resolution.same_control_scope(target);
+          });
+      if (same_scope != runtime_scale_control_settings_.end()) {
+        if (target.members.size() == 1U &&
+            same_scope->generation.value() == std::numeric_limits<std::uint64_t>::max()) {
+          return reject<RuntimeScaleControlAcceptedDTO>(
+              "runtime-scale member generation space is exhausted",
+              "runtime_scale_control_generation_exhausted", ErrorCode::kInternalError);
+        }
+        continue;
+      }
+      const auto same_selector = std::find_if(
+          runtime_scale_control_settings_.begin(), runtime_scale_control_settings_.end(),
+          [&](const RuntimeScaleControlSetting& retained) {
+            return retained.resolution.selector == target.selector;
+          });
+      if (same_selector == runtime_scale_control_settings_.end()) {
+        ++projected_setting_count;
+      } else {
+        projected_memberships -= same_selector->resolution.members.size();
+      }
+      projected_memberships += target.members.size();
+    }
+    if (projected_setting_count > registrations_.size() + kMaxProgramExecutionGroups ||
+        projected_memberships > kMaxProgramExecutionMemberships) {
+      return reject<RuntimeScaleControlAcceptedDTO>(
+          "runtime-scale control setting capacity is exhausted",
+          "runtime_scale_control_capacity_exhausted", ErrorCode::kInvalidStateTransition);
     }
   }
 
@@ -13496,42 +13666,65 @@ Result<RuntimeScaleControlAcceptedDTO> ResourceAddressedExecutionKernel::set_run
           "runtime-scale control changed while its live effect was applied",
           "runtime_scale_control_generation_stale");
     }
-    if (setting == runtime_scale_control_settings_.end()) {
-      // One portable selector has one current setting. A group setting and
-      // its members' individual settings are distinct: group execution uses
-      // the exact group scope, while ordinary execution keeps each member's
-      // own value.
-      std::erase_if(runtime_scale_control_settings_, [&](const auto& candidate) {
-        return candidate.resolution.selector == request.selector;
-      });
-      runtime_scale_control_settings_.push_back(
-          RuntimeScaleControlSetting{resolved.value(), accepted.control_generation, request.scale});
-    } else {
-      setting->resolution = resolved.value();
-      setting->generation = accepted.control_generation;
-      setting->requested_scale = request.scale;
+    const auto upsert_setting = [&](RuntimeScaleControlScope resolution,
+                                    const RuntimeScaleControlGeneration generation) {
+      auto retained = std::find_if(
+          runtime_scale_control_settings_.begin(), runtime_scale_control_settings_.end(),
+          [&](const RuntimeScaleControlSetting& candidate) {
+            return candidate.resolution.same_control_scope(resolution);
+          });
+      if (retained == runtime_scale_control_settings_.end()) {
+        // A portable selector replaces a stale route resolution instead of
+        // accumulating aliases as control configurations change.
+        std::erase_if(runtime_scale_control_settings_, [&](const auto& candidate) {
+          return candidate.resolution.selector == resolution.selector;
+        });
+        runtime_scale_control_settings_.push_back(
+            RuntimeScaleControlSetting{std::move(resolution), generation, request.scale});
+      } else {
+        retained->resolution = std::move(resolution);
+        retained->generation = generation;
+        retained->requested_scale = request.scale;
+      }
+    };
+    upsert_setting(resolved.value(), accepted.control_generation);
+    if (resolved.value().members.size() > 1U) {
+      for (const auto& member : resolved.value().members) {
+        RuntimeScaleControlScope singular{member.selector, {member}};
+        const auto retained = std::find_if(
+            runtime_scale_control_settings_.begin(), runtime_scale_control_settings_.end(),
+            [&](const RuntimeScaleControlSetting& candidate) {
+              return candidate.resolution.same_control_scope(singular);
+            });
+        const auto generation = retained == runtime_scale_control_settings_.end()
+                                    ? RuntimeScaleControlGeneration(1U)
+                                    : RuntimeScaleControlGeneration(retained->generation.value() + 1U);
+        upsert_setting(std::move(singular), generation);
+      }
     }
     const auto matches_scope = [&](const RuntimeParticipantBindingDTO& binding) {
       if (!binding.control_path || !binding.control_path->runtime_scale_qualification) return false;
       const auto& control = *binding.control_path;
       const auto& qualification = *control.runtime_scale_qualification;
-      return std::any_of(resolved.value().members.begin(), resolved.value().members.end(),
-                         [&](const auto& member) {
-                           return control.control_domain_id == member.control_domain_id &&
-                                  control.control_domain_revision == member.control_domain_revision &&
-                                  control.control_binding_id == member.control_binding_id &&
-                                  control.control_binding_revision == member.control_binding_revision &&
-                                  qualification.scaling_domain_id == member.scaling_domain_id &&
-                                  control.active_control_configuration_id ==
-                                      member.active_control_configuration_id &&
-                                  control.active_control_configuration_generation ==
-                                      member.active_control_configuration_generation;
-                         });
+      return std::any_of(
+          resolved.value().members.begin(), resolved.value().members.end(),
+          [&](const auto& member) {
+            return control.control_domain_id == member.control_domain_id &&
+                   control.control_domain_revision == member.control_domain_revision &&
+                   control.control_binding_id == member.control_binding_id &&
+                   control.control_binding_revision == member.control_binding_revision &&
+                   qualification.scaling_domain_id == member.scaling_domain_id &&
+                   control.active_control_configuration_id ==
+                       member.active_control_configuration_id &&
+                   control.active_control_configuration_generation ==
+                       member.active_control_configuration_generation;
+          });
     };
     for (const auto& [operation_id, operation] : active_operations_) {
       if (terminal(operation->state.state) || !operation->runtime_scale_status) continue;
       const bool selected = std::any_of(
-          operation->participants.begin(), operation->participants.end(), [&](const auto& participant) {
+          operation->participants.begin(), operation->participants.end(),
+          [&](const auto& participant) {
             return participant.payload_kind == OperationParticipantPayloadKind::kMotion &&
                    matches_scope(participant.binding.value());
           });

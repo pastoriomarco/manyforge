@@ -340,36 +340,36 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def(py::init([](std::vector<manyforge::core::Pose3DTO> waypoints,
                        double max_translation_step_m, double max_rotation_step_rad,
                        manyforge::core::CartesianSpeedModeDTO speed_mode,
-                       double max_linear_speed_mps, double max_angular_speed_rad_s,
+                       double max_angular_speed_rad_s,
                        double max_linear_acceleration_mps2, double max_angular_acceleration_rad_s2,
-                       manyforge::core::CartesianFallbackPolicyDTO fallback_policy) {
+                       manyforge::core::CartesianFallbackPolicyDTO fallback_policy,
+                       double max_blend_deviation_rad) {
              manyforge::core::CartesianPathDTO path;
              path.waypoints = std::move(waypoints);
              path.max_translation_step_m = max_translation_step_m;
              path.max_rotation_step_rad = max_rotation_step_rad;
              path.speed_mode = speed_mode;
-             path.max_linear_speed_mps = max_linear_speed_mps;
              path.max_angular_speed_rad_s = max_angular_speed_rad_s;
              path.max_linear_acceleration_mps2 = max_linear_acceleration_mps2;
              path.max_angular_acceleration_rad_s2 = max_angular_acceleration_rad_s2;
              path.fallback_policy = fallback_policy;
+             path.max_blend_deviation_rad = max_blend_deviation_rad;
              return path;
            }),
            py::arg("waypoints"), py::arg("max_translation_step_m") = 0.005,
            py::arg("max_rotation_step_rad") = 0.05,
            py::arg("speed_mode") = manyforge::core::CartesianSpeedModeDTO::kBounded,
-           py::arg("max_linear_speed_mps") = 0.1, py::arg("max_angular_speed_rad_s") = 0.5,
+           py::arg("max_angular_speed_rad_s") = 0.5,
            py::arg("max_linear_acceleration_mps2") = 0.5,
            py::arg("max_angular_acceleration_rad_s2") = 2.5,
-           py::arg("fallback_policy") = manyforge::core::CartesianFallbackPolicyDTO::kFailClosed)
+           py::arg("fallback_policy") = manyforge::core::CartesianFallbackPolicyDTO::kFailClosed,
+           py::arg("max_blend_deviation_rad") = 0.01)
       .def_readwrite("waypoints", &manyforge::core::CartesianPathDTO::waypoints)
       .def_readwrite("max_translation_step_m",
                      &manyforge::core::CartesianPathDTO::max_translation_step_m)
       .def_readwrite("max_rotation_step_rad",
                      &manyforge::core::CartesianPathDTO::max_rotation_step_rad)
       .def_readwrite("speed_mode", &manyforge::core::CartesianPathDTO::speed_mode)
-      .def_readwrite("max_linear_speed_mps",
-                     &manyforge::core::CartesianPathDTO::max_linear_speed_mps)
       .def_readwrite("max_angular_speed_rad_s",
                      &manyforge::core::CartesianPathDTO::max_angular_speed_rad_s)
       .def_readwrite("max_linear_acceleration_mps2",
@@ -377,6 +377,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def_readwrite("max_angular_acceleration_rad_s2",
                      &manyforge::core::CartesianPathDTO::max_angular_acceleration_rad_s2)
       .def_readwrite("fallback_policy", &manyforge::core::CartesianPathDTO::fallback_policy)
+      .def_readwrite("max_blend_deviation_rad",
+                     &manyforge::core::CartesianPathDTO::max_blend_deviation_rad)
       .def("__repr__", [](const manyforge::core::CartesianPathDTO& c) {
         return py::str(
                    "CartesianPathDTO(waypoints={}, max_translation_step_m={}, "
@@ -436,6 +438,38 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def_readonly("nominal_time_multiplier",
                     &manyforge::core::TrajectoryRuntimeScaleBoundsDTO::nominal_time_multiplier);
 
+  py::class_<manyforge::core::CartesianFidelityMetricsDTO>(m, "CartesianFidelityMetricsDTO")
+      .def(py::init<>())
+      .def_readwrite(
+          "requested_translation_tolerance_m",
+          &manyforge::core::CartesianFidelityMetricsDTO::requested_translation_tolerance_m)
+      .def_readwrite(
+          "requested_rotation_tolerance_rad",
+          &manyforge::core::CartesianFidelityMetricsDTO::requested_rotation_tolerance_rad)
+      .def_readwrite(
+          "measured_max_translation_error_m",
+          &manyforge::core::CartesianFidelityMetricsDTO::measured_max_translation_error_m)
+      .def_readwrite("measured_max_rotation_error_rad",
+                     &manyforge::core::CartesianFidelityMetricsDTO::measured_max_rotation_error_rad)
+      .def_readwrite("unsampled_translation_bound_m",
+                     &manyforge::core::CartesianFidelityMetricsDTO::unsampled_translation_bound_m)
+      .def_readwrite("unsampled_rotation_bound_rad",
+                     &manyforge::core::CartesianFidelityMetricsDTO::unsampled_rotation_bound_rad)
+      .def_readwrite(
+          "certified_max_translation_error_m",
+          &manyforge::core::CartesianFidelityMetricsDTO::certified_max_translation_error_m)
+      .def_readwrite(
+          "certified_max_rotation_error_rad",
+          &manyforge::core::CartesianFidelityMetricsDTO::certified_max_rotation_error_rad)
+      .def_readwrite(
+          "requested_max_blend_deviation_rad",
+          &manyforge::core::CartesianFidelityMetricsDTO::requested_max_blend_deviation_rad)
+      .def_readwrite(
+          "accepted_max_blend_deviation_rad",
+          &manyforge::core::CartesianFidelityMetricsDTO::accepted_max_blend_deviation_rad)
+      .def_readwrite("planning_attempt_count",
+                     &manyforge::core::CartesianFidelityMetricsDTO::planning_attempt_count);
+
   py::class_<manyforge::core::TrajectoryDTO>(m, "TrajectoryDTO")
       .def(py::init<>())
       .def(py::init<std::vector<manyforge::core::ResourceId>, std::vector<std::string>,
@@ -447,6 +481,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def_readwrite("runtime_scale_bounds", &manyforge::core::TrajectoryDTO::runtime_scale_bounds)
       .def_readwrite("cartesian_waypoint_times_s",
                      &manyforge::core::TrajectoryDTO::cartesian_waypoint_times_s)
+      .def_readwrite("cartesian_fidelity_metrics",
+                     &manyforge::core::TrajectoryDTO::cartesian_fidelity_metrics)
       .def("empty", &manyforge::core::TrajectoryDTO::empty)
       .def("__repr__", [](const manyforge::core::TrajectoryDTO& t) {
         return py::str("TrajectoryDTO(joint_names={}, waypoints={})")
@@ -577,21 +613,20 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             .format(v.max_tcp_linear_speed_mps, v.tcp_frame, v.base_frame, v.run_collision_checks);
       });
 
-  py::class_<manyforge::core::TrajectoryValidationMetricsDTO>(
-      m, "TrajectoryValidationMetricsDTO")
+  py::class_<manyforge::core::TrajectoryValidationMetricsDTO>(m, "TrajectoryValidationMetricsDTO")
       .def(py::init<>())
-      .def_readwrite(
-          "trajectory_duration_s",
-          &manyforge::core::TrajectoryValidationMetricsDTO::trajectory_duration_s)
+      .def_readwrite("trajectory_duration_s",
+                     &manyforge::core::TrajectoryValidationMetricsDTO::trajectory_duration_s)
       .def_readwrite(
           "peak_abs_joint_velocity_rad_s",
           &manyforge::core::TrajectoryValidationMetricsDTO::peak_abs_joint_velocity_rad_s)
       .def_readwrite(
           "peak_abs_joint_acceleration_rad_s2",
           &manyforge::core::TrajectoryValidationMetricsDTO::peak_abs_joint_acceleration_rad_s2)
-      .def_readwrite(
-          "peak_tcp_linear_speed_mps",
-          &manyforge::core::TrajectoryValidationMetricsDTO::peak_tcp_linear_speed_mps);
+      .def_readwrite("peak_tcp_linear_speed_mps",
+                     &manyforge::core::TrajectoryValidationMetricsDTO::peak_tcp_linear_speed_mps)
+      .def_readwrite("cartesian_fidelity_metrics",
+                     &manyforge::core::TrajectoryValidationMetricsDTO::cartesian_fidelity_metrics);
 
   py::class_<manyforge::core::ValidationResultDTO>(m, "ValidationResultDTO")
       .def(py::init<>())

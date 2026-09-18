@@ -930,6 +930,15 @@ def test_new_draft_is_fresh_empty_authoring_and_clears_saved_identity() -> None:
     assert authoring["program_id"].startswith("program-")
     assert len(authoring["program_id"]) == len("program-") + 32
     assert authoring["forest"] == []
+    assert {
+        row["parameter_id"]: row["default"] for row in authoring["parameters"]
+    } == {
+        "acceleration_scale": 1.0,
+        "max_blend_deviation_rad": 0.01,
+        "max_tcp_linear_speed_mps": 0.1,
+        "translation_tol_m": 0.005,
+        "velocity_scale": 1.0,
+    }
     assert created["draft"]["diagnostics"] == [{
         "code": "authoring_forest_root_count",
         "path": "forest",
@@ -1077,21 +1086,39 @@ def test_node_execution_groups_use_existing_draft_policy_validation() -> None:
     session = ComposerDraftSession(_program())
     arguments = {**_node_policy_arguments(session), "execution_groups": ["robot_a", "all_grippers"]}
     result = _mutate(session, "program_draft_update_node_policies", arguments)
-    node = result.snapshot["program"]["tree"]["children"][0]
+    node = result.snapshot["authoring"]["forest"][0]["children"][0]
     assert node["execution_groups"] == ["all_grippers", "robot_a"]
-    assert Program.from_dict(result.snapshot["program"], build_node_environment().catalog)
+    assert result.snapshot["program"] is None
+    assert result.snapshot["candidate_available"] is False
+    assert any(
+        diagnostic["path"] == "execution_groups"
+        for diagnostic in result.snapshot["diagnostics"]
+    )
 
     # Other policy changes preserve membership unless it is explicitly supplied.
     result = _mutate(session, "program_draft_update_node_policies", _node_policy_arguments(session))
-    assert result.snapshot["program"]["tree"]["children"][0]["execution_groups"] == node["execution_groups"]
+    assert result.snapshot["authoring"]["forest"][0]["children"][0][
+        "execution_groups"
+    ] == node["execution_groups"]
     before = session.snapshot()
     for groups in ([], ["all"], ["robot_a", "robot_a"], ["Robot A"], None):
         with pytest.raises(DraftSessionError, match="execution_groups"):
-            _mutate(session, "program_draft_update_node_policies", {**arguments, "execution_groups": groups})
+            _mutate(
+                session,
+                "program_draft_update_node_policies",
+                {**arguments, "execution_groups": groups},
+            )
         assert session.snapshot() == before
     for groups in ("all", "inherit"):
-        result = _mutate(session, "program_draft_update_node_policies", {**arguments, "execution_groups": groups})
-        assert result.snapshot["program"]["tree"]["children"][0].get("execution_groups", "inherit") == groups
+        result = _mutate(
+            session,
+            "program_draft_update_node_policies",
+            {**arguments, "execution_groups": groups},
+        )
+        assert result.snapshot["candidate_available"] is True
+        assert result.snapshot["program"]["tree"]["children"][0].get(
+            "execution_groups", "inherit"
+        ) == groups
 
 
 def test_node_policy_rejects_unavailable_skills_atomically() -> None:
@@ -1654,6 +1681,8 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
         "velocity_scale": "velocity_scale",
         "acceleration_scale": "acceleration_scale",
         "max_tcp_linear_speed_mps": "max_tcp_linear_speed_mps",
+        "translation_tol_m": "translation_tol_m",
+        "max_blend_deviation_rad": "max_blend_deviation_rad",
     }
 
     with pytest.raises(DraftSessionError) as conflict:
@@ -1665,6 +1694,8 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
                 "velocity_scale": 0.35,
                 "acceleration_scale": 0.7,
                 "max_tcp_linear_speed_mps": 0.1,
+                "translation_tol_m": 0.004,
+                "max_blend_deviation_rad": 0.02,
                 "parameter_bindings": bindings,
                 "conflict_resolution": "reject",
             },
@@ -1680,6 +1711,8 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
             "velocity_scale": 0.35,
             "acceleration_scale": 0.7,
             "max_tcp_linear_speed_mps": 0.1,
+            "translation_tol_m": 0.004,
+            "max_blend_deviation_rad": 0.02,
             "parameter_bindings": bindings,
             "conflict_resolution": "reduce",
         },
@@ -1691,6 +1724,8 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
     assert declarations["velocity_scale"]["default"] == 0.35
     assert declarations["acceleration_scale"]["default"] == 0.7
     assert declarations["max_tcp_linear_speed_mps"]["default"] == 0.1
+    assert declarations["translation_tol_m"]["default"] == 0.004
+    assert declarations["max_blend_deviation_rad"]["default"] == 0.02
     move = next(
         child
         for child in authoring["forest"][0]["children"]
@@ -1726,6 +1761,8 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
         ("acceleration_scale", 0.0),
         ("acceleration_scale", 1.01),
         ("max_tcp_linear_speed_mps", 0.0),
+        ("translation_tol_m", 0.0),
+        ("max_blend_deviation_rad", -0.001),
     ],
 )
 def test_program_motion_defaults_reject_invalid_values_without_mutation(
@@ -1739,10 +1776,14 @@ def test_program_motion_defaults_reject_invalid_values_without_mutation(
         "velocity_scale": 0.4,
         "acceleration_scale": 1.0,
         "max_tcp_linear_speed_mps": 0.15,
+        "translation_tol_m": 0.005,
+        "max_blend_deviation_rad": 0.01,
         "parameter_bindings": {
             "velocity_scale": "velocity_scale",
             "acceleration_scale": "acceleration_scale",
             "max_tcp_linear_speed_mps": "max_tcp_linear_speed_mps",
+            "translation_tol_m": "translation_tol_m",
+            "max_blend_deviation_rad": "max_blend_deviation_rad",
         },
         "conflict_resolution": "reject",
     }
@@ -1766,6 +1807,7 @@ def test_new_motion_node_defaults_to_program_motion_references() -> None:
         ("velocity_scale", 0.9),
         ("acceleration_scale", 0.8),
         ("max_tcp_linear_speed_mps", 0.14),
+        ("translation_tol_m", 0.004),
     ):
         sources.pop(field, None)
         node["parameters"][field] = value
@@ -1786,7 +1828,50 @@ def test_new_motion_node_defaults_to_program_motion_references() -> None:
         "velocity_scale",
         "acceleration_scale",
         "max_tcp_linear_speed_mps",
+        "translation_tol_m",
     ):
+        assert field not in authored["parameters"]
+        assert authored["value_sources"][field] == {
+            "kind": "program_parameter",
+            "reference": field,
+        }
+
+
+def test_new_cartesian_node_inherits_scenario_fidelity_defaults() -> None:
+    catalog = build_node_environment().catalog
+    program = Program(_LITE6_PROGRAM_PATH, catalog)
+    session = ComposerDraftSession(program)
+    node = {
+        "instance_id": "new_cartesian_move",
+        "node_id": "motion.follow_cartesian_path",
+        "parameters": {
+            "target_role": "arm",
+            "base_frame_role": "base",
+            "tcp_frame_role": "tcp",
+            "translation_tol_m": 0.002,
+            "max_blend_deviation_rad": 0.03,
+        },
+        "value_sources": {
+            "path": {
+                "kind": "blackboard_key",
+                "reference": "planning.cartesian_path",
+            },
+        },
+        "children": [],
+    }
+
+    inserted = _mutate(
+        session,
+        "tree_draft_insert_node",
+        {"parent_instance_id": "@root", "node": node},
+    )
+
+    authored = next(
+        child
+        for child in inserted.snapshot["authoring"]["forest"][0]["children"]
+        if child["instance_id"] == "new_cartesian_move"
+    )
+    for field in ("translation_tol_m", "max_blend_deviation_rad"):
         assert field not in authored["parameters"]
         assert authored["value_sources"][field] == {
             "kind": "program_parameter",
@@ -1801,11 +1886,13 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
         "velocity_scale": "cycle_velocity",
         "acceleration_scale": "cycle_acceleration",
         "max_tcp_linear_speed_mps": "cycle_tcp_cap",
+        "translation_tol_m": "cycle_path_tolerance",
     }
     for declaration in document["parameters"]:
         parameter_id = declaration["parameter_id"]
         if parameter_id in aliases:
             declaration["parameter_id"] = aliases[parameter_id]
+    document["parameters"].sort(key=lambda row: row["parameter_id"])
 
     pending = [document["tree"]]
     while pending:
@@ -1831,7 +1918,12 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
             "velocity_scale": 0.3,
             "acceleration_scale": 0.6,
             "max_tcp_linear_speed_mps": 0.12,
-            "parameter_bindings": aliases,
+            "translation_tol_m": 0.004,
+            "max_blend_deviation_rad": 0.02,
+            "parameter_bindings": {
+                **aliases,
+                "max_blend_deviation_rad": "max_blend_deviation_rad",
+            },
             "conflict_resolution": "reject",
         },
     )
@@ -1842,6 +1934,8 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
     assert declarations["cycle_velocity"] == 0.3
     assert declarations["cycle_acceleration"] == 0.6
     assert declarations["cycle_tcp_cap"] == 0.12
+    assert declarations["cycle_path_tolerance"] == 0.004
+    assert declarations["max_blend_deviation_rad"] == 0.02
     assert not set(aliases).intersection(declarations)
 
     node = deepcopy(updated.snapshot["authoring"]["forest"][0]["children"][1])
@@ -1850,6 +1944,7 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
         "velocity_scale": 0.9,
         "acceleration_scale": 0.8,
         "max_tcp_linear_speed_mps": 0.14,
+        "translation_tol_m": 0.003,
     })
     node.pop("value_sources", None)
     inserted = _mutate(

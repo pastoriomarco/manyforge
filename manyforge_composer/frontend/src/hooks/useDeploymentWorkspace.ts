@@ -43,8 +43,8 @@ export function useDeploymentWorkspace(
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
-  const [candidate, setCandidate] = useState<
-    DeploymentCandidateOperationResponse['result'] | null
+  const [pendingApplyConfirmation, setPendingApplyConfirmation] = useState<
+    DeploymentCandidateOperationResponse | null
   >(null);
   const mounted = useRef(true);
   const inFlight = useRef(false);
@@ -63,7 +63,6 @@ export function useDeploymentWorkspace(
       const next = await api.deploymentWorkspace.get();
       if (mounted.current && sequence === refreshSequence.current) {
         setWorkspace(next);
-        setCandidate(null);
       }
       return next;
     } catch (reason: unknown) {
@@ -87,7 +86,7 @@ export function useDeploymentWorkspace(
       setLoading(false);
       setError(null);
       setFeedback(null);
-      setCandidate(null);
+      setPendingApplyConfirmation(null);
     }
     return () => { mounted.current = false; };
   }, [enabled, refresh]);
@@ -129,7 +128,6 @@ export function useDeploymentWorkspace(
     setBusy(true);
     setError(null);
     setFeedback(null);
-    setCandidate(null);
     try {
       const next = await operation(requestFence);
       if (mounted.current) {
@@ -143,7 +141,6 @@ export function useDeploymentWorkspace(
         // must not replace the newer owner-issued post-image when it arrives.
         refreshSequence.current += 1;
         setWorkspace(next);
-        setCandidate(null);
         setFeedback(message);
       }
       return next;
@@ -162,7 +159,7 @@ export function useDeploymentWorkspace(
     }
   }, [fence, refresh, snapshot]);
 
-  const runCandidate = useCallback(async (
+  const runApply = useCallback(async (
     operation: (
       requestFence: DraftFenceRequest,
     ) => Promise<DeploymentCandidateOperationResponse>,
@@ -174,7 +171,6 @@ export function useDeploymentWorkspace(
     setBusy(true);
     setError(null);
     setFeedback(null);
-    setCandidate(null);
     try {
       const response = await operation(requestFence);
       if (mounted.current) {
@@ -184,15 +180,24 @@ export function useDeploymentWorkspace(
         });
         refreshSequence.current += 1;
         setWorkspace(response.workspace);
-        setCandidate(response.result.status === 'previewed' ? response.result : null);
-        setFeedback(message);
+        if (response.result.status === 'confirmation_required') {
+          setPendingApplyConfirmation(response);
+          setFeedback(null);
+        } else {
+          setPendingApplyConfirmation(null);
+          setFeedback(message);
+        }
       }
       return response;
     } catch (reason: unknown) {
       const message = errorMessage(
         reason,
-        'Deployment candidate request failed.',
+        'Deployment Apply request failed.',
       );
+      // Confirmation is a one-shot fence for one exact compiled candidate.
+      // A terminal request failure must return the UI to the ordinary Apply
+      // action instead of leaving a disabled confirmation overlay behind.
+      if (mounted.current) setPendingApplyConfirmation(null);
       if (isStaleDraftError(reason)) {
         const latest = await refresh();
         if (mounted.current && latest !== null) setError(message);
@@ -240,7 +245,7 @@ export function useDeploymentWorkspace(
         commandTargetId,
         maximumTcpLinearSpeedMps,
       ),
-      'Target motion cap Draft updated; Manager Applied was unchanged.',
+      'Target maximum TCP speed updated in Draft; Manager Applied was unchanged.',
     ),
     save: () => run(
       (requestFence) => api.deploymentWorkspace.save(requestFence),
@@ -260,15 +265,23 @@ export function useDeploymentWorkspace(
       (requestFence) => api.deploymentWorkspace.revert(requestFence),
       'Saved Deployment restored to Draft and applied by Manager.',
     ),
-    previewDraft: () => runCandidate(
-      (requestFence) => api.deploymentWorkspace.previewDraft(requestFence),
-      'Deployment Draft compiled and validated; Manager Applied was unchanged.',
-    ),
-    applyDraft: () => runCandidate(
-      (requestFence) => api.deploymentWorkspace.applyDraft(requestFence),
-      'Deployment Draft compiled, applied by Manager, and rebound to the current Program.',
-    ),
-  }), [run, runCandidate]);
+    applyDraft: () => {
+      setPendingApplyConfirmation(null);
+      return runApply(
+        (requestFence) => api.deploymentWorkspace.applyDraft(requestFence),
+        'Deployment Draft compiled, applied by Manager, and rebound to the current Program.',
+      );
+    },
+    confirmApply: () => {
+      const token = pendingApplyConfirmation?.result.confirmationToken ?? null;
+      if (token === null) return Promise.resolve(null);
+      return runApply(
+        (requestFence) => api.deploymentWorkspace.applyDraft(requestFence, token),
+        'Deployment Draft compiled, applied by Manager, and rebound to the current Program.',
+      );
+    },
+    cancelApplyConfirmation: () => setPendingApplyConfirmation(null),
+  }), [pendingApplyConfirmation, run, runApply]);
 
   return {
     workspace,
@@ -276,7 +289,7 @@ export function useDeploymentWorkspace(
     busy,
     error,
     feedback,
-    candidate,
+    pendingApplyConfirmation,
     mutationAvailable,
     mutationUnavailableReason,
     refresh,

@@ -15,6 +15,13 @@ class IManagerSceneProjectionHandoffPort {
  public:
   virtual ~IManagerSceneProjectionHandoffPort() = default;
 
+  /// Returns the exact logical-scene composite that a new named Apply must
+  /// freeze as its predecessor.  The active bundle publication deliberately
+  /// does not advance for ordinary scene edits, so its scene revision is not
+  /// an authoritative substitute for this owner-issued snapshot.
+  [[nodiscard]] virtual ProjectionRevisionDTO
+  CurrentProjectionRevision() const = 0;
+
   [[nodiscard]] virtual ProjectionApplyStageResultDTO
   StageCandidateProjection(const ProjectionApplyStageDTO& request) = 0;
 

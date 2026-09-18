@@ -333,6 +333,8 @@ TEST(ManagerSourcePublication,
   EXPECT_NE(bytes.find("\"phase\":\"scope_persisted\""), std::string::npos);
   EXPECT_NE(bytes.find("\"state\":\"scope_persisted\""), std::string::npos);
   EXPECT_NE(bytes.find("\"incomplete\":true"), std::string::npos);
+  EXPECT_NE(bytes.find("\"manager_ready\":false"), std::string::npos);
+  EXPECT_NE(bytes.find("\"converged\":false"), std::string::npos);
   EXPECT_EQ(bytes.find("\"configuration_fence_id\":\""), std::string::npos);
 }
 

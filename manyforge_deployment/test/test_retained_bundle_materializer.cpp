@@ -270,12 +270,6 @@ make_runtime_policy_retention_fixture() {
       {"runtime_policy_id", CanonicalValue("runtime.safe")},
       {"runtime_policy_revision", CanonicalValue(std::string(kZeroDigest))},
       {"interrupt_policy_ids", CanonicalValue(CanonicalValue::Array{})},
-      {"motion_speed_limits",
-       CanonicalValue(
-           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-               {"scope_kind", CanonicalValue("cell")},
-               {"maximum_tcp_linear_speed_mps", CanonicalValue(0.5)},
-           })})},
       {"open_loop_grasp_acknowledgements",
        CanonicalValue(CanonicalValue::Array{})},
   });
@@ -297,7 +291,7 @@ make_runtime_policy_retention_fixture() {
       core::SchemaId("manyforge.runtime_policy.v1"),
       core::SchemaRevision(
           "sha256:"
-          "330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"),
+          "fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"),
       core::ContentDigest(policy_digest),
       core::ContentAddressedStoreKey("sha256/" + policy_digest.substr(7U)),
   };

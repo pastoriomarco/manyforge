@@ -37,6 +37,7 @@ from .models import (
     ProgramNodeAvailabilityRequest,
     ProgramScenePreparationRequest,
     ProgramSelectionStopRequest,
+    ProgramSelectionStartRequest,
     ProgramSelectionResumeRequest,
     ProgramManualHandoverRequest,
     RuntimeBlackboardWriteRequest,
@@ -269,6 +270,10 @@ class ProgramRunnerApplicationPort(Protocol):
 
     def resume_motion(
         self, program_run_id: str, request: ProgramSelectionResumeRequest
+    ) -> dict[str, Any]: ...
+
+    def start_motion(
+        self, program_run_id: str, request: ProgramSelectionStartRequest
     ) -> dict[str, Any]: ...
 
     def prepare_manual_handover(
@@ -510,6 +515,19 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
             )
         return await control_call(
             lambda: runtime.resume_motion(program_run_id, request)
+        )
+
+    @app.post("/api/program/runs/{program_run_id}/motion-start")
+    async def start_motion(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        request: ProgramSelectionStartRequest,
+    ) -> dict[str, Any]:
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid", "Program-run path and body must match"
+            )
+        return await control_call(
+            lambda: runtime.start_motion(program_run_id, request)
         )
 
     @app.post("/api/program/runs/{program_run_id}/manual-handover")

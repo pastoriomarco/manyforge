@@ -36,11 +36,9 @@ namespace {
   decision.action = CollisionDecisionAction::kDispatch;
   decision.collision_world_revision = world;
   return {ValidationRevision("validation.3"),
-          ValidationResultDTO{
-              true, std::nullopt,
-              TrajectoryValidationMetricsDTO{1.0, {0.5}, {0.0}, 0.02}},
-          world,
-          CollisionPolicyRevision{5U, Digest('b')}, std::move(decision)};
+          ValidationResultDTO{true, std::nullopt,
+                              TrajectoryValidationMetricsDTO{1.0, {0.5}, {0.0}, 0.02}},
+          world, CollisionPolicyRevision{5U, Digest('b')}, std::move(decision)};
 }
 
 TEST(PreparedMotionEvidenceCodecTest, RoundTripsAcceptedPlanningAndValidationEvidence) {
@@ -58,17 +56,37 @@ TEST(PreparedMotionEvidenceCodecTest, RoundTripsAcceptedPlanningAndValidationEvi
   ASSERT_TRUE(decoded_validation.ok()) << decoded_validation.error().message;
   EXPECT_EQ(decoded_validation.value().collision_world_revision.revision_id, 3U);
   ASSERT_TRUE(decoded_validation.value().noncollision_result.trajectory_metrics.has_value());
-  EXPECT_EQ(decoded_validation.value().noncollision_result.trajectory_metrics->
-                peak_abs_joint_velocity_rad_s,
+  EXPECT_EQ(decoded_validation.value()
+                .noncollision_result.trajectory_metrics->peak_abs_joint_velocity_rad_s,
             (std::vector<double>{0.5}));
-  EXPECT_EQ(decoded_validation.value().noncollision_result.trajectory_metrics->
-                peak_abs_joint_acceleration_rad_s2,
+  EXPECT_EQ(decoded_validation.value()
+                .noncollision_result.trajectory_metrics->peak_abs_joint_acceleration_rad_s2,
             (std::vector<double>{0.0}));
-  EXPECT_DOUBLE_EQ(*decoded_validation.value().noncollision_result.trajectory_metrics->
-                        peak_tcp_linear_speed_mps,
-                   0.02);
+  EXPECT_DOUBLE_EQ(
+      *decoded_validation.value().noncollision_result.trajectory_metrics->peak_tcp_linear_speed_mps,
+      0.02);
   EXPECT_EQ(EncodePreparedMotionValidationEvidence(decoded_validation.value()).value(),
             validation.value());
+}
+
+TEST(PreparedMotionEvidenceCodecTest,
+     RoundTripsAcceptedCartesianFidelityDiagnosticsWithoutChangingLegacyShape) {
+  auto cartesian = Validation();
+  auto& metrics = *cartesian.noncollision_result.trajectory_metrics;
+  metrics.cartesian_fidelity_metrics = CartesianFidelityMetricsDTO{
+      0.005, 0.05, 0.001, 0.01, 0.0005, 0.002, 0.0015, 0.012, 0.01, 0.005, 2U};
+  const auto encoded = EncodePreparedMotionValidationEvidence(cartesian);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  const auto decoded = DecodePreparedMotionValidationEvidence(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  ASSERT_TRUE(decoded.value()
+                  .noncollision_result.trajectory_metrics->cartesian_fidelity_metrics.has_value());
+  EXPECT_EQ(*decoded.value().noncollision_result.trajectory_metrics->cartesian_fidelity_metrics,
+            *metrics.cartesian_fidelity_metrics);
+
+  const auto legacy = EncodePreparedMotionValidationEvidence(Validation());
+  ASSERT_TRUE(legacy.ok());
+  EXPECT_EQ(legacy.value().find("cartesian_fidelity_metrics"), std::string::npos);
 }
 
 TEST(PreparedMotionEvidenceCodecTest, RejectsFailureEvidenceAndClosedShapeViolations) {

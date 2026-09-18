@@ -43,6 +43,22 @@ def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> No
         row["controllable_component_id"]
         for row in runtime["configuration"]["motion_target_limits"]
     } == {"lite6_robot", "ur5e_robot"}
+    grippers = {
+        row["controllable_component_id"]: row
+        for row in runtime["configuration"]["gripper_target_configurations"]
+    }
+    assert set(grippers) == {"lite6_robot", "ur5e_robot"}
+    assert all(
+        row["command_target_id"] == "gripper"
+        and row["actuation_kind"] == "position_commanded"
+        and row["open_state_ref"] == "open"
+        and row["closed_state_ref"] == "closed"
+        and row["mount_frame"]
+        and row["attach_frame"]
+        and row["tcp_frame"]
+        and row["touch_links"]
+        for row in grippers.values()
+    )
     assert all(
         row["runtime_unit_ids"] == ["robot_cell.native_execution"]
         for row in components.values()
@@ -90,21 +106,7 @@ def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> No
         / "manyforge_deployment/resources/maintained/catalog/runtime_policy/"
         "manyforge.runtime_motion.ur5e_lite6_wall.json"
     )
-    assert policy["motion_speed_limits"] == [
-        {"scope_kind": "cell", "maximum_tcp_linear_speed_mps": 0.5},
-        {
-            "scope_kind": "command_target",
-            "controllable_component_id": "lite6_robot",
-            "command_target_id": "arm",
-            "maximum_tcp_linear_speed_mps": 0.15,
-        },
-        {
-            "scope_kind": "command_target",
-            "controllable_component_id": "ur5e_robot",
-            "command_target_id": "arm",
-            "maximum_tcp_linear_speed_mps": 0.25,
-        },
-    ]
+    assert "motion_speed_limits" not in policy
     retained = deployment["policies"]["retained_policy_records"]
     assert len(retained) == 1
     assert retained[0]["record_id"] == policy["runtime_policy_id"]

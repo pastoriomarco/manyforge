@@ -378,7 +378,7 @@ TEST(CartesianTrajectoryContractTest,
   request.speed_profile.velocity_scale = 1.0;
   request.speed_profile.acceleration_scale = 1.0;
   CartesianPathDTO path;
-  path.max_linear_speed_mps = 10.0;
+  request.speed_profile.max_tcp_linear_speed_mps = 10.0;
   path.max_angular_speed_rad_s = 10.0;
   path.max_linear_acceleration_mps2 = 100.0;
   path.max_angular_acceleration_rad_s2 = 100.0;
@@ -403,15 +403,13 @@ TEST(CartesianTrajectoryContractTest,
   // A rest-to-rest unit quintic peaks at 1.875 * delta / duration.
   // This serial chain moves (1 + 2 + 6) times the source coordinate.
   constexpr double kExactPeakLinearSpeedMps = 1.875 * 0.1 * 9.0;
-  EXPECT_GE(envelope.value().linear_speed_ratio *
-                path.max_linear_speed_mps,
+  EXPECT_GE(envelope.value().linear_speed_ratio * 10.0,
             kExactPeakLinearSpeedMps * 0.999);
-  request.speed_profile.max_tcp_linear_speed_mps = path.max_linear_speed_mps;
   const auto linear_only = trajectory_detail::measure_cartesian_frame_dynamics_envelope(
       request, nullptr, scene, trajectory, control);
   ASSERT_TRUE(linear_only.ok()) << linear_only.error().message;
   ASSERT_TRUE(linear_only.value().complete);
-  EXPECT_GE(linear_only.value().linear_speed_ratio * path.max_linear_speed_mps,
+  EXPECT_GE(linear_only.value().linear_speed_ratio * 10.0,
             kExactPeakLinearSpeedMps * 0.999);
   EXPECT_DOUBLE_EQ(linear_only.value().angular_speed_ratio, 0.0);
   EXPECT_DOUBLE_EQ(linear_only.value().linear_acceleration_ratio, 0.0);

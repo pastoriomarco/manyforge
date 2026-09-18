@@ -24,9 +24,7 @@ const groupCommands: string[][] = [];
 let setNativeAvailable: (available: boolean) => void;
 let currentStatus = statusFixture();
 currentStatus.directControl.targetDescriptor.operationalLimit = {
-  catalogPolicyMaximumTcpLinearSpeedMps: 0.3, deploymentMaximumTcpLinearSpeedMps: 0.2,
-  effectiveMaximumTcpLinearSpeedMps: 0.2, policyId: 'tcp', policyRevision: '1',
-  selectedScope: 'command_target', sourceContentDigest: 'sha256:tcp-limits',
+  maximumTcpLinearSpeedMps: 0.2,
 };
 let previewCount = 0;
 let availabilityCount = 0;

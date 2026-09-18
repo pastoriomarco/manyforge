@@ -184,13 +184,11 @@ class HeadlessApiConfig:
         if any(compiler_parts) and not compiler_configured:
             raise ValueError(
                 "Deployment compiler requires an executable, workspace, and "
-                "three prepared model roots"
+                "at least one prepared model root"
             )
         if compiler_configured:
             assert self.deployment_compiler_path is not None
             assert self.deployment_compiler_workspace_root is not None
-            if len(self.deployment_compiler_prepared_roots) != 3:
-                raise ValueError("Deployment compiler requires three prepared model roots")
             compiler_paths = (
                 self.deployment_compiler_path,
                 self.deployment_compiler_workspace_root,

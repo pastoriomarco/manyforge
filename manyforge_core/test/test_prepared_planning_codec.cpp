@@ -70,8 +70,8 @@ TEST(PreparedPlanningCodecTest, RuntimeScaleBoundsAreIdentityBoundAndRequireComp
   ASSERT_TRUE(timed_roundtrip.value().runtime_scale_bounds->nominal_time_multiplier);
   EXPECT_DOUBLE_EQ(*timed_roundtrip.value().runtime_scale_bounds->nominal_time_multiplier, 2.5);
   EXPECT_EQ(EncodePreparedTrajectory(timed_roundtrip.value()).value(), timed.value());
-  for (const double invalid : {0.9, std::numeric_limits<double>::infinity(),
-                               std::numeric_limits<double>::quiet_NaN()}) {
+  for (const double invalid :
+       {0.9, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
     trajectory.runtime_scale_bounds->nominal_time_multiplier = invalid;
     EXPECT_FALSE(EncodePreparedTrajectory(trajectory).ok());
   }
@@ -82,8 +82,9 @@ TEST(PreparedPlanningCodecTest, RuntimeScaleBoundsAreIdentityBoundAndRequireComp
   ASSERT_TRUE(enhanced.ok());
   EXPECT_NE(enhanced.value(), encoded.value());
   ASSERT_TRUE(DecodePreparedTrajectory(enhanced.value()).ok());
-  EXPECT_DOUBLE_EQ(DecodePreparedTrajectory(enhanced.value()).value()
-                      .runtime_scale_bounds->max_stop_path_rate, 1.5);
+  EXPECT_DOUBLE_EQ(
+      DecodePreparedTrajectory(enhanced.value()).value().runtime_scale_bounds->max_stop_path_rate,
+      1.5);
   trajectory.runtime_scale_bounds->max_stop_path_rate = 0.9;
   EXPECT_FALSE(EncodePreparedTrajectory(trajectory).ok());
   trajectory.runtime_scale_bounds->max_stop_path_rate = 1.0;
@@ -118,6 +119,29 @@ TEST(PreparedPlanningCodecTest, CartesianMilestonesAreClosedAndIdentityBound) {
     trajectory.cartesian_waypoint_times_s = invalid;
     EXPECT_FALSE(EncodePreparedTrajectory(trajectory).ok());
   }
+}
+
+TEST(PreparedPlanningCodecTest, CartesianFidelityEvidenceIsClosedValidatedAndIdentityBound) {
+  auto trajectory = Trajectory();
+  const double end = trajectory.waypoints.back().time_from_start_s;
+  trajectory.cartesian_waypoint_times_s = {0.0, end};
+  trajectory.cartesian_fidelity_metrics = CartesianFidelityMetricsDTO{
+      0.005, 0.05, 0.001, 0.01, 0.0005, 0.002, 0.0015, 0.012, 0.01, 0.005, 2U};
+  const auto encoded = EncodePreparedTrajectory(trajectory);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  const auto decoded = DecodePreparedTrajectory(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  ASSERT_TRUE(decoded.value().cartesian_fidelity_metrics.has_value());
+  EXPECT_EQ(*decoded.value().cartesian_fidelity_metrics, *trajectory.cartesian_fidelity_metrics);
+  EXPECT_EQ(EncodePreparedTrajectory(decoded.value()).value(), encoded.value());
+
+  trajectory.cartesian_fidelity_metrics->certified_max_translation_error_m = 0.006;
+  EXPECT_FALSE(EncodePreparedTrajectory(trajectory).ok());
+  trajectory.cartesian_fidelity_metrics.reset();
+  trajectory.cartesian_waypoint_times_s.clear();
+  const auto legacy = EncodePreparedTrajectory(trajectory);
+  ASSERT_TRUE(legacy.ok());
+  EXPECT_EQ(legacy.value().find("cartesian_fidelity_metrics"), std::string::npos);
 }
 
 TEST(PreparedPlanningCodecTest, RoundTripsCompletePlanRequestWithoutPrivateHandles) {

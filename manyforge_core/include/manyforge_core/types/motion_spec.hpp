@@ -154,11 +154,13 @@ struct CartesianPathDTO {
   double max_translation_step_m = 0.005;
   double max_rotation_step_rad = 0.05;
   CartesianSpeedModeDTO speed_mode = CartesianSpeedModeDTO::kBounded;
-  double max_linear_speed_mps = 0.1;
   double max_angular_speed_rad_s = 0.5;
   double max_linear_acceleration_mps2 = 0.5;
   double max_angular_acceleration_rad_s2 = 2.5;
   CartesianFallbackPolicyDTO fallback_policy = CartesianFallbackPolicyDTO::kFailClosed;
+  /// Maximum joint-path corner deviation admitted while smoothing the
+  /// Cartesian tracker output. Zero preserves the unsmoothed polyline.
+  double max_blend_deviation_rad = 0.01;
   friend bool operator==(const CartesianPathDTO&, const CartesianPathDTO&) = default;
 };
 

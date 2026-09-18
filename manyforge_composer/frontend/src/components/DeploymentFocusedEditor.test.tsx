@@ -97,7 +97,7 @@ function controller(): DeploymentWorkspaceController {
     busy: false,
     error: null,
     feedback: null,
-    candidate: null,
+    pendingApplyConfirmation: null,
     mutationAvailable: true,
     mutationUnavailableReason: null,
     refresh: vi.fn(),
@@ -111,8 +111,9 @@ function controller(): DeploymentWorkspaceController {
     save: vi.fn(),
     saveAs: vi.fn(),
     discard: vi.fn(),
-    previewDraft: vi.fn(),
     applyDraft: vi.fn(),
+    confirmApply: vi.fn(),
+    cancelApplyConfirmation: vi.fn(),
   };
 }
 
@@ -139,12 +140,10 @@ describe('DeploymentFocusedEditor', () => {
     const descriptor = statusFixture().directControl.targetDescriptor;
     descriptor.controllableComponentId = 'robot';
     descriptor.operationalLimit = {
-      catalogPolicyMaximumTcpLinearSpeedMps: 0.2, deploymentMaximumTcpLinearSpeedMps: 0.15,
-      effectiveMaximumTcpLinearSpeedMps: 0.15, policyId: 'policy', policyRevision: digest,
-      selectedScope: 'command_target', sourceContentDigest: digest,
+      maximumTcpLinearSpeedMps: 0.15,
     };
     const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'loading' }} motionDescriptor={descriptor} gripperDescriptor={null} />);
+      sourceModel={{ status: 'loading' }} motionDescriptors={[descriptor]} gripperDescriptors={[]} />);
     const input = markup.match(/Maximum jerk<\/span>[\s\S]*?(<input[^>]*>)/)?.[1];
     expect(input).toBeDefined();
     if (maximum === null) expect(input).not.toContain('max=');
@@ -169,7 +168,7 @@ describe('DeploymentFocusedEditor', () => {
       sourceJointName: 'joint1', source: 'preset', maximumRadS3: 12, presetRadS3: 12, imported: null,
     }] };
     const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'loading' }} motionDescriptor={descriptor} gripperDescriptor={null} />);
+      sourceModel={{ status: 'loading' }} motionDescriptors={[descriptor]} gripperDescriptors={[]} />);
     const selector = markup.match(/aria-label="robot \/ arm ordinary motion jerk"[\s\S]*?<\/select>/)?.[0];
     if (component === 'robot') {
       expect(selector).toContain('<option value="off" disabled="">');
@@ -193,6 +192,7 @@ describe('DeploymentFocusedEditor', () => {
     });
     const descriptor = statusFixture().directControl.targetDescriptor;
     descriptor.controllableComponentId = 'robot-b';
+    const unrelatedDescriptor = { ...descriptor, controllableComponentId: 'robot-c' };
     const sourceModel = {
       occurrences: [
         { component_id: 'robot-b', model_instance_id: 'unrelated-tool',
@@ -204,7 +204,8 @@ describe('DeploymentFocusedEditor', () => {
         model_groups: [{ model_instance_id: 'selected-arm', source_group_name: 'Selected group' }] }],
     } as SourceModelProjection;
     const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'ready', data: sourceModel }} motionDescriptor={descriptor} gripperDescriptor={null} />);
+      sourceModel={{ status: 'ready', data: sourceModel }}
+      motionDescriptors={[unrelatedDescriptor, descriptor]} gripperDescriptors={[]} />);
     expect(markup).toContain('aria-label="Motion limits target"');
     expect(markup).toMatch(/<option[^>]*selected=""[^>]*>robot-b \/ arm<\/option>/);
     expect(markup).toContain('value="0.25"');
@@ -221,7 +222,7 @@ describe('DeploymentFocusedEditor', () => {
   it('does not show another component model or joint caps for an undescribed target', () => {
     const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={controller()}
       sourceModel={{ status: 'loading' }}
-      motionDescriptor={statusFixture().directControl.targetDescriptor} gripperDescriptor={null} />);
+      motionDescriptors={[statusFixture().directControl.targetDescriptor]} gripperDescriptors={[]} />);
     expect(markup).toContain('No current motion descriptor for this target.');
     expect(markup).not.toContain('aria-label="Source model joint limits"');
     expect(markup).not.toContain('Robot Control joint caps');
@@ -239,7 +240,7 @@ describe('DeploymentFocusedEditor', () => {
       control_binding_id: 'arm_contact', capability_id: 'execution.contact.geometric' });
     document.policies.stop_stage_parameters.push({ ...document.policies.stop_stage_parameters[0], control_binding_id: 'arm_contact' });
     const render = () => renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'loading' }} motionDescriptor={null} gripperDescriptor={null} />);
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
     let markup = render();
     expect(markup).toContain('robot · arm · execution.trajectory.execute');
     expect(markup).toContain('robot · arm · execution.contact.geometric');
@@ -266,7 +267,7 @@ describe('DeploymentFocusedEditor', () => {
     profile.stop_mode = 'spring_back_hold';
     profile.allow_natural_completion_on_short_path = natural;
     const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'loading' }} motionDescriptor={null} gripperDescriptor={null} />);
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
     expect(markup).toContain('Brake + return time');
     expect(markup).toContain('Allow natural completion');
     expect(markup).toContain('Off by default: brake and return');
@@ -280,7 +281,7 @@ describe('DeploymentFocusedEditor', () => {
     };
     delete document.policies.stop_stage_parameters[0].default_contract_parameters.jerk_limits_enabled;
     const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'loading' }} motionDescriptor={null} gripperDescriptor={null} />);
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
     expect(markup).toContain('older Stop contract needs explicit migration');
     expect(markup).toMatch(/<select[^>]+aria-label="Controlled Stop jerk limits"[^>]+disabled/);
     expect(markup).toMatch(/<button[^>]+disabled[^>]*>Update Controlled Stop Draft/);
@@ -291,8 +292,8 @@ describe('DeploymentFocusedEditor', () => {
       <DeploymentFocusedEditor
         controller={controller()}
         sourceModel={{ status: 'loading' }}
-        motionDescriptor={{
-          schemaVersion: 'manyforge.manual_control_motion_descriptor.v4',
+        motionDescriptors={[{
+          schemaVersion: 'manyforge.manual_control_motion_descriptor.v5',
           ordinaryJerk: { enabled: false, presetReferenceTimeS: 1, jointLimits: [{
             sourceJointName: 'joint1', source: 'off', maximumRadS3: null,
             presetRadS3: 12, imported: null,
@@ -315,19 +316,15 @@ describe('DeploymentFocusedEditor', () => {
             effectiveMaxJerkRadS3: null,
           }],
           operationalLimit: {
-            catalogPolicyMaximumTcpLinearSpeedMps: 0.2,
-            deploymentMaximumTcpLinearSpeedMps: 0.15,
-            effectiveMaximumTcpLinearSpeedMps: 0.15,
-            policyId: 'policy', policyRevision: digest,
-            selectedScope: 'command_target', sourceContentDigest: digest,
+            maximumTcpLinearSpeedMps: 0.15,
           },
           contracts: {
             operationCapabilityId: 'execution.trajectory.execute',
             operationCapabilityDefinitionRevision: digest,
             commandSchema: null, controlPath: null, supportingProviders: [],
           },
-        }}
-        gripperDescriptor={null}
+        }]}
+        gripperDescriptors={[]}
       />,
     );
 
@@ -359,8 +356,8 @@ describe('DeploymentFocusedEditor', () => {
       <DeploymentFocusedEditor
         controller={controller()}
         sourceModel={{ status: 'loading' }}
-        motionDescriptor={null}
-        gripperDescriptor={{
+        motionDescriptors={[]}
+        gripperDescriptors={[{
           schemaVersion: 'manyforge.manual_control_gripper_descriptor.v2',
           controllableComponentId: 'robot', commandTargetId: 'gripper',
           componentRoleId: 'robot', targetRoleId: 'gripper',
@@ -386,7 +383,7 @@ describe('DeploymentFocusedEditor', () => {
             commandSchema: { commandSchemaId: 'gripper.command_position', commandSchemaRevision: digest },
             controlPath: null, supportingProviders: [],
           },
-        }}
+        }]}
       />,
     );
 

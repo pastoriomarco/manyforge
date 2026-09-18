@@ -55,27 +55,26 @@ describe('UI4 application and viewport composition', () => {
     expect(styles).not.toContain('.viewer-slot > .runtime-observability-surface');
   });
 
-  it('keeps transport scopes explicit and uses one persistent addressed velocity owner', () => {
+  it('keeps explicit group columns separate from unique cell controls', () => {
     const transport = source('./ProgramRuntimePanel.tsx');
     const robotControl = source('../hooks/useRobotControl.ts');
     const styles = source('../index.css');
 
-    expect(transport).toContain('canResume || canResumeOperatorStop');
-    expect(transport).toContain('program.resumeMotion(groupIds)');
-    expect(transport).toContain('transport-stop-primary');
-    expect(transport).toContain('transport-stop-disclosure');
-    expect(transport).toContain('Full Stop');
+    expect(transport).toContain('program.resumeMotion([group.groupId])');
+    expect(transport).toContain('program.stopMotion([group.groupId])');
+    expect(transport).toContain('transport-group-column');
+    expect(transport).toContain('transport-unique-column');
+    expect(transport).toContain('transport-group-settings');
+    expect(transport).toContain("'Halting' : 'Halt'");
     expect(transport).toContain('program.fullStop()');
     expect(transport).toContain('program.resumeFullStop()');
     expect(transport).toContain('Cell Full Stop');
-    expect(transport).toMatch(/transport-stop-group[\s\S]*transport-stop-primary[\s\S]*transport-stop-disclosure[\s\S]*transport-stop-menu/);
+    expect(transport).not.toContain('transport-stop-disclosure');
     expect(transport).not.toContain("motionPaused ? robot.resume() : robot.pause()");
     expect(transport).toContain("robot.fullStop()");
     expect(transport).toContain('expectedStopGeneration');
     expect(transport).toContain('Latest certificate');
-    expect(transport).toContain("robot.state.operation?.state === 'paused'");
-    expect(transport).toContain('robot.setRuntimeScale');
-    expect(transport).toContain('robot.runtimeScaleStatus.supported');
+    expect(transport).toContain('program.setGroupRuntimeScale');
     expect(robotControl).toContain("sendExecutionCommand(");
     expect(robotControl).toContain("'cell_full_stop'");
     expect(transport).not.toContain('setVelocityScale');
@@ -88,10 +87,22 @@ describe('UI4 application and viewport composition', () => {
     expect(robotControl).not.toContain('api.execution.runtimeScaleControl');
     expect(robotControl).not.toContain('programRuntimeScaleOffer');
     expect(transport).toContain('Scale current and subsequent moves');
-    expect(styles).toMatch(/\.transport-stop-group \{[\s\S]*?position: relative;[\s\S]*?display: flex;/);
-    expect(styles).toMatch(/\.transport-stop-menu \{[\s\S]*?position: absolute;[\s\S]*?bottom: calc\(100% \+ 0\.35rem\);/);
+    expect(styles).toMatch(/\.viewer-transport \{[^}]*grid-template-columns:[^;]*var\(--viewer-transport-motion-panel-width\)[^;]*minmax\(0, 1fr\)[^;]*var\(--viewer-transport-column-width\);/s);
+    expect(styles).toMatch(/\.transport-control-layout \{[^}]*display: contents;/s);
+    expect(styles).toMatch(/\.transport-guidance \{[^}]*grid-column: 2;[^}]*align-self: end;/s);
+    expect(styles).toMatch(/\.viewer-transport \{[^}]*padding: 0;[^}]*overflow: visible;/s);
+    expect(styles).not.toMatch(/\.viewer-transport \{[^}]*(?:border|background):/s);
+    expect(styles).toMatch(/\.transport-motion-panel \{[^}]*border: 1px solid #365463;[^}]*background: rgb\(8 23 32 \/ 94%\);/s);
+    expect(styles).toMatch(/\.transport-group-grid \{[^}]*justify-content: flex-start;[^}]*padding: 0;[^}]*overflow-x: auto;/s);
+    expect(styles).toMatch(/\.transport-panel-title \{[^}]*font-size: 0\.94rem;[^}]*line-height: 1\.2rem;/s);
+    expect(styles).toMatch(/\.transport-unique-column \{[^}]*border: 1px solid #365463;[^}]*background: rgb\(8 23 32 \/ 94%\);[^}]*margin-left: auto;/s);
     expect(styles).toContain('--viewer-transport-control-height: 2.85rem;');
-    expect(styles).toMatch(/\.viewer-transport > button,[\s\S]*?\.viewer-transport \.transport-stop-group > button \{[\s\S]*?height: var\(--viewer-transport-control-height\);[\s\S]*?font-size: 0\.84rem;/);
+    expect(styles).toContain('--viewer-transport-column-width: 7rem;');
+    expect(styles).toMatch(/\.viewer-transport button \{[\s\S]*?height: var\(--viewer-transport-control-height\);[\s\S]*?font-size: 0\.84rem;/);
+    expect(styles).toMatch(/\.transport-group-scale \{[\s\S]*?"label output"[\s\S]*?"slider slider";/);
+    expect(styles).toMatch(/\.transport-group-scale input \{[\s\S]*?grid-area: slider;[\s\S]*?width: 100%;/);
+    expect(styles).toMatch(/\.transport-group-scale \{[^}]*border: 1px solid #385061;[^}]*border-radius: 0\.45rem;/s);
+    expect(styles).toMatch(/\.transport-unique-icons \{[\s\S]*?grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
   });
 
   it('locates lifecycle control under Deployment and binds selection to Manager graph identities', () => {

@@ -128,7 +128,7 @@ struct CandidateFixture final {
           fixture.binding, start == nullptr ? fixture.start : *start),
       .motion = std::move(motion),
       .tolerances = TolerancesDTO{1.0e-4, 5.0e-3, 1.0e-2},
-      .speed_profile = SpeedProfileDTO{0.5, 0.5, std::nullopt},
+      .speed_profile = SpeedProfileDTO{0.5, 0.5, 0.1},
       .planning_profile = PlanningProfileDTO::kFirstFeasible,
       .dynamics_limits = {},
       .planning_timeout_s = 3.0,
@@ -432,6 +432,20 @@ TEST(RoboPlanCandidateComputerTest,
   const auto candidate_request = request(fixture, path);
   const auto result = computer.compute(candidate_request);
   ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().cartesian_fidelity_metrics.has_value());
+  const auto &fidelity = *result.value().cartesian_fidelity_metrics;
+  EXPECT_DOUBLE_EQ(fidelity.requested_translation_tolerance_m,
+                   candidate_request.tolerances.translation_tol_m);
+  EXPECT_DOUBLE_EQ(fidelity.requested_rotation_tolerance_rad,
+                   candidate_request.tolerances.rotation_tol_rad);
+  EXPECT_LE(fidelity.certified_max_translation_error_m,
+            candidate_request.tolerances.translation_tol_m);
+  EXPECT_LE(fidelity.certified_max_rotation_error_rad,
+            candidate_request.tolerances.rotation_tol_rad);
+  EXPECT_LE(fidelity.accepted_max_blend_deviation_rad,
+            fidelity.requested_max_blend_deviation_rad);
+  EXPECT_GE(fidelity.planning_attempt_count, 1U);
+  EXPECT_LE(fidelity.planning_attempt_count, 5U);
   ASSERT_EQ(result.value().cartesian_waypoint_times_s.size(), 3U);
   EXPECT_GT(result.value().cartesian_waypoint_times_s[1], 0.0);
   EXPECT_LT(result.value().cartesian_waypoint_times_s[1],
@@ -473,13 +487,25 @@ TEST(RoboPlanCandidateComputerTest,
   path.waypoints = {pose(start_pose), pose(middle_pose), pose(end_pose)};
   path.max_translation_step_m = 0.005;
   path.max_rotation_step_rad = 0.05;
-  path.max_linear_speed_mps = 0.05;
   path.max_angular_speed_rad_s = 0.25;
   path.max_linear_acceleration_mps2 = 0.25;
   path.max_angular_acceleration_rad_s2 = 1.0;
+  path.max_blend_deviation_rad = 0.0;
   const auto cartesian_result = computer.compute(request(
       fixture, ResolvedMotionSpecDTO{std::move(path)}, &cartesian_start));
   ASSERT_TRUE(cartesian_result.ok()) << cartesian_result.error().message;
+  ASSERT_TRUE(cartesian_result.value().cartesian_fidelity_metrics.has_value());
+  EXPECT_DOUBLE_EQ(
+      cartesian_result.value().cartesian_fidelity_metrics
+          ->requested_max_blend_deviation_rad,
+      0.0);
+  EXPECT_DOUBLE_EQ(
+      cartesian_result.value().cartesian_fidelity_metrics
+          ->accepted_max_blend_deviation_rad,
+      0.0);
+  EXPECT_EQ(cartesian_result.value().cartesian_fidelity_metrics
+                ->planning_attempt_count,
+            1U);
   EXPECT_EQ(cartesian_result.value().resources, fixture.binding.resources);
   EXPECT_EQ(cartesian_result.value().joint_names,
             fixture.binding.compiled_joint_names);
@@ -500,6 +526,7 @@ TEST(RoboPlanCandidateComputerTest,
   EXPECT_LE((actual.block<3, 1>(0, 3) - middle_pose.block<3, 1>(0, 3)).norm(),
             5e-3);
   EXPECT_TRUE(pose_result.value().cartesian_waypoint_times_s.empty());
+  EXPECT_FALSE(pose_result.value().cartesian_fidelity_metrics.has_value());
 }
 
 TEST(RoboPlanCandidateComputerTest,

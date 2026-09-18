@@ -357,7 +357,9 @@ runtime_registration(
     std::optional<core::MotionInterruptStopProfileDTO>
         default_operator_stop_profile = std::nullopt,
     std::optional<core::MotionInterruptStopProfileDTO>
-        default_fault_stop_profile = std::nullopt) {
+        default_fault_stop_profile = std::nullopt,
+    std::optional<double> deployment_maximum_tcp_linear_speed_mps =
+        std::nullopt) {
   if (runtime_policy.has_value() &&
       (runtime_policy->value().controllable_component_id !=
            binding.value().controllable_component_id ||
@@ -393,7 +395,8 @@ runtime_registration(
       runtime_policy,
       dynamic_cast<core::IResolvedPreparedParticipantExecutionEngine *>(engine),
       std::move(default_operator_stop_profile),
-      std::move(default_fault_stop_profile)};
+      std::move(default_fault_stop_profile),
+      deployment_maximum_tcp_linear_speed_mps};
 }
 
 [[nodiscard]] std::optional<core::RuntimeParticipantPolicySelection>
@@ -775,7 +778,8 @@ make_kernel_participant_resolver(
           std::move(binding.value().binding), physical->stop_readiness,
           physical->engine, physical->stop_execution_port,
           physical->runtime_policy, physical->default_operator_stop_profile,
-          physical->default_fault_stop_profile);
+          physical->default_fault_stop_profile,
+          physical->deployment_maximum_tcp_linear_speed_mps);
       registration.intrinsic_direct_control =
           binding.value().intrinsic_direct_control;
       registration.direct_control_joint_limits =
@@ -995,17 +999,15 @@ create_retained_native_runtime_participants(
           sealed.error().message);
     }
     motion_runtime_policy = std::move(sealed.value());
-    if (input.deployment_maximum_tcp_linear_speed_mps.has_value()) {
-      auto tightened = core::apply_deployment_motion_speed_ceiling(
-          *motion_runtime_policy,
-          *input.deployment_maximum_tcp_linear_speed_mps);
-      if (!tightened.ok()) {
-        throw std::invalid_argument(
-            "native Deployment motion ceiling is invalid: " +
-            tightened.error().message);
-      }
-      motion_runtime_policy = std::move(tightened.value());
-    }
+  }
+
+  if (!input.deployment_maximum_tcp_linear_speed_mps.has_value() ||
+      !std::isfinite(*input.deployment_maximum_tcp_linear_speed_mps) ||
+      *input.deployment_maximum_tcp_linear_speed_mps <= 0.0 ||
+      *input.deployment_maximum_tcp_linear_speed_mps > 1000.0) {
+    throw std::invalid_argument(
+        "native motion target requires one finite positive Deployment TCP "
+        "linear-speed maximum");
   }
 
   if (input.ordinary_motion_jerk) {
@@ -1315,14 +1317,17 @@ create_retained_native_runtime_participants(
                                       motion_runtime_policy),
         motion_owner ? motion_operator_stop_profile
                      : std::optional<core::MotionInterruptStopProfileDTO>{},
-        motion_owner ? motion_fault_stop_profile
-                     : std::optional<core::MotionInterruptStopProfileDTO>{}));
+          motion_owner ? motion_fault_stop_profile
+                     : std::optional<core::MotionInterruptStopProfileDTO>{},
+        motion_owner ? input.deployment_maximum_tcp_linear_speed_mps
+                     : std::optional<double>{}));
   }
   for (const auto &alias : runtime->motion_binding_aliases) {
     registrations.push_back(runtime_registration(
         alias, input.motion_stop_readiness, runtime->participant_engine.get(),
         runtime->execution.get(), motion_runtime_policy,
-        motion_operator_stop_profile, motion_fault_stop_profile));
+        motion_operator_stop_profile, motion_fault_stop_profile,
+        input.deployment_maximum_tcp_linear_speed_mps));
   }
   for (const auto &alias : runtime->gripper_binding_aliases) {
     registrations.push_back(runtime_registration(
@@ -1336,7 +1341,8 @@ create_retained_native_runtime_participants(
       runtime->motion_binding, input.motion_stop_readiness,
       runtime->participant_engine.get(), runtime->execution.get(),
       motion_runtime_policy, motion_operator_stop_profile,
-      motion_fault_stop_profile));
+      motion_fault_stop_profile,
+      input.deployment_maximum_tcp_linear_speed_mps));
   physical_registrations.back().direct_control_joint_limits =
       runtime->direct_control_joint_limits;
   if (runtime->gripper_binding.has_value()) {
@@ -1967,13 +1973,16 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
           motion_owner ? motion_operator_stop_profile
                        : std::optional<core::MotionInterruptStopProfileDTO>{},
           motion_owner ? motion_fault_stop_profile
-                       : std::optional<core::MotionInterruptStopProfileDTO>{}));
+                       : std::optional<core::MotionInterruptStopProfileDTO>{},
+          motion_owner ? deployment_maximum_tcp_linear_speed_mps
+                       : std::optional<double>{}));
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
           alias, motion_readiness, participant_engine.get(), execution.get(),
           motion_runtime_policy, motion_operator_stop_profile,
-          motion_fault_stop_profile));
+          motion_fault_stop_profile,
+          deployment_maximum_tcp_linear_speed_mps));
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(
@@ -2379,13 +2388,16 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
           motion_owner ? motion_operator_stop_profile
                        : std::optional<core::MotionInterruptStopProfileDTO>{},
           motion_owner ? motion_fault_stop_profile
-                       : std::optional<core::MotionInterruptStopProfileDTO>{}));
+                       : std::optional<core::MotionInterruptStopProfileDTO>{},
+          motion_owner ? deployment_maximum_tcp_linear_speed_mps
+                       : std::optional<double>{}));
     }
     for (const auto &alias : next_motion_aliases) {
       registrations.push_back(runtime_registration(
           alias, motion_readiness, participant_engine.get(), execution.get(),
           motion_runtime_policy, motion_operator_stop_profile,
-          motion_fault_stop_profile));
+          motion_fault_stop_profile,
+          deployment_maximum_tcp_linear_speed_mps));
     }
     for (const auto &alias : next_gripper_aliases) {
       registrations.push_back(runtime_registration(

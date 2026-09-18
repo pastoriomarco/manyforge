@@ -13,20 +13,29 @@ import {
   buildPreviewIntent,
   buildJointMotionIntent,
   buildGripperCommandIntent,
+  gripperTargetsForStatus,
   initialRobotControlState,
   operationStateIsTerminal,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
   robotControlHasActiveOperation,
   robotControlHasLocalDraft,
   robotControlReducer,
+  selectedStatusForState,
+  motionTargetsForStatus,
 } from '../state/robotControl';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { HeadlessStateSource } from './useHeadlessState';
-import type { ManualMotionSettings, RobotControlState } from '../state/robotControl';
+import type {
+  ManualCartesianDefaults,
+  ManualMotionSettings,
+  RobotControlState,
+} from '../state/robotControl';
 import type { RobotControlMode } from '../state/robotControl';
 import type { CartesianMoveDraftOptions, MoveToDraftSource } from '../utils/moveTo';
 import type {
   DirectControlOperationIntent,
+  DirectControlGripperStatus,
+  DirectControlMotionStatus,
   ExecutionOwnerStatus,
   ManualControlAvailability,
   Pose3Value,
@@ -45,7 +54,7 @@ function errorMessage(error: unknown, fallback: string): string {
     : fallback;
 }
 
-function runtimeScaleSelectorIdentity(selector: RuntimeScaleControlStatus['selector']): string {
+export function runtimeScaleSelectorIdentity(selector: RuntimeScaleControlStatus['selector']): string {
   const compareTuples = (left: unknown[], right: unknown[]): number => {
     const leftJson = JSON.stringify(left);
     const rightJson = JSON.stringify(right);
@@ -170,11 +179,19 @@ export function acceptedRuntimeScaleStatus(
 }
 
 /** Cold ownership/hold revisions only; never pose samples or node tick status. */
-export function manualAvailabilityScopeFence(snapshot: ComposerHeadlessState | null, mode: RobotControlMode): string | null {
+export function manualAvailabilityScopeFence(
+  snapshot: ComposerHeadlessState | null,
+  mode: RobotControlMode,
+  selection?: Pick<RobotControlState, 'selectedComponentId' | 'selectedMotionTargetId' | 'selectedGripperTargetId'>,
+): string | null {
   const status = snapshot?.executionControlStatus;
   if (status == null || snapshot == null) return null;
+  const selected = selection === undefined
+    ? status
+    : selectedStatusForState({ status, ...selection });
+  if (selected === null) return null;
   const cycle = snapshot.programCycle;
-  const target = mode === 'gripper' ? status.directControlGripper : status.directControl;
+  const target = mode === 'gripper' ? selected.directControlGripper : selected.directControl;
   return JSON.stringify([
     status.ownerEpoch, status.retainedBundleId, status.graphRevision,
     target.programBindingId, target.programRunId,
@@ -191,6 +208,10 @@ export interface RobotControlController {
   state: RobotControlState;
   /** Current owner projection, unlike state.status retained for presentation. */
   currentStatus: ExecutionOwnerStatus | null;
+  /** Selected addressed robot/tool projection used by all direct-control UI. */
+  selectedStatus: ExecutionOwnerStatus | null;
+  motionTargets: DirectControlMotionStatus[];
+  gripperTargets: DirectControlGripperStatus[];
   manualControlAllowed: boolean;
   manualControlUnavailableReason: string | null;
   setManualPanelVisible: (visible: boolean) => void;
@@ -201,6 +222,8 @@ export interface RobotControlController {
   runtimeScaleError: string | null;
   fullStopPending: boolean;
   fullStopError: string | null;
+  selectRobot: (componentId: string, motionTargetId: string) => void;
+  selectTool: (gripperTargetId: string) => void;
   selectMode: (mode: RobotControlMode) => void;
   selectMoveToSource: (source: MoveToDraftSource) => void;
   editMoveToOptions: (update: Partial<CartesianMoveDraftOptions>) => void;
@@ -234,6 +257,7 @@ export function useRobotControl(
   programStopActive = false,
   headlessSnapshot: ComposerHeadlessState | null = null,
   controlSource: HeadlessStateSource | null = null,
+  cartesianDefaults: ManualCartesianDefaults | null = null,
 ): RobotControlController {
   const [state, dispatch] = useReducer(
     robotControlReducer,
@@ -283,7 +307,31 @@ export function useRobotControl(
   const cleanupInFlight = useRef<Promise<void> | null>(null);
   const latestSnapshot = useRef(headlessSnapshot);
   latestSnapshot.current = headlessSnapshot;
-  const availabilityScope = observeProgramRun ? manualAvailabilityScopeFence(headlessSnapshot, state.mode) : null;
+  const ownerStatus = state.status;
+  const selectedComponentId = state.selectedComponentId;
+  const selectedMotionTargetId = state.selectedMotionTargetId;
+  const selectedGripperTargetId = state.selectedGripperTargetId;
+  const selectedStatus = useMemo(
+    () => selectedStatusForState({
+      status: ownerStatus,
+      selectedComponentId,
+      selectedMotionTargetId,
+      selectedGripperTargetId,
+    }),
+    [ownerStatus, selectedComponentId, selectedMotionTargetId,
+      selectedGripperTargetId],
+  );
+  const motionTargets = useMemo(
+    () => ownerStatus === null ? [] : motionTargetsForStatus(ownerStatus),
+    [ownerStatus],
+  );
+  const gripperTargets = useMemo(
+    () => ownerStatus === null ? [] : gripperTargetsForStatus(ownerStatus),
+    [ownerStatus],
+  );
+  const availabilityScope = observeProgramRun
+    ? manualAvailabilityScopeFence(headlessSnapshot, state.mode, state)
+    : null;
   const currentAvailability = availability?.scope === availabilityScope ? availability.result : null;
   const manualControlAllowed = !observeProgramRun || (currentAvailability?.available === true && cleanupFailure === null);
   const manualControlUnavailableReason = manualControlAllowed ? null : cleanupFailure
@@ -293,8 +341,10 @@ export function useRobotControl(
   const manualControlBlocked = useRef(!manualControlAllowed);
   manualControlBlocked.current = !manualControlAllowed;
   const projectedOwnerRef = useRef<string | null>(null);
-  const previewStatusRef = useRef(state.status);
-  previewStatusRef.current = state.status;
+  const previewStatusRef = useRef(selectedStatus);
+  previewStatusRef.current = selectedStatus;
+  const availabilityStatusRef = useRef(selectedStatus);
+  availabilityStatusRef.current = selectedStatus;
 
   useEffect(() => {
     // An old owner's response cannot block or reject a successor's draft.
@@ -306,7 +356,7 @@ export function useRobotControl(
 
   useEffect(() => {
     if (!enabled || !observeProgramRun || !observeManualAvailability || availabilityScope === null) return;
-    const status = latestSnapshot.current?.executionControlStatus;
+    const status = availabilityStatusRef.current;
     if (status == null) return;
     const controller = new AbortController();
     let current = true;
@@ -327,7 +377,8 @@ export function useRobotControl(
     };
     void read();
     return () => { current = false; controller.abort(); };
-  }, [enabled, observeProgramRun, observeManualAvailability, availabilityScope, availabilityRefresh, state.mode]);
+  }, [enabled, observeProgramRun, observeManualAvailability, availabilityScope, availabilityRefresh,
+    state.mode]);
 
   useEffect(() => {
     if (observeProgramRun) dispatch({ type: 'manual_scope_changed' });
@@ -351,8 +402,14 @@ export function useRobotControl(
     dispatch({
       type: initialize ? 'status_resolved' : 'status_refreshed',
       status,
+      cartesianDefaults,
     });
-  }, [enabled, headlessSnapshot?.executionControlStatus]);
+  }, [cartesianDefaults, enabled, headlessSnapshot?.executionControlStatus]);
+
+  useEffect(() => {
+    if (cartesianDefaults === null) return;
+    dispatch({ type: 'program_cartesian_defaults_changed', defaults: cartesianDefaults });
+  }, [cartesianDefaults]);
 
   useEffect(() => {
     const previewStatus = previewStatusRef.current;
@@ -477,6 +534,14 @@ export function useRobotControl(
 
   const selectMode = useCallback((mode: RobotControlMode) => {
     dispatch({ type: 'select_mode', mode });
+  }, []);
+
+  const selectRobot = useCallback((componentId: string, motionTargetId: string) => {
+    dispatch({ type: 'select_robot', componentId, motionTargetId });
+  }, []);
+
+  const selectTool = useCallback((gripperTargetId: string) => {
+    dispatch({ type: 'select_tool', gripperTargetId });
   }, []);
 
   useEffect(() => {
@@ -927,7 +992,12 @@ export function useRobotControl(
 
   return useMemo(() => ({
     state,
-    currentStatus: headlessSnapshot?.executionControlStatus ?? null,
+    // Keep the complete owner projection for cross-target recovery and cell
+    // controls. Target-specific authoring uses selectedStatus below.
+    currentStatus: state.status,
+    selectedStatus,
+    motionTargets,
+    gripperTargets,
     manualControlAllowed,
     manualControlUnavailableReason,
     setManualPanelVisible,
@@ -938,6 +1008,8 @@ export function useRobotControl(
     runtimeScaleError,
     fullStopPending,
     fullStopError,
+    selectRobot,
+    selectTool,
     selectMode,
     selectMoveToSource,
     editMoveToOptions,
@@ -992,11 +1064,15 @@ export function useRobotControl(
     setRuntimeScale,
     commitRuntimeScale,
     state,
-    headlessSnapshot?.executionControlStatus,
+    selectedStatus,
+    motionTargets,
+    gripperTargets,
     manualControlAllowed,
     manualControlUnavailableReason,
     stop,
     fullStop,
+    selectRobot,
+    selectTool,
     dismissFullStopError,
     dismissRuntimeScaleError,
     dismissError,

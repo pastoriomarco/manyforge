@@ -84,6 +84,10 @@ struct RuntimeParticipantExecutionRegistration final {
   /// operation/goal as the ordinary plan and never selected by caller input.
   std::optional<MotionInterruptStopProfileDTO> default_fault_stop_profile;
 
+  /// Sole configured TCP linear-speed ceiling for this exact applied
+  /// Deployment target. Motion admission fails closed when it is absent.
+  std::optional<double> deployment_maximum_tcp_linear_speed_mps;
+
   /// Composition-owned classification from an exact compiler-direct product,
   /// never inferred from missing Program origin or a caller's source label.
   bool intrinsic_direct_control{};
@@ -391,6 +395,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<ProgramExecutionScopeStateDTO> release_program_selection(
       const ProgramExecutionSelectionRequestDTO& request,
       std::uint64_t expected_selection_revision);
+  [[nodiscard]] Result<ProgramExecutionScopeStateDTO> start_program_selection(
+      const ProgramExecutionSelectionRequestDTO& request,
+      std::uint64_t expected_selection_revision);
   /// Reopen one exact Program-run admission fence after its accepted Stop has
   /// settled and the Program owner has explicitly chosen recovery/resume.
   [[nodiscard]] Result<void> release_program_run_stop_fence(const ProgramRunId& program_run_id,
@@ -521,6 +528,14 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> reconfigure_runtime_participants(
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver = {});
+
+  /// Select one verified runtime product before route readiness is published.
+  /// Unlike a later participant/readiness refresh, this replaces the retained
+  /// cell-wide Stop deadline referent with the exact product-owned value.
+  [[nodiscard]] Result<void> reconfigure_runtime_product(
+      std::vector<RuntimeParticipantExecutionRegistration> registrations,
+      RuntimeParticipantAdmissionResolver participant_resolver,
+      std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget);
 
   /// Publish the candidate-side active-configuration identities already
   /// declared by the installed registrations while the exact durable Apply
@@ -689,7 +704,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> reconfigure_runtime_participants_impl(
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver,
-      bool retain_unready_configuration_facts);
+      bool retain_unready_configuration_facts,
+      const std::optional<StopDeadlineBudgetDTO>* replacement_stop_deadline_budget = nullptr);
   [[nodiscard]] StopIntentDTO internal_control_stop_intent_locked(
       const ActiveOperation& operation, const OperationControlAcceptedDTO& accepted,
       std::string_view reason) const;

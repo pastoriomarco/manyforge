@@ -1077,13 +1077,13 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pick/124ded46f75ef3a999510c936b24b1f2fc223504b01e318df067592f54d87e2a",
-        "content_digest": "sha256:3e6c4c6c6136c1a9d7a19400043b91a98c422f635622dc7ffbcab4b54efb73c4",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pick/a4808545dc7e0130f3cd8fb36601be305e202646e174d0e17cd8165e4fd7f7ef",
+        "content_digest": "sha256:ec5f7b899880c44962bf4e10a657255286fbf6ff0b0bcdf17e179a1028085760",
         "record_id": "manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pick",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:124ded46f75ef3a999510c936b24b1f2fc223504b01e318df067592f54d87e2a",
+        "record_revision": "sha256:a4808545dc7e0130f3cd8fb36601be305e202646e174d0e17cd8165e4fd7f7ef",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/7016c53470a155760287cdd2186a783a2185d63bb3ac2e455e49f1d80130a00b",
@@ -1127,7 +1127,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pick",
-  "deployment_revision": "sha256:eda8a108de30c76a64d937334a6dcadd9bd6e5efa615d2218d219fdd0a1109c7",
+  "deployment_revision": "sha256:8db5948bdd0c1c4775234e5177b872622fa50fc4d2151a257372b77efa2d398b",
   "description": "Local deployment for the vision-guided bin-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
   "desired_control_configurations": [
     {
@@ -2126,13 +2126,13 @@
     "interrupt_sources": [],
     "retained_policy_records": [
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pick/124ded46f75ef3a999510c936b24b1f2fc223504b01e318df067592f54d87e2a",
-        "content_digest": "sha256:3e6c4c6c6136c1a9d7a19400043b91a98c422f635622dc7ffbcab4b54efb73c4",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pick/a4808545dc7e0130f3cd8fb36601be305e202646e174d0e17cd8165e4fd7f7ef",
+        "content_digest": "sha256:ec5f7b899880c44962bf4e10a657255286fbf6ff0b0bcdf17e179a1028085760",
         "record_id": "manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pick",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:124ded46f75ef3a999510c936b24b1f2fc223504b01e318df067592f54d87e2a",
+        "record_revision": "sha256:a4808545dc7e0130f3cd8fb36601be305e202646e174d0e17cd8165e4fd7f7ef",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       }
     ],
     "stop_stage_parameters": [

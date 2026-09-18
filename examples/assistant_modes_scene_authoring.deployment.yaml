@@ -1172,13 +1172,13 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur10e_robotiq_assistant_modes_scene_authoring/60a2c6e6e66b086bc15240f6494f04ccd903a4a44f1758933a11d7bcc6a72c61",
-        "content_digest": "sha256:ebce1179b3e7278f966a0db7655b6a4c71284374fba1776e02adb4bd6cbc8613",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur10e_robotiq_assistant_modes_scene_authoring/2eac196ea89e3ffa5721910cba7b0f7aec707b1d7faf3e697097a046cc6a2a21",
+        "content_digest": "sha256:02cfaa9ee5367d13290f6c244e9e4ccda26cebd81e96064e92134643c3af5521",
         "record_id": "manyforge.runtime_motion.ur10e_robotiq_assistant_modes_scene_authoring",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:60a2c6e6e66b086bc15240f6494f04ccd903a4a44f1758933a11d7bcc6a72c61",
+        "record_revision": "sha256:2eac196ea89e3ffa5721910cba7b0f7aec707b1d7faf3e697097a046cc6a2a21",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/7016c53470a155760287cdd2186a783a2185d63bb3ac2e455e49f1d80130a00b",
@@ -1223,7 +1223,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "deployment_revision": "sha256:ddd5db747536d1ce8409fede2b8fc19469a7cd609a1f2062f0fe6a2cab9f405c",
+  "deployment_revision": "sha256:393d5cf10708a09ff7de4df4f4676815dc951a01785e31737c6a2acd3f755ec6",
   "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to query and composer-assistant requests.",
   "desired_control_configurations": [
     {
@@ -2231,13 +2231,13 @@
     "interrupt_sources": [],
     "retained_policy_records": [
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur10e_robotiq_assistant_modes_scene_authoring/60a2c6e6e66b086bc15240f6494f04ccd903a4a44f1758933a11d7bcc6a72c61",
-        "content_digest": "sha256:ebce1179b3e7278f966a0db7655b6a4c71284374fba1776e02adb4bd6cbc8613",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur10e_robotiq_assistant_modes_scene_authoring/2eac196ea89e3ffa5721910cba7b0f7aec707b1d7faf3e697097a046cc6a2a21",
+        "content_digest": "sha256:02cfaa9ee5367d13290f6c244e9e4ccda26cebd81e96064e92134643c3af5521",
         "record_id": "manyforge.runtime_motion.ur10e_robotiq_assistant_modes_scene_authoring",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:60a2c6e6e66b086bc15240f6494f04ccd903a4a44f1758933a11d7bcc6a72c61",
+        "record_revision": "sha256:2eac196ea89e3ffa5721910cba7b0f7aec707b1d7faf3e697097a046cc6a2a21",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       }
     ],
     "stop_stage_parameters": [

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -2045,35 +2046,9 @@ void verify_scenarios(const std::filesystem::path &root,
                            [runtime_policy_ref](const auto &policy) {
                              return policy.reference() == *runtime_policy_ref;
                            });
-    if (selected_policy == catalog.runtime_policies.end() ||
-        selected_policy->value().motion_speed_limits.size() != 2U) {
+    if (selected_policy == catalog.runtime_policies.end()) {
       throw std::invalid_argument(
           "maintained scenario runtime policy is absent or incomplete: " +
-          std::string(scenario.source));
-    }
-    std::optional<double> cell_speed_limit;
-    std::optional<double> target_speed_limit;
-    for (const auto &limit : selected_policy->value().motion_speed_limits) {
-      if (std::holds_alternative<core::RuntimePolicyCellScopeDTO>(
-              limit.scope)) {
-        cell_speed_limit = limit.maximum_tcp_linear_speed_mps;
-        continue;
-      }
-      const auto &target =
-          std::get<core::RuntimePolicyCommandTargetScopeDTO>(limit.scope);
-      if (target.controllable_component_id ==
-              graph.controllable_components.front().controllable_component_id &&
-          target.command_target_id.value() == "arm") {
-        target_speed_limit = limit.maximum_tcp_linear_speed_mps;
-      }
-    }
-    const double expected_target_speed_limit =
-        scenario.family_id == "lite6_lite_gripper" ? 0.15 : 0.25;
-    if (cell_speed_limit != std::optional<double>{0.5} ||
-        target_speed_limit !=
-            std::optional<double>{expected_target_speed_limit}) {
-      throw std::invalid_argument(
-          "maintained scenario has the wrong exact target speed policy: " +
           std::string(scenario.source));
     }
     const auto &runtime = graph.runtime_units.front();
@@ -2124,6 +2099,33 @@ void verify_scenarios(const std::filesystem::path &root,
         {"planner_rng_seed", core::JsonValueDTO{12345.0}},
     };
     if (!scenario.ros2_control_execution) {
+      const auto motion_targets =
+          runtime.configuration.find("motion_target_limits");
+      const auto *motion_target_rows =
+          motion_targets == runtime.configuration.end()
+              ? nullptr
+              : std::get_if<core::JsonValueDTO::Array>(
+                    &motion_targets->second.value);
+      const auto *motion_target =
+          motion_target_rows == nullptr || motion_target_rows->size() != 1U
+              ? nullptr
+              : std::get_if<core::JsonObjectDTO>(
+                    &motion_target_rows->front().value);
+      const auto speed =
+          motion_target == nullptr
+              ? core::JsonObjectDTO::const_iterator{}
+              : motion_target->find("maximum_tcp_linear_speed_mps");
+      const auto *expected_target_speed_limit =
+          motion_target == nullptr || speed == motion_target->end()
+              ? nullptr
+              : std::get_if<double>(&speed->second.value);
+      if (expected_target_speed_limit == nullptr ||
+          !std::isfinite(*expected_target_speed_limit) ||
+          *expected_target_speed_limit <= 0.0) {
+        throw std::invalid_argument(
+            "maintained scenario has no valid Deployment TCP speed limit: " +
+            std::string(scenario.source));
+      }
       expected_runtime_configuration.emplace(
           "direct_control_joint_limits",
           core::JsonValueDTO{core::JsonValueDTO::Array{}});
@@ -2133,7 +2135,7 @@ void verify_scenarios(const std::filesystem::path &root,
            core::JsonValueDTO{graph.controllable_components.front()
                                   .controllable_component_id.value()}},
           {"maximum_tcp_linear_speed_mps",
-           core::JsonValueDTO{expected_target_speed_limit}},
+           core::JsonValueDTO{*expected_target_speed_limit}},
           {"ordinary_motion_jerk",
            core::JsonValueDTO{core::JsonObjectDTO{
                {"enabled", core::JsonValueDTO{false}},
@@ -2570,6 +2572,21 @@ compile_candidate(const Options &options,
     throw std::runtime_error(
         "candidate scenario catalog did not reopen exactly");
   }
+  const auto candidate_deployment_source =
+      options.candidate_package_root /
+      std::filesystem::path(scenario.source).filename();
+  const bool source_already_retained =
+      std::filesystem::exists(candidate_deployment_source) &&
+      std::filesystem::equivalent(options.candidate_deployment_path,
+                                  candidate_deployment_source);
+  if (std::filesystem::is_symlink(candidate_deployment_source) ||
+      (!source_already_retained &&
+       !std::filesystem::copy_file(
+           options.candidate_deployment_path, candidate_deployment_source,
+           std::filesystem::copy_options::overwrite_existing))) {
+    throw std::runtime_error(
+        "candidate Deployment source could not be retained for authoring");
+  }
   const deployment::FilesystemScenarioApplyCandidateSource reopened(
       options.candidate_package_root, "maintained");
   const auto exact =
@@ -2581,6 +2598,7 @@ compile_candidate(const Options &options,
     throw std::runtime_error(
         "candidate scenario selection did not reopen exactly");
   }
+  static_cast<void>(reopened.LoadExactDeploymentDocument(exact));
 
   return deployment::CanonicalValue(deployment::CanonicalValue::Object{
       {"deployment_artifact_id",

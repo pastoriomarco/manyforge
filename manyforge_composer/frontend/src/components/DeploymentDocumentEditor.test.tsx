@@ -38,7 +38,7 @@ function controller(): DeploymentWorkspaceController {
     busy: false,
     error: null,
     feedback: null,
-    candidate: null,
+    pendingApplyConfirmation: null,
     mutationAvailable: true,
     mutationUnavailableReason: null,
     refresh: vi.fn(),
@@ -52,8 +52,9 @@ function controller(): DeploymentWorkspaceController {
     save: vi.fn(),
     saveAs: vi.fn(),
     discard: vi.fn(),
-    previewDraft: vi.fn(),
     applyDraft: vi.fn(),
+    confirmApply: vi.fn(),
+    cancelApplyConfirmation: vi.fn(),
   };
 }
 

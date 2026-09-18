@@ -20,6 +20,13 @@ using manyforge::core::RuntimeRoleId;
 using manyforge::core::RuntimeUnitId;
 using manyforge::deployment::RetainedBundle;
 
+[[nodiscard]] bool SameDeploymentRevision(
+    const manyforge::core::ProjectionRevisionDTO &left,
+    const manyforge::core::ProjectionRevisionDTO &right) noexcept {
+  return left.retained_bundle_id == right.retained_bundle_id &&
+         left.graph_revision == right.graph_revision;
+}
+
 [[noreturn]] void Fail(const std::string &detail) {
   throw ManagerRuntimeConvergenceCoordinatorError(detail);
 }
@@ -68,8 +75,9 @@ void VerifyApplyInputs(const ManagerApplyIntentDTO &apply_intent,
   const auto &receipt = read.value();
   if (!receipt.valid() ||
       receipt.publication_generation != publication_generation ||
-      receipt.request.candidate_projection_revision !=
-          apply_intent.expected_active_projection_revision ||
+      !SameDeploymentRevision(receipt.request.candidate_projection_revision,
+                              apply_intent
+                                  .expected_active_projection_revision) ||
       receipt.request.candidate_retained_bundle_id !=
           apply_intent.expected_active_projection_revision.retained_bundle_id ||
       receipt.request.candidate_graph_revision !=

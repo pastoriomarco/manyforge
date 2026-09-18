@@ -1120,7 +1120,7 @@ def main() -> None:
                 ],
                 "velocity_scale": 0.3,
                 "acceleration_scale": 0.25,
-                "max_linear_speed_mps": 0.05,
+                "max_tcp_linear_speed_mps": 0.05,
                 "execution_timeout_s": 30,
             }
         controls = {

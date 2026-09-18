@@ -88,6 +88,7 @@ from .models import (
     ProgramNodeAvailabilityRequest,
     ProgramSelectionStopRequest,
     ProgramSelectionResumeRequest,
+    ProgramSelectionStartRequest,
     ProgramManualHandoverRequest,
     RuntimeBlackboardWriteRequest,
     RuntimeOverrideActionRequest,
@@ -1195,6 +1196,7 @@ class ProgramRuntime:
             ):
                 return False
             if row["kind"] in {
+                "start_motion",
                 "resume_motion",
                 "resume_full_stop",
                 "prepare_manual_handover",
@@ -1321,6 +1323,7 @@ class ProgramRuntime:
         recovery_reset = self._current_cycle_recovery_reset(cycle)
         allowed_by_state = {
             "program_run": cycle.state == "idle_after_reset",
+            "program_motion_start": cycle.state == "running",
             "program_motion_stop": cycle.state in {"starting", "running"},
             "program_motion_resume": cycle.state == "running",
             "program_full_stop": cycle.state in {"starting", "running"},
@@ -1521,6 +1524,9 @@ class ProgramRuntime:
 
         stoppable = ("running", "intervention_required")
         exact_run_permissions = {
+            "program_motion_start": run_allows(
+                "program_motion_start", *stoppable
+            ),
             "program_motion_resume": run_allows("program_motion_resume", *stoppable),
             # A nominal held Stop may retain an interrupted task awaiting
             # cleanup. Its intervention state must not prevent that cleanup;
@@ -1663,11 +1669,9 @@ class ProgramRuntime:
         intervention = self._owner.intervention(program_run_id)
         if intervention is None:
             return None
-        if intervention.policy_parameter == "operator_stop_policy":
-            self._owner.refresh_operator_stop_intervention(program_run_id)
-            intervention = self._owner.intervention(program_run_id)
-            if intervention is None:
-                return None
+        # Status projection uses the retained owner assessment. It must not
+        # perform owner I/O; Resume revalidates every selected attempt before
+        # releasing any hold.
         controls = self._optional_controls(program_run_id)
         if controls is None:
             return None
@@ -3186,7 +3190,7 @@ class ProgramRuntime:
         execution_selections: dict[str, Any],
     ) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.program_runtime_control_projection.v4",
+            "schema_version": "manyforge.program_runtime_control_projection.v6",
             "owner_id": self.owner_id,
             "owner_epoch": self.owner_epoch,
             "program_run_id": program_run_id,
@@ -3273,7 +3277,7 @@ class ProgramRuntime:
                 or cycle.state not in {"running", "stopping"}
                 or cycle.reconciliation_required
                 or (
-                    kind in {"resume_motion", "prepare_manual_handover"}
+                    kind in {"start_motion", "resume_motion", "prepare_manual_handover"}
                     and cycle.state != "running"
                 )
             ):
@@ -4338,6 +4342,33 @@ class ProgramRuntime:
         # Reuse ordinary current-run command ordering, attribution and outcome
         # retention. Unknown effects enter its existing reconciliation path.
         result = self._control_effect(request, kind="resume_motion", effect=effect)
+        return self._project_run(result["run"])
+
+    def start_motion(
+        self, program_run_id: str, request: ProgramSelectionStartRequest
+    ) -> dict[str, Any]:
+        if not isinstance(request, ProgramSelectionStartRequest):
+            raise TypeError("start_motion requires one ProgramSelectionStartRequest")
+        if request.program_run_id != program_run_id:
+            raise ProgramRunnerError(
+                "program_run_path_invalid", "initial motion Run changed its Program"
+            )
+
+        def effect() -> dict[str, Any]:
+            snapshot = self._host.start_motion(
+                program_run_id,
+                expected_run_revision=request.expected_run_revision,
+                expected_selection_revision=request.expected_selection_revision,
+                request_id=request.request_id,
+                group_id=request.group_ids,
+                reason=request.reason,
+            )
+            return {
+                "state": snapshot.state.value,
+                "run_revision": snapshot.run_revision,
+            }
+
+        result = self._control_effect(request, kind="start_motion", effect=effect)
         return self._project_run(result["run"])
 
     def prepare_manual_handover(

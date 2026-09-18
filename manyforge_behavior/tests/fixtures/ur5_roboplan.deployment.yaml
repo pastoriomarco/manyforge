@@ -10,7 +10,6 @@ robot_config:
   group_id: arm
   urdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf
   srdf_path: package://roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf
-  global_max_tcp_linear_speed_mps: 0.25
 
 adapters:
   planning:

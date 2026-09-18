@@ -28,6 +28,7 @@ function controller(): CCLCController {
     transaction: null,
     pendingTransaction: null,
     busy: false,
+    readUnavailableReason: null,
     error: null,
     setComponentId: vi.fn(),
     refresh: vi.fn(),
@@ -52,5 +53,20 @@ describe('CCLC presentation', () => {
     expect(html).toContain('Start / prepare');
     expect(html).toContain('Connect / enable');
     expect(html).toContain('Owner-issued state');
+  });
+
+  it('keeps read unavailability local to the lifecycle panel', () => {
+    const unavailable = controller();
+    unavailable.snapshot = null;
+    unavailable.routeTemplates = null;
+    unavailable.readUnavailableReason = 'This Deployment uses direct native control.';
+    const html = renderToStaticMarkup(createElement(CCLCPanelView, {
+      enabled: true,
+      mutationAvailable: true,
+      mutationUnavailableReason: null,
+      controller: unavailable,
+    }));
+    expect(html).toContain('This Deployment uses direct native control.');
+    expect(html).not.toContain('error-state');
   });
 });

@@ -598,14 +598,6 @@ struct QualifiedIndexes final {
   };
   for (const auto &key : result.required_runtime_policies) {
     const auto &policy = result.runtime_policies.at(key)->value();
-    for (const auto &limit : policy.motion_speed_limits) {
-      if (const auto *scoped =
-              std::get_if<core::RuntimePolicyCommandTargetScopeDTO>(
-                  &limit.scope);
-          scoped != nullptr) {
-        require_exact_target(*scoped);
-      }
-    }
     for (const auto &acknowledgement :
          policy.open_loop_grasp_acknowledgements) {
       require_exact_target(acknowledgement);

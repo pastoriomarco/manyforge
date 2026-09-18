@@ -11,6 +11,7 @@ import type {
 import {
   deriveProgramMotionConfiguration,
   flattenProgramForest,
+  PROGRAM_MOTION_CEILING_FIELDS,
   PROGRAM_MOTION_FIELDS,
   type ProgramMotionValues,
 } from '../utils/programAuthoring';
@@ -195,8 +196,11 @@ export function ProgramSettingsEditor({
       const preservedDeferredGroups = Object.fromEntries(
         Object.entries(program.execution_groups ?? {}).filter(
           ([, definition]) => definition.execution_policy !== 'independent',
-        ),
-      );
+        ).map(([groupId, definition]) => [
+          groupId,
+          { execution_policy: definition.execution_policy },
+        ]),
+      ) as Record<string, JsonValue>;
       onMutate('program_draft_update_settings', {
         name: name.trim(),
         description: description.trim(),
@@ -343,7 +347,7 @@ export function ProgramSettingsEditor({
     ));
   const motionConflictCount = (values: MotionDefaults): number => (
     flattenProgramForest(program.forest).reduce((count, { node }) => (
-      count + PROGRAM_MOTION_FIELDS.filter((field) => {
+      count + PROGRAM_MOTION_CEILING_FIELDS.filter((field) => {
         const value = node.parameters[field];
         return typeof value === 'number'
           && value > values[field];
@@ -362,7 +366,8 @@ export function ProgramSettingsEditor({
       mode: 'update',
       velocity_scale: values.velocity_scale,
       acceleration_scale: values.acceleration_scale,
-      max_tcp_linear_speed_mps: values.max_tcp_linear_speed_mps,
+      translation_tol_m: values.translation_tol_m,
+      max_blend_deviation_rad: values.max_blend_deviation_rad,
       parameter_bindings: motionConfiguration.configuration.bindings,
       conflict_resolution: conflictResolution,
     });
@@ -385,10 +390,12 @@ export function ProgramSettingsEditor({
       || !Number.isFinite(motion.acceleration_scale)
       || motion.acceleration_scale <= 0
       || motion.acceleration_scale > 1
-      || !Number.isFinite(motion.max_tcp_linear_speed_mps)
-      || motion.max_tcp_linear_speed_mps <= 0
+      || !Number.isFinite(motion.translation_tol_m)
+      || motion.translation_tol_m <= 0
+      || !Number.isFinite(motion.max_blend_deviation_rad)
+      || motion.max_blend_deviation_rad < 0
     ) {
-      setMotionError('Velocity and acceleration scales must be in (0, 1]; TCP speed must be positive.');
+      setMotionError('Scales must be in (0, 1], translation tolerance must be positive, and blend deviation must be non-negative.');
       return;
     }
     const count = motionConflictCount(motion);
@@ -491,10 +498,11 @@ export function ProgramSettingsEditor({
       </section>
 
       <section className="program-settings-section program-motion-defaults">
-        <h3>Program motion limits</h3>
+        <h3>Program motion defaults</h3>
         <p>
-          These are portable Program ceilings. Motion nodes default to them;
-          lower per-node values remain valid. The live command-bar Velocity
+          These are portable Program defaults. Velocity, acceleration and TCP
+          speed remain ceilings; Cartesian nodes may override the inherited
+          path tolerance and blend value. The live command-bar Velocity
           control further scales current and subsequent compatible moves for
           the addressed target without changing these Program values.
         </p>
@@ -553,27 +561,45 @@ export function ProgramSettingsEditor({
                 />
               </label>
               <label>
-                Maximum TCP linear speed
+                Cartesian translation tolerance
                 <span className="program-motion-number">
                   <input
-                    aria-label="Program maximum TCP linear speed"
+                    aria-label="Program Cartesian translation tolerance"
                     type="number"
-                    min="0.001"
+                    min="0.000001"
                     step="0.001"
-                    value={motion.max_tcp_linear_speed_mps}
+                    value={motion.translation_tol_m}
                     disabled={busy}
                     onChange={(event) => setMotion((current) => current === null ? null : ({
                       ...current,
-                      max_tcp_linear_speed_mps: event.currentTarget.valueAsNumber,
+                      translation_tol_m: event.currentTarget.valueAsNumber,
                     }))}
                   />
-                  <span>m/s</span>
+                  <span>m</span>
+                </span>
+              </label>
+              <label>
+                Maximum Cartesian blend deviation
+                <span className="program-motion-number">
+                  <input
+                    aria-label="Program maximum Cartesian blend deviation"
+                    type="number"
+                    min="0"
+                    step="0.005"
+                    value={motion.max_blend_deviation_rad}
+                    disabled={busy}
+                    onChange={(event) => setMotion((current) => current === null ? null : ({
+                      ...current,
+                      max_blend_deviation_rad: event.currentTarget.valueAsNumber,
+                    }))}
+                  />
+                  <span>rad</span>
                 </span>
               </label>
             </div>
             <div className="program-motion-actions">
               <button type="button" disabled={busy || !motionDirty} onClick={submitMotion}>
-                Update motion limits
+                Update motion defaults
               </button>
               <button
                 type="button"

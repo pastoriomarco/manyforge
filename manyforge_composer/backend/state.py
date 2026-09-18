@@ -56,6 +56,11 @@ from .deployment_artifacts import (
     load_deployment_artifact,
     save_deployment_artifact,
 )
+from .scenario_artifacts import (
+    ScenarioArtifactError,
+    load_scenario_artifact,
+    save_scenario_artifact,
+)
 from .execution_observation_stream import ExecutionObservationSource
 
 if TYPE_CHECKING:
@@ -154,6 +159,13 @@ class ComposerState:
             raise ValueError(
                 "authoring_state_root is required with Headless-backed authoring"
             )
+        # Editable-document presentation state only. Runtime Scenario truth
+        # remains the exact Headless/Manager/Applied projection. Initialize it
+        # before journal recovery so a recovered Save may restore its path.
+        self.scenario_document_path: str | None = None
+        self.scenario_base_scenario_id: str | None = None
+        self.scenario_source_program_digest: str | None = None
+        self.scenario_source_deployment_digest: str | None = None
         self.authoring_admission = (
             AuthoringAdmissionCoordinator(
                 headless_client,
@@ -208,6 +220,39 @@ class ComposerState:
     @property
     def node_catalog(self):
         return self.node_environment.catalog
+
+    def remember_scenario_document(
+        self, document: dict[str, Any] | None
+    ) -> None:
+        if document is None:
+            self.scenario_source_program_digest = None
+            self.scenario_source_deployment_digest = None
+            return
+        self.scenario_source_program_digest = canonical_digest(
+            {"value": document.get("program_draft")}
+        )
+        self.scenario_source_deployment_digest = canonical_digest(
+            {"value": document.get("deployment_draft")}
+        )
+
+    def current_drafts_match_remembered_scenario(self) -> bool:
+        if (
+            self.scenario_source_program_digest is None
+            or self.scenario_source_deployment_digest is None
+        ):
+            return False
+        return (
+            canonical_digest(
+                {"value": self.draft_session.retained_state().get("authoring")}
+            )
+            == self.scenario_source_program_digest
+            and canonical_digest({
+                "value": self.deployment_draft_session.retained_state().get(
+                    "document"
+                )
+            })
+            == self.scenario_source_deployment_digest
+        )
 
     def _active_authoring_catalog(self):
         return (
@@ -472,11 +517,6 @@ class ComposerState:
         document = deepcopy(selection["program"])
         if pre_state["program"] == document:
             post_state = deepcopy(pre_state)
-            if (
-                post_state["saved_document"] == document
-                and post_state["saved_path"] is not None
-            ):
-                return post_state
         else:
             post_state = {
                 "schema_version": pre_state["schema_version"],
@@ -497,29 +537,69 @@ class ComposerState:
                 "saved_program_revision": None,
                 "saved_document": None,
             }
-        for root in sorted(Path(path).resolve() for path in self.allowed_fs_roots):
-            for suffix in (".program.yaml", ".program.yml", ".program.json"):
-                candidate = root / f"{selection['program_id']}{suffix}"
-                if not candidate.is_file() or candidate.is_symlink():
+        if not (
+            post_state["saved_document"] == document
+            and post_state["saved_path"] is not None
+        ):
+            for root in sorted(
+                Path(path).resolve() for path in self.allowed_fs_roots
+            ):
+                for suffix in (".program.yaml", ".program.yml", ".program.json"):
+                    candidate = root / f"{selection['program_id']}{suffix}"
+                    if not candidate.is_file() or candidate.is_symlink():
+                        continue
+                    try:
+                        saved_program, source_path = load_program_artifact(
+                            str(candidate),
+                            allowed_roots=self.allowed_fs_roots,
+                            catalog=self.node_catalog,
+                        )
+                    except ProgramArtifactError:
+                        continue
+                    if saved_program.to_dict() == document:
+                        post_state.update(
+                            {
+                                "saved_path": source_path,
+                                "saved_program_revision": (
+                                    saved_program.program_revision
+                                ),
+                                "saved_document": document,
+                            }
+                        )
+                        break
+                else:
                     continue
-                try:
-                    program, source_path = load_program_artifact(
-                        str(candidate),
-                        allowed_roots=self.allowed_fs_roots,
-                        catalog=self.node_catalog,
-                    )
-                except ProgramArtifactError:
-                    continue
-                if program.to_dict() == document:
-                    post_state.update(
+                break
+        program_post_state = post_state
+
+        deployment_document = deepcopy(selection["deployment"])
+        deployment_current = self.deployment_draft_session.retained_state()
+        if deployment_current["document"] == deployment_document:
+            deployment_post_state = deepcopy(deployment_current)
+        else:
+            deployment_post_state = {
+                "schema_version": deployment_current["schema_version"],
+                "draft_id": (
+                    "deployment-draft-scenario-"
+                    + canonical_digest(
                         {
-                            "saved_path": source_path,
-                            "saved_program_revision": program.program_revision,
-                            "saved_document": document,
+                            "scenario_id": selection["scenario_id"],
+                            "deployment_revision": selection[
+                                "deployment_revision"
+                            ],
                         }
-                    )
-                    return post_state
-        return post_state
+                    ).removeprefix("sha256:")[:24]
+                ),
+                "draft_revision": 1,
+                "document": deployment_document,
+                "saved_path": None,
+                "saved_document": None,
+            }
+        return {
+            "schema_version": "manyforge.composer_authoring_workspace.v2",
+            "program": program_post_state,
+            "deployment": deployment_post_state,
+        }
 
     def prepare_scenario_load(
         self,
@@ -568,8 +648,12 @@ class ComposerState:
                 reason["code"], reason["message"], status_code=409
             )
         pre_state = self.draft_session.retained_state()
+        deployment_pre_state = self.deployment_draft_session.retained_state()
         applied = self._optional_applied()
         replacing = pre_state["program"] != selection["program"]
+        replacing_deployment = (
+            deployment_pre_state["document"] != selection["deployment"]
+        )
         current_matches_saved = (
             pre_state["program"] is not None
             and pre_state["program"] == pre_state["saved_document"]
@@ -577,12 +661,18 @@ class ComposerState:
         current_matches_applied = applied is not None and pre_state[
             "program"
         ] == applied.get("program")
-        if (
+        discards_program = (
             replacing
             and pre_state["program"] is not None
             and (not current_matches_saved or not current_matches_applied)
-            and not confirm_discard
-        ):
+        )
+        discards_deployment = (
+            replacing_deployment
+            and deployment_pre_state["document"] is not None
+            and deployment_pre_state["document"]
+            != deployment_pre_state["saved_document"]
+        )
+        if (discards_program or discards_deployment) and not confirm_discard:
             raise DraftSessionError(
                 "composer_draft_discard_confirmation_required",
                 "loading this Scenario would discard unsaved or unapplied Draft changes",
@@ -748,6 +838,15 @@ class ComposerState:
             deepcopy(intent["post_state"]),
             catalog=self.node_catalog,
         )
+        if isinstance(intent.get("scenario_document_id"), str):
+            self.scenario_document_path = intent.get("scenario_document_path")
+            self.scenario_base_scenario_id = intent.get("base_scenario_id")
+            self.scenario_source_program_digest = intent.get(
+                "scenario_source_program_digest"
+            )
+            self.scenario_source_deployment_digest = intent.get(
+                "scenario_source_deployment_digest"
+            )
         return {
             "status": "loaded",
             "headless": {
@@ -901,6 +1000,53 @@ class ComposerState:
                     "deployment_candidate_rejected",
                     "Manager rejected the compiled Deployment candidate",
                 )
+            diff = preview.get("diff")
+            disruptive = isinstance(diff, dict) and any(
+                isinstance(record_diff, dict)
+                and any(
+                    isinstance(record_diff.get(change), list)
+                    and bool(record_diff[change])
+                    for change in ("added", "changed", "removed")
+                )
+                for record_diff in diff.values()
+            )
+            confirmation_token = canonical_digest(
+                {
+                    "schema_version": (
+                        "manyforge.deployment_apply_confirmation.v1"
+                    ),
+                    "draft_id": intent["draft_id"],
+                    "draft_revision": intent["draft_revision"],
+                    "candidate": {
+                        field: compilation[field]
+                        for field in _CURRENT_SCENARIO_FIELDS
+                    },
+                    "manager_current": receipt["expected_current"],
+                    "candidate_retained_bundle_id": receipt[
+                        "candidate_retained_bundle_id"
+                    ],
+                    "candidate_graph_revision": receipt[
+                        "candidate_graph_revision"
+                    ],
+                    "diff": diff,
+                }
+            )
+            if (
+                apply
+                and disruptive
+                and intent.get("confirmation_token") != confirmation_token
+            ):
+                return {
+                    "status": "confirmation_required",
+                    "confirmation_token": confirmation_token,
+                    "compilation": compilation,
+                    "candidate_preview": preview,
+                    "manager_apply": None,
+                    "selection": {
+                        field: compilation[field]
+                        for field in _CURRENT_SCENARIO_FIELDS
+                    },
+                }
             if apply:
                 manager_receipt = self.apply_manager_deployment_candidate(
                     {
@@ -1001,12 +1147,50 @@ class ComposerState:
 
         return {
             "status": "applied" if apply else "previewed",
+            "confirmation_token": None,
             "compilation": compilation,
             "candidate_preview": preview,
             "manager_apply": manager_receipt,
             "selection": {
                 field: compilation[field] for field in _CURRENT_SCENARIO_FIELDS
             },
+        }
+
+    def execute_scenario_document_load(
+        self,
+        intent: dict[str, Any],
+        claim: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Activate and project one durable editable-Scenario Load intent."""
+
+        activation = self.execute_authored_deployment_candidate(
+            intent, claim, apply=True
+        )
+        selection = activation.get("selection")
+        if not isinstance(selection, dict) or not isinstance(
+            selection.get("program_revision"), str
+        ):
+            raise AuthoringJournalError(
+                "scenario_document_activation_invalid",
+                "Scenario activation omitted its exact Program identity",
+            )
+        self.scenario_document_path = intent["scenario_document_path"]
+        self.scenario_base_scenario_id = intent.get("base_scenario_id")
+        self.scenario_source_program_digest = intent.get(
+            "scenario_source_program_digest"
+        )
+        self.scenario_source_deployment_digest = intent.get(
+            "scenario_source_deployment_digest"
+        )
+        return {
+            "status": "loaded",
+            "path": intent["scenario_document_path"],
+            "scenario_id": intent["scenario_document_id"],
+            "activation": activation,
+            "diagnostics": [],
+            "workspace": self.draft_session.workspace_snapshot(
+                applied_program_revision=selection["program_revision"]
+            ),
         }
 
     def load_scenario(
@@ -1122,6 +1306,57 @@ class ComposerState:
             )
         kind = intent.get("external_kind")
         post_state = deepcopy(intent["post_state"])
+        if kind == "save_scenario_document":
+            exact_already_present = False
+            try:
+                present, present_path = load_scenario_artifact(
+                    intent["target_path"],
+                    allowed_roots=self.allowed_fs_roots,
+                )
+                exact_already_present = (
+                    present == intent["scenario_document"]
+                    and present_path
+                    == str(Path(intent["target_path"]).expanduser().resolve())
+                )
+            except ScenarioArtifactError as error:
+                if (
+                    error.code != "scenario_artifact_path_invalid"
+                    and not intent["overwrite"]
+                ):
+                    raise AuthoringJournalError(
+                        "composer_authoring_scenario_save_recovery_conflict",
+                        "Scenario Save target cannot be proven exact without overwrite authority",
+                    ) from error
+            if not exact_already_present:
+                saved_path = save_scenario_artifact(
+                    intent["scenario_document"],
+                    intent["target_path"],
+                    allowed_roots=self.allowed_fs_roots,
+                    overwrite=bool(intent["overwrite"]),
+                )
+            else:
+                saved_path = str(Path(intent["target_path"]).expanduser().resolve())
+            self.scenario_document_path = saved_path
+            self.scenario_base_scenario_id = intent["scenario_document"].get(
+                "base_scenario_id"
+            )
+            self.remember_scenario_document(intent["scenario_document"])
+            self._restore_authoring_post_image(post_state)
+            return {
+                "status": "saved",
+                "path": saved_path,
+                "scenario_id": intent["scenario_document"]["scenario_id"],
+                "last_known_status": intent["scenario_document"]["saved_status"][
+                    "last_known_status"
+                ],
+                "workspace": self.draft_session.workspace_snapshot(
+                    applied_program_revision=None,
+                    applied_unavailable_reason={
+                        "code": "applied_state_refresh_required",
+                        "message": "Applied Program status is refreshed after recovery.",
+                    },
+                ),
+            }, post_state
         if kind == "save_deployment":
             exact_already_present = False
             try:
@@ -1164,6 +1399,9 @@ class ComposerState:
         if kind == "revert_deployment":
             result = self.apply_manager_deployment_candidate(intent, claim)
             self._restore_authoring_post_image(post_state)
+            return result, post_state
+        if kind == "scenario_document_load":
+            result = self.execute_scenario_document_load(intent, claim)
             return result, post_state
         if kind in {
             "deployment_candidate_preview",

@@ -16,8 +16,8 @@ import type {
 interface DeploymentFocusedEditorProps {
   controller: DeploymentWorkspaceController;
   sourceModel: StructuralResourceState<SourceModelProjection>;
-  motionDescriptor: ManualControlMotionDescriptor | null;
-  gripperDescriptor: ManualControlGripperDescriptor | null;
+  motionDescriptors: ManualControlMotionDescriptor[];
+  gripperDescriptors: ManualControlGripperDescriptor[];
 }
 
 interface RuntimeConfiguration {
@@ -720,10 +720,10 @@ function OrdinaryMotionJerkEditor({ controller, runtime, limit, descriptor }: {
 function ModelAndTargetSection({
   controller,
   sourceModel,
-  motionDescriptor,
+  motionDescriptors,
   limits,
   runtimes,
-}: Pick<DeploymentFocusedEditorProps, 'controller' | 'sourceModel' | 'motionDescriptor'> & {
+}: Pick<DeploymentFocusedEditorProps, 'controller' | 'sourceModel' | 'motionDescriptors'> & {
   limits: MotionTargetLimit[];
   runtimes: RuntimeConfiguration[];
 }) {
@@ -731,11 +731,15 @@ function ModelAndTargetSection({
   const [selectedTarget, setSelectedTarget] = useState('');
   const targetKey = (limit: MotionTargetLimit) => JSON.stringify([limit.componentId, limit.targetId]);
   const target = limits.find((limit) => targetKey(limit) === selectedTarget)
-    ?? limits.find((limit) => limit.componentId === motionDescriptor?.controllableComponentId
-      && limit.targetId === motionDescriptor.commandTargetId)
+    ?? limits.find((limit) => motionDescriptors.some((descriptor) => (
+      limit.componentId === descriptor.controllableComponentId
+      && limit.targetId === descriptor.commandTargetId
+    )))
     ?? limits[0];
-  const selectedDescriptor = target?.componentId === motionDescriptor?.controllableComponentId
-    && target?.targetId === motionDescriptor?.commandTargetId ? motionDescriptor : null;
+  const selectedDescriptor = motionDescriptors.find((descriptor) => (
+    target?.componentId === descriptor.controllableComponentId
+    && target?.targetId === descriptor.commandTargetId
+  )) ?? null;
   const modelTarget = source?.targets.find((item) => item.component_id === target?.componentId
     && item.target_id === target?.targetId);
   const occurrences = source?.occurrences.filter((item) => modelTarget?.model_groups.some(
@@ -782,7 +786,7 @@ function ModelAndTargetSection({
           </div>
         )}
         <div className="deployment-target-limits">
-          {limits.length === 0 && <p className="muted">No Deployment-owned motion target cap is declared.</p>}
+          {limits.length === 0 && <p className="muted">No Deployment motion-target maximum is declared.</p>}
           {(target ? [target] : []).map((limit) => {
             const matching = selectedDescriptor?.operationalLimit ?? null;
             const runtime = runtimes.find((item) => item.index === limit.runtimeIndex);
@@ -808,31 +812,37 @@ function ModelAndTargetSection({
                     value,
                   )}
                 />
+                <p className="field-help">
+                  Maximum TCP speed enforced for this target after Apply.
+                  Individual motion nodes and manual commands may request a
+                  slower speed.
+                </p>
+                {matching !== null
+                  && matching.maximumTcpLinearSpeedMps !== limit.value && (
+                  <p className="deployment-applied-comparison">
+                    Currently applied: {format(matching.maximumTcpLinearSpeedMps)} m/s
+                  </p>
+                )}
                 {runtime !== undefined && <OrdinaryMotionJerkEditor
                   controller={controller} runtime={runtime} limit={limit}
                   descriptor={selectedDescriptor} />}
                 {matching !== null && selectedDescriptor !== null && (
-                  <>
-                    <div className="deployment-resolved-grid compact">
-                      <span><small>Catalog policy</small><strong>{format(matching.catalogPolicyMaximumTcpLinearSpeedMps)} m/s</strong></span>
-                      <span><small>Deployment cap</small><strong>{format(matching.deploymentMaximumTcpLinearSpeedMps)} m/s</strong></span>
-                      <span><small>Effective minimum</small><strong>{format(matching.effectiveMaximumTcpLinearSpeedMps)} m/s</strong></span>
-                    </div>
-                    {runtime !== undefined && (
-                      <DirectControlJointLimitsEditor
-                        controller={controller}
-                        runtime={runtime}
-                        descriptor={selectedDescriptor}
-                      />
-                    )}
-                  </>
+                  runtime !== undefined && (
+                    <DirectControlJointLimitsEditor
+                      controller={controller}
+                      runtime={runtime}
+                      descriptor={selectedDescriptor}
+                    />
+                  )
                 )}
               </div>
             );
           })}
         </div>
         <p className="field-help">
-          Physical joint limits remain source-model facts. Runtime uses the conservative minimum of model, catalog-policy, Deployment, Program, node, and live-scale limits.
+          Physical joint limits remain source-model facts. The Deployment value
+          above is the configured TCP-speed maximum; individual motions may
+          request a lower speed, and execution validates the measured result.
         </p>
       </div>
     </details>
@@ -1151,14 +1161,25 @@ function ControlledStopEditor({ controller, target }: {
 
 function GripperSection({
   controller,
-  descriptor,
+  descriptors,
   runtimes,
 }: {
   controller: DeploymentWorkspaceController;
-  descriptor: ManualControlGripperDescriptor | null;
+  descriptors: ManualControlGripperDescriptor[];
   runtimes: RuntimeConfiguration[];
 }) {
   const authored = useMemo(() => gripperTargetConfigurations(runtimes), [runtimes]);
+  const [selectedTarget, setSelectedTarget] = useState('');
+  const descriptorKey = (descriptor: ManualControlGripperDescriptor) => JSON.stringify([
+    descriptor.controllableComponentId, descriptor.commandTargetId,
+  ]);
+  const descriptor = descriptors.find((candidate) => descriptorKey(candidate) === selectedTarget)
+    ?? descriptors.find((candidate) => authored.some((row) => (
+      row.componentId === candidate.controllableComponentId
+      && row.targetId === candidate.commandTargetId
+    )))
+    ?? descriptors[0]
+    ?? null;
   const source = descriptor === null ? null : authored.find((row) => (
     row.componentId === descriptor.controllableComponentId
     && row.targetId === descriptor.commandTargetId
@@ -1231,6 +1252,17 @@ function GripperSection({
       <div className="deployment-focused-body">
         {descriptor === null ? <p className="muted">No current addressed gripper descriptor is available.</p> : (
           <>
+            {descriptors.length > 1 && <label className="deployment-focused-field">
+              <span>Target</span>
+              <select aria-label="Gripper target" value={descriptorKey(descriptor)}
+                disabled={controller.busy} onChange={(event) => setSelectedTarget(event.target.value)}>
+                {descriptors.map((candidate) => (
+                  <option key={descriptorKey(candidate)} value={descriptorKey(candidate)}>
+                    {candidate.controllableComponentId} / {candidate.commandTargetId}
+                  </option>
+                ))}
+              </select>
+            </label>}
             <div className="deployment-resolved-grid">
               <span><small>Target</small><strong>{descriptor.controllableComponentId} / {descriptor.commandTargetId}</strong></span>
               <span><small>Group / command joint</small><strong>{descriptor.sourceGroupName ?? 'not declared'} / {descriptor.sourceCoordinateName}</strong></span>
@@ -1377,8 +1409,8 @@ function GripperSection({
 export function DeploymentFocusedEditor({
   controller,
   sourceModel,
-  motionDescriptor,
-  gripperDescriptor,
+  motionDescriptors,
+  gripperDescriptors,
 }: DeploymentFocusedEditorProps) {
   const document = controller.workspace?.draft.document ?? null;
   const runtimes = useMemo(() => runtimeConfigurations(document), [document]);
@@ -1398,13 +1430,13 @@ export function DeploymentFocusedEditor({
       <ModelAndTargetSection
         controller={controller}
         sourceModel={sourceModel}
-        motionDescriptor={motionDescriptor}
+        motionDescriptors={motionDescriptors}
         limits={limits}
         runtimes={runtimes}
       />
       <NativeRuntimeSection controller={controller} runtimes={runtimes} />
       <ControlledStopSection controller={controller} targets={controlledStop} />
-      <GripperSection controller={controller} descriptor={gripperDescriptor} runtimes={runtimes} />
+      <GripperSection controller={controller} descriptors={gripperDescriptors} runtimes={runtimes} />
     </section>
   );
 }

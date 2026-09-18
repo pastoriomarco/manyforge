@@ -12,8 +12,10 @@ export type ProgramWorkspaceActionName =
   | 'discard'
   | 'revert'
   | 'load'
+  | 'load_scenario_document'
   | 'save'
-  | 'save_as';
+  | 'save_as'
+  | 'save_scenario_document';
 
 export type ProgramWorkspaceState =
   | {

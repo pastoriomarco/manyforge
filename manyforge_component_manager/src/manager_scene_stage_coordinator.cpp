@@ -23,6 +23,13 @@ using core::ProjectionApplyStatusState;
 using core::ProjectionTransitionRowDTO;
 using deployment::RetainedBundle;
 
+[[nodiscard]] bool SameDeploymentRevision(
+    const core::ProjectionRevisionDTO &left,
+    const core::ProjectionRevisionDTO &right) noexcept {
+  return left.retained_bundle_id == right.retained_bundle_id &&
+         left.graph_revision == right.graph_revision;
+}
+
 [[noreturn]] void Fail(const std::string &detail) {
   throw ManagerSceneStageCoordinatorError(detail);
 }
@@ -90,8 +97,9 @@ VerifyCurrentPredecessor(const core::IActiveBundlePublicationReader &reader,
           stage_intent.predecessor_publication_generation ||
       receipt.durable_public_pointer_content_digest !=
           stage_intent.predecessor_public_pointer_digest ||
-      receipt.request.candidate_projection_revision !=
-          stage_intent.expected_active_projection_revision ||
+      !SameDeploymentRevision(receipt.request.candidate_projection_revision,
+                              stage_intent
+                                  .expected_active_projection_revision) ||
       receipt.request.candidate_retained_bundle_id !=
           stage_intent.expected_active_projection_revision.retained_bundle_id ||
       receipt.request.candidate_graph_revision !=
@@ -144,9 +152,13 @@ ObservePredecessorNativeHealth(
             current_publication.request.candidate_projection_revision))
       Fail("current named Apply native predecessor identity differs from the "
            "active publication");
-    // These rows carry Scene's exact active membership even if a replaced
-    // child is now unavailable. Derivation requires either live target health
-    // for each row or its exact, already durable Manager withdrawal receipt.
+    // These rows carry Scene's exact active membership even when runtime
+    // convergence has already replaced a predecessor child. Do not require
+    // aggregate live health here: DeriveNativeProjectionTransitionRows owns
+    // the per-binding decision and accepts an unavailable row only when the
+    // exact, already durable Manager withdrawal receipt names that runtime
+    // epoch. Provenance and canonical membership remain fail-closed above and
+    // in that derivation.
     return health.native_projection_health;
   } catch (const ManagerSceneStageCoordinatorError &) {
     throw;

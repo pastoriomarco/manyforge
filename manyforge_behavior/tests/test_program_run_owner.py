@@ -360,6 +360,7 @@ class _ScopePort:
         self.node_count = 0
         self.selection_revision = 0
         self.held = False
+        self.ready = False
 
     def bind(self, context: ProgramRunPortContext) -> None:
         pending = [context.program["tree"]]
@@ -374,7 +375,7 @@ class _ScopePort:
 
     def execution_scope(self, program_run_id: str) -> Mapping[str, Any]:
         return {
-            "schema_version": "manyforge.program_execution_scope.v1",
+            "schema_version": "manyforge.program_execution_scope.v2",
             "request_owner_epoch": "kernel.epoch.1",
             "program_runner_owner_epoch": "program-runner.epoch.1",
             "claim_generation": 1,
@@ -383,6 +384,11 @@ class _ScopePort:
             "held_node_indices": (
                 list(range(self.node_count))
                 if self.held and self.state is ProgramRunScopeState.SETTLED
+                else []
+            ),
+            "ready_node_indices": (
+                list(range(self.node_count))
+                if self.ready and self.state is ProgramRunScopeState.SETTLED
                 else []
             ),
             "stopping_node_indices": (
@@ -412,6 +418,17 @@ class _ScopePort:
         if self.state is not ProgramRunScopeState.SETTLED:
             raise ProgramSelectionReleaseRejectedError("selected scope has not settled")
         self.release_stop(request["program_run_id"])
+        return self.execution_scope(request["program_run_id"])
+
+    def start_selection(self, request, expected_selection_revision):
+        self.last_selection_start = request
+        if self.selection_revision != expected_selection_revision:
+            raise ProgramSelectionReleaseRejectedError("selection revision changed")
+        if not self.ready or self.state is not ProgramRunScopeState.SETTLED:
+            raise ProgramSelectionReleaseRejectedError("selected scope is not Ready")
+        self.ready = False
+        self.selection_revision += 1
+        self._events.append("scope_motion_start")
         return self.execution_scope(request["program_run_id"])
 
     def _snapshot(self, program_run_id: str) -> ProgramRunScopeSnapshot:
@@ -1230,11 +1247,11 @@ def test_tick_host_keeps_only_operator_stop_intervention_observable() -> None:
     assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
     held = host.advance_ready_once()[0]
     assert held.state is ProgramRunState.INTERVENTION_REQUIRED
-    assert owner.operator_stop_observation_required(started.capture.program_run_id)
-    owner.refresh_operator_stop_intervention(started.capture.program_run_id)
-    assert task.observations == 2
-    assert host.advance_ready_once()[0].state is (ProgramRunState.INTERVENTION_REQUIRED)
-    assert task.observations == 2
+    assert task.observations == 1
+    assert not owner.operator_stop_observation_required(
+        started.capture.program_run_id
+    )
+    assert host.advance_ready_once() == ()
 
     intervention = interventions.read(started.capture.program_run_id)
     assert intervention is not None
@@ -1294,6 +1311,10 @@ def test_tick_host_retains_resume_after_a_stale_intervention_worker(
             time.sleep(0.001)
 
         block_stale_worker.set()
+        # A settled ordinary Stop is intentionally dormant.  Model a crossing
+        # command-side wake explicitly instead of relying on idle polling to
+        # manufacture the stale worker.
+        host.schedule(program_run_id)
         assert stale_worker_entered.wait(timeout=2.0)
         intervention = interventions.read(program_run_id)
         assert intervention is not None
@@ -1377,6 +1398,10 @@ def test_motion_stop_holds_the_current_node_and_resume_hands_off_its_exact_fence
     if isinstance(groups, list):
         document = admission.program.to_dict()
         document["tree"]["execution_groups"] = ["arm", "tools"]
+        document["execution_groups"] = {
+            "arm": {"execution_policy": "independent"},
+            "tools": {"execution_policy": "independent"},
+        }
         document["program_revision"] = compute_content_identity(
             document,
             own_field="program_revision",
@@ -1929,7 +1954,6 @@ def test_selection_status_never_settles_an_observed_completed_task():
     assert "leaf_acknowledge" not in events
     assert owner.read(run_id) == before
     assert task.starts == 1 and task.cancels == 0
-
     held = owner.advance_once(run_id)
     assert held.state is ProgramRunState.RUNNING
     assert held.node_statuses["move_to_pick"] == "success"
@@ -1949,6 +1973,79 @@ def test_selection_status_never_settles_an_observed_completed_task():
     assert completed.active_operation_count == 0
     assert events.count("leaf_acknowledge") == 1
     assert task.starts == 1 and task.cancels == 0
+
+
+def test_initial_motion_run_releases_ready_scope_without_recovery():
+    owner, admission, task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    scope.ready = True
+    # The production Kernel capture already knows the sealed table when the
+    # run first observes revision zero. Seed the test double equivalently.
+    scope.node_count = 3
+    started = owner.start(admission)
+    run_id = started.capture.program_run_id
+
+    controls = owner.execution_selection_controls(run_id)
+    group = controls["groups"][0]
+    assert group["state"] == "ready"
+    assert group["start_allowed"]
+    assert not group["stop_allowed"]
+    assert not group["resume_allowed"]
+    with pytest.raises(ProgramRunOwnerError, match="not held"):
+        owner.resume_motion(
+            run_id,
+            expected_run_revision=started.run_revision,
+            expected_selection_revision=controls["selection_revision"],
+            request_id="resume.before.initial.run",
+        )
+
+    released = owner.start_motion(
+        run_id,
+        expected_run_revision=started.run_revision,
+        expected_selection_revision=controls["selection_revision"],
+        request_id="initial.motion.run",
+    )
+    assert released.state is ProgramRunState.RUNNING
+    assert task.starts == 0
+    assert events[-1] == "scope_motion_start"
+    running = owner.execution_selection_controls(run_id)["groups"][0]
+    assert running["state"] == "running"
+    assert not running["start_allowed"]
+    assert running["stop_allowed"]
+
+
+def test_tick_host_initial_motion_run_releases_and_wakes_selected_scope():
+    owner, admission, task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    scope.ready = True
+    scope.node_count = 3
+    observed = []
+    host = ProgramRunTickHost(
+        owner,
+        tick_interval_s=0.01,
+        state_observer=observed.append,
+    )
+    started = host.start_run(admission, defer_ticks=True)
+    controls = owner.execution_selection_controls(started.capture.program_run_id)
+
+    released = host.start_motion(
+        started.capture.program_run_id,
+        expected_run_revision=started.run_revision,
+        expected_selection_revision=controls["selection_revision"],
+        request_id="initial.motion.run.host",
+        group_id="all",
+        reason="operator initial motion Run",
+    )
+
+    assert released.run_revision == started.run_revision + 1
+    assert events[-1] == "scope_motion_start"
+    assert task.starts == 0
+    assert observed[-1] == released
+    assert started.capture.program_run_id in host._scheduled  # noqa: SLF001
+    host.stop_run(started.capture.program_run_id)
+    host.shutdown()
 
 
 def test_late_stop_reply_preserves_a_completed_run_projection():
@@ -2009,6 +2106,31 @@ def test_selection_projection_captures_run_after_waiting_for_tree_transition():
     assert snapshot == advanced
     assert controls["groups"][0]["state"] == "running"
     assert task.starts == 1
+
+
+def test_selection_projection_uses_retained_owner_assessment_without_owner_io():
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=1)
+    owner, admission, task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+        interventions=interventions,
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    owner.stop_motion(run_id)
+    owner.advance_once(run_id)
+
+    observe = task.observe
+    entered = Event()
+
+    def slow_observe(task_id):
+        entered.set()
+        return observe(task_id)
+
+    task.observe = slow_observe
+    _snapshot, controls = owner.read_selection_controls(run_id)
+    assert not entered.is_set()
+    assert controls["groups"][0]["resume_allowed"]
 
 
 def test_stop_command_publication_does_not_advance_revision_again_on_unchanged_tick():
@@ -2486,19 +2608,13 @@ def test_selected_resume_refreshes_siblings_and_retains_partial_cleanup(policy) 
         admission, program, [row.to_dict() for row in program_node_policies(program)]
     )
     observe, recover = task.observe, task.recover
-    ready = False
     second_settled = False
 
     def current_assessment(task_id):
         snapshot = observe(task_id)
         if task_id == "task-2" and not second_settled:
             return OwnerTaskSnapshot(task_id=task_id, state=OwnerTaskState.ACTIVE)
-        assessment = {**snapshot.metadata["recovery_assessment"]}
-        if not ready:
-            assessment["allowed_actions"] = []
-        return replace(
-            snapshot, metadata={**snapshot.metadata, "recovery_assessment": assessment}
-        )
+        return snapshot
 
     task.observe = current_assessment
     run_id = owner.start(admission).capture.program_run_id
@@ -2512,14 +2628,8 @@ def test_selected_resume_refreshes_siblings_and_retains_partial_cleanup(policy) 
     assert second.run_revision > first.run_revision
     assert second.node_status_revision == first.node_status_revision
     assert len(interventions.read_all(run_id)) == 2
-    assert all(
-        not item.owner_assessment["allowed_actions"]
-        for item in interventions.read_all(run_id)
-    )
-    assert not owner.execution_selection_controls(run_id)["groups"][0]["resume_allowed"]
-    ready = True
     assert owner.execution_selection_controls(run_id)["groups"][0]["resume_allowed"]
-    assert not task.recoveries  # A fresh display assessment is not recovery.
+    assert not task.recoveries
     rejected_once = False
 
     def recover_current(task_id, *args, **kwargs):

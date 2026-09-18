@@ -66,10 +66,10 @@ using namespace manyforge::core;
                     {{0.2, 0.3, 0.4}, {0.0, 0.0, 0.5, 0.5}}};
   path.max_translation_step_m = 0.004;
   path.max_rotation_step_rad = 0.03;
-  path.max_linear_speed_mps = 0.08;
   path.max_angular_speed_rad_s = 0.4;
   path.max_linear_acceleration_mps2 = 0.3;
   path.max_angular_acceleration_rad_s2 = 1.5;
+  path.max_blend_deviation_rad = 0.02;
   path.fallback_policy =
       CartesianFallbackPolicyDTO::kAllowJointSpaceFallback;
   return RoboPlanCandidateRequestDTO{
@@ -174,6 +174,9 @@ TEST(RoboPlanWorkerProtocolTest,
   EXPECT_EQ(decoded.tcp_frame, input.tcp_frame);
   EXPECT_EQ(decoded.start_state, input.start_state);
   EXPECT_EQ(decoded.motion, input.motion);
+  EXPECT_DOUBLE_EQ(
+      std::get<CartesianPathDTO>(decoded.motion).max_blend_deviation_rad,
+      0.02);
   EXPECT_EQ(decoded.tolerances, input.tolerances);
   EXPECT_EQ(decoded.speed_profile, input.speed_profile);
   EXPECT_EQ(decoded.planning_profile, input.planning_profile);
@@ -203,6 +206,9 @@ TEST(RoboPlanWorkerProtocolTest,
        TrajectoryWaypointDTO{1.0, {0.2, 0.3}, {0.0, 0.0}, {0.0, 0.0}}},
       TrajectoryRuntimeScaleBoundsDTO{2.0, 8.0, 1.5, 2.5}};
   trajectory.cartesian_waypoint_times_s = {0.0, 0.5, 1.0};
+  trajectory.cartesian_fidelity_metrics = CartesianFidelityMetricsDTO{
+      0.005, 0.01, 0.001, 0.002, 0.0005, 0.001,
+      0.0015, 0.003, 0.02, 0.01, 2U};
   const auto decoded_success = decode_trajectory_result(
       encode_trajectory_result(Result<TrajectoryDTO>::Ok(trajectory)));
   ASSERT_TRUE(decoded_success.ok());
@@ -210,6 +216,8 @@ TEST(RoboPlanWorkerProtocolTest,
   EXPECT_EQ(decoded_success.value().joint_names, trajectory.joint_names);
   EXPECT_EQ(decoded_success.value().cartesian_waypoint_times_s,
             trajectory.cartesian_waypoint_times_s);
+  EXPECT_EQ(decoded_success.value().cartesian_fidelity_metrics,
+            trajectory.cartesian_fidelity_metrics);
   ASSERT_EQ(decoded_success.value().waypoints.size(), 2U);
   ASSERT_TRUE(decoded_success.value().runtime_scale_bounds);
   EXPECT_EQ(decoded_success.value().runtime_scale_bounds->max_rate_per_s, 2.0);

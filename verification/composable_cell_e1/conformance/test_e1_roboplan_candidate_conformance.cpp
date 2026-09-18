@@ -382,7 +382,11 @@ class E1RoboPlanCandidateAdapter final : public IPlannerBackend {
     options.group_name = kGroup;
     options.dt = 0.01;
     options.speed_mode = roboplan::CartesianSpeedMode::Bounded;
-    options.max_linear_speed = path.max_linear_speed_mps;
+    if (!request.speed_profile.max_tcp_linear_speed_mps.has_value()) {
+      return std::nullopt;
+    }
+    options.max_linear_speed =
+        *request.speed_profile.max_tcp_linear_speed_mps;
     options.max_angular_speed = path.max_angular_speed_rad_s;
     options.max_linear_acceleration = path.max_linear_acceleration_mps2;
     options.max_angular_acceleration = path.max_angular_acceleration_rad_s2;
@@ -484,7 +488,7 @@ PlannerBackendConformanceInput make_candidate_input(
     waypoint.position_m.x_m += static_cast<double>(index) * 0.025;
     path.waypoints.push_back(waypoint);
   }
-  path.max_linear_speed_mps = 0.05;
+  cartesian.speed_profile.max_tcp_linear_speed_mps = 0.05;
   cartesian.motion = path;
 
   PlannerBackendConformanceInput input;

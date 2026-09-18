@@ -30,6 +30,11 @@ def test_native_revision_update_roundtrips_through_strict_loader(tmp_path, group
     }
     if groups is not None:
         document["tree"]["execution_groups"] = groups
+        if isinstance(groups, list):
+            document["execution_groups"] = {
+                group_id: {"execution_policy": "independent"}
+                for group_id in sorted(groups)
+            }
     document["program_revision"] = "sha256:" + "0" * 64
     source = tmp_path / "program.yaml"
     source.write_text(yaml.safe_dump(document, sort_keys=False))

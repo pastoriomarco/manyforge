@@ -278,7 +278,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_event_historian PRIVATE
     manyforge_event_historian GTest::gtest_main)
   gtest_discover_tests(test_event_historian
-    PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
+    PROPERTIES
+      RUN_SERIAL TRUE
+      TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
   set(
     MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT

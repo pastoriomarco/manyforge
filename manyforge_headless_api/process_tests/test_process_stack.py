@@ -52,6 +52,7 @@ class ProcessStack:
         package_root: Path | None = None,
         cell_id: str = "c1_build_authority_cell",
         program_path: Path | None = None,
+        composer_fs_roots: tuple[Path, ...] | None = None,
         freshness_milliseconds: int = 200,
         enable_program_runner: bool = False,
     ) -> None:
@@ -91,6 +92,7 @@ class ProcessStack:
             raise RuntimeError(f"retained package root does not exist: {self.package_root}")
         self.cell_id = cell_id
         self.program_path = program_path
+        self.composer_fs_roots = composer_fs_roots
         self.freshness_milliseconds = freshness_milliseconds
         self.enable_program_runner = enable_program_runner
         self.port = _free_loopback_port()
@@ -152,6 +154,8 @@ class ProcessStack:
             str(self.manager_executable),
             "--install-root",
             str(self.manager_package_root),
+            "--candidate-package-root",
+            str(self.artifact_root),
             "--manager-state-root",
             str(self.manager_root),
             "--manager-run-root",
@@ -394,11 +398,16 @@ class ProcessStack:
             command.extend(("--program-path", str(self.program_path)))
         if startup_scenario is not None:
             command.extend(("--startup-scenario", startup_scenario))
+        environment = os.environ.copy()
+        if self.composer_fs_roots is not None:
+            environment["MANYFORGE_FS_ROOTS"] = ",".join(
+                str(path) for path in self.composer_fs_roots
+            )
         self.composer = subprocess.Popen(
             command,
             stdout=self.log,
             stderr=subprocess.STDOUT,
-            env=os.environ.copy(),
+            env=environment,
         )
 
     def wait_composer(self, timeout_seconds: float = 8.0) -> dict:

@@ -4,6 +4,7 @@ import type { CSSProperties } from 'react';
 import { ApiError, api } from './api/client';
 import { AssistantOverlay } from './components/AssistantOverlay';
 import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
+import { DeploymentDocumentControls } from './components/DeploymentDocumentControls';
 import {
   HeadlessRuntimeSurfaces,
   attentionAlarmsNewestFirst,
@@ -22,11 +23,13 @@ import {
   useHeadlessStateSource,
   useShellHeadlessState,
 } from './hooks/useHeadlessState';
+import { useDeploymentWorkspace } from './hooks/useDeploymentWorkspace';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
 import { nodeEnvironmentRefreshKey } from './state/nodeEnvironmentRefresh';
 import { useStructuralResource } from './state/structuralResource';
+import { deriveProgramMotionConfiguration } from './utils/programAuthoring';
 import {
   useOperationalErrorMirror,
   useOperationalErrors,
@@ -149,6 +152,10 @@ export default function App() {
   const headlessStateSource = useHeadlessStateSource(headlessEnabled);
   const headlessState = useShellHeadlessState(headlessStateSource);
   const headlessSnapshot = headlessState.snapshot;
+  const deploymentController = useDeploymentWorkspace(
+    headlessEnabled,
+    headlessSnapshot,
+  );
   useEffect(() => {
     if (!headlessEnabled) {
       nodeEnvironmentWakeKey.current = null;
@@ -171,6 +178,15 @@ export default function App() {
     programController.state.workspace,
     headlessStateSource,
   );
+  const programCartesianDefaults = useMemo(() => {
+    const authoring = programController.state.workspace?.draft.authoring ?? null;
+    if (authoring === null || catalog.status !== 'ready') return null;
+    const configuration = deriveProgramMotionConfiguration(authoring, catalog.data.entries);
+    return configuration.available ? {
+      translationToleranceM: configuration.configuration.values.translation_tol_m,
+      maxBlendDeviationRad: configuration.configuration.values.max_blend_deviation_rad,
+    } : null;
+  }, [catalog, programController.state.workspace?.draft.authoring]);
   const robotControl = useRobotControl(
     headlessEnabled,
     programRuntime.cycleState !== null
@@ -181,6 +197,7 @@ export default function App() {
       ),
     headlessSnapshot,
     headlessStateSource,
+    programCartesianDefaults,
   );
   const operationalErrors = useOperationalErrors();
   useOperationalErrorMirror({
@@ -188,6 +205,12 @@ export default function App() {
     title: 'Control connection became unavailable',
     message: headlessState.transportError,
     onDismiss: headlessState.reconnect,
+  });
+  useOperationalErrorMirror({
+    source: 'composer.deployment_workspace',
+    title: 'Deployment command or response failed',
+    message: deploymentController.error,
+    onDismiss: deploymentController.dismissError,
   });
   useOperationalErrorMirror({
     source: 'composer.program_workspace',
@@ -487,18 +510,22 @@ export default function App() {
             </span>
           </button>
         </nav>
-        <ProgramDocumentControls
-          controller={programController}
-          runtime={programRuntime}
-          catalogEntries={catalog.status === 'ready' ? catalog.data.entries : []}
-          localInvalidEdit={programInvalidEdit}
-          settingsRequest={programSettingsRequest}
-          onProgramRequirementCreated={(kind, id) => setProgramRequirementCreated((current) => ({
-            sequence: (current?.sequence ?? 0) + 1,
-            kind,
-            id,
-          }))}
-        />
+        {activeWorkspace === 'deployment' ? (
+          <DeploymentDocumentControls controller={deploymentController} />
+        ) : (
+          <ProgramDocumentControls
+            controller={programController}
+            runtime={programRuntime}
+            catalogEntries={catalog.status === 'ready' ? catalog.data.entries : []}
+            localInvalidEdit={programInvalidEdit}
+            settingsRequest={programSettingsRequest}
+            onProgramRequirementCreated={(kind, id) => setProgramRequirementCreated((current) => ({
+              sequence: (current?.sequence ?? 0) + 1,
+              kind,
+              id,
+            }))}
+          />
+        )}
         <div className="global-surface-launchers" aria-label="Application tools">
           <button
             ref={runtimeButton}
@@ -544,6 +571,10 @@ export default function App() {
               catalog={catalog}
               environment={nodeEnvironment}
               sourceModel={sourceModel}
+              deploymentWorkspace={deploymentController.workspace}
+              motionDescriptors={robotControl.motionTargets.map(
+                (target) => target.targetDescriptor,
+              )}
               onRetryCatalog={retryCatalog}
               onRetryEnvironment={retryNodeEnvironment}
               onInvalidEditChange={setProgramInvalidEdit}
@@ -565,15 +596,16 @@ export default function App() {
           ) : (
             <div className="deployment-workspace">
               <DeploymentCompositionPanel
+                controller={deploymentController}
                 enabled={headlessEnabled}
                 snapshot={headlessSnapshot}
                 sourceModel={sourceModel}
-                motionDescriptor={
-                  robotControl.state.status?.directControl.targetDescriptor ?? null
-                }
-                gripperDescriptor={
-                  robotControl.state.status?.directControlGripper.targetDescriptor ?? null
-                }
+                motionDescriptors={robotControl.motionTargets.map(
+                  (target) => target.targetDescriptor,
+                )}
+                gripperDescriptors={robotControl.gripperTargets.map(
+                  (target) => target.targetDescriptor,
+                )}
                 componentOverview={{
                   request: componentOverviewRequest,
                   status: runtimeView,

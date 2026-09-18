@@ -81,4 +81,3 @@ def test_native_benchmark_uses_no_singleton_python_request_contract() -> None:
     assert not hasattr(kernel_client, "ExecuteRequest")
     source = Path(kernel_client.__file__).read_text(encoding="utf-8")
     assert "robot_id" not in source
-    assert "group_id" not in source

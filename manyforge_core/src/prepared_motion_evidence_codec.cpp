@@ -1,9 +1,9 @@
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/prepared_motion_evidence_codec.hpp>
 #include <manyforge_core/prepared_planning_codec.hpp>
-#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -250,6 +250,57 @@ void require_digest(std::string_view value, std::string reason) {
   return result;
 }
 
+[[nodiscard]] CanonicalValue cartesian_fidelity_value(
+    const std::optional<CartesianFidelityMetricsDTO>& value) {
+  if (!value) return CanonicalValue(nullptr);
+  if (!valid_cartesian_fidelity_metrics(*value)) fail("cartesian_fidelity_metrics_invalid");
+  return CanonicalValue(CanonicalValue::Object{
+      {"accepted_max_blend_deviation_rad", CanonicalValue(value->accepted_max_blend_deviation_rad)},
+      {"certified_max_rotation_error_rad", CanonicalValue(value->certified_max_rotation_error_rad)},
+      {"certified_max_translation_error_m",
+       CanonicalValue(value->certified_max_translation_error_m)},
+      {"measured_max_rotation_error_rad", CanonicalValue(value->measured_max_rotation_error_rad)},
+      {"measured_max_translation_error_m", CanonicalValue(value->measured_max_translation_error_m)},
+      {"planning_attempt_count",
+       CanonicalValue(static_cast<double>(value->planning_attempt_count))},
+      {"requested_max_blend_deviation_rad",
+       CanonicalValue(value->requested_max_blend_deviation_rad)},
+      {"requested_rotation_tolerance_rad", CanonicalValue(value->requested_rotation_tolerance_rad)},
+      {"requested_translation_tolerance_m",
+       CanonicalValue(value->requested_translation_tolerance_m)},
+      {"unsampled_rotation_bound_rad", CanonicalValue(value->unsampled_rotation_bound_rad)},
+      {"unsampled_translation_bound_m", CanonicalValue(value->unsampled_translation_bound_m)},
+  });
+}
+
+[[nodiscard]] std::optional<CartesianFidelityMetricsDTO> parse_cartesian_fidelity(
+    const CanonicalValue& value) {
+  if (value.is_null()) return std::nullopt;
+  exact(value, {"accepted_max_blend_deviation_rad", "certified_max_rotation_error_rad",
+                "certified_max_translation_error_m", "measured_max_rotation_error_rad",
+                "measured_max_translation_error_m", "planning_attempt_count",
+                "requested_max_blend_deviation_rad", "requested_rotation_tolerance_rad",
+                "requested_translation_tolerance_m", "unsampled_rotation_bound_rad",
+                "unsampled_translation_bound_m"});
+  const auto attempts = unsigned_integer(member(value, "planning_attempt_count"), true);
+  CartesianFidelityMetricsDTO result{
+      finite_number(member(value, "requested_translation_tolerance_m")),
+      finite_number(member(value, "requested_rotation_tolerance_rad")),
+      finite_number(member(value, "measured_max_translation_error_m")),
+      finite_number(member(value, "measured_max_rotation_error_rad")),
+      finite_number(member(value, "unsampled_translation_bound_m")),
+      finite_number(member(value, "unsampled_rotation_bound_rad")),
+      finite_number(member(value, "certified_max_translation_error_m")),
+      finite_number(member(value, "certified_max_rotation_error_rad")),
+      finite_number(member(value, "requested_max_blend_deviation_rad")),
+      finite_number(member(value, "accepted_max_blend_deviation_rad")),
+      static_cast<std::uint32_t>(attempts)};
+  if (attempts > std::numeric_limits<std::uint32_t>::max() ||
+      !valid_cartesian_fidelity_metrics(result))
+    fail("cartesian_fidelity_metrics_invalid");
+  return result;
+}
+
 [[nodiscard]] CanonicalValue validation_value(const PreparedMotionValidationEvidenceDTO& value) {
   if (!portable_identifier(value.validation_revision.value()) || !value.noncollision_result.valid ||
       value.noncollision_result.error || !value.noncollision_result.trajectory_metrics ||
@@ -260,12 +311,10 @@ void require_digest(std::string_view value, std::string reason) {
   }
   const auto& metrics = *value.noncollision_result.trajectory_metrics;
   const auto metrics_valid = [](const std::vector<double>& values) {
-    return std::all_of(values.begin(), values.end(), [](const double item) {
-      return std::isfinite(item) && item >= 0.0;
-    });
+    return std::all_of(values.begin(), values.end(),
+                       [](const double item) { return std::isfinite(item) && item >= 0.0; });
   };
-  if (!std::isfinite(metrics.trajectory_duration_s) ||
-      metrics.trajectory_duration_s < 0.0 ||
+  if (!std::isfinite(metrics.trajectory_duration_s) || metrics.trajectory_duration_s < 0.0 ||
       metrics.peak_abs_joint_velocity_rad_s.empty() ||
       !metrics_valid(metrics.peak_abs_joint_velocity_rad_s) ||
       (!metrics.peak_abs_joint_acceleration_rad_s2.empty() &&
@@ -274,29 +323,31 @@ void require_digest(std::string_view value, std::string reason) {
       !metrics_valid(metrics.peak_abs_joint_acceleration_rad_s2) ||
       (metrics.peak_tcp_linear_speed_mps.has_value() &&
        (!std::isfinite(*metrics.peak_tcp_linear_speed_mps) ||
-        *metrics.peak_tcp_linear_speed_mps < 0.0))) {
+        *metrics.peak_tcp_linear_speed_mps < 0.0)) ||
+      (metrics.cartesian_fidelity_metrics.has_value() &&
+       !valid_cartesian_fidelity_metrics(*metrics.cartesian_fidelity_metrics))) {
     fail("trajectory_validation_metrics_invalid");
   }
-  const CanonicalValue metrics_value(CanonicalValue::Object{
+  CanonicalValue::Object metrics_fields{
       {"peak_abs_joint_acceleration_rad_s2",
        metrics.peak_abs_joint_acceleration_rad_s2.empty()
            ? CanonicalValue(nullptr)
            : numbers(metrics.peak_abs_joint_acceleration_rad_s2)},
-      {"peak_abs_joint_velocity_rad_s",
-       numbers(metrics.peak_abs_joint_velocity_rad_s)},
-      {"peak_tcp_linear_speed_mps",
-       metrics.peak_tcp_linear_speed_mps.has_value()
-           ? CanonicalValue(*metrics.peak_tcp_linear_speed_mps)
-           : CanonicalValue(nullptr)},
-      {"trajectory_duration_s",
-       CanonicalValue(metrics.trajectory_duration_s)},
-  });
+      {"peak_abs_joint_velocity_rad_s", numbers(metrics.peak_abs_joint_velocity_rad_s)},
+      {"peak_tcp_linear_speed_mps", metrics.peak_tcp_linear_speed_mps.has_value()
+                                        ? CanonicalValue(*metrics.peak_tcp_linear_speed_mps)
+                                        : CanonicalValue(nullptr)},
+      {"trajectory_duration_s", CanonicalValue(metrics.trajectory_duration_s)},
+  };
+  if (metrics.cartesian_fidelity_metrics)
+    metrics_fields.emplace_back("cartesian_fidelity_metrics",
+                                cartesian_fidelity_value(metrics.cartesian_fidelity_metrics));
+  const CanonicalValue metrics_value(std::move(metrics_fields));
   return CanonicalValue(CanonicalValue::Object{
       {"validation_revision", CanonicalValue(value.validation_revision.value())},
       {"noncollision_result",
-       CanonicalValue(CanonicalValue::Object{
-           {"trajectory_metrics", metrics_value},
-           {"valid", CanonicalValue(true)}})},
+       CanonicalValue(CanonicalValue::Object{{"trajectory_metrics", metrics_value},
+                                             {"valid", CanonicalValue(true)}})},
       {"collision_world_revision", revision_value(value.collision_world_revision)},
       {"collision_policy_revision", revision_value(value.collision_policy_revision)},
       {"collision_decision", decision_value(value.collision_decision)}});
@@ -311,34 +362,34 @@ void require_digest(std::string_view value, std::string reason) {
   exact(noncollision, {"trajectory_metrics", "valid"});
   if (!boolean(member(noncollision, "valid"))) fail("accepted_noncollision_result_required");
   const auto& metrics_value = member(noncollision, "trajectory_metrics");
-  exact(metrics_value,
-        {"peak_abs_joint_acceleration_rad_s2", "peak_abs_joint_velocity_rad_s",
-         "peak_tcp_linear_speed_mps", "trajectory_duration_s"});
-  const auto& acceleration_value =
-      member(metrics_value, "peak_abs_joint_acceleration_rad_s2");
+  const auto* fidelity_value = metrics_value.find_object_member("cartesian_fidelity_metrics");
+  if (fidelity_value)
+    exact(metrics_value,
+          {"cartesian_fidelity_metrics", "peak_abs_joint_acceleration_rad_s2",
+           "peak_abs_joint_velocity_rad_s", "peak_tcp_linear_speed_mps", "trajectory_duration_s"});
+  else
+    exact(metrics_value, {"peak_abs_joint_acceleration_rad_s2", "peak_abs_joint_velocity_rad_s",
+                          "peak_tcp_linear_speed_mps", "trajectory_duration_s"});
+  const auto& acceleration_value = member(metrics_value, "peak_abs_joint_acceleration_rad_s2");
   const auto& tcp_value = member(metrics_value, "peak_tcp_linear_speed_mps");
   TrajectoryValidationMetricsDTO metrics{
       finite_number(member(metrics_value, "trajectory_duration_s")),
       number_array(member(metrics_value, "peak_abs_joint_velocity_rad_s")),
-      acceleration_value.is_null() ? std::vector<double>{}
-                                   : number_array(acceleration_value),
-      tcp_value.is_null()
-          ? std::nullopt
-          : std::optional<double>{finite_number(tcp_value)}};
+      acceleration_value.is_null() ? std::vector<double>{} : number_array(acceleration_value),
+      tcp_value.is_null() ? std::nullopt : std::optional<double>{finite_number(tcp_value)},
+      fidelity_value ? parse_cartesian_fidelity(*fidelity_value) : std::nullopt};
   const auto metrics_valid = [](const std::vector<double>& values) {
-    return std::all_of(values.begin(), values.end(), [](const double item) {
-      return item >= 0.0;
-    });
+    return std::all_of(values.begin(), values.end(), [](const double item) { return item >= 0.0; });
   };
-  if (metrics.trajectory_duration_s < 0.0 ||
-      metrics.peak_abs_joint_velocity_rad_s.empty() ||
+  if (metrics.trajectory_duration_s < 0.0 || metrics.peak_abs_joint_velocity_rad_s.empty() ||
       !metrics_valid(metrics.peak_abs_joint_velocity_rad_s) ||
       (!metrics.peak_abs_joint_acceleration_rad_s2.empty() &&
        metrics.peak_abs_joint_acceleration_rad_s2.size() !=
            metrics.peak_abs_joint_velocity_rad_s.size()) ||
       !metrics_valid(metrics.peak_abs_joint_acceleration_rad_s2) ||
-      (metrics.peak_tcp_linear_speed_mps.has_value() &&
-       *metrics.peak_tcp_linear_speed_mps < 0.0)) {
+      (metrics.peak_tcp_linear_speed_mps.has_value() && *metrics.peak_tcp_linear_speed_mps < 0.0) ||
+      (metrics.cartesian_fidelity_metrics.has_value() &&
+       !valid_cartesian_fidelity_metrics(*metrics.cartesian_fidelity_metrics))) {
     fail("trajectory_validation_metrics_invalid");
   }
   PreparedMotionValidationEvidenceDTO result{

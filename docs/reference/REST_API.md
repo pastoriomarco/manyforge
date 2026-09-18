@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-13 13:10:39 UTC
+  Last regenerated: 2026-09-17 18:47:19 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -74,9 +74,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/execution/operations/{operation_id}/resume` | headless-runtime-client | Execution Resume |
 | `POST` | `/api/execution/pick-place/plans/pick` | headless-runtime-client | Execution Plan Pick |
 | `POST` | `/api/execution/pick-place/plans/place` | headless-runtime-client | Execution Plan Place |
-| `POST` | `/api/execution/pick-place/sequences/pick` | headless-runtime-client | Execution Start Pick |
-| `POST` | `/api/execution/pick-place/sequences/place` | headless-runtime-client | Execution Start Place |
-| `GET` | `/api/execution/pick-place/sequences/{sequence_id}` | headless-runtime-client | Execution Pick Place Sequence |
 | `GET` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Get Runtime Scale Control |
 | `POST` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Set Runtime Scale Control |
 | `GET` | `/api/execution/status` | headless-runtime-client | Execution Status |
@@ -114,6 +111,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/runs/{program_run_id}/blackboard-values` | headless-runtime-client | Write Runtime Blackboard |
 | `POST` | `/api/program/runs/{program_run_id}/full-stop` | headless-runtime-client | Program Run Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/manual-result` | headless-runtime-client | Stage Manual Result |
+| `POST` | `/api/program/runs/{program_run_id}/motion-start` | headless-runtime-client | Program Run Motion Start |
 | `POST` | `/api/program/runs/{program_run_id}/motion-stop` | headless-runtime-client | Program Run Motion Stop |
 | `POST` | `/api/program/runs/{program_run_id}/reset` | headless-runtime-client | Program Run Reset Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/resume-full-stop` | headless-runtime-client | Program Run Resume Full Stop |
@@ -129,6 +127,9 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/validate` | composer-draft | Validate Program Source |
 | `GET` | `/api/program/workspace` | composer-draft | Read Workspace |
 | `GET` | `/api/runtime` | headless-runtime-client | Runtime |
+| `GET` | `/api/scenario-documents` | composer-scenario-documents | List Documents |
+| `POST` | `/api/scenario-documents/load` | composer-scenario-documents | Load Document |
+| `POST` | `/api/scenario-documents/save` | composer-scenario-documents | Save Document |
 | `GET` | `/api/scenarios` | headless-runtime-client | Scenarios |
 | `GET` | `/api/scenarios/current` | headless-runtime-client | Current Scenario |
 | `POST` | `/api/scenarios/load` | composer-draft | Load Scenario |

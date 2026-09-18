@@ -36,6 +36,7 @@ import type {
   ManagerStatusProjection,
   ProgramDocument,
   ProgramAuthoringDocument,
+  ProgramAuthoringDiagnostic,
   ProgramInterventionDelegate,
   ProgramModificationPolicyValue,
   ProgramNodeModificationPolicy,
@@ -68,6 +69,10 @@ import type {
   ProgramViewerMetadata,
   ProgramWorkspaceResponse,
   ProgramWorkspaceTransitionResponse,
+  ScenarioDocumentDisplayStatus,
+  ScenarioDocumentIndexResponse,
+  ScenarioDocumentLoadResponse,
+  ScenarioDocumentSaveResponse,
   ScenarioCatalogResponse,
   CarriedObjectAttachment,
   LogicalSceneObject,
@@ -2332,6 +2337,22 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
   };
 }
 
+function parseProgramAuthoringDiagnostic(
+  value: unknown,
+  path: string,
+): ProgramAuthoringDiagnostic {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['code', 'path', 'message', 'severity'], path);
+  const severity = stringAt(record.severity, `${path}.severity`);
+  if (severity !== 'error') return fail(`${path}.severity`, 'error');
+  return {
+    code: stringAt(record.code, `${path}.code`),
+    path: stringAt(record.path, `${path}.path`),
+    message: stringAt(record.message, `${path}.message`),
+    severity,
+  };
+}
+
 function parseProgramDraftProjection(
   value: unknown,
   path: string,
@@ -2370,19 +2391,10 @@ function parseProgramDraftProjection(
     draft.diagnostics,
     `${path}.diagnostics`,
     100_000,
-  ).map((value, index) => {
-    const diagnosticPath = `${path}.diagnostics[${index}]`;
-    const record = objectAt(value, diagnosticPath);
-    exactKeysAt(record, ['code', 'path', 'message', 'severity'], diagnosticPath);
-    const severity = stringAt(record.severity, `${diagnosticPath}.severity`);
-    if (severity !== 'error') return fail(`${diagnosticPath}.severity`, 'error');
-    return {
-      code: stringAt(record.code, `${diagnosticPath}.code`),
-      path: stringAt(record.path, `${diagnosticPath}.path`),
-      message: stringAt(record.message, `${diagnosticPath}.message`),
-      severity: severity as 'error',
-    };
-  });
+  ).map((value, index) => parseProgramAuthoringDiagnostic(
+    value,
+    `${path}.diagnostics[${index}]`,
+  ));
   if (
     programLoaded !== (authoring !== null)
     || candidateAvailable !== (program !== null)
@@ -2560,6 +2572,154 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
     },
     hasUnsavedChanges,
     hasUnappliedChanges,
+  };
+}
+
+const SCENARIO_DOCUMENT_STATUSES = [
+  'ready',
+  'incomplete',
+  'unknown',
+  'changed',
+  'version_changed',
+  'unsupported',
+] as const;
+
+export function parseScenarioDocumentIndexResponse(
+  value: unknown,
+): ScenarioDocumentIndexResponse {
+  const path = 'scenarioDocumentIndex';
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['api_version', 'catalog_revision', 'directory', 'entries'],
+    path,
+  );
+  const apiVersion = stringAt(record.api_version, `${path}.api_version`);
+  if (apiVersion !== 'manyforge.scenario_document_index.v1') {
+    return fail(`${path}.api_version`, 'manyforge.scenario_document_index.v1');
+  }
+  return {
+    apiVersion,
+    directory: stringAt(record.directory, `${path}.directory`),
+    catalogRevision: record.catalog_revision === null
+      ? null
+      : digestAt(record.catalog_revision, `${path}.catalog_revision`),
+    entries: boundedArrayAt(record.entries, `${path}.entries`, 10_000).map(
+      (entry, index) => {
+        const entryPath = `${path}.entries[${index}]`;
+        const row = objectAt(entry, entryPath);
+        exactKeysAt(row, [
+          'base_scenario_id',
+          'description',
+          'display_status',
+          'name',
+          'path',
+          'saved_manyforge_version',
+          'scenario_id',
+          'source_kind',
+          'status_detail',
+        ], entryPath);
+        const sourceKind = stringAt(row.source_kind, `${entryPath}.source_kind`);
+        if (sourceKind !== 'saved' && sourceKind !== 'qualified') {
+          return fail(`${entryPath}.source_kind`, 'saved or qualified');
+        }
+        const displayStatus = stringAt(
+          row.display_status,
+          `${entryPath}.display_status`,
+        );
+        if (!SCENARIO_DOCUMENT_STATUSES.includes(
+          displayStatus as ScenarioDocumentDisplayStatus,
+        )) {
+          return fail(`${entryPath}.display_status`, 'a Scenario display status');
+        }
+        return {
+          sourceKind,
+          path: nullableStringAt(row.path, `${entryPath}.path`),
+          scenarioId: nullableStringAt(
+            row.scenario_id,
+            `${entryPath}.scenario_id`,
+          ),
+          name: stringAt(row.name, `${entryPath}.name`),
+          description: stringAt(row.description, `${entryPath}.description`),
+          baseScenarioId: nullableStringAt(
+            row.base_scenario_id,
+            `${entryPath}.base_scenario_id`,
+          ),
+          savedManyforgeVersion: nullableStringAt(
+            row.saved_manyforge_version,
+            `${entryPath}.saved_manyforge_version`,
+          ),
+          displayStatus: displayStatus as ScenarioDocumentDisplayStatus,
+          statusDetail: stringAt(
+            row.status_detail,
+            `${entryPath}.status_detail`,
+          ),
+        };
+      },
+    ),
+  };
+}
+
+export function parseScenarioDocumentSaveResponse(
+  value: unknown,
+): ScenarioDocumentSaveResponse {
+  const path = 'scenarioDocumentSave';
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['last_known_status', 'path', 'scenario_id', 'status', 'workspace'],
+    path,
+  );
+  const status = stringAt(record.status, `${path}.status`);
+  if (status !== 'saved') return fail(`${path}.status`, 'saved');
+  const lastKnownStatus = stringAt(
+    record.last_known_status,
+    `${path}.last_known_status`,
+  );
+  if (!['ready', 'incomplete', 'unknown'].includes(lastKnownStatus)) {
+    return fail(`${path}.last_known_status`, 'ready, incomplete, or unknown');
+  }
+  return {
+    status,
+    path: stringAt(record.path, `${path}.path`),
+    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
+    lastKnownStatus: lastKnownStatus as ScenarioDocumentSaveResponse['lastKnownStatus'],
+    workspace: parseProgramWorkspaceResponse(record.workspace),
+  };
+}
+
+export function parseScenarioDocumentLoadResponse(
+  value: unknown,
+): ScenarioDocumentLoadResponse {
+  const path = 'scenarioDocumentLoad';
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['activation', 'diagnostics', 'path', 'scenario_id', 'status', 'workspace'],
+    path,
+  );
+  const status = stringAt(record.status, `${path}.status`);
+  if (status !== 'loaded' && status !== 'opened') {
+    return fail(`${path}.status`, 'loaded or opened');
+  }
+  const activation = record.activation === null
+    ? null
+    : jsonRecordAt(record.activation, `${path}.activation`);
+  if ((status === 'loaded') !== (activation !== null)) {
+    return fail(`${path}.activation`, 'an activation only for loaded status');
+  }
+  return {
+    status,
+    path: nullableStringAt(record.path, `${path}.path`),
+    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
+    activation,
+    diagnostics: arrayAt(record.diagnostics, `${path}.diagnostics`).map(
+      (diagnostic, index) => parseProgramAuthoringDiagnostic(
+        diagnostic,
+        `${path}.diagnostics[${index}]`,
+      ),
+    ),
+    workspace: parseProgramWorkspaceResponse(record.workspace),
   };
 }
 
@@ -2862,11 +3022,31 @@ export function parseDeploymentCandidateOperationResponse(
   const workspace = parseDeploymentWorkspaceResponse(record.workspace);
   const resultRecord = objectAt(record.result, `${path}.result`);
   exactKeysAt(resultRecord, [
-    'status', 'compilation', 'candidate_preview', 'manager_apply', 'selection',
+    'status', 'confirmation_token', 'compilation', 'candidate_preview',
+    'manager_apply', 'selection',
   ], `${path}.result`);
   const status = stringAt(resultRecord.status, `${path}.result.status`);
-  if (status !== 'previewed' && status !== 'applied') {
-    return fail(`${path}.result.status`, 'previewed or applied');
+  if (
+    status !== 'previewed'
+    && status !== 'confirmation_required'
+    && status !== 'applied'
+  ) {
+    return fail(
+      `${path}.result.status`,
+      'previewed, confirmation_required, or applied',
+    );
+  }
+  const confirmationToken = resultRecord.confirmation_token === null
+    ? null
+    : digestAt(
+      resultRecord.confirmation_token,
+      `${path}.result.confirmation_token`,
+    );
+  if ((status === 'confirmation_required') !== (confirmationToken !== null)) {
+    return fail(
+      `${path}.result.confirmation_token`,
+      'a token exactly when confirmation is required',
+    );
   }
   const compilation = parseDeploymentCandidateIdentity(
     resultRecord.compilation,
@@ -2944,6 +3124,7 @@ export function parseDeploymentCandidateOperationResponse(
     workspace,
     result: {
       status,
+      confirmationToken,
       compilation,
       candidatePreview,
       managerApply,
@@ -3994,7 +4175,9 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
     const key = `${path}.groups[${index}]`;
     const row = objectAt(raw, key);
     exactKeysAt(row, ['group_id', 'node_count', 'held_node_count', 'state',
-      'stop_allowed', 'resume_allowed', 'resume_unavailable_reason'], key);
+      'stop_allowed', 'start_allowed', 'start_unavailable_reason',
+      'resume_allowed', 'resume_unavailable_reason',
+      'runtime_scale_selector', 'runtime_scale_unavailable_reason'], key);
     const groupId = stringAt(row.group_id, `${key}.group_id`);
     if (!/^[a-z][a-z0-9_.-]{0,127}$/.test(groupId) || groupId === 'inherit' || groupId <= previous) {
       return fail(key, 'canonical unique captured group IDs');
@@ -4003,23 +4186,49 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
     const nodeCount = positiveIntegerAt(row.node_count, `${key}.node_count`);
     const heldNodeCount = integerAt(row.held_node_count, `${key}.held_node_count`);
     const state = stringAt(row.state, `${key}.state`);
-    if (!['running', 'held', 'mixed', 'stopping', 'faulted', 'unavailable'].includes(state)) {
+    if (!['ready', 'running', 'held', 'mixed', 'stopping', 'faulted', 'unavailable'].includes(state)) {
       return fail(key, 'an owner selection state');
     }
     const stopAllowed = booleanAt(row.stop_allowed, `${key}.stop_allowed`);
+    const startAllowed = booleanAt(row.start_allowed, `${key}.start_allowed`);
+    const startUnavailableReason = nullableStringAt(
+      row.start_unavailable_reason,
+      `${key}.start_unavailable_reason`,
+    );
     const resumeAllowed = booleanAt(row.resume_allowed, `${key}.resume_allowed`);
     const resumeUnavailableReason = nullableStringAt(row.resume_unavailable_reason, `${key}.resume_unavailable_reason`);
+    const runtimeScaleSelector = row.runtime_scale_selector === null
+      ? null
+      : runtimeScaleControlSelectorAt(
+        row.runtime_scale_selector,
+        `${key}.runtime_scale_selector`,
+      );
+    const runtimeScaleUnavailableReason = nullableStringAt(
+      row.runtime_scale_unavailable_reason,
+      `${key}.runtime_scale_unavailable_reason`,
+    );
+    if ((runtimeScaleSelector === null)
+      !== (runtimeScaleUnavailableReason !== null)) {
+      return fail(
+        key,
+        'a complete runtime-scale selector or an owner unavailability reason',
+      );
+    }
     if (nodeCount > 100_000 || heldNodeCount < 0 || heldNodeCount > nodeCount
       || (state === 'running' && heldNodeCount !== 0)
       || (state === 'held' && heldNodeCount !== nodeCount)
       || (state === 'mixed' && (heldNodeCount === 0 || heldNodeCount === nodeCount))
+      || (startAllowed && state !== 'ready')
+      || startAllowed !== (startUnavailableReason === null)
       || (resumeAllowed && (!['held', 'mixed'].includes(state) || heldNodeCount === 0))
       || resumeAllowed !== (resumeUnavailableReason === null)) {
       return fail(key, 'coherent bounded selection status and eligibility');
     }
     return { groupId, nodeCount, heldNodeCount,
       state: state as ProgramExecutionSelectionControls['groups'][number]['state'],
-      stopAllowed, resumeAllowed, resumeUnavailableReason };
+      stopAllowed, startAllowed, startUnavailableReason,
+      resumeAllowed, resumeUnavailableReason,
+      runtimeScaleSelector, runtimeScaleUnavailableReason };
   });
   if (!groups.some((group) => group.groupId === 'all')) return fail(path, 'the built-in all selection');
   return { selectionRevision, groups };
@@ -4036,10 +4245,10 @@ export function parseProgramRuntimeControlProjection(
     'observation_override_candidate', 'execution_selections',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v4') {
+  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v6') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.program_runtime_control_projection.v4',
+      'manyforge.program_runtime_control_projection.v6',
     );
   }
   const programRunId = stringAt(record.program_run_id, `${path}.program_run_id`);
@@ -6756,7 +6965,7 @@ function manualControlMotionDescriptorAt(
     'operational_limit', 'ordinary_jerk', 'schema_version', 'target_role_id',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.manual_control_motion_descriptor.v4') {
+  if (schemaVersion !== 'manyforge.manual_control_motion_descriptor.v5') {
     return fail(`${path}.schema_version`, 'the supported motion descriptor');
   }
   const operationalLimit = record.operational_limit === null
@@ -6764,38 +6973,11 @@ function manualControlMotionDescriptorAt(
     : (() => {
         const limitPath = `${path}.operational_limit`;
         const limit = objectAt(record.operational_limit, limitPath);
-        exactKeysAt(limit, [
-          'catalog_policy_maximum_tcp_linear_speed_mps',
-          'deployment_maximum_tcp_linear_speed_mps',
-          'effective_maximum_tcp_linear_speed_mps', 'policy_id',
-          'policy_revision', 'selected_scope', 'source_content_digest',
-        ], limitPath);
-        const selectedScope = stringAt(limit.selected_scope, `${limitPath}.selected_scope`);
-        if (selectedScope !== 'cell' && selectedScope !== 'command_target') {
-          return fail(`${limitPath}.selected_scope`, 'cell or command_target');
-        }
+        exactKeysAt(limit, ['maximum_tcp_linear_speed_mps'], limitPath);
         return {
-          catalogPolicyMaximumTcpLinearSpeedMps: positiveNumberAt(
-            limit.catalog_policy_maximum_tcp_linear_speed_mps,
-            `${limitPath}.catalog_policy_maximum_tcp_linear_speed_mps`,
-          ),
-          deploymentMaximumTcpLinearSpeedMps:
-            limit.deployment_maximum_tcp_linear_speed_mps === null
-              ? null
-              : positiveNumberAt(
-                  limit.deployment_maximum_tcp_linear_speed_mps,
-                  `${limitPath}.deployment_maximum_tcp_linear_speed_mps`,
-                ),
-          effectiveMaximumTcpLinearSpeedMps: positiveNumberAt(
-            limit.effective_maximum_tcp_linear_speed_mps,
-            `${limitPath}.effective_maximum_tcp_linear_speed_mps`,
-          ),
-          policyId: stringAt(limit.policy_id, `${limitPath}.policy_id`),
-          policyRevision: digestAt(limit.policy_revision, `${limitPath}.policy_revision`),
-          selectedScope: selectedScope as 'cell' | 'command_target',
-          sourceContentDigest: digestAt(
-            limit.source_content_digest,
-            `${limitPath}.source_content_digest`,
+          maximumTcpLinearSpeedMps: positiveNumberAt(
+            limit.maximum_tcp_linear_speed_mps,
+            `${limitPath}.maximum_tcp_linear_speed_mps`,
           ),
         };
       })();
@@ -7354,23 +7536,28 @@ export function parseExecutionControlStatus(
     return fail('executionControlStatus', 'matching owner/product identities');
   }
   const targets = objectAt(targetsEnvelope.targets, 'executionTargets.targets');
-  exactKeysAt(
+  allowedKeysAt(
     targets,
     ['direct_control', 'direct_control_gripper', 'schema_version'],
+    ['direct_control_targets', 'direct_control_gripper_targets'],
     'executionTargets.targets',
   );
-  if (stringAt(targets.schema_version, 'executionTargets.targets.schema_version')
-      !== 'manyforge.execution_targets.v1') {
+  const targetsSchemaVersion = stringAt(
+    targets.schema_version,
+    'executionTargets.targets.schema_version',
+  );
+  if (!['manyforge.execution_targets.v1', 'manyforge.execution_targets.v2']
+    .includes(targetsSchemaVersion)) {
     return fail(
       'executionTargets.targets.schema_version',
-      'manyforge.execution_targets.v1',
+      'manyforge.execution_targets.v1 or manyforge.execution_targets.v2',
     );
   }
   const control = objectAt(
     controlEnvelope.control_state,
     'executionControlState.control_state',
   );
-  exactKeysAt(
+  allowedKeysAt(
     control,
     [
       'cell_stop_action',
@@ -7380,15 +7567,20 @@ export function parseExecutionControlStatus(
       'runtime_scale_control',
       'schema_version',
     ],
+    ['observed_target_states'],
     'executionControlState.control_state',
   );
-  if (stringAt(
+  const controlSchemaVersion = stringAt(
     control.schema_version,
     'executionControlState.control_state.schema_version',
-  ) !== 'manyforge.execution_control_state.v4') {
+  );
+  if (![
+    'manyforge.execution_control_state.v4',
+    'manyforge.execution_control_state.v5',
+  ].includes(controlSchemaVersion)) {
     return fail(
       'executionControlState.control_state.schema_version',
-      'manyforge.execution_control_state.v4',
+      'manyforge.execution_control_state.v4 or manyforge.execution_control_state.v5',
     );
   }
   const motionTarget = objectAt(
@@ -7399,23 +7591,126 @@ export function parseExecutionControlStatus(
     targets.direct_control_gripper,
     'executionTargets.targets.direct_control_gripper',
   );
+  const motionTargetRows = targets.direct_control_targets === undefined
+    ? [motionTarget]
+    : arrayAt(
+      targets.direct_control_targets,
+      'executionTargets.targets.direct_control_targets',
+    ).map((value, index) => objectAt(
+      value,
+      `executionTargets.targets.direct_control_targets[${index}]`,
+    ));
+  const gripperTargetRows = targets.direct_control_gripper_targets === undefined
+    ? [gripperTarget]
+    : arrayAt(
+      targets.direct_control_gripper_targets,
+      'executionTargets.targets.direct_control_gripper_targets',
+    ).map((value, index) => objectAt(
+      value,
+      `executionTargets.targets.direct_control_gripper_targets[${index}]`,
+    ));
+  if (motionTargetRows.length === 0 || gripperTargetRows.length === 0) {
+    return fail(
+      'executionTargets.targets.direct_control_targets',
+      'at least one addressed motion and gripper target',
+    );
+  }
+  const observedTargetStates = control.observed_target_states === undefined
+    ? []
+    : arrayAt(
+      control.observed_target_states,
+      'executionControlState.control_state.observed_target_states',
+    ).map((value, index) => {
+      const row = objectAt(
+        value,
+        `executionControlState.control_state.observed_target_states[${index}]`,
+      );
+      exactKeysAt(row, [
+        'command_target_id',
+        'controllable_component_id',
+        'gripper',
+        'gripper_target_role_id',
+        'motion',
+        'motion_target_role_id',
+      ], `executionControlState.control_state.observed_target_states[${index}]`);
+      return row;
+    });
+  const addressedIdentity = (target: JsonObject, path: string) => ({
+    componentId: stringAt(
+      target.controllable_component_id,
+      `${path}.controllable_component_id`,
+    ),
+    commandTargetId: stringAt(
+      target.command_target_id,
+      `${path}.command_target_id`,
+    ),
+  });
+  const observedFor = (
+    target: JsonObject,
+    targetPath: string,
+    key: 'motion' | 'gripper',
+    fallback: unknown,
+  ): unknown => {
+    const identity = addressedIdentity(target, targetPath);
+    const matches = observedTargetStates.filter((row) => (
+      row.controllable_component_id === identity.componentId
+      && row.command_target_id === identity.commandTargetId
+    ));
+    if (matches.length > 1) {
+      return fail(
+        'executionControlState.control_state.observed_target_states',
+        'one observation row per addressed component/target',
+      );
+    }
+    if (matches.length === 1) return matches[0][key];
+    const primary = addressedIdentity(
+      key === 'motion' ? motionTarget : gripperTarget,
+      key === 'motion'
+        ? 'executionTargets.targets.direct_control'
+        : 'executionTargets.targets.direct_control_gripper',
+    );
+    if (identity.componentId === primary.componentId
+      && identity.commandTargetId === primary.commandTargetId) return fallback;
+    return fail(
+      `${targetPath}.${key}`,
+      'an observation row for the exact addressed target',
+    );
+  };
+  const motionProjectionRows = motionTargetRows.map((target, index) => ({
+    ...target,
+    observed_state: observedFor(
+      target,
+      `executionTargets.targets.direct_control_targets[${index}]`,
+      'motion',
+      target === motionTarget ? control.observed_motion : null,
+    ),
+  }));
+  const gripperProjectionRows = gripperTargetRows.map((target, index) => ({
+    ...target,
+    observed_state: observedFor(
+      target,
+      `executionTargets.targets.direct_control_gripper_targets[${index}]`,
+      'gripper',
+      target === gripperTarget ? control.observed_gripper : null,
+    ),
+  }));
   const identity = targetIdentity;
   const allowedProgramRuns = new Set([
-    stringAt(
-      motionTarget.program_run_id,
-      'executionTargets.targets.direct_control.program_run_id',
-    ),
-    stringAt(
-      gripperTarget.program_run_id,
-      'executionTargets.targets.direct_control_gripper.program_run_id',
-    ),
+    ...motionTargetRows.map((target, index) => stringAt(
+      target.program_run_id,
+      `executionTargets.targets.direct_control_targets[${index}].program_run_id`,
+    )),
+    ...gripperTargetRows.map((target, index) => stringAt(
+      target.program_run_id,
+      `executionTargets.targets.direct_control_gripper_targets[${index}].program_run_id`,
+    )),
   ]);
   const manualRows = arrayAt(
     control.manual_operations,
     'executionControlState.control_state.manual_operations',
   );
-  if (manualRows.length > allowedProgramRuns.size) {
-    return fail('executionControlState.control_state.manual_operations', 'at most one result per addressed manual target');
+  if (manualRows.length > 128) {
+    return fail('executionControlState.control_state.manual_operations', 'a bounded operation list');
   }
   const manualOperations = manualRows.map((value, index) => {
     const projection = objectAt(
@@ -7451,7 +7746,7 @@ export function parseExecutionControlStatus(
     return { ...observed, programRunId };
   });
   if (new Set(manualOperations.map((operation) => operation.operationId)).size
-    !== manualOperations.length
+      !== manualOperations.length
     || new Set(manualOperations.map((operation) => operation.programRunId)).size
       !== manualOperations.length) {
     return fail(
@@ -7467,14 +7762,10 @@ export function parseExecutionControlStatus(
       active_publication_generation: identity.activePublicationGeneration,
       cell_id: identity.cellId,
       cell_stop_action: control.cell_stop_action,
-      direct_control: {
-        ...motionTarget,
-        observed_state: control.observed_motion,
-      },
-      direct_control_gripper: {
-        ...gripperTarget,
-        observed_state: control.observed_gripper,
-      },
+      direct_control: motionProjectionRows[0],
+      direct_control_gripper: gripperProjectionRows[0],
+      direct_control_targets: motionProjectionRows,
+      direct_control_gripper_targets: gripperProjectionRows,
       graph_revision: identity.graphRevision,
       owner_epoch: identity.ownerEpoch,
       retained_bundle_id: identity.retainedBundleId,
@@ -8006,7 +8297,7 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
   ) {
     return fail('executionStatus.status.direct_control', 'descriptors joined to the exact addressed targets');
   }
-  return {
+  const parsedStatus: ExecutionOwnerStatus = {
     ownerEpoch: stringAt(status.owner_epoch, 'executionStatus.status.owner_epoch'),
     cellId: stringAt(status.cell_id, 'executionStatus.status.cell_id'),
     activePublicationGeneration: positiveIntegerAt(
@@ -8135,6 +8426,89 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
       latestTerminal,
       fault: cellStopFault,
     },
+  };
+  const hasMotionInventory = status.direct_control_targets !== undefined;
+  const hasGripperInventory = status.direct_control_gripper_targets !== undefined;
+  if (hasMotionInventory !== hasGripperInventory) {
+    return fail(
+      'executionStatus.status.direct_control_targets',
+      'motion and gripper inventories published together',
+    );
+  }
+  if (!hasMotionInventory) return parsedStatus;
+
+  const motionTargetEntries = arrayAt(
+    status.direct_control_targets,
+    'executionStatus.status.direct_control_targets',
+  ).map((value, index) => objectAt(
+    value,
+    `executionStatus.status.direct_control_targets[${index}]`,
+  ));
+  const gripperTargetEntries = arrayAt(
+    status.direct_control_gripper_targets,
+    'executionStatus.status.direct_control_gripper_targets',
+  ).map((value, index) => objectAt(
+    value,
+    `executionStatus.status.direct_control_gripper_targets[${index}]`,
+  ));
+  if (motionTargetEntries.length === 0 || gripperTargetEntries.length === 0) {
+    return fail(
+      'executionStatus.status.direct_control_targets',
+      'at least one addressed motion and gripper target',
+    );
+  }
+  const gripperForMotion = (motionTarget: JsonObject, index: number): JsonObject => {
+    const addressedComponentId = stringAt(
+      motionTarget.controllable_component_id,
+      `executionStatus.status.direct_control_targets[${index}].controllable_component_id`,
+    );
+    const matches = gripperTargetEntries.filter((candidate) => (
+      candidate.controllable_component_id === addressedComponentId
+    ));
+    if (matches.length !== 1) {
+      return fail(
+        `executionStatus.status.direct_control_targets[${index}]`,
+        'exactly one attached gripper target for its component',
+      );
+    }
+    return matches[0];
+  };
+  const parsedInventory = motionTargetEntries.map((motionTarget, index) => {
+    const nestedStatus = { ...status };
+    delete nestedStatus.direct_control_targets;
+    delete nestedStatus.direct_control_gripper_targets;
+    nestedStatus.direct_control = motionTarget;
+    nestedStatus.direct_control_gripper = gripperForMotion(motionTarget, index);
+    return parseExecutionOwnerStatus({ ...envelope, status: nestedStatus });
+  });
+  const targetKeys = parsedInventory.map((entry) => (
+    `${entry.directControl.controllableComponentId}\u0000${entry.directControl.commandTargetId}`
+  ));
+  if (new Set(targetKeys).size !== targetKeys.length) {
+    return fail(
+      'executionStatus.status.direct_control_targets',
+      'unique addressed component/target identities',
+    );
+  }
+  const directControlTargets = parsedInventory.map((entry) => entry.directControl);
+  const directControlGripperTargets = parsedInventory.map(
+    (entry) => entry.directControlGripper,
+  );
+  const observedMotions = parsedInventory.map((entry) => entry.observedMotion);
+  const observedGrippers = parsedInventory
+    .map((entry) => entry.observedGripper === null ? null : {
+      ...entry.observedGripper,
+      targetRoleId: entry.directControlGripper.targetRoleId,
+      controllableComponentId: entry.directControlGripper.controllableComponentId,
+      commandTargetId: entry.directControlGripper.commandTargetId,
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+  return {
+    ...parsedStatus,
+    directControlTargets,
+    directControlGripperTargets,
+    observedMotions,
+    observedGrippers,
   };
 }
 
@@ -8657,6 +9031,11 @@ export function parseOperationObservation(value: unknown): OperationObservation 
   if (revision < 1) {
     return fail('operationObservation.operation.operation_revision', 'positive');
   }
+  const optionalParticipantText = (key: string): string | undefined => (
+    typeof participant[key] === 'string' && participant[key] !== ''
+      ? participant[key] as string
+      : undefined
+  );
   return {
     operationId: stringAt(
       operation.operation_id,
@@ -8678,8 +9057,12 @@ export function parseOperationObservation(value: unknown): OperationObservation 
       : integerAt(
         operation.active_stop_generation,
         'operationObservation.operation.active_stop_generation',
-      ),
+    ),
     terminalError,
+    componentRoleId: optionalParticipantText('component_role_id'),
+    targetRoleId: optionalParticipantText('target_role_id'),
+    controllableComponentId: optionalParticipantText('controllable_component_id'),
+    commandTargetId: optionalParticipantText('command_target_id'),
   };
 }
 

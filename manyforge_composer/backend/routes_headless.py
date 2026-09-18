@@ -40,6 +40,7 @@ from manyforge_headless_api.models import (
     StopFaultRecoveryIntentRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
+    ProgramSelectionStartRequest,
     ProgramSelectionStopRequest,
     ProgramSelectionResumeRequest,
     ProgramFullStopResetRequest,
@@ -255,9 +256,10 @@ def create_headless_router(
     def cclc_lifecycle_submit(
         body: ComponentLifecycleRequest,
     ) -> dict[str, Any]:
-        return _call(
-            lambda: client.submit_component_lifecycle(body.model_dump(mode="json"))
-        )
+        payload = body.model_dump(mode="json")
+        if payload.get("program_node_evidence") is None:
+            payload.pop("program_node_evidence", None)
+        return _call(lambda: client.submit_component_lifecycle(payload))
 
     @router.get("/api/cclc/lifecycle/transactions/{transaction_id}")
     def cclc_lifecycle_status(
@@ -536,6 +538,26 @@ def create_headless_router(
                 body.model_dump(mode="json"),
             ),
             stop=True,
+        )
+
+    @router.post("/api/program/runs/{program_run_id}/motion-start")
+    async def program_run_motion_start(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ProgramSelectionStartRequest,
+    ) -> dict[str, Any]:
+        if body.program_run_id != program_run_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "program_run_path_invalid",
+                    "message": "Program-run identity in path and body must match",
+                },
+            )
+        return await control_call(
+            lambda: client.program_run_motion_start(
+                program_run_id,
+                body.model_dump(mode="json"),
+            )
         )
 
     @router.post("/api/program/runs/{program_run_id}/resume-motion")

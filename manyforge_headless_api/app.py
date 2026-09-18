@@ -73,6 +73,7 @@ from .models import (
     ProgramRunStartRequest,
     ProgramRunStopRequest,
     ProgramSelectionStopRequest,
+    ProgramSelectionStartRequest,
     ProgramSelectionResumeRequest,
     ProgramManualHandoverRequest,
     ProgramFullStopResetRequest,
@@ -1038,6 +1039,24 @@ def create_app(
             transport_request=request,
         )
 
+    @app.post("/api/program/runs/{program_run_id}/motion-start")
+    async def program_run_motion_start(
+        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ProgramSelectionStartRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        if body.program_run_id != program_run_id:
+            raise HeadlessApiError(
+                "program_run_path_invalid",
+                "Program-run identity in path and body must match",
+            )
+        return await rest_execution_command(
+            command_kind="program_motion_start",
+            payload=body.model_dump(mode="json"),
+            request_context=body,
+            transport_request=request,
+        )
+
     @app.post("/api/program/runs/{program_run_id}/manual-handover")
     async def program_run_manual_handover(
         program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
@@ -1828,21 +1847,25 @@ def create_app(
         body: AcknowledgeAlarmRequest,
         request: Request,
     ) -> dict[str, Any]:
-        return service.acknowledge_alarm(
+        result = service.acknowledge_alarm(
             condition_id,
             body,
             _trusted_attribution(request, trusted_principal_adapter),
         )
+        control_state_source.notify_cold()
+        return result
 
     @app.post("/api/execution/alarms/acknowledge-all")
     def acknowledge_all(
         body: AcknowledgeAllAlarmsRequest,
         request: Request,
     ) -> dict[str, Any]:
-        return service.acknowledge_all(
+        result = service.acknowledge_all(
             body,
             _trusted_attribution(request, trusted_principal_adapter),
         )
+        control_state_source.notify_cold()
+        return result
 
     @app.get("/api/execution/history")
     def history(

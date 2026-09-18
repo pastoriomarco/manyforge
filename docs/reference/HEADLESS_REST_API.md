@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-09-10 23:46:35 UTC
+  Last regenerated: 2026-09-17 18:47:20 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -171,9 +171,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/execution/operations/{operation_id}/resume` |  | Execution Resume |
 | `POST` | `/api/execution/pick-place/plans/pick` |  | Execution Plan Pick |
 | `POST` | `/api/execution/pick-place/plans/place` |  | Execution Plan Place |
-| `POST` | `/api/execution/pick-place/sequences/pick` |  | Execution Start Pick |
-| `POST` | `/api/execution/pick-place/sequences/place` |  | Execution Start Place |
-| `GET` | `/api/execution/pick-place/sequences/{sequence_id}` |  | Execution Pick Place Sequence |
 | `GET` | `/api/execution/runtime-scale-control` |  | Execution Get Runtime Scale Control |
 | `POST` | `/api/execution/runtime-scale-control` |  | Execution Set Runtime Scale Control |
 | `GET` | `/api/execution/status` |  | Execution Status |
@@ -207,6 +204,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/runs/{program_run_id}/full-stop` |  | Program Run Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/manual-handover` |  | Program Run Manual Handover |
 | `POST` | `/api/program/runs/{program_run_id}/manual-result` |  | Stage Manual Result |
+| `POST` | `/api/program/runs/{program_run_id}/motion-start` |  | Program Run Motion Start |
 | `POST` | `/api/program/runs/{program_run_id}/motion-stop` |  | Program Run Motion Stop |
 | `POST` | `/api/program/runs/{program_run_id}/reset` |  | Program Run Reset Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/resume-full-stop` |  | Program Run Resume Full Stop |

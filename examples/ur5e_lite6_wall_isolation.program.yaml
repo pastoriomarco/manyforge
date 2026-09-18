@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: ur5e_lite6_wall_isolation
-program_revision: sha256:63df7b25627044b7e1766c9389982fa7044bcfdaecd0fab1e8da99b8869906a8
+program_revision: sha256:e695415a062a59618e0d4af1dcad08bb479b0e65f86da59741c59dbc4cae06f7
 program_profile: composable-cell-v1
 name: ur5e_lite6_wall_isolation
 description: Two independent joint trajectories in the UR5e + Lite6 wall cell, in separate control groups
@@ -149,6 +149,27 @@ parameters:
     max_inclusive: 1.0
   runtime_mutability: before_run
   description: Acceleration scale shared by the two planned motions.
+- parameter_id: max_blend_deviation_rad
+  type: float64
+  default: 0.01
+  constraints:
+    min_inclusive: 0.0
+  runtime_mutability: before_run
+  description: Default maximum Cartesian blend deviation.
+- parameter_id: max_tcp_linear_speed_mps
+  type: float64
+  default: 0.15
+  constraints:
+    min_exclusive: 0.0
+  runtime_mutability: before_run
+  description: Maximum TCP linear speed shared by the two robots.
+- parameter_id: translation_tol_m
+  type: float64
+  default: 0.005
+  constraints:
+    min_exclusive: 0.0
+  runtime_mutability: before_run
+  description: Default Cartesian translation tolerance.
 - parameter_id: velocity_scale
   type: float64
   default: 0.35
@@ -193,6 +214,12 @@ tree:
       acceleration_scale:
         kind: program_parameter
         reference: acceleration_scale
+      max_tcp_linear_speed_mps:
+        kind: program_parameter
+        reference: max_tcp_linear_speed_mps
+      translation_tol_m:
+        kind: program_parameter
+        reference: translation_tol_m
       velocity_scale:
         kind: program_parameter
         reference: velocity_scale
@@ -224,6 +251,12 @@ tree:
       acceleration_scale:
         kind: program_parameter
         reference: acceleration_scale
+      max_tcp_linear_speed_mps:
+        kind: program_parameter
+        reference: max_tcp_linear_speed_mps
+      translation_tol_m:
+        kind: program_parameter
+        reference: translation_tol_m
       velocity_scale:
         kind: program_parameter
         reference: velocity_scale

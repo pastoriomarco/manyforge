@@ -1186,8 +1186,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                  std::vector<double>(trajectory.joint_names.size(), 0.0), 0.1}},
          world, CollisionPolicyRevision{1U, Digest('d')}, decision},
         std::move(contact_policy),
-        {authority.runtime_policy.value().source_artifact,
-         authority.runtime_policy.value().selected_motion_speed_limit},
+        {authority.runtime_policy.value().source_artifact},
+        authority.requested_tcp_linear_speed_mps,
+        authority.deployment_maximum_tcp_linear_speed_mps,
         std::move(scopes),
         request.timeouts.execution_timeout_s};
 
@@ -1967,7 +1968,6 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
                           RuntimePolicyRevision(test_digest('d')),
                           std::nullopt,
                           {},
-                          {RuntimeMotionSpeedLimitDTO{RuntimePolicyCellScopeDTO{}, 0.5}},
                           {}};
   RuntimePolicyCatalogRecordRefDTO policy_reference{
       policy.runtime_policy_id,
@@ -2016,7 +2016,8 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
       std::move(runtime_policy.value()),
       dynamic_cast<IResolvedPreparedParticipantExecutionEngine*>(&engine),
       std::move(operator_stop_profile),
-      std::move(fault_stop_profile)};
+      std::move(fault_stop_profile),
+      0.5};
 }
 
 [[nodiscard]] RuntimeParticipantExecutionRegistration unqualified_registration(
@@ -2026,7 +2027,8 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
       {},           MotionInterruptNodeCategory::kGeneric,
       &engine,      dynamic_cast<IControlDomainExecutionPort*>(&engine),
       std::nullopt, nullptr,
-      std::nullopt, std::nullopt};
+      std::nullopt, std::nullopt,
+      std::nullopt};
 }
 
 [[nodiscard]] ActiveControlConfigurationDTO route_configuration_for(
@@ -2709,6 +2711,63 @@ TEST(ResourceAddressedExecutionKernelTest,
           {}};
 }
 
+void start_program_motion(ResourceAddressedExecutionKernel& kernel,
+                          std::string group = "all", std::string program_run = "run.1",
+                          std::string program_owner = "program.owner",
+                          const std::uint64_t claim_generation = 1U) {
+  const auto scope = kernel.get_program_execution_scope(ProgramRunId(program_run));
+  ASSERT_TRUE(scope.ok()) << scope.error().message;
+  const auto request_id = "initial.run." + group;
+  auto request = program_selection_request(request_id, std::move(group));
+  request.program_run_id = ProgramRunId(std::move(program_run));
+  request.program_runner_owner_epoch = RequestOwnerEpoch(std::move(program_owner));
+  request.claim_generation = CellAdmissionClaimGeneration(claim_generation);
+  const auto started =
+      kernel.start_program_selection(request, scope.value().selection_revision);
+  ASSERT_TRUE(started.ok()) << started.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramCaptureRequiresExplicitInitialMotionRunWithoutRecovery) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+
+  const auto initial = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(initial.ok()) << initial.error().message;
+  ASSERT_EQ(initial.value().held_nodes.size(), 1U);
+  EXPECT_EQ(initial.value().held_nodes.front().node_index, 0U);
+  EXPECT_EQ(initial.value().held_nodes.front().state, ProgramNodeHoldStateDTO::kReady);
+
+  const auto before_run = kernel.execute(scoped_motion_operation("before.initial.run"));
+  ASSERT_FALSE(before_run.ok());
+  EXPECT_EQ(before_run.error().details.at("reason"), "program_node_stop_fence_active");
+  const auto wrong_resume = kernel.release_program_selection(
+      program_selection_request("resume.before.initial.run", "arm"),
+      initial.value().selection_revision);
+  ASSERT_FALSE(wrong_resume.ok());
+  EXPECT_EQ(wrong_resume.error().details.at("reason"), "program_selection_not_releasable");
+  EXPECT_EQ(engine.prepare_motion_calls, 0);
+  EXPECT_EQ(engine.execute_calls, 0);
+
+  const auto started = kernel.start_program_selection(
+      program_selection_request("initial.run.arm", "arm"), initial.value().selection_revision);
+  ASSERT_TRUE(started.ok()) << started.error().message;
+  EXPECT_TRUE(started.value().held_nodes.empty());
+  const auto admitted = kernel.execute(scoped_motion_operation("after.initial.run"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
 [[nodiscard]] RuntimeScaleControlSelectorDTO runtime_scale_control_selector(
     std::string component_role = "robot", std::string target_role = "arm") {
   return RuntimeScaleControlSelectorDTO{ProgramBindingId(test_digest('1')),
@@ -2733,7 +2792,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     RuntimeScaleGroupSettingIsSeparateCanonicalAndSeedsSynchronizedDispatch) {
+     RuntimeScaleGroupRetainsCanonicalAndLatestScopeWritesMembers) {
   for (const bool configured : {false, true}) {
     SCOPED_TRACE(configured);
     FakeClock clock;
@@ -2785,6 +2844,18 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_EQ(second_engine.runtime_scale_calls, 0);
     EXPECT_EQ(third_engine.runtime_scale_calls, 0);
 
+    // Scope commands write through to the member settings used by ordinary
+    // independent moves. The latest accepted scope affecting a member wins
+    // only for that member: the overlapping command changes robot_2, but not
+    // robot_1. The exact group setting remains its own replay/generation
+    // authority and reports the now-mixed effective member values.
+    const auto group_after_overlap = kernel.get_runtime_scale_control(group_request.selector);
+    ASSERT_TRUE(group_after_overlap.ok());
+    EXPECT_DOUBLE_EQ(group_after_overlap.value().requested_scale, configured ? 0.35 : 1.0);
+    EXPECT_FALSE(group_after_overlap.value().effective_scale.has_value());
+    EXPECT_EQ(group_after_overlap.value().application_state,
+              RuntimeScaleApplicationState::kApplied);
+
     const auto admitted = kernel.execute(coordinated_motion_operation("motion.synchronized"));
     ASSERT_TRUE(admitted.ok()) << admitted.error().message;
     for (const auto* engine : {&first_engine, &second_engine}) {
@@ -2797,8 +2868,8 @@ TEST(ResourceAddressedExecutionKernelTest,
     const auto second_setting = kernel.get_runtime_scale_control(second_request.selector);
     ASSERT_TRUE(first_setting.ok());
     ASSERT_TRUE(second_setting.ok());
-    EXPECT_DOUBLE_EQ(first_setting.value().requested_scale, 0.2);
-    EXPECT_DOUBLE_EQ(second_setting.value().requested_scale, 0.8);
+    EXPECT_DOUBLE_EQ(first_setting.value().requested_scale, configured ? 0.35 : 0.2);
+    EXPECT_DOUBLE_EQ(second_setting.value().requested_scale, 0.65);
     EXPECT_TRUE(first_setting.value().frozen);
     const auto busy = kernel.get_runtime_scale_control(overlapping.selector);
     ASSERT_TRUE(busy.ok());
@@ -2825,10 +2896,8 @@ TEST(ResourceAddressedExecutionKernelTest, RuntimeScaleGroupRejectsMalformedOrCl
     request.selector = runtime_scale_group_selector();
     if (malformed == 0) request.selector.component_role_id = ComponentRoleId("robot");
     if (malformed == 1) request.selector.group_targets.pop_back();
-    if (malformed == 2)
-      request.selector.group_targets[1] = request.selector.group_targets[0];
-    if (malformed == 3)
-      request.selector.group_targets[1].target_role_id = TargetRoleId("missing");
+    if (malformed == 2) request.selector.group_targets[1] = request.selector.group_targets[0];
+    if (malformed == 3) request.selector.group_targets[1].target_role_id = TargetRoleId("missing");
     const auto status = kernel.get_runtime_scale_control(request.selector);
     ASSERT_TRUE(status.ok());
     EXPECT_FALSE(status.value().supported);
@@ -2874,17 +2943,16 @@ TEST(ResourceAddressedExecutionKernelTest,
   binding->target_role_bindings.push_back(std::move(second_target));
   capture.binding = std::move(binding);
   auto table = std::make_shared<ProgramExecutionTableDTO>();
-  table->nodes = {
-      {ProgramNodeInstanceId("a"),
-       "kernel.operation",
-       {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}},
-      {ProgramNodeInstanceId("b"),
-       "kernel.operation",
-       {{TargetRoleId("arm_2"), CapabilityId("execution.trajectory.execute"), true}}}};
-  table->named_selections = {
-      {"robot_group", {0U, 1U}, ProgramExecutionPolicy::kIndependent}};
+  table->nodes = {{ProgramNodeInstanceId("a"),
+                   "kernel.operation",
+                   {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}},
+                  {ProgramNodeInstanceId("b"),
+                   "kernel.operation",
+                   {{TargetRoleId("arm_2"), CapabilityId("execution.trajectory.execute"), true}}}};
+  table->named_selections = {{"robot_group", {0U, 1U}, ProgramExecutionPolicy::kIndependent}};
   capture.table = table;
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  start_program_motion(kernel);
 
   auto first_intent = motion_operation("group.scale.first");
   first_intent.participants.front().execution_scope =
@@ -2902,8 +2970,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   second_engine.runtime_scale.active = true;
   ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
 
-  const auto projected =
-      kernel.present_runtime_scale_control(runtime_scale_control_selector());
+  const auto projected = kernel.present_runtime_scale_control(runtime_scale_control_selector());
   ASSERT_TRUE(projected.ok()) << projected.error().message;
   EXPECT_EQ(projected.value().selector, runtime_scale_group_selector());
   EXPECT_FALSE(projected.value().frozen);
@@ -2919,9 +2986,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(second_engine.last_runtime_scale_command);
   EXPECT_DOUBLE_EQ(first_engine.last_runtime_scale_command->requested_scale, 0.4);
   EXPECT_DOUBLE_EQ(second_engine.last_runtime_scale_command->requested_scale, 0.4);
-  EXPECT_DOUBLE_EQ(
-      kernel.get_runtime_scale_control(request.selector).value().requested_scale,
-      0.4);
+  EXPECT_DOUBLE_EQ(kernel.get_runtime_scale_control(request.selector).value().requested_scale, 0.4);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -2937,8 +3002,8 @@ TEST(ResourceAddressedExecutionKernelTest,
                                                 CellId("cell.test"), 32U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
   ResourceAddressedExecutionKernel kernel(
-      {registration(first, first_engine), registration(second, second_engine)},
-      clock, scheduler, journal, std::move(config));
+      {registration(first, first_engine), registration(second, second_engine)}, clock, scheduler,
+      journal, std::move(config));
   ASSERT_TRUE(claim_program_execution(kernel).ok());
 
   auto capture = program_execution_capture();
@@ -2953,23 +3018,21 @@ TEST(ResourceAddressedExecutionKernelTest,
   second_target.command_target_id = second.value().command_target_id;
   binding->target_role_bindings.push_back(std::move(second_target));
   capture.binding = std::move(binding);
-  capture.table = std::make_shared<ProgramExecutionTableDTO>(
-      ProgramExecutionTableDTO{
-          {{ProgramNodeInstanceId("a"),
-            "kernel.operation",
-            {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}},
-           {ProgramNodeInstanceId("b"),
-            "kernel.operation",
-            {{TargetRoleId("arm_2"), CapabilityId("execution.trajectory.execute"), true}}}},
-          {{"robot_group", {0U, 1U}, ProgramExecutionPolicy::kIndependent}}});
+  capture.table = std::make_shared<ProgramExecutionTableDTO>(ProgramExecutionTableDTO{
+      {{ProgramNodeInstanceId("a"),
+        "kernel.operation",
+        {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}},
+       {ProgramNodeInstanceId("b"),
+        "kernel.operation",
+        {{TargetRoleId("arm_2"), CapabilityId("execution.trajectory.execute"), true}}}},
+      {{"robot_group", {0U, 1U}, ProgramExecutionPolicy::kIndependent}}});
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
 
-  RuntimeScaleControlSelectorDTO selector{
-      authored_binding,
-      ComponentRoleId(""),
-      TargetRoleId(""),
-      {{ComponentRoleId("robot"), TargetRoleId("arm")},
-       {ComponentRoleId("robot_2"), TargetRoleId("arm_2")}}};
+  RuntimeScaleControlSelectorDTO selector{authored_binding,
+                                          ComponentRoleId(""),
+                                          TargetRoleId(""),
+                                          {{ComponentRoleId("robot"), TargetRoleId("arm")},
+                                           {ComponentRoleId("robot_2"), TargetRoleId("arm_2")}}};
   const auto status = kernel.get_runtime_scale_control(selector);
   ASSERT_TRUE(status.ok()) << status.error().message;
   EXPECT_TRUE(status.value().supported);
@@ -4360,7 +4423,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_FALSE(kernel.set_runtime_scale_control(group_alias).ok());
     EXPECT_DOUBLE_EQ(
         kernel.get_runtime_scale_control(runtime_scale_control_selector()).value().requested_scale,
-        1.0);
+        0.5);
     second_engine.last_runtime_scale_command->requested_runtime_scale_generation =
         RuntimeScaleGeneration(2U);
     second_engine.last_runtime_scale_command->requested_scale = 0.5;
@@ -6389,6 +6452,7 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramSceneClaimOrdersAgainstStopWit
   EXPECT_EQ(kernel.AcquireCellAdmissionClaim(intent).error().details.at("reason"),
             "program_node_parent_not_current");
   ASSERT_TRUE(kernel.register_program_run_capture(std::move(capture)).ok());
+  start_program_motion(kernel);
   const CellAdmissionReadinessSnapshotDTO idle{
       true,
       ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"),
@@ -6551,6 +6615,7 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramSelectionIdleOverlapHasOneHold
       clock, scheduler, default_journal, std::move(config));
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(kernel);
   const auto arm = kernel.stop_program_selection(program_selection_request("stop.arm", "arm"));
   ASSERT_TRUE(arm.ok()) << arm.error().message;
   ASSERT_TRUE(arm.value().state.has_value());
@@ -6608,6 +6673,7 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramSelectionFencesPreparedResumeA
   table->nodes[1].target_effects = {{TargetRoleId("arm"), CapabilityId("execution.resume"), true}};
   capture.table = std::move(table);
   ASSERT_TRUE(kernel.register_program_run_capture(std::move(capture)).ok());
+  start_program_motion(kernel);
   const auto executed = kernel.execute(scoped_motion_operation("resume.actor.motion"));
   ASSERT_TRUE(executed.ok()) << executed.error().message;
   engine.emit_transition(ExecutionState::kValidating, ExecutionState::kExecuting);
@@ -6678,6 +6744,7 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramSelectionUnknownContainsThroug
       clock, scheduler, default_journal, std::move(config));
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(kernel);
   ASSERT_TRUE(kernel.execute(scoped_motion_operation("active.arm")).ok());
   const auto stopped =
       kernel.stop_program_selection(program_selection_request("unknown.stop", "missing"));
@@ -6721,6 +6788,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   table->named_selections = {{"a", {0U}}, {"b", {1U}}};
   capture.table = table;
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  start_program_motion(kernel);
   std::vector<OperationAcceptedDTO> operations;
   for (const auto* name : {"a", "b"}) {
     auto intent = motion_operation(std::string("execute.") + name);
@@ -6828,6 +6896,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       clock, scheduler, default_journal, std::move(config));
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(kernel);
   auto request = program_selection_request("stop.union", "arm");
   request.group_ids = {"arm", "supervision", "arm"};
   const auto stopped = kernel.stop_program_selection(request);
@@ -6879,11 +6948,10 @@ TEST(ResourceAddressedExecutionKernelTest,
                    "kernel.operation",
                    {{TargetRoleId("arm_3"), CapabilityId("execution.trajectory.execute"), true}}}};
   table->named_selections = {
-      {"a", {0U}},
-      {"both_arms", {0U, 1U}, ProgramExecutionPolicy::kCommonStart},
-      {"c", {2U}}};
+      {"a", {0U}}, {"both_arms", {0U, 1U}, ProgramExecutionPolicy::kCommonStart}, {"c", {2U}}};
   capture.table = table;
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  start_program_motion(kernel);
   auto incomplete = motion_operation("execute.synchronized.member.alone");
   incomplete.participants.front().execution_scope =
       ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("a"), "attempt.alone"};
@@ -7003,6 +7071,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {"arm_first", {0U}}, {"arm_producers", {0U, 2U}}, {"supervision", {1U, 3U}}};
   capture.table = table;
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  start_program_motion(kernel);
   EXPECT_FALSE(kernel.get_manual_program_handover(manual).ok());
   ASSERT_TRUE(
       kernel.stop_program_selection(program_selection_request("hold.first", "arm_first")).ok());
@@ -7098,6 +7167,7 @@ TEST(ResourceAddressedExecutionKernelTest, ManualAvailabilityDistinguishesSettle
   const auto parent = claim_program_execution(kernel);
   ASSERT_TRUE(parent.ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(kernel);
   ASSERT_TRUE(kernel
                   .UpdateCellAdmissionReadiness(
                       {true,
@@ -7162,6 +7232,7 @@ TEST(ResourceAddressedExecutionKernelTest, HeldManualAdmissionRetainsParentAndSt
     const auto parent = claim_program_execution(kernel);
     ASSERT_TRUE(parent.ok());
     ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+    start_program_motion(kernel);
     const CellAdmissionReadinessSnapshotDTO running{
         true,
         ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 2U,
@@ -7349,6 +7420,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   capture.table = table;
   capture.binding = binding;
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  start_program_motion(kernel);
   const CellAdmissionReadinessSnapshotDTO running{
       true,
       ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kRunning,
@@ -7504,6 +7576,7 @@ TEST(ResourceAddressedExecutionKernelTest,
         clock, scheduler, default_journal, std::move(config));
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+    start_program_motion(kernel);
     const auto first = kernel.execute(scoped_motion_operation("continuation.first"));
     ASSERT_TRUE(first.ok()) << first.error().message;
     ASSERT_TRUE(engine.prepared_snapshot && engine.prepared_snapshot->participant);
@@ -7605,6 +7678,7 @@ TEST(ResourceAddressedExecutionKernelTest,
         clock, scheduler, default_journal, std::move(config));
     ASSERT_TRUE(claim_program_execution(kernel).ok());
     ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+    start_program_motion(kernel);
     const auto operation = kernel.execute(scoped_motion_operation("capture.failure"));
     ASSERT_TRUE(operation.ok());
     engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
@@ -7791,6 +7865,8 @@ TEST(ResourceAddressedExecutionKernelTest, ReconciledProgramClaimCannotRetainAdm
   EXPECT_FALSE(kernel.register_program_run_capture(capture).ok());
   capture.claim_generation = successor.value().claim_generation;
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  start_program_motion(kernel, "all", "run.2", "program.successor",
+                       successor.value().claim_generation.value());
   // Whether retained or compacted, replaying old reconciliation cannot
   // reinstall its predecessor or discard the current successor capture.
   (void)kernel.ReconcileCellAdmissionClaims(reconcile);
@@ -7815,6 +7891,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       clock, scheduler, default_journal, std::move(config));
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(kernel);
   EXPECT_FALSE(kernel.execute(motion_operation("missing-origin")).ok());
   auto forged = scoped_motion_operation("unknown-origin");
   forged.participants.front().execution_scope->node_instance_id = ProgramNodeInstanceId("unknown");
@@ -7866,6 +7943,7 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramStopOvertakesResolvedButUnadmi
   owner = &kernel;
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(kernel);
   const auto late = kernel.execute(scoped_motion_operation("late-resolved-work"));
   ASSERT_FALSE(late.ok());
   EXPECT_EQ(late.error().details.at("reason"), "program_run_stop_fence_active");
@@ -8420,6 +8498,7 @@ TEST(ResourceAddressedExecutionKernelTest, HeldManualPreviewRechecksContextBetwe
   ASSERT_TRUE(claim_program_execution(kernel).ok());
   const auto capture = program_execution_capture();
   ASSERT_TRUE(kernel.register_program_run_capture(capture).ok());
+  start_program_motion(kernel);
   auto manual = motion_operation("manual.preview");
   manual.program_run_id = ProgramRunId("manual.run");
   EXPECT_FALSE(kernel.begin_motion_preview_session(manual).ok());
@@ -15552,6 +15631,35 @@ TEST(ResourceAddressedExecutionKernelTest,
       rejected.error().message.find("runtime participants do not share one current graph revision"),
       std::string::npos);
   EXPECT_EQ(kernel.resource_snapshot().size(), 1U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PhysicalProductReconfigurationInstallsStopDeadlineBeforeRouteReadiness) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.empty_runtime_retained_bundle_id = RetainedBundleId(test_digest('6'));
+  config.empty_runtime_graph_revision = GraphRevision(test_digest('7'));
+  config.prequalified_max_live_stop_participants = 1U;
+  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal, std::move(config));
+
+  const auto binding = select_candidate_product(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular));
+  const StopDeadlineBudgetDTO product_budget{3'000'000'000, 100'000'000, {}};
+  const auto installed = kernel.reconfigure_runtime_product(
+      {unqualified_registration(binding, engine)}, {}, product_budget);
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+
+  const auto stopped = kernel.full_stop(
+      FullStopIntentDTO{{RequestId("request.product-before-readiness.stop"),
+                         RequestOwnerEpoch("kernel.epoch.1"), "test", std::nullopt},
+                        StopGeneration(0U),
+                        {}});
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  EXPECT_EQ(stopped.value().fixed_outer_duration_ns, product_budget.outer_duration_ns);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

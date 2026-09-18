@@ -24,6 +24,7 @@ export interface CCLCController {
   transaction: CCLCTransactionStatus | null;
   pendingTransaction: { kind: 'lifecycle' | 'route'; id: string } | null;
   busy: boolean;
+  readUnavailableReason: string | null;
   error: string | null;
   setComponentId: (value: string) => void;
   refresh: () => Promise<void>;
@@ -79,6 +80,16 @@ export function lifecycleSupportsRouteSelection(
   state: CCLCComponentSnapshot['lifecycleState'],
 ): boolean {
   return state === 'prepared' || state === 'active';
+}
+
+export function cclcControlModeUnavailableReason(
+  mode: ExecutionIdentity['controlManagementMode'],
+): string | null {
+  if (mode === 'component_lifecycle') return null;
+  if (mode === 'direct') {
+    return 'This Deployment uses direct native control; component lifecycle and route selection do not apply.';
+  }
+  return 'Component lifecycle control is still attaching to the active Deployment.';
 }
 
 export function lifecycleRequestFromSnapshot(
@@ -156,22 +167,28 @@ export function useCCLC(
     kind: 'lifecycle' | 'route'; id: string;
   } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [readUnavailableReason, setReadUnavailableReason] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const setComponentId = useCallback((value: string) => {
     setComponentIdValue(value);
     setSnapshot(null);
     setRouteTemplates(null);
+    setReadUnavailableReason(null);
   }, []);
 
   const readCurrent = useCallback(async (signal?: AbortSignal) => {
     if (!enabled) throw new Error('CCLC client is unavailable');
     const identity = componentId.trim();
     if (!identity) throw new Error('Enter a component identity first');
-    const [owner, nextSnapshot, execution] = await Promise.all([
+    const execution = await api.execution.identity(signal);
+    const unavailableReason = cclcControlModeUnavailableReason(
+      execution.controlManagementMode,
+    );
+    if (unavailableReason !== null) throw new Error(unavailableReason);
+    const [owner, nextSnapshot] = await Promise.all([
       api.cclc.owner(signal),
       api.cclc.component(identity, signal),
-      api.execution.identity(signal),
     ]);
     const ownerEpoch = cclcRequestOwnerEpoch(owner, nextSnapshot, execution);
     let nextTemplates: CCLCRouteTemplateSet = {
@@ -192,6 +209,7 @@ export function useCCLC(
     }
     setSnapshot(nextSnapshot);
     setRouteTemplates(nextTemplates);
+    setReadUnavailableReason(null);
     return { snapshot: nextSnapshot, templates: nextTemplates, ownerEpoch };
   }, [componentId, enabled]);
 
@@ -201,7 +219,9 @@ export function useCCLC(
     try {
       await readCurrent();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'CCLC refresh failed');
+      setReadUnavailableReason(
+        reason instanceof Error ? reason.message : 'CCLC state is unavailable',
+      );
     } finally {
       setBusy(false);
     }
@@ -335,6 +355,7 @@ export function useCCLC(
     transaction,
     pendingTransaction,
     busy,
+    readUnavailableReason,
     error,
     setComponentId,
     refresh,

@@ -91,13 +91,11 @@ describe('Composer shell continuity', () => {
     expect(css).toContain('.workbench-inspector');
     expect(css).toContain('.central-inspector-slot');
     expect(source).toContain('Math.round(window.innerWidth * 0.45)');
-    expect(css).toMatch(/\.viewer-transport\s*\{[\s\S]*?flex-wrap: wrap;/);
+    expect(css).toMatch(/\.viewer-transport\s*\{[\s\S]*?display: grid;/);
     expect(css).toMatch(
-      /\.viewer-transport\s*\{[\s\S]*?width: min\(40rem, calc\(100% - 1\.2rem\)\);/,
+      /\.viewer-transport\s*\{[\s\S]*?width: min\(58rem, calc\(100% - 1\.2rem\)\);/,
     );
-    expect(css).not.toMatch(
-      /\.viewer-transport \.transport-velocity\s*\{\s*display: none;/,
-    );
+    expect(css).toMatch(/\.transport-control-layout\s*\{[\s\S]*?justify-content: space-between;/);
     expect(css).toContain('--inspector-control-height: 1.9rem');
     expect(css).toContain('.central-inspector-header > strong');
     expect(css).toContain("input:not([type='checkbox']):not([type='range'])");

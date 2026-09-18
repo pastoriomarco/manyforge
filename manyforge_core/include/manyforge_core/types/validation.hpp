@@ -1,21 +1,21 @@
 #pragma once
 
+#include <manyforge_core/types/cartesian_fidelity.hpp>
+#include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/geometry.hpp>
+#include <manyforge_core/types/robot_state.hpp>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
-
-#include <manyforge_core/types/error_code.hpp>
-#include <manyforge_core/types/geometry.hpp>
-#include <manyforge_core/types/robot_state.hpp>
 
 namespace manyforge::core {
 
 /// Validation options for trajectory validation (spec §3.8)
 struct ValidationOptionsDTO {
   double max_tcp_linear_speed_mps = 0.0;  // > 0: effective TCP speed limit to enforce (ADR-0015)
-  std::string tcp_frame;            // frame for TCP speed measurement
-  std::string base_frame;           // reference frame for TCP speed measurement
+  std::string tcp_frame;                  // frame for TCP speed measurement
+  std::string base_frame;                 // reference frame for TCP speed measurement
   // When false, validate_trajectory() must run non-collision validation only
   // (for example TCP-speed checks). Collision authority is then expected to
   // live in the normalized CollisionValidationCoordinator path.
@@ -29,10 +29,25 @@ struct ValidationOptionsDTO {
 /// trajectory segments were available to measure acceleration.  TCP speed is
 /// absent when no exact TCP/base-frame speed check was requested.
 struct TrajectoryValidationMetricsDTO final {
+  TrajectoryValidationMetricsDTO() = default;
+  TrajectoryValidationMetricsDTO(
+      double trajectory_duration_s_,
+      std::vector<double> peak_abs_joint_velocity_rad_s_,
+      std::vector<double> peak_abs_joint_acceleration_rad_s2_,
+      std::optional<double> peak_tcp_linear_speed_mps_,
+      std::optional<CartesianFidelityMetricsDTO> cartesian_fidelity_metrics_ = std::nullopt)
+      : trajectory_duration_s(trajectory_duration_s_),
+        peak_abs_joint_velocity_rad_s(std::move(peak_abs_joint_velocity_rad_s_)),
+        peak_abs_joint_acceleration_rad_s2(
+            std::move(peak_abs_joint_acceleration_rad_s2_)),
+        peak_tcp_linear_speed_mps(peak_tcp_linear_speed_mps_),
+        cartesian_fidelity_metrics(std::move(cartesian_fidelity_metrics_)) {}
+
   double trajectory_duration_s{};
   std::vector<double> peak_abs_joint_velocity_rad_s;
   std::vector<double> peak_abs_joint_acceleration_rad_s2;
   std::optional<double> peak_tcp_linear_speed_mps;
+  std::optional<CartesianFidelityMetricsDTO> cartesian_fidelity_metrics;
 
   friend bool operator==(const TrajectoryValidationMetricsDTO&,
                          const TrajectoryValidationMetricsDTO&) = default;
@@ -43,8 +58,7 @@ struct ValidationResultDTO {
   ValidationResultDTO() = default;
   ValidationResultDTO(
       bool valid_, std::optional<ErrorDTO> error_,
-      std::optional<TrajectoryValidationMetricsDTO> trajectory_metrics_ =
-          std::nullopt)
+      std::optional<TrajectoryValidationMetricsDTO> trajectory_metrics_ = std::nullopt)
       : valid(valid_),
         error(std::move(error_)),
         trajectory_metrics(std::move(trajectory_metrics_)) {}
@@ -64,12 +78,11 @@ struct CollisionCheckRequestDTO {
 /// Collision check result (spec §3.8)
 struct CollisionCheckResultDTO {
   CollisionCheckResultDTO() = default;
-  CollisionCheckResultDTO(
-      bool in_collision_,
-      std::optional<std::string> contact_body_a_ = std::nullopt,
-      std::optional<std::string> contact_body_b_ = std::nullopt,
-      std::optional<double> penetration_depth_m_ = std::nullopt,
-      std::optional<double> estimated_force_n_ = std::nullopt)
+  CollisionCheckResultDTO(bool in_collision_,
+                          std::optional<std::string> contact_body_a_ = std::nullopt,
+                          std::optional<std::string> contact_body_b_ = std::nullopt,
+                          std::optional<double> penetration_depth_m_ = std::nullopt,
+                          std::optional<double> estimated_force_n_ = std::nullopt)
       : in_collision(in_collision_),
         contact_body_a(std::move(contact_body_a_)),
         contact_body_b(std::move(contact_body_b_)),

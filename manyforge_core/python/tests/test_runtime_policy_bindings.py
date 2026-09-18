@@ -10,7 +10,7 @@ import pytest
 core = pytest.importorskip("manyforge_core_py")
 
 RUNTIME_POLICY_SCHEMA_REVISION = (
-    "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+    "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
 )
 
 
@@ -20,18 +20,6 @@ def _policy_document() -> str:
         "runtime_policy_id": "runtime.python",
         "description": "Python binding policy",
         "interrupt_policy_ids": ["fault.stop", "probe.trip"],
-        "motion_speed_limits": [
-            {
-                "scope_kind": "cell",
-                "maximum_tcp_linear_speed_mps": 0.5,
-            },
-            {
-                "scope_kind": "command_target",
-                "controllable_component_id": "robot_a",
-                "command_target_id": "arm",
-                "maximum_tcp_linear_speed_mps": 0.25,
-            },
-        ],
         "open_loop_grasp_acknowledgements": [
             {
                 "controllable_component_id": "robot_a",
@@ -88,13 +76,6 @@ def test_runtime_policy_resolves_to_exact_immutable_types():
         core.InterruptPolicyId("fault.stop"),
         core.InterruptPolicyId("probe.trip"),
     ]
-    assert isinstance(
-        qualified.value.motion_speed_limits[0].scope,
-        core.RuntimePolicyCellScopeDTO,
-    )
-    target_scope = qualified.value.motion_speed_limits[1].scope
-    assert isinstance(target_scope, core.RuntimePolicyCommandTargetScopeDTO)
-    assert target_scope.command_target_id == core.CommandTargetId("arm")
     acknowledgement = qualified.value.open_loop_grasp_acknowledgements[0]
     assert (
         acknowledgement.environment

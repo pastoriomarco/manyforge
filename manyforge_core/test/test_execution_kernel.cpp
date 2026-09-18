@@ -5851,7 +5851,6 @@ TEST_F(ExecutionKernelTest, CartesianResumeUsesFreshTcpAndCurrentCurveRemainingD
   request.cache_mode = CacheMode::kDisable;
   CartesianPathDTO source;
   source.waypoints = {make_pose(0, 0, 0), make_pose(0.4, 0, 0), make_pose(1, 0, 0)};
-  source.max_linear_speed_mps = 0.037;
   request.motion = source;
   request.binding.planner_capability_binding.capability_id =
       CapabilityId("planning.motion.cartesian_path");
@@ -5883,7 +5882,6 @@ TEST_F(ExecutionKernelTest, CartesianResumeUsesFreshTcpAndCurrentCurveRemainingD
     ASSERT_EQ(resumed->waypoints.size(), 2U);
     EXPECT_EQ(resumed->waypoints.front(), context.next_fk);
     EXPECT_EQ(resumed->waypoints.back(), source.waypoints.back());
-    EXPECT_DOUBLE_EQ(resumed->max_linear_speed_mps, source.max_linear_speed_mps);
     EXPECT_EQ(context.last_fk_request.robot_state.positions_rad,
               (std::vector<double>{position, position}));
   }

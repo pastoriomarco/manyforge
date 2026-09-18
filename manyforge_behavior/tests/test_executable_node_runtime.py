@@ -1038,7 +1038,7 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner(
     )
     index = json.loads(_MAINTAINED_PROGRAM_INDEX.read_text(encoding="utf-8"))
     sources = tuple(sorted({assignment["program_source"] for assignment in index["assignments"]}))
-    assert len(sources) == 11
+    assert len(sources) == 13
     environment = build_node_environment()
     exercised: set[str] = set()
 

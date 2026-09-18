@@ -486,6 +486,15 @@ RoboPlanTrajectoryValidator::validate_non_collision(
         "Trajectory must contain joints and at least one waypoint",
         "trajectory_empty");
   }
+  if (trajectory.cartesian_fidelity_metrics &&
+      (trajectory.cartesian_waypoint_times_s.empty() ||
+       !core::valid_cartesian_fidelity_metrics(
+           *trajectory.cartesian_fidelity_metrics))) {
+    return validation_error(
+        core::ErrorCode::kInvalidRequest,
+        "Cartesian candidate fidelity evidence is invalid",
+        "cartesian_fidelity_evidence_invalid");
+  }
   const bool canonical_joint_order =
       trajectory.joint_names == model_joint_names_;
   std::vector<std::size_t> trajectory_to_model;
@@ -813,7 +822,8 @@ RoboPlanTrajectoryValidator::validate_non_collision(
       std::move(peak_joint_velocity),
       joint_acceleration_measured ? std::move(peak_joint_acceleration)
                                   : std::vector<double>{},
-      peak_tcp_linear_speed_mps};
+      peak_tcp_linear_speed_mps,
+      trajectory.cartesian_fidelity_metrics};
   return core::ValidationResultDTO{true, std::nullopt, std::move(metrics)};
 }
 

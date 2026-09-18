@@ -563,10 +563,11 @@ densify_cartesian_path(const core::CartesianPathDTO &path,
       !finite_positive(path.max_rotation_step_rad) ||
       path.speed_mode != core::CartesianSpeedModeDTO::kBounded ||
       path.fallback_policy != core::CartesianFallbackPolicyDTO::kFailClosed ||
-      !finite_positive(path.max_linear_speed_mps) ||
       !finite_positive(path.max_angular_speed_rad_s) ||
       !finite_positive(path.max_linear_acceleration_mps2) ||
-      !finite_positive(path.max_angular_acceleration_rad_s2)) {
+      !finite_positive(path.max_angular_acceleration_rad_s2) ||
+      !std::isfinite(path.max_blend_deviation_rad) ||
+      path.max_blend_deviation_rad < 0.0) {
     return fail<DensifiedCartesianPath>(
         ErrorCode::kInvalidRequest,
         "Cartesian request shape, policy, steps, or limits are invalid",
@@ -766,9 +767,7 @@ prepare_candidate_time_law(
                                     frame.value().angular_speed_ratio);
     if (path) {
       const double linear_velocity =
-          std::min(path->max_linear_speed_mps,
-                   contract.speed_profile.max_tcp_linear_speed_mps.value_or(
-                       path->max_linear_speed_mps)) *
+          contract.speed_profile.max_tcp_linear_speed_mps.value_or(0.0) *
           contract.speed_profile.velocity_scale;
       const double angular_velocity =
           path->max_angular_speed_rad_s * contract.speed_profile.velocity_scale;
@@ -833,7 +832,8 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
                          const RoboPlanCandidateComputerConfig &config,
                          const RoboPlanCandidateControl &control,
                          core::TrajectoryRuntimeScaleBoundsDTO &scale_bounds,
-                         std::vector<double>& waypoint_times_s) {
+                         std::vector<double>& waypoint_times_s,
+                         core::CartesianFidelityMetricsDTO& fidelity_metrics) {
   if (!finite_positive(request.tolerances.translation_tol_m) ||
       !finite_positive(request.tolerances.rotation_tol_rad)) {
     return fail<roboplan::JointTrajectory>(
@@ -897,12 +897,14 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
   options.group_name = binding.compiled_group_name;
   options.dt = config.trajectory_sample_period_s;
   options.speed_mode = roboplan::CartesianSpeedMode::Bounded;
-  options.max_linear_speed = path.max_linear_speed_mps;
-  if (request.speed_profile.max_tcp_linear_speed_mps.has_value()) {
-    options.max_linear_speed =
-        std::min(options.max_linear_speed,
-                 *request.speed_profile.max_tcp_linear_speed_mps);
+  if (!request.speed_profile.max_tcp_linear_speed_mps.has_value()) {
+    return fail<roboplan::JointTrajectory>(
+        ErrorCode::kInvalidRequest,
+        "Cartesian planning requires the admitted TCP linear speed",
+        "cartesian_tcp_linear_speed_missing");
   }
+  options.max_linear_speed =
+      *request.speed_profile.max_tcp_linear_speed_mps;
   options.max_angular_speed = path.max_angular_speed_rad_s;
   options.max_linear_acceleration = path.max_linear_acceleration_mps2;
   options.max_angular_acceleration = path.max_angular_acceleration_rad_s2;
@@ -910,92 +912,109 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
   options.max_orientation_error = request.tolerances.rotation_tol_rad;
   options.velocity_scale = request.speed_profile.velocity_scale;
   options.acceleration_scale = request.speed_profile.acceleration_scale;
-  options.toppra_blend_deviation = 0.0;
 
-  if (auto error = control_error(control, "before_cartesian_tracking");
-      error.has_value()) {
-    return core::Result<roboplan::JointTrajectory>::Err(std::move(*error));
-  }
-  auto planned = [&] {
-    // RoboPlan's Cartesian tracker cannot parameterize a zero-length pose
-    // path. Reuse its ordinary stationary joint timing instead. This is only
-    // floating-point equality, not permission to omit small authored moves
-    // merely because they fit within the goal tolerance.
-    const bool stationary =
-        std::all_of(dense.value().poses.begin(), dense.value().poses.end(),
-                    [&](const auto &target) {
-                      return target.isApprox(actual_start, 1e-12);
-                    });
-    if (stationary) {
-      roboplan::PathParameterizerTOPPRA parameterizer(
-          scene, binding.compiled_group_name);
-      roboplan::TOPPRAOptions timing;
-      timing.dt = config.trajectory_sample_period_s;
-      timing.mode = roboplan::SplineFittingMode::Hermite;
-      timing.velocity_scale = options.velocity_scale;
-      timing.acceleration_scale = options.acceleration_scale;
-      timing.max_output_samples = config.maximum_trajectory_samples;
-      return parameterizer.generate(
-          roboplan::JointPath{binding.compiled_joint_names,
-                              {group_start, group_start}},
-          timing);
+  constexpr std::size_t kMaximumBlendAttempts = 5U;
+  std::array<double, kMaximumBlendAttempts> blend_attempts{};
+  blend_attempts.front() = path.max_blend_deviation_rad;
+  std::size_t blend_attempt_count = 1U;
+  if (path.max_blend_deviation_rad > 0.0) {
+    for (std::size_t index = 1U; index + 1U < kMaximumBlendAttempts; ++index) {
+      blend_attempts[index] = blend_attempts[index - 1U] * 0.5;
     }
-    roboplan::CartesianPathPlanner planner(scene, options);
-    const roboplan::CartesianPath native_path(
-        {core::compiled_frame_name(request.base_frame)},
-        {core::compiled_frame_name(request.tcp_frame)}, {dense.value().poses});
-    roboplan::JointConfiguration native_start;
-    native_start.positions = full_start;
-    return planner.plan(native_path, native_start);
-  }();
-  if (!planned.has_value()) {
-    if (auto error = control_error(control, "cartesian_tracking");
+    blend_attempts.back() = 0.0;
+    blend_attempt_count = kMaximumBlendAttempts;
+  }
+
+  for (std::size_t blend_attempt = 0U;
+       blend_attempt < blend_attempt_count; ++blend_attempt) {
+    options.toppra_blend_deviation = blend_attempts[blend_attempt];
+
+    if (auto error = control_error(control, "before_cartesian_tracking");
         error.has_value()) {
       return core::Result<roboplan::JointTrajectory>::Err(std::move(*error));
     }
-    return core::Result<roboplan::JointTrajectory>::Err(
-        map_cartesian_backend_failure(planned.error(), 0.0, 0U));
-  }
-  auto trajectory = std::move(planned.value());
-  const auto contract = cartesian_contract_input(binding, request, caps);
-  const auto contract_control = cartesian_control(control);
-  if (const auto error =
-          detail::validate_and_normalize_cartesian_trajectory_output(
-              trajectory, binding.compiled_joint_names, contract_control);
-      error.has_value()) {
-    return core::Result<roboplan::JointTrajectory>::Err(*error);
-  }
+    auto planned = [&] {
+      // RoboPlan's Cartesian tracker cannot parameterize a zero-length pose
+      // path. Reuse its ordinary stationary joint timing instead. This is only
+      // floating-point equality, not permission to omit small authored moves
+      // merely because they fit within the goal tolerance.
+      const bool stationary =
+          std::all_of(dense.value().poses.begin(), dense.value().poses.end(),
+                      [&](const auto &target) {
+                        return target.isApprox(actual_start, 1e-12);
+                      });
+      if (stationary) {
+        roboplan::PathParameterizerTOPPRA parameterizer(
+            scene, binding.compiled_group_name);
+        roboplan::TOPPRAOptions timing;
+        timing.dt = config.trajectory_sample_period_s;
+        timing.mode = roboplan::SplineFittingMode::Hermite;
+        timing.velocity_scale = options.velocity_scale;
+        timing.acceleration_scale = options.acceleration_scale;
+        timing.max_output_samples = config.maximum_trajectory_samples;
+        return parameterizer.generate(
+            roboplan::JointPath{binding.compiled_joint_names,
+                                {group_start, group_start}},
+            timing);
+      }
+      roboplan::CartesianPathPlanner planner(scene, options);
+      const roboplan::CartesianPath native_path(
+          {core::compiled_frame_name(request.base_frame)},
+          {core::compiled_frame_name(request.tcp_frame)},
+          {dense.value().poses});
+      roboplan::JointConfiguration native_start;
+      native_start.positions = full_start;
+      return planner.plan(native_path, native_start);
+    }();
+    if (!planned.has_value()) {
+      if (auto error = control_error(control, "cartesian_tracking");
+          error.has_value()) {
+        return core::Result<roboplan::JointTrajectory>::Err(std::move(*error));
+      }
+      return core::Result<roboplan::JointTrajectory>::Err(
+          map_cartesian_backend_failure(planned.error(), 0.0, 0U));
+    }
+    auto trajectory = std::move(planned.value());
+    const auto contract = cartesian_contract_input(binding, request, caps);
+    const auto contract_control = cartesian_control(control);
+    if (const auto error =
+            detail::validate_and_normalize_cartesian_trajectory_output(
+                trajectory, binding.compiled_joint_names, contract_control);
+        error.has_value()) {
+      return core::Result<roboplan::JointTrajectory>::Err(*error);
+    }
 
-  auto interpolant = detail::sample_cartesian_interpolant_path(
-      contract, scene, trajectory, request.tolerances.translation_tol_m,
-      request.tolerances.rotation_tol_rad, contract_control);
-  if (!interpolant.ok()) {
-    return core::Result<roboplan::JointTrajectory>::Err(interpolant.error());
-  }
-  const double certified_translation =
-      request.tolerances.translation_tol_m -
-      interpolant.value().unsampled_translation_bound_m;
-  const double certified_rotation =
-      request.tolerances.rotation_tol_rad -
-      interpolant.value().unsampled_rotation_bound_rad;
-  if (!finite_positive(certified_translation) ||
-      !finite_positive(certified_rotation)) {
-    return fail<roboplan::JointTrajectory>(
-        ErrorCode::kCartesianIncomplete,
-        "Cartesian continuous-path fidelity margin cannot be represented",
-        "cartesian_resource_budget_exceeded",
-        {{"failure_stage", "cartesian_output_validation"},
-         {"resource", "interpolant_fidelity_margin"}});
-  }
-  auto fidelity = verify_cartesian_path_fidelity_controlled(
-      dense.value().poses, interpolant.value().poses, certified_translation,
-      certified_rotation, contract_control,
-      dense.value().source_waypoint_dense_indices);
-  if (!fidelity.ok()) {
-    return core::Result<roboplan::JointTrajectory>::Err(fidelity.error());
-  }
-  if (!fidelity.value().complete) {
-    std::map<std::string, std::string> details{
+    auto interpolant = detail::sample_cartesian_interpolant_path(
+        contract, scene, trajectory, request.tolerances.translation_tol_m,
+        request.tolerances.rotation_tol_rad, contract_control);
+    if (!interpolant.ok()) {
+      return core::Result<roboplan::JointTrajectory>::Err(interpolant.error());
+    }
+    const double certified_translation =
+        request.tolerances.translation_tol_m -
+        interpolant.value().unsampled_translation_bound_m;
+    const double certified_rotation =
+        request.tolerances.rotation_tol_rad -
+        interpolant.value().unsampled_rotation_bound_rad;
+    if (!finite_positive(certified_translation) ||
+        !finite_positive(certified_rotation)) {
+      return fail<roboplan::JointTrajectory>(
+          ErrorCode::kCartesianIncomplete,
+          "Cartesian continuous-path fidelity margin cannot be represented",
+          "cartesian_resource_budget_exceeded",
+          {{"failure_stage", "cartesian_output_validation"},
+           {"resource", "interpolant_fidelity_margin"}});
+    }
+    auto fidelity = verify_cartesian_path_fidelity_controlled(
+        dense.value().poses, interpolant.value().poses, certified_translation,
+        certified_rotation, contract_control,
+        dense.value().source_waypoint_dense_indices);
+    if (!fidelity.ok()) {
+      return core::Result<roboplan::JointTrajectory>::Err(fidelity.error());
+    }
+    if (!fidelity.value().complete) {
+      if (blend_attempt + 1U < blend_attempt_count) continue;
+      std::map<std::string, std::string> details{
         {"reason", "cartesian_path_tolerance_exceeded"},
         {"failure_stage", "cartesian_output_validation"},
         {"fraction_completed",
@@ -1003,53 +1022,75 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
         {"max_translation_error_m",
          std::to_string(fidelity.value().max_translation_error_m)},
         {"max_rotation_error_rad",
-         std::to_string(fidelity.value().max_rotation_error_rad)}};
-    if (fidelity.value().first_failing_path_sample_index.has_value()) {
-      details["first_failing_path_sample_index"] =
-          std::to_string(*fidelity.value().first_failing_path_sample_index);
+         std::to_string(fidelity.value().max_rotation_error_rad)},
+        {"requested_max_blend_deviation_rad",
+         std::to_string(path.max_blend_deviation_rad)},
+        {"planning_attempt_count", std::to_string(blend_attempt + 1U)}};
+      if (fidelity.value().first_failing_path_sample_index.has_value()) {
+        details["first_failing_path_sample_index"] =
+            std::to_string(*fidelity.value().first_failing_path_sample_index);
+      }
+      return core::Result<roboplan::JointTrajectory>::Err(
+          make_error(ErrorCode::kCartesianIncomplete,
+                     "Cartesian trajectory deviated from the requested path",
+                     "cartesian_path_tolerance_exceeded", std::move(details)));
     }
-    return core::Result<roboplan::JointTrajectory>::Err(
-        make_error(ErrorCode::kCartesianIncomplete,
-                   "Cartesian trajectory deviated from the requested path",
-                   "cartesian_path_tolerance_exceeded", std::move(details)));
-  }
 
-  const auto &matches = fidelity.value().waypoint_actual_sample_indices;
-  if (matches.size() != path.waypoints.size() ||
-      interpolant.value().times_s.size() != interpolant.value().poses.size())
-    return fail<roboplan::JointTrajectory>(
-        ErrorCode::kCartesianIncomplete,
-        "Cartesian source waypoint correspondence is incomplete",
-        "cartesian_waypoint_correspondence_invalid");
-  waypoint_times_s.clear();
-  waypoint_times_s.reserve(matches.size());
-  for (std::size_t i = 0; i < matches.size(); ++i) {
-    if (matches[i] >= interpolant.value().poses.size())
+    const auto &matches = fidelity.value().waypoint_actual_sample_indices;
+    if (matches.size() != path.waypoints.size() ||
+        interpolant.value().times_s.size() != interpolant.value().poses.size())
       return fail<roboplan::JointTrajectory>(
           ErrorCode::kCartesianIncomplete,
-          "Cartesian source waypoint has no reached trajectory sample",
+          "Cartesian source waypoint correspondence is incomplete",
           "cartesian_waypoint_correspondence_invalid");
-    const auto &actual = interpolant.value().poses[matches[i]];
-    const auto &requested =
-        dense.value().poses[dense.value().source_waypoint_dense_indices[i]];
-    if ((actual.block<3, 1>(0, 3) - requested.block<3, 1>(0, 3)).norm() >
-            request.tolerances.translation_tol_m ||
-        rotation_distance(actual.block<3, 3>(0, 0),
-                          requested.block<3, 3>(0, 0)) >
-            request.tolerances.rotation_tol_rad)
-      return fail<roboplan::JointTrajectory>(
-          ErrorCode::kCartesianIncomplete,
-          "Cartesian waypoint milestone is outside its pose tolerance",
-          "cartesian_waypoint_correspondence_invalid");
-    waypoint_times_s.push_back(interpolant.value().times_s[matches[i]]);
+    waypoint_times_s.clear();
+    waypoint_times_s.reserve(matches.size());
+    for (std::size_t i = 0; i < matches.size(); ++i) {
+      if (matches[i] >= interpolant.value().poses.size())
+        return fail<roboplan::JointTrajectory>(
+            ErrorCode::kCartesianIncomplete,
+            "Cartesian source waypoint has no reached trajectory sample",
+            "cartesian_waypoint_correspondence_invalid");
+      const auto &actual = interpolant.value().poses[matches[i]];
+      const auto &requested =
+          dense.value().poses[dense.value().source_waypoint_dense_indices[i]];
+      if ((actual.block<3, 1>(0, 3) - requested.block<3, 1>(0, 3)).norm() >
+              request.tolerances.translation_tol_m ||
+          rotation_distance(actual.block<3, 3>(0, 0),
+                            requested.block<3, 3>(0, 0)) >
+              request.tolerances.rotation_tol_rad)
+        return fail<roboplan::JointTrajectory>(
+            ErrorCode::kCartesianIncomplete,
+            "Cartesian waypoint milestone is outside its pose tolerance",
+            "cartesian_waypoint_correspondence_invalid");
+      waypoint_times_s.push_back(interpolant.value().times_s[matches[i]]);
+    }
+    auto prepared = prepare_candidate_time_law(
+        contract, &path, scene, trajectory, model_velocity_limits->second,
+        model_acceleration_limits->second, contract_control, &waypoint_times_s);
+    if (!prepared.ok())
+      return core::Result<roboplan::JointTrajectory>::Err(prepared.error());
+    scale_bounds = prepared.value();
+    fidelity_metrics = core::CartesianFidelityMetricsDTO{
+        request.tolerances.translation_tol_m,
+        request.tolerances.rotation_tol_rad,
+        fidelity.value().max_translation_error_m,
+        fidelity.value().max_rotation_error_rad,
+        interpolant.value().unsampled_translation_bound_m,
+        interpolant.value().unsampled_rotation_bound_rad,
+        fidelity.value().max_translation_error_m +
+            interpolant.value().unsampled_translation_bound_m,
+        fidelity.value().max_rotation_error_rad +
+            interpolant.value().unsampled_rotation_bound_rad,
+        path.max_blend_deviation_rad,
+        options.toppra_blend_deviation,
+        static_cast<std::uint32_t>(blend_attempt + 1U)};
+    return core::Result<roboplan::JointTrajectory>::Ok(std::move(trajectory));
   }
-  auto prepared = prepare_candidate_time_law(
-      contract, &path, scene, trajectory, model_velocity_limits->second,
-      model_acceleration_limits->second, contract_control, &waypoint_times_s);
-  if (!prepared.ok())
-    return core::Result<roboplan::JointTrajectory>::Err(prepared.error());
-  scale_bounds = prepared.value();
-  return core::Result<roboplan::JointTrajectory>::Ok(std::move(trajectory));
+  return fail<roboplan::JointTrajectory>(
+      ErrorCode::kCartesianIncomplete,
+      "Cartesian blend search exhausted without a candidate",
+      "cartesian_blend_search_exhausted");
 }
 
 [[nodiscard]] core::Result<roboplan::JointTrajectory> time_joint_candidate(
@@ -1260,9 +1301,10 @@ RoboPlanCandidateComputer::compute(const RoboPlanCandidateRequestDTO &request,
             std::get_if<core::CartesianPathDTO>(&request.motion)) {
       core::TrajectoryRuntimeScaleBoundsDTO scale_bounds;
       std::vector<double> waypoint_times_s;
+      core::CartesianFidelityMetricsDTO fidelity_metrics;
       auto trajectory = plan_cartesian_candidate(
           planning_scene, binding_, request, *cartesian, caps.value(), config_,
-          control, scale_bounds, waypoint_times_s);
+          control, scale_bounds, waypoint_times_s, fidelity_metrics);
       if (!trajectory.ok()) {
         return core::Result<core::TrajectoryDTO>::Err(trajectory.error());
       }
@@ -1272,6 +1314,8 @@ RoboPlanCandidateComputer::compute(const RoboPlanCandidateRequestDTO &request,
       if (portable.ok())
         portable.value().cartesian_waypoint_times_s =
             std::move(waypoint_times_s);
+      if (portable.ok())
+        portable.value().cartesian_fidelity_metrics = fidelity_metrics;
       return portable;
     }
 

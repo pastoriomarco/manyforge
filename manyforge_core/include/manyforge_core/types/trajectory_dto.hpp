@@ -1,5 +1,6 @@
 #pragma once
 
+#include <manyforge_core/types/cartesian_fidelity.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
@@ -9,10 +10,10 @@ namespace manyforge::core {
 
 /// A single waypoint in a trajectory (spec §3.5)
 struct TrajectoryWaypointDTO {
-  double time_from_start_s;           // >= 0, strictly monotonically increasing
-  std::vector<double> positions_rad;  // joint positions
+  double time_from_start_s;                  // >= 0, strictly monotonically increasing
+  std::vector<double> positions_rad;         // joint positions
   std::vector<double> velocities_rad_s;      // optional; if absent, assumed zero at endpoints
-  std::vector<double> accelerations_rad_s2; // optional
+  std::vector<double> accelerations_rad_s2;  // optional
 };
 
 /// Immutable, candidate-derived time-law preparation for this exact curve.
@@ -41,6 +42,9 @@ struct TrajectoryDTO {
   /// Producer-proved source Cartesian waypoint milestones on this exact curve.
   /// Ordinal matches the prepared Cartesian request; no post-Stop path guessing.
   std::vector<double> cartesian_waypoint_times_s{};
+  /// Producer-measured evidence for this exact Cartesian candidate. Generic
+  /// validation republishes it only after accepting the same trajectory.
+  std::optional<CartesianFidelityMetricsDTO> cartesian_fidelity_metrics{};
 
   bool empty() const { return waypoints.empty(); }
 };

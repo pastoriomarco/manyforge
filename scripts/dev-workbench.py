@@ -262,8 +262,10 @@ def _ensure_deployment_compiler() -> tuple[Path, tuple[tuple[str, Path], ...]]:
         )
         for family_id, directory in (
             ("lite6_lite_gripper", "lite6_lite_gripper_structural"),
+            ("uf850_xarm_gripper", "uf850_xarm_gripper_structural"),
             ("ur10e_robotiq_2f_140", "ur10e_robotiq_2f_140_structural"),
             ("ur5_roboplan", "ur5_roboplan_structural"),
+            ("ur5e_robotiq_2f_85", "ur5e_robotiq_2f_85_structural"),
         )
     )
     for family_id, root in prepared:

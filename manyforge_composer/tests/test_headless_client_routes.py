@@ -557,6 +557,8 @@ def headless_client() -> (
             payload = _program_run_status(state="stopping")
         elif path == "/api/program/runs/program-run.1/motion-stop":
             payload = _program_run_status(state="running")
+        elif path == "/api/program/runs/program-run.1/motion-start":
+            payload = _program_run_status(state="running")
         elif path == "/api/program/runs/program-run.1/full-stop":
             payload = _program_run_status(state="full_stopping")
         elif path == "/api/program/runs/program-run.1/resume-full-stop":
@@ -1399,6 +1401,16 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
                 "reason": "ordinary operator motion Stop",
             },
         )
+        motion_started = composer.post(
+            "/api/program/runs/program-run.1/motion-start",
+            json={
+                **stop,
+                "request_id": "request.program.motion-start.1",
+                "expected_run_revision": 1,
+                "expected_selection_revision": 0,
+                "reason": "initial operator motion Run",
+            },
+        )
         full_stopped = composer.post(
             "/api/program/runs/program-run.1/full-stop",
             json={
@@ -1443,6 +1455,7 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
     assert started.status_code == 200
     assert read.json()["capture"]["program_run_id"] == "program-run.1"
     assert motion_stopped.json()["state"] == "running"
+    assert motion_started.json()["state"] == "running"
     assert full_stopped.json()["state"] == "full_stopping"
     assert resumed.json()["state"] == "running"
     assert reset.json()["idle_cycle_generation"] == 5
@@ -1457,6 +1470,7 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
         "GET",
         "POST",
         "GET",
+        "POST",
         "POST",
         "POST",
         "POST",

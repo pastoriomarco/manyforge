@@ -213,11 +213,11 @@ void mix_motion(IntentIdentityBuilder& identity, const ResolvedMotionSpecDTO& mo
           identity.mix(value.max_translation_step_m)
               .mix(value.max_rotation_step_rad)
               .mix(static_cast<std::int64_t>(value.speed_mode))
-              .mix(value.max_linear_speed_mps)
               .mix(value.max_angular_speed_rad_s)
               .mix(value.max_linear_acceleration_mps2)
               .mix(value.max_angular_acceleration_rad_s2)
-              .mix(static_cast<std::int64_t>(value.fallback_policy));
+              .mix(static_cast<std::int64_t>(value.fallback_policy))
+              .mix(value.max_blend_deviation_rad);
         }
       },
       motion);

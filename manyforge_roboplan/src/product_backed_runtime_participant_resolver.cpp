@@ -276,13 +276,11 @@ ProductBackedRuntimeParticipantResolver::ResolveOperationTarget(
     const core::ProgramBindingId &program_binding_id,
     const core::TargetRoleId &target_role_id) const {
   try {
-    const auto binding = bindings_.get_verified(
-        program_binding_id, *retained_bundle_, retained_model_map_);
+    const auto binding = LoadProgramBinding(program_binding_id);
     if (!binding)
       throw std::invalid_argument("no exact retained Program Binding");
-    const auto program = programs_.get_verified(
-        binding->value().program_id, binding->value().program_revision,
-        *retained_bundle_);
+    const auto program = LoadProgram(binding->value().program_id,
+                                     binding->value().program_revision);
     if (!program ||
         program->value().node_environment != binding->value().node_environment)
       throw std::invalid_argument("no exact canonical Program");
@@ -406,8 +404,20 @@ ProductBackedRuntimeParticipantResolver::
         std::shared_ptr<const deployment::RetainedBundle> retained_bundle,
         deployment::VerifiedRetainedModelMap retained_model_map,
         std::vector<core::RuntimeParticipantBinding> physical_bindings,
-        std::vector<core::ProgramBindingId> intrinsic_direct_bindings)
+        std::vector<core::ProgramBindingId> intrinsic_direct_bindings,
+        std::filesystem::path program_artifact_root)
     : programs_(package_root), bindings_(std::move(package_root)),
+      artifact_programs_(
+          program_artifact_root.empty()
+              ? nullptr
+              : std::make_unique<deployment::FilesystemVerifiedProgramSource>(
+                    program_artifact_root)),
+      artifact_bindings_(
+          program_artifact_root.empty()
+              ? nullptr
+              : std::make_unique<
+                    deployment::FilesystemVerifiedProgramBindingSource>(
+                    std::move(program_artifact_root))),
       retained_bundle_(std::move(retained_bundle)),
       retained_model_map_(std::move(retained_model_map)),
       physical_bindings_(std::move(physical_bindings)),
@@ -469,6 +479,33 @@ ProductBackedRuntimeParticipantResolver::
   for (const auto &[semantic, physical] : canonical.aliases) {
     collision_body_aliases_.push_back({semantic, physical});
   }
+}
+
+std::shared_ptr<const deployment::ProgramBinding>
+ProductBackedRuntimeParticipantResolver::LoadProgramBinding(
+    const core::ProgramBindingId &program_binding_id) const {
+  if (artifact_bindings_) {
+    auto binding = artifact_bindings_->get_verified(
+        program_binding_id, *retained_bundle_, retained_model_map_);
+    if (binding)
+      return binding;
+  }
+  return bindings_.get_verified(program_binding_id, *retained_bundle_,
+                                retained_model_map_);
+}
+
+std::shared_ptr<const deployment::ProgramBindingContract>
+ProductBackedRuntimeParticipantResolver::LoadProgram(
+    const core::ProgramId &program_id,
+    const core::ProgramRevision &program_revision) const {
+  if (artifact_programs_) {
+    auto program = artifact_programs_->get_verified(
+        program_id, program_revision, *retained_bundle_);
+    if (program)
+      return program;
+  }
+  return programs_.get_verified(program_id, program_revision,
+                                *retained_bundle_);
 }
 
 bool ProductBackedRuntimeParticipantResolver::FrameObservationCovered(
@@ -548,37 +585,42 @@ ProductBackedRuntimeParticipantResolver::ResolveObservationTarget(
     }
     const bool frame_query = capability_id.value() == "model.kinematics.fk";
     auto selection = observation_selection_.load();
-    if (!selection || selection->target.program_binding_id() != program_binding_id ||
+    if (!selection ||
+        selection->target.program_binding_id() != program_binding_id ||
         selection->target.target_role().target_role_id != target_role_id ||
         selection->target.capability().capability_id != capability_id) {
-      auto binding = selection && selection->binding->program_binding_id() == program_binding_id
+      auto binding = selection && selection->binding->program_binding_id() ==
+                                      program_binding_id
                          ? selection->binding
                          : nullptr;
       if (!binding) {
-        binding =
-            bindings_.get_verified(program_binding_id, *retained_bundle_, retained_model_map_);
+        binding = LoadProgramBinding(program_binding_id);
         if (!binding) {
           throw std::invalid_argument("no exact retained Program Binding");
         }
-        const auto program = programs_.get_verified(
-            binding->value().program_id, binding->value().program_revision, *retained_bundle_);
-        if (!program || program->value().node_environment != binding->value().node_environment) {
+        const auto program = LoadProgram(binding->value().program_id,
+                                         binding->value().program_revision);
+        if (!program || program->value().node_environment !=
+                            binding->value().node_environment) {
           throw std::invalid_argument("no exact canonical Program");
         }
       }
       auto target = deployment::resolve_runtime_program_target(
-          *binding, target_role_id, capability_id, *retained_bundle_, retained_model_map_);
+          *binding, target_role_id, capability_id, *retained_bundle_,
+          retained_model_map_);
       auto state_target =
-          frame_query ? std::optional{deployment::resolve_runtime_program_target(
-                            *binding, target_role_id, core::CapabilityId("state.observed.current"),
-                            *retained_bundle_, retained_model_map_)}
-                      : std::nullopt;
+          frame_query
+              ? std::optional{deployment::resolve_runtime_program_target(
+                    *binding, target_role_id,
+                    core::CapabilityId("state.observed.current"),
+                    *retained_bundle_, retained_model_map_)}
+              : std::nullopt;
       selection = std::make_shared<const ObservationSelection>(
           std::move(binding), std::move(target), std::move(state_target));
       observation_selection_.store(selection);
     }
-    const auto& target = selection->target;
-    const auto& read_target =
+    const auto &target = selection->target;
+    const auto &read_target =
         selection->frame_state_target ? *selection->frame_state_target : target;
     if (!read_target.control_binding())
       throw std::invalid_argument("observation has no exact ControlBinding");
@@ -666,8 +708,7 @@ ProductBackedRuntimeParticipantResolver::ResolveProgramCapture(
           "Program capture must name the active product and carry no table",
           "program_capture_product_mismatch", core::ErrorCode::kInvalidRequest);
     }
-    const auto binding = bindings_.get_verified(
-        capture.program_binding_id, *retained_bundle_, retained_model_map_);
+    const auto binding = LoadProgramBinding(capture.program_binding_id);
     if (binding == nullptr ||
         binding->value().program_id != capture.program_id ||
         binding->value().program_revision != capture.program_revision) {
@@ -676,8 +717,8 @@ ProductBackedRuntimeParticipantResolver::ResolveProgramCapture(
           "program_capture_binding_unavailable",
           core::ErrorCode::kMissingReference);
     }
-    const auto program = programs_.get_verified(
-        capture.program_id, capture.program_revision, *retained_bundle_);
+    const auto program =
+        LoadProgram(capture.program_id, capture.program_revision);
     if (program == nullptr || program->value().node_environment !=
                                   binding->value().node_environment) {
       return Reject<core::ProgramRunExecutionCaptureDTO>(
@@ -731,8 +772,7 @@ ProductBackedRuntimeParticipantResolver::Resolve(
           *precomposed, collision_body_aliases_);
     }
 
-    const auto binding = bindings_.get_verified(
-        operation.program_binding_id, *retained_bundle_, retained_model_map_);
+    const auto binding = LoadProgramBinding(operation.program_binding_id);
     if (binding == nullptr ||
         binding->value().program_id != operation.program_id ||
         binding->value().program_revision != operation.program_revision) {
@@ -742,8 +782,8 @@ ProductBackedRuntimeParticipantResolver::Resolve(
           "runtime_program_binding_unavailable",
           core::ErrorCode::kMissingReference);
     }
-    const auto program = programs_.get_verified(
-        operation.program_id, operation.program_revision, *retained_bundle_);
+    const auto program =
+        LoadProgram(operation.program_id, operation.program_revision);
     if (program == nullptr || program->value().node_environment !=
                                   binding->value().node_environment) {
       return Reject<core::RuntimeParticipantBinding>(

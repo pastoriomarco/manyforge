@@ -292,6 +292,8 @@ describe('Program parameter binding continuity', () => {
         parameter('velocity_scale', 'number'),
         parameter('acceleration_scale', 'number'),
         parameter('max_tcp_linear_speed_mps', 'number'),
+        parameter('translation_tol_m', 'number'),
+        parameter('max_blend_deviation_rad', 'number'),
       ],
     };
     const program = {
@@ -309,6 +311,8 @@ describe('Program parameter binding continuity', () => {
         { ...declaration, parameter_id: 'cycle_velocity', default: 0.35 },
         { ...declaration, parameter_id: 'cycle_acceleration', default: 0.7 },
         { ...declaration, parameter_id: 'cycle_tcp_cap', default: 0.12 },
+        { ...declaration, parameter_id: 'path_tolerance', default: 0.005 },
+        { ...declaration, parameter_id: 'path_blend', default: 0.01 },
       ],
       schema_version: 'manyforge.composer_authoring_forest.v1',
       forest: [tree({
@@ -325,6 +329,14 @@ describe('Program parameter binding continuity', () => {
             kind: 'program_parameter',
             reference: 'cycle_tcp_cap',
           },
+          translation_tol_m: {
+            kind: 'program_parameter',
+            reference: 'path_tolerance',
+          },
+          max_blend_deviation_rad: {
+            kind: 'program_parameter',
+            reference: 'path_blend',
+          },
         },
       })],
       positions: {},
@@ -337,21 +349,29 @@ describe('Program parameter binding continuity', () => {
           velocity_scale: 'cycle_velocity',
           acceleration_scale: 'cycle_acceleration',
           max_tcp_linear_speed_mps: 'cycle_tcp_cap',
+          translation_tol_m: 'path_tolerance',
+          max_blend_deviation_rad: 'path_blend',
         },
         values: {
           velocity_scale: 0.35,
           acceleration_scale: 0.7,
           max_tcp_linear_speed_mps: 0.12,
+          translation_tol_m: 0.005,
+          max_blend_deviation_rad: 0.01,
         },
         usageCounts: {
           velocity_scale: 1,
           acceleration_scale: 1,
           max_tcp_linear_speed_mps: 1,
+          translation_tol_m: 1,
+          max_blend_deviation_rad: 1,
         },
         applicableCounts: {
           velocity_scale: 1,
           acceleration_scale: 1,
           max_tcp_linear_speed_mps: 1,
+          translation_tol_m: 1,
+          max_blend_deviation_rad: 1,
         },
       },
     });
@@ -364,6 +384,8 @@ describe('Program parameter binding continuity', () => {
         parameter('velocity_scale', 'number'),
         parameter('acceleration_scale', 'number'),
         parameter('max_tcp_linear_speed_mps', 'number'),
+        parameter('translation_tol_m', 'number'),
+        parameter('max_blend_deviation_rad', 'number'),
       ],
     };
     const program = {
@@ -391,5 +413,57 @@ describe('Program parameter binding continuity', () => {
       available: false,
       reason: 'No acceleration_scale field is bound to a Program parameter.',
     });
+  });
+
+  it('retains a declared Cartesian default when this Program has no Cartesian node', () => {
+    const motionEntry: CatalogEntry = {
+      ...entry,
+      parameters: [
+        parameter('velocity_scale', 'number'),
+        parameter('acceleration_scale', 'number'),
+        parameter('max_tcp_linear_speed_mps', 'number'),
+        parameter('translation_tol_m', 'number'),
+      ],
+    };
+    const fields = {
+      velocity_scale: 0.35,
+      acceleration_scale: 0.7,
+      max_tcp_linear_speed_mps: 0.12,
+      translation_tol_m: 0.005,
+    };
+    const program = {
+      api_version: 'manyforge.program.v2',
+      program_id: 'joint_only_motion',
+      program_profile: 'composable-cell-v1',
+      name: 'Joint-only motion',
+      catalog: {
+        api_version: 'manyforge.node_catalog.v2',
+        content_version: '2.3.0',
+      },
+      component_roles: {},
+      target_roles: {},
+      parameters: [
+        ...Object.entries(fields).map(([parameter_id, defaultValue]) => ({
+          ...declaration, parameter_id, default: defaultValue,
+        })),
+        { ...declaration, parameter_id: 'max_blend_deviation_rad', default: 0.01 },
+      ],
+      schema_version: 'manyforge.composer_authoring_forest.v1',
+      forest: [tree({
+        value_sources: Object.fromEntries(Object.keys(fields).map((field) => [field, {
+          kind: 'program_parameter' as const,
+          reference: field,
+        }])),
+      })],
+      positions: {},
+    } satisfies ProgramAuthoringDocument;
+
+    const result = deriveProgramMotionConfiguration(program, [motionEntry]);
+    expect(result.available).toBe(true);
+    if (!result.available) return;
+    expect(result.configuration.bindings.max_blend_deviation_rad)
+      .toBe('max_blend_deviation_rad');
+    expect(result.configuration.values.max_blend_deviation_rad).toBe(0.01);
+    expect(result.configuration.applicableCounts.max_blend_deviation_rad).toBe(0);
   });
 });

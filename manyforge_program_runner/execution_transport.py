@@ -107,12 +107,14 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
         try:
             return self.require_success(response)
         except HeadlessApiError as error:
-            if command.get(
-                "command"
-            ) == "release_program_selection" and error.details.get("reason") in {
+            if command.get("command") in {
+                "start_program_selection",
+                "release_program_selection",
+            } and error.details.get("reason") in {
                 "program_selection_stale",
                 "program_selection_unknown",
                 "program_selection_revision_stale",
+                "program_selection_not_ready",
                 "program_selection_not_releasable",
                 "program_selection_recovery_required",
                 "program_children_unsettled",
@@ -190,6 +192,19 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "command": "release_program_selection",
+                "attribution": self._request_attribution(None),
+                "request": dict(body),
+                "expected_selection_revision": expected_selection_revision,
+            }
+        )
+
+    def start_program_selection(
+        self, body: Mapping[str, Any], expected_selection_revision: int
+    ) -> dict[str, Any]:
+        return self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "start_program_selection",
                 "attribution": self._request_attribution(None),
                 "request": dict(body),
                 "expected_selection_revision": expected_selection_revision,

@@ -2488,22 +2488,16 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(motion_registration->runtime_policy.has_value());
   EXPECT_EQ(motion_registration->runtime_policy->value().policy,
             runtime_policy->value());
-  EXPECT_DOUBLE_EQ(motion_registration->runtime_policy->value()
-                       .effective_maximum_tcp_linear_speed_mps,
-                   0.15);
+  ASSERT_TRUE(
+      motion_registration->deployment_maximum_tcp_linear_speed_mps.has_value());
+  EXPECT_DOUBLE_EQ(
+      *motion_registration->deployment_maximum_tcp_linear_speed_mps, 0.15);
   EXPECT_EQ(motion_registration->runtime_policy->value().source_artifact,
             runtime_policy->reference());
   ASSERT_TRUE(
       motion_registration->runtime_policy->value().ordinary_motion_jerk);
   EXPECT_EQ(*motion_registration->runtime_policy->value().ordinary_motion_jerk,
             jerk_profile);
-  ASSERT_TRUE(std::holds_alternative<core::RuntimePolicyCommandTargetScopeDTO>(
-      motion_registration->runtime_policy->value()
-          .selected_motion_speed_limit.scope));
-  EXPECT_DOUBLE_EQ(
-      motion_registration->runtime_policy->value()
-          .selected_motion_speed_limit.maximum_tcp_linear_speed_mps,
-      0.15);
   ASSERT_NE(runtime->motion_state_channel, nullptr);
   ASSERT_NE(runtime->gripper_state_channel, nullptr);
   const auto initial_motion_state =
@@ -4549,6 +4543,8 @@ TEST(
       projection->ProjectionHealth().healthy_for_target(candidate_revision));
   EXPECT_EQ(projection->collision_shared_model(), candidate_shared_model);
   EXPECT_NE(projection->snapshot(), predecessor_world);
+  EXPECT_NE(projection->snapshot()->publisher_id,
+            predecessor_world->publisher_id);
   const auto candidate_lease = projection->RetainProjection(
       candidate_revision,
       core::ProjectionLeaseId("command-fenced-candidate-lease"));

@@ -192,8 +192,7 @@ struct RetainedNativeRuntimeInput final {
   /// owner shape.
   std::vector<core::RuntimeParticipantBinding>
       control_binding_representatives{};
-  /// Independent Deployment-authored cap for this exact motion target.  It
-  /// tightens, but never relabels or weakens, the immutable runtime policy.
+  /// Sole Deployment-authored TCP-speed maximum for this exact motion target.
   std::optional<double> deployment_maximum_tcp_linear_speed_mps{};
   /// Retained manual-motion ceilings for the exact motion binding above.
   core::PerJointDynamicsLimitsDTO direct_control_joint_limits{};
@@ -262,9 +261,8 @@ struct RetainedNativeRuntime final
   RetainedMotionBackendRouteRebinder rebind_motion_route;
   RetainedGripperBackendRouteRebinder rebind_gripper_route;
   std::optional<RetainedGripperPositionLimits> gripper_position_limits;
-  /// Exact Deployment-selected runtime policy sealed against this motion
-  /// target. Retained for focused observability; it is immutable and does not
-  /// grant a second policy owner.
+  /// Exact Deployment-selected non-speed runtime policy sealed against this
+  /// motion target. It carries interrupt/acknowledgement/jerk semantics only.
   std::optional<core::RuntimeParticipantPolicySelection> motion_runtime_policy;
   std::optional<double> deployment_maximum_tcp_linear_speed_mps;
   core::PerJointDynamicsLimitsDTO direct_control_joint_limits;

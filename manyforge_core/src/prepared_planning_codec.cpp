@@ -97,6 +97,52 @@ std::vector<double> get_numbers(const CanonicalValue& value) {
   for (const auto& row : value.as_array()) result.push_back(number(row));
   return result;
 }
+
+[[nodiscard]] CanonicalValue cartesian_fidelity_value(const CartesianFidelityMetricsDTO& value) {
+  if (!valid_cartesian_fidelity_metrics(value)) fail("trajectory_cartesian_fidelity_invalid");
+  return CanonicalValue(CanonicalValue::Object{
+      {"accepted_max_blend_deviation_rad", CanonicalValue(value.accepted_max_blend_deviation_rad)},
+      {"certified_max_rotation_error_rad", CanonicalValue(value.certified_max_rotation_error_rad)},
+      {"certified_max_translation_error_m",
+       CanonicalValue(value.certified_max_translation_error_m)},
+      {"measured_max_rotation_error_rad", CanonicalValue(value.measured_max_rotation_error_rad)},
+      {"measured_max_translation_error_m", CanonicalValue(value.measured_max_translation_error_m)},
+      {"planning_attempt_count", CanonicalValue(static_cast<double>(value.planning_attempt_count))},
+      {"requested_max_blend_deviation_rad",
+       CanonicalValue(value.requested_max_blend_deviation_rad)},
+      {"requested_rotation_tolerance_rad", CanonicalValue(value.requested_rotation_tolerance_rad)},
+      {"requested_translation_tolerance_m",
+       CanonicalValue(value.requested_translation_tolerance_m)},
+      {"unsampled_rotation_bound_rad", CanonicalValue(value.unsampled_rotation_bound_rad)},
+      {"unsampled_translation_bound_m", CanonicalValue(value.unsampled_translation_bound_m)},
+  });
+}
+
+[[nodiscard]] CartesianFidelityMetricsDTO get_cartesian_fidelity(const CanonicalValue& value) {
+  exact(value, {"accepted_max_blend_deviation_rad", "certified_max_rotation_error_rad",
+                "certified_max_translation_error_m", "measured_max_rotation_error_rad",
+                "measured_max_translation_error_m", "planning_attempt_count",
+                "requested_max_blend_deviation_rad", "requested_rotation_tolerance_rad",
+                "requested_translation_tolerance_m", "unsampled_rotation_bound_rad",
+                "unsampled_translation_bound_m"});
+  const double attempts = number(member(value, "planning_attempt_count"));
+  CartesianFidelityMetricsDTO result{number(member(value, "requested_translation_tolerance_m")),
+                                     number(member(value, "requested_rotation_tolerance_rad")),
+                                     number(member(value, "measured_max_translation_error_m")),
+                                     number(member(value, "measured_max_rotation_error_rad")),
+                                     number(member(value, "unsampled_translation_bound_m")),
+                                     number(member(value, "unsampled_rotation_bound_rad")),
+                                     number(member(value, "certified_max_translation_error_m")),
+                                     number(member(value, "certified_max_rotation_error_rad")),
+                                     number(member(value, "requested_max_blend_deviation_rad")),
+                                     number(member(value, "accepted_max_blend_deviation_rad")),
+                                     static_cast<std::uint32_t>(attempts)};
+  if (attempts != static_cast<double>(result.planning_attempt_count) ||
+      !valid_cartesian_fidelity_metrics(result))
+    fail("trajectory_cartesian_fidelity_invalid");
+  return result;
+}
+
 void validate_trajectory(const TrajectoryDTO& value) {
   const auto width = value.resources.size();
   if (width == 0U || width > kMaxCoordinates || value.joint_names.size() != width ||
@@ -134,13 +180,16 @@ void validate_trajectory(const TrajectoryDTO& value) {
        !std::all_of(milestones.begin(), milestones.end(),
                     [](double time) { return std::isfinite(time) && time >= 0.0; })))
     fail("trajectory_cartesian_milestones_invalid");
+  if (value.cartesian_fidelity_metrics &&
+      (milestones.empty() || !valid_cartesian_fidelity_metrics(*value.cartesian_fidelity_metrics)))
+    fail("trajectory_cartesian_fidelity_invalid");
   if (value.runtime_scale_bounds) {
     const auto& bounds = *value.runtime_scale_bounds;
     if (!std::isfinite(bounds.max_rate_per_s) || bounds.max_rate_per_s <= 0.0 ||
         !std::isfinite(bounds.max_rate_change_per_s2) || bounds.max_rate_change_per_s2 <= 0.0 ||
         !std::isfinite(bounds.max_stop_path_rate) || bounds.max_stop_path_rate < 1.0 ||
-        (bounds.nominal_time_multiplier &&
-         (!std::isfinite(*bounds.nominal_time_multiplier) || *bounds.nominal_time_multiplier < 1.0)) ||
+        (bounds.nominal_time_multiplier && (!std::isfinite(*bounds.nominal_time_multiplier) ||
+                                            *bounds.nominal_time_multiplier < 1.0)) ||
         value.waypoints.front().time_from_start_s != 0.0) {
       fail("trajectory_runtime_scale_bounds_invalid");
     }
@@ -180,6 +229,9 @@ CanonicalValue trajectory_value(const TrajectoryDTO& value) {
                                 {"waypoints", CanonicalValue(std::move(waypoints))}};
   if (!value.cartesian_waypoint_times_s.empty())
     result.emplace_back("cartesian_waypoint_times_s", numbers(value.cartesian_waypoint_times_s));
+  if (value.cartesian_fidelity_metrics)
+    result.emplace_back("cartesian_fidelity_metrics",
+                        cartesian_fidelity_value(*value.cartesian_fidelity_metrics));
   if (value.runtime_scale_bounds) {
     CanonicalValue::Object bounds{
         {"max_rate_per_s", CanonicalValue(value.runtime_scale_bounds->max_rate_per_s)},
@@ -198,7 +250,17 @@ CanonicalValue trajectory_value(const TrajectoryDTO& value) {
 TrajectoryDTO get_trajectory(const CanonicalValue& value) {
   const auto* scale = value.find_object_member("runtime_scale_bounds");
   const auto* milestones = value.find_object_member("cartesian_waypoint_times_s");
-  if (scale)
+  const auto* fidelity = value.find_object_member("cartesian_fidelity_metrics");
+  if (fidelity)
+    exact(value,
+          scale ? std::initializer_list<std::string_view>{"resources", "joint_names", "waypoints",
+                                                          "runtime_scale_bounds",
+                                                          "cartesian_waypoint_times_s",
+                                                          "cartesian_fidelity_metrics"}
+                : std::initializer_list<std::string_view>{"resources", "joint_names", "waypoints",
+                                                          "cartesian_waypoint_times_s",
+                                                          "cartesian_fidelity_metrics"});
+  else if (scale)
     exact(value, milestones
                      ? std::initializer_list<std::string_view>{"resources", "joint_names",
                                                                "waypoints", "runtime_scale_bounds",
@@ -242,8 +304,8 @@ TrajectoryDTO get_trajectory(const CanonicalValue& value) {
     const auto* stop_rate = scale->find_object_member("max_stop_path_rate");
     const auto* multiplier = scale->find_object_member("nominal_time_multiplier");
     const auto& fields = object(*scale);
-    if (fields.size() != 2U + static_cast<std::size_t>(stop_rate != nullptr)
-                              + static_cast<std::size_t>(multiplier != nullptr))
+    if (fields.size() != 2U + static_cast<std::size_t>(stop_rate != nullptr) +
+                             static_cast<std::size_t>(multiplier != nullptr))
       fail("unknown_or_missing_member");
     result.runtime_scale_bounds = TrajectoryRuntimeScaleBoundsDTO{
         number(member(*scale, "max_rate_per_s")), number(member(*scale, "max_rate_change_per_s2")),
@@ -254,6 +316,7 @@ TrajectoryDTO get_trajectory(const CanonicalValue& value) {
     result.cartesian_waypoint_times_s = get_numbers(*milestones);
     if (result.cartesian_waypoint_times_s.empty()) fail("trajectory_cartesian_milestones_invalid");
   }
+  if (fidelity) result.cartesian_fidelity_metrics = get_cartesian_fidelity(*fidelity);
   validate_trajectory(result);
   return result;
 }
@@ -584,11 +647,11 @@ CanonicalValue motion_value(const ResolvedMotionSpecDTO& m) {
                    {"max_translation_step_m", CanonicalValue(x.max_translation_step_m)},
                    {"max_rotation_step_rad", CanonicalValue(x.max_rotation_step_rad)},
                    {"speed_mode", CanonicalValue("bounded")},
-                   {"max_linear_speed_mps", CanonicalValue(x.max_linear_speed_mps)},
                    {"max_angular_speed_rad_s", CanonicalValue(x.max_angular_speed_rad_s)},
                    {"max_linear_acceleration_mps2", CanonicalValue(x.max_linear_acceleration_mps2)},
                    {"max_angular_acceleration_rad_s2",
                     CanonicalValue(x.max_angular_acceleration_rad_s2)},
+                   {"max_blend_deviation_rad", CanonicalValue(x.max_blend_deviation_rad)},
                    {"fallback_policy",
                     CanonicalValue(x.fallback_policy == CartesianFallbackPolicyDTO::kFailClosed
                                        ? "fail_closed"
@@ -608,26 +671,33 @@ ResolvedMotionSpecDTO get_motion(const CanonicalValue& v) {
   }
   if (const auto* x = v.find_object_member("pose_goal")) return PoseGoalDTO{get_pose(*x)};
   if (const auto* x = v.find_object_member("cartesian_path")) {
-    exact(*x, {"waypoints", "max_translation_step_m", "max_rotation_step_rad", "speed_mode",
-               "max_linear_speed_mps", "max_angular_speed_rad_s", "max_linear_acceleration_mps2",
-               "max_angular_acceleration_rad_s2", "fallback_policy"});
+    const auto* blend = x->find_object_member("max_blend_deviation_rad");
+    if (blend)
+      exact(*x, {"waypoints", "max_translation_step_m", "max_rotation_step_rad", "speed_mode",
+                 "max_angular_speed_rad_s", "max_linear_acceleration_mps2",
+                 "max_angular_acceleration_rad_s2", "fallback_policy", "max_blend_deviation_rad"});
+    else
+      exact(*x, {"waypoints", "max_translation_step_m", "max_rotation_step_rad", "speed_mode",
+                 "max_angular_speed_rad_s", "max_linear_acceleration_mps2",
+                 "max_angular_acceleration_rad_s2", "fallback_policy"});
     if (text(member(*x, "speed_mode")) != "bounded") fail("cartesian_speed_mode_invalid");
     std::vector<Pose3DTO> w;
     for (const auto& p : member(*x, "waypoints").as_array()) w.push_back(get_pose(p));
     const auto fp = text(member(*x, "fallback_policy"));
     if (fp != "fail_closed" && fp != "allow_joint_space_fallback")
       fail("cartesian_fallback_invalid");
-    return CartesianPathDTO{std::move(w),
+    CartesianPathDTO result{std::move(w),
                             number(member(*x, "max_translation_step_m")),
                             number(member(*x, "max_rotation_step_rad")),
                             CartesianSpeedModeDTO::kBounded,
-                            number(member(*x, "max_linear_speed_mps")),
                             number(member(*x, "max_angular_speed_rad_s")),
                             number(member(*x, "max_linear_acceleration_mps2")),
                             number(member(*x, "max_angular_acceleration_rad_s2")),
                             fp == "fail_closed"
                                 ? CartesianFallbackPolicyDTO::kFailClosed
                                 : CartesianFallbackPolicyDTO::kAllowJointSpaceFallback};
+    if (blend) result.max_blend_deviation_rad = number(*blend);
+    return result;
   }
   fail("motion_tag_invalid");
 }

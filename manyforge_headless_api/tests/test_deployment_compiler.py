@@ -10,10 +10,39 @@ import pytest
 from manyforge_headless_api.deployment_compiler import (
     DeploymentCandidateCompiler,
 )
-from manyforge_headless_api.native import HeadlessApiError
+from manyforge_headless_api.native import HeadlessApiConfig, HeadlessApiError
 
 
 _DIGEST = "sha256:" + "1" * 64
+
+
+def test_headless_config_accepts_every_available_prepared_model_family(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path.resolve()
+    prepared_roots = tuple(
+        (family_id, root / family_id)
+        for family_id in ("lite6", "uf850", "ur10e", "ur5", "ur5e")
+    )
+
+    config = HeadlessApiConfig(
+        projection_root=root / "projection",
+        install_root=root / "install",
+        artifact_root=root / "artifacts",
+        program_selection_state_root=root / "program-selection",
+        node_catalog_path=root / "node-catalog.yaml",
+        node_environment_manifest_path=root / "node-environment.yaml",
+        alarm_catalog_path=root / "alarm-catalog.yaml",
+        historian_database_path=root / "history.sqlite3",
+        manager_run_root=root / "manager-run",
+        execution_run_root=root / "execution-run",
+        cell_id="cell_a",
+        deployment_compiler_path=root / "compiler",
+        deployment_compiler_workspace_root=root / "workspace",
+        deployment_compiler_prepared_roots=prepared_roots,
+    )
+
+    assert config.deployment_compiler_prepared_roots == prepared_roots
 
 
 def _compiler(tmp_path: Path) -> DeploymentCandidateCompiler:

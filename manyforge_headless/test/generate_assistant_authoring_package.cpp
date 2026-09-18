@@ -48,6 +48,25 @@ void WriteBundleId(const std::filesystem::path &path,
   }
 }
 
+void WriteDeploymentSource(
+    const std::filesystem::path &package_root,
+    const deployment::RevisionVerifiedDeploymentArtifact &deployment) {
+  const auto path =
+      package_root /
+      (deployment.deployment_artifact_id().value() + ".deployment.json");
+  std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+  if (!stream) {
+    throw std::runtime_error(
+        "cannot create assistant fixture Deployment source");
+  }
+  stream << deployment::canonical_json(deployment.normalized_authored_root());
+  stream.flush();
+  if (!stream) {
+    throw std::runtime_error(
+        "cannot write assistant fixture Deployment source");
+  }
+}
+
 [[nodiscard]] std::string
 ProgramBytes(const deployment::RetainedBundle &bundle,
              const std::string_view name = "Program Apply fixture") {
@@ -211,9 +230,13 @@ int main(int argc, char **argv) {
   try {
     const auto arguments = ParseArguments(argc, argv);
     std::filesystem::create_directories(arguments.package_root);
+    auto source = manyforge::deployment::test::
+        make_lite6_composer_assistant_retention_fixture();
+    WriteDeploymentSource(arguments.package_root,
+                          source.qualified.deployment());
     const auto fixture = manyforge::deployment::test::
-        materialize_lite6_composer_assistant_retained_consumer_fixture(
-            arguments.package_root);
+        materialize_lite6_retained_consumer_fixture_from(arguments.package_root,
+                                                         std::move(source));
     PublishProgramScenario(arguments.package_root, fixture.bundle);
     WriteBundleId(arguments.bundle_id_output,
                   fixture.bundle->retained_bundle_id().value());

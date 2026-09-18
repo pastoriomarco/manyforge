@@ -46,6 +46,14 @@ _FIELDS = {
     "body",
     "example",
 }
+_PROGRAM_MOTION_DEFAULTS = frozenset(
+    {
+        "velocity_scale",
+        "acceleration_scale",
+        "translation_tol_m",
+        "max_blend_deviation_rad",
+    }
+)
 
 
 class SkillValidationError(ValueError):
@@ -404,6 +412,11 @@ class SkillCatalog:
         trace: list[dict[str, Any]] = []
         budget = [MAX_EXPANDED_NODES]
         rendered_items, rendered_bytes = 8192, MAX_EXPANDED_BYTES
+        program_motion_defaults = _PROGRAM_MOTION_DEFAULTS & {
+            declaration.get("parameter_id")
+            for declaration in host.get("parameters", [])
+            if type(declaration) is dict
+        }
 
         def copy_value(value: Any, substitutions: dict | None = None) -> Any:
             nonlocal rendered_items, rendered_bytes
@@ -512,6 +525,24 @@ class SkillCatalog:
                     )
                     created.extend(trace[-1]["instance_ids"])
                     return expanded
+                entry = self._catalog.get(node["node_id"])
+                applicable_defaults = program_motion_defaults & {
+                    parameter.id for parameter in entry.parameters
+                }
+                sources = node.setdefault("value_sources", {})
+                for parameter_id in sorted(
+                    applicable_defaults - set(node["parameters"]) - set(sources)
+                ):
+                    sources[parameter_id] = {
+                        "kind": "program_parameter",
+                        "reference": parameter_id,
+                    }
+                if sources:
+                    node["value_sources"] = {
+                        key: sources[key] for key in sorted(sources)
+                    }
+                else:
+                    node.pop("value_sources", None)
                 node["instance_id"] = copy_value(instance)
                 node["children"] = [expand_node(child) for child in template["children"]]
                 created.append(instance)

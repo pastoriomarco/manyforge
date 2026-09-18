@@ -396,24 +396,6 @@ def build_runtime_policy(
             "runtime_policy_id": "manyforge.runtime_motion.ur5e_lite6_wall",
             "description": "Maintained native motion policy for ur5e_lite6_wall",
             "interrupt_policy_ids": [],
-            "motion_speed_limits": [
-                {
-                    "scope_kind": "cell",
-                    "maximum_tcp_linear_speed_mps": 0.5,
-                },
-                {
-                    "scope_kind": "command_target",
-                    "controllable_component_id": "lite6_robot",
-                    "command_target_id": "arm",
-                    "maximum_tcp_linear_speed_mps": 0.15,
-                },
-                {
-                    "scope_kind": "command_target",
-                    "controllable_component_id": "ur5e_robot",
-                    "command_target_id": "arm",
-                    "maximum_tcp_linear_speed_mps": 0.25,
-                },
-            ],
             "open_loop_grasp_acknowledgements": [],
         },
         domain="catalog-record-revision/runtime_policy",
@@ -455,6 +437,14 @@ def motion_node(
             "acceleration_scale": {
                 "kind": "program_parameter",
                 "reference": "acceleration_scale",
+            },
+            "max_tcp_linear_speed_mps": {
+                "kind": "program_parameter",
+                "reference": "max_tcp_linear_speed_mps",
+            },
+            "translation_tol_m": {
+                "kind": "program_parameter",
+                "reference": "translation_tol_m",
             },
             "velocity_scale": {
                 "kind": "program_parameter",
@@ -539,6 +529,30 @@ def build_program(root: Path, *, grouped: bool) -> dict[str, Any]:
                 "constraints": {"min_exclusive": 0.0, "max_inclusive": 1.0},
                 "runtime_mutability": "before_run",
                 "description": "Acceleration scale shared by the two planned motions.",
+            },
+            {
+                "parameter_id": "max_blend_deviation_rad",
+                "type": "float64",
+                "default": 0.01,
+                "constraints": {"min_inclusive": 0.0},
+                "runtime_mutability": "before_run",
+                "description": "Default maximum Cartesian blend deviation.",
+            },
+            {
+                "parameter_id": "max_tcp_linear_speed_mps",
+                "type": "float64",
+                "default": 0.15,
+                "constraints": {"min_exclusive": 0.0},
+                "runtime_mutability": "before_run",
+                "description": "Maximum TCP linear speed shared by the two robots.",
+            },
+            {
+                "parameter_id": "translation_tol_m",
+                "type": "float64",
+                "default": 0.005,
+                "constraints": {"min_exclusive": 0.0},
+                "runtime_mutability": "before_run",
+                "description": "Default Cartesian translation tolerance.",
             },
             {
                 "parameter_id": "velocity_scale",

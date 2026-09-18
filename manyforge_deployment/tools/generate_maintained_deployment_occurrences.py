@@ -1717,35 +1717,6 @@ def ros2_control_runtime_profile() -> dict[str, Any]:
 def deployment_runtime_policy(
     deployment: dict[str, Any], *, ros2_control: bool
 ) -> dict[str, Any]:
-    speed_inputs = [
-        row
-        for row in deployment["policy_restoration_inputs"]
-        if row["kind"] == "target_tcp_linear_speed_limit"
-    ]
-    if len(speed_inputs) != 1:
-        raise GenerationError(
-            f"deployment {deployment['deployment_source']} must retain one exact "
-            "target TCP speed limit"
-        )
-    source = speed_inputs[0]
-    target_role_id = source["target_role_id"]
-    target_ids = {
-        assignment["target_roles"][target_role_id]["command_target_id"]
-        for assignment in deployment["program_role_assignments"]
-    }
-    component_ids = {
-        assignment["component_roles"][
-            assignment["target_roles"][target_role_id]["component_role"]
-        ]
-        for assignment in deployment["program_role_assignments"]
-    }
-    if target_ids != {"arm"} or component_ids != {
-        deployment["component_occurrence_id"]
-    }:
-        raise GenerationError(
-            f"deployment {deployment['deployment_source']} has an ambiguous "
-            "target TCP speed-limit scope"
-        )
     policy_id = "manyforge.runtime_motion." + deployment["deployment_artifact_id"]
     value = {
         "api_version": "manyforge.runtime_policy.v1",
@@ -1757,18 +1728,6 @@ def deployment_runtime_policy(
             + deployment["deployment_artifact_id"]
         ),
         "interrupt_policy_ids": [],
-        "motion_speed_limits": [
-            {
-                "scope_kind": "cell",
-                "maximum_tcp_linear_speed_mps": 0.5,
-            },
-            {
-                "scope_kind": "command_target",
-                "controllable_component_id": deployment["component_occurrence_id"],
-                "command_target_id": "arm",
-                "maximum_tcp_linear_speed_mps": source["maximum_speed_mps"],
-            },
-        ],
         "open_loop_grasp_acknowledgements": [],
     }
     return revisioned_document(

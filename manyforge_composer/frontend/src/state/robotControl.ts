@@ -1,5 +1,7 @@
 import type {
   CapabilityCommandPreviewReceipt,
+  DirectControlGripperStatus,
+  DirectControlMotionStatus,
   DirectControlMotionSpec,
   DirectControlOperationIntent,
   DirectControlPreviewReceipt,
@@ -8,6 +10,8 @@ import type {
   MotionPreviewReceipt,
   OperationObservation,
   OperationStateName,
+  ObservedGripperTarget,
+  ObservedMotionTarget,
   Pose3Value,
 } from '../types/robotControl';
 import { cartesianMoveOffsetsFromTarget, computeCartesianMoveDraft, DEFAULT_MOVE_TO_OPTIONS } from '../utils/moveTo';
@@ -61,10 +65,18 @@ export interface ManualMotionSettings {
   tcpAngularSpeedRadS: number;
   tcpLinearAccelerationMps2: number;
   tcpAngularAccelerationRadS2: number;
+  cartesianTranslationToleranceM: number;
+  cartesianRotationToleranceRad: number;
+  cartesianMaxBlendDeviationRad: number;
   jointLimits: Record<string, {
     max_velocity_rad_s?: number | null;
     max_acceleration_rad_s2?: number | null;
   }>;
+}
+
+export interface ManualCartesianDefaults {
+  translationToleranceM: number;
+  maxBlendDeviationRad: number;
 }
 
 const DEFAULT_MANUAL_MOTION_SETTINGS: ManualMotionSettings = {
@@ -74,11 +86,18 @@ const DEFAULT_MANUAL_MOTION_SETTINGS: ManualMotionSettings = {
   tcpAngularSpeedRadS: 0.5,
   tcpLinearAccelerationMps2: 0.5,
   tcpAngularAccelerationRadS2: 2.5,
+  cartesianTranslationToleranceM: 0.005,
+  cartesianRotationToleranceRad: 0.05,
+  cartesianMaxBlendDeviationRad: 0.01,
   jointLimits: {},
 };
 
 export interface RobotControlState {
   status: ExecutionOwnerStatus | null;
+  /** Stable addressed identities selected by this browser only. */
+  selectedComponentId: string | null;
+  selectedMotionTargetId: string | null;
+  selectedGripperTargetId: string | null;
   phase: RobotControlPhase;
   mode: RobotControlMode;
   moveToKind: 'pose' | 'joint';
@@ -100,8 +119,11 @@ export interface RobotControlState {
 
 export type RobotControlAction =
   | { type: 'load' }
-  | { type: 'status_resolved'; status: ExecutionOwnerStatus }
-  | { type: 'status_refreshed'; status: ExecutionOwnerStatus }
+  | { type: 'status_resolved'; status: ExecutionOwnerStatus; cartesianDefaults?: ManualCartesianDefaults | null }
+  | { type: 'status_refreshed'; status: ExecutionOwnerStatus; cartesianDefaults?: ManualCartesianDefaults | null }
+  | { type: 'program_cartesian_defaults_changed'; defaults: ManualCartesianDefaults }
+  | { type: 'select_robot'; componentId: string; motionTargetId: string }
+  | { type: 'select_tool'; gripperTargetId: string }
   | { type: 'manual_scope_changed' }
   | { type: 'load_failed'; error: string }
   | { type: 'program_activity_changed' }
@@ -138,6 +160,9 @@ export type RobotControlAction =
 
 export const initialRobotControlState: RobotControlState = {
   status: null,
+  selectedComponentId: null,
+  selectedMotionTargetId: null,
+  selectedGripperTargetId: null,
   phase: 'loading',
   mode: 'joint',
   moveToKind: 'pose',
@@ -156,6 +181,125 @@ export const initialRobotControlState: RobotControlState = {
   previewIssue: null,
   error: null,
 };
+
+/**
+ * Manual control targets are an owner projection, not a second browser-side
+ * model.  The singular fields are retained as the compatibility fallback for
+ * older owners; a multi-target owner publishes the complete arrays.
+ */
+export function motionTargetsForStatus(
+  status: ExecutionOwnerStatus,
+): DirectControlMotionStatus[] {
+  return status.directControlTargets !== undefined
+    && status.directControlTargets.length > 0
+    ? status.directControlTargets
+    : [status.directControl];
+}
+
+export function gripperTargetsForStatus(
+  status: ExecutionOwnerStatus,
+): DirectControlGripperStatus[] {
+  return status.directControlGripperTargets !== undefined
+    ? status.directControlGripperTargets
+    : [status.directControlGripper];
+}
+
+export interface RobotTargetSelection {
+  componentId: string | null;
+  motionTargetId: string | null;
+  gripperTargetId: string | null;
+}
+
+function selectedStateFields(selection: RobotTargetSelection): Pick<
+  RobotControlState,
+  'selectedComponentId' | 'selectedMotionTargetId' | 'selectedGripperTargetId'
+> {
+  return {
+    selectedComponentId: selection.componentId,
+    selectedMotionTargetId: selection.motionTargetId,
+    selectedGripperTargetId: selection.gripperTargetId,
+  };
+}
+
+export function reconcileRobotTargetSelection(
+  status: ExecutionOwnerStatus,
+  selection: RobotTargetSelection,
+): RobotTargetSelection {
+  const motions = motionTargetsForStatus(status);
+  const selectedComponentMotions = selection.componentId === null
+    ? []
+    : motions.filter((target) => (
+      target.controllableComponentId === selection.componentId
+    ));
+  const selectedMotion = motions.find((target) => (
+    target.controllableComponentId === selection.componentId
+    && target.commandTargetId === selection.motionTargetId
+  )) ?? selectedComponentMotions[0] ?? motions.find((target) => (
+    target.controllableComponentId === status.directControl.controllableComponentId
+    && target.commandTargetId === status.directControl.commandTargetId
+  )) ?? motions[0];
+  if (selectedMotion === undefined) {
+    return { componentId: null, motionTargetId: null, gripperTargetId: null };
+  }
+  const tools = gripperTargetsForStatus(status).filter((target) => (
+    target.controllableComponentId === selectedMotion.controllableComponentId
+  ));
+  const selectedTool = tools.find((target) => (
+    target.commandTargetId === selection.gripperTargetId
+  )) ?? tools[0];
+  return {
+    componentId: selectedMotion.controllableComponentId,
+    motionTargetId: selectedMotion.commandTargetId,
+    gripperTargetId: selectedTool?.commandTargetId ?? null,
+  };
+}
+
+function observedMotionForSelection(
+  status: ExecutionOwnerStatus,
+  motion: DirectControlMotionStatus,
+): ObservedMotionTarget {
+  return status.observedMotions?.find((observed) => (
+    observed.controllableComponentId === motion.controllableComponentId
+    && observed.commandTargetId === motion.commandTargetId
+  )) ?? status.observedMotion;
+}
+
+function observedGripperForSelection(
+  status: ExecutionOwnerStatus,
+  gripper: DirectControlGripperStatus,
+): ObservedGripperTarget | null {
+  return status.observedGrippers?.find((observed) => (
+    observed.controllableComponentId === gripper.controllableComponentId
+    && observed.commandTargetId === gripper.commandTargetId
+  )) ?? status.observedGripper;
+}
+
+/** Return the current owner snapshot projected onto one selected robot/tool. */
+export function selectedStatusForState(
+  state: Pick<RobotControlState, 'status' | 'selectedComponentId' | 'selectedMotionTargetId' | 'selectedGripperTargetId'>,
+): ExecutionOwnerStatus | null {
+  if (state.status === null) return null;
+  const selection = reconcileRobotTargetSelection(state.status, {
+    componentId: state.selectedComponentId,
+    motionTargetId: state.selectedMotionTargetId,
+    gripperTargetId: state.selectedGripperTargetId,
+  });
+  const motion = motionTargetsForStatus(state.status).find((target) => (
+    target.controllableComponentId === selection.componentId
+    && target.commandTargetId === selection.motionTargetId
+  )) ?? state.status.directControl;
+  const gripper = gripperTargetsForStatus(state.status).find((target) => (
+    target.controllableComponentId === selection.componentId
+    && target.commandTargetId === selection.gripperTargetId
+  )) ?? state.status.directControlGripper;
+  return {
+    ...state.status,
+    directControl: motion,
+    directControlGripper: gripper,
+    observedMotion: observedMotionForSelection(state.status, motion),
+    observedGripper: observedGripperForSelection(state.status, gripper),
+  };
+}
 
 function copyPose(pose: Pose3Value): Pose3Value {
   return {
@@ -189,8 +333,12 @@ export function robotControlCandidatePresentationAllowed(
   state: RobotControlState,
   manualControlAllowed: boolean,
 ): boolean {
+  const cleanCompletedResult = state.operation !== null
+    && !state.operation.resident
+    && state.operation.state === 'completed'
+    && state.operation.terminalError === null;
   return manualControlAllowed
-    && state.operation === null
+    && (state.operation === null || cleanCompletedResult)
     && !robotControlHasActiveOperation(state);
 }
 
@@ -225,11 +373,12 @@ function positionsAreValid(
 }
 
 function motionSettingsAreValid(status: ExecutionOwnerStatus, settings: ManualMotionSettings): boolean {
-  const { jointLimits, ...values } = settings;
+  const { jointLimits, cartesianMaxBlendDeviationRad, ...positiveValues } = settings;
   const descriptor = status.directControl.targetDescriptor;
-  return Object.values(values).every((value) => Number.isFinite(value) && value > 0)
+  return Object.values(positiveValues).every((value) => Number.isFinite(value) && value > 0)
+    && Number.isFinite(cartesianMaxBlendDeviationRad) && cartesianMaxBlendDeviationRad >= 0
     && settings.velocityScale <= 1 && settings.accelerationScale <= 1
-    && settings.tcpLinearSpeedMps <= (descriptor.operationalLimit?.effectiveMaximumTcpLinearSpeedMps ?? Infinity)
+    && settings.tcpLinearSpeedMps <= (descriptor.operationalLimit?.maximumTcpLinearSpeedMps ?? Infinity)
     && Object.entries(jointLimits).every(([name, limit]) => {
       const joint = descriptor.joints.find((entry) => entry.sourceJointName === name);
       if (joint === undefined) return false;
@@ -242,11 +391,18 @@ function motionSettingsAreValid(status: ExecutionOwnerStatus, settings: ManualMo
     });
 }
 
-function initialMotionSettings(status: ExecutionOwnerStatus): ManualMotionSettings {
+function initialMotionSettings(
+  status: ExecutionOwnerStatus,
+  cartesianDefaults: ManualCartesianDefaults | null = null,
+): ManualMotionSettings {
   return {
     ...DEFAULT_MANUAL_MOTION_SETTINGS,
+    cartesianTranslationToleranceM: cartesianDefaults?.translationToleranceM
+      ?? DEFAULT_MANUAL_MOTION_SETTINGS.cartesianTranslationToleranceM,
+    cartesianMaxBlendDeviationRad: cartesianDefaults?.maxBlendDeviationRad
+      ?? DEFAULT_MANUAL_MOTION_SETTINGS.cartesianMaxBlendDeviationRad,
     tcpLinearSpeedMps: Math.min(DEFAULT_MANUAL_MOTION_SETTINGS.tcpLinearSpeedMps,
-      status.directControl.targetDescriptor.operationalLimit?.effectiveMaximumTcpLinearSpeedMps ?? Infinity),
+      status.directControl.targetDescriptor.operationalLimit?.maximumTcpLinearSpeedMps ?? Infinity),
   };
 }
 
@@ -313,7 +469,8 @@ function receiptMatchesCurrentDraft(
   state: RobotControlState,
   receipt: DirectControlPreviewReceipt,
 ): boolean {
-  const { intent, status } = state;
+  const { intent } = state;
+  const status = selectedStatusForState(state);
   if (intent === null || status === null) return false;
   const payload = intent.participants[0].payload;
   if (!commonReceiptMatches(status, intent, receipt)) return false;
@@ -364,38 +521,119 @@ export function robotControlHasLocalDraft(state: RobotControlState): boolean {
       || state.phase === 'approving' || state.phase === 'blocked');
 }
 
+function operationMatchesSelectedTarget(
+  status: ExecutionOwnerStatus,
+  selectedStatus: ExecutionOwnerStatus,
+  operation: OperationObservation,
+): boolean {
+  const hasComponentId = operation.controllableComponentId !== undefined;
+  const hasCommandTargetId = operation.commandTargetId !== undefined;
+  if (hasComponentId || hasCommandTargetId) {
+    // A partial address cannot safely identify a target in a multi-target
+    // owner. Require both owner-issued identity fields before projecting it.
+    if (!hasComponentId || !hasCommandTargetId) return false;
+    const matchesMotion = operation.controllableComponentId
+      === selectedStatus.directControl.controllableComponentId
+      && operation.commandTargetId === selectedStatus.directControl.commandTargetId;
+    const matchesGripper = operation.controllableComponentId
+      === selectedStatus.directControlGripper.controllableComponentId
+      && operation.commandTargetId === selectedStatus.directControlGripper.commandTargetId;
+    if (!matchesMotion && !matchesGripper) return false;
+    return operation.targetRoleId === undefined
+      || operation.targetRoleId === selectedStatus.directControl.targetRoleId
+      || operation.targetRoleId === selectedStatus.directControlGripper.targetRoleId;
+  }
+  if (operation.targetRoleId === undefined) {
+    // Old singleton owners did not publish participant identity. Preserve that
+    // compatibility only when there is no second target to guess between.
+    return motionTargetsForStatus(status).length === 1
+      && gripperTargetsForStatus(status).length === 1;
+  }
+  // The exact Program-run identity was matched by the caller. Legacy
+  // singleton owners may use the same target-role name for arm and gripper,
+  // so that role is corroborating evidence rather than a discriminator.
+  return motionTargetsForStatus(status).length === 1
+    && gripperTargetsForStatus(status).length === 1
+    && (operation.targetRoleId === selectedStatus.directControl.targetRoleId
+      || operation.targetRoleId === selectedStatus.directControlGripper.targetRoleId);
+}
+
 function resolveStatus(
   state: RobotControlState,
   status: ExecutionOwnerStatus,
   initialize: boolean,
+  cartesianDefaults: ManualCartesianDefaults | null = null,
 ): RobotControlState {
+  const selection = reconcileRobotTargetSelection(status, {
+    componentId: state.selectedComponentId,
+    motionTargetId: state.selectedMotionTargetId,
+    gripperTargetId: state.selectedGripperTargetId,
+  });
+  const selectedStatus = selectedStatusForState({
+    status,
+    selectedComponentId: selection.componentId,
+    selectedMotionTargetId: selection.motionTargetId,
+    selectedGripperTargetId: selection.gripperTargetId,
+  });
+  if (selectedStatus === null) return state;
+  const previousSelectedStatus = state.status === null
+    ? null
+    : selectedStatusForState(state);
   const selectedRun = state.mode === 'gripper'
-    ? status.directControlGripper.programRunId : status.directControl.programRunId;
-  const projected = status.manualOperations.filter((operation) => operation.programRunId === selectedRun);
+    ? selectedStatus.directControlGripper.programRunId
+    : selectedStatus.directControl.programRunId;
+  const projected = status.manualOperations.filter((operation) => {
+    if (operation.programRunId !== selectedRun) return false;
+    return operationMatchesSelectedTarget(status, selectedStatus, operation);
+  });
+  const retainedOperation = state.operation?.resident
+    ? status.manualOperations.find((operation) => (
+      operation.operationId === state.operation?.operationId
+    )) ?? null
+    : null;
   const projectedOperation = projected.length === 1 ? projected[0] : null;
   const projectionError = projected.length > 1
     ? 'More than one direct-control operation is resident; Robot Control will not guess which operation to own.'
     : null;
+  const resolvedOperation = retainedOperation ?? (
+    projectionError === null ? projectedOperation : null
+  );
   const resolvedPhase = projectionError !== null
     ? 'blocked'
-    : projectedOperation === null
+    : resolvedOperation === null
       ? 'idle'
-      : phaseForOperation(projectedOperation);
-  const resolvedOperation = projectionError === null ? projectedOperation : null;
+      : phaseForOperation(resolvedOperation);
+  const selectionChanged = state.selectedComponentId !== selection.componentId
+    || state.selectedMotionTargetId !== selection.motionTargetId
+    || state.selectedGripperTargetId !== selection.gripperTargetId;
+  const selectedBindingChanged = previousSelectedStatus !== null && (
+    previousSelectedStatus.directControl.programBindingId
+      !== selectedStatus.directControl.programBindingId
+    || previousSelectedStatus.directControlGripper.programBindingId
+      !== selectedStatus.directControlGripper.programBindingId
+    || previousSelectedStatus.directControl.controllableComponentId
+      !== selectedStatus.directControl.controllableComponentId
+    || previousSelectedStatus.directControl.commandTargetId
+      !== selectedStatus.directControl.commandTargetId
+    || previousSelectedStatus.directControlGripper.controllableComponentId
+      !== selectedStatus.directControlGripper.controllableComponentId
+    || previousSelectedStatus.directControlGripper.commandTargetId
+      !== selectedStatus.directControlGripper.commandTargetId
+  );
   if (state.status !== null && (
     state.status.ownerEpoch !== status.ownerEpoch
     || state.status.retainedBundleId !== status.retainedBundleId
     || state.status.graphRevision !== status.graphRevision
-    || state.status.directControl.programBindingId !== status.directControl.programBindingId
-    || state.status.directControlGripper.programBindingId !== status.directControlGripper.programBindingId
+    || selectedBindingChanged
   )) {
     return {
       ...initialRobotControlState,
       mode: state.mode,
-      motionSettings: initialMotionSettings(status),
+      motionSettings: initialMotionSettings(selectedStatus, cartesianDefaults),
       status,
+      ...selectedStateFields(selection),
       phase: resolvedPhase,
-      ...draftFromStatus(status),
+      ...draftFromStatus(selectedStatus),
       generation: state.generation + 1,
       operation: resolvedOperation,
       error: projectionError
@@ -408,9 +646,12 @@ function resolveStatus(
     return {
       ...state,
       status,
+      ...selectedStateFields(selection),
       phase: resolvedPhase,
-      ...draftFromStatus(status),
-      motionSettings: state.status === null ? initialMotionSettings(status) : state.motionSettings,
+      ...draftFromStatus(selectedStatus),
+      motionSettings: state.status === null
+        ? initialMotionSettings(selectedStatus, cartesianDefaults)
+        : state.motionSettings,
       intent: null,
       preview: null,
       ghost: null,
@@ -418,6 +659,23 @@ function resolveStatus(
       operation: resolvedOperation,
       previewIssue: null,
       error: projectionError ?? resolvedOperation?.terminalError ?? null,
+    };
+  }
+  if (selectionChanged) {
+    return {
+      ...state,
+      status,
+      ...selectedStateFields(selection),
+      phase: resolvedOperation === null ? 'idle' : phaseForOperation(resolvedOperation),
+      ...draftFromStatus(selectedStatus),
+      generation: state.generation + 1,
+      intent: null,
+      preview: null,
+      ghost: null,
+      ghostStale: false,
+      operation: resolvedOperation,
+      previewIssue: null,
+      error: resolvedOperation?.terminalError ?? null,
     };
   }
   if (projectionError !== null) {
@@ -433,10 +691,10 @@ function resolveStatus(
   // The latest settled result stays visible through the same owner snapshot,
   // but repeated publication must not overwrite a new draft or an approval
   // still waiting for a *new* operation to become visible.
-  const alreadyPresentedTerminal = projectedOperation !== null && !projectedOperation.resident
+  const alreadyPresentedTerminal = resolvedOperation !== null && !resolvedOperation.resident
     && state.status.manualOperations.some((previous) => !previous.resident
-      && previous.operationId === projectedOperation.operationId);
-  if ((projectedOperation === null || alreadyPresentedTerminal)
+      && previous.operationId === resolvedOperation.operationId);
+  if ((resolvedOperation === null || alreadyPresentedTerminal)
     && (state.phase === 'ready' || state.phase === 'planning'
       || (state.phase === 'blocked' && state.intent === null))
     && (state.status.sceneRevision.scene_id !== status.sceneRevision.scene_id
@@ -449,22 +707,22 @@ function resolveStatus(
   if (alreadyPresentedTerminal) {
     return { ...state, status };
   }
-  if (projectedOperation !== null) {
+  if (resolvedOperation !== null) {
     return {
       ...state,
       status,
-      phase: phaseForOperation(projectedOperation),
+      phase: phaseForOperation(resolvedOperation),
       poseDragging: false,
       moveToDraft: null,
-      operation: projectedOperation,
+      operation: resolvedOperation,
       previewIssue: null,
       intent: null,
       preview: null,
       ghost: null,
       ghostStale: false,
-      error: projectedOperation.terminalError ?? state.error,
-      ...(operationStateIsTerminal(projectedOperation.state)
-        ? draftFromStatus(status)
+      error: resolvedOperation.terminalError ?? state.error,
+      ...(operationStateIsTerminal(resolvedOperation.state)
+        ? draftFromStatus(selectedStatus)
         : {}),
     };
   }
@@ -473,7 +731,7 @@ function resolveStatus(
       ...state,
       status,
       phase: 'idle',
-      ...draftFromStatus(status),
+      ...draftFromStatus(selectedStatus),
       operation: null,
       intent: null,
       preview: null,
@@ -507,6 +765,38 @@ function invalidateDraft(
   };
 }
 
+function changeSelection(
+  state: RobotControlState,
+  selection: RobotTargetSelection,
+): RobotControlState {
+  if (state.status === null
+    || (state.selectedComponentId === selection.componentId
+      && state.selectedMotionTargetId === selection.motionTargetId
+      && state.selectedGripperTargetId === selection.gripperTargetId)) {
+    return state;
+  }
+  const selected = selectedStatusForState({
+    status: state.status,
+    selectedComponentId: selection.componentId,
+    selectedMotionTargetId: selection.motionTargetId,
+    selectedGripperTargetId: selection.gripperTargetId,
+  });
+  if (selected === null) return state;
+  return {
+    ...state,
+    ...selectedStateFields(selection),
+    phase: state.operation === null ? 'idle' : phaseForOperation(state.operation),
+    ...draftFromStatus(selected),
+    generation: state.generation + 1,
+    intent: null,
+    preview: null,
+    ghost: null,
+    ghostStale: false,
+    previewIssue: null,
+    error: state.operation?.terminalError ?? null,
+  };
+}
+
 export function robotControlReducer(
   state: RobotControlState,
   action: RobotControlAction,
@@ -519,9 +809,39 @@ export function robotControlReducer(
         ? { ...state, phase: 'loading', error: null }
         : { ...state, error: null };
     case 'status_resolved':
-      return resolveStatus(state, action.status, true);
+      return resolveStatus(state, action.status, true, action.cartesianDefaults);
     case 'status_refreshed':
-      return resolveStatus(state, action.status, false);
+      return resolveStatus(state, action.status, false, action.cartesianDefaults);
+    case 'program_cartesian_defaults_changed': {
+      if (state.status === null || robotControlHasActiveOperation(state)) return state;
+      const motionSettings = {
+        ...state.motionSettings,
+        cartesianTranslationToleranceM: action.defaults.translationToleranceM,
+        cartesianMaxBlendDeviationRad: action.defaults.maxBlendDeviationRad,
+      };
+      if (!motionSettingsAreValid(selectedStatusForState(state)!, motionSettings)) return state;
+      return robotControlHasLocalDraft(state)
+        ? invalidateDraft(state, { motionSettings })
+        : { ...state, motionSettings };
+    }
+    case 'select_robot': {
+      if (state.status === null) return state;
+      const selection = reconcileRobotTargetSelection(state.status, {
+        componentId: action.componentId,
+        motionTargetId: action.motionTargetId,
+        gripperTargetId: state.selectedGripperTargetId,
+      });
+      return changeSelection(state, selection);
+    }
+    case 'select_tool': {
+      if (state.status === null) return state;
+      const selection = reconcileRobotTargetSelection(state.status, {
+        componentId: state.selectedComponentId,
+        motionTargetId: state.selectedMotionTargetId,
+        gripperTargetId: action.gripperTargetId,
+      });
+      return changeSelection(state, selection);
+    }
     case 'manual_scope_changed':
       return robotControlHasLocalDraft(state) ? invalidateDraft(state, {}) : state;
     case 'load_failed':
@@ -538,7 +858,7 @@ export function robotControlReducer(
       return {
         ...state,
         phase: 'idle',
-        ...draftFromStatus(state.status),
+        ...draftFromStatus(selectedStatusForState(state)!),
         generation: state.generation + 1,
         intent: null,
         preview: null,
@@ -561,7 +881,7 @@ export function robotControlReducer(
         mode: action.mode,
         moveToKind: 'pose',
         phase: 'idle',
-        ...draftFromStatus(state.status),
+        ...draftFromStatus(selectedStatusForState(state)!),
         generation: state.generation + 1,
         intent: null,
         preview: null,
@@ -576,15 +896,17 @@ export function robotControlReducer(
       if (state.status === null || robotControlHasActiveOperation(state)) {
         return state;
       }
+      const selectedStatus = selectedStatusForState(state);
+      if (selectedStatus === null) return state;
       const baseline = robotControlHasLocalDraft(state)
-        ? state.draftPositionsRad : state.status.observedMotion.positionsRad;
+        ? state.draftPositionsRad : selectedStatus.observedMotion.positionsRad;
       const positionsRad = action.type === 'edit' ? action.positionsRad : [...baseline];
       if (action.type === 'edit_joint') {
         if (!Number.isInteger(action.jointIndex) || action.jointIndex < 0
           || action.jointIndex >= positionsRad.length) return state;
         positionsRad[action.jointIndex] = action.positionRad;
       }
-      if (!positionsAreValid(state.status, positionsRad)) {
+      if (!positionsAreValid(selectedStatus, positionsRad)) {
         return {
           ...state,
           phase: 'blocked',
@@ -607,6 +929,8 @@ export function robotControlReducer(
     }
     case 'edit_motion_settings': {
       if (state.status === null || state.mode === 'gripper' || robotControlHasActiveOperation(state)) return state;
+      const selectedStatus = selectedStatusForState(state);
+      if (selectedStatus === null) return state;
       const motionSettings = {
         ...state.motionSettings,
         ...action.update,
@@ -615,7 +939,7 @@ export function robotControlReducer(
       for (const [joint, limit] of Object.entries(action.update.jointLimits ?? {})) {
         motionSettings.jointLimits[joint] = { ...motionSettings.jointLimits[joint], ...limit };
       }
-      if (!motionSettingsAreValid(state.status, motionSettings)) return state;
+      if (!motionSettingsAreValid(selectedStatus, motionSettings)) return state;
       // Editing limits alone does not invent a target or start a no-op preview.
       return robotControlHasLocalDraft(state)
         ? invalidateDraft(state, { motionSettings })
@@ -623,9 +947,11 @@ export function robotControlReducer(
     }
     case 'select_move_source': {
       if (state.status === null || robotControlHasActiveOperation(state)) return state;
+      const selectedStatus = selectedStatusForState(state);
+      if (selectedStatus === null) return state;
       const moveToDraft: MoveToDraft = {
         source: structuredClone(action.source),
-        currentTcpPose: poseTupleFromValue(state.status.observedMotion.currentTcpPose),
+        currentTcpPose: poseTupleFromValue(selectedStatus.observedMotion.currentTcpPose),
         options: structuredClone(state.moveToDraft?.options ?? DEFAULT_MOVE_TO_OPTIONS),
       };
       if (action.source.kind === 'joint') {
@@ -650,7 +976,8 @@ export function robotControlReducer(
         || (state.mode === 'move_to' && state.moveToDraft?.source.kind !== 'pose')) return state;
       return {
         ...state,
-        draftPose: robotControlHasLocalDraft(state) ? state.draftPose : copyPose(state.status.observedMotion.currentTcpPose),
+        draftPose: robotControlHasLocalDraft(state) ? state.draftPose
+          : copyPose(selectedStatusForState(state)!.observedMotion.currentTcpPose),
         poseDragging: true,
         generation: state.generation + 1,
       };
@@ -664,7 +991,9 @@ export function robotControlReducer(
       if (state.status === null || robotControlHasActiveOperation(state)) {
         return state;
       }
-      if (!positionsAreValid(state.status, action.positionsRad)) {
+      const selectedStatus = selectedStatusForState(state);
+      if (selectedStatus === null) return state;
+      if (!positionsAreValid(selectedStatus, action.positionsRad)) {
         return {
           ...state,
           phase: 'blocked',
@@ -691,6 +1020,8 @@ export function robotControlReducer(
       if (state.status === null || robotControlHasActiveOperation(state)) {
         return state;
       }
+      const selectedStatus = selectedStatusForState(state);
+      if (selectedStatus === null) return state;
       if (!poseIsValid(action.pose)) {
         return {
           ...state,
@@ -704,7 +1035,7 @@ export function robotControlReducer(
         };
       }
       if (posesEqual(robotControlHasLocalDraft(state)
-        ? state.draftPose : state.status.observedMotion.currentTcpPose, action.pose)
+        ? state.draftPose : selectedStatus.observedMotion.currentTcpPose, action.pose)
         && (state.mode !== 'move_to' || state.moveToKind === 'pose')) return state;
       const draft = state.mode === 'move_to' ? state.moveToDraft : null;
       const options = draft?.source.kind === 'pose'
@@ -716,11 +1047,13 @@ export function robotControlReducer(
         draftPose: copyPose(action.pose),
       });
     }
-    case 'edit_gripper':
+    case 'edit_gripper': {
       if (state.status === null || robotControlHasActiveOperation(state)) {
         return state;
       }
-      if (!gripperPositionIsValid(state.status, action.position)) {
+      const selectedStatus = selectedStatusForState(state);
+      if (selectedStatus === null) return state;
+      if (!gripperPositionIsValid(selectedStatus, action.position)) {
         return {
           ...state,
           phase: 'blocked',
@@ -734,13 +1067,14 @@ export function robotControlReducer(
       }
       if (
         state.mode === 'gripper'
-        && (robotControlHasLocalDraft(state)
-          ? state.draftGripperPosition : state.status.observedGripper?.position) === action.position
+          && (robotControlHasLocalDraft(state)
+          ? state.draftGripperPosition : selectedStatus.observedGripper?.position) === action.position
       ) return state;
       return invalidateDraft(state, {
         mode: 'gripper',
         draftGripperPosition: action.position,
       });
+    }
     case 'preview_started':
       if (
         action.generation !== state.generation
@@ -832,8 +1166,9 @@ export function robotControlReducer(
         : state;
     case 'dismiss_error':
       return state.error === null ? state : { ...state, error: null };
-    case 'revert':
+    case 'revert': {
       if (robotControlHasActiveOperation(state)) return state;
+      const selectedStatus = state.status === null ? null : selectedStatusForState(state);
       return {
         ...state,
         phase: state.operation?.resident ? phaseForOperation(state.operation)
@@ -844,7 +1179,7 @@ export function robotControlReducer(
               draftPose: IDENTITY_POSE,
               draftGripperPosition: null,
             }
-          : draftFromStatus(state.status)),
+          : draftFromStatus(selectedStatus!)),
         generation: state.generation + 1,
         intent: null,
         preview: null,
@@ -854,6 +1189,7 @@ export function robotControlReducer(
         previewIssue: null,
         error: state.operation?.resident ? state.operation.terminalError : null,
       };
+    }
     case 'clear':
       return {
         ...initialRobotControlState,
@@ -901,8 +1237,6 @@ function buildMotionIntent(
     const values = Object.entries(limit).filter(([, value]) => value != null);
     return values.length === 0 ? [] : [[name, Object.fromEntries(values)]];
   }));
-  const targetTcpLimit = status.directControl.targetDescriptor.operationalLimit
-    ?.effectiveMaximumTcpLinearSpeedMps ?? null;
   const payload: MotionParticipantPayload = {
     kind: 'motion',
     move_id: `robot-control-${requestId}`,
@@ -910,13 +1244,13 @@ function buildMotionIntent(
     tcp_frame_role_id: status.directControl.tcpFrameRoleId,
     tolerances: {
       joint_position_tol_rad: 0.05,
-      translation_tol_m: 0.005,
-      rotation_tol_rad: 0.05,
+      translation_tol_m: settings.cartesianTranslationToleranceM,
+      rotation_tol_rad: settings.cartesianRotationToleranceRad,
     },
     speed_profile: {
       velocity_scale: settings.velocityScale,
       acceleration_scale: settings.accelerationScale,
-      max_tcp_linear_speed_mps: Math.min(settings.tcpLinearSpeedMps, targetTcpLimit ?? Infinity),
+      max_tcp_linear_speed_mps: settings.tcpLinearSpeedMps,
     },
     timeouts: {
       planning_timeout_s: 2,
@@ -1022,11 +1356,11 @@ export function buildCartesianMotionIntent(
     max_translation_step_m: 0.005,
     max_rotation_step_rad: 0.05,
     speed_mode: 'bounded',
-    max_linear_speed_mps: settings.tcpLinearSpeedMps,
     max_angular_speed_rad_s: settings.tcpAngularSpeedRadS,
     max_linear_acceleration_mps2: settings.tcpLinearAccelerationMps2,
     max_angular_acceleration_rad_s2: settings.tcpAngularAccelerationRadS2,
     fallback_policy: 'fail_closed',
+    max_blend_deviation_rad: settings.cartesianMaxBlendDeviationRad,
   }, requestId, settings);
 }
 

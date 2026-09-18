@@ -150,6 +150,7 @@ function RobotNumberInput({
   onCommit,
   pending = false,
   limitUnit,
+  hint,
 }: {
   label: string;
   value: number | null;
@@ -160,6 +161,7 @@ function RobotNumberInput({
   onCommit: (value: number) => void;
   pending?: boolean;
   limitUnit?: string;
+  hint?: string;
 }) {
   const { resetKey, reportPending } = useContext(RobotInputContext);
   const [invalidMessage, setInvalidMessage] = useState<string | null>(null);
@@ -188,9 +190,12 @@ function RobotNumberInput({
       value={displayValue}
       resetKey={resetKey}
       onPendingChange={onPendingChange}
-      title={limitUnit !== undefined && max !== undefined
-        ? `Global limit: ${Number(max.toPrecision(6))} ${limitUnit}.`
-        : value === null ? undefined : `Exact value: ${String(value)}`}
+      title={[
+        hint,
+        limitUnit !== undefined && max !== undefined
+          ? `Global limit: ${Number(max.toPrecision(6))} ${limitUnit}.`
+          : value === null ? undefined : `Exact value: ${String(value)}`,
+      ].filter(Boolean).join(' ') || undefined}
       disabled={disabled}
       className={pending ? 'robot-control-target-pending' : undefined}
       dirtyClassName="robot-control-target-pending"
@@ -217,40 +222,51 @@ function ManualMotionSettingsControls({ controller, disabled }: {
   disabled: boolean;
 }) {
   const { state, editMotionSettings } = controller;
-  const descriptor = state.status!.directControl.targetDescriptor;
+  const descriptor = controller.selectedStatus!.directControl.targetDescriptor;
   const settings = state.motionSettings;
   const cartesian = state.mode === 'cartesian_path';
-  const fields: Array<{
+  type MotionSettingField = {
     key: Exclude<keyof ManualMotionSettings, 'jointLimits'>;
-    label: string; unit: string; factor: number; step: number; max?: number;
-  }> = [
-    { key: 'velocityScale', label: 'Velocity (%)', unit: '%', factor: 100, step: 5, max: 100 },
-    { key: 'accelerationScale', label: 'Acceleration (%)', unit: '%', factor: 100, step: 5, max: 100 },
-    { key: 'tcpLinearSpeedMps', label: 'TCP speed (m/s)', unit: 'm/s', factor: 1, step: 0.01,
-      max: descriptor.operationalLimit?.effectiveMaximumTcpLinearSpeedMps },
-    ...(cartesian ? [
-      { key: 'tcpAngularSpeedRadS' as const, label: 'TCP angular speed (deg/s)', unit: 'deg/s', factor: RAD_TO_DEG, step: 5 },
-      { key: 'tcpLinearAccelerationMps2' as const, label: 'TCP accel. (m/s²)', unit: 'm/s²', factor: 1, step: 0.1 },
-      { key: 'tcpAngularAccelerationRadS2' as const, label: 'TCP angular accel. (deg/s²)', unit: 'deg/s²', factor: RAD_TO_DEG, step: 10 },
-    ] : []),
+    label: string; fullLabel: string; unit: string; factor: number; step: number;
+    min?: number; max?: number;
+  };
+  const commonFields: MotionSettingField[] = [
+    { key: 'velocityScale', label: 'Vel. (%)', fullLabel: 'Velocity scale (%)', unit: '%', factor: 100, step: 5, max: 100 },
+    { key: 'accelerationScale', label: 'Acc. (%)', fullLabel: 'Acceleration scale (%)', unit: '%', factor: 100, step: 5, max: 100 },
+    { key: 'tcpLinearSpeedMps', label: 'TCP Sp. (m/s)', fullLabel: 'TCP linear speed (m/s)', unit: 'm/s', factor: 1, step: 0.01,
+      max: descriptor.operationalLimit?.maximumTcpLinearSpeedMps },
   ];
+  const advancedFields: MotionSettingField[] = cartesian ? [
+    { key: 'tcpAngularSpeedRadS', label: 'TCP Ang. (deg/s)', fullLabel: 'TCP angular speed (deg/s)', unit: 'deg/s', factor: RAD_TO_DEG, step: 5 },
+    { key: 'tcpLinearAccelerationMps2', label: 'TCP Acc. (m/s²)', fullLabel: 'TCP linear acceleration (m/s²)', unit: 'm/s²', factor: 1, step: 0.1 },
+    { key: 'tcpAngularAccelerationRadS2', label: 'Ang. Acc. (deg/s²)', fullLabel: 'TCP angular acceleration (deg/s²)', unit: 'deg/s²', factor: RAD_TO_DEG, step: 10 },
+    { key: 'cartesianTranslationToleranceM', label: 'Lin. Tol. (m)', fullLabel: 'Cartesian linear path tolerance (m)', unit: 'm', factor: 1, step: 0.001 },
+    { key: 'cartesianRotationToleranceRad', label: 'Rot. Tol. (deg)', fullLabel: 'Cartesian rotation path tolerance (deg)', unit: 'deg', factor: RAD_TO_DEG, step: 0.5 },
+    { key: 'cartesianMaxBlendDeviationRad', label: 'Blend (rad)', fullLabel: 'Maximum Cartesian joint-path blend deviation (rad); zero disables blending', unit: 'rad', factor: 1, step: 0.005, min: 0 },
+  ] : [];
+  const settingControl = ({ key, label, fullLabel, unit, factor, step, min, max }: MotionSettingField) => (
+    <label key={key} title={fullLabel}>
+      <span>{label}</span>
+      <RobotNumberInput label={`Manual ${fullLabel}`} value={settings[key] * factor}
+        min={min ?? (key.endsWith('Scale') ? 1 : 0.000001)} max={max} step={step}
+        disabled={disabled} limitUnit={unit} hint={fullLabel}
+        onCommit={(value) => editMotionSettings({ [key]: value / factor })} />
+    </label>
+  );
   return (
     <section className="robot-control-motion-settings" aria-label="Manual speed and acceleration">
       <h4 title="These defaults apply to every preview and approval without needing an edit. Percentages independently scale the planned velocity and acceleration within Deployment/model ceilings. The live Velocity bar is separate. TCP angular speed and acceleration limits are supported only in Cartesian mode.">
         Speed &amp; acceleration <span className="inspector-info-button" aria-hidden="true">i</span>
       </h4>
       <div className="robot-control-motion-settings-grid">
-        {fields.map(({ key, label, unit, factor, step, max }) => (
-          <label key={key}>
-            <span>{label}</span>
-            <RobotNumberInput label={`Manual ${label}`} value={settings[key] * factor}
-              min={key.endsWith('Scale') ? 1 : 0.000001} max={max} step={step} disabled={disabled} limitUnit={unit}
-              onCommit={(value) => editMotionSettings({ [key]: value / factor })} />
-          </label>
-        ))}
+        {commonFields.map(settingControl)}
       </div>
       <details className="robot-control-joint-settings">
-        <summary title="Optional tighter joint limits, before percentages. The displayed Deployment/model ceilings apply by default. Use ceilings removes only your local overrides.">Individual joint limits</summary>
+        <summary title="Cartesian path fidelity, smoothing and optional tighter per-joint limits.">Advanced</summary>
+        {advancedFields.length > 0 && <div className="robot-control-advanced-settings-grid">
+          {advancedFields.map(settingControl)}
+        </div>}
+        <h5>Joint limits</h5>
         <div className="robot-control-joint-settings-grid">
           <span>Joint</span><span>Velocity (deg/s)</span><span>Acceleration (deg/s²)</span>
           {descriptor.joints.map((joint) => {
@@ -346,7 +362,10 @@ export function RobotControlPanelView({
   } = controller;
   const moveSourceId = state.moveToDraft?.source.id ?? '';
   const moveOptions = state.moveToDraft?.options ?? DEFAULT_MOVE_TO_OPTIONS;
-  const status = state.status;
+  // All target-specific controls use the selected addressed projection. The
+  // controller keeps the complete owner projection separately so changing
+  // this selection never creates a second browser-side ownership model.
+  const status = controller.selectedStatus;
   const programActive = program?.cycleState !== null
     && program?.cycleState !== undefined
     && program.cycleState !== 'idle_after_reset';
@@ -354,6 +373,7 @@ export function RobotControlPanelView({
     status?.directControlGripper.programBindingId, status?.sceneRevision.scene_id,
     status?.sceneRevision.revision_id, status?.sceneRevision.content_hash,
     status?.retainedBundleId, status?.graphRevision, programActive,
+    state.selectedComponentId, state.selectedMotionTargetId, state.selectedGripperTargetId,
     state.mode, inputRebase].join('\u0000');
   const inputContext = useMemo(() => ({ resetKey: inputResetKey, reportPending }), [inputResetKey, reportPending]);
   const operationActive = robotControlHasActiveOperation(state);
@@ -592,7 +612,12 @@ export function RobotControlPanelView({
   };
 
   const modeAvailable = (mode: RobotControlMode): boolean => {
-    if (status === null || mode === 'gripper') return status !== null;
+    if (status === null) return false;
+    if (mode === 'gripper') {
+      return controller.gripperTargets.some((target) => (
+        target.controllableComponentId === status.directControl.controllableComponentId
+      ));
+    }
     if (mode === 'move_to') {
       return status.directControl.targetDescriptor.contracts.supportingProviders.some((provider) => (
         provider.capabilityId === 'planning.motion.pose_goal'
@@ -641,6 +666,12 @@ export function RobotControlPanelView({
   const presentedGripperPosition = gripperTargetPending
     ? state.draftGripperPosition
     : observedGripperPosition ?? state.draftGripperPosition;
+  const selectedTools = controller.gripperTargets.filter((target) => (
+    status !== null
+      && target.controllableComponentId === status.directControl.controllableComponentId
+  ));
+  const targetLabel = (target: { commandTargetId: string; controllableComponentId: string }) =>
+    `${target.controllableComponentId} · ${target.commandTargetId}`;
 
   return (
     <RobotInputContext.Provider value={inputContext}>
@@ -699,6 +730,69 @@ export function RobotControlPanelView({
                   setDismissedPreviewNotice(previewNoticeKey);
                   previewInfoButton.current?.focus();
                 }}>×</button>
+            </div>
+          )}
+          {controller.motionTargets.length > 0 && (
+            <div className="robot-control-target-selectors" aria-label="Direct control target">
+              {controller.motionTargets.length > 1 && (
+                <label>
+                  <span>Robot</span>
+                  <select
+                    aria-label="Robot target"
+                    value={`${state.selectedComponentId ?? ''}\u0000${state.selectedMotionTargetId ?? ''}`}
+                    disabled={state.phase === 'approving'}
+                    onChange={(event) => {
+                      const [componentId, motionTargetId] = event.currentTarget.value.split('\u0000');
+                      if (componentId !== undefined && motionTargetId !== undefined) {
+                        controller.selectRobot(componentId, motionTargetId);
+                      }
+                    }}
+                  >
+                    {controller.motionTargets.map((target) => (
+                      <option
+                        key={`${target.controllableComponentId}\u0000${target.commandTargetId}`}
+                        value={`${target.controllableComponentId}\u0000${target.commandTargetId}`}
+                      >{targetLabel(target)}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {controller.motionTargets.length === 1 && (
+                <span className="robot-control-target-identity" title="The only addressed robot currently offered by the execution owner.">
+                  <span>Robot</span>
+                  <code>{targetLabel(status.directControl)}</code>
+                </span>
+              )}
+              {state.mode === 'gripper' && selectedTools.length > 1 && (
+                <label>
+                  <span>Tool</span>
+                  <select
+                    aria-label="Gripper target"
+                    value={state.selectedGripperTargetId ?? ''}
+                    disabled={state.phase === 'approving'}
+                    onChange={(event) => controller.selectTool(event.currentTarget.value)}
+                  >
+                    {selectedTools.map((target) => (
+                      <option
+                        key={`${target.controllableComponentId}\u0000${target.commandTargetId}`}
+                        value={target.commandTargetId}
+                      >{targetLabel(target)}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {state.mode === 'gripper' && selectedTools.length === 1 && (
+                <span className="robot-control-target-identity" title="The only qualified attached tool currently offered for this robot.">
+                  <span>Tool</span>
+                  <code>{targetLabel(selectedTools[0])}</code>
+                </span>
+              )}
+              {state.mode === 'gripper' && selectedTools.length === 0 && (
+                <span className="robot-control-target-identity robot-control-target-unavailable" role="status">
+                  <span>Tool</span>
+                  <span>No qualified attached tool</span>
+                </span>
+              )}
             </div>
           )}
           <nav className="robot-control-modes" aria-label="Manual control mode">

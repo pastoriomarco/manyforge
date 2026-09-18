@@ -1,5 +1,9 @@
 import type { ProgramBindingDocument } from './programBindingTransport.generated';
 import type { Nanoseconds } from './nanoseconds';
+import type {
+  RuntimeScaleControlSelector,
+  RuntimeScaleControlStatus,
+} from './robotControl';
 export type { ProgramBindingDocument } from './programBindingTransport.generated';
 
 export type ArtifactKind = 'program' | 'deployment' | 'mesh';
@@ -348,6 +352,55 @@ export interface ProgramWorkspaceResponse {
   hasUnappliedChanges: boolean | null;
 }
 
+export type ScenarioDocumentDisplayStatus =
+  | 'ready'
+  | 'incomplete'
+  | 'unknown'
+  | 'changed'
+  | 'version_changed'
+  | 'unsupported';
+
+export interface ScenarioDocumentEntry {
+  sourceKind: 'saved' | 'qualified';
+  path: string | null;
+  scenarioId: string | null;
+  name: string;
+  description: string;
+  baseScenarioId: string | null;
+  savedManyforgeVersion: string | null;
+  displayStatus: ScenarioDocumentDisplayStatus;
+  statusDetail: string;
+}
+
+export interface ScenarioDocumentIndexResponse {
+  apiVersion: 'manyforge.scenario_document_index.v1';
+  directory: string;
+  catalogRevision: string | null;
+  entries: ScenarioDocumentEntry[];
+}
+
+export interface ScenarioDocumentFenceRequest extends DraftFenceRequest {
+  deploymentDraftId: string;
+  expectedDeploymentDraftRevision: number;
+}
+
+export interface ScenarioDocumentSaveResponse {
+  status: 'saved';
+  path: string;
+  scenarioId: string;
+  lastKnownStatus: 'ready' | 'incomplete' | 'unknown';
+  workspace: ProgramWorkspaceResponse;
+}
+
+export interface ScenarioDocumentLoadResponse {
+  status: 'loaded' | 'opened';
+  path: string | null;
+  scenarioId: string;
+  activation: Record<string, JsonValue> | null;
+  diagnostics: ProgramAuthoringDiagnostic[];
+  workspace: ProgramWorkspaceResponse;
+}
+
 export interface DeploymentScenarioCandidate {
   scenarioId: string;
   scenarioCatalogRevision: string;
@@ -406,7 +459,8 @@ export interface DeploymentCandidateOperationResponse {
   schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1';
   workspace: DeploymentWorkspaceResponse;
   result: {
-    status: 'previewed' | 'applied';
+    status: 'previewed' | 'confirmation_required' | 'applied';
+    confirmationToken: string | null;
     compilation: DeploymentCandidateCompilation;
     candidatePreview: ManagerDeploymentCandidatePreviewResponse | null;
     managerApply: ManagerApplyResponse | null;
@@ -719,15 +773,28 @@ export interface ProgramExecutionSelectionControls {
     groupId: string;
     nodeCount: number;
     heldNodeCount: number;
-    state: 'running' | 'held' | 'mixed' | 'stopping' | 'faulted' | 'unavailable';
+    state: 'ready' | 'running' | 'held' | 'mixed' | 'stopping' | 'faulted' | 'unavailable';
     stopAllowed: boolean;
+    startAllowed: boolean;
+    startUnavailableReason: string | null;
     resumeAllowed: boolean;
     resumeUnavailableReason: string | null;
+    /** Exact captured motion scope used by the runtime-scale owner. */
+    runtimeScaleSelector: RuntimeScaleControlSelector | null;
+    runtimeScaleUnavailableReason: string | null;
   }>;
 }
 
+export interface ProgramGroupRuntimeScaleState {
+  selector: RuntimeScaleControlSelector | null;
+  status: RuntimeScaleControlStatus | null;
+  draft: number;
+  pending: boolean;
+  error: string | null;
+}
+
 export interface ProgramRuntimeControlProjection {
-  schemaVersion: 'manyforge.program_runtime_control_projection.v4';
+  schemaVersion: 'manyforge.program_runtime_control_projection.v6';
   ownerId: string;
   ownerEpoch: string;
   programRunId: string;

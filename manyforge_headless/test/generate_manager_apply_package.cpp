@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <span>
 #include <stdexcept>
@@ -39,9 +40,28 @@ struct Arguments final {
   bool operator_confirmation;
 };
 
+void WriteDeploymentSource(
+    const std::filesystem::path &package_root,
+    const deployment::RevisionVerifiedDeploymentArtifact &deployment) {
+  const auto path =
+      package_root /
+      (deployment.deployment_artifact_id().value() + ".deployment.json");
+  std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+  if (!stream) {
+    throw std::runtime_error("cannot create Manager Apply Deployment source");
+  }
+  stream << deployment::canonical_json(deployment.normalized_authored_root());
+  stream.flush();
+  if (!stream) {
+    throw std::runtime_error("cannot write Manager Apply Deployment source");
+  }
+}
+
 [[nodiscard]] Arguments ParseArguments(const int argc, char **argv) {
-  if ((argc != 5 && argc != 7) || std::string_view(argv[1]) != "--package-root" ||
-      std::string_view(argv[2]).empty() || std::string_view(argv[3]) != "--metadata" ||
+  if ((argc != 5 && argc != 7) ||
+      std::string_view(argv[1]) != "--package-root" ||
+      std::string_view(argv[2]).empty() ||
+      std::string_view(argv[3]) != "--metadata" ||
       std::string_view(argv[4]).empty() ||
       (argc == 7 && (std::string_view(argv[5]) != "--profile" ||
                      (std::string_view(argv[6]) != "assistant-native" &&
@@ -50,7 +70,8 @@ struct Arguments final {
         "usage: generate_manager_apply_package --package-root <path> "
         "--metadata <path> [--profile assistant-native|operator-confirmation]");
   }
-  return {argv[2], argv[4], argc == 7 && std::string_view(argv[6]) == "assistant-native",
+  return {argv[2], argv[4],
+          argc == 7 && std::string_view(argv[6]) == "assistant-native",
           argc == 7 && std::string_view(argv[6]) == "operator-confirmation"};
 }
 
@@ -148,7 +169,7 @@ struct ProgramPublication final {
   core::ScenarioCatalogRevision catalog_revision;
 };
 
-[[nodiscard]] std::string ProgramBytes(const deployment::RetainedBundle& bundle,
+[[nodiscard]] std::string ProgramBytes(const deployment::RetainedBundle &bundle,
                                        const bool operator_confirmation) {
   const auto arm_binding =
       std::find_if(bundle.value().cell_graph.control_bindings.begin(),
@@ -240,10 +261,11 @@ struct ProgramPublication final {
   if (operator_confirmation) {
     // One explicit qualified test source; the maintained default is unchanged.
     auto fields = root.as_object();
-    for (auto& [field, value] : fields) {
+    for (auto &[field, value] : fields) {
       if (field == "target_roles") {
         auto targets = value.as_object();
-        targets.emplace_back("gripper", deployment::parse_strict_json_model_yaml(R"({
+        targets.emplace_back("gripper",
+                             deployment::parse_strict_json_model_yaml(R"({
           "component_role":"robot",
           "required_capabilities":[
             {"capability_id":"tool.gripper.command","parameters":{},"disposition":"required"},
@@ -252,7 +274,7 @@ struct ProgramPublication final {
           "required_frame_roles":["tcp"], "required_resource_roles":["fingers"],
           "required_collision_body_roles":["gripper_collision"], "required_model_roles":["arm_model"]
         })")
-                                            .root());
+                                 .root());
         value = deployment::CanonicalValue(std::move(targets));
       } else if (field == "tree") {
         value = deployment::parse_strict_json_model_yaml(R"({
@@ -285,8 +307,8 @@ struct ProgramPublication final {
 }
 
 [[nodiscard]] ProgramPublication PublishAssistantNativeProgram(
-    const std::filesystem::path& package_root,
-    const std::shared_ptr<const deployment::RetainedBundle>& bundle,
+    const std::filesystem::path &package_root,
+    const std::shared_ptr<const deployment::RetainedBundle> &bundle,
     const bool operator_confirmation = false) {
   if (bundle == nullptr ||
       bundle->value().compiled_products.symbol_role_maps.size() != 1U) {
@@ -307,20 +329,20 @@ struct ProgramPublication final {
       ProgramBytes(*bundle, operator_confirmation), *bundle);
   deployment::FilesystemCatalogArtifactStore catalogs(package_root);
   std::vector<core::ProgramTargetRoleAssignmentDTO> targets{
-      {core::TargetRoleId("arm"),
-       core::CommandTargetId(std::string(deployment::test::kLite6ArmTargetId))}};
+      {core::TargetRoleId("arm"), core::CommandTargetId(std::string(
+                                      deployment::test::kLite6ArmTargetId))}};
   if (operator_confirmation) {
-    targets.push_back(
-        {core::TargetRoleId("gripper"),
-         core::CommandTargetId(std::string(deployment::test::kLite6GripperTargetId))});
+    targets.push_back({core::TargetRoleId("gripper"),
+                       core::CommandTargetId(std::string(
+                           deployment::test::kLite6GripperTargetId))});
   }
   const auto binding = deployment::compile_program_binding(
       *program,
       core::ProgramRoleAssignmentDTO{
           {core::ProgramComponentRoleAssignmentDTO{
               core::ComponentRoleId("robot"),
-              core::ControllableComponentId(
-                  std::string(deployment::test::kLite6ControllableComponentId))}},
+              core::ControllableComponentId(std::string(
+                  deployment::test::kLite6ControllableComponentId))}},
           std::move(targets),
       },
       *bundle, *model_map, catalogs);
@@ -338,9 +360,11 @@ struct ProgramPublication final {
           .retained_bundle_id = bundle->retained_bundle_id(),
           .program_binding_id = binding->program_binding_id(),
           .deployment_compatibility =
-              deployment::ScenarioDeploymentCompatibilityDTO{"manyforge-only", {}},
-          .assistant_mode = operator_confirmation ? deployment::ScenarioAssistantMode::kForbidden
-                                                  : deployment::ScenarioAssistantMode::kRequired,
+              deployment::ScenarioDeploymentCompatibilityDTO{"manyforge-only",
+                                                             {}},
+          .assistant_mode = operator_confirmation
+                                ? deployment::ScenarioAssistantMode::kForbidden
+                                : deployment::ScenarioAssistantMode::kRequired,
           .typed_parameter_overrides =
               deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
       },
@@ -413,12 +437,15 @@ int main(int argc, char **argv) {
     }
     auto source =
         arguments.assistant_native
-            ? deployment::test::make_lite6_native_cclc_assistant_product_retention_fixture(
-                  arm_lifecycle_semantic.value().value(),
-                  gripper_lifecycle_semantic.value().value())
-            : deployment::test::make_lite6_native_cclc_product_retention_fixture(
-                  arm_lifecycle_semantic.value().value(),
-                  gripper_lifecycle_semantic.value().value(), arguments.operator_confirmation);
+            ? deployment::test::
+                  make_lite6_native_cclc_assistant_product_retention_fixture(
+                      arm_lifecycle_semantic.value().value(),
+                      gripper_lifecycle_semantic.value().value())
+            : deployment::test::
+                  make_lite6_native_cclc_product_retention_fixture(
+                      arm_lifecycle_semantic.value().value(),
+                      gripper_lifecycle_semantic.value().value(),
+                      arguments.operator_confirmation);
     if (!source.native_execution_runtime_profile.has_value()) {
       throw std::logic_error(
           "Manager Apply fixture lacks its native runtime profile");
@@ -445,6 +472,7 @@ int main(int argc, char **argv) {
     if (!arguments.assistant_native) {
       const auto candidate_source =
           NamedRuntimeOnlyCandidate(predecessor_source, profiles);
+      WriteDeploymentSource(arguments.package_root, candidate_source);
       candidate = deployment::detail::RetainedBundleMaterializer::
           materialize_store_and_reload_production(
               CompileEmpty(candidate_source, profiles), manifests, input_source,
@@ -454,6 +482,8 @@ int main(int argc, char **argv) {
         materialize_store_and_reload_production(
             source.qualified, manifests, input_source,
             source.structural_preparations(), catalogs, raw_artifacts, bundles);
+    WriteDeploymentSource(arguments.package_root,
+                          source.qualified.deployment());
     if (predecessor == nullptr || physical_candidate == nullptr ||
         (!arguments.assistant_native && candidate == nullptr) ||
         (candidate != nullptr &&
@@ -477,8 +507,9 @@ int main(int argc, char **argv) {
             arguments.package_root, admission_filename, *predecessor);
 
     if (arguments.assistant_native || arguments.operator_confirmation) {
-      const auto program = PublishAssistantNativeProgram(arguments.package_root, physical_candidate,
-                                                         arguments.operator_confirmation);
+      const auto program = PublishAssistantNativeProgram(
+          arguments.package_root, physical_candidate,
+          arguments.operator_confirmation);
       WriteAssistantNativeMetadata(arguments.metadata_path, admission,
                                    *physical_candidate, program,
                                    admission_filename);

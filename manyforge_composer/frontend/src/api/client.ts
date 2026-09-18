@@ -26,6 +26,9 @@ import {
   parseRuntimeOverrideMaterializationResponse,
   parseRuntimeScaleControlStatus,
   parseScenarioCatalogResponse,
+  parseScenarioDocumentIndexResponse,
+  parseScenarioDocumentLoadResponse,
+  parseScenarioDocumentSaveResponse,
   parseSceneTransactionResponse,
   parseSceneMeshAssetMetadata,
   parseProgramDraftMeshAssetMetadata,
@@ -68,6 +71,10 @@ import type {
   CurrentScenarioResponse,
   RuntimeOverrideMaterializationResponse,
   ScenarioCatalogResponse,
+  ScenarioDocumentFenceRequest,
+  ScenarioDocumentIndexResponse,
+  ScenarioDocumentLoadResponse,
+  ScenarioDocumentSaveResponse,
   SceneTransactionRequest,
   SceneTransactionResponse,
   SceneMeshAssetMetadata,
@@ -549,26 +556,6 @@ export const api = {
         body: JSON.stringify(fence),
       },
     ),
-    loadScenario: (
-      fence: DraftFenceRequest,
-      scenarioId: string,
-      scenarioCatalogRevision: string,
-      confirmDiscard: boolean,
-      signal?: AbortSignal,
-    ): Promise<ProgramWorkspaceTransitionResponse> => requestJson(
-      '/api/scenarios/load',
-      parseProgramWorkspaceTransitionResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          ...fence,
-          scenarioId,
-          scenarioCatalogRevision,
-          confirmDiscard,
-        }),
-      },
-    ),
     materializeRuntimeOverride: (
       fence: DraftFenceRequest,
       programRunId: string,
@@ -584,6 +571,57 @@ export const api = {
           ...fence,
           programRunId,
           proposalId,
+        }),
+      },
+    ),
+  },
+  scenarioDocuments: {
+    list: (
+      directory?: string,
+      signal?: AbortSignal,
+    ): Promise<ScenarioDocumentIndexResponse> => requestJson(
+      `/api/scenario-documents${directory ? `?directory=${encodeURIComponent(directory)}` : ''}`,
+      parseScenarioDocumentIndexResponse,
+      signal,
+    ),
+    save: (
+      fence: ScenarioDocumentFenceRequest,
+      input: {
+        path: string;
+        scenarioId: string;
+        name: string;
+        description: string;
+        confirmOverwrite: boolean;
+      },
+      signal?: AbortSignal,
+    ): Promise<ScenarioDocumentSaveResponse> => requestJson(
+      '/api/scenario-documents/save',
+      parseScenarioDocumentSaveResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, ...input }),
+      },
+    ),
+    load: (
+      fence: ScenarioDocumentFenceRequest,
+      path: string | null,
+      qualifiedScenarioId: string | null,
+      alternateDeploymentPath: string | null,
+      confirmDiscard: boolean,
+      signal?: AbortSignal,
+    ): Promise<ScenarioDocumentLoadResponse> => requestJson(
+      '/api/scenario-documents/load',
+      parseScenarioDocumentLoadResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...fence,
+          path,
+          qualifiedScenarioId,
+          alternateDeploymentPath,
+          confirmDiscard,
         }),
       },
     ),
@@ -698,23 +736,18 @@ export const api = {
       signal,
       { method: 'POST', body: JSON.stringify(fence) },
     ),
-    previewDraft: (
-      fence: DraftFenceRequest,
-      signal?: AbortSignal,
-    ): Promise<DeploymentCandidateOperationResponse> => requestJson(
-      '/api/deployment/draft/preview',
-      parseDeploymentCandidateOperationResponse,
-      signal,
-      { method: 'POST', body: JSON.stringify(fence) },
-    ),
     applyDraft: (
       fence: DraftFenceRequest,
+      confirmationToken: string | null = null,
       signal?: AbortSignal,
     ): Promise<DeploymentCandidateOperationResponse> => requestJson(
       '/api/deployment/draft/apply',
       parseDeploymentCandidateOperationResponse,
       signal,
-      { method: 'POST', body: JSON.stringify(fence) },
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, confirmationToken }),
+      },
     ),
   },
   programs: {

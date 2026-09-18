@@ -226,9 +226,10 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         "    printf '%s\\n' producer-build >> \"$FAKE_LOG\"\n"
         '    printf \'producer-targets:%s\\n\' "$*" >> "$FAKE_LOG"\n'
         "    for output in \\\n"
-        "      manyforge_native_execution_host \\\n"
-        "      manyforge_native_execution_host_pick_place_fixture \\\n"
-        "      manyforge_roboplan_candidate_worker; do\n"
+            "      manyforge_native_execution_host \\\n"
+            "      manyforge_native_execution_host_pick_place_fixture \\\n"
+            "      manyforge_native_execution_host_pick_place_planning_fixture \\\n"
+            "      manyforge_roboplan_candidate_worker; do\n"
         '      : > "$root/$output"\n'
         "    done\n"
         '  elif [ "$root" = "${MANYFORGE_BUILD_DIR}/headless" ]; then\n'
@@ -239,6 +240,10 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         '    : > "$root/manager-apply-test-fixture/metadata.json"\n'
         '    : > "$root/manager-apply-o1-4g-replacement-fixture/metadata.json"\n'
         '    : > "$root/assistant-native-test-fixture/metadata.json"\n'
+        '  elif [ "$root" = "${MANYFORGE_BUILD_DIR}/deployment" ]; then\n'
+        '    package="$root/ui6i-dual-scenario-fixture/retained-package"\n'
+        '    mkdir -p "$package"\n'
+        '    : > "$package/canonical-empty-admission.ui6i_ur5e_lite6_wall_cell.json"\n'
         "  fi\n"
         "  exit 0\n"
         "fi\n"

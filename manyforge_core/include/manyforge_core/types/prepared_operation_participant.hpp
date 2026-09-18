@@ -77,8 +77,6 @@ struct PreparedContactPolicyRefDTO final {
 struct PreparedRuntimePolicyRefDTO final {
   /// Exact retained artifact accepted by Deployment for this operation.
   RuntimePolicyCatalogRecordRefDTO source_artifact;
-  /// Exact row that produced the effective conservative speed ceiling.
-  RuntimeMotionSpeedLimitDTO selected_motion_speed_limit;
   friend bool operator==(const PreparedRuntimePolicyRefDTO&,
                          const PreparedRuntimePolicyRefDTO&) = default;
 };
@@ -104,6 +102,8 @@ struct PreparedMotionExecutionDTO final {
   PreparedMotionValidationEvidenceDTO validation_evidence;
   std::optional<PreparedContactPolicyRefDTO> contact_policy;
   PreparedRuntimePolicyRefDTO runtime_policy;
+  std::optional<double> requested_tcp_linear_speed_mps;
+  double deployment_maximum_tcp_linear_speed_mps{};
   std::vector<PreparedMotionInterruptScopeDTO> interrupt_scopes;
   double execution_timeout_s{};
 };

@@ -149,7 +149,9 @@ _RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
         "adapters.execution.config.initial_joint_positions_rad"
     ),
     "mode": "adapters.execution.config.mode",
-    "motion_target_limits": "robot_config.global_max_tcp_linear_speed_mps",
+    "motion_target_limits": (
+        "deployment.motion_target_limits[].maximum_tcp_linear_speed_mps"
+    ),
     "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
     "planner_rng_seed": "adapters.planning.config.rng_seed",
 }
@@ -262,25 +264,25 @@ _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
         "5465175c487df3cc2cc34ef714b3372550bec75396cbb24809f3a5140dab9ed1"
     ),
     "lite6_native_simulated_v0": (
-        "0f7aebf916e5dda449405bd2a52ea2554a495dea510ef787312978a1b85490ce"
+        "de7787ba7631291e7701432b4f1a14d0296082af345c0a6197acc42dde2ec425"
     ),
     "ur10e_robotiq_assistant_isaac_commanded_v0": (
         "c334ba022f55d83199ef995747d778016d498753cbf28dec99d22bc9de6f7330"
     ),
     "ur10e_robotiq_assistant_native_simulated_v0": (
-        "949f67583115adac7f31eba35ee68ae4e9fbbfeee94289cce0a14cf52b93f615"
+        "ebc4ae29cb59420a463895a8b2f43d7155f56c320e8bdcc0794f9f6deda10613"
     ),
     "ur10e_robotiq_isaac_commanded_v0": (
         "8f1205f803354b32c887ee9db8ef98ab3a599e30cb5b22dbfb0aad4e83b7c3a8"
     ),
     "ur10e_robotiq_native_simulated_v0": (
-        "abd8e7b067258f09067267a94eb02613e1dfa7907c5a92e0afbd147c01ce5347"
+        "1bf900ab5269eadf578a5344bf87d974a02c3ac52131db5f2e3e9533f7822f0a"
     ),
     "ur5_native_simulated_v0": (
-        "4657afd224d18c83d40955e4cd7a2c1f556c83934e568e775255b4ced385c85b"
+        "f0c73afe865b8952c82310ef47f9db62ccd2ab5c7002fc76262be7f07f1abac5"
     ),
     "ur5e_robotiq_native_simulated_v0": (
-        "790a592d040a8141288f9f626d7262e54dff047a9fc0786e4685762431eba7e0"
+        "3f500ed608e42f2855cb45a74b1fc940ce68f20e0f1758b9259f382e56f4364f"
     ),
 }
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
@@ -322,10 +324,6 @@ _EXPECTED_DEPLOYMENT_RUNTIME_PROFILE_IDS: Final = {
     "examples/trocar_lite6_foundationpose_pick.deployment.yaml": (
         "lite6_isaac_commanded_v0"
     ),
-}
-_EXPECTED_SPEED_MPS: Final = {
-    source: 0.15 if "lite6_" in source else 0.25
-    for source in _EXPECTED_DEPLOYMENT_SOURCES
 }
 _EXPECTED_OPEN_LOOP_SOURCES: Final = frozenset(
     {
@@ -1620,38 +1618,7 @@ def _validate_role_assignment(
 def _validate_policy(value: object, *, target_roles: set[str], path: str) -> str:
     row = _object(value, path=path)
     kind = row.get("kind")
-    if kind == "target_tcp_linear_speed_limit":
-        row = _exact(
-            row,
-            required=frozenset(
-                {
-                    "kind",
-                    "source_field",
-                    "target_role_id",
-                    "maximum_speed_mps",
-                    "runtime_acceptance_step",
-                    "acceptance_obligation_id",
-                }
-            ),
-            path=path,
-        )
-        if row["source_field"] != "robot_config.global_max_tcp_linear_speed_mps":
-            raise SourceDescriptionError(
-                f"{path}.source_field is not the historical speed field"
-            )
-        speed = row["maximum_speed_mps"]
-        if type(speed) not in {int, float} or not math.isfinite(speed) or speed <= 0.0:
-            raise SourceDescriptionError(
-                f"{path}.maximum_speed_mps must be positive and finite"
-            )
-        if (
-            row["runtime_acceptance_step"] != "I8/P5"
-            or row["acceptance_obligation_id"] != "retained_native_tcp_speed_limit"
-        ):
-            raise SourceDescriptionError(
-                f"{path} changes the deferred speed owner/acceptance obligation"
-            )
-    elif kind == "open_loop_grasp_acknowledgement":
+    if kind == "open_loop_grasp_acknowledgement":
         row = _exact(
             row,
             required=frozenset(
@@ -1959,7 +1926,10 @@ def validate(source: Path, root: Path) -> None:
             if is_ros2_control
             else _RUNTIME_RESTORATION_SOURCE_FIELDS
         )
-        if profile_id == "lite6_native_simulated_v0":
+        if profile_id in {
+            "lite6_native_simulated_v0",
+            "ur5e_robotiq_native_simulated_v0",
+        }:
             expected_source_fields = {
                 **expected_source_fields,
                 "gripper_target_configurations": "grippers",
@@ -2002,7 +1972,6 @@ def validate(source: Path, root: Path) -> None:
     deployment_sources: list[str] = []
     scenario_identifiers: set[str] = set()
     open_loop_sources: set[str] = set()
-    speed_sources: set[str] = set()
     for index, raw_deployment in enumerate(
         _array(top["deployments"], path="$.deployments")
     ):
@@ -2182,22 +2151,10 @@ def validate(source: Path, root: Path) -> None:
                 path=f"{path}.policy_restoration_inputs[{policy_index}]",
             )
             kinds.append(kind)
-            if (
-                kind == "target_tcp_linear_speed_limit"
-                and policy["maximum_speed_mps"]
-                != _EXPECTED_SPEED_MPS[deployment_source]
-            ):
-                raise SourceDescriptionError(
-                    f"{path}.policy_restoration_inputs[{policy_index}] "
-                    "changes the historical speed"
-                )
-        if kinds.count("target_tcp_linear_speed_limit") != 1 or len(kinds) != len(
-            set(kinds)
-        ):
+        if len(kinds) != len(set(kinds)):
             raise SourceDescriptionError(
-                f"{path} must retain one speed input and no duplicate policy kind"
+                f"{path} contains a duplicate runtime-policy kind"
             )
-        speed_sources.add(deployment_source)
         if "open_loop_grasp_acknowledgement" in kinds:
             open_loop_sources.add(deployment_source)
 
@@ -2207,12 +2164,9 @@ def validate(source: Path, root: Path) -> None:
         raise SourceDescriptionError(
             "$.deployments must be unique and canonical-sorted"
         )
-    if (
-        set(deployment_sources) != _EXPECTED_DEPLOYMENT_SOURCES
-        or speed_sources != _EXPECTED_DEPLOYMENT_SOURCES
-    ):
+    if set(deployment_sources) != _EXPECTED_DEPLOYMENT_SOURCES:
         raise SourceDescriptionError(
-            "the exact twelve maintained deployment/speed inputs are incomplete"
+            "the exact twelve maintained Deployment inputs are incomplete"
         )
     if open_loop_sources != _EXPECTED_OPEN_LOOP_SOURCES:
         raise SourceDescriptionError(

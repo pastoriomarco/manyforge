@@ -434,7 +434,33 @@ class ProgramRunTickHost:
         finally:
             # Cleanup or an explicit reconciliation may have changed the
             # current view even when the release reply was lost. No retries.
-            self._observe_after_motion_cleanup(program_run_id)
+            self._observe_after_motion_control(program_run_id)
+
+    def start_motion(
+        self,
+        program_run_id: str,
+        *,
+        expected_run_revision: int,
+        expected_selection_revision: int,
+        request_id: str,
+        group_id: str | list[str] = "all",
+        reason: str | None = None,
+    ) -> ProgramRunSnapshot:
+        """Release one initially Ready selection, then wake its Program."""
+
+        try:
+            return self._owner.start_motion(
+                program_run_id,
+                expected_run_revision=expected_run_revision,
+                expected_selection_revision=expected_selection_revision,
+                request_id=request_id,
+                group_id=group_id,
+                reason=reason,
+            )
+        finally:
+            # The release may have completed even if its reply was lost.
+            # Observe once and never retry the effect.
+            self._observe_after_motion_control(program_run_id)
 
     def prepare_manual_handover(
         self,
@@ -456,9 +482,9 @@ class ProgramRunTickHost:
                 reason=reason,
             )
         finally:
-            self._observe_after_motion_cleanup(program_run_id)
+            self._observe_after_motion_control(program_run_id)
 
-    def _observe_after_motion_cleanup(self, program_run_id: str) -> None:
+    def _observe_after_motion_control(self, program_run_id: str) -> None:
         snapshot = self._owner.read(program_run_id)
         if snapshot.state in {
             ProgramRunState.RUNNING,

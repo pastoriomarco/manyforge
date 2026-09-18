@@ -672,10 +672,11 @@ describe('Program authoring panels', () => {
     const elapsedMs = performance.now() - started;
 
     expect(markup.match(/data-node-id=/g)).toHaveLength(513);
-    expect(markup).toContain('Add child');
-    expect(markup).toContain('Add after');
-    expect(markup).toContain('>Wrap</button>');
-    expect(markup).toContain('Change type');
+    expect(markup).toContain('Node type');
+    expect(markup).toContain('Move earlier');
+    expect(markup).toContain('Move later');
+    expect(markup).not.toContain('Add child');
+    expect(markup).not.toContain('Change type');
     expect(elapsedMs).toBeLessThan(2_000);
   });
 
@@ -733,7 +734,9 @@ describe('Program authoring panels', () => {
       apply: vi.fn(),
       discard: vi.fn(),
       revert: vi.fn(),
-      loadScenario: vi.fn(),
+      saveScenarioDocument: vi.fn(),
+      loadScenarioDocument: vi.fn(),
+      scenarioDocumentPath: null,
       updateNodePolicies: vi.fn(),
       clearFeedback: vi.fn(),
     } satisfies ProgramWorkspaceController;
@@ -749,6 +752,7 @@ describe('Program authoring panels', () => {
         loading: false,
       observationError: null,
       pending: null,
+      selectionPending: [],
       controlPending: null,
         error: null,
       },
@@ -762,7 +766,11 @@ describe('Program authoring panels', () => {
       dismissError: vi.fn(),
       run: vi.fn(),
       stopMotion: vi.fn(),
+      startMotion: vi.fn(),
       resumeMotion: vi.fn(),
+      groupRuntimeScales: {},
+      setGroupRuntimeScale: vi.fn(),
+      commitGroupRuntimeScale: vi.fn(),
       fullStop: vi.fn(),
       resumeFullStop: vi.fn(),
       stop: vi.fn(),
@@ -908,7 +916,9 @@ describe('Program authoring panels', () => {
       apply: vi.fn(),
       discard: vi.fn(),
       revert: vi.fn(),
-      loadScenario: vi.fn(),
+      saveScenarioDocument: vi.fn(),
+      loadScenarioDocument: vi.fn(),
+      scenarioDocumentPath: null,
       updateNodePolicies: vi.fn(),
       clearFeedback: vi.fn(),
     } satisfies ProgramWorkspaceController;
@@ -937,6 +947,7 @@ describe('Program authoring panels', () => {
         loading: false,
       observationError: null,
       pending: null,
+      selectionPending: [],
       controlPending: null,
         error: null,
       },
@@ -950,7 +961,11 @@ describe('Program authoring panels', () => {
       dismissError: vi.fn(),
       run: vi.fn(),
       stopMotion: vi.fn(),
+      startMotion: vi.fn(),
       resumeMotion: vi.fn(),
+      groupRuntimeScales: {},
+      setGroupRuntimeScale: vi.fn(),
+      commitGroupRuntimeScale: vi.fn(),
       fullStop: vi.fn(),
       resumeFullStop: vi.fn(),
       stop: vi.fn(),

@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from 'react';
 
 import { api } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
@@ -17,6 +24,7 @@ import type {
   ProgramWorkspaceResponse,
   ProgramWorkspaceTransitionResponse,
   ProgramWorkspaceTransitionStatus,
+  ScenarioDocumentFenceRequest,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import { browserStableIdentity } from './useHeadlessState';
@@ -97,6 +105,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     programWorkspaceReducer,
     INITIAL_PROGRAM_WORKSPACE_STATE,
   );
+  const [scenarioDocumentPath, setScenarioDocumentPath] = useState<string | null>(null);
   const generation = useRef(0);
   const mounted = useRef(true);
   const workspaceRead = useRef<Promise<ProgramWorkspaceResponse> | null>(null);
@@ -220,6 +229,19 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
 
   const requireWorkspace = useCallback((): ProgramWorkspaceResponse | null =>
     state.workspace, [state.workspace]);
+
+  const scenarioFence = useCallback(async (
+    workspace: ProgramWorkspaceResponse,
+  ): Promise<ScenarioDocumentFenceRequest | null> => {
+    const programFence = fence(workspace, snapshot, requestOwnerEpoch.current);
+    if (programFence === null) return null;
+    const deployment = await api.deploymentWorkspace.get();
+    return {
+      ...programFence,
+      deploymentDraftId: deployment.draft.id,
+      expectedDeploymentDraftRevision: deployment.draft.revision,
+    };
+  }, [snapshot]);
 
   const mutate = useCallback(async (
     mutation: string,
@@ -346,25 +368,54 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     );
   }, [requireWorkspace, run, snapshot]);
 
-  const loadScenario = useCallback((
-    scenarioId: string,
-    scenarioCatalogRevision: string,
+  const saveScenarioDocument = useCallback((input: {
+    path: string;
+    scenarioId: string;
+    name: string;
+    description: string;
+    confirmOverwrite: boolean;
+  }) => {
+    const workspace = requireWorkspace();
+    if (workspace === null) return;
+    void run('save_scenario_document', async () => {
+      const requestFence = await scenarioFence(workspace);
+      if (requestFence === null) throw new Error('Scenario Save is not admitted.');
+      const response = await api.scenarioDocuments.save(requestFence, input);
+      setScenarioDocumentPath(response.path);
+      return workspaceResult(
+        response.workspace,
+        `Scenario saved (${response.lastKnownStatus}); runtime state was not changed.`,
+      );
+    });
+  }, [requireWorkspace, run, scenarioFence]);
+
+  const loadScenarioDocument = useCallback((
+    path: string | null,
+    qualifiedScenarioId: string | null,
+    alternateDeploymentPath: string | null,
     confirmDiscard: boolean,
   ) => {
     const workspace = requireWorkspace();
-    const requestFence = workspace
-      ? fence(workspace, snapshot, requestOwnerEpoch.current) : null;
-    if (!requestFence) return;
-    void run(
-      'load',
-      () => api.programWorkspace.loadScenario(
+    if (workspace === null) return;
+    void run('load_scenario_document', async () => {
+      const requestFence = await scenarioFence(workspace);
+      if (requestFence === null) throw new Error('Scenario Load is not admitted.');
+      const response = await api.scenarioDocuments.load(
         requestFence,
-        scenarioId,
-        scenarioCatalogRevision,
+        path,
+        qualifiedScenarioId,
+        alternateDeploymentPath,
         confirmDiscard,
-      ).then((response) => programWorkspaceTransitionResult('load', response)),
-    );
-  }, [requireWorkspace, run, snapshot]);
+      );
+      setScenarioDocumentPath(response.path);
+      return workspaceResult(
+        response.workspace,
+        response.status === 'loaded'
+          ? 'Scenario loaded; its Deployment converged and its Program was Applied.'
+          : 'Incomplete Scenario opened for editing; runtime state was not changed.',
+      );
+    });
+  }, [requireWorkspace, run, scenarioFence]);
 
   const updateNodePolicies = useCallback((
     instanceId: string,
@@ -399,7 +450,9 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     apply,
     discard,
     revert,
-    loadScenario,
+    saveScenarioDocument,
+    loadScenarioDocument,
+    scenarioDocumentPath,
     updateNodePolicies,
     clearFeedback,
   }), [
@@ -407,7 +460,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     apply,
     clearFeedback,
     discard,
-    loadScenario,
+    loadScenarioDocument,
     mutate,
     mutationAvailable,
     mutationUnavailableReason,
@@ -417,6 +470,8 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     revert,
     save,
     saveAs,
+    saveScenarioDocument,
+    scenarioDocumentPath,
     state,
     updateNodePolicies,
   ]);

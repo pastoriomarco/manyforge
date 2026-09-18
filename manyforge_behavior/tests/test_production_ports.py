@@ -1236,6 +1236,51 @@ def test_program_scope_stop_joins_inflight_admission_and_fences_fresh_work() -> 
     assert len(transport.submissions) == 1
 
 
+def test_program_scope_stop_owns_operation_accepted_before_local_retention() -> None:
+    accepted = Event()
+    release_reply = Event()
+
+    class _AcceptedBeforeReplyTransport(_Transport):
+        def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            response = super().submit(body)
+            accepted.set()
+            assert release_reply.wait(timeout=2.0)
+            return response
+
+    transport = _AcceptedBeforeReplyTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    started: list[OwnerTaskSnapshot] = []
+
+    admission = Thread(target=lambda: started.append(port.operations.start(
+        "motion.move_to_pose",
+        _identity("accepted-before-local-retention"),
+        _motion_inputs(),
+    )))
+    admission.start()
+    assert accepted.wait(timeout=1.0)
+
+    stopped = port.scope.request_stop(
+        "program-run.1",
+        "execution:caller.1:request.crossing-retention",
+        "priority Stop",
+    )
+    assert stopped.state is ProgramRunScopeState.ACTIVE
+    assert stopped.active_operation_count == 0
+
+    release_reply.set()
+    admission.join(timeout=1.0)
+    assert not admission.is_alive()
+    assert len(started) == 1
+
+    port.operations.cancel(
+        started[0].task_id,
+        _identity("accepted-before-local-retention"),
+    )
+
+    assert [row[0] for row in transport.controls] == ["stop_program_run"]
+
+
 def test_program_scope_stop_reaches_kernel_before_first_task_is_retained() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))

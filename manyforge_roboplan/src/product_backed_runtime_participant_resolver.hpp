@@ -47,7 +47,8 @@ public:
       std::shared_ptr<const deployment::RetainedBundle> retained_bundle,
       deployment::VerifiedRetainedModelMap retained_model_map,
       std::vector<core::RuntimeParticipantBinding> physical_bindings,
-      std::vector<core::ProgramBindingId> intrinsic_direct_bindings);
+      std::vector<core::ProgramBindingId> intrinsic_direct_bindings,
+      std::filesystem::path program_artifact_root = {});
 
   [[nodiscard]] core::Result<core::RuntimeParticipantBinding>
   Resolve(const core::OperationIntentDTO &operation,
@@ -95,16 +96,29 @@ public:
   operator=(const ProductBackedRuntimeParticipantResolver &) = delete;
 
 private:
- struct ObservationSelection final {
-   // This exact Binding's Program was verified when the slot was populated.
-   // Changing only role/capability must not reparse the immutable Program.
-   std::shared_ptr<const deployment::ProgramBinding> binding;
-   deployment::RuntimeProgramTargetBinding target;
-   std::optional<deployment::RuntimeProgramTargetBinding> frame_state_target;
- };
+  struct ObservationSelection final {
+    // This exact Binding's Program was verified when the slot was populated.
+    // Changing only role/capability must not reparse the immutable Program.
+    std::shared_ptr<const deployment::ProgramBinding> binding;
+    deployment::RuntimeProgramTargetBinding target;
+    std::optional<deployment::RuntimeProgramTargetBinding> frame_state_target;
+  };
+
+  [[nodiscard]] std::shared_ptr<const deployment::ProgramBinding>
+  LoadProgramBinding(const core::ProgramBindingId &program_binding_id) const;
+  [[nodiscard]] std::shared_ptr<const deployment::ProgramBindingContract>
+  LoadProgram(const core::ProgramId &program_id,
+              const core::ProgramRevision &program_revision) const;
 
   deployment::FilesystemVerifiedProgramSource programs_;
   deployment::FilesystemVerifiedProgramBindingSource bindings_;
+  // Program Apply publishes immutable, content-addressed Programs and Bindings
+  // outside the installed package. Exact point reads prefer that repository
+  // and fall back to the installed baseline; neither source is enumerated.
+  std::unique_ptr<deployment::FilesystemVerifiedProgramSource>
+      artifact_programs_;
+  std::unique_ptr<deployment::FilesystemVerifiedProgramBindingSource>
+      artifact_bindings_;
   std::shared_ptr<const deployment::RetainedBundle> retained_bundle_;
   deployment::VerifiedRetainedModelMap retained_model_map_;
   std::vector<core::RuntimeParticipantBinding> physical_bindings_;
@@ -115,7 +129,8 @@ private:
   // One immutable resolution per composition, never a live source/sample.
   // Concurrent misses may duplicate bounded cold work; neither waits for the
   // other's I/O and replacement cannot grow a service-lifetime cache.
-  mutable std::atomic<std::shared_ptr<const ObservationSelection>> observation_selection_;
+  mutable std::atomic<std::shared_ptr<const ObservationSelection>>
+      observation_selection_;
 };
 
 } // namespace manyforge::roboplan_backend

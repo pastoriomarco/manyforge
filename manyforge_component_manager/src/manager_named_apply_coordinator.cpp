@@ -15,6 +15,13 @@ namespace deployment = manyforge::deployment;
 constexpr std::size_t kMaximumApplyIdMintAttempts = 4U;
 constexpr std::size_t kMaximumSelectedBundleAdvances = 2U;
 
+[[nodiscard]] bool SameDeploymentRevision(
+    const core::ProjectionRevisionDTO &left,
+    const core::ProjectionRevisionDTO &right) noexcept {
+  return left.retained_bundle_id == right.retained_bundle_id &&
+         left.graph_revision == right.graph_revision;
+}
+
 [[noreturn]] void Fail(const std::string &detail) {
   throw ManagerNamedApplyCoordinatorError(detail);
 }
@@ -72,8 +79,8 @@ FenceExpectation(const ManagerApplyIntentDTO &intent,
   const auto snapshot = kernel_fence.ObserveAdmission(query);
   Require(snapshot.matches(query),
           "Kernel returned invalid or foreign admission evidence");
-  Require(snapshot.active_projection_revision ==
-                  intent.expected_active_projection_revision &&
+  Require(SameDeploymentRevision(snapshot.active_projection_revision,
+                                 intent.expected_active_projection_revision) &&
               snapshot.active_public_pointer_digest ==
                   active_plan.active_publication
                       .durable_public_pointer_content_digest &&
@@ -256,12 +263,15 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     core::RuntimeEpoch manager_runtime_epoch, std::string operating_system,
     std::vector<std::string> launch_environment_contracts,
     RuntimeObservationReducer::Clock clock_ns, ApplyIdFactory apply_id_factory,
-    RuntimePreStartGuard pre_start_guard)
+    RuntimePreStartGuard pre_start_guard,
+    ApplyProgressObserver apply_progress_observer)
     : apply_journal_(apply_journal), active_plan_source_(active_plan_source),
       retained_bundle_source_(retained_bundle_source),
+      scene_owner_(scene_owner),
       kernel_fence_(kernel_fence), cell_admission_(cell_admission),
       manager_runtime_epoch_(std::move(manager_runtime_epoch)),
       apply_id_factory_(std::move(apply_id_factory)),
+      apply_progress_observer_(std::move(apply_progress_observer)),
       fence_coordinator_(apply_journal_, kernel_fence_, manager_runtime_epoch_),
       runtime_coordinator_(fence_coordinator_, apply_journal_,
                            publication_store, artifact_source, process_port,
@@ -342,12 +352,17 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ApplyOrRecover(
                   request.expected_current_graph_revision,
           "named Apply expected_current does not match the active pointer");
 
+  const auto scene_revision = scene_owner_.CurrentProjectionRevision();
+  Require(scene_revision.valid() &&
+              SameDeploymentRevision(scene_revision, active_revision),
+          "logical-scene predecessor does not match the active Deployment");
+
   ManagerApplyIntentDTO intent{
       request.request_context,
       MintApplyId(),
       core::ApplyGeneration(1U),
       apply_journal_.cell_id(),
-      active_revision,
+      scene_revision,
       candidate->retained_bundle_id(),
       candidate_value.cell_graph.graph_revision,
       request.expected_admission_generation,
@@ -363,6 +378,9 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   Require(intent.valid() && intent.cell_id == apply_journal_.cell_id(),
           "durable Apply intent is invalid or belongs to another cell");
   const auto durable_intent = apply_journal_.EnsureIntent(intent).record;
+  if (apply_progress_observer_) {
+    apply_progress_observer_(durable_intent.intent);
+  }
 
   if (const auto terminal = apply_journal_.ReadTerminalOutcome(
           intent.apply_id, intent.apply_generation);
@@ -418,9 +436,10 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
                .has_value()) {
         const auto active_plan = active_plan_source_.ReadCurrentPlan();
         Require(active_plan.valid() &&
-                    active_plan.active_publication.request
-                            .candidate_projection_revision ==
-                        intent.expected_active_projection_revision,
+                    SameDeploymentRevision(
+                        active_plan.active_publication.request
+                            .candidate_projection_revision,
+                        intent.expected_active_projection_revision),
                 "predecessor publication changed before Apply selection");
         const auto expectation = FenceExpectation(
             intent, *predecessor, *candidate, active_plan, apply_journal_,

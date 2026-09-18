@@ -5,6 +5,7 @@
 
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/deployment_authoring.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/scenario_catalog.hpp>
@@ -472,10 +473,9 @@ bool ScenarioProgramSelection::valid() const noexcept {
          is_sha256_digest(program_revision.value()) &&
          is_sha256_digest(node_environment_digest.value()) &&
          compatibility_valid && typed_parameter_overrides.is_object() &&
-         (assistant_absent ||
-          normalized_assistant_projection.is_object()) &&
+         (assistant_absent || normalized_assistant_projection.is_object()) &&
          (assistant_mode != ScenarioAssistantMode::kRequired ||
-         normalized_assistant_projection.is_object()) &&
+          normalized_assistant_projection.is_object()) &&
          (assistant_mode != ScenarioAssistantMode::kForbidden ||
           assistant_absent) &&
          normalized_program_root.is_object() &&
@@ -499,20 +499,17 @@ ScenarioApplyCandidateSelection
 FilesystemScenarioApplyCandidateSource::ResolveExact(
     const ScenarioApplyCandidateQuery &query) const {
   Require(query.valid(), "scenario Apply candidate query is invalid");
-  if (const auto candidate = candidate_catalog_path();
-      candidate.has_value()) {
+  if (const auto candidate = candidate_catalog_path(); candidate.has_value()) {
     auto result = TryResolveCatalog(
         ReadExactArtifact(*candidate, "candidate scenario Apply catalog"),
         query);
     if (result.has_value()) {
-      Require(result->valid(),
-              "scenario Apply candidate selection is invalid");
+      Require(result->valid(), "scenario Apply candidate selection is invalid");
       return *result;
     }
   }
-  auto result = ResolveCatalog(ReadExactArtifact(
-                                   catalog_path(), "scenario Apply catalog"),
-                               query);
+  auto result = ResolveCatalog(
+      ReadExactArtifact(catalog_path(), "scenario Apply catalog"), query);
   Require(result.valid(), "scenario Apply candidate selection is invalid");
   return result;
 }
@@ -529,6 +526,76 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
   return LoadExactProgramSelectionFrom(scenario_id, catalog_path());
 }
 
+CanonicalValue
+FilesystemScenarioApplyCandidateSource::LoadExactDeploymentDocument(
+    const ScenarioProgramSelection &selection) const {
+  Require(selection.valid(), "scenario Deployment selection is invalid");
+  const auto load_from =
+      [&](const std::filesystem::path &root) -> std::optional<CanonicalValue> {
+    std::vector<std::filesystem::path> candidates;
+    std::size_t entry_count = 0U;
+    std::error_code error;
+    for (std::filesystem::directory_iterator iterator(root, error), end;
+         !error && iterator != end; iterator.increment(error)) {
+      Require(entry_count < 4096U,
+              "scenario package contains too many direct entries");
+      ++entry_count;
+      const auto &path = iterator->path();
+      const auto name = path.filename().string();
+      const bool deployment_name = name.ends_with(".deployment.yaml") ||
+                                   name.ends_with(".deployment.yml") ||
+                                   name.ends_with(".deployment.json");
+      const auto status = iterator->symlink_status(error);
+      if (error) {
+        break;
+      }
+      if (deployment_name && std::filesystem::is_regular_file(status) &&
+          !std::filesystem::is_symlink(status)) {
+        candidates.push_back(path);
+      }
+    }
+    Require(!error, "scenario Deployment source enumeration failed");
+    std::sort(candidates.begin(), candidates.end());
+    std::optional<CanonicalValue> selected_document;
+    for (const auto &path : candidates) {
+      try {
+        const auto verified = verify_deployment_draft(
+            ReadExactArtifact(path, "scenario Deployment"));
+        if (verified.deployment_artifact_id !=
+                selection.deployment_artifact_id.value() ||
+            verified.deployment_revision !=
+                selection.deployment_revision.value() ||
+            verified.graph_revision != selection.graph_revision.value()) {
+          continue;
+        }
+        Require(!selected_document.has_value(),
+                "scenario Deployment source is ambiguous");
+        selected_document =
+            parse_strict_json_model_yaml(verified.canonical_json).root();
+      } catch (const std::invalid_argument &) {
+        continue;
+      }
+    }
+    return selected_document;
+  };
+
+  // The generated artifact repository is a sparse overlay. Prefer an exact
+  // authored Deployment source published there, but do not mistake the
+  // presence of another artifact from the same retained bundle for a complete
+  // package. An unchanged exact Deployment remains owned by the installed
+  // package beneath that overlay.
+  std::optional<CanonicalValue> selected;
+  if (candidate_package_root_.has_value()) {
+    selected = load_from(*candidate_package_root_);
+  }
+  if (!selected.has_value()) {
+    selected = load_from(package_root_);
+  }
+  Require(selected.has_value(),
+          "scenario Deployment source is absent or unverifiable");
+  return std::move(*selected);
+}
+
 ScenarioProgramSelection
 FilesystemScenarioApplyCandidateSource::LoadExactProgramSelectionForCatalog(
     const std::string_view scenario_id,
@@ -538,16 +605,14 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelectionForCatalog(
 }
 
 std::optional<ScenarioProgramSelection>
-FilesystemScenarioApplyCandidateSource::
-    TryLoadExactProgramSelectionForActive(
-        const std::string_view scenario_id,
-        const core::RetainedBundleId &retained_bundle_id,
-        const core::GraphRevision &graph_revision) const {
+FilesystemScenarioApplyCandidateSource::TryLoadExactProgramSelectionForActive(
+    const std::string_view scenario_id,
+    const core::RetainedBundleId &retained_bundle_id,
+    const core::GraphRevision &graph_revision) const {
   Require(is_sha256_digest(retained_bundle_id.value()) &&
               is_sha256_digest(graph_revision.value()),
           "active Scenario selection identity is invalid");
-  if (const auto candidate = candidate_catalog_path();
-      candidate.has_value()) {
+  if (const auto candidate = candidate_catalog_path(); candidate.has_value()) {
     auto selection = LoadExactProgramSelectionFrom(scenario_id, *candidate);
     if (selection.retained_bundle_id == retained_bundle_id &&
         selection.graph_revision == graph_revision) {
@@ -566,8 +631,8 @@ ScenarioProgramSelection
 FilesystemScenarioApplyCandidateSource::LoadExactProgramSelectionFrom(
     const std::string_view scenario_id,
     const std::filesystem::path &selected_catalog_path) const {
-  const auto catalog =
-      VerifyCatalog(ReadExactArtifact(selected_catalog_path, "scenario catalog"));
+  const auto catalog = VerifyCatalog(
+      ReadExactArtifact(selected_catalog_path, "scenario catalog"));
   const auto &row = ExactScenario(catalog.root, scenario_id);
   const auto &row_scenario_id = Text(
       Member(row, "scenario_id", "$.scenarios[]"), "$.scenarios[].scenario_id");
@@ -625,10 +690,10 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelectionFrom(
   Require(model_map.has_value(),
           "scenario retained model map is absent or unverifiable");
 
-  const auto binding_bytes = ReadExactArtifact(
-      DigestPath(selected_package_root, "program-bindings",
-                 program_binding_id.value()),
-      "scenario Program Binding");
+  const auto binding_bytes =
+      ReadExactArtifact(DigestPath(selected_package_root, "program-bindings",
+                                   program_binding_id.value()),
+                        "scenario Program Binding");
   const auto binding =
       reload_verified_program_binding(binding_bytes, *bundle, *model_map);
   Require(binding->program_binding_id() == program_binding_id &&
@@ -661,9 +726,9 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelectionFrom(
   CanonicalValue assistant_projection(nullptr);
   if (bundle->value().assistant.has_value()) {
     try {
-      assistant_projection =
-          parse_strict_json_model_yaml(bundle->value().assistant->canonical_json)
-              .root();
+      assistant_projection = parse_strict_json_model_yaml(
+                                 bundle->value().assistant->canonical_json)
+                                 .root();
     } catch (const ArtifactCodecError &error) {
       Fail(std::string("scenario retained assistant projection cannot be "
                        "decoded: ") +
@@ -722,8 +787,7 @@ FilesystemScenarioApplyCandidateSource::catalog_path_for_revision(
     const core::ScenarioCatalogRevision &scenario_catalog_revision) const {
   Require(is_sha256_digest(scenario_catalog_revision.value()),
           "scenario catalog revision is invalid");
-  if (const auto candidate = candidate_catalog_path();
-      candidate.has_value()) {
+  if (const auto candidate = candidate_catalog_path(); candidate.has_value()) {
     const auto verified = VerifyCatalog(
         ReadExactArtifact(*candidate, "candidate scenario catalog"));
     if (verified.revision == scenario_catalog_revision) {

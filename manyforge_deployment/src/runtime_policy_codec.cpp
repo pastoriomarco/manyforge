@@ -7,10 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <tuple>
-#include <type_traits>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include "catalog_record_referent_internal.hpp"
@@ -53,16 +50,6 @@ namespace {
   return *result;
 }
 
-[[nodiscard]] double number(const CanonicalValue& value,
-                            std::string_view name) {
-  const auto* result = std::get_if<double>(&value.storage());
-  if (result == nullptr || !std::isfinite(*result)) {
-    fail("runtime policy normalized field is not finite: " +
-         std::string(name));
-  }
-  return *result;
-}
-
 [[nodiscard]] bool boolean(const CanonicalValue& value,
                            std::string_view name) {
   const auto* result = std::get_if<bool>(&value.storage());
@@ -71,46 +58,6 @@ namespace {
          std::string(name));
   }
   return *result;
-}
-
-using MotionScopeKey = std::tuple<std::string, std::string, std::string>;
-
-[[nodiscard]] MotionScopeKey motion_scope_key(
-    const core::RuntimePolicyMotionScopeDTO& scope) {
-  return std::visit(
-      [](const auto& value) -> MotionScopeKey {
-        using Value = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<Value,
-                                     core::RuntimePolicyCellScopeDTO>) {
-          return {"cell", "", ""};
-        } else {
-          return {"command_target", value.controllable_component_id.value(),
-                  value.command_target_id.value()};
-        }
-      },
-      scope);
-}
-
-[[nodiscard]] core::RuntimeMotionSpeedLimitDTO decode_motion_limit(
-    const CanonicalValue& value) {
-  const std::string& scope_kind = text(member(value, "scope_kind"),
-                                       "motion_speed_limits.scope_kind");
-  core::RuntimePolicyMotionScopeDTO scope =
-      core::RuntimePolicyCellScopeDTO{};
-  if (scope_kind == "command_target") {
-    scope = core::RuntimePolicyCommandTargetScopeDTO{
-        core::ControllableComponentId(
-            text(member(value, "controllable_component_id"),
-                 "motion_speed_limits.controllable_component_id")),
-        core::CommandTargetId(text(member(value, "command_target_id"),
-                                   "motion_speed_limits.command_target_id"))};
-  } else if (scope_kind != "cell") {
-    fail("runtime policy has an unknown motion-limit scope");
-  }
-  return core::RuntimeMotionSpeedLimitDTO{
-      std::move(scope),
-      number(member(value, "maximum_tcp_linear_speed_mps"),
-             "motion_speed_limits.maximum_tcp_linear_speed_mps")};
 }
 
 [[nodiscard]] core::RuntimeOpenLoopGraspAcknowledgementDTO
@@ -154,27 +101,6 @@ decode_open_loop_acknowledgement(const CanonicalValue& value) {
     interrupt_policy_ids.emplace_back(text(value, "interrupt_policy_ids[]"));
   }
 
-  std::vector<core::RuntimeMotionSpeedLimitDTO> motion_limits;
-  const auto& limit_values = array(member(normalized, "motion_speed_limits"),
-                                   "motion_speed_limits");
-  motion_limits.reserve(limit_values.size());
-  for (const auto& value : limit_values) {
-    motion_limits.push_back(decode_motion_limit(value));
-  }
-  if (!std::is_sorted(motion_limits.begin(), motion_limits.end(),
-                      [](const auto& left, const auto& right) {
-                        return motion_scope_key(left.scope) <
-                               motion_scope_key(right.scope);
-                      }) ||
-      std::adjacent_find(motion_limits.begin(), motion_limits.end(),
-                         [](const auto& left, const auto& right) {
-                           return motion_scope_key(left.scope) ==
-                                  motion_scope_key(right.scope);
-                         }) != motion_limits.end()) {
-    fail("runtime policy motion_speed_limits must be unique and canonical-"
-         "sorted by scope");
-  }
-
   std::vector<core::RuntimeOpenLoopGraspAcknowledgementDTO>
       open_loop_acknowledgements;
   const auto& acknowledgement_values = array(
@@ -194,7 +120,6 @@ decode_open_loop_acknowledgement(const CanonicalValue& value) {
                "runtime_policy_revision")),
       std::move(description),
       std::move(interrupt_policy_ids),
-      std::move(motion_limits),
       std::move(open_loop_acknowledgements)};
 }
 

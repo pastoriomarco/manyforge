@@ -26,6 +26,13 @@ using core::ProjectionApplyStatusState;
 using core::ProjectionTransitionEvidenceState;
 using deployment::RetainedBundle;
 
+[[nodiscard]] bool SameDeploymentRevision(
+    const core::ProjectionRevisionDTO &left,
+    const core::ProjectionRevisionDTO &right) noexcept {
+  return left.retained_bundle_id == right.retained_bundle_id &&
+         left.graph_revision == right.graph_revision;
+}
+
 [[noreturn]] void Fail(const std::string &detail) {
   throw ManagerSelectedBundleTransitionCoordinatorError(detail);
 }
@@ -179,8 +186,9 @@ ObserveObsoleteManagedCommandSurfaces(
              stage_intent.predecessor_publication_generation &&
          receipt.durable_public_pointer_content_digest ==
              stage_intent.predecessor_public_pointer_digest &&
-         receipt.request.candidate_projection_revision ==
-             stage_intent.expected_active_projection_revision &&
+         SameDeploymentRevision(
+             receipt.request.candidate_projection_revision,
+             stage_intent.expected_active_projection_revision) &&
          receipt.request.candidate_retained_bundle_id ==
              stage_intent.expected_active_projection_revision
                  .retained_bundle_id &&

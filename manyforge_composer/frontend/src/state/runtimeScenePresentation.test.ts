@@ -10,6 +10,7 @@ import type {
   SourceModelProjection,
 } from '../types/api';
 import type {
+  CapabilityCommandPreviewReceipt,
   ExecutionOwnerStatus,
   ManualControlMotionDescriptor,
   MotionPreviewReceipt,
@@ -17,6 +18,7 @@ import type {
 import type { ExecutionObservationFrame } from '../types/viewerObservation';
 import {
   attachedScenePresentation,
+  candidateGripperPresentation,
   candidateRobotPresentation,
   candidateToolPresentation,
   candidateObservationEpoch,
@@ -167,7 +169,7 @@ function sourceModel(): SourceModelProjection {
 
 function motionDescriptor(): ManualControlMotionDescriptor {
   return {
-    schemaVersion: 'manyforge.manual_control_motion_descriptor.v4',
+    schemaVersion: 'manyforge.manual_control_motion_descriptor.v5',
     ordinaryJerk: null,
     controllableComponentId: 'robot-1',
     commandTargetId: 'arm',
@@ -358,6 +360,62 @@ describe('runtime scene presentation', () => {
     const mismatched = executionStatus();
     mismatched.graphRevision = 'another-graph';
     expect(executionRobotPresentation(mismatched, sourceModel(), manifest())).toBeNull();
+  });
+
+  it('projects every observed robot instead of fabricating unselected robots at neutral', () => {
+    const status = executionStatus();
+    const secondDescriptor = {
+      ...status.directControl.targetDescriptor,
+      controllableComponentId: 'robot-2',
+      commandTargetId: 'arm-2',
+      joints: [{
+        ...status.directControl.targetDescriptor.joints[0],
+        sourceJointName: 'source-joint-2',
+        compiledJointName: 'joint-2',
+      }],
+    };
+    status.directControlTargets = [status.directControl, {
+      ...status.directControl,
+      controllableComponentId: 'robot-2',
+      commandTargetId: 'arm-2',
+      targetDescriptor: secondDescriptor,
+    }];
+    status.observedMotions = [status.observedMotion, {
+      ...status.observedMotion,
+      controllableComponentId: 'robot-2',
+      commandTargetId: 'arm-2',
+      sourceJointNames: ['source-joint-2'],
+      positionsRad: [-Math.PI / 2],
+    }];
+    const model = sourceModel();
+    model.occurrences.push({
+      ...model.occurrences[0],
+      component_id: 'robot-2',
+      model_instance_id: 'model-instance-2',
+      coordinates: [{
+        ...model.occurrences[0].coordinates[0],
+        source_joint_name: 'source-joint-2',
+        viewer_joint_name: 'joint-2',
+      }],
+    });
+    const cellManifest = manifest();
+    cellManifest.links.push(
+      { ...cellManifest.links[1], name: 'link-2' },
+      { ...cellManifest.links[2], name: 'tip-2' },
+    );
+    cellManifest.joints.push(
+      joint('joint-2', 'revolute', 'base', 'link-2', [10, 0, 0]),
+      joint('fixed-tip-2', 'fixed', 'link-2', 'tip-2', [1, 0, 0]),
+    );
+
+    const presentation = executionRobotPresentation(status, model, cellManifest);
+
+    expect(presentation?.linkTransforms.tip.position_m).toEqual(expect.arrayContaining([
+      expect.closeTo(1), expect.closeTo(1), expect.closeTo(0),
+    ]));
+    expect(presentation?.linkTransforms['tip-2'].position_m).toEqual(expect.arrayContaining([
+      expect.closeTo(10), expect.closeTo(-1), expect.closeTo(0),
+    ]));
   });
 
   it('projects and caches compact owner observations once per frame', () => {
@@ -838,6 +896,59 @@ describe('runtime scene presentation', () => {
     expect(scoped.linkTransforms.finger.position_m[2]).toBeCloseTo(0.025);
     expect(Math.abs(scoped.linkTransforms['cross-branch-mimic'].orientation_xyzw[2])).toBeCloseTo(1);
     expect(candidateRobotPresentation(receipt, placed, descriptor, {})).toBeNull();
+  });
+
+  it('materializes an exact gripper preview on the addressed tool only', () => {
+    const placed = manifest();
+    placed.links.push({ ...placed.links[2], name: 'finger' });
+    placed.joints.push(joint('finger-joint', 'prismatic', 'tip', 'finger', [0, 0, 0]));
+    const source = sourceModel();
+    source.occurrences[0].coordinates.push({
+      source_joint_name: 'source-finger', viewer_joint_name: 'finger-joint',
+      coordinate_kind: 'linear', unit: 'meters',
+    } as SourceModelProjection['occurrences'][number]['coordinates'][number]);
+    source.occurrences[0].links = [{
+      source_link_name: 'source-finger-link', viewer_link_name: 'finger',
+    }];
+    source.targets[1].model_groups[0] = {
+      ...source.targets[1].model_groups[0],
+      model_instance_id: 'model-instance-1',
+      commandable_source_joint_names: ['source-finger'],
+    };
+    source.targets[1].collision_bodies = [{
+      collision_body_role_id: 'gripper_collision',
+      model_instance_id: 'model-instance-1',
+      source_link_names: ['source-finger-link'],
+    }];
+    const status = executionStatus();
+    status.directControlGripper = {
+      controllableComponentId: 'robot-1', commandTargetId: 'gripper',
+      componentRoleId: 'controlled_component', targetRoleId: 'command_target',
+      operationCapabilityId: 'tool.gripper.command',
+      commandSchemaId: 'gripper.command_position', commandSchemaRevision: 'schema-1',
+      sourceCoordinateName: 'source-finger', sourceKind: 'model_role',
+      coordinateKind: 'linear_m', minPosition: 0, maxPosition: 0.04,
+    } as ExecutionOwnerStatus['directControlGripper'];
+    const receipt = {
+      schemaVersion: 'manyforge.direct_control_capability_command_preview.v1',
+      receiptDigest: 'gripper-receipt-1', retainedBundleId: 'bundle-1',
+      graphRevision: 'graph-1', componentRoleId: 'controlled_component',
+      targetRoleId: 'command_target', requiredCapabilityId: 'tool.gripper.command',
+      commandSchemaId: 'gripper.command_position', commandSchemaRevision: 'schema-1',
+      sourceCoordinateName: 'source-finger', sourceKind: 'model_role',
+      coordinateKind: 'linear_m', targetPosition: 0.03,
+      minPosition: 0, maxPosition: 0.04,
+    } as CapabilityCommandPreviewReceipt;
+    const measured = measuredLinkTransforms(placed, new Map([['finger-joint', 0.01]]))!;
+    const presentation = candidateGripperPresentation(
+      receipt, status, source, placed, measured,
+    );
+    expect(presentation?.receiptDigest).toBe('gripper-receipt-1');
+    expect(Object.keys(presentation?.linkTransforms ?? {})).toEqual(['finger']);
+    expect(presentation?.linkTransforms.finger.position_m[2]).toBeCloseTo(0.03);
+    expect(candidateGripperPresentation(
+      { ...receipt, targetPosition: 0.05 }, status, source, placed, measured,
+    )).toBeNull();
   });
 
   it('marks a rejected TCP target with only its exact tool, without inventing an IK solution', () => {

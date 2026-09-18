@@ -6,9 +6,16 @@ import {
   type MouseEvent,
 } from 'react';
 
+import { api } from '../api/client';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
-import type { ArtifactKind, CatalogEntry, FileBrowserEntry } from '../types/api';
+import type {
+  ArtifactKind,
+  CatalogEntry,
+  FileBrowserEntry,
+  ScenarioDocumentEntry,
+  ScenarioDocumentIndexResponse,
+} from '../types/api';
 import { ArtifactBrowser } from './ArtifactBrowser';
 import { OverlayPanel } from './OverlayPanel';
 import { ProgramSettingsEditor } from './ProgramSettingsEditor';
@@ -20,7 +27,7 @@ type ProgramAction =
   | 'apply'
   | 'revert'
   | 'discard'
-  | 'load';
+  | 'scenario';
 
 interface ProgramDocumentControlsProps {
   controller: ProgramWorkspaceController;
@@ -47,8 +54,17 @@ function actionTitle(action: ProgramAction): string {
     case 'apply': return 'Apply Draft?';
     case 'revert': return 'Revert to Saved?';
     case 'discard': return 'Discard Draft changes?';
-    case 'load': return 'Load Scenario';
+    case 'scenario': return 'Scenario Save / Load';
   }
+}
+
+function scenarioEntryKey(entry: ScenarioDocumentEntry): string {
+  return `${entry.sourceKind}:${entry.path ?? entry.scenarioId ?? entry.name}`;
+}
+
+function scenarioStatusLabel(entry: ScenarioDocumentEntry): string {
+  if (entry.sourceKind === 'qualified') return 'installed';
+  return entry.displayStatus.replaceAll('_', ' ');
 }
 
 export function ProgramDocumentControls({
@@ -70,7 +86,9 @@ export function ProgramDocumentControls({
     apply: applyDraft,
     discard,
     revert,
-    loadScenario,
+    saveScenarioDocument,
+    loadScenarioDocument,
+    scenarioDocumentPath,
   } = controller;
   const [action, setAction] = useState<ProgramAction | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -79,6 +97,18 @@ export function ProgramDocumentControls({
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmOverwrite, setConfirmOverwrite] = useState(false);
   const [saveAsPath, setSaveAsPath] = useState('');
+  const [scenarioMode, setScenarioMode] = useState<'load' | 'save'>('load');
+  const [scenarioIndex, setScenarioIndex] = useState<ScenarioDocumentIndexResponse | null>(null);
+  const [scenarioIndexError, setScenarioIndexError] = useState<string | null>(null);
+  const [scenarioIndexLoading, setScenarioIndexLoading] = useState(false);
+  const [scenarioDirectory, setScenarioDirectory] = useState('');
+  const [selectedScenarioKey, setSelectedScenarioKey] = useState('');
+  const [alternateDeploymentPath, setAlternateDeploymentPath] = useState('');
+  const [scenarioSavePath, setScenarioSavePath] = useState('');
+  const [scenarioId, setScenarioId] = useState('scenario');
+  const [scenarioName, setScenarioName] = useState('Scenario');
+  const [scenarioDescription, setScenarioDescription] = useState('');
+  const scenarioDirectoryRef = useRef('');
   const returnFocus = useRef<HTMLElement | null>(null);
   const settingsButton = useRef<HTMLButtonElement>(null);
   const observedSettingsRequest = useRef(settingsRequest);
@@ -97,10 +127,6 @@ export function ProgramDocumentControls({
     : mutationUnavailableReason;
   const replaceNeedsConfirmation = workspace?.hasUnsavedChanges === true
     || workspace?.hasUnappliedChanges === true;
-  const scenarioCatalog = runtime.state.catalog;
-  const selectedScenario = scenarioCatalog?.scenarios.find(
-    (row) => row.scenarioId === runtime.state.selectedScenarioId,
-  ) ?? null;
   const currentScenarioProjection = runtime.state.currentScenario;
   const currentScenario = currentScenarioProjection?.currentScenario ?? null;
   const currentScenarioUnavailable = currentScenarioProjection === null
@@ -109,6 +135,18 @@ export function ProgramDocumentControls({
       ? currentScenarioProjection.unavailableReasons.join(', ').replaceAll('_', ' ')
       : 'No exact current Scenario exists.';
   const affectedPolicyInstances = workspace?.applicability.affectedInstanceIds ?? [];
+  const selectedScenarioDocument = scenarioIndex?.entries.find(
+    (entry) => scenarioEntryKey(entry) === selectedScenarioKey,
+  ) ?? null;
+  const selectedScenarioLoadable = selectedScenarioDocument !== null
+    && selectedScenarioDocument.displayStatus !== 'unsupported'
+    && (
+      selectedScenarioDocument.sourceKind === 'saved'
+        ? selectedScenarioDocument.path !== null
+        : selectedScenarioDocument.scenarioId !== null
+          && scenarioIndex?.catalogRevision !== null
+    );
+  const scenarioIdValid = /^[a-z][a-z0-9._-]{0,127}$/.test(scenarioId.trim());
   const hasAppliedUnsavedChanges = workspace?.saved.available === true
     && workspace.applied.available
     && workspace.saved.programRevision !== workspace.applied.programRevision;
@@ -119,6 +157,53 @@ export function ProgramDocumentControls({
   useEffect(() => {
     if (workspace?.saved.path) setSaveAsPath(workspace.saved.path);
   }, [workspace?.saved.path]);
+
+  useEffect(() => {
+    if (scenarioDocumentPath) setScenarioSavePath(scenarioDocumentPath);
+  }, [scenarioDocumentPath]);
+
+  useEffect(() => {
+    if (action !== 'scenario') return;
+    const nextId = authoring?.program_id ?? 'scenario';
+    setScenarioId(nextId);
+    setScenarioName(authoring?.name ?? 'Scenario');
+    setScenarioDescription(authoring?.description ?? '');
+  }, [action, authoring?.description, authoring?.name, authoring?.program_id]);
+
+  const refreshScenarioIndex = useCallback(async (directory?: string) => {
+    setScenarioIndexLoading(true);
+    setScenarioIndexError(null);
+    try {
+      const index = await api.scenarioDocuments.list(directory?.trim() || undefined);
+      setScenarioIndex(index);
+      setScenarioDirectory(index.directory);
+      scenarioDirectoryRef.current = index.directory;
+      setSelectedScenarioKey((current) => (
+        index.entries.some((entry) => scenarioEntryKey(entry) === current)
+          ? current
+          : ''
+      ));
+      setScenarioSavePath((current) => current || (
+        `${index.directory}/${authoring?.program_id ?? 'scenario'}.scenario.yaml`
+      ));
+    } catch (error: unknown) {
+      setScenarioIndexError(
+        error instanceof Error ? error.message : 'Scenario directory could not be read.',
+      );
+    } finally {
+      setScenarioIndexLoading(false);
+    }
+  }, [authoring?.program_id]);
+
+  useEffect(() => {
+    if (action === 'scenario') {
+      void refreshScenarioIndex(scenarioDirectoryRef.current || undefined);
+    }
+  }, [
+    action,
+    refreshScenarioIndex,
+    runtime.state.catalog?.scenarioCatalogRevision,
+  ]);
 
   useEffect(() => {
     if (settingsRequest === observedSettingsRequest.current) return;
@@ -141,6 +226,7 @@ export function ProgramDocumentControls({
     setSelectedProgramPath(null);
     setConfirmDiscard(false);
     setConfirmOverwrite(false);
+    setAlternateDeploymentPath('');
   }, []);
   const beginAction = (
     next: ProgramAction,
@@ -150,6 +236,7 @@ export function ProgramDocumentControls({
     setSelectedProgramPath(null);
     setConfirmDiscard(false);
     setConfirmOverwrite(false);
+    if (next === 'scenario') setScenarioMode('load');
     setAction(next);
   };
   const chooseArtifact = useCallback((
@@ -222,7 +309,7 @@ export function ProgramDocumentControls({
           <button type="button" disabled={authoringBusy || workspace === null} title={authoringBlockReason ?? 'Open a Program as the local Draft without changing the active Scenario.'} onClick={(event) => beginAction('open', event)}>Open</button>
           <button type="button" disabled={authoringBusy || !program || !workspace?.saved.available || !workspace.hasUnsavedChanges} title={authoringBlockReason ?? (!program ? incompleteReason : !workspace?.hasUnsavedChanges ? 'Draft already matches Saved.' : 'Save the current Draft.')} onClick={save}>Save</button>
           <button type="button" disabled={authoringBusy || !program} title={authoringBlockReason ?? (!program ? incompleteReason : 'Save the current Draft to another Program file.')} onClick={(event) => beginAction('save_as', event)}>Save As</button>
-          <button type="button" disabled={authoringBusy || workspace === null || scenarioCatalog === null} title={authoringBlockReason ?? (scenarioCatalog === null ? 'Scenario catalog is still loading or unavailable.' : 'Load a complete Scenario: Deployment, Binding, and Program.')} onClick={(event) => beginAction('load', event)}>Load</button>
+          <button type="button" disabled={busy || workspace === null} title={busy ? 'Another Program operation is in progress.' : 'Save or load the complete Program and Deployment setup.'} onClick={(event) => beginAction('scenario', event)}>Scenario</button>
           <span className="header-action-divider" aria-hidden="true" />
           <button type="button" disabled={authoringBusy || workspace?.hasUnappliedChanges !== true} title={authoringBlockReason ?? (workspace?.hasUnappliedChanges !== true ? 'Draft already matches Applied.' : 'Discard Draft edits and return to Applied.')} onClick={(event) => beginAction('discard', event)}>Discard</button>
           <button type="button" disabled={authoringBusy || !hasAppliedUnsavedChanges} title={authoringBlockReason ?? (!hasAppliedUnsavedChanges ? 'Applied already matches Saved.' : 'Restore Applied and Draft to Saved.')} onClick={(event) => beginAction('revert', event)}>Revert</button>
@@ -376,50 +463,185 @@ export function ProgramDocumentControls({
           </div>
         )}
 
-        {action === 'load' && (
+        {action === 'scenario' && (
           <div className="program-document-dialog">
-            <div className="program-dialog-copy">
-              <label className="program-save-as-path">
-                Qualified scenario
-                <select
-                  value={runtime.state.selectedScenarioId ?? ''}
-                  disabled={busy || scenarioCatalog === null}
-                  onChange={(event) => {
-                    if (event.target.value) runtime.selectScenario(event.target.value);
-                    else runtime.clearScenarioSelection();
+            <div className="scenario-document-tabs" role="tablist" aria-label="Scenario operation">
+              <button type="button" className={scenarioMode === 'load' ? 'active' : ''} onClick={() => setScenarioMode('load')}>Load</button>
+              <button type="button" className={scenarioMode === 'save' ? 'active' : ''} onClick={() => setScenarioMode('save')}>Save current</button>
+            </div>
+
+            {scenarioMode === 'load' ? (
+              <div className="program-dialog-copy">
+                <div className="scenario-directory-row">
+                  <label className="program-save-as-path">
+                    Scenario directory
+                    <input value={scenarioDirectory} onChange={(event) => {
+                      setScenarioDirectory(event.target.value);
+                      scenarioDirectoryRef.current = event.target.value;
+                    }} />
+                  </label>
+                  <button type="button" disabled={scenarioIndexLoading} onClick={() => void refreshScenarioIndex(scenarioDirectory)}>
+                    {scenarioIndexLoading ? 'Reading…' : 'Refresh'}
+                  </button>
+                </div>
+                {scenarioIndexError && <div className="program-apply-blocked" role="alert">{scenarioIndexError}</div>}
+                <label className="program-save-as-path">
+                  Available Scenario
+                  <select
+                    value={selectedScenarioKey}
+                    disabled={scenarioIndexLoading || scenarioIndex === null}
+                    onChange={(event) => setSelectedScenarioKey(event.target.value)}
+                  >
+                    <option value="">Select a Scenario</option>
+                    {scenarioIndex?.entries.map((entry) => (
+                      <option
+                        key={scenarioEntryKey(entry)}
+                        value={scenarioEntryKey(entry)}
+                        disabled={entry.displayStatus === 'unsupported'}
+                        title={entry.statusDetail}
+                      >
+                        {entry.name} — {scenarioStatusLabel(entry)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {selectedScenarioDocument && (
+                  <div className={`scenario-status scenario-status-${selectedScenarioDocument.displayStatus}`}>
+                    <strong>{selectedScenarioDocument.name}</strong>
+                    <span>{selectedScenarioDocument.statusDetail}</span>
+                    {selectedScenarioDocument.description && (
+                      <span>{selectedScenarioDocument.description}</span>
+                    )}
+                  </div>
+                )}
+                <label className="program-save-as-path">
+                  Deployment override (optional)
+                  <input
+                    value={alternateDeploymentPath}
+                    onChange={(event) => setAlternateDeploymentPath(event.target.value)}
+                    list="scenario-deployment-overrides"
+                    placeholder="Another .scenario.yaml or Deployment file"
+                  />
+                  <datalist id="scenario-deployment-overrides">
+                    {scenarioIndex?.entries
+                      .filter((entry) => entry.sourceKind === 'saved' && entry.path)
+                      .map((entry) => (
+                        <option key={scenarioEntryKey(entry)} value={entry.path ?? ''}>
+                          {entry.name}
+                        </option>
+                      ))}
+                  </datalist>
+                </label>
+                <details className="scenario-deployment-browser">
+                  <summary>Browse for a standalone Deployment</summary>
+                  <ArtifactBrowser
+                    lockedKind="deployment"
+                    onSelectionChange={(kind, entry) => {
+                      if (kind === 'deployment') {
+                        setAlternateDeploymentPath(entry?.path ?? '');
+                      }
+                    }}
+                  />
+                </details>
+                <p>
+                  Loading a saved Scenario parses and validates its current file contents. A complete setup is activated atomically; an incomplete setup opens only for editing.
+                </p>
+                {replaceNeedsConfirmation && (
+                  <label className="program-confirmation">
+                    <input type="checkbox" checked={confirmDiscard} onChange={(event) => setConfirmDiscard(event.target.checked)} />
+                    Replace current unsaved or unapplied Draft changes
+                  </label>
+                )}
+                <button
+                  type="button"
+                  className="primary-action"
+                  disabled={
+                    authoringBusy
+                    || !selectedScenarioLoadable
+                    || (replaceNeedsConfirmation && !confirmDiscard)
+                  }
+                  onClick={() => {
+                    const selected = selectedScenarioDocument;
+                    if (!selected || !selectedScenarioLoadable) return;
+                    if (selected.sourceKind === 'qualified') {
+                      const selectedScenarioId = selected.scenarioId;
+                      if (!selectedScenarioId) return;
+                      complete(() => loadScenarioDocument(
+                        null,
+                        selectedScenarioId,
+                        alternateDeploymentPath.trim() || null,
+                        confirmDiscard,
+                      ));
+                      return;
+                    }
+                    const selectedPath = selected.path;
+                    if (!selectedPath) return;
+                    complete(() => loadScenarioDocument(
+                      selectedPath,
+                      null,
+                      alternateDeploymentPath.trim() || null,
+                      confirmDiscard,
+                    ));
                   }}
                 >
-                  <option value="">Select a scenario</option>
-                  {scenarioCatalog?.scenarios.map((row) => (
-                    <option key={row.scenarioId} value={row.scenarioId}>
-                      {row.description ? `${row.scenarioId} — ${row.description}` : row.scenarioId}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <p>Load activates this Scenario’s exact Deployment, waits for convergence, then Applies its bound Program. It completes as one backend-owned operation.</p>
-              {replaceNeedsConfirmation && (
-                <label className="program-confirmation">
-                  <input type="checkbox" checked={confirmDiscard} onChange={(event) => setConfirmDiscard(event.target.checked)} />
-                  Discard current unsaved or unapplied Draft changes
+                  Load Scenario
+                </button>
+              </div>
+            ) : (
+              <div className="program-dialog-copy">
+                <p>
+                  Save the editable Program, Scene, and Deployment in one lightweight file. Referenced robot meshes and other assets are not copied.
+                </p>
+                <label className="program-save-as-path">
+                  Scenario path
+                  <input value={scenarioSavePath} onChange={(event) => setScenarioSavePath(event.target.value)} />
                 </label>
-              )}
-              <button
-                type="button"
-                className="primary-action"
-                disabled={
-                  authoringBusy
-                  || selectedScenario === null
-                  || (replaceNeedsConfirmation && !confirmDiscard)
-                }
-                onClick={() => {
-                  if (!selectedScenario || !scenarioCatalog) return;
-                  complete(() => loadScenario(selectedScenario.scenarioId, scenarioCatalog.scenarioCatalogRevision, confirmDiscard));
-                }}
-              >
-                Load Scenario
-              </button>
-            </div>
+                <div className="scenario-metadata-grid">
+                  <label className="program-save-as-path">
+                    Scenario ID
+                    <input
+                      value={scenarioId}
+                      aria-invalid={!scenarioIdValid}
+                      onChange={(event) => setScenarioId(event.target.value)}
+                    />
+                    {!scenarioIdValid && (
+                      <small>Use lowercase letters, digits, dots, underscores, or hyphens; start with a letter.</small>
+                    )}
+                  </label>
+                  <label className="program-save-as-path">
+                    Name
+                    <input value={scenarioName} onChange={(event) => setScenarioName(event.target.value)} />
+                  </label>
+                </div>
+                <label className="program-save-as-path">
+                  Description
+                  <input value={scenarioDescription} onChange={(event) => setScenarioDescription(event.target.value)} />
+                </label>
+                <label className="program-confirmation">
+                  <input type="checkbox" checked={confirmOverwrite} onChange={(event) => setConfirmOverwrite(event.target.checked)} />
+                  Allow replacing an existing Scenario file
+                </label>
+                <button
+                  type="button"
+                  className="primary-action"
+                  disabled={
+                    authoringBusy
+                    || !scenarioSavePath.trim()
+                    || !scenarioIdValid
+                    || !scenarioName.trim()
+                  }
+                  onClick={() => complete(() => saveScenarioDocument({
+                    path: scenarioSavePath.trim(),
+                    scenarioId: scenarioId.trim(),
+                    name: scenarioName.trim(),
+                    description: scenarioDescription.trim(),
+                    confirmOverwrite,
+                  }))}
+                >
+                  Save Scenario
+                </button>
+              </div>
+            )}
           </div>
         )}
 

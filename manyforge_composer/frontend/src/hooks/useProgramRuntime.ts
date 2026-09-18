@@ -8,6 +8,7 @@ import type {
   JsonValue,
   CycleRecoveryActionId,
   ProgramRuntimeControlProjection,
+  ProgramGroupRuntimeScaleState,
   ProgramCycleStatus,
   RuntimeOverridePromotionProposal,
   RuntimeOverrideRecord,
@@ -21,6 +22,18 @@ import {
   type ExecutionControlCommandKind,
   type HeadlessStateSource,
 } from './useHeadlessState';
+import { parseRuntimeScaleControlAccepted } from '../api/parsers';
+import type {
+  RuntimeScaleControlSelector,
+  RuntimeScaleControlStatus,
+} from '../types/robotControl';
+import {
+  acceptedRuntimeScaleStatus,
+  mergeRuntimeScaleStatus,
+  runtimeScaleControlScopeFence,
+  runtimeScaleFlushDelay,
+  runtimeScaleSelectorIdentity,
+} from './useRobotControl';
 
 const CURRENT_STATES = new Set([
   'running',
@@ -116,6 +129,7 @@ function identity(prefix: string): string {
 
 export type ProgramPendingCommand =
   | 'run'
+  | 'start-motion'
   | 'motion-stop'
   | 'resume-motion'
   | 'full-stop'
@@ -123,6 +137,14 @@ export type ProgramPendingCommand =
   | 'stop'
   | 'reset'
   | null;
+
+export interface ProgramSelectionPending {
+  kind: 'start-motion' | 'motion-stop' | 'resume-motion';
+  groupIds: string[];
+  requestId: string;
+  ownerEpoch: string;
+  programRunId: string;
+}
 
 interface ProgramRuntimeState {
   catalog: ScenarioCatalogResponse | null;
@@ -135,6 +157,7 @@ interface ProgramRuntimeState {
   loading: boolean;
   observationError: string | null;
   pending: ProgramPendingCommand;
+  selectionPending: ProgramSelectionPending[];
   controlPending: string | null;
   error: string | null;
 }
@@ -150,6 +173,7 @@ const INITIAL_STATE: ProgramRuntimeState = {
   loading: true,
   observationError: null,
   pending: null,
+  selectionPending: [],
   controlPending: null,
   error: null,
 };
@@ -239,7 +263,7 @@ export function programPendingAfterProjection(
   cycle: ProgramCycleDebugProjection | null = null,
   previousRun: ProgramRunStatus | null = run,
 ): ProgramPendingCommand {
-  if (pending === 'motion-stop' || pending === 'resume-motion') {
+  if (pending === 'start-motion' || pending === 'motion-stop' || pending === 'resume-motion') {
     // Delivery feedback belongs to its captured run, not a successor/idle
     // projection. Its late reply cannot clear a newer request's exact token.
     return run === null
@@ -399,6 +423,68 @@ function controlsMatchRun(
     && controls.runRevision === run.runRevision;
 }
 
+function runtimeScaleSelectorWire(
+  selector: RuntimeScaleControlSelector,
+): Record<string, JsonValue> {
+  return selector.kind === 'singular'
+    ? {
+      program_binding_id: selector.programBindingId,
+      component_role_id: selector.componentRoleId,
+      target_role_id: selector.targetRoleId,
+    }
+    : {
+      program_binding_id: selector.programBindingId,
+      group_targets: selector.groupTargets.map((target) => ({
+        component_role_id: target.componentRoleId,
+        target_role_id: target.targetRoleId,
+      })),
+    };
+}
+
+function selectionPendingAfterProjection(
+  pending: ProgramSelectionPending[],
+  run: ProgramRunStatus | null,
+  controls: ProgramRuntimeControlProjection | null,
+): ProgramSelectionPending[] {
+  if (pending.length === 0) return [];
+  if (run === null || !['running', 'intervention_required'].includes(run.state)) {
+    return [];
+  }
+  const currentRunPending = pending.filter((request) => (
+    request.ownerEpoch === run.ownerEpoch
+    && request.programRunId === run.capture.programRunId
+  ));
+  // Keep delivery feedback while a matching run's control projection is
+  // temporarily unavailable. Clearing it here would make a lost observation
+  // look like a completed command and could expose a second command too soon.
+  if (controls === null || !controlsMatchRun(controls, run)) return currentRunPending;
+  return currentRunPending.filter((request) => {
+    const rows = controls.executionSelections.groups.filter((group) => (
+      request.groupIds.includes(group.groupId)
+    ));
+    if (rows.length !== request.groupIds.length) return true;
+    const complete = request.kind === 'motion-stop'
+      ? rows.every((group) => group.state === 'stopping' || group.state === 'held')
+      : rows.every((group) => group.state === 'running' && group.heldNodeCount === 0);
+    return !complete;
+  });
+}
+
+function sameSelectionPending(
+  left: ProgramSelectionPending[],
+  right: ProgramSelectionPending[],
+): boolean {
+  return left.length === right.length && left.every((request, index) => {
+    const other = right[index];
+    return request.kind === other.kind
+      && request.requestId === other.requestId
+      && request.ownerEpoch === other.ownerEpoch
+      && request.programRunId === other.programRunId
+      && request.groupIds.length === other.groupIds.length
+      && request.groupIds.every((id, groupIndex) => id === other.groupIds[groupIndex]);
+  });
+}
+
 export function programRuntimeAfterSnapshot(
   currentRun: ProgramRunStatus | null,
   currentControls: ProgramRuntimeControlProjection | null,
@@ -453,6 +539,24 @@ export function useProgramRuntime(
   const observationRetryAttempt = useRef(0);
   const [observationRetrySequence, setObservationRetrySequence] = useState(0);
   const catalogCache = useRef<ScenarioCatalogResponse | null>(null);
+  const [groupRuntimeScales, setGroupRuntimeScales] = useState<
+    Record<string, ProgramGroupRuntimeScaleState>
+  >({});
+  const groupScaleStatusRef = useRef(new Map<string, RuntimeScaleControlStatus>());
+  const groupScaleScopeFenceRef = useRef(new Map<string, string>());
+  const groupScaleQueue = useRef(new Map<string, number>());
+  const groupScaleInFlight = useRef<{
+    groupId: string;
+    scopeFence: string;
+  } | null>(null);
+  const groupScaleTimer = useRef<number | null>(null);
+  const groupScaleLastSentAt = useRef(Number.NEGATIVE_INFINITY);
+  const groupScaleFlush = useRef<() => void>(() => undefined);
+  const groupScaleGeneration = useRef(0);
+  const [groupScaleRefreshSequence, setGroupScaleRefreshSequence] = useState(0);
+  const groupScaleRowsRef = useRef<ProgramRuntimeControlProjection['executionSelections']['groups']>([]);
+  const groupScaleStopActiveRef = useRef<Set<string>>(new Set());
+  const groupScaleIdentityRef = useRef('');
   const requestedWakeKey = useRef<string | null>(null);
   const callerEpoch = useRef(browserStableIdentity(
     'manyforge.composer.program_request_owner_epoch',
@@ -601,6 +705,11 @@ export function useProgramRuntime(
         projected.controls,
         projected.run,
       );
+      const selectionPending = selectionPendingAfterProjection(
+        current.selectionPending,
+        projected.run,
+        projected.controls,
+      );
       const error = current.error ?? (
         cycle.state === 'idle_after_reset'
           ? null
@@ -615,6 +724,7 @@ export function useProgramRuntime(
         && controlsKey(current.controls) === controlsKey(projected.controls)
         && current.runnerAvailable
         && current.pending === pending
+        && sameSelectionPending(current.selectionPending, selectionPending)
         && current.controlPending === controlPending
         && current.error === error
       ) return current;
@@ -624,6 +734,7 @@ export function useProgramRuntime(
         controls: projected.controls,
         runnerAvailable: true,
         pending,
+        selectionPending,
         controlPending,
         error,
       };
@@ -690,6 +801,48 @@ export function useProgramRuntime(
     return () => document.removeEventListener('visibilitychange', onVisibility);
   }, [enabled, refresh, snapshotAvailable]);
 
+  // Runtime scaling belongs to an exact captured run. Before Execute there is
+  // deliberately no owner target to query or mutate.
+  const groupScaleRows = useMemo(
+    () => state.controls?.executionSelections.groups ?? [],
+    [state.controls],
+  );
+  groupScaleRowsRef.current = groupScaleRows;
+  const groupScaleOwnerEpoch = snapshot?.executionControlStatus?.ownerEpoch
+    ?? state.run?.ownerEpoch
+    ?? '';
+  const groupScaleIdentityKey = JSON.stringify([
+    groupScaleOwnerEpoch,
+    ...groupScaleRows.map((group) => [
+      group.groupId,
+      group.runtimeScaleSelector,
+      group.runtimeScaleUnavailableReason,
+    ]),
+  ]);
+  const groupScaleObservationKey = JSON.stringify(groupScaleRows.map((group) => [
+    group.groupId,
+    group.state,
+    group.heldNodeCount,
+  ]));
+  const groupScaleStopActive = useMemo(() => {
+    const allProgramStop = ['stopping', 'full_stopping'].includes(state.run?.state ?? '');
+    return new Set(groupScaleRows
+      .filter((group) => (
+        allProgramStop
+        || group.state === 'stopping'
+        || (group.groupId === 'all' && state.selectionPending.some(
+          (request) => request.kind === 'motion-stop',
+        ))
+        || state.selectionPending.some(
+          (request) => request.kind === 'motion-stop'
+            && (request.groupIds.includes(group.groupId)
+              || request.groupIds.includes('all')),
+        )
+      ))
+      .map((group) => group.groupId));
+  }, [groupScaleRows, state.run?.state, state.selectionPending]);
+  groupScaleStopActiveRef.current = groupScaleStopActive;
+
   const selectScenario = useCallback((scenarioId: string) => {
     setState((current) => ({
       ...current,
@@ -719,12 +872,27 @@ export function useProgramRuntime(
   }, []);
 
   const beginProgramCommand = useCallback((
-    pending: Exclude<ProgramPendingCommand, null>, requestId: string,
+    pending: Exclude<ProgramPendingCommand, null>,
+    requestId: string,
+    selectionGroups: string[] = [],
   ) => {
     pendingProgramRequest.current = requestId;
     setState((current) => ({
       ...current,
       pending,
+      selectionPending: pending === 'start-motion'
+        || pending === 'motion-stop' || pending === 'resume-motion'
+        ? [
+          ...current.selectionPending,
+          {
+            kind: pending,
+            groupIds: [...selectionGroups],
+            requestId,
+            ownerEpoch: current.run?.ownerEpoch ?? '',
+            programRunId: current.run?.capture.programRunId ?? '',
+          },
+        ]
+        : current.selectionPending,
       error: null,
     }));
   }, []);
@@ -743,9 +911,16 @@ export function useProgramRuntime(
   ) => {
     if (!mounted.current) return;
     setState((current) => {
+      const selectionRequest = expectedPending === 'start-motion'
+        || expectedPending === 'motion-stop'
+        || expectedPending === 'resume-motion';
       if (
-        (pendingKind === 'program' && (current.pending !== expectedPending
-          || pendingProgramRequest.current !== requestId))
+        (pendingKind === 'program' && (
+          selectionRequest
+            ? !current.selectionPending.some((entry) => entry.requestId === requestId)
+            : current.pending !== expectedPending
+              || pendingProgramRequest.current !== requestId
+        ))
         || (pendingKind === 'control'
           && current.controlPending !== expectedPending)
         || (expectedRun !== undefined && (
@@ -755,7 +930,12 @@ export function useProgramRuntime(
       ) return current;
       return {
         ...current,
-        pending: pendingKind === 'program' ? null : current.pending,
+        pending: pendingKind === 'program'
+          && (!selectionRequest || pendingProgramRequest.current === requestId)
+          ? null : current.pending,
+        selectionPending: pendingKind === 'program'
+          ? current.selectionPending.filter((entry) => entry.requestId !== requestId)
+          : current.selectionPending,
         controlPending: pendingKind === 'control' ? null : current.controlPending,
         error: [
           errorMessage(reason, fallback),
@@ -844,8 +1024,9 @@ export function useProgramRuntime(
   ]);
 
   const selectionCommand = useCallback(async (
-    pending: 'motion-stop' | 'resume-motion', groupIds: string[],
-  ) => {
+    pending: 'start-motion' | 'motion-stop' | 'resume-motion', groupIds: string[],
+  ): Promise<boolean> => {
+    const start = pending === 'start-motion';
     const resume = pending === 'resume-motion';
     const controls = state.controls;
     if (
@@ -855,18 +1036,21 @@ export function useProgramRuntime(
       || !state.runnerAvailable
       || ['stop', 'full-stop', 'reset']
         .includes(state.pending ?? '')
-      || (resume && (state.pending !== null || state.controlPending !== null
+      || ((start || resume) && (state.selectionPending.length > 0 || state.controlPending !== null
         || !controlsMatchRun(controls, state.run)
         || !groupIds.every((id) => controls.executionSelections.groups.some(
-          (group) => group.groupId === id && group.resumeAllowed,
+          (group) => group.groupId === id
+            && (start ? group.startAllowed : group.resumeAllowed),
         ))))
-    ) return;
+    ) return false;
     const requestId = identity(`program-${pending}`);
-    if (controlSource === null) return;
-    beginProgramCommand(pending, requestId);
+    if (controlSource === null) return false;
+    beginProgramCommand(pending, requestId, groupIds);
     try {
       await controlSource.sendExecutionCommand(
-        resume ? 'program_motion_resume' : 'program_motion_stop',
+        start
+          ? 'program_motion_start'
+          : resume ? 'program_motion_resume' : 'program_motion_stop',
         {
           request_id: requestId,
           request_owner_epoch: callerEpoch.current,
@@ -875,7 +1059,7 @@ export function useProgramRuntime(
           program_run_id: state.run.capture.programRunId,
           expected_owner_epoch: state.run.ownerEpoch,
           group_ids: groupIds,
-          ...(resume && controls !== null ? {
+          ...((start || resume) && controls !== null ? {
             expected_run_revision: controls.runRevision,
             expected_selection_revision: controls.executionSelections.selectionRevision,
           } : {}),
@@ -883,27 +1067,356 @@ export function useProgramRuntime(
         },
         requestId,
       );
+      return true;
     } catch (reason) {
       await recordCommandFailure(
         reason, 'Selection command was rejected.', requestId, 'program', pending, state.run,
       );
+      return false;
     } finally {
       // This clears only Sending feedback, never a hold or lifecycle state.
       // A newer priority Stop must not be cleared by an older Resume reply.
-      if (mounted.current) setState((current) => current.pending === pending
-        && pendingProgramRequest.current === requestId
-        && current.run?.ownerEpoch === state.run?.ownerEpoch
-        && current.run?.capture.programRunId === state.run?.capture.programRunId
-        ? { ...current, pending: null } : current);
+      if (mounted.current) setState((current) => ({
+        ...current,
+        pending: current.pending === pending
+          && pendingProgramRequest.current === requestId
+          ? null : current.pending,
+        // Keep accepted scope feedback until the owner projection proves the
+        // requested state. A receipt only proves admission; removing it here
+        // would briefly expose a duplicate command while Stop/Resume settles.
+        selectionPending: current.selectionPending,
+      }));
     }
   }, [
     beginProgramCommand, controlSource,
     recordCommandFailure,
-    state.pending, state.controlPending, state.controls, state.run, state.runnerAvailable,
+    state.pending, state.selectionPending, state.controlPending, state.controls,
+    state.run, state.runnerAvailable,
   ]);
 
   const stopMotion = useCallback((groups: string | string[] = 'all') => selectionCommand('motion-stop', typeof groups === 'string' ? [groups] : groups), [selectionCommand]);
+  const startMotion = useCallback((groups: string | string[] = 'all') => selectionCommand('start-motion', typeof groups === 'string' ? [groups] : groups), [selectionCommand]);
   const resumeMotion = useCallback((groups: string | string[] = 'all') => selectionCommand('resume-motion', typeof groups === 'string' ? [groups] : groups), [selectionCommand]);
+
+  const clearGroupScaleQueue = useCallback(() => {
+    groupScaleQueue.current.clear();
+    if (groupScaleTimer.current !== null) {
+      window.clearTimeout(groupScaleTimer.current);
+      groupScaleTimer.current = null;
+    }
+    setGroupRuntimeScales((current) => {
+      const next: Record<string, ProgramGroupRuntimeScaleState> = {};
+      for (const [groupId, value] of Object.entries(current)) {
+        next[groupId] = value.pending ? { ...value, pending: false } : value;
+      }
+      return next;
+    });
+  }, []);
+
+  const scheduleGroupScaleFlush = useCallback(() => {
+    if (groupScaleTimer.current !== null) return;
+    const delay = runtimeScaleFlushDelay(
+      performance.now(),
+      groupScaleLastSentAt.current,
+      groupScaleQueue.current.size > 0,
+      groupScaleInFlight.current !== null,
+    );
+    if (delay === null) return;
+    if (delay === 0) {
+      groupScaleFlush.current();
+      return;
+    }
+    groupScaleTimer.current = window.setTimeout(() => {
+      groupScaleTimer.current = null;
+      groupScaleFlush.current();
+    }, delay);
+  }, []);
+
+  const flushGroupScale = useCallback(async () => {
+    if (
+      groupScaleInFlight.current !== null
+      || groupScaleQueue.current.size === 0
+      || controlSource === null
+    ) return;
+    const row = groupScaleRowsRef.current.find((candidate) => (
+      groupScaleQueue.current.has(candidate.groupId)
+      && !groupScaleStopActiveRef.current.has(candidate.groupId)
+    ));
+    if (row === undefined) return;
+    if (row.runtimeScaleSelector === null) {
+      groupScaleQueue.current.delete(row.groupId);
+      scheduleGroupScaleFlush();
+      return;
+    }
+    const status = groupScaleStatusRef.current.get(row.groupId);
+    const scale = groupScaleQueue.current.get(row.groupId);
+    if (
+      status === undefined
+      || !status.supported
+      || status.frozen
+      || scale === undefined
+      || !Number.isFinite(scale)
+    ) {
+      groupScaleQueue.current.delete(row.groupId);
+      setGroupRuntimeScales((current) => ({
+        ...current,
+        [row.groupId]: current[row.groupId] === undefined
+          ? {
+            selector: row.runtimeScaleSelector,
+            status: status ?? null,
+            draft: status?.requestedScale ?? 1,
+            pending: false,
+            error: row.runtimeScaleUnavailableReason,
+          }
+          : { ...current[row.groupId], pending: false },
+      }));
+      scheduleGroupScaleFlush();
+      return;
+    }
+    groupScaleQueue.current.delete(row.groupId);
+    const scopeFence = runtimeScaleControlScopeFence(groupScaleOwnerEpoch, status);
+    const inFlight = { groupId: row.groupId, scopeFence };
+    groupScaleInFlight.current = inFlight;
+    groupScaleLastSentAt.current = performance.now();
+    setGroupRuntimeScales((current) => ({
+      ...current,
+      [row.groupId]: current[row.groupId] === undefined
+        ? {
+          selector: row.runtimeScaleSelector,
+          status,
+          draft: scale,
+          pending: true,
+          error: null,
+        }
+        : { ...current[row.groupId], pending: true, error: null },
+    }));
+    try {
+      const commandRequestId = identity(`program-group-scale.${row.groupId}`);
+      const receipt = await controlSource.sendExecutionCommand(
+        'runtime_scale',
+        {
+          selector: runtimeScaleSelectorWire(status.selector),
+          expected_control_generation: status.controlGeneration,
+          scale,
+        },
+        commandRequestId,
+      );
+      if (
+        groupScaleInFlight.current !== inFlight
+        || groupScaleStatusRef.current.get(row.groupId) !== status
+        || groupScaleScopeFenceRef.current.get(row.groupId) !== scopeFence
+        || groupScaleStopActiveRef.current.has(row.groupId)
+      ) return;
+      const accepted = parseRuntimeScaleControlAccepted(receipt.result);
+      const nextStatus = acceptedRuntimeScaleStatus(
+        status,
+        accepted,
+        commandRequestId,
+        scale,
+      );
+      groupScaleStatusRef.current.set(row.groupId, nextStatus);
+      groupScaleScopeFenceRef.current.set(row.groupId, scopeFence);
+      setGroupRuntimeScales((current) => ({
+        ...current,
+        [row.groupId]: current[row.groupId] === undefined
+          ? {
+            selector: row.runtimeScaleSelector,
+            status: nextStatus,
+            draft: accepted.requestedScale,
+            pending: false,
+            error: null,
+          }
+          : {
+            ...current[row.groupId],
+            status: nextStatus,
+            draft: accepted.requestedScale,
+            pending: false,
+            error: null,
+          },
+      }));
+      // One scope command may change the effective value of overlapping All
+      // or named scopes. Refresh every row from the owner after acceptance.
+      setGroupScaleRefreshSequence((current) => current + 1);
+    } catch (reason) {
+      if (groupScaleInFlight.current === inFlight) {
+        setGroupRuntimeScales((current) => ({
+          ...current,
+          [row.groupId]: current[row.groupId] === undefined
+            ? {
+              selector: row.runtimeScaleSelector,
+              status,
+              draft: scale,
+              pending: false,
+              error: errorMessage(reason, 'Group velocity could not be updated.'),
+            }
+            : {
+              ...current[row.groupId],
+              pending: false,
+              error: errorMessage(reason, 'Group velocity could not be updated.'),
+            },
+        }));
+      }
+    } finally {
+      if (groupScaleInFlight.current === inFlight) {
+        groupScaleInFlight.current = null;
+        scheduleGroupScaleFlush();
+      }
+    }
+  }, [controlSource, groupScaleOwnerEpoch, scheduleGroupScaleFlush]);
+  groupScaleFlush.current = () => { void flushGroupScale(); };
+
+  useEffect(() => {
+    const scaleQueue = groupScaleQueue.current;
+    const identityChanged = groupScaleIdentityRef.current !== groupScaleIdentityKey;
+    groupScaleIdentityRef.current = groupScaleIdentityKey;
+    if (identityChanged) {
+      clearGroupScaleQueue();
+      groupScaleStatusRef.current.clear();
+      groupScaleScopeFenceRef.current.clear();
+      groupScaleInFlight.current = null;
+      groupScaleLastSentAt.current = Number.NEGATIVE_INFINITY;
+    }
+    groupScaleGeneration.current += 1;
+    const generation = groupScaleGeneration.current;
+    const rows = groupScaleRowsRef.current;
+    setGroupRuntimeScales((current) => Object.fromEntries(rows.map((row) => {
+      const previous = current[row.groupId];
+      return [row.groupId, {
+        selector: row.runtimeScaleSelector,
+        status: previous?.status ?? null,
+        draft: previous?.draft ?? 1,
+        pending: identityChanged ? false : previous?.pending ?? false,
+        error: row.runtimeScaleUnavailableReason,
+      } satisfies ProgramGroupRuntimeScaleState];
+    })));
+    if (!enabled || !snapshotAvailable || rows.length === 0) return undefined;
+    let cancelled = false;
+    void Promise.all(rows.map(async (row) => {
+      if (row.runtimeScaleSelector === null) return;
+      try {
+        const status = await api.execution.runtimeScaleControl(row.runtimeScaleSelector);
+        if (cancelled || groupScaleGeneration.current !== generation) return;
+        if (
+          runtimeScaleSelectorIdentity(status.selector)
+          !== runtimeScaleSelectorIdentity(row.runtimeScaleSelector)
+        ) {
+          throw new Error('Runtime velocity status does not match its group scope.');
+        }
+        const scopeFence = runtimeScaleControlScopeFence(groupScaleOwnerEpoch, status);
+        const priorFence = groupScaleScopeFenceRef.current.get(row.groupId);
+        const merged = priorFence === scopeFence
+          ? mergeRuntimeScaleStatus(
+            groupScaleStatusRef.current.get(row.groupId) ?? null,
+            status,
+          )
+          : status;
+        if (priorFence !== undefined && priorFence !== scopeFence) {
+          scaleQueue.delete(row.groupId);
+        }
+        groupScaleScopeFenceRef.current.set(row.groupId, scopeFence);
+        groupScaleStatusRef.current.set(row.groupId, merged);
+        setGroupRuntimeScales((current) => ({
+          ...current,
+          [row.groupId]: {
+            selector: row.runtimeScaleSelector,
+            status: merged,
+            draft: current[row.groupId]?.pending
+              ? current[row.groupId].draft : merged.requestedScale,
+            pending: current[row.groupId]?.pending ?? false,
+            error: null,
+          },
+        }));
+      } catch (reason) {
+        if (cancelled || groupScaleGeneration.current !== generation) return;
+        setGroupRuntimeScales((current) => ({
+          ...current,
+          [row.groupId]: {
+            selector: row.runtimeScaleSelector,
+            status: null,
+            draft: current[row.groupId]?.draft ?? 1,
+            pending: false,
+            error: errorMessage(reason, 'Group velocity status is unavailable.'),
+          },
+        }));
+      }
+    }));
+    return () => {
+      cancelled = true;
+      scaleQueue.clear();
+      if (groupScaleTimer.current !== null) {
+        window.clearTimeout(groupScaleTimer.current);
+        groupScaleTimer.current = null;
+      }
+    };
+  }, [
+    clearGroupScaleQueue,
+    enabled,
+    groupScaleIdentityKey,
+    groupScaleObservationKey,
+    groupScaleOwnerEpoch,
+    groupScaleRefreshSequence,
+    snapshotAvailable,
+  ]);
+
+  useEffect(() => {
+    if (groupScaleStopActive.size === 0) return;
+    for (const groupId of groupScaleStopActive) {
+      groupScaleQueue.current.delete(groupId);
+    }
+    if (groupScaleTimer.current !== null && groupScaleQueue.current.size === 0) {
+      window.clearTimeout(groupScaleTimer.current);
+      groupScaleTimer.current = null;
+    }
+    setGroupRuntimeScales((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const groupId of groupScaleStopActive) {
+        const value = next[groupId];
+        if (value?.pending) {
+          next[groupId] = { ...value, pending: false };
+          changed = true;
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [groupScaleStopActive]);
+
+  const setGroupRuntimeScale = useCallback((groupId: string, scale: number) => {
+    const row = groupScaleRowsRef.current.find((candidate) => candidate.groupId === groupId);
+    const status = groupScaleStatusRef.current.get(groupId);
+    if (
+      row?.runtimeScaleSelector === null
+      || row === undefined
+      || status === undefined
+      || !status.supported
+      || status.frozen
+      || groupScaleStopActiveRef.current.has(groupId)
+      || !Number.isFinite(scale)
+    ) return;
+    const bounded = Math.min(1, Math.max(0, scale));
+    groupScaleQueue.current.set(groupId, bounded);
+    setGroupRuntimeScales((current) => ({
+      ...current,
+      [groupId]: current[groupId] === undefined
+        ? {
+          selector: row.runtimeScaleSelector,
+          status,
+          draft: bounded,
+          pending: true,
+          error: null,
+        }
+        : { ...current[groupId], draft: bounded, pending: true, error: null },
+    }));
+    scheduleGroupScaleFlush();
+  }, [scheduleGroupScaleFlush]);
+
+  const commitGroupRuntimeScale = useCallback(() => {
+    if (groupScaleTimer.current !== null) {
+      window.clearTimeout(groupScaleTimer.current);
+      groupScaleTimer.current = null;
+    }
+    groupScaleFlush.current();
+  }, []);
 
   const fullStop = useCallback(async () => {
     if (
@@ -1248,8 +1761,12 @@ export function useProgramRuntime(
     clearScenarioSelection,
     dismissError,
     run,
+    startMotion,
     stopMotion,
     resumeMotion,
+    groupRuntimeScales,
+    setGroupRuntimeScale,
+    commitGroupRuntimeScale,
     fullStop,
     resumeFullStop,
     stop,
@@ -1280,8 +1797,12 @@ export function useProgramRuntime(
     refresh,
     reset,
     run,
+    startMotion,
     stopMotion,
     resumeMotion,
+    groupRuntimeScales,
+    setGroupRuntimeScale,
+    commitGroupRuntimeScale,
     fullStop,
     resumeFullStop,
     selectScenario,

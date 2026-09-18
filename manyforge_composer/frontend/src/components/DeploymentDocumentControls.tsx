@@ -18,6 +18,7 @@ export function DeploymentDocumentControls({
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmOverwrite, setConfirmOverwrite] = useState(false);
   const workspace = controller.workspace;
+  const pendingConfirmation = controller.pendingApplyConfirmation;
   const chooseArtifact = useCallback((
     _kind: ArtifactKind,
     entry: FileBrowserEntry | null,
@@ -34,21 +35,24 @@ export function DeploymentDocumentControls({
   };
   return (
     <>
-      <div className="deployment-document-bar">
-        <div className="deployment-document-identity">
-          <span>Draft</span>
-          <strong>{workspace?.draft.deploymentArtifactId ?? 'No Deployment open'}</strong>
-          <small>{workspace?.draft.deploymentRevision ?? 'Open a bounded artifact to begin.'}</small>
-        </div>
-        <div className="deployment-document-state" aria-label="Deployment document state">
-          <span className={workspace?.draft.differsFromSaved ? 'warning' : 'ok'}>
-            {workspace?.draft.differsFromSaved ? 'Unsaved' : 'Saved'}
+      <div className="program-document-controls" aria-label="Deployment document controls">
+        <div className="program-document-identity">
+          <strong title={workspace?.saved.path ?? workspace?.draft.deploymentRevision ?? undefined}>
+            {workspace?.draft.deploymentArtifactId ?? 'No Deployment'}
+          </strong>
+          <span className="document-identity-divider" aria-hidden="true" />
+          <span className={`document-state state-${workspace?.draft.differsFromSaved ? 'modified' : 'draft'}`}>
+            {workspace?.draft.differsFromSaved ? 'modified' : 'draft'}
           </span>
-          <span className={workspace?.runAdmission.ready ? 'ok' : 'warning'}>
-            {workspace?.runAdmission.ready ? 'Applied match' : 'Applied differs'}
+          <span className={`document-state state-${workspace?.draft.differsFromSaved ? 'different' : 'saved'}`}>
+            {workspace?.draft.differsFromSaved ? 'different' : 'saved'}
           </span>
+          <span className={`document-state state-${workspace?.runAdmission.ready ? 'applied' : 'different'}`}>
+            {workspace?.runAdmission.ready ? 'applied' : 'different'}
+          </span>
+          <span className="document-identity-divider document-settings-divider" aria-hidden="true" />
         </div>
-        <div className="deployment-document-actions">
+        <div className="program-document-actions">
           <button
             type="button"
             disabled={!controller.mutationAvailable || controller.busy}
@@ -80,57 +84,23 @@ export function DeploymentDocumentControls({
             }
             onClick={() => setAction('revert')}
           >Revert</button>
-          <span className="deployment-document-action-divider" aria-hidden="true" />
-          <button
-            type="button"
-            disabled={
-              !controller.mutationAvailable
-              || controller.busy
-              || !workspace?.draft.document
-            }
-            onClick={() => { void controller.previewDraft(); }}
-          >Preview Draft</button>
+          <span className="header-action-divider" aria-hidden="true" />
           <button
             type="button"
             className="primary-action"
             disabled={
               !controller.mutationAvailable
               || controller.busy
-              || controller.candidate === null
-              || controller.candidate.compilation.deploymentRevision
-                !== workspace?.draft.deploymentRevision
+              || !workspace?.draft.document
+              || workspace?.runAdmission.ready === true
             }
-            title={controller.candidate === null
-              ? 'Preview this exact Draft before applying it.'
-              : undefined}
+            title={workspace?.runAdmission.ready === true
+              ? 'Draft already matches Manager Applied.'
+              : 'Validate and apply this Deployment Draft to runtime.'}
             onClick={() => { void controller.applyDraft(); }}
-          >Apply Draft</button>
+          >Apply</button>
         </div>
       </div>
-      {controller.mutationUnavailableReason && (
-        <div className="authoring-unavailable-notice">{controller.mutationUnavailableReason}</div>
-      )}
-      {!workspace?.runAdmission.ready && workspace?.runAdmission.reason && (
-        <div className="deployment-run-gate" role="status">{workspace.runAdmission.reason}. Run remains disabled until Manager Applied matches this Draft.</div>
-      )}
-      {controller.candidate !== null && (
-        <div className="deployment-candidate-summary" role="status">
-          <strong>Preview valid</strong>
-          <span>
-            {controller.candidate.candidatePreview?.converged
-              ? 'No Manager graph changes.'
-              : 'Exact candidate is ready for deliberate Apply.'}
-          </span>
-          <code>{controller.candidate.compilation.deploymentRevision}</code>
-        </div>
-      )}
-      {controller.error && <div className="panel-state error-state" role="alert">{controller.error}</div>}
-      {controller.feedback && (
-        <div className="program-feedback" role="status">
-          {controller.feedback}
-          <button type="button" className="quiet-button" onClick={controller.clearFeedback}>Dismiss</button>
-        </div>
-      )}
 
       {action !== null && (
         <OverlayPanel
@@ -186,6 +156,33 @@ export function DeploymentDocumentControls({
               <button type="button" className="primary-action" onClick={() => { void complete(controller.revert); }}>Revert to Saved</button>
             </div>
           )}
+        </OverlayPanel>
+      )}
+      {pendingConfirmation !== null && (
+        <OverlayPanel
+          open
+          title="Apply disruptive Deployment change?"
+          titleId="deployment-apply-confirmation-title"
+          onClose={controller.cancelApplyConfirmation}
+          compact
+        >
+          <div className="program-dialog-copy program-compact-confirmation">
+            <p>
+              Applying this exact Deployment Draft will reconfigure active runtime
+              components. Running operations remain protected by Manager admission.
+            </p>
+            <p>
+              <strong>{pendingConfirmation.result.compilation.deploymentArtifactId}</strong>
+              {' · '}
+              <code>{pendingConfirmation.result.compilation.deploymentRevision}</code>
+            </p>
+            <button
+              type="button"
+              className="primary-action"
+              disabled={!controller.mutationAvailable || controller.busy}
+              onClick={() => { void controller.confirmApply(); }}
+            >Confirm Apply</button>
+          </div>
         </OverlayPanel>
       )}
     </>

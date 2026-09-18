@@ -6521,8 +6521,9 @@ ExecutionKernel::make_and_prepare_motion_participant(
                                         plan_phase.plan_request->planner_capability_binding},
       *validation_phase.validation_evidence,
       std::move(contact_policy),
-      PreparedRuntimePolicyRefDTO{authority.runtime_policy.value().source_artifact,
-                                  authority.runtime_policy.value().selected_motion_speed_limit},
+      PreparedRuntimePolicyRefDTO{authority.runtime_policy.value().source_artifact},
+      authority.requested_tcp_linear_speed_mps,
+      authority.deployment_maximum_tcp_linear_speed_mps,
       std::move(prepared_scopes),
       request.timeouts.execution_timeout_s};
 

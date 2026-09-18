@@ -15,7 +15,10 @@ import type {
   SourceModelProjection,
   Vector3Tuple,
 } from '../types/api';
-import type { MotionPreviewReceipt } from '../types/robotControl';
+import type {
+  CapabilityCommandPreviewReceipt,
+  MotionPreviewReceipt,
+} from '../types/robotControl';
 import type {
   ExecutionOwnerStatus,
   ManualControlMotionDescriptor,
@@ -140,7 +143,6 @@ export function executionRobotPresentation(
     status === null
     || sourceModel === null
     || manifest === null
-    || !status.observedMotion.complete
     || status.cellId !== sourceModel.cell_id
     || status.cellId !== manifest.cell_id
     || status.retainedBundleId !== sourceModel.retained_bundle_id
@@ -148,35 +150,76 @@ export function executionRobotPresentation(
     || status.graphRevision !== sourceModel.graph_revision
     || status.graphRevision !== manifest.graph_revision
   ) return null;
-  const observed = status.observedMotion;
-  const descriptor = status.directControl.targetDescriptor;
-  const occurrence = sourceModel.occurrences.find(
-    (candidate) => candidate.component_id === observed.controllableComponentId,
-  );
-  if (
-    occurrence === undefined
-    || descriptor.controllableComponentId !== observed.controllableComponentId
-    || descriptor.commandTargetId !== observed.commandTargetId
-    || descriptor.joints.length !== observed.sourceJointNames.length
-    || observed.positionsRad.length !== observed.sourceJointNames.length
-  ) return null;
-  const occurrenceCoordinates = new Set(
-    occurrence.coordinates.map((coordinate) => coordinate.source_joint_name),
-  );
   const positions = new Map<string, number>();
-  for (const [index, sourceJointName] of observed.sourceJointNames.entries()) {
-    const joint = descriptor.joints[index];
-    const position = observed.positionsRad[index];
+  const setPosition = (compiledJointName: string, position: number): boolean => {
+    const previous = positions.get(compiledJointName);
+    if (!Number.isFinite(position) || (previous !== undefined && previous !== position)) return false;
+    positions.set(compiledJointName, position);
+    return true;
+  };
+  const observedMotions = status.observedMotions?.length
+    ? status.observedMotions : [status.observedMotion];
+  const motionDescriptors = status.directControlTargets?.length
+    ? status.directControlTargets.map((target) => target.targetDescriptor)
+    : [status.directControl.targetDescriptor];
+  for (const observed of observedMotions) {
+    const descriptor = motionDescriptors.find((candidate) => (
+      candidate.controllableComponentId === observed.controllableComponentId
+      && candidate.commandTargetId === observed.commandTargetId
+    ));
+    const occurrence = sourceModel.occurrences.find(
+      (candidate) => candidate.component_id === observed.controllableComponentId,
+    );
     if (
-      joint === undefined
-      || joint.sourceJointName !== sourceJointName
-      || !occurrenceCoordinates.has(sourceJointName)
-      || !Number.isFinite(position)
-      || positions.has(joint.compiledJointName)
+      !observed.complete
+      || descriptor === undefined
+      || occurrence === undefined
+      || descriptor.joints.length !== observed.sourceJointNames.length
+      || observed.positionsRad.length !== observed.sourceJointNames.length
     ) return null;
-    positions.set(joint.compiledJointName, position);
+    const occurrenceCoordinates = new Set(
+      occurrence.coordinates.map((coordinate) => coordinate.source_joint_name),
+    );
+    for (const [index, sourceJointName] of observed.sourceJointNames.entries()) {
+      const joint = descriptor.joints[index];
+      if (
+        joint === undefined
+        || joint.sourceJointName !== sourceJointName
+        || !occurrenceCoordinates.has(sourceJointName)
+        || !setPosition(joint.compiledJointName, observed.positionsRad[index])
+      ) return null;
+    }
+  }
+  const observedGrippers = status.observedGrippers?.length
+    ? status.observedGrippers
+    : status.observedGripper == null ? [] : [status.observedGripper];
+  const gripperTargets = status.directControlGripperTargets?.length
+    ? status.directControlGripperTargets : [status.directControlGripper];
+  for (const observed of observedGrippers) {
+    if (!observed.complete) return null;
+    const target = gripperTargets.find((candidate) => (
+      (observed.controllableComponentId === undefined
+        || candidate.controllableComponentId === observed.controllableComponentId)
+      && (observed.commandTargetId === undefined
+        || candidate.commandTargetId === observed.commandTargetId)
+      && candidate.sourceCoordinateName === observed.sourceCoordinateName
+    ));
+    if (target === undefined) return null;
+    const occurrence = sourceModel.occurrences.find((candidate) => (
+      candidate.component_id === target.controllableComponentId
+      && candidate.coordinates.some(
+        (coordinate) => coordinate.source_joint_name === observed.sourceCoordinateName,
+      )
+    ));
+    const coordinate = occurrence?.coordinates.find(
+      (candidate) => candidate.source_joint_name === observed.sourceCoordinateName,
+    );
+    if (coordinate === undefined || !setPosition(coordinate.viewer_joint_name, observed.position)) {
+      return null;
+    }
   }
   const linkTransforms = measuredLinkTransforms(manifest, positions);
+  const observed = status.observedMotion;
   return linkTransforms === null ? null : {
     objectId: observed.controllableComponentId,
     sourceId: `execution:${observed.commandTargetId}`,
@@ -790,6 +833,86 @@ export function candidateRobotPresentation(
     receiptDigest: receipt.receiptDigest,
     linkTransforms: Object.fromEntries(Object.entries(transforms)
       .filter(([link]) => affected.has(link))),
+  };
+}
+
+/**
+ * Materialize an exact capability-preview target on the selected tool only.
+ * The backend receipt remains the command authority; the browser merely maps
+ * its validated source coordinate through the retained model for display.
+ */
+export function candidateGripperPresentation(
+  receipt: CapabilityCommandPreviewReceipt,
+  status: ExecutionOwnerStatus,
+  sourceModel: SourceModelProjection,
+  manifest: SceneUrdfManifest,
+  measured: Readonly<Record<string, RuntimeLinkTransform>>,
+): CandidateRobotPresentation | null {
+  const gripper = status.directControlGripper;
+  if (
+    status.cellId !== sourceModel.cell_id
+    || status.cellId !== manifest.cell_id
+    || receipt.retainedBundleId !== sourceModel.retained_bundle_id
+    || receipt.retainedBundleId !== manifest.retained_bundle_id
+    || receipt.graphRevision !== sourceModel.graph_revision
+    || receipt.graphRevision !== manifest.graph_revision
+    || receipt.componentRoleId !== gripper.componentRoleId
+    || receipt.targetRoleId !== gripper.targetRoleId
+    || receipt.requiredCapabilityId !== gripper.operationCapabilityId
+    || receipt.commandSchemaId !== gripper.commandSchemaId
+    || receipt.commandSchemaRevision !== gripper.commandSchemaRevision
+    || receipt.sourceCoordinateName !== gripper.sourceCoordinateName
+    || receipt.sourceKind !== gripper.sourceKind
+    || receipt.coordinateKind !== gripper.coordinateKind
+    || !Number.isFinite(receipt.targetPosition)
+    || (receipt.minPosition !== null && receipt.targetPosition < receipt.minPosition)
+    || (receipt.maxPosition !== null && receipt.targetPosition > receipt.maxPosition)
+  ) return null;
+  const targets = sourceModel.targets.filter((target) => (
+    target.component_id === gripper.controllableComponentId
+    && target.target_id === gripper.commandTargetId
+  ));
+  if (targets.length !== 1) return null;
+  const groups = targets[0].model_groups.filter((group) => (
+    group.commandable_source_joint_names.includes(receipt.sourceCoordinateName)
+  ));
+  if (groups.length !== 1) return null;
+  const occurrences = sourceModel.occurrences.filter((occurrence) => (
+    occurrence.component_id === gripper.controllableComponentId
+    && occurrence.model_instance_id === groups[0].model_instance_id
+  ));
+  if (occurrences.length !== 1) return null;
+  const occurrence = occurrences[0];
+  const coordinates = occurrence.coordinates.filter((coordinate) => (
+    coordinate.source_joint_name === receipt.sourceCoordinateName
+  ));
+  const coordinateKind = receipt.coordinateKind === 'angular_rad' ? 'angular' : 'linear';
+  const unit = receipt.coordinateKind === 'angular_rad' ? 'radians' : 'meters';
+  if (coordinates.length !== 1
+    || coordinates[0].coordinate_kind !== coordinateKind
+    || coordinates[0].unit !== unit) return null;
+  const sourceLinks = new Set(targets[0].collision_bodies
+    .filter((body) => body.model_instance_id === groups[0].model_instance_id)
+    .flatMap((body) => body.source_link_names));
+  if (sourceLinks.size === 0) return null;
+  const viewerLinks = occurrence.links.filter((link) => sourceLinks.has(link.source_link_name));
+  if (viewerLinks.length !== sourceLinks.size
+    || new Set(viewerLinks.map((link) => link.source_link_name)).size !== sourceLinks.size) return null;
+  const transforms = measuredLinkTransforms(
+    manifest,
+    new Map([[coordinates[0].viewer_joint_name, receipt.targetPosition]]),
+    measured,
+  );
+  if (transforms === null) return null;
+  const linkTransforms: Record<string, RuntimeLinkTransform> = {};
+  for (const link of viewerLinks) {
+    const transform = transforms[link.viewer_link_name];
+    if (transform === undefined) return null;
+    linkTransforms[link.viewer_link_name] = transform;
+  }
+  return {
+    receiptDigest: receipt.receiptDigest,
+    linkTransforms,
   };
 }
 

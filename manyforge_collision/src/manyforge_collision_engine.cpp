@@ -722,6 +722,7 @@ struct ManyForgeCollisionEngine::PreparedScene {
     core::CollisionPairId pair;
   };
 
+  std::string publisher_id;
   core::CollisionWorldRevision revision;
   pinocchio::GeometryModel collision_model;
   std::vector<std::string> scene_geometry_names;
@@ -2384,10 +2385,15 @@ ManyForgeCollisionEngine::full_configuration_from_query(
 
 std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
     const core::CollisionWorldSnapshot& snapshot, bool allow_resource_io) {
-  const auto revision_matches = [&](const std::shared_ptr<const PreparedScene>& prepared) {
-    return prepared &&
-           prepared->revision.revision_id == snapshot.revision.revision_id &&
-           prepared->revision.content_hash == snapshot.revision.content_hash;
+  const auto snapshot_matches = [&](const std::shared_ptr<const PreparedScene>& prepared) {
+    if (!prepared ||
+        prepared->revision.content_hash != snapshot.revision.content_hash) {
+      return false;
+    }
+    // Revision numbers are comparable only within one publisher incarnation.
+    // Equal content from another publisher is still safe to reuse.
+    return prepared->publisher_id != snapshot.publisher_id ||
+           prepared->revision.revision_id == snapshot.revision.revision_id;
   };
   const auto bind_prepared_scene = [&](std::shared_ptr<const PreparedScene> prepared) {
     active_prepared_scene_ = std::move(prepared);
@@ -2400,11 +2406,11 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
     runtime_clearance_observations_.reserve(pair_count);
   };
 
-  if (revision_matches(active_prepared_scene_)) {
+  if (snapshot_matches(active_prepared_scene_)) {
     return std::nullopt;
   }
   if (auto cached = scene_cache_->latest.load(std::memory_order_acquire);
-      revision_matches(cached)) {
+      snapshot_matches(cached)) {
     bind_prepared_scene(std::move(cached));
     return std::nullopt;
   }
@@ -2414,6 +2420,7 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
   runtime_collision_observations_.clear();
   runtime_clearance_observations_.clear();
   auto prepared = std::make_shared<PreparedScene>();
+  prepared->publisher_id = snapshot.publisher_id;
   prepared->revision = snapshot.revision;
   prepared->collision_model = shared_model_->base_collision_model;
   // Rebuild the active subset below using the retained SRDF inventory plus
@@ -2821,16 +2828,18 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
   std::shared_ptr<const PreparedScene> selected = prepared;
   auto observed = scene_cache_->latest.load(std::memory_order_acquire);
   for (;;) {
-    if (revision_matches(observed)) {
+    if (snapshot_matches(observed)) {
       selected = std::move(observed);
       break;
     }
     if (observed &&
+        observed->publisher_id == snapshot.publisher_id &&
         observed->revision.revision_id == snapshot.revision.revision_id &&
         observed->revision.content_hash != snapshot.revision.content_hash) {
       return "collision snapshot revision reused with different content hash";
     }
     if (observed &&
+        observed->publisher_id == snapshot.publisher_id &&
         observed->revision.revision_id > snapshot.revision.revision_id) {
       // An older in-flight validation may finish after a newer publication.
       // Use its prepared value locally without regressing the shared cache.

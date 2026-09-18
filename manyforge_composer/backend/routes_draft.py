@@ -16,7 +16,6 @@ from fastapi.responses import JSONResponse
 from manyforge_behavior.canonical_artifact import (
     canonical_json_bytes,
     StrictArtifactError,
-    verify_content_identity,
 )
 from manyforge_behavior.program import Program, ProgramValidationError
 from manyforge_headless_api.client import HeadlessClientError
@@ -93,30 +92,6 @@ _SOURCE_RESOLVED_MUTATIONS = frozenset(
     }
 )
 _DTO_CONFIG = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)
-_PROGRAM_REQUIRED_FIELDS = frozenset(
-    {
-        "api_version",
-        "program_id",
-        "program_revision",
-        "program_profile",
-        "name",
-        "catalog",
-        "component_roles",
-        "target_roles",
-        "tree",
-    }
-)
-_PROGRAM_FIELDS = _PROGRAM_REQUIRED_FIELDS | frozenset(
-    {
-        "blackboard",
-        "compatibility",
-        "contact_policies",
-        "description",
-        "parameters",
-        "scene",
-        "viewer",
-    }
-)
 _ACTIVE_AUTHORING_CLAIM: ContextVar[dict[str, Any] | None] = ContextVar(
     "active_authoring_claim", default=None
 )
@@ -279,20 +254,18 @@ def _applied_context(
     program_revision = applied.get("program_revision")
     record_digest = source.get("record_digest") if isinstance(source, dict) else None
     try:
-        program_identity = (
-            verify_content_identity(
-                program,
-                own_field="program_revision",
-                identity_domain="program-revision",
-                api_version="manyforge.program.v2",
-                label="applied_program.program",
-            )
-            if isinstance(program, dict)
-            else None
+        parsed_program = Program.from_dict(
+            program,
+            _active_catalog(state),
+            path="<headless-applied-program>",
         )
+        program_identity = parsed_program.program_revision
         validate_applied_program_selection(applied)
     except (
         ProgramBindingTransportError,
+        ProgramValidationError,
+        ActiveNodeEnvironmentProjectionError,
+        HeadlessClientError,
         TypeError,
         ValueError,
         StrictArtifactError,
@@ -300,12 +273,6 @@ def _applied_context(
         program_identity = None
     if (
         not isinstance(program, dict)
-        or not _PROGRAM_REQUIRED_FIELDS.issubset(program)
-        or not set(program).issubset(_PROGRAM_FIELDS)
-        or not isinstance(program.get("catalog"), dict)
-        or not isinstance(program.get("component_roles"), dict)
-        or not isinstance(program.get("target_roles"), dict)
-        or not isinstance(program.get("tree"), dict)
         or program.get("program_id") != program_id
         or program_identity != program_revision
     ):
@@ -405,7 +372,59 @@ def _observed_move_arguments(
     targets = targets_projection.get("targets")
     control = control_projection.get("control_state")
     direct = targets.get("direct_control") if isinstance(targets, dict) else None
+    direct_rows = (
+        [row for row in targets.get("direct_control_targets", []) if isinstance(row, dict)]
+        if isinstance(targets, dict) and isinstance(targets.get("direct_control_targets"), list)
+        else []
+    )
+    if not direct_rows and isinstance(direct, dict):
+        direct_rows = [direct]
+    observed_rows = (
+        [row for row in control.get("observed_target_states", []) if isinstance(row, dict)]
+        if isinstance(control, dict) and isinstance(control.get("observed_target_states"), list)
+        else []
+    )
     observed = control.get("observed_motion") if isinstance(control, dict) else None
+    authoring = state.draft_session.snapshot().get("authoring")
+    if not isinstance(authoring, dict):
+        raise DraftSessionError(
+            "composer_draft_unavailable", "Composer has no Program Draft", status_code=404
+        )
+    node = _draft_node(authoring, instance_id)
+    expected_node_id = (
+        "motion.move_to_joint_target" if observed_kind == "joint" else "motion.move_to_pose"
+    )
+    node_target_role = node.get("parameters", {}).get("target_role")
+    if node.get("node_id") != expected_node_id or type(node_target_role) is not str:
+        raise DraftSessionError(
+            "observed_move_target_mismatch",
+            "selected move does not address an observed motion target",
+            status_code=409,
+        )
+    matching_direct = [
+        row for row in direct_rows
+        if row.get("target_role_id") == node_target_role
+    ]
+    if len(matching_direct) != 1:
+        raise DraftSessionError(
+            "observed_move_target_mismatch",
+            "selected move target role is not unique in the current execution owner",
+            status_code=409,
+        )
+    direct = matching_direct[0]
+    matching_observed = [
+        row.get("motion") for row in observed_rows
+        if row.get("motion_target_role_id") == node_target_role
+        and row.get("command_target_id") == direct.get("command_target_id")
+        and row.get("controllable_component_id") == direct.get("controllable_component_id")
+        and isinstance(row.get("motion"), dict)
+    ]
+    if observed_rows:
+        observed = matching_observed[0] if len(matching_observed) == 1 else None
+    elif len(direct_rows) == 1:
+        observed = control.get("observed_motion") if isinstance(control, dict) else None
+    else:
+        observed = None
     if (
         targets_projection.get("ok") is not True
         or control_projection.get("ok") is not True
@@ -422,24 +441,6 @@ def _observed_move_arguments(
         raise DraftSessionError(
             "observed_move_unavailable",
             "execution owner has no complete current observed target",
-            status_code=409,
-        )
-    authoring = state.draft_session.snapshot().get("authoring")
-    if not isinstance(authoring, dict):
-        raise DraftSessionError(
-            "composer_draft_unavailable", "Composer has no Program Draft", status_code=404
-        )
-    node = _draft_node(authoring, instance_id)
-    expected_node_id = (
-        "motion.move_to_joint_target" if observed_kind == "joint" else "motion.move_to_pose"
-    )
-    if (
-        node.get("node_id") != expected_node_id
-        or node.get("parameters", {}).get("target_role") != direct["target_role_id"]
-    ):
-        raise DraftSessionError(
-            "observed_move_target_mismatch",
-            "selected move does not address the current observed target role",
             status_code=409,
         )
     resolved_observation = (

@@ -1200,13 +1200,13 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pose_pick/97eab6fd80388801bb20f83fc60af67e07c85f1c863b642766d9d6f0d8bee7f8",
-        "content_digest": "sha256:68298df2099927690880419245ce0f14d3082cd26c08063e84a7cfb93770b82e",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pose_pick/18cb6d3a0baacf6ec3e6233846854f2b4c99bc6098952138283da3ca406130d7",
+        "content_digest": "sha256:22d640b87b7cd93263292aa7358247e96f40c74ab6e55fb087aa130cfed10eaf",
         "record_id": "manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pose_pick",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:97eab6fd80388801bb20f83fc60af67e07c85f1c863b642766d9d6f0d8bee7f8",
+        "record_revision": "sha256:18cb6d3a0baacf6ec3e6233846854f2b4c99bc6098952138283da3ca406130d7",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/7016c53470a155760287cdd2186a783a2185d63bb3ac2e455e49f1d80130a00b",
@@ -1249,7 +1249,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pose_pick",
-  "deployment_revision": "sha256:933b015f7aefb6ea21f047a038a1759eae1f2e9eb9ae1386248ca11a000f138e",
+  "deployment_revision": "sha256:1cbae02258ccc1dc60a626df0a66da04af7dc8d6a49a0d9b936a8fdd8e89cc63",
   "description": "Local deployment for the vision-guided pose-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
   "desired_control_configurations": [
     {
@@ -2266,13 +2266,13 @@
     "interrupt_sources": [],
     "retained_policy_records": [
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pose_pick/97eab6fd80388801bb20f83fc60af67e07c85f1c863b642766d9d6f0d8bee7f8",
-        "content_digest": "sha256:68298df2099927690880419245ce0f14d3082cd26c08063e84a7cfb93770b82e",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pose_pick/18cb6d3a0baacf6ec3e6233846854f2b4c99bc6098952138283da3ca406130d7",
+        "content_digest": "sha256:22d640b87b7cd93263292aa7358247e96f40c74ab6e55fb087aa130cfed10eaf",
         "record_id": "manyforge.runtime_motion.ur5_roboplan_local_vision_guided_pose_pick",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:97eab6fd80388801bb20f83fc60af67e07c85f1c863b642766d9d6f0d8bee7f8",
+        "record_revision": "sha256:18cb6d3a0baacf6ec3e6233846854f2b4c99bc6098952138283da3ca406130d7",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       }
     ],
     "stop_stage_parameters": [

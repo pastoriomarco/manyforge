@@ -1,18 +1,51 @@
-import { useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 
 import {
   programMotionStopSettled,
   type ProgramRuntimeController,
 } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
-import type { JsonValue } from '../types/api';
+import type {
+  JsonValue,
+} from '../types/api';
 import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
+import { appliedExecutionSelectionRows } from '../state/programExecutionGroups';
 import { OverlayPanel } from './OverlayPanel';
 
 
 interface ProgramRuntimePanelProps {
   enabled: boolean;
   controller: ProgramRuntimeController;
+}
+
+const TRANSPORT_PREFERENCES_KEY = 'manyforge.composer.transport_preferences.v1';
+
+interface TransportPreferences {
+  controlWidthRem: number;
+  confirmHalt: boolean;
+}
+
+const DEFAULT_TRANSPORT_PREFERENCES: TransportPreferences = {
+  controlWidthRem: 7,
+  confirmHalt: true,
+};
+
+function loadTransportPreferences(): TransportPreferences {
+  try {
+    const raw = globalThis.localStorage?.getItem(TRANSPORT_PREFERENCES_KEY);
+    if (raw === null || raw === undefined) return DEFAULT_TRANSPORT_PREFERENCES;
+    const parsed = JSON.parse(raw) as Partial<TransportPreferences>;
+    return {
+      controlWidthRem: typeof parsed.controlWidthRem === 'number'
+        && Number.isFinite(parsed.controlWidthRem)
+        ? Math.min(11, Math.max(6, parsed.controlWidthRem))
+        : DEFAULT_TRANSPORT_PREFERENCES.controlWidthRem,
+      confirmHalt: typeof parsed.confirmHalt === 'boolean'
+        ? parsed.confirmHalt : DEFAULT_TRANSPORT_PREFERENCES.confirmHalt,
+    };
+  } catch {
+    return DEFAULT_TRANSPORT_PREFERENCES;
+  }
 }
 
 function shortIdentity(value: string | null): string {
@@ -163,7 +196,7 @@ export function ProgramRuntimePanel({
             <small>
               {state.applied
                 ? `${state.applied.scenarioId} · ${shortIdentity(state.applied.programRevision)}`
-                : 'Apply a validated Draft before Run.'}
+                : 'Apply a validated Draft before Execute.'}
             </small>
             {state.applied && (
               <a
@@ -201,7 +234,7 @@ export function ProgramRuntimePanel({
             <small>
               {state.run
                 ? `${state.run.capture.scenarioId} · ${shortIdentity(state.run.capture.programRevision)} · immutable for this run`
-                : 'A new Run captures the exact Applied selection once.'}
+                : 'Execute captures the exact Applied selection once.'}
             </small>
           </div>
           <div className="program-runtime-fact">
@@ -509,12 +542,12 @@ export function ProgramRuntimePanel({
           }}
         >
           {cycleState === 'starting'
-            ? 'Starting'
+            ? 'Executing'
             : state.pending === 'run' || state.pending === 'resume-full-stop'
-            ? 'Sending Run'
+            ? 'Sending Execute'
             : fullStopped
-              ? 'Run'
-              : 'Run Applied Program'}
+              ? 'Execute'
+              : 'Execute Applied Program'}
         </button>
         <button
           type="button"
@@ -543,9 +576,8 @@ export function ProgramRuntimePanel({
 }
 
 /**
- * Compact viewport transport. It renders only commands backed by the current
- * owner contracts; unsupported velocity control stays visibly unavailable
- * instead of being simulated in the browser.
+ * Compact viewport transport. It renders one owner-backed control column per
+ * displayed Program scope and keeps whole-Program/cell commands separate.
  */
 export function ProgramTransportControls({
   enabled,
@@ -561,23 +593,56 @@ export function ProgramTransportControls({
   onOpenRobotControls?: () => void;
 }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const [stopMenuOpen, setStopMenuOpen] = useState(false);
-  const [selection, setSelection] = useState({ runId: '', groupIds: ['all'] });
+  const [groupSettingsOpen, setGroupSettingsOpen] = useState(false);
+  const [haltIntent, setHaltIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
+  const [preferences, setPreferences] = useState<TransportPreferences>(loadTransportPreferences);
+  const [selection, setSelection] = useState({ scopeKey: '', groupIds: ['all'] });
   const detailsButton = useRef<HTMLButtonElement>(null);
+  const groupSettingsButton = useRef<HTMLButtonElement>(null);
+  const haltButton = useRef<HTMLButtonElement>(null);
   const { state, cycleState, cycleFailure } = program;
-  const runId = state.run?.capture.programRunId ?? '';
-  const selections = state.controls?.executionSelections.groups ?? [];
-  const groupIds = selection.runId === runId ? selection.groupIds : ['all'];
-  const selectedGroups = selections.filter((group) => groupIds.includes(group.groupId));
-  const selectedGroup = selectedGroups.find((group) => group.resumeUnavailableReason)
-    ?? selectedGroups[0];
+  const scopeKey = state.applied === null
+    ? ''
+    : `${state.applied.programId}:${state.applied.programRevision}:${state.applied.recordDigest}`;
+  const appliedSelections = useMemo(
+    () => appliedExecutionSelectionRows(state.applied),
+    [state.applied],
+  );
+  const projectedSelections = state.controls?.executionSelections.groups;
+  const selections = projectedSelections !== undefined && projectedSelections.length > 0
+    ? projectedSelections
+    : appliedSelections;
+  const availableGroupIds = selections.map((group) => group.groupId);
+  const allGroup = selections.find((group) => group.groupId === 'all');
+  const namedGroups = selections.filter((group) => group.groupId !== 'all');
+  const hasMultipleScopes = selections.length > 1;
+  const defaultGroupIds = namedGroups.length > 0
+    ? namedGroups.map((group) => group.groupId)
+    : allGroup === undefined ? [] : ['all'];
+  const requestedGroupIds = selection.scopeKey === scopeKey
+    ? selection.groupIds.filter((groupId) => availableGroupIds.includes(groupId))
+    : [];
+  const groupIds = requestedGroupIds.length > 0 ? requestedGroupIds : defaultGroupIds;
+  const visibleGroups = selections.filter((group) => groupIds.includes(group.groupId));
+  const hiddenGroupCount = hasMultipleScopes
+    ? Math.max(0, selections.length - visibleGroups.length)
+    : 0;
+  const selectionGroupPending = (
+    groupId: string,
+    kind: 'start-motion' | 'motion-stop' | 'resume-motion',
+  ) => (
+    state.selectionPending.some((request) => (
+      request.kind === kind && request.groupIds.includes(groupId)
+    ))
+  );
   const motionActive = robotControlHasActiveOperation(robot.state);
-  const motionPaused = robot.state.operation?.state === 'paused';
   // Includes the other manual mode, not just the operation currently shown
   // in Robot Control. The native owner independently fences Program Resume.
   const manualResident = robot.currentStatus?.manualOperations.some((operation) => operation.resident) === true;
   const programMotionRunning = ['running', 'intervention_required'].includes(state.run?.state ?? '');
-  const programStarting = cycleState === 'starting';
+  // The command receipt can precede the next owner projection. Treat that
+  // short accepted-Run interval as starting so Stop remains available and
+  // the owner-scoped velocity controls do not flicker off.
   const programStopping = cycleState === 'stopping';
   const programFullStopping = state.run?.state === 'full_stopping';
   const programFullStopped = state.run?.state === 'full_stopped';
@@ -588,77 +653,73 @@ export function ProgramTransportControls({
     && state.pending === null
     && !programMotionRunning
     && program.commandAllowed('program_run');
-  const motionStopSettled = selectedGroups.length > 0
-    && selectedGroups.every((group) => group.state === 'held') && programMotionRunning;
-  const motionStopSettling = selectedGroups.some((group) => group.state === 'stopping')
-    && selectedGroups.every((group) => group.state === 'stopping' || group.state === 'held');
-  const motionStopped = motionStopSettled
-    || programFullStopped
-    || state.run?.state === 'stopped'
-    || (
-      !programMotionRunning
-      && robot.state.operation?.state === 'stopped'
-    );
   const stopCommandPending = ['stop', 'full-stop', 'reset']
     .includes(state.pending ?? '');
-  const canStopMotion = enabled
-    && !stopCommandPending
-    && !programStopping
-    && !motionStopSettled
-    && !motionStopSettling
-    && groupIds.length > 0
-    && (
-      (state.runnerAvailable && (programStarting || (programMotionRunning
-        && program.commandAllowed('program_motion_stop')
-        && (selectedGroups.some((group) => group.stopAllowed) || selections.length === 0))))
-      || (robot.controlPending === null && motionActive)
-    );
-  const canResumeOperatorStop = enabled
-    && cycleState === 'running'
-    && !manualResident
-    && selectedGroups.length === groupIds.length && groupIds.length > 0
-    && selectedGroups.every((group) => group.resumeAllowed)
-    && program.commandAllowed('program_motion_resume')
-    && state.pending === null
-    && state.controlPending === null;
-  const canResume = enabled
-    && motionPaused
-    && state.pending === null
-    && robot.controlPending === null;
   const canResumeFullStop = enabled
     && !manualResident
     && programFullStopped
     && state.pending === null;
-  const canRunOrResume = canRun || canResume || canResumeOperatorStop
-    || canResumeFullStop;
-  const canFullStop = enabled
-    && state.runnerAvailable
-    && !stopCommandPending
-    && ['running', 'intervention_required'].includes(state.run?.state ?? '');
+  const canRunOrResume = canRun || canResumeFullStop;
   const canReset = enabled
     && state.pending === null
+    && state.selectionPending.length === 0
     && state.controlPending === null
     && program.commandAllowed('program_reset');
-  const velocityAvailable = enabled
-    && (state.pending === null || state.pending === 'run')
-    && !['stopping', 'full_stopping'].includes(state.run?.state ?? '')
-    && robot.state.phase !== 'stopping'
-    && !robot.fullStopPending
-    && robot.runtimeScaleStatus !== null
-    && robot.runtimeScaleStatus.supported
-    && !robot.runtimeScaleStatus.frozen;
-  const velocityReason = robot.runtimeScaleError
-    ?? robot.runtimeScaleStatus?.reason
-    ?? 'The addressed target does not currently expose qualified runtime velocity control.';
-  const velocityGroup = robot.runtimeScaleStatus?.selector.kind === 'group'
-    ? robot.runtimeScaleStatus.selector.groupTargets : null;
-  const fullCellStop = robot.state.status?.cellStopAction ?? null;
+  // Cell Full Stop is independent of the selected Robot panel target. Use the
+  // owner-wide projection first so changing the selected robot cannot hide a
+  // valid cell command.
+  const fullCellStop = robot.currentStatus?.cellStopAction
+    ?? robot.state.status?.cellStopAction
+    ?? null;
   const fullStopReason = fullCellStop === null
     ? 'The current execution owner status is unavailable.'
     : fullCellStop.available
       ? 'Stop all currently addressed motion in this cell using the exact owner-issued generation fence.'
       : fullCellStop.unavailableReason
         ?? 'The execution owner has not made Full Stop available.';
+  const allMotionQuiesced = allGroup?.state === 'ready' || allGroup?.state === 'held';
+  const canProgramHalt = enabled
+    && state.runnerAvailable
+    && cycleState === 'running'
+    && ['running', 'intervention_required'].includes(state.run?.state ?? '')
+    && state.controls !== null
+    && allGroup !== undefined
+    && allGroup.state !== 'unavailable'
+    && state.pending === null
+    && state.selectionPending.length === 0
+    && state.controlPending === null
+    && !programFullStopping
+    && program.commandAllowed('program_full_stop');
+
+  useEffect(() => {
+    try {
+      globalThis.localStorage?.setItem(
+        TRANSPORT_PREFERENCES_KEY,
+        JSON.stringify(preferences),
+      );
+    } catch {
+      // A blocked preference store must never disable execution controls.
+    }
+  }, [preferences]);
+
+  useEffect(() => {
+    if (haltIntent !== 'automatic' || !allMotionQuiesced) return;
+    setHaltIntent(null);
+    void program.fullStop();
+  }, [allMotionQuiesced, haltIntent, program]);
+
+  const requestProgramHalt = async () => {
+    if (!canProgramHalt) return;
+    if (!allMotionQuiesced) {
+      setHaltIntent('stopping');
+      const accepted = await program.stopMotion(['all']);
+      if (!accepted) {
+        setHaltIntent(null);
+        return;
+      }
+    }
+    setHaltIntent(preferences.confirmHalt ? 'confirm' : 'automatic');
+  };
   const nativeStatus = robot.currentStatus;
   const manualRecovery = nativeStatus?.manualOperations
     .filter(manualOperationRequiresRecovery) ?? [];
@@ -674,6 +735,18 @@ export function ProgramTransportControls({
       && recoveryOffer != null && recoveryOffer.recoveryClass !== 'ordinary_operator_stop');
   const resetRequired = cycleState === 'terminal_awaiting_reset';
   const recoveryRequired = manualRecovery.length > 0 || cellFault != null || programRecovery;
+  const groupScaleStopAffects = (groupId: string): boolean => {
+    if (['stopping', 'full_stopping'].includes(state.run?.state ?? '')) return true;
+    if (selections.some((group) => group.groupId === groupId && group.state === 'stopping')) {
+      return true;
+    }
+    return state.selectionPending.some((request) => (
+      request.kind === 'motion-stop'
+      && (groupId === 'all'
+        || request.groupIds.includes(groupId)
+        || request.groupIds.includes('all'))
+    ));
+  };
   const blockedReason = !enabled
     ? 'Control status unavailable. Commands are disabled until a current backend status is received.'
     : manualRecovery.length > 0
@@ -685,10 +758,25 @@ export function ProgramTransportControls({
           : resetRequired ? 'Reset the Program before starting another run.'
             : nativeStatus == null
               ? 'Robot status unavailable. Last-known manual and cell recovery status is not current.' : null;
+  // Keep the control panels at their established sizes. Only the center
+  // guidance track is elastic; additional Motion groups widen the left panel
+  // by exactly one control column plus its inter-column gap.
+  const motionPanelWidthRem = visibleGroups.length === 0
+    ? 12.725
+    : (visibleGroups.length * preferences.controlWidthRem)
+      + (Math.max(0, visibleGroups.length - 1) * 0.35)
+      + 0.725;
 
   return (
     <>
-      <div className="viewer-transport" aria-label="Program and motion controls">
+      <div
+        className="viewer-transport"
+        aria-label="Program and motion controls"
+        style={{
+          '--viewer-transport-column-width': `${preferences.controlWidthRem}rem`,
+          '--viewer-transport-motion-panel-width': `${motionPanelWidthRem}rem`,
+        } as CSSProperties}
+      >
         {blockedReason !== null && (
           <div
             className={`transport-guidance${recoveryRequired && enabled ? ' recovery-required' : ''}`}
@@ -699,8 +787,26 @@ export function ProgramTransportControls({
                 Robot status unavailable. Last-known manual and cell recovery status is not current.
               </p>}
               {manualRecovery.map((operation) => {
-                const gripper = operation.programRunId === nativeStatus?.directControlGripper.programRunId;
-                const target = gripper ? nativeStatus?.directControlGripper : nativeStatus?.directControl;
+                const motionTarget = operation.controllableComponentId === undefined
+                  || operation.commandTargetId === undefined
+                  ? undefined
+                  : (robot.motionTargets ?? []).find((candidate) => (
+                    candidate.controllableComponentId === operation.controllableComponentId
+                    && candidate.commandTargetId === operation.commandTargetId
+                  ));
+                const gripperTarget = operation.controllableComponentId === undefined
+                  || operation.commandTargetId === undefined
+                  ? undefined
+                  : (robot.gripperTargets ?? []).find((candidate) => (
+                    candidate.controllableComponentId === operation.controllableComponentId
+                    && candidate.commandTargetId === operation.commandTargetId
+                  ));
+                const gripper = gripperTarget !== undefined
+                  || (motionTarget === undefined
+                    && operation.programRunId === nativeStatus?.directControlGripper.programRunId);
+                const target = gripper
+                  ? (gripperTarget ?? nativeStatus?.directControlGripper)
+                  : (motionTarget ?? nativeStatus?.directControl);
                 return (
                   <div className="transport-guidance-row" key={operation.operationId}>
                     <p>
@@ -714,6 +820,24 @@ export function ProgramTransportControls({
                       disabled={motionActive && robot.state.operation?.operationId !== operation.operationId}
                       title="Open this target's Robot panel. This does not reset or move the robot."
                       onClick={() => {
+                        // Select the exact addressed robot before opening the
+                        // panel. A gripper operation selects its owning
+                        // motion target first; the tool then follows it.
+                        const owningMotion = motionTarget
+                          ?? (target === undefined ? undefined : (robot.motionTargets ?? [])
+                            .find((candidate) => (
+                              candidate.controllableComponentId
+                                === target.controllableComponentId
+                            )));
+                        if (owningMotion !== undefined) {
+                          robot.selectRobot(
+                            owningMotion.controllableComponentId,
+                            owningMotion.commandTargetId,
+                          );
+                        }
+                        if (gripperTarget !== undefined) {
+                          robot.selectTool(gripperTarget.commandTargetId);
+                        }
                         robot.selectMode(gripper ? 'gripper' : 'joint');
                         onOpenRobotControls();
                       }}
@@ -729,223 +853,302 @@ export function ProgramTransportControls({
               {programRecovery ? <div className="transport-guidance-row">
                 <p><strong>Program recovery required.</strong> {programRecoveryMessage}</p>
                 <button type="button" onClick={() => setDetailsOpen(true)}>Review Program recovery</button>
-              </div> : resetRequired && <p>Program finished. Use <strong>Reset</strong> below before another Run.</p>}
+              </div> : resetRequired && <p>Program finished. Use <strong>Reset</strong> below before another Execute.</p>}
             </>}
           </div>
         )}
-        {selections.length > 1 && (
-          <details className="transport-selection">
-            <summary aria-label="Motion control groups">
-              {groupIds.includes('all') ? 'All nodes' : `${groupIds.length} groups`}
-            </summary>
-            <div className="transport-selection-options">
-              {selections.map((group) => (
-                <label key={group.groupId}>
-                  <input type="checkbox" value={group.groupId} checked={groupIds.includes(group.groupId)}
-                    onChange={(event) => setSelection({ runId, groupIds: event.target.checked
-                      ? group.groupId === 'all' ? ['all']
-                        : [...groupIds.filter((id) => id !== 'all'), group.groupId]
-                      : groupIds.filter((id) => id !== group.groupId) })} />
-                  {group.groupId === 'all' ? 'All nodes' : group.groupId} · {group.state}
-                </label>
-              ))}
-            </div>
-          </details>
-        )}
-        <button
-          type="button"
-          className="transport-run"
-          disabled={!canRunOrResume}
-          title={canResume
-            ? 'Resume the exact paused motion operation.'
-            : canResumeFullStop
-              ? 'Run the preserved Program tree from fresh current-state resolution.'
-            : canResumeOperatorStop
-              ? 'Resume only this selection after fresh backend assessment.'
-            : canRun
-              ? 'Run the exact Applied Program.'
-              : blockedReason ?? selectedGroup?.resumeUnavailableReason?.replaceAll('_', ' ')
-                ?? 'Run requires an Applied Program and an idle, reset runner.'}
-          onClick={() => {
-            if (canResume) {
-              void robot.resume();
-            } else if (canResumeFullStop) {
-              void program.resumeFullStop();
-            } else if (canResumeOperatorStop) {
-              void program.resumeMotion(groupIds);
-            } else {
-              void program.run();
-            }
-          }}
-        >
-          {robot.controlPending === 'resume'
-            ? 'Sending Resume'
-            : cycleState === 'starting'
-              ? 'Starting'
-            : state.pending === 'resume-full-stop'
-              ? 'Sending Run'
-            : state.pending === 'resume-motion' || state.controlPending?.startsWith('recovery:')
-              ? 'Sending Resume'
-            : state.pending === 'run'
-              ? 'Sending Run'
-              : canResume || canResumeOperatorStop
-                ? 'Resume Motion'
-                : programRecovery
-                  ? 'Recovery required'
-                : programMotionRunning
-                  ? 'Running'
-                  : 'Run'}
-        </button>
-        <div
-          className="transport-stop-group"
-          onBlur={(event) => {
-            if (!event.currentTarget.contains(event.relatedTarget)) {
-              setStopMenuOpen(false);
-            }
-          }}
-          onKeyDown={(event) => {
-            if (event.key === 'Escape') {
-              setStopMenuOpen(false);
-              event.stopPropagation();
-            }
-          }}
-        >
-          <button
-            type="button"
-            className="danger-button transport-stop-primary"
-            disabled={!canStopMotion || robot.state.phase === 'stopping'}
-            title={programStarting
-              ? 'Stop the Program before its pending start can launch motion.'
-              : programMotionRunning
-              ? 'Stop addressed motion in the current Program without terminating its execution.'
-              : motionActive
-                ? 'Stop the exact active Robot Control motion.'
-                : 'No addressed robot motion is active.'}
-            onClick={() => {
-              if (programStarting) {
-                void program.stop();
-              } else if (programMotionRunning) {
-                void program.stopMotion(groupIds);
-              } else {
-                void robot.stop();
-              }
-            }}
-          >
-            {programStopping || motionStopSettling
-              ? 'Stopping'
-              : robot.controlPending === 'stop'
-              ? 'Sending Stop'
-              : robot.state.phase === 'stopping'
-              ? 'Stopping'
-              : state.pending === 'motion-stop'
-                ? 'Sending Stop'
-              : motionStopped
-                ? 'Stopped'
-                : 'Stop'}
-          </button>
-          <button
-            type="button"
-            className="danger-button transport-stop-disclosure"
-            disabled={
-              !enabled
-              || !canFullStop
-              || programFullStopping
-            }
-            aria-label="More Stop actions"
-            aria-haspopup="menu"
-            aria-expanded={stopMenuOpen}
-            title={canFullStop
-              ? 'Show the deliberate Full Stop action.'
-              : 'Full Stop requires a current Program run.'}
-            onClick={() => setStopMenuOpen((open) => !open)}
-          >
-            ▾
-          </button>
-          {stopMenuOpen && (
-            <div className="transport-stop-menu" role="menu">
-              <button
-                type="button"
-                className="danger-button"
-                role="menuitem"
-                disabled={
-                  !enabled
-                  || !canFullStop
-                  || programFullStopping
-                }
-                title="Contain motion, then quiesce the current Program while preserving it for Run or Reset."
-                onClick={() => {
-                  setStopMenuOpen(false);
-                  void program.fullStop();
-                }}
-              >
-                {programFullStopping
-                  ? 'Stopping'
-                  : state.pending === 'full-stop'
-                    ? 'Sending Full Stop'
-                  : 'Full Stop'}
-              </button>
-            </div>
+        <div className="transport-control-layout">
+          <section className="transport-motion-panel" aria-label="Motion controls">
+            <h3 className="transport-panel-title">Motion</h3>
+            <div className="transport-group-grid" aria-label="Motion group controls">
+          {visibleGroups.length === 0 && (
+            <p className="transport-groups-empty">
+              {selections.length === 0
+                ? 'Group controls require an Applied Program.'
+                : 'No command groups are displayed. Open Settings to choose one.'}
+            </p>
           )}
+          {visibleGroups.map((group) => {
+            const stopPending = selectionGroupPending(group.groupId, 'motion-stop');
+            const startPending = selectionGroupPending(group.groupId, 'start-motion');
+            const resumePending = selectionGroupPending(group.groupId, 'resume-motion');
+            const selectionTransitionPending = state.selectionPending.length > 0;
+            const canGroupStop = enabled
+              && state.runnerAvailable
+              && !stopCommandPending
+              && !programStopping
+              && programMotionRunning
+              && group.stopAllowed
+              && !selectionTransitionPending
+              && !stopPending
+              && group.state !== 'held'
+              && group.state !== 'ready'
+              && group.state !== 'stopping'
+              && program.commandAllowed('program_motion_stop');
+            const canGroupStart = enabled
+              && state.runnerAvailable
+              && cycleState === 'running'
+              && !manualResident
+              && programMotionRunning
+              && state.pending === null
+              && !selectionTransitionPending
+              && state.controlPending === null
+              && group.startAllowed
+              && program.commandAllowed('program_motion_start');
+            const canGroupResume = enabled
+              && state.runnerAvailable
+              && cycleState === 'running'
+              && !manualResident
+              && programMotionRunning
+              && state.pending === null
+              && !selectionTransitionPending
+              && group.resumeAllowed
+              && !resumePending
+              && state.controlPending === null
+              && program.commandAllowed('program_motion_resume');
+            const scale = program.groupRuntimeScales[group.groupId];
+            const scaleAvailable = enabled
+              && blockedReason === null
+              && state.applied !== null
+              && state.run !== null
+              && state.controls !== null
+              && program.commandAllowed('runtime_scale')
+              && !groupScaleStopAffects(group.groupId)
+              && group.state !== 'stopping'
+              && scale?.status?.supported === true
+              && scale.status.frozen === false;
+            const scaleReason = scale?.error
+              ?? group.runtimeScaleUnavailableReason
+              ?? scale?.status?.reason
+              ?? 'The group has no qualified runtime velocity control.';
+            const requestedScale = scale?.draft ?? scale?.status?.requestedScale ?? 1;
+            const effectiveScale = scale?.status?.effectiveScale ?? null;
+            const effectiveDiffers = effectiveScale !== null
+              && Math.abs(effectiveScale - requestedScale) > 0.005;
+            const effectiveMixed = effectiveScale === null
+              && scale?.status !== null
+              && scale?.status !== undefined
+              && (scale.status.applicationState === 'applied'
+                || scale.status.activeOperationId !== null
+                || ['running', 'mixed'].includes(group.state));
+            const scaleOutput = scaleAvailable
+              ? `${Math.round(requestedScale * 100)}%${effectiveDiffers || effectiveMixed ? '*' : ''}`
+              : '—';
+            return (
+              <section
+                className="transport-group-column"
+                key={group.groupId}
+                aria-label={`${group.groupId} controls`}
+              >
+                <button
+                  type="button"
+                  className="transport-group-resume"
+                  disabled={!canGroupStart && !canGroupResume}
+                  title={canGroupStart
+                    ? `Run initial motion in ${group.groupId}.`
+                    : canGroupResume
+                      ? `Resume ${group.groupId} from current observations.`
+                      : group.state === 'running'
+                        ? `${group.groupId} motion is running.`
+                        : (group.state === 'ready'
+                          ? group.startUnavailableReason
+                          : group.resumeUnavailableReason)?.replaceAll('_', ' ')
+                            ?? 'Run is unavailable for this group.'}
+                  onClick={() => {
+                    if (canGroupStart) void program.startMotion([group.groupId]);
+                    else if (canGroupResume) void program.resumeMotion([group.groupId]);
+                  }}
+                >{startPending ? 'Starting'
+                    : resumePending ? 'Resuming'
+                      : group.state === 'ready' ? 'Run'
+                        : group.state === 'held' ? 'Resume'
+                          : group.state === 'running' ? 'Running' : 'Run'}</button>
+                <button
+                  type="button"
+                  className="danger-button transport-group-stop"
+                  disabled={!canGroupStop}
+                  title={canGroupStop
+                    ? `Stop motion in ${group.groupId} without resetting the Program.`
+                    : group.state === 'held'
+                      ? 'This group is already stopped.'
+                      : 'Stop is unavailable for this group.'}
+                  onClick={() => { void program.stopMotion([group.groupId]); }}
+                >{stopPending || group.state === 'stopping' ? 'Stopping'
+                    : group.state === 'held' || group.state === 'ready' ? 'Stopped' : 'Stop'}</button>
+                <label className="transport-group-scale" title={scaleAvailable
+                  ? `Scale current and subsequent moves for ${group.groupId}.`
+                    + (effectiveDiffers
+                      ? ` Requested ${Math.round(requestedScale * 100)}%; effective ${Math.round(effectiveScale! * 100)}%.`
+                      : effectiveMixed
+                        ? ' Effective member scales are mixed or not yet settled.'
+                        : '')
+                  : scaleReason}
+                >
+                  <span>Velocity</span>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    value={requestedScale}
+                    disabled={!scaleAvailable}
+                    onChange={(event) => program.setGroupRuntimeScale(group.groupId, Number(event.target.value))}
+                    onPointerUp={() => program.commitGroupRuntimeScale()}
+                    onKeyUp={() => program.commitGroupRuntimeScale()}
+                    onBlur={() => program.commitGroupRuntimeScale()}
+                  />
+                  <output
+                    aria-busy={scale?.pending || undefined}
+                    aria-label={`Requested velocity ${scaleOutput}`}
+                  >{scale?.pending ? '…' : scaleOutput}</output>
+                </label>
+                <span className="transport-group-name" title={group.groupId}>
+                  {group.groupId === 'all' ? 'All groups' : group.groupId}
+                </span>
+              </section>
+            );
+          })}
+            </div>
+          </section>
+          <section className="transport-unique-column" aria-label="Program and cell controls">
+          <h3 className="transport-panel-title">Program</h3>
+          <button
+            type="button"
+            className="transport-run transport-unique-control"
+            disabled={!canRunOrResume}
+            title={canResumeFullStop
+                ? 'Execute the preserved Program tree from fresh current-state resolution.'
+                : canRun
+                  ? 'Execute the exact Applied Program without starting robot motion.'
+                  : blockedReason ?? 'Execute requires an Applied Program and an idle, reset runner.'}
+            onClick={() => {
+              if (canResumeFullStop) void program.resumeFullStop();
+              else void program.run();
+            }}
+          >{state.pending === 'run' || state.pending === 'resume-full-stop'
+            ? 'Executing'
+            : canResumeFullStop
+              ? 'Execute'
+              : cycleState === 'starting'
+                ? 'Executing'
+                : programMotionRunning ? 'Executing' : 'Execute'}</button>
+          <button
+            ref={haltButton}
+            type="button"
+            className="danger-button transport-full-stop transport-unique-control"
+            disabled={!canProgramHalt || haltIntent !== null}
+            title={canProgramHalt
+              ? 'Stop all Program motion, then halt Program execution.'
+              : 'Halt is available only while a Program is executing.'}
+            onClick={() => { void requestProgramHalt(); }}
+          >{haltIntent !== null || programFullStopping ? 'Halting' : 'Halt'}</button>
+          <button
+            type="button"
+            className={canReset ? 'transport-reset transport-unique-control meaningful' : 'transport-reset transport-unique-control'}
+            disabled={!canReset}
+            title={canReset
+              ? resetRequired ? 'Reset the completed Program cycle.'
+                : 'Reset the current Program cycle using its exact owner evidence.'
+              : 'Reset is unavailable in the current backend control state.'}
+            onClick={() => { void program.reset(); }}
+          >{cycleState === 'resetting' || state.pending === 'reset'
+            || state.controlPending === 'recovery:reset_cycle' ? 'Resetting' : 'Reset'}</button>
+          <div className="transport-unique-icons">
+            <button
+              ref={detailsButton}
+              type="button"
+              className="icon-button transport-unique-icon"
+              data-recovery-required={enabled && recoveryRequired || undefined}
+              aria-label="Program run information"
+              title={blockedReason ?? 'Program and cell run information'}
+              onClick={() => setDetailsOpen(true)}
+            >i</button>
+            <div
+              className="transport-group-settings"
+              onBlur={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget)) setGroupSettingsOpen(false);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') {
+                  setGroupSettingsOpen(false);
+                  event.stopPropagation();
+                }
+              }}
+            >
+              <button
+                ref={groupSettingsButton}
+                type="button"
+                className="icon-button transport-unique-icon transport-settings-button"
+                aria-label={hiddenGroupCount > 0
+                  ? `Open control settings; ${hiddenGroupCount} command groups hidden`
+                  : 'Open control settings'}
+                aria-haspopup="dialog"
+                aria-expanded={groupSettingsOpen}
+                title="Control layout and Program Halt settings."
+                onClick={() => setGroupSettingsOpen((open) => !open)}
+              >
+                <span className="transport-settings-glyph" aria-hidden="true">⚙</span>
+                {hiddenGroupCount > 0 && (
+                  <span
+                    className="transport-hidden-group-count"
+                    aria-hidden="true"
+                  >{hiddenGroupCount}</span>
+                )}
+              </button>
+              {groupSettingsOpen && (
+                <div className="transport-group-settings-menu" role="dialog" aria-label="Control settings">
+                  {hasMultipleScopes && <>
+                    <strong>Displayed groups</strong>
+                    {selections.map((group) => (
+                      <label className="transport-settings-option" key={group.groupId}>
+                        <input
+                          type="checkbox"
+                          checked={groupIds.includes(group.groupId)}
+                          onChange={(event) => {
+                            const nextGroupIds = event.target.checked
+                              ? [...new Set([...groupIds, group.groupId])]
+                              : groupIds.filter((id) => id !== group.groupId);
+                            if (nextGroupIds.length === 0) return;
+                            setSelection({ scopeKey, groupIds: nextGroupIds });
+                          }}
+                        />
+                        <span title={group.groupId}>{group.groupId === 'all' ? 'All groups' : group.groupId}</span>
+                      </label>
+                    ))}
+                  </>}
+                  <strong>Layout</strong>
+                  <label className="transport-settings-range">
+                    <span>Control width</span>
+                    <input
+                      type="range"
+                      min="6"
+                      max="11"
+                      step="0.25"
+                      value={preferences.controlWidthRem}
+                      onChange={(event) => setPreferences((current) => ({
+                        ...current,
+                        controlWidthRem: Number(event.target.value),
+                      }))}
+                    />
+                    <output>{preferences.controlWidthRem.toFixed(2).replace(/\.00$/, '')} rem</output>
+                  </label>
+                  <label className="transport-settings-option">
+                    <input
+                      type="checkbox"
+                      checked={preferences.confirmHalt}
+                      onChange={(event) => setPreferences((current) => ({
+                        ...current,
+                        confirmHalt: event.target.checked,
+                      }))}
+                    />
+                    <span>Confirm before halting Program execution</span>
+                  </label>
+                </div>
+              )}
+            </div>
+          </div>
+          </section>
         </div>
-        <button
-          type="button"
-          className={canReset ? 'transport-reset meaningful' : 'transport-reset'}
-          disabled={!canReset}
-          title={canReset
-            ? cycleState === 'recovery_required'
-              ? 'Contain and reconcile the current Program using its exact retained cycle and command evidence.'
-              : motionStopSettled
-              ? 'Discard the held Program context and reset the Program cycle.'
-              : programFullStopped
-              ? 'Discard the Full-stopped tree and rebuild an idle Program cycle.'
-              : 'Reset the completed Program cycle.'
-            : 'Reset is unavailable in the current backend control state.'}
-          onClick={() => {
-            void program.reset();
-          }}
-        >
-          {cycleState === 'resetting'
-            ? 'Resetting'
-            : state.pending === 'reset'
-              || state.controlPending === 'recovery:reset_cycle'
-              ? 'Sending Reset'
-            : 'Reset'}
-        </button>
-        <span className="viewer-tool-separator" aria-hidden="true" />
-        <label className="transport-velocity" title={velocityAvailable
-          ? velocityGroup
-            ? `One shared velocity for ${velocityGroup.map((target) => `${target.componentRoleId}/${target.targetRoleId}`).join(', ')}.`
-            : 'Scale current and subsequent moves for this addressed target.'
-          : velocityReason}
-        >
-          <span>{velocityGroup ? 'Group velocity' : 'Velocity'}</span>
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.01"
-            value={robot.runtimeScaleDraft}
-            disabled={!velocityAvailable}
-            onChange={(event) => robot.setRuntimeScale(Number(event.target.value))}
-            onPointerUp={robot.commitRuntimeScale}
-            onKeyUp={robot.commitRuntimeScale}
-            onBlur={robot.commitRuntimeScale}
-          />
-          <output>
-            {velocityAvailable
-              ? `${Math.round(robot.runtimeScaleDraft * 100)}%`
-              : '—'}
-          </output>
-        </label>
-        <button
-          ref={detailsButton}
-          type="button"
-          className="icon-button"
-          data-recovery-required={enabled && recoveryRequired || undefined}
-          aria-label="Program run details"
-          title={blockedReason ?? 'Program run details'}
-          onClick={() => setDetailsOpen(true)}
-        >i</button>
       </div>
       <OverlayPanel
         open={detailsOpen}
@@ -957,12 +1160,28 @@ export function ProgramTransportControls({
       >
         <ProgramRuntimePanel enabled={enabled} controller={program} />
         <p className="panel-intro transport-unavailable-reason">
-          Runtime velocity is retained for this addressed robot target across
-          current and subsequent moves. The slider keeps only the latest pending
-          value, reconciles the owner&apos;s applied value, and drops pending input
-          when Stop begins.
-          {!velocityAvailable && <> Currently unavailable: {velocityReason}</>}
+          Each displayed group has its own owner-scoped runtime velocity. A
+          slider keeps only the latest pending value, reconciles the owner&apos;s
+          applied value, and drops pending input when Stop begins. A disabled
+          slider means that the selected group has no qualified runtime-scale
+          target or is currently held for Stop/recovery.
         </p>
+        <section className="runtime-detail-group" aria-label="Program Halt">
+          <h4>Program Halt</h4>
+          <p className="panel-intro transport-unavailable-reason">
+            Quiesce the current Program while retaining its captured run for a
+            later Execute or Reset. This is distinct from the cell-wide Full Stop.
+          </p>
+          <button
+            type="button"
+            className="danger-button"
+            disabled={!canProgramHalt || haltIntent !== null}
+            onClick={() => { void requestProgramHalt(); }}
+          >
+            {haltIntent !== null || state.pending === 'full-stop'
+              ? 'Halting Program' : 'Halt Program'}
+          </button>
+        </section>
         <section className="runtime-detail-group" aria-label="Cell Full Stop">
           <h4>Cell Full Stop</h4>
           <p className="panel-intro transport-unavailable-reason">
@@ -1022,6 +1241,34 @@ export function ProgramTransportControls({
             </button>
           )}
         </section>
+      </OverlayPanel>
+      <OverlayPanel
+        open={haltIntent === 'confirm'}
+        title="Halt Program execution?"
+        titleId="program-halt-confirmation-title"
+        kind="dialog"
+        onClose={() => setHaltIntent(null)}
+        returnFocusRef={haltButton}
+      >
+        <p className="panel-intro">
+          Program motion has been stopped. Halting also pauses Program-tree
+          execution; choose Cancel if you intended to stop motion only.
+        </p>
+        {!allMotionQuiesced && (
+          <p className="panel-intro" role="status">Waiting for all motion groups to stop…</p>
+        )}
+        <div className="program-halt-confirmation-actions">
+          <button type="button" onClick={() => setHaltIntent(null)}>Cancel</button>
+          <button
+            type="button"
+            className="danger-button"
+            disabled={!allMotionQuiesced}
+            onClick={() => {
+              setHaltIntent(null);
+              void program.fullStop();
+            }}
+          >Halt Program</button>
+        </div>
       </OverlayPanel>
     </>
   );

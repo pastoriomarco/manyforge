@@ -32,7 +32,6 @@ TEST(MotionResumeIntentTest, RetainsResolvedJointAndPoseDestinationsWithoutCurso
 TEST(MotionResumeIntentTest, ReplacesOnlyConsumedCartesianPrefixAndKeepsConstraints) {
   CartesianPathDTO source;
   source.waypoints = {pose_at(0, 0, 0), pose_at(1, 0, 0), pose_at(2, 0, 0), pose_at(1, 0, 0)};
-  source.max_linear_speed_mps = 0.037;
   source.max_angular_acceleration_rad_s2 = 0.123;
   TrajectoryDTO trajectory;
   trajectory.waypoints = {{0.0, {0.0}, {}, {}}, {3.0, {1.0}, {}, {}}};

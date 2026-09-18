@@ -9,7 +9,9 @@ import {
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
   robotControlCandidatePresentationAllowed,
   robotControlReducer,
+  selectedStatusForState,
   type ManualMotionSettings,
+  type RobotControlState,
 } from './robotControl';
 
 import { statusFixture, receiptFixture, readyState, executingState, gripperReceiptFixture } from '../testFixtures/robotControl';
@@ -17,18 +19,120 @@ import { poseTupleFromValue, samePose } from '../utils/poseTransforms';
 import { computeCartesianMoveDraft } from '../utils/moveTo';
 
 describe('addressed Robot Control state', () => {
+  it('keeps one stable addressed selection and fences the previous robot draft', () => {
+    const status = statusFixture();
+    const secondMotion = structuredClone(status.directControl);
+    secondMotion.controllableComponentId = 'robot-b';
+    secondMotion.programBindingId = 'sha256:robot-b-motion-binding';
+    secondMotion.targetDescriptor.controllableComponentId = 'robot-b';
+    const secondGripper = structuredClone(status.directControlGripper);
+    secondGripper.controllableComponentId = 'robot-b';
+    secondGripper.programBindingId = 'sha256:robot-b-gripper-binding';
+    secondGripper.targetDescriptor.controllableComponentId = 'robot-b';
+    const secondObservedMotion = {
+      ...structuredClone(status.observedMotion),
+      controllableComponentId: 'robot-b',
+      positionsRad: [0.4, 0.5],
+      sequence: 8,
+    };
+    status.directControlTargets = [status.directControl, secondMotion];
+    status.directControlGripperTargets = [status.directControlGripper, secondGripper];
+    status.observedMotions = [status.observedMotion, secondObservedMotion];
+    status.observedGrippers = [{
+      ...status.observedGripper!, targetRoleId: status.directControlGripper.targetRoleId,
+      controllableComponentId: 'robot-a', commandTargetId: 'gripper',
+    }, {
+      ...status.observedGripper!, targetRoleId: secondGripper.targetRoleId,
+      controllableComponentId: 'robot-b', commandTargetId: 'gripper', sequence: 5,
+    }];
+
+    let state = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved', status,
+    });
+    expect(state).toMatchObject({
+      selectedComponentId: 'robot-a',
+      selectedMotionTargetId: 'arm',
+      selectedGripperTargetId: 'gripper',
+    });
+    state = robotControlReducer(state, { type: 'edit_joint', jointIndex: 0, positionRad: 0.2 });
+    const oldGeneration = state.generation;
+    const switched = robotControlReducer(state, {
+      type: 'select_robot', componentId: 'robot-b', motionTargetId: 'arm',
+    });
+    expect(switched).toMatchObject({
+      selectedComponentId: 'robot-b',
+      selectedMotionTargetId: 'arm',
+      selectedGripperTargetId: 'gripper',
+      phase: 'idle',
+      draftPositionsRad: [0.4, 0.5],
+      preview: null,
+      ghost: null,
+    });
+    expect(switched.generation).toBeGreaterThan(oldGeneration);
+    const refreshed = robotControlReducer(switched, {
+      type: 'status_refreshed', status: structuredClone(status),
+    });
+    expect(refreshed.selectedComponentId).toBe('robot-b');
+    expect(refreshed.generation).toBe(switched.generation);
+    expect(robotControlReducer(refreshed, {
+      type: 'preview_resolved', generation: oldGeneration,
+      receipt: receiptFixture(status, 'obsolete-robot-a', [0.2, 0.1]),
+    })).toBe(refreshed);
+
+    let planning = robotControlReducer(refreshed, {
+      type: 'edit_joint', jointIndex: 0, positionRad: 0.6,
+    });
+    let selected = selectedStatusForState(planning)!;
+    planning = robotControlReducer(planning, {
+      type: 'preview_started', generation: planning.generation,
+      intent: buildJointMotionIntent(selected, [0.6, 0.5], 'robot-b-motion'),
+    });
+    let accepted = robotControlReducer(planning, {
+      type: 'preview_resolved', generation: planning.generation,
+      receipt: receiptFixture(selected, 'robot-b-motion', [0.6, 0.5]),
+    });
+    expect(accepted.phase).toBe('ready');
+
+    accepted = robotControlReducer(accepted, { type: 'select_mode', mode: 'gripper' });
+    planning = robotControlReducer(accepted, { type: 'edit_gripper', position: 0.03 });
+    selected = selectedStatusForState(planning)!;
+    planning = robotControlReducer(planning, {
+      type: 'preview_started', generation: planning.generation,
+      intent: buildGripperCommandIntent(selected, 0.03, 'robot-b-gripper'),
+    });
+    accepted = robotControlReducer(planning, {
+      type: 'preview_resolved', generation: planning.generation,
+      receipt: gripperReceiptFixture(selected, 'robot-b-gripper', 0.03),
+    });
+    expect(accepted.phase).toBe('ready');
+  });
+
   it('presents candidates whenever backend manual admission is available and unowned', () => {
     const ready = readyState();
     expect(robotControlCandidatePresentationAllowed(ready, true)).toBe(true);
     expect(robotControlCandidatePresentationAllowed(ready, false)).toBe(false);
     expect(robotControlCandidatePresentationAllowed(executingState(), true)).toBe(false);
-    expect(robotControlCandidatePresentationAllowed({
+    const completed = {
       ...ready,
       phase: 'completed',
       operation: {
         operationId: 'completed-operation', operationRevision: 2, resident: true,
         state: 'completed', progress: 1, activeStopId: null,
         activeStopGeneration: null, terminalError: null,
+      },
+    } satisfies RobotControlState;
+    expect(robotControlCandidatePresentationAllowed(completed, true)).toBe(false);
+    expect(robotControlCandidatePresentationAllowed({
+      ...completed,
+      operation: { ...completed.operation, resident: false },
+    }, true)).toBe(true);
+    expect(robotControlCandidatePresentationAllowed({
+      ...completed,
+      operation: {
+        ...completed.operation,
+        resident: false,
+        state: 'failed',
+        terminalError: 'execution failed',
       },
     }, true)).toBe(false);
   });
@@ -193,6 +297,8 @@ describe('addressed Robot Control state', () => {
     let state = robotControlReducer(ready, { type: 'edit_motion_settings', update: {
       velocityScale: 0.4, accelerationScale: 0.3, tcpLinearSpeedMps: 0.07,
       tcpAngularSpeedRadS: 0.2, tcpLinearAccelerationMps2: 0.15, tcpAngularAccelerationRadS2: 0.6,
+      cartesianTranslationToleranceM: 0.003, cartesianRotationToleranceRad: 0.04,
+      cartesianMaxBlendDeviationRad: 0.02,
       jointLimits: { joint1: { max_velocity_rad_s: 0.5 } },
     } });
     state = robotControlReducer(state, { type: 'edit_motion_settings', update: {
@@ -209,9 +315,10 @@ describe('addressed Robot Control state', () => {
           joint2: { max_velocity_rad_s: 0.7 } },
       });
       if (mode === 'cartesian_path') expect(payload).toMatchObject({ motion: {
-        max_linear_speed_mps: 0.07, max_angular_speed_rad_s: 0.2,
+        max_angular_speed_rad_s: 0.2,
         max_linear_acceleration_mps2: 0.15, max_angular_acceleration_rad_s2: 0.6,
-      } });
+        max_blend_deviation_rad: 0.02,
+      }, tolerances: { translation_tol_m: 0.003, rotation_tol_rad: 0.04 } });
     }
     expect(robotControlReducer(state, { type: 'revert' }).motionSettings).toBe(state.motionSettings);
     const cleared = robotControlReducer(state, { type: 'edit_motion_settings', update: {
@@ -225,6 +332,29 @@ describe('addressed Robot Control state', () => {
     }
   });
 
+  it('uses Program Cartesian defaults until the manual move overrides them', () => {
+    const status = statusFixture();
+    let state = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved',
+      status,
+      cartesianDefaults: {
+        translationToleranceM: 0.002,
+        maxBlendDeviationRad: 0.015,
+      },
+    });
+    expect(state.motionSettings.cartesianTranslationToleranceM).toBe(0.002);
+    expect(state.motionSettings.cartesianMaxBlendDeviationRad).toBe(0.015);
+    state = robotControlReducer(state, {
+      type: 'edit_motion_settings',
+      update: {
+        cartesianTranslationToleranceM: 0.001,
+        cartesianMaxBlendDeviationRad: 0,
+      },
+    });
+    expect(state.motionSettings.cartesianTranslationToleranceM).toBe(0.001);
+    expect(state.motionSettings.cartesianMaxBlendDeviationRad).toBe(0);
+  });
+
   it('does not plan when only settings change at idle, and resets settings with the target owner', () => {
     const loaded = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status: statusFixture() });
     const edited = robotControlReducer(loaded, { type: 'edit_motion_settings', update: { velocityScale: 0.4 } });
@@ -234,12 +364,10 @@ describe('addressed Robot Control state', () => {
     expect(restarted.motionSettings.velocityScale).toBe(1);
   });
 
-  it('bounds defaults by global TCP limits and rejects larger local limits before preview', () => {
+  it('bounds defaults by the Deployment TCP maximum and rejects larger requests before preview', () => {
     const status = statusFixture();
     status.directControl.targetDescriptor.operationalLimit = {
-      catalogPolicyMaximumTcpLinearSpeedMps: 0.2, deploymentMaximumTcpLinearSpeedMps: 0.05,
-      effectiveMaximumTcpLinearSpeedMps: 0.05, policyId: 'tcp', policyRevision: '1',
-      selectedScope: 'command_target', sourceContentDigest: 'sha256:limits',
+      maximumTcpLinearSpeedMps: 0.05,
     };
     const loaded = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
     expect(loaded.motionSettings.tcpLinearSpeedMps).toBe(0.05);

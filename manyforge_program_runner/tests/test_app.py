@@ -129,6 +129,10 @@ class FakeRuntime:
         self.calls.append(("resume_motion", (program_run_id, request)))
         return _snapshot()
 
+    def start_motion(self, program_run_id: str, request) -> dict[str, Any]:
+        self.calls.append(("start_motion", (program_run_id, request)))
+        return _snapshot()
+
     def prepare_manual_handover(self, program_run_id: str, request) -> dict[str, Any]:
         raise AssertionError("Manual handover is outside this fixture's scenarios")
 
@@ -483,6 +487,19 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
                 "reason": "ordinary operator motion Stop",
             },
         )
+        motion_started = client.post(
+            "/api/program/runs/program-run.1/motion-start",
+            json={
+                **_caller(),
+                "request_id": "request.motion-start.1",
+                "program_run_id": "program-run.1",
+                "expected_owner_epoch": "program-runner.epoch.1",
+                "expected_run_revision": 1,
+                "expected_selection_revision": 0,
+                "group_ids": ["robot_group"],
+                "reason": "initial operator motion Run",
+            },
+        )
         full_stopped = client.post(
             "/api/program/runs/program-run.1/full-stop",
             json={
@@ -536,6 +553,7 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
     assert started.status_code == 200
     assert read.status_code == 200
     assert motion_stopped.json()["state"] == "running"
+    assert motion_started.json()["state"] == "running"
     assert full_stopped.json()["state"] == "full_stopping"
     assert resumed.json()["state"] == "running"
     assert discarded.json()["state"] == "stopped"
@@ -545,10 +563,11 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
     assert runtime.calls[2][0] == "prepare_scene"
     assert runtime.calls[3] == ("read", "program-run.1")
     assert runtime.calls[4][0] == "motion_stop"
-    assert runtime.calls[5][0] == "full_stop"
-    assert runtime.calls[6][0] == "resume_full_stop"
-    assert runtime.calls[7][0] == "discard_full_stop"
-    assert runtime.calls[8][0] == "stop"
+    assert runtime.calls[5][0] == "start_motion"
+    assert runtime.calls[6][0] == "full_stop"
+    assert runtime.calls[7][0] == "resume_full_stop"
+    assert runtime.calls[8][0] == "discard_full_stop"
+    assert runtime.calls[9][0] == "stop"
     assert runtime.closed is True
 
 

@@ -135,7 +135,7 @@
         "gripper_target_configurations": "grippers",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
         "mode": "adapters.execution.config.mode",
-        "motion_target_limits": "robot_config.global_max_tcp_linear_speed_mps",
+        "motion_target_limits": "deployment.motion_target_limits[].maximum_tcp_linear_speed_mps",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
         "planner_rng_seed": "adapters.planning.config.rng_seed"
       },
@@ -308,7 +308,7 @@
         "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
         "mode": "adapters.execution.config.mode",
-        "motion_target_limits": "robot_config.global_max_tcp_linear_speed_mps",
+        "motion_target_limits": "deployment.motion_target_limits[].maximum_tcp_linear_speed_mps",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
         "planner_rng_seed": "adapters.planning.config.rng_seed"
       },
@@ -478,7 +478,7 @@
         "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
         "mode": "adapters.execution.config.mode",
-        "motion_target_limits": "robot_config.global_max_tcp_linear_speed_mps",
+        "motion_target_limits": "deployment.motion_target_limits[].maximum_tcp_linear_speed_mps",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
         "planner_rng_seed": "adapters.planning.config.rng_seed"
       },
@@ -563,7 +563,7 @@
         "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
         "mode": "adapters.execution.config.mode",
-        "motion_target_limits": "robot_config.global_max_tcp_linear_speed_mps",
+        "motion_target_limits": "deployment.motion_target_limits[].maximum_tcp_linear_speed_mps",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
         "planner_rng_seed": "adapters.planning.config.rng_seed"
       },
@@ -632,9 +632,10 @@
         "default_fault_stop_profile": "adapters.execution.config.default_fault_stop_profile",
         "direct_control_joint_limits": "robot_config.robot_control_joint_limits",
         "execution_tick_hz": "adapters.execution.config.execution_tick_hz",
+        "gripper_target_configurations": "grippers",
         "initial_joint_positions_rad": "adapters.execution.config.initial_joint_positions_rad",
         "mode": "adapters.execution.config.mode",
-        "motion_target_limits": "robot_config.global_max_tcp_linear_speed_mps",
+        "motion_target_limits": "deployment.motion_target_limits[].maximum_tcp_linear_speed_mps",
         "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
         "planner_rng_seed": "adapters.planning.config.rng_seed"
       },
@@ -642,6 +643,7 @@
         "collision_monitor_period_ms": 50.0,
         "direct_control_joint_limits": [],
         "execution_tick_hz": 100,
+        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "robotiq_85_base_link", "auxiliary_frames": ["robotiq_85_base_link"], "closed_state_ref": "closed", "command_duration_s": 1.0, "command_target_id": "gripper", "controllable_component_id": "ur5e_robot", "description": "Native simulated Robotiq 2F-85 gripper.", "mount_frame": "tool0", "open_state_ref": "open", "tcp_frame": "robotiq_85_base_link", "touch_links": ["robotiq_85_base_link", "robotiq_85_left_finger_link", "robotiq_85_left_finger_tip_link", "robotiq_85_left_inner_knuckle_link", "robotiq_85_left_knuckle_link", "robotiq_85_right_finger_link", "robotiq_85_right_finger_tip_link", "robotiq_85_right_inner_knuckle_link", "robotiq_85_right_knuckle_link"]}],
         "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
         "mode": "simulated",
         "motion_target_limits": [{"command_target_id": "arm", "controllable_component_id": "ur5e_robot", "maximum_tcp_linear_speed_mps": 0.25}],
@@ -985,14 +987,6 @@
           "runtime_acceptance_step": "I8/P5",
           "tool_acceptance_step": "I11/T",
           "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        },
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.25,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
         }
       ]
     },
@@ -1058,14 +1052,6 @@
           "runtime_acceptance_step": "I8/P5",
           "tool_acceptance_step": "I11/T",
           "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        },
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.15,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
         }
       ]
     },
@@ -1133,14 +1119,6 @@
           "runtime_acceptance_step": "I8/P5",
           "tool_acceptance_step": "I11/T",
           "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        },
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.25,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
         }
       ]
     },
@@ -1206,14 +1184,6 @@
           "runtime_acceptance_step": "I8/P5",
           "tool_acceptance_step": "I11/T",
           "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        },
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.25,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
         }
       ]
     },
@@ -1279,14 +1249,6 @@
           "runtime_acceptance_step": "I8/P5",
           "tool_acceptance_step": "I11/T",
           "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        },
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.25,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
         }
       ]
     },
@@ -1334,14 +1296,6 @@
           "runtime_acceptance_step": "I8/P5",
           "tool_acceptance_step": "I11/T",
           "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        },
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.15,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
         }
       ]
     },
@@ -1384,16 +1338,7 @@
           }
         }
       ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.25,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
-        }
-      ]
+      "policy_restoration_inputs": []
     },
     {
       "deployment_source": "examples/pick_and_place_ur10e_robotiq.deployment.yaml",
@@ -1440,14 +1385,6 @@
           "runtime_acceptance_step": "I8/P5",
           "tool_acceptance_step": "I11/T",
           "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        },
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.25,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
         }
       ]
     },
@@ -1484,16 +1421,7 @@
           }
         }
       ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.25,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
-        }
-      ]
+      "policy_restoration_inputs": []
     },
     {
       "deployment_source": "examples/trocar_lite6_foundationpose_pick.deployment.yaml",
@@ -1559,14 +1487,6 @@
           "runtime_acceptance_step": "I8/P5",
           "tool_acceptance_step": "I11/T",
           "acceptance_obligation_id": "open_loop_grasp_scope_and_evidence"
-        },
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.15,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
         }
       ]
     },
@@ -1604,16 +1524,7 @@
           }
         }
       ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.25,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
-        }
-      ]
+      "policy_restoration_inputs": []
     },
     {
       "deployment_source": "examples/vision_guided_pose_pick.deployment.yaml",
@@ -1647,16 +1558,7 @@
           }
         }
       ],
-      "policy_restoration_inputs": [
-        {
-          "kind": "target_tcp_linear_speed_limit",
-          "source_field": "robot_config.global_max_tcp_linear_speed_mps",
-          "target_role_id": "arm",
-          "maximum_speed_mps": 0.25,
-          "runtime_acceptance_step": "I8/P5",
-          "acceptance_obligation_id": "retained_native_tcp_speed_limit"
-        }
-      ]
+      "policy_restoration_inputs": []
     }
   ]
 }

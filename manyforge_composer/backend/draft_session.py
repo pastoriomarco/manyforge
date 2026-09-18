@@ -89,7 +89,11 @@ _NODE_POLICY_MUTATION = "program_draft_update_node_policies"
 _PROGRAM_MOTION_DEFAULTS = (
     "velocity_scale",
     "acceleration_scale",
-    "max_tcp_linear_speed_mps",
+    "translation_tol_m",
+    "max_blend_deviation_rad",
+)
+_PROGRAM_MOTION_CEILINGS = frozenset(
+    {"velocity_scale", "acceleration_scale"}
 )
 _ASSISTANT_PROPOSAL_MUTATIONS = frozenset(
     {
@@ -771,6 +775,15 @@ class ComposerDraftSession:
     def program_loaded(self) -> bool:
         with self._lock:
             return self._authoring is not None
+
+    def require_identity(self, draft_id: str, expected_revision: int) -> None:
+        """Require one exact Program Draft identity without changing it."""
+
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=draft_id,
+                expected_revision=expected_revision,
+            )
 
     def retained_state(self) -> dict[str, Any]:
         """Return the complete bounded local owner state needed after restart."""
@@ -2313,11 +2326,15 @@ class ComposerDraftSession:
         references: dict[str, set[str]] = {
             field: set() for field in _PROGRAM_MOTION_DEFAULTS
         }
+        applicable: dict[str, int] = {
+            field: 0 for field in _PROGRAM_MOTION_DEFAULTS
+        }
         for node, fields in cls._program_motion_nodes(document, catalog):
             sources = node.get("value_sources", {})
             if type(sources) is not dict:
                 continue
             for field in fields:
+                applicable[field] += 1
                 source = sources.get(field)
                 if (
                     type(source) is dict
@@ -2327,6 +2344,16 @@ class ComposerDraftSession:
                     references[field].add(source["reference"])
         resolved: dict[str, str] = {}
         for field, candidates in references.items():
+            if not candidates and applicable[field] == 0:
+                declaration = declarations.get(field)
+                if (
+                    type(declaration) is dict
+                    and declaration.get("type") in {"float64", "int64"}
+                    and type(declaration.get("default")) in {int, float}
+                    and not isinstance(declaration.get("default"), bool)
+                ):
+                    resolved[field] = field
+                continue
             if len(candidates) != 1:
                 continue
             reference = next(iter(candidates))
@@ -2484,7 +2511,8 @@ class ComposerDraftSession:
             "mode",
             "velocity_scale",
             "acceleration_scale",
-            "max_tcp_linear_speed_mps",
+            "translation_tol_m",
+            "max_blend_deviation_rad",
             "parameter_bindings",
             "conflict_resolution",
         }:
@@ -2492,7 +2520,8 @@ class ComposerDraftSession:
         values = {
             "velocity_scale": arguments["velocity_scale"],
             "acceleration_scale": arguments["acceleration_scale"],
-            "max_tcp_linear_speed_mps": arguments["max_tcp_linear_speed_mps"],
+            "translation_tol_m": arguments["translation_tol_m"],
+            "max_blend_deviation_rad": arguments["max_blend_deviation_rad"],
         }
         if any(type(value) not in {int, float} or not math.isfinite(float(value)) for value in values.values()):
             _error("draft_arguments_invalid", "motion defaults must be finite numbers")
@@ -2500,8 +2529,10 @@ class ComposerDraftSession:
             _error("draft_arguments_invalid", "velocity scale must be in (0, 1]")
         if not 0.0 < float(values["acceleration_scale"]) <= 1.0:
             _error("draft_arguments_invalid", "acceleration scale must be in (0, 1]")
-        if not float(values["max_tcp_linear_speed_mps"]) > 0.0:
-            _error("draft_arguments_invalid", "TCP linear-speed cap must be positive")
+        if not float(values["translation_tol_m"]) > 0.0:
+            _error("draft_arguments_invalid", "Cartesian translation tolerance must be positive")
+        if float(values["max_blend_deviation_rad"]) < 0.0:
+            _error("draft_arguments_invalid", "Cartesian blend deviation must be non-negative")
         resolution = arguments["conflict_resolution"]
         if resolution not in {"reject", "reduce"}:
             _error("draft_arguments_invalid", "motion conflict resolution is invalid")
@@ -2518,7 +2549,7 @@ class ComposerDraftSession:
         ):
             _error(
                 "draft_arguments_invalid",
-                "motion parameter bindings must identify three distinct Program parameters",
+                "motion parameter bindings must identify distinct Program parameters",
             )
         if requested_bindings != actual_bindings:
             _error(
@@ -2539,7 +2570,7 @@ class ComposerDraftSession:
             for field in fields:
                 literal = parameters.get(field)
                 source = sources.get(field)
-                if literal is not None and (
+                if field in _PROGRAM_MOTION_CEILINGS and literal is not None and (
                     type(literal) not in {int, float}
                     or float(literal) > float(values[field])
                 ):

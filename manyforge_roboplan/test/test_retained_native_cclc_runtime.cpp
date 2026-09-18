@@ -1041,8 +1041,9 @@ private:
                  std::vector<double>(trajectory.joint_names.size(), 0.0), 0.1}},
          world, CollisionPolicyRevision{1U, Sha('d')}, decision},
         std::move(contact_policy),
-        {authority.runtime_policy.value().source_artifact,
-         authority.runtime_policy.value().selected_motion_speed_limit},
+        {authority.runtime_policy.value().source_artifact},
+        request.speed_profile.max_tcp_linear_speed_mps,
+        *authority.deployment_maximum_tcp_linear_speed_mps,
         std::move(scopes),
         request.timeouts.execution_timeout_s};
 

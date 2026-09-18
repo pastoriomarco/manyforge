@@ -62,7 +62,8 @@ constexpr int kChildLivenessChannelFd = 4;
 constexpr int kChildExecErrorFd = 5;
 constexpr int kChildPackageRootFd = 6;
 constexpr int kChildExecutableFd = 7;
-constexpr int kChildHighestReservedFd = kChildExecutableFd;
+constexpr int kChildProgramArtifactRootFd = 8;
+constexpr int kChildHighestReservedFd = kChildProgramArtifactRootFd;
 constexpr std::size_t kMaximumControlPacketBytes =
     detail::kMaximumManagedRuntimeRpcPacketBytes;
 static_assert(detail::kMaximumNativeProjectionRpcPacketBytes <=
@@ -647,6 +648,7 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
 [[noreturn]] void EnterChild(const pid_t expected_parent, const int channel_fd,
                              const int liveness_channel_fd, const int error_fd,
                              const int executable_fd, const int package_root_fd,
+                             const int program_artifact_root_fd,
                              char *const argv[]) noexcept {
   if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
     ChildExit(error_fd, errno);
@@ -664,13 +666,17 @@ SameChildProduct(const NativeExecutionRuntimeUnitAdmission &admission,
       ::fcntl(executable_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
   const int package_root_copy =
       ::fcntl(package_root_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
+  const int program_artifact_root_copy = ::fcntl(
+      program_artifact_root_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
   if (channel_copy < 0 || liveness_channel_copy < 0 || error_copy < 0 ||
       executable_copy < 0 || package_root_copy < 0 ||
+      program_artifact_root_copy < 0 ||
       ::dup3(channel_copy, kChildChannelFd, 0) < 0 ||
       ::dup3(liveness_channel_copy, kChildLivenessChannelFd, 0) < 0 ||
       ::dup3(error_copy, kChildExecErrorFd, O_CLOEXEC) < 0 ||
       ::dup3(executable_copy, kChildExecutableFd, O_CLOEXEC) < 0 ||
-      ::dup3(package_root_copy, kChildPackageRootFd, 0) < 0) {
+      ::dup3(package_root_copy, kChildPackageRootFd, 0) < 0 ||
+      ::dup3(program_artifact_root_copy, kChildProgramArtifactRootFd, 0) < 0) {
     ChildExit(error_fd, errno);
   }
 #ifdef SYS_close_range
@@ -1618,6 +1624,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                      launch_arguments.end());
     arguments.emplace_back("--manyforge-managed-package-root-fd");
     arguments.push_back(std::to_string(kChildPackageRootFd));
+    arguments.emplace_back("--manyforge-managed-program-artifact-root-fd");
+    arguments.push_back(std::to_string(kChildProgramArtifactRootFd));
     arguments.emplace_back("--manyforge-managed-liveness-channel-fd");
     arguments.push_back(std::to_string(kChildLivenessChannelFd));
     arguments.emplace_back("--manyforge-managed-manager-state-root");
@@ -1658,6 +1666,11 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     argv.push_back(nullptr);
 
+    const int selected_package_root_fd =
+        PackageRootFd(bundle.retained_bundle_id());
+    const int selected_program_artifact_root_fd =
+        candidate_package_root_path.empty() ? selected_package_root_fd
+                                            : candidate_package_root_fd.get();
     const pid_t parent = ::getpid();
     const pid_t pid = ::fork();
     if (pid < 0) {
@@ -1665,8 +1678,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     if (pid == 0) {
       EnterChild(parent, channels[1].get(), liveness_channels[1].get(),
-                 exec_pipe[1].get(), target.get(),
-                 PackageRootFd(bundle.retained_bundle_id()), argv.data());
+                 exec_pipe[1].get(), target.get(), selected_package_root_fd,
+                 selected_program_artifact_root_fd, argv.data());
     }
 
     channels[1].Reset();

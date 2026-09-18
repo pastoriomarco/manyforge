@@ -35,6 +35,7 @@ from .routes_draft import create_draft_router
 from .routes_deployment_draft import create_deployment_draft_router
 from .routes_filesystem import create_filesystem_router
 from .routes_nodes import create_nodes_router
+from .routes_scenario_documents import create_scenario_document_router
 from .routes_urdf import create_urdf_router
 from .routes_viewer import create_viewer_router
 from .security import SecurityConfig
@@ -255,6 +256,7 @@ def create_app(
         "/api/program/save",
         "/api/program/validate",
         "/api/scenarios/load",
+        "/api/scenario-documents/",
     ):
         app.add_middleware(
             ComposerRequestBodyLimitMiddleware,
@@ -466,6 +468,10 @@ def create_app(
     app.include_router(
         create_deployment_draft_router(state),
         tags=["composer-deployment-draft"],
+    )
+    app.include_router(
+        create_scenario_document_router(state),
+        tags=["composer-scenario-documents"],
     )
     if state.headless_client is not None:
         app.include_router(

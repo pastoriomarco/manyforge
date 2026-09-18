@@ -76,7 +76,8 @@ export function CCLCPanelView({
 }) {
   const {
     componentId, snapshot, routeTemplates, transaction, pendingTransaction,
-    busy, error, setComponentId, refresh, reconcileTransaction, dismissError,
+    busy, readUnavailableReason, error, setComponentId, refresh,
+    reconcileTransaction, dismissError,
     submitLifecycle, submitRoute,
   } = controller;
   useOperationalErrorMirror({
@@ -138,7 +139,9 @@ export function CCLCPanelView({
       </div>
 
       {snapshot === null ? (
-        <p className="muted">Select a component to read its current lifecycle.</p>
+        <p className="muted" role="status">
+          {readUnavailableReason ?? 'Select a component to read its current lifecycle.'}
+        </p>
       ) : (
         <div className="cclc-current-state">
           <p>

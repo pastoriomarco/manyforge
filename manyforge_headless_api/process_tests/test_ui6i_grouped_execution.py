@@ -44,6 +44,7 @@ def _dual_robot_stack() -> Iterator[ProcessStack]:
                 stack_root,
                 package_root=package,
                 cell_id=CELL_ID,
+                composer_fs_roots=(stack_root,),
                 freshness_milliseconds=120_000,
                 enable_program_runner=True,
             )
@@ -83,31 +84,124 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
         draft = composer.request("GET", "/api/program/draft")
         for attempt in range(8):
             snapshot = _matching_composer_snapshot(snapshots, draft)
+            deployment = composer.request("GET", "/api/deployment/workspace")
             try:
                 loaded = composer.request(
                     "POST",
-                    "/api/scenarios/load",
+                    "/api/scenario-documents/load",
                     body={
                         **_composer_fence(
                             snapshot,
                             request_id=f"ui6i.{scenario_id}.load.{attempt}",
                         ),
-                        "scenarioId": scenario_id,
-                        "scenarioCatalogRevision": scenarios[
-                            "scenario_catalog_revision"
+                        "deploymentDraftId": deployment["draft"]["id"],
+                        "expectedDeploymentDraftRevision": deployment["draft"][
+                            "revision"
                         ],
+                        "qualifiedScenarioId": scenario_id,
                         "confirmDiscard": False,
                     },
                 )
                 break
             except HeadlessClientError as error:
-                if error.code not in {"authoring_not_ready", "stale_generation"} or attempt == 7:
+                if (
+                    error.code
+                    not in {"authoring_not_ready", "stale_generation"}
+                    or attempt == 7
+                ):
                     raise
                 draft = composer.request("GET", "/api/program/draft")
         assert loaded["status"] == "loaded"
+        assert loaded["path"] is None
+        deployment = composer.request("GET", "/api/deployment/workspace")
+        assert deployment["draft"]["document"]["deployment_artifact_id"] == (
+            "ur5e_lite6_wall"
+        )
         applied = composer.program_applied()
         assert applied["scenario_id"] == scenario_id
         return applied, scenarios["scenario_catalog_revision"]
+
+
+def _save_and_reopen_current_scenario(
+    stack: ProcessStack, scenario_id: str
+) -> None:
+    directory = stack.root / "saved-scenarios"
+    directory.mkdir()
+    target = directory / f"{scenario_id}.scenario.yaml"
+    with (
+        _composer_snapshot_stream(stack, client_id=f"ui6i-save-{scenario_id}") as snapshots,
+        HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
+    ):
+        draft = composer.request("GET", "/api/program/draft")
+        snapshot = _matching_composer_snapshot(snapshots, draft)
+        deployment = composer.request("GET", "/api/deployment/workspace")
+        fence = {
+            **_composer_fence(
+                snapshot,
+                request_id=f"ui6i.{scenario_id}.save",
+            ),
+            "deploymentDraftId": deployment["draft"]["id"],
+            "expectedDeploymentDraftRevision": deployment["draft"]["revision"],
+        }
+        manager_before = composer.manager_status()["status"]["active"]
+        saved = composer.request(
+            "POST",
+            "/api/scenario-documents/save",
+            body={
+                **fence,
+                "path": str(target),
+                "scenarioId": f"{scenario_id}_saved",
+                "name": "UI6-I grouped Scenario copy",
+                "description": "Native Save/Load qualification copy",
+                "confirmOverwrite": False,
+            },
+        )
+        assert saved["status"] == "saved"
+        assert saved["last_known_status"] == "ready"
+        assert saved["path"] == str(target.resolve())
+        index = composer.request(
+            "GET",
+            "/api/scenario-documents",
+            params=(("directory", str(directory)),),
+        )
+        saved_rows = [
+            row for row in index["entries"] if row["source_kind"] == "saved"
+        ]
+        assert len(saved_rows) == 1
+        assert saved_rows[0]["path"] == str(target.resolve())
+
+        draft = composer.request("GET", "/api/program/draft")
+        for attempt in range(8):
+            snapshot = _matching_composer_snapshot(snapshots, draft)
+            deployment = composer.request("GET", "/api/deployment/workspace")
+            try:
+                reopened = composer.request(
+                    "POST",
+                    "/api/scenario-documents/load",
+                    body={
+                        **_composer_fence(
+                            snapshot,
+                            request_id=f"ui6i.{scenario_id}.reopen.{attempt}",
+                        ),
+                        "deploymentDraftId": deployment["draft"]["id"],
+                        "expectedDeploymentDraftRevision": deployment["draft"][
+                            "revision"
+                        ],
+                        "path": str(target),
+                        "confirmDiscard": False,
+                    },
+                )
+                break
+            except HeadlessClientError as error:
+                if (
+                    error.code not in {"authoring_not_ready", "stale_generation"}
+                    or attempt == 7
+                ):
+                    raise
+                draft = composer.request("GET", "/api/program/draft")
+        assert reopened["status"] == "loaded"
+        assert reopened["path"] == str(target.resolve())
+        assert composer.manager_status()["status"]["active"] == manager_before
 
 
 def _start_run(
@@ -139,7 +233,15 @@ def _start_run(
                     }
                 )
             except HeadlessClientError as error:
-                if error.code not in {"authoring_not_ready", "stale_generation"} or attempt == 7:
+                if (
+                    error.code
+                    not in {
+                        "authoring_not_ready",
+                        "program_node_availability_stale",
+                        "stale_generation",
+                    }
+                    or attempt == 7
+                ):
                     raise
         raise AssertionError("unreachable")
 
@@ -155,6 +257,45 @@ def _native_events(stack: ProcessStack) -> list[dict[str, Any]]:
         if not page["has_more"]:
             return result
         after = page["next_after_sequence"]
+
+
+def _start_motion(
+    client: HeadlessHttpClient,
+    started: dict[str, Any],
+    *,
+    request_id: str,
+) -> dict[str, Any]:
+    program_run_id = started["capture"]["program_run_id"]
+    deadline = time.monotonic() + 5.0
+    while True:
+        cycle = client.program_cycle_status()
+        controls = cycle.get("runtime_controls")
+        selections = None if controls is None else controls.get("execution_selections")
+        if (
+            cycle.get("program_run_id") == program_run_id
+            and isinstance(selections, dict)
+        ):
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"current motion controls were not published for {program_run_id}: {cycle!r}"
+            )
+        time.sleep(0.01)
+    return client.program_run_motion_start(
+        program_run_id,
+        {
+            "request_id": request_id,
+            "request_owner_epoch": "ui6i.grouped.process-test",
+            "source_label": "ui6i_grouped_process_test",
+            "correlation_id": request_id,
+            "program_run_id": program_run_id,
+            "expected_owner_epoch": cycle["program_runner_owner_epoch"],
+            "expected_run_revision": cycle["run"]["run_revision"],
+            "expected_selection_revision": selections["selection_revision"],
+            "reason": "initial operator motion Run",
+            "group_ids": ["all"],
+        },
+    )
 
 
 def _operation_acceptances(
@@ -298,6 +439,9 @@ def _reset_cycle(client: HeadlessHttpClient, program_run_id: str) -> None:
 def test_grouped_dual_robot_run_scales_stops_and_resumes() -> None:
     with _dual_robot_stack() as stack:
         applied, catalog_revision = _load_scenario(stack, GROUPED_SCENARIO)
+        _save_and_reopen_current_scenario(stack, GROUPED_SCENARIO)
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=10.0) as client:
+            applied = client.program_applied()
         selector = _group_selector(applied["program_binding_id"])
         with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
             started = _start_run(
@@ -307,6 +451,11 @@ def test_grouped_dual_robot_run_scales_stops_and_resumes() -> None:
                 applied=applied,
             )
             program_run_id = started["capture"]["program_run_id"]
+            _start_motion(
+                client,
+                started,
+                request_id="ui6i.group.motion-start",
+            )
             accepted = _operation_acceptances(stack, program_run_id)
             intents = [event["payload"]["intent"] for event in accepted]
             assert len({event["operation_id"] for event in accepted}) == 2
@@ -377,6 +526,11 @@ def test_separate_group_stop_does_not_stop_the_other_robot() -> None:
                 applied=applied,
             )
             program_run_id = started["capture"]["program_run_id"]
+            _start_motion(
+                client,
+                started,
+                request_id="ui6i.isolation.motion-start",
+            )
             accepted = _operation_acceptances(stack, program_run_id)
             accepted_by_target = {
                 event["payload"]["intent"]["participants"][0]["target_role_id"]: event

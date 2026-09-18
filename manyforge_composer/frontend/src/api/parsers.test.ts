@@ -32,6 +32,9 @@ import {
   parseProgramCycleStatus,
   parseProgramRuntimeControlProjection,
   parseScenarioCatalogResponse,
+  parseScenarioDocumentIndexResponse,
+  parseScenarioDocumentLoadResponse,
+  parseScenarioDocumentSaveResponse,
   parseSceneRuntimeProjection,
   parseSceneMeshAssetMetadata,
   parseProgramDraftMeshAssetMetadata,
@@ -39,6 +42,74 @@ import {
   parseSceneUrdfManifest,
   parseSourceModelProjection,
 } from './parsers';
+
+describe('editable Scenario document transport', () => {
+  it('parses dynamic saved and qualified entries with explicit advisory state', () => {
+    const parsed = parseScenarioDocumentIndexResponse({
+      api_version: 'manyforge.scenario_document_index.v1',
+      directory: '/workspace/examples',
+      catalog_revision: `sha256:${'c'.repeat(64)}`,
+      entries: [{
+        source_kind: 'saved',
+        path: '/workspace/examples/cell.scenario.yaml',
+        scenario_id: 'cell',
+        name: 'Cell',
+        description: 'Editable cell',
+        base_scenario_id: 'maintained_cell',
+        saved_manyforge_version: '1.0.0',
+        display_status: 'changed',
+        status_detail: 'Content changed since the recorded status.',
+      }, {
+        source_kind: 'qualified',
+        path: null,
+        scenario_id: 'installed_cell',
+        name: 'installed_cell',
+        description: '',
+        base_scenario_id: 'installed_cell',
+        saved_manyforge_version: null,
+        display_status: 'ready',
+        status_detail: 'Qualified by the installed Scenario catalog.',
+      }],
+    });
+
+    expect(parsed.directory).toBe('/workspace/examples');
+    expect(parsed.entries.map((entry) => entry.sourceKind)).toEqual([
+      'saved',
+      'qualified',
+    ]);
+    expect(parsed.entries[0]?.displayStatus).toBe('changed');
+  });
+
+  it('parses Save and editor-only Load outcomes without inventing activation', () => {
+    const saved = parseScenarioDocumentSaveResponse({
+      status: 'saved',
+      path: '/workspace/cell.scenario.yaml',
+      scenario_id: 'cell',
+      last_known_status: 'unknown',
+      workspace: workspaceFixture(),
+    });
+    const opened = parseScenarioDocumentLoadResponse({
+      status: 'opened',
+      path: null,
+      scenario_id: 'cell',
+      activation: null,
+      diagnostics: [],
+      workspace: workspaceFixture(),
+    });
+
+    expect(saved.lastKnownStatus).toBe('unknown');
+    expect(opened.path).toBeNull();
+    expect(opened.activation).toBeNull();
+    expect(() => parseScenarioDocumentLoadResponse({
+      status: 'loaded',
+      path: '/workspace/cell.scenario.yaml',
+      scenario_id: 'cell',
+      activation: null,
+      diagnostics: [],
+      workspace: workspaceFixture(),
+    })).toThrow('activation');
+  });
+});
 
 it('bounds discovery by encoded bytes and requires the exact continuation', () => {
   const page = { schema_version: 'manyforge.historian_discovery.v1', kind: 'channel',
@@ -598,7 +669,7 @@ describe('Program product projections', () => {
 
   function runtimeControlsProjection(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_runtime_control_projection.v4',
+      schema_version: 'manyforge.program_runtime_control_projection.v6',
       owner_id: 'program-runner.cell-a',
       owner_epoch: 'program-runner.epoch.1',
       program_run_id: 'program-run.1',
@@ -625,8 +696,16 @@ describe('Program product projections', () => {
       execution_selections: {
         selection_revision: 0,
         groups: [{ group_id: 'all', node_count: 1, held_node_count: 0,
-          state: 'running', stop_allowed: true, resume_allowed: false,
-          resume_unavailable_reason: 'selection_not_held' }],
+          state: 'running', stop_allowed: true,
+          start_allowed: false, start_unavailable_reason: 'selection_not_ready',
+          resume_allowed: false,
+          resume_unavailable_reason: 'selection_not_held',
+          runtime_scale_selector: {
+            program_binding_id: digestC,
+            component_role_id: 'robot',
+            target_role_id: 'arm',
+          },
+          runtime_scale_unavailable_reason: null }],
       },
       observation_override_candidate: {
         schema_version: 'manyforge.runtime_override_observation_candidate.v1',
@@ -2135,7 +2214,7 @@ describe('addressed Robot Control parsers', () => {
             max_acceleration_rad_s2: null,
           }],
           target_descriptor: {
-            schema_version: 'manyforge.manual_control_motion_descriptor.v4',
+            schema_version: 'manyforge.manual_control_motion_descriptor.v5',
             ordinary_jerk: null,
             controllable_component_id: 'robot-a',
             command_target_id: 'arm',
@@ -2345,6 +2424,39 @@ describe('addressed Robot Control parsers', () => {
         ok: true,
     };
     const scoped = parseExecutionControlStatus(targetsResponse, controlResponse);
+    const addressedTargets = structuredClone(targetsResponse);
+    addressedTargets.targets.schema_version = 'manyforge.execution_targets.v2';
+    Object.assign(addressedTargets.targets, {
+      direct_control_targets: [motionTarget],
+      direct_control_gripper_targets: [gripperTarget],
+    });
+    const addressedControl: { control_state: Record<string, unknown> } = structuredClone(controlResponse);
+    addressedControl.control_state.schema_version = 'manyforge.execution_control_state.v5';
+    addressedControl.control_state.observed_target_states = [{
+      command_target_id: motionTarget.command_target_id,
+      controllable_component_id: motionTarget.controllable_component_id,
+      gripper: null,
+      gripper_target_role_id: gripperTarget.target_role_id,
+      motion: observedMotion,
+      motion_target_role_id: motionTarget.target_role_id,
+    }, {
+      command_target_id: gripperTarget.command_target_id,
+      controllable_component_id: gripperTarget.controllable_component_id,
+      gripper: observedGripper,
+      gripper_target_role_id: gripperTarget.target_role_id,
+      motion: null,
+      motion_target_role_id: motionTarget.target_role_id,
+    }];
+    const addressed = parseExecutionControlStatus(addressedTargets, addressedControl);
+    expect(addressed.directControlTargets).toHaveLength(1);
+    expect(addressed.observedMotions?.[0]).toMatchObject({
+      controllableComponentId: motionTarget.controllable_component_id,
+      commandTargetId: motionTarget.command_target_id,
+    });
+    expect(addressed.observedGrippers?.[0]).toMatchObject({
+      controllableComponentId: gripperTarget.controllable_component_id,
+      commandTargetId: gripperTarget.command_target_id,
+    });
     const groupedControlResponse: { control_state: Record<string, unknown> } = structuredClone(controlResponse);
     groupedControlResponse.control_state.runtime_scale_control = {
       ...controlResponse.control_state.runtime_scale_control,

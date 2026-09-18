@@ -68,13 +68,15 @@ namespace {
                  std::all_of(value.waypoints.begin(), value.waypoints.end(), finite_pose) &&
                  std::isfinite(value.max_translation_step_m) &&
                  value.max_translation_step_m > 0.0 && std::isfinite(value.max_rotation_step_rad) &&
-                 value.max_rotation_step_rad > 0.0 && std::isfinite(value.max_linear_speed_mps) &&
-                 value.max_linear_speed_mps > 0.0 && std::isfinite(value.max_angular_speed_rad_s) &&
+                 value.max_rotation_step_rad > 0.0 &&
+                 std::isfinite(value.max_angular_speed_rad_s) &&
                  value.max_angular_speed_rad_s > 0.0 &&
                  std::isfinite(value.max_linear_acceleration_mps2) &&
                  value.max_linear_acceleration_mps2 > 0.0 &&
                  std::isfinite(value.max_angular_acceleration_rad_s2) &&
-                 value.max_angular_acceleration_rad_s2 > 0.0;
+                 value.max_angular_acceleration_rad_s2 > 0.0 &&
+                 std::isfinite(value.max_blend_deviation_rad) &&
+                 value.max_blend_deviation_rad >= 0.0;
         }
       },
       motion);

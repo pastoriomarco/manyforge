@@ -20,6 +20,9 @@ struct PreparedMotionDiagnosticsDTO final {
   std::vector<std::string> joint_names;
   TrajectoryValidationMetricsDTO trajectory_metrics;
   PreparedRuntimePolicyRefDTO runtime_policy;
+  std::optional<double> requested_tcp_linear_speed_mps;
+  double deployment_maximum_tcp_linear_speed_mps{};
+  double admitted_tcp_linear_speed_mps{};
 
   friend bool operator==(const PreparedMotionDiagnosticsDTO&,
                          const PreparedMotionDiagnosticsDTO&) = default;

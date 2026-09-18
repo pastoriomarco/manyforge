@@ -1029,7 +1029,11 @@ class ExecutionCommandClient:
         return response
 
     def observation(self) -> dict[str, Any]:
-        return self._read_projection_on("observation", self._observation_socket_path)
+        # A long-poll observation session may legitimately occupy the
+        # dedicated single-client streaming lane until its source changes.
+        # One-shot snapshots are already supported by the ordinary command
+        # lane and must not queue behind that stream.
+        return self._read_projection("observation")
 
     def open_observation_session(self) -> ExecutionObservationSession:
         return ExecutionObservationSession(

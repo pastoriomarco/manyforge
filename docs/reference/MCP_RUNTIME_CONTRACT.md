@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-09-14 17:20:25 UTC
+  Last regenerated: 2026-09-17 22:57:05 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -1940,6 +1940,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "command_kind": {
             "enum": [
               "program_run",
+              "program_motion_start",
               "program_motion_stop",
               "program_motion_resume",
               "program_full_stop",
@@ -5070,6 +5071,20 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "ApplyDeploymentCandidateRequest": {
         "additionalProperties": false,
         "properties": {
+          "confirmationToken": {
+            "anyOf": [
+              {
+                "maxLength": 71,
+                "minLength": 71,
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmationtoken"
+          },
           "draftId": {
             "maxLength": 256,
             "minLength": 1,
@@ -6557,14 +6572,15 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Max Angular Speed Rad S",
             "type": "number"
           },
+          "max_blend_deviation_rad": {
+            "default": 0.01,
+            "minimum": 0.0,
+            "title": "Max Blend Deviation Rad",
+            "type": "number"
+          },
           "max_linear_acceleration_mps2": {
             "exclusiveMinimum": 0.0,
             "title": "Max Linear Acceleration Mps2",
-            "type": "number"
-          },
-          "max_linear_speed_mps": {
-            "exclusiveMinimum": 0.0,
-            "title": "Max Linear Speed Mps",
             "type": "number"
           },
           "max_rotation_step_rad": {
@@ -6598,7 +6614,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "max_translation_step_m",
           "max_rotation_step_rad",
           "speed_mode",
-          "max_linear_speed_mps",
           "max_angular_speed_rad_s",
           "max_linear_acceleration_mps2",
           "max_angular_acceleration_rad_s2",
@@ -7527,11 +7542,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             ],
             "title": "Component Role Id"
           },
-          "program_binding_id": {
-            "title": "Program Binding Id",
-            "type": "string"
-          },
-          "synchronized_targets": {
+          "group_targets": {
             "anyOf": [
               {
                 "items": {
@@ -7545,7 +7556,11 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "type": "null"
               }
             ],
-            "title": "Synchronized Targets"
+            "title": "Group Targets"
+          },
+          "program_binding_id": {
+            "title": "Program Binding Id",
+            "type": "string"
           },
           "target_role_id": {
             "anyOf": [
@@ -8133,13 +8148,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 ],
                 "title": "Component Role Id"
               },
-              "program_binding_id": {
-                "maxLength": 256,
-                "minLength": 1,
-                "title": "Program Binding Id",
-                "type": "string"
-              },
-              "synchronized_targets": {
+              "group_targets": {
                 "anyOf": [
                   {
                     "maxLength": 2097152,
@@ -8149,7 +8158,13 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                     "type": "null"
                   }
                 ],
-                "title": "Synchronized Targets"
+                "title": "Group Targets"
+              },
+              "program_binding_id": {
+                "maxLength": 256,
+                "minLength": 1,
+                "title": "Program Binding Id",
+                "type": "string"
               },
               "target_role_id": {
                 "anyOf": [

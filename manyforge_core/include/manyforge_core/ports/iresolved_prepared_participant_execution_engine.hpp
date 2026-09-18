@@ -32,6 +32,8 @@ struct ResolvedPreparedMotionExecutionRequestDTO final {
   RuntimeParticipantBinding binding;
   RuntimeParticipantStopReadiness stop_readiness;
   RuntimeParticipantPolicySelection runtime_policy;
+  std::optional<double> requested_tcp_linear_speed_mps;
+  double deployment_maximum_tcp_linear_speed_mps{};
   std::vector<HardStopResourceLimitDTO> retained_default_stop_limits;
   MotionInterruptNodeCategory stop_node_category{MotionInterruptNodeCategory::kGeneric};
   std::shared_ptr<const PreparedParticipantStopPlanDTO> ordinary_stop_plan;

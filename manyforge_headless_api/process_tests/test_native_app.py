@@ -303,12 +303,25 @@ def test_http_owner_restart_reannunciates_from_fresh_source_observation(
             )
             acknowledged = first.post(path, json=body)
             assert acknowledged.status_code == 200
-            assert first.post(path, json=body).json() == acknowledged.json()
-            conflict = first.post(path, json={**body, "reason": "changed"})
-            assert conflict.status_code == 409
-            assert conflict.json()["detail"]["code"] == (
-                "headless_request_identity_conflict"
+            replayed = first.post(path, json=body).json()
+            assert replayed["status"] == "already_acknowledged"
+            assert replayed["changed"] is False
+            assert replayed["audit_event_ids"] == []
+            replayed_alarm = next(
+                alarm
+                for alarm in replayed["snapshot"]["alarms"]
+                if alarm["condition_id"] == first_alarm["condition_id"]
             )
+            assert replayed_alarm["acknowledged"] is True
+            assert replayed_alarm["acknowledgement_attribution"]["request_id"] == (
+                "request.1"
+            )
+            conflict = first.post(path, json={**body, "reason": "changed"})
+            assert conflict.status_code == 200
+            repeated = conflict.json()
+            assert repeated["status"] == "already_acknowledged"
+            assert repeated["changed"] is False
+            assert repeated["audit_event_ids"] == []
 
             deadline = time.monotonic() + 2.0
             history = {"events": []}

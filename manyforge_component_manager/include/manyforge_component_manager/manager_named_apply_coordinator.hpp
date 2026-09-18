@@ -78,6 +78,8 @@ struct ManagerNamedApplyResult final {
 class ManagerNamedApplyCoordinator final {
 public:
   using ApplyIdFactory = std::function<manyforge::core::ApplyId()>;
+  using ApplyProgressObserver =
+      std::function<void(const ManagerApplyIntentDTO &)>;
 
   ManagerNamedApplyCoordinator(
       SqliteManagerApplyJournal &apply_journal,
@@ -100,7 +102,8 @@ public:
       std::vector<std::string> launch_environment_contracts,
       RuntimeObservationReducer::Clock clock_ns,
       ApplyIdFactory apply_id_factory,
-      RuntimePreStartGuard pre_start_guard = {});
+      RuntimePreStartGuard pre_start_guard = {},
+      ApplyProgressObserver apply_progress_observer = {});
 
   [[nodiscard]] ManagerNamedApplyResult
   ApplyOrRecover(const ManagerNamedApplyRequestDTO &request);
@@ -123,10 +126,12 @@ private:
   IManagerActiveRuntimePlanSource &active_plan_source_;
   const manyforge::deployment::IVerifiedRetainedBundleSource
       &retained_bundle_source_;
+  manyforge::core::IManagerSceneProjectionHandoffPort &scene_owner_;
   manyforge::core::IManagerKernelApplyFencePort &kernel_fence_;
   manyforge::core::IKernelCellAdmissionPort &cell_admission_;
   manyforge::core::RuntimeEpoch manager_runtime_epoch_;
   ApplyIdFactory apply_id_factory_;
+  ApplyProgressObserver apply_progress_observer_;
   ManagerApplyFenceCoordinator fence_coordinator_;
   ManagerApplyRuntimeConvergenceCoordinator runtime_coordinator_;
   ManagerSceneStageCoordinator scene_stage_coordinator_;

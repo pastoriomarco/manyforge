@@ -590,6 +590,10 @@ class ProgramSelectionResumeRequest(ProgramSelectionStopRequest):
     expected_selection_revision: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
 
 
+class ProgramSelectionStartRequest(ProgramSelectionResumeRequest):
+    """Release one initially Ready selection of the current Program run."""
+
+
 class ProgramCycleResetRequest(ExecutionControlAttributionRequest):
     program_run_id: str
     expected_owner_epoch: str
@@ -1723,11 +1727,13 @@ class CartesianPathRequest(StrictRequest):
     max_translation_step_m: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     max_rotation_step_rad: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     speed_mode: Literal["bounded"]
-    max_linear_speed_mps: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     max_angular_speed_rad_s: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     max_linear_acceleration_mps2: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     max_angular_acceleration_rad_s2: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     fallback_policy: Literal["fail_closed", "allow_joint_space_fallback"]
+    max_blend_deviation_rad: Annotated[
+        float, Field(ge=0, allow_inf_nan=False)
+    ] = 0.01
 
 
 MotionSpecRequest = Annotated[

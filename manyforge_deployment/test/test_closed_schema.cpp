@@ -631,7 +631,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       EXPECT_EQ(
           entry.compiled_schema()->schema_revision().value(),
           "sha256:"
-          "330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f");
+          "fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -1302,7 +1302,7 @@ TEST(ClosedSchema,
                  core::CatalogRecordKind::kRuntimePolicy) {
         expected_revision =
             "sha256:"
-            "330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f";
+            "fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4";
         expected_path = "catalog/manyforge.runtime_policy.v1.yaml";
       } else {
         expected_revision =

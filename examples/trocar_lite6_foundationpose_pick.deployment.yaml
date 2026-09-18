@@ -1049,13 +1049,13 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.trocar_lite6_foundationpose_pick/e8a4691f949c835c58a41e74a0972704736684ef4be6b807c277ab230b9a64e7",
-        "content_digest": "sha256:974e8bd384030fdaf9d9bc629783d5502253534cb4c8f35be40b920bd754b23a",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.trocar_lite6_foundationpose_pick/5e235e8be2c953efaa67749ff97d54e9672ebd434e3cc4f87235ca948bf44b40",
+        "content_digest": "sha256:0ca4f14255f18ccdaee8d477047f68313a00297b13cf1d5d641e8bbace9a7aba",
         "record_id": "manyforge.runtime_motion.trocar_lite6_foundationpose_pick",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:e8a4691f949c835c58a41e74a0972704736684ef4be6b807c277ab230b9a64e7",
+        "record_revision": "sha256:5e235e8be2c953efaa67749ff97d54e9672ebd434e3cc4f87235ca948bf44b40",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/434fcba1ae9687c7dc7fb2031b06210f1b6cc9a18934b6551abf519c7cf3750b",
@@ -1102,7 +1102,7 @@
     ]
   },
   "deployment_artifact_id": "trocar_lite6_foundationpose_pick",
-  "deployment_revision": "sha256:667496cb63249b912f72f5be6f65645825a33ed1b029d0b1faadfc6cfadab741",
+  "deployment_revision": "sha256:fd190c7f30c34ee9ba4b49d394b8ac8ca403af1c04f6e5a766c290806f7ae431",
   "description": "Retained Isaac Lite6 trocar pick deployment using the commanded ROS 2 control runtime and the qualified FoundationPose Detection3D pose-source client.",
   "desired_control_configurations": [
     {
@@ -1989,13 +1989,13 @@
     "interrupt_sources": [],
     "retained_policy_records": [
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.trocar_lite6_foundationpose_pick/e8a4691f949c835c58a41e74a0972704736684ef4be6b807c277ab230b9a64e7",
-        "content_digest": "sha256:974e8bd384030fdaf9d9bc629783d5502253534cb4c8f35be40b920bd754b23a",
+        "content_addressed_store_key": "catalog/maintained/runtime_policy/manyforge.runtime_motion.trocar_lite6_foundationpose_pick/5e235e8be2c953efaa67749ff97d54e9672ebd434e3cc4f87235ca948bf44b40",
+        "content_digest": "sha256:0ca4f14255f18ccdaee8d477047f68313a00297b13cf1d5d641e8bbace9a7aba",
         "record_id": "manyforge.runtime_motion.trocar_lite6_foundationpose_pick",
         "record_kind": "runtime_policy",
-        "record_revision": "sha256:e8a4691f949c835c58a41e74a0972704736684ef4be6b807c277ab230b9a64e7",
+        "record_revision": "sha256:5e235e8be2c953efaa67749ff97d54e9672ebd434e3cc4f87235ca948bf44b40",
         "schema_id": "manyforge.runtime_policy.v1",
-        "schema_revision": "sha256:330a7505c585d69b231a1322bffbcd71775a1070c3a519a1ef7eb013ed5b5e9f"
+        "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       }
     ],
     "stop_stage_parameters": [

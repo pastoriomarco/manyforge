@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   DraftMutationResponse,
+  DeploymentWorkspaceResponse,
   ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
@@ -14,6 +15,13 @@ const apiMock = vi.hoisted(() => ({
   programWorkspace: {
     get: vi.fn(),
     mutate: vi.fn(),
+  },
+  deploymentWorkspace: {
+    get: vi.fn(),
+  },
+  scenarioDocuments: {
+    save: vi.fn(),
+    load: vi.fn(),
   },
 }));
 
@@ -117,6 +125,28 @@ const recoveryPolicy: ProgramNodeRecoveryPolicy = {
   persistence_ceiling: 'draft_patch',
 };
 const operatorStopPolicy: ProgramOperatorStopPolicy = 'hold';
+
+function deploymentWorkspace(): DeploymentWorkspaceResponse {
+  return {
+    schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+    draft: {
+      id: 'deployment-draft-1',
+      revision: 4,
+      document: null,
+      deploymentArtifactId: null,
+      deploymentRevision: null,
+      graphRevision: null,
+      differsFromSaved: false,
+    },
+    saved: { path: null, deploymentRevision: null },
+    managerApplied: { deploymentRevision: null, scenarioId: null },
+    runAdmission: { ready: false, reason: 'No Deployment' },
+    binding: null,
+    scenarioCandidates: [],
+    savedScenarioCandidates: [],
+    unavailableReasons: ['deployment_draft_unavailable'],
+  };
+}
 
 type FakeNode = {
   nodeType: number;
@@ -394,5 +424,70 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     }));
     expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
     expect(latest?.state.pendingAction).toBeNull();
+  });
+
+  it('fences Scenario Save and Load with both current authored documents', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    await mountHarness(initial, authoringSnapshot(workspace(1)));
+    await act(async () => initial.resolve(workspace(1)));
+    apiMock.deploymentWorkspace.get.mockResolvedValue(deploymentWorkspace());
+    apiMock.scenarioDocuments.save.mockResolvedValue({
+      status: 'saved',
+      path: '/workspace/cell.scenario.yaml',
+      scenarioId: 'cell',
+      lastKnownStatus: 'unknown',
+      workspace: workspace(1),
+    });
+    apiMock.scenarioDocuments.load.mockResolvedValue({
+      status: 'opened',
+      path: '/workspace/cell.scenario.yaml',
+      scenarioId: 'cell',
+      activation: null,
+      diagnostics: [],
+      workspace: workspace(1),
+    });
+
+    await act(async () => {
+      latest?.saveScenarioDocument({
+        path: '/workspace/cell.scenario.yaml',
+        scenarioId: 'cell',
+        name: 'Cell',
+        description: '',
+        confirmOverwrite: false,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(apiMock.scenarioDocuments.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        draftId: 'draft-1',
+        expectedDraftRevision: 1,
+        deploymentDraftId: 'deployment-draft-1',
+        expectedDeploymentDraftRevision: 4,
+      }),
+      expect.objectContaining({ scenarioId: 'cell' }),
+    );
+    expect(latest?.scenarioDocumentPath).toBe('/workspace/cell.scenario.yaml');
+
+    await act(async () => {
+      latest?.loadScenarioDocument(
+        '/workspace/cell.scenario.yaml',
+        null,
+        '/workspace/other.deployment.yaml',
+        true,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(apiMock.scenarioDocuments.load).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deploymentDraftId: 'deployment-draft-1',
+        expectedDeploymentDraftRevision: 4,
+      }),
+      '/workspace/cell.scenario.yaml',
+      null,
+      '/workspace/other.deployment.yaml',
+      true,
+    );
   });
 });

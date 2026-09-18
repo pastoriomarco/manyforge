@@ -17,6 +17,7 @@ class OperatorMotionStopSnapshot:
     held_nodes: frozenset[str] = frozenset()
     stopping_nodes: frozenset[str] = frozenset()
     faulted_nodes: frozenset[str] = frozenset()
+    ready_nodes: frozenset[str] = frozenset()
 
 
 class OperatorMotionStopState:
@@ -45,6 +46,8 @@ class OperatorMotionStopState:
             seen.add(node_id)
         self._read_scope = read_scope
         self._snapshot = OperatorMotionStopSnapshot()
+        self._has_snapshot = False
+        self._initial_ready_nodes: frozenset[str] | None = None
         self._held_subtrees: frozenset[str] = frozenset()
         self._observation_changed = False
         self._observation_error: str | None = None
@@ -62,36 +65,52 @@ class OperatorMotionStopState:
             or snapshot.selection_revision < 0
             or not isinstance(snapshot.held_nodes, frozenset)
             or not snapshot.held_nodes <= self._node_ids
+            or not isinstance(snapshot.ready_nodes, frozenset)
+            or not snapshot.ready_nodes <= snapshot.held_nodes
             or not isinstance(snapshot.stopping_nodes, frozenset)
             or not isinstance(snapshot.faulted_nodes, frozenset)
             or not (snapshot.stopping_nodes | snapshot.faulted_nodes) <= snapshot.held_nodes
             or snapshot.stopping_nodes & snapshot.faulted_nodes
+            or snapshot.ready_nodes & (snapshot.stopping_nodes | snapshot.faulted_nodes)
         ):
             raise ValueError("operator Stop projection is outside its captured scope")
         with self._lock:
-            if snapshot.selection_revision < self._snapshot.selection_revision:
-                return
-            if snapshot.selection_revision == self._snapshot.selection_revision:
-                if snapshot.held_nodes != self._snapshot.held_nodes:
-                    raise ValueError("operator Stop projection changed without a revision")
-                # Within one selection, settlement is monotonic. A crossing
-                # older read cannot put settled work back into Stopping or
-                # erase a fault. Release/reset has a new selection revision.
-                if (
-                    not snapshot.stopping_nodes <= self._snapshot.stopping_nodes
-                    or not self._snapshot.faulted_nodes <= snapshot.faulted_nodes
-                ):
+            if self._initial_ready_nodes is None and snapshot.selection_revision == 0:
+                self._initial_ready_nodes = snapshot.ready_nodes
+            first_snapshot = not self._has_snapshot
+            self._has_snapshot = True
+            if not first_snapshot:
+                if snapshot.selection_revision < self._snapshot.selection_revision:
                     return
-                if (
-                    not (snapshot.faulted_nodes - self._snapshot.faulted_nodes)
-                    <= self._snapshot.stopping_nodes
-                ):
-                    raise ValueError("settled operator Stop changed its terminal outcome")
-                if self._observation_error is not None:
-                    self._observation_error = None
-                    self._observation_changed |= notify_observation
-                if snapshot == self._snapshot:
-                    return
+                if snapshot.selection_revision == self._snapshot.selection_revision:
+                    if snapshot.held_nodes != self._snapshot.held_nodes:
+                        raise ValueError(
+                            "operator Stop projection changed without a revision"
+                        )
+                    if snapshot.ready_nodes != self._snapshot.ready_nodes:
+                        raise ValueError("operator hold cause changed without a revision")
+                    # Within one selection, settlement is monotonic. A crossing
+                    # older read cannot put settled work back into Stopping or
+                    # erase a fault. Release/reset has a new selection revision.
+                    if (
+                        not snapshot.stopping_nodes
+                        <= self._snapshot.stopping_nodes
+                        or not self._snapshot.faulted_nodes
+                        <= snapshot.faulted_nodes
+                    ):
+                        return
+                    if (
+                        not (snapshot.faulted_nodes - self._snapshot.faulted_nodes)
+                        <= self._snapshot.stopping_nodes
+                    ):
+                        raise ValueError(
+                            "settled operator Stop changed its terminal outcome"
+                        )
+                    if self._observation_error is not None:
+                        self._observation_error = None
+                        self._observation_changed |= notify_observation
+                    if snapshot == self._snapshot:
+                        return
             if snapshot.held_nodes != self._snapshot.held_nodes:
                 held_subtrees: set[str] = set()
                 for node_id, children in self._node_children:
@@ -140,6 +159,10 @@ class OperatorMotionStopState:
     def snapshot(self) -> OperatorMotionStopSnapshot:
         with self._lock:
             return self._snapshot
+
+    def initial_ready_nodes(self) -> frozenset[str]:
+        with self._lock:
+            return self._initial_ready_nodes or frozenset()
 
     def holds_subtree(self, node_instance_id: str) -> bool:
         with self._lock:

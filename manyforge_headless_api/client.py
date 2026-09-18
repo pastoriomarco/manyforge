@@ -28,6 +28,7 @@ from .program_binding_projection import (
     validate_applied_program_selection,
     validate_program_apply_result,
     validate_scenario_program_selection,
+    validate_scenario_load_selection,
 )
 from .models import (
     MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES,
@@ -659,10 +660,9 @@ class HeadlessHttpClient:
             f"/api/scenarios/{quote(scenario_id, safe='')}/load-selection",
         )
         try:
-            validate_scenario_program_selection(
+            validate_scenario_load_selection(
                 projection,
                 scenario_id=scenario_id,
-                label="scenario_load_selection",
             )
         except (ProgramBindingTransportError, TypeError, ValueError) as error:
             raise HeadlessClientError(
@@ -797,6 +797,17 @@ class HeadlessHttpClient:
         return self.request(
             "POST",
             f"{self._program_run_path(program_run_id)}/resume-motion",
+            body=body,
+        )
+
+    def program_run_motion_start(
+        self,
+        program_run_id: str,
+        body: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            f"{self._program_run_path(program_run_id)}/motion-start",
             body=body,
         )
 

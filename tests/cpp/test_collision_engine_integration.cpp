@@ -82,6 +82,13 @@ CollisionWorldSnapshot minimal_snapshot() {
   return snapshot;
 }
 
+CollisionQuery one_joint_query() {
+  CollisionQuery query;
+  query.robot_state.joint_names = {"joint"};
+  query.robot_state.positions_rad = {0.0};
+  return query;
+}
+
 CollisionResult check(ManyForgeCollisionEngine& engine,
                       const CollisionWorldSnapshot& snapshot,
                       CollisionQuery query,
@@ -101,6 +108,23 @@ struct TemporaryModel {
   }
   ~TemporaryModel() { std::filesystem::remove_all(root); }
 };
+
+ManyForgeCollisionEngine::SharedModelPtr load_empty_collision_model(
+    const TemporaryModel& temporary) {
+  const auto urdf = temporary.root / "empty.urdf";
+  const auto srdf = temporary.root / "empty.srdf";
+  {
+    std::ofstream model(urdf);
+    model << R"(<robot name="empty"><link name="base"/><link name="tip"/>
+      <joint name="joint" type="revolute"><parent link="base"/><child link="tip"/>
+      <axis xyz="0 0 1"/><limit lower="-1" upper="1" effort="1" velocity="1"/>
+      </joint></robot>)";
+    std::ofstream semantic(srdf);
+    semantic << R"(<robot name="empty"><group name="arm"><joint name="joint"/></group></robot>)";
+  }
+  return ManyForgeCollisionEngine::load_shared_model(
+      "empty", urdf, srdf, {}, "arm");
+}
 
 TEST(CollisionEngineSelfCoverage, BoundsColdGeometryBeforeQuadraticAllocationOrMeshIo) {
   TemporaryModel temporary;
@@ -413,6 +437,43 @@ TEST(ManyForgeCollisionEngineTest,
             immediate.internal_scene_cache_identity());
   EXPECT_NE(validation.capability().mutable_context_id,
             lookahead.capability().mutable_context_id);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     SharedCacheTreatsRevisionNumbersAsPublisherLocal) {
+  TemporaryModel temporary;
+  const auto model = load_empty_collision_model(temporary);
+  const auto cache = ManyForgeCollisionEngine::make_shared_scene_cache(model);
+  ManyForgeCollisionEngine first(model, cache);
+  ManyForgeCollisionEngine replacement(model, cache);
+  auto original = minimal_snapshot();
+  auto next_incarnation = original;
+  next_incarnation.publisher_id = "replacement-collision-publisher";
+  next_incarnation.revision.content_hash = "sha256:replacement-world";
+
+  (void)check(first, original, one_joint_query());
+  const auto result = check(replacement, next_incarnation, one_joint_query());
+
+  EXPECT_EQ(replacement.internal_prepared_scene_build_count(), 2U);
+  EXPECT_EQ(result.raw_diagnostics.count("snapshot_sync_error"), 0U);
+}
+
+TEST(ManyForgeCollisionEngineTest,
+     SharedCacheRejectsRevisionReuseWithinOnePublisher) {
+  TemporaryModel temporary;
+  const auto model = load_empty_collision_model(temporary);
+  const auto cache = ManyForgeCollisionEngine::make_shared_scene_cache(model);
+  ManyForgeCollisionEngine first(model, cache);
+  ManyForgeCollisionEngine replacement(model, cache);
+  auto original = minimal_snapshot();
+  auto invalid_reuse = original;
+  invalid_reuse.revision.content_hash = "sha256:changed-without-revision";
+
+  (void)check(first, original, one_joint_query());
+  const auto result = check(replacement, invalid_reuse, one_joint_query());
+
+  EXPECT_EQ(result.raw_diagnostics.at("snapshot_sync_error"),
+            "collision snapshot revision reused with different content hash");
 }
 
 TEST(ManyForgeCollisionEngineTest, EngineExposesStableIdAndVersion) {

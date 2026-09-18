@@ -1,5 +1,6 @@
 #include "manyforge_headless/owner_publication.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -813,6 +814,9 @@ CanonicalValue BuildManagerSourcePayload(
             "Apply status belongs to a different cell");
     applies.emplace_back(ApplyStatus(apply));
   }
+  const bool apply_in_progress = std::any_of(
+      apply_inventory.begin(), apply_inventory.end(),
+      [](const auto &status) { return !status.terminal_outcome.has_value(); });
 
   const bool apply_available =
       apply_availability == ManagerApplyMutationAvailability::kAvailable;
@@ -827,6 +831,7 @@ CanonicalValue BuildManagerSourcePayload(
   const bool runtime_converged =
       runtime.state ==
           component_manager::ManagerActiveRuntimeConvergenceState::kConverged &&
+      !apply_in_progress &&
       apply_availability !=
           ManagerApplyMutationAvailability::kFullStackRestartRequired;
   return CanonicalValue(CanonicalValue::Object{

@@ -276,7 +276,9 @@ def test_execution_client_uses_exact_focused_projection_commands(
             "status",
         )
     ]
-    assert observation_paths == [tmp_path / "execution-observation.sock"]
+    # One-shot observation snapshots share the ordinary request/reply lane;
+    # only long-poll sessions use the dedicated observation socket.
+    assert observation_paths == []
 
     monkeypatch.setattr(
         client,

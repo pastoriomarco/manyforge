@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   browserRequestIdentity,
+  cclcControlModeUnavailableReason,
   cclcRequestOwnerEpoch,
   lifecycleSupportsRouteSelection,
   lifecycleRequestFromSnapshot,
@@ -114,6 +115,12 @@ describe('CCLC request projection', () => {
     expect(lifecycleSupportsRouteSelection('prepared')).toBe(true);
     expect(lifecycleSupportsRouteSelection('active')).toBe(true);
     expect(lifecycleSupportsRouteSelection('disabled')).toBe(false);
+  });
+
+  it('queries CCLC only for component-lifecycle managed deployments', () => {
+    expect(cclcControlModeUnavailableReason('component_lifecycle')).toBeNull();
+    expect(cclcControlModeUnavailableReason('direct')).toContain('direct native control');
+    expect(cclcControlModeUnavailableReason('pending')).toContain('still attaching');
   });
 
   it('creates bounded identities when randomUUID is unavailable on trusted-LAN HTTP', () => {

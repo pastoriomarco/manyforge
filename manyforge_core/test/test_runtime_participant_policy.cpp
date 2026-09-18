@@ -74,10 +74,6 @@ using namespace manyforge::core;
       RuntimePolicyRevision(digest('a')),
       std::nullopt,
       {InterruptPolicyId("interrupt.contact"), InterruptPolicyId("interrupt.limit")},
-      {RuntimeMotionSpeedLimitDTO{RuntimePolicyCellScopeDTO{}, 0.5},
-       RuntimeMotionSpeedLimitDTO{RuntimePolicyCommandTargetScopeDTO{
-                                      ControllableComponentId("robot.1"), CommandTargetId("arm")},
-                                  0.25}},
       {RuntimeOpenLoopGraspAcknowledgementDTO{ControllableComponentId("robot.1"),
                                               CommandTargetId("arm"),
                                               OpenLoopGraspEnvironmentDTO::kSimulation, true}}};
@@ -92,75 +88,34 @@ using namespace manyforge::core;
           ContentAddressedStoreKey("catalog/runtime-policy/runtime.safe.json")};
 }
 
-TEST(RuntimeParticipantPolicy, SealsExactTargetAndAppliesMinimumCeiling) {
+TEST(RuntimeParticipantPolicy, SealsExactTargetWithoutTcpSpeedAuthority) {
   const auto participant = binding();
   auto source = policy();
   const auto source_reference = policy_reference(source);
   auto selected =
       verify_runtime_participant_policy_selection(source_reference, std::move(source), participant);
   ASSERT_TRUE(selected.ok()) << selected.error().message;
-  EXPECT_DOUBLE_EQ(selected.value().value().effective_maximum_tcp_linear_speed_mps, 0.25);
   EXPECT_EQ(selected.value().value().source_artifact.content_addressed_store_key,
             ContentAddressedStoreKey("catalog/runtime-policy/runtime.safe.json"));
-  ASSERT_TRUE(std::holds_alternative<RuntimePolicyCommandTargetScopeDTO>(
-      selected.value().value().selected_motion_speed_limit.scope));
-  EXPECT_DOUBLE_EQ(
-      selected.value().value().selected_motion_speed_limit.maximum_tcp_linear_speed_mps, 0.25);
+  EXPECT_EQ(selected.value().value().policy, policy());
+}
 
-  auto unspecified = apply_runtime_participant_motion_speed_policy(selected.value(), {});
+TEST(RuntimeParticipantPolicy, DeploymentMaximumSelectsOrRejectsOperationRequest) {
+  auto unspecified = apply_deployment_motion_speed_limit(0.25, {});
   ASSERT_TRUE(unspecified.ok());
   EXPECT_EQ(unspecified.value().max_tcp_linear_speed_mps, 0.25);
 
   SpeedProfileDTO tighter;
   tighter.max_tcp_linear_speed_mps = 0.1;
-  auto applied = apply_runtime_participant_motion_speed_policy(selected.value(), tighter);
+  auto applied = apply_deployment_motion_speed_limit(0.25, tighter);
   ASSERT_TRUE(applied.ok());
   EXPECT_EQ(applied.value().max_tcp_linear_speed_mps, 0.1);
-}
-
-TEST(RuntimeParticipantPolicy, DeploymentCeilingOnlyTightensWithoutRelabelingPolicy) {
-  const auto participant = binding();
-  auto source = policy();
-  const auto source_reference = policy_reference(source);
-  auto selected =
-      verify_runtime_participant_policy_selection(source_reference, std::move(source), participant);
-  ASSERT_TRUE(selected.ok()) << selected.error().message;
-  const auto original = selected.value().value();
-
-  auto tightened = apply_deployment_motion_speed_ceiling(selected.value(), 0.1);
-  ASSERT_TRUE(tightened.ok()) << tightened.error().message;
-  EXPECT_DOUBLE_EQ(tightened.value().value().effective_maximum_tcp_linear_speed_mps, 0.1);
-  EXPECT_EQ(tightened.value().value().source_artifact, original.source_artifact);
-  EXPECT_EQ(tightened.value().value().policy, original.policy);
-  EXPECT_EQ(tightened.value().value().selected_motion_speed_limit,
-            original.selected_motion_speed_limit);
-
-  auto weaker = apply_deployment_motion_speed_ceiling(selected.value(), 0.4);
-  ASSERT_TRUE(weaker.ok()) << weaker.error().message;
-  EXPECT_DOUBLE_EQ(weaker.value().value().effective_maximum_tcp_linear_speed_mps, 0.25);
-  EXPECT_FALSE(apply_deployment_motion_speed_ceiling(selected.value(), 0.0).ok());
-  EXPECT_FALSE(apply_deployment_motion_speed_ceiling(selected.value(), 1000.1).ok());
-}
-
-TEST(RuntimeParticipantPolicy, RejectsUnmatchedAndWeakeningTargetScopes) {
-  const auto participant = binding();
-  auto unmatched = policy();
-  unmatched.motion_speed_limits.erase(unmatched.motion_speed_limits.begin());
-  auto& target =
-      std::get<RuntimePolicyCommandTargetScopeDTO>(unmatched.motion_speed_limits.front().scope);
-  target.command_target_id = CommandTargetId("other");
-  const auto unmatched_reference = policy_reference(unmatched);
-  EXPECT_FALSE(verify_runtime_participant_policy_selection(unmatched_reference,
-                                                           std::move(unmatched), participant)
-                   .ok());
-
-  auto weakening = policy();
-  weakening.motion_speed_limits.back().maximum_tcp_linear_speed_mps = 0.75;
-  const auto weakening_reference = policy_reference(weakening);
-  auto result = verify_runtime_participant_policy_selection(weakening_reference,
-                                                            std::move(weakening), participant);
-  ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().details.at("reason"), "runtime_policy_target_limit_weakens_cell");
+  tighter.max_tcp_linear_speed_mps = 0.3;
+  const auto excessive = apply_deployment_motion_speed_limit(0.25, tighter);
+  ASSERT_FALSE(excessive.ok());
+  EXPECT_EQ(excessive.error().details.at("reason"), "deployment_motion_speed_exceeded");
+  EXPECT_FALSE(apply_deployment_motion_speed_limit(0.0, {}).ok());
+  EXPECT_FALSE(apply_deployment_motion_speed_limit(1000.1, {}).ok());
 }
 
 TEST(RuntimeParticipantPolicy, EnforcesCanonicalShapeAndInterruptMembership) {

@@ -235,6 +235,7 @@ _REQUEST_KINDS: Final = frozenset(
         "manual_result_stage",
         "recovery_action",
         "resume_full_stop",
+        "start_motion",
         "resume_motion",
         "prepare_manual_handover",
         "discard_full_stop",

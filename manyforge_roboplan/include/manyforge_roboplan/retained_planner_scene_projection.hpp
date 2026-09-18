@@ -220,6 +220,10 @@ private:
   core::ProjectionNativeRuntimeBindingDTO native_runtime_binding_;
   RetainedPlannerSceneProjectionConfig config_;
   Clock clock_;
+  // BuildPublisher is called during construction or under mutex_. Each
+  // concrete publisher restarts its revision sequence, so it must also have
+  // a distinct identity within this projection lifetime.
+  mutable std::uint64_t next_publisher_incarnation_{1U};
 
   mutable std::mutex mutex_;
   core::ProjectionHealthDTO health_;

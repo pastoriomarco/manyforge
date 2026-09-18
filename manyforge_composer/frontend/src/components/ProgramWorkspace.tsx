@@ -8,8 +8,10 @@ import type { StructuralResourceState } from '../state/structuralResource';
 import type {
   CatalogResponse,
   NodeEnvironmentResponse,
+  DeploymentWorkspaceResponse,
   SourceModelProjection,
 } from '../types/api';
+import type { ManualControlMotionDescriptor } from '../types/robotControl';
 import {
   flattenProgramForest,
   programDiagnosticNodeId,
@@ -56,6 +58,8 @@ interface ProgramWorkspaceProps {
   catalog: StructuralResourceState<CatalogResponse>;
   environment: StructuralResourceState<NodeEnvironmentResponse>;
   sourceModel: StructuralResourceState<SourceModelProjection>;
+  deploymentWorkspace?: DeploymentWorkspaceResponse | null;
+  motionDescriptors?: ManualControlMotionDescriptor[];
   onRetryCatalog: () => void;
   onRetryEnvironment: () => void;
   onInvalidEditChange?: (invalid: boolean) => void;
@@ -83,6 +87,8 @@ export function ProgramWorkspace({
   catalog,
   environment,
   sourceModel,
+  deploymentWorkspace = null,
+  motionDescriptors = [],
   onRetryCatalog,
   onRetryEnvironment,
   onInvalidEditChange,
@@ -618,6 +624,8 @@ export function ProgramWorkspace({
                     : sourceModel.status === 'ready'
                       ? null
                       : sourceModel.message}
+                  deploymentWorkspace={deploymentWorkspace}
+                  motionDescriptors={motionDescriptors}
                   busy={authoringBusy}
                   onMutate={mutate}
                   onCreateReference={(target, expectedType, expectedAccess, source) => {

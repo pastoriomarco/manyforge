@@ -99,7 +99,13 @@ class PreviewDeploymentCandidateRequest(_Fence):
 
 
 class ApplyDeploymentCandidateRequest(_Fence):
-    pass
+    confirmation_token: str | None = Field(
+        default=None,
+        alias="confirmationToken",
+        min_length=71,
+        max_length=71,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
 
 
 def _raise(error: Exception) -> NoReturn:
@@ -543,16 +549,38 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             state.deployment_draft_session.require_current(
                 body.draft_id, body.expected_draft_revision
             )
-            retained = state.deployment_draft_session.retained_state()
-            saved = retained["saved_document"]
-            if saved is None:
+            current_projection = state.current_scenario()
+            current = current_projection.get("current_scenario")
+            if current_projection.get("ready") is not True or not isinstance(
+                current, dict
+            ):
                 raise DeploymentDraftError(
-                    "deployment_saved_unavailable",
-                    "Deployment has no Saved baseline",
-                    status_code=404,
+                    "deployment_applied_unavailable",
+                    "Deployment Discard requires one exact currently Applied Scenario",
+                    status_code=409,
+                )
+            if state.headless_client is None:
+                raise DeploymentDraftError(
+                    "deployment_applied_unavailable",
+                    "Deployment Discard requires the configured Manager",
+                    status_code=503,
+                )
+            selection = state.headless_client.scenario_load_selection(
+                current["scenario_id"]
+            )
+            applied = selection.get("deployment")
+            if (
+                not isinstance(applied, dict)
+                or applied.get("deployment_revision")
+                != current.get("deployment_revision")
+            ):
+                raise DeploymentDraftError(
+                    "deployment_applied_projection_mismatch",
+                    "Applied Scenario did not return its exact Deployment document",
+                    status_code=409,
                 )
             prepared["compiled"] = state.deployment_draft_session.preview_source(
-                json.dumps(saved, ensure_ascii=False, allow_nan=False)
+                json.dumps(applied, ensure_ascii=False, allow_nan=False)
             )
 
         def effect(_claim: dict[str, Any]) -> dict[str, Any]:
@@ -789,6 +817,13 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
             ).hexdigest()[:32],
             "correlation_id": body.request_id,
+            "confirmation_token": (
+                body.confirmation_token
+                if isinstance(body, ApplyDeploymentCandidateRequest)
+                else None
+            ),
+            "draft_id": body.draft_id,
+            "draft_revision": body.expected_draft_revision,
             "post_state": pre_state,
         }
 
@@ -824,10 +859,14 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     status_code=409,
                 )
 
+        completed_apply = False
+
         def effect(claim: dict[str, Any]) -> dict[str, Any]:
+            nonlocal completed_apply
             result = state.execute_authored_deployment_candidate(
                 intent, claim, apply=apply
             )
+            completed_apply = result.get("status") == "applied"
             return {
                 "schemaVersion": (
                     "manyforge.composer_deployment_candidate_operation.v1"
@@ -848,7 +887,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                         request_owner_epoch=body.request_owner_epoch,
                         request_id=body.request_id,
                     )
-                    if apply
+                    if completed_apply
                     else None
                 )
             ),
