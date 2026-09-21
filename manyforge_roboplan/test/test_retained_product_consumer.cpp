@@ -21,6 +21,7 @@
 #include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
+#include <manyforge_deployment/model_source.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/retained_runtime_policy.hpp>
@@ -37,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numbers>
 #include <optional>
 #include <roboplan/core/geometry_wrappers.hpp>
 #include <roboplan/core/scene.hpp>
@@ -67,6 +69,58 @@ constexpr std::string_view kCanonicalCellFrame =
     "mf1_cell_e228ede37638a8d03080644d418a75c681930a4b5b3f6b0bbde2603974dab681";
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+[[nodiscard]] std::vector<RoboPlanJointLimitInput>
+retained_joint_limit_rows(std::string_view urdf,
+                          std::optional<std::string_view> srdf) {
+  const auto documents = deployment::parse_model_documents_for_projection(
+      urdf, srdf);
+  std::vector<RoboPlanJointLimitInput> result;
+  for (const auto& joint : documents.urdf.joints) {
+    if (joint.type == deployment::UrdfJointType::kFixed ||
+        joint.type == deployment::UrdfJointType::kFloating ||
+        joint.type == deployment::UrdfJointType::kPlanar ||
+        joint.mimic.has_value()) {
+      continue;
+    }
+    if (!joint.limit.has_value() || !std::isfinite(joint.limit->velocity) ||
+        joint.limit->velocity <= 0.0) {
+      throw std::runtime_error("test retained joint has no velocity limit");
+    }
+    RoboPlanJointLimitInput row;
+    row.joint_name = joint.name;
+    row.maximum_velocity = {joint.limit->velocity};
+    if (joint.type == deployment::UrdfJointType::kRevolute ||
+        joint.type == deployment::UrdfJointType::kPrismatic) {
+      if (!joint.limit->authored_lower.has_value() ||
+          !joint.limit->authored_upper.has_value()) {
+        throw std::runtime_error("test retained joint has incomplete bounds");
+      }
+      row.minimum_position = std::vector<double>{joint.limit->lower};
+      row.maximum_position = std::vector<double>{joint.limit->upper};
+    }
+    if (joint.limit->acceleration.has_value()) {
+      row.maximum_acceleration =
+          std::vector<double>{*joint.limit->acceleration};
+    }
+    result.push_back(std::move(row));
+  }
+  std::sort(result.begin(), result.end(), [](const auto& left,
+                                             const auto& right) {
+    return left.joint_name < right.joint_name;
+  });
+  return result;
+}
+
+[[nodiscard]] std::vector<RoboPlanJointLimitInput>
+retained_joint_limit_rows(
+    const deployment::VerifiedRetainedPlanningModel& retained) {
+  return retained_joint_limit_rows(
+      retained.urdf_bytes(),
+      retained.srdf_bytes().empty()
+          ? std::optional<std::string_view>{}
+          : std::optional<std::string_view>{retained.srdf_bytes()});
+}
 
 static_assert(!std::is_default_constructible_v<
               deployment::VerifiedRetainedProductArtifact>);
@@ -1156,6 +1210,86 @@ staged_resource_path(const RetainedPlanningModelStage &stage,
          std::string(logical_uri.substr(kAssetPrefix.size()));
 }
 
+[[nodiscard]] RetainedPlanningModelInput prepared_model_input(
+    std::string urdf, std::string srdf,
+    const std::filesystem::path& source_root,
+    std::string_view exact_asset_prefix) {
+  constexpr std::string_view kFilenamePrefix = "filename=\"";
+  if (!exact_asset_prefix.starts_with("asset://") ||
+      !exact_asset_prefix.ends_with('/')) {
+    throw std::logic_error("test asset prefix is not exact and bounded");
+  }
+
+  std::set<std::string, std::less<>> logical_uris;
+  std::size_t cursor = 0U;
+  while ((cursor = urdf.find(kFilenamePrefix, cursor)) != std::string::npos) {
+    const auto value_start = cursor + kFilenamePrefix.size();
+    const auto value_end = urdf.find('"', value_start);
+    if (value_end == std::string::npos) {
+      throw std::logic_error("prepared test URDF has an unterminated filename");
+    }
+    std::string logical_uri = urdf.substr(value_start, value_end - value_start);
+    if (!std::string_view(logical_uri).starts_with(exact_asset_prefix)) {
+      throw std::logic_error(
+          "prepared test URDF escaped its closure-local asset prefix");
+    }
+    logical_uris.insert(std::move(logical_uri));
+    cursor = value_end + 1U;
+  }
+  if (logical_uris.empty()) {
+    throw std::logic_error("prepared test URDF has no retained resources");
+  }
+
+  RetainedPlanningModelInput result{std::move(urdf), std::move(srdf), {}};
+  result.resources.reserve(logical_uris.size());
+  for (const auto& logical_uri : logical_uris) {
+    const std::string relative = logical_uri.substr(exact_asset_prefix.size());
+    if (relative.empty() || relative.starts_with('/') ||
+        relative.find("..") != std::string::npos) {
+      throw std::logic_error("prepared test resource path is not bounded");
+    }
+    const auto extension = std::filesystem::path(relative).extension();
+    const std::string media_type =
+        extension == ".stl"   ? "model/stl"
+        : extension == ".dae" ? "model/vnd.collada+xml"
+                              : throw std::logic_error(
+                                    "prepared test resource type is unsupported");
+    std::string bytes = deployment::test::read_lite6_fixture_file(
+        source_root / relative);
+    const std::string digest = deployment::sha256_digest(bytes);
+    result.resources.push_back(RetainedPlanningResourceInput{
+        logical_uri, media_type, static_cast<std::uint64_t>(bytes.size()),
+        digest,
+        "sha256/" + digest.substr(std::string_view("sha256:").size()),
+        std::move(bytes)});
+  }
+  return result;
+}
+
+[[nodiscard]] std::map<std::string, std::string, std::less<>>
+load_joint_name_map(const std::filesystem::path& path) {
+  std::ifstream stream(path);
+  if (!stream) {
+    throw std::runtime_error("cannot open RoboPlan import joint map");
+  }
+  std::map<std::string, std::string, std::less<>> result;
+  std::string line;
+  while (std::getline(stream, line)) {
+    const auto separator = line.find('\t');
+    if (separator == std::string::npos || separator == 0U ||
+        separator + 1U == line.size() ||
+        !result.emplace(line.substr(0U, separator),
+                        line.substr(separator + 1U))
+             .second) {
+      throw std::runtime_error("RoboPlan import joint map is malformed");
+    }
+  }
+  if (result.empty()) {
+    throw std::runtime_error("RoboPlan import joint map is empty");
+  }
+  return result;
+}
+
 [[nodiscard]] std::string
 compiled_symbol(const deployment::VerifiedRetainedModelMap &model_map,
                 deployment::OccurrenceSymbolKind kind,
@@ -1568,22 +1702,99 @@ TEST(RetainedProductRoboPlanConsumer,
       "<joint name=\"" +
       follower + "\"/><joint name=\"" + master + "\"/></group></robot>";
 
-  roboplan::Scene scene("mf2_cross_branch", urdf, srdf);
-  EXPECT_EQ(scene.getModel().nq, 1);
-  EXPECT_EQ(scene.getModel().nv, 1);
-  EXPECT_EQ(scene.getJointNames(), (std::vector<std::string>{master}));
-  EXPECT_EQ(scene.getJointNamesWithMimics(),
+  const auto scene = make_roboplan_scene(RoboPlanSceneInput{
+      "mf2_cross_branch", urdf, srdf, {},
+      retained_joint_limit_rows(urdf, std::string_view(srdf))});
+  EXPECT_EQ(scene->getModel().nq, 1);
+  EXPECT_EQ(scene->getModel().nv, 1);
+  EXPECT_EQ(scene->getJointNames(), (std::vector<std::string>{master}));
+  EXPECT_EQ(scene->getJointNamesWithMimics(),
             (std::vector<std::string>{master, follower}));
-  const auto group = scene.getJointGroupInfo("motion");
+  const auto group = scene->getJointGroupInfo("motion");
   ASSERT_TRUE(group.has_value()) << group.error();
   EXPECT_EQ(group->joint_names, (std::vector<std::string>{follower, master}));
   EXPECT_EQ(static_cast<std::size_t>(group->q_indices.size()), 1U);
-  auto positions = scene.getCurrentJointPositions();
+  auto positions = scene->getCurrentJointPositions();
   ASSERT_EQ(positions.size(), 1);
   positions[0] = 0.25;
-  scene.setJointPositions(positions);
-  EXPECT_NEAR(mimic_expanded_position(scene, master), 0.25, 1e-12);
-  EXPECT_NEAR(mimic_expanded_position(scene, follower), 0.25, 1e-12);
+  scene->setJointPositions(positions);
+  EXPECT_NEAR(mimic_expanded_position(*scene, master), 0.25, 1e-12);
+  EXPECT_NEAR(mimic_expanded_position(*scene, follower), 0.25, 1e-12);
+}
+
+TEST(RetainedProductRoboPlanConsumer,
+     MaintainedUr5eFactoryPreservesNamesAndRadianLimits) {
+  const std::filesystem::path model_root(
+      MANYFORGE_UR5E_STRUCTURAL_SOURCE_ROOT);
+  const std::filesystem::path fixture_root(
+      MANYFORGE_UR5E_STRUCTURAL_FIXTURE_ROOT);
+  const std::string verified_urdf =
+      roboplan::loadTextFile(fixture_root / "model.urdf");
+  const std::string verified_srdf =
+      roboplan::loadTextFile(fixture_root / "model.srdf");
+  const auto limits = retained_joint_limit_rows(verified_urdf, verified_srdf);
+  ASSERT_EQ(limits.size(), 7U);
+  const auto joint_names = load_joint_name_map(
+      MANYFORGE_UR5E_ROBOPLAN_IMPORT_JOINT_MAP);
+
+  ScopedTemporaryRoot temporary;
+  const auto staging_parent = temporary.path() / "staging";
+  ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
+  auto stage = RetainedPlanningModelStage::create(
+      prepared_model_input(verified_urdf, verified_srdf, model_root,
+                           "asset://ur5e_robotiq_2f_85/"),
+      staging_parent);
+  EXPECT_NE(stage.loader_urdf_bytes().find("package://ur5e_robotiq_2f_85/"),
+            std::string_view::npos);
+  EXPECT_EQ(stage.loader_urdf_bytes().find("asset://"),
+            std::string_view::npos);
+  ASSERT_EQ(stage.package_paths().size(), 1U);
+  EXPECT_EQ(stage.package_paths().front(), stage.staging_root());
+
+  const auto scene = make_roboplan_scene(RoboPlanSceneInput{
+      "retained_ur5e", std::string(stage.loader_urdf_bytes()),
+      std::string(stage.srdf_bytes()), stage.package_paths(), limits});
+  const std::vector<std::string> arm_names{
+      "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+      "wrist_1_joint",     "wrist_2_joint",       "wrist_3_joint"};
+  std::vector<std::string> imported_arm_names;
+  imported_arm_names.reserve(arm_names.size());
+  std::transform(arm_names.begin(), arm_names.end(),
+                 std::back_inserter(imported_arm_names),
+                 [&joint_names](const auto& name) {
+                   return joint_names.at(name);
+                 });
+  const auto arm = scene->getJointGroupInfo("ur_manipulator");
+  ASSERT_TRUE(arm.has_value()) << arm.error();
+  EXPECT_EQ(arm->joint_names, imported_arm_names);
+
+  for (const auto& name : arm_names) {
+    const auto joint = scene->getJointInfo(joint_names.at(name));
+    ASSERT_TRUE(joint.has_value()) << name;
+    ASSERT_EQ(joint->limits.max_velocity.size(), 1);
+    EXPECT_DOUBLE_EQ(joint->limits.max_velocity[0], std::numbers::pi) << name;
+  }
+  const auto shoulder =
+      scene->getJointInfo(joint_names.at("shoulder_pan_joint"));
+  ASSERT_TRUE(shoulder.has_value());
+  EXPECT_DOUBLE_EQ(shoulder->limits.min_position[0], -2.0 * std::numbers::pi);
+  EXPECT_DOUBLE_EQ(shoulder->limits.max_position[0], 2.0 * std::numbers::pi);
+  const auto elbow = scene->getJointInfo(joint_names.at("elbow_joint"));
+  ASSERT_TRUE(elbow.has_value());
+  EXPECT_DOUBLE_EQ(elbow->limits.min_position[0], -std::numbers::pi);
+  EXPECT_DOUBLE_EQ(elbow->limits.max_position[0], std::numbers::pi);
+
+  const auto gripper = scene->getJointInfo(
+      joint_names.at("robotiq_85_left_knuckle_joint"));
+  ASSERT_TRUE(gripper.has_value());
+  EXPECT_DOUBLE_EQ(gripper->limits.min_position[0], 0.0);
+  EXPECT_DOUBLE_EQ(gripper->limits.max_position[0], 0.8);
+  EXPECT_DOUBLE_EQ(gripper->limits.max_velocity[0], 0.5);
+  const auto gripper_group =
+      scene->getJointGroupInfo("robotiq_2f_85_gripper");
+  ASSERT_TRUE(gripper_group.has_value()) << gripper_group.error();
+  EXPECT_EQ(gripper_group->joint_names.size(), 6U);
+  EXPECT_EQ(gripper_group->q_indices.size(), 1U);
 }
 
 TEST(RetainedProductRoboPlanConsumer,
@@ -1612,10 +1823,11 @@ TEST(RetainedProductRoboPlanConsumer,
   EXPECT_EQ(urdf.artifact_ref().media_type, "application/xml");
   EXPECT_EQ(srdf.artifact_ref().media_type, "application/xml");
 
-  const roboplan::Scene first_scene(
+  const auto first_scene = make_roboplan_scene(RoboPlanSceneInput{
       admission.cell_id().value(), std::string(urdf.bytes()),
-      std::string(srdf.bytes()), std::vector<std::filesystem::path>{});
-  expect_canonical_empty_scene(first_scene);
+      std::string(srdf.bytes()), {},
+      retained_joint_limit_rows(urdf.bytes(), srdf.bytes())});
+  expect_canonical_empty_scene(*first_scene);
 
   const deployment::FilesystemCanonicalEmptyRetainedBundleSource
       reopened_admission_source(package_root);
@@ -1642,13 +1854,17 @@ TEST(RetainedProductRoboPlanConsumer,
   EXPECT_EQ(reopened_urdf.bytes(), urdf.bytes());
   EXPECT_EQ(reopened_srdf.bytes(), srdf.bytes());
 
-  const roboplan::Scene reopened_scene(
-      reopened_admission.cell_id().value(), std::string(reopened_urdf.bytes()),
-      std::string(reopened_srdf.bytes()), std::vector<std::filesystem::path>{});
-  expect_canonical_empty_scene(reopened_scene);
-  EXPECT_EQ(reopened_scene.getModel().nframes, first_scene.getModel().nframes);
-  EXPECT_EQ(reopened_scene.getCollisionModel().geometryObjects.size(),
-            first_scene.getCollisionModel().geometryObjects.size());
+  const auto reopened_scene = make_roboplan_scene(RoboPlanSceneInput{
+      reopened_admission.cell_id().value(),
+      std::string(reopened_urdf.bytes()),
+      std::string(reopened_srdf.bytes()), {},
+      retained_joint_limit_rows(reopened_urdf.bytes(),
+                                reopened_srdf.bytes())});
+  expect_canonical_empty_scene(*reopened_scene);
+  EXPECT_EQ(reopened_scene->getModel().nframes,
+            first_scene->getModel().nframes);
+  EXPECT_EQ(reopened_scene->getCollisionModel().geometryObjects.size(),
+            first_scene->getCollisionModel().geometryObjects.size());
 }
 
 TEST(RetainedProductRoboPlanConsumer,
@@ -1783,21 +1999,36 @@ TEST(RetainedProductRoboPlanConsumer,
 
     ScopedCurrentDirectory no_ambient_lookup(empty_ambient_root);
     try {
-      roboplan::Scene scene(
+      const auto joint_limits = retained_joint_limit_rows(first);
+      auto scene = make_roboplan_scene(RoboPlanSceneInput{
           "retained_lite6", std::string(stage.loader_urdf_bytes()),
-          std::string(stage.srdf_bytes()), stage.package_paths());
-      first_scene_facts = require_meaningful_lite6_scene(scene);
-      expect_exact_retained_and_roboplan_mimic_semantics(model_map, scene);
+          std::string(stage.srdf_bytes()), stage.package_paths(),
+          joint_limits});
+      first_scene_facts = require_meaningful_lite6_scene(*scene);
+      std::size_t imported_acceleration_limit_count = 0U;
+      for (const auto& row : joint_limits) {
+        if (!row.maximum_acceleration.has_value()) {
+          continue;
+        }
+        const auto imported = scene->getJointInfo(row.joint_name);
+        ASSERT_TRUE(imported.has_value()) << row.joint_name;
+        ASSERT_EQ(imported->limits.max_acceleration.size(), 1);
+        EXPECT_DOUBLE_EQ(imported->limits.max_acceleration[0], 10.0)
+            << row.joint_name;
+        ++imported_acceleration_limit_count;
+      }
+      EXPECT_EQ(imported_acceleration_limit_count, 6U);
+      expect_exact_retained_and_roboplan_mimic_semantics(model_map, *scene);
 
       const std::string master =
           compiled_symbol(model_map, deployment::OccurrenceSymbolKind::kJoint,
                           "right_finger_joint");
-      auto positions = scene.getCurrentJointPositions();
-      const auto master_id = scene.getModel().getJointId(master);
-      ASSERT_LT(master_id, scene.getModel().idx_qs.size());
-      positions[scene.getModel().idx_qs[master_id]] = 0.004;
-      scene.setJointPositions(positions);
-      EXPECT_NEAR(mimic_expanded_position(scene, master), 0.004, 1e-12);
+      auto positions = scene->getCurrentJointPositions();
+      const auto master_id = scene->getModel().getJointId(master);
+      ASSERT_LT(master_id, scene->getModel().idx_qs.size());
+      positions[scene->getModel().idx_qs[master_id]] = 0.004;
+      scene->setJointPositions(positions);
+      EXPECT_NEAR(mimic_expanded_position(*scene, master), 0.004, 1e-12);
     } catch (const std::exception &error) {
       ADD_FAILURE() << error.what() << "\n" << first.urdf_bytes();
       return;
@@ -1815,10 +2046,11 @@ TEST(RetainedProductRoboPlanConsumer,
     EXPECT_EQ(stage.loader_urdf_bytes(), first_loader_urdf);
 
     ScopedCurrentDirectory no_ambient_lookup(empty_ambient_root);
-    const roboplan::Scene scene(
+    const auto scene = make_roboplan_scene(RoboPlanSceneInput{
         "retained_lite6", std::string(stage.loader_urdf_bytes()),
-        std::string(stage.srdf_bytes()), stage.package_paths());
-    reopened_scene_facts = require_meaningful_lite6_scene(scene);
+        std::string(stage.srdf_bytes()), stage.package_paths(),
+        retained_joint_limit_rows(reopened)});
+    reopened_scene_facts = require_meaningful_lite6_scene(*scene);
   }
   EXPECT_EQ(reopened_scene_facts, first_scene_facts);
   EXPECT_FALSE(std::filesystem::exists(reopened_stage_root));
@@ -1860,10 +2092,10 @@ TEST(RetainedProductRoboPlanConsumer,
     ASSERT_NO_THROW(std::filesystem::rename(selected_path, hidden_path));
 
     ScopedCurrentDirectory no_ambient_lookup(empty_ambient_root);
-    EXPECT_ANY_THROW(static_cast<void>(roboplan::Scene(
+    EXPECT_ANY_THROW(static_cast<void>(make_roboplan_scene(RoboPlanSceneInput{
         "retained_lite6_missing_resource",
         std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
-        stage.package_paths())));
+        stage.package_paths(), retained_joint_limit_rows(reopened)})));
   }
   EXPECT_FALSE(std::filesystem::exists(incomplete_stage_root));
   EXPECT_TRUE(std::filesystem::is_empty(staging_parent));
@@ -1911,9 +2143,10 @@ TEST(RetainedProductCrossConsumer,
   auto stage =
       RetainedPlanningModelStage::create_verified(retained, staging_parent);
   ScopedCurrentDirectory no_ambient_lookup(empty_ambient_root);
-  auto scene = std::make_shared<roboplan::Scene>(
+  auto scene = make_roboplan_scene(RoboPlanSceneInput{
       "retained_lite6_state_projection", std::string(stage.loader_urdf_bytes()),
-      std::string(stage.srdf_bytes()), stage.package_paths());
+      std::string(stage.srdf_bytes()), stage.package_paths(),
+      retained_joint_limit_rows(retained)});
   auto scene_mutex = std::make_shared<std::mutex>();
   auto projector = RetainedKinematicStateProjector::create_verified(
       scene, scene_mutex, *materialized.bundle, model_map, retained,
@@ -2101,10 +2334,10 @@ TEST(
 
   auto stage =
       RetainedPlanningModelStage::create_verified(retained, staging_parent);
-  auto scene = std::make_shared<roboplan::Scene>(
+  auto scene = make_roboplan_scene(RoboPlanSceneInput{
       "retained_lite6_direct_frame_state",
       std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
-      stage.package_paths());
+      stage.package_paths(), retained_joint_limit_rows(retained)});
   auto scene_mutex = std::make_shared<std::mutex>();
   auto state_projector = std::make_shared<RetainedKinematicStateProjector>(
       RetainedKinematicStateProjector::create_verified(
@@ -2558,10 +2791,11 @@ TEST(RetainedProductCrossConsumer,
   auto stage =
       RetainedPlanningModelStage::create_verified(retained, staging_parent);
   ScopedCurrentDirectory no_ambient_lookup(empty_ambient_root);
-  auto scene = std::make_shared<roboplan::Scene>(
+  const auto joint_limits = retained_joint_limit_rows(retained);
+  auto scene = make_roboplan_scene(RoboPlanSceneInput{
       "retained_lite6_native_composition",
       std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
-      stage.package_paths());
+      stage.package_paths(), joint_limits});
   auto scene_mutex = std::make_shared<std::mutex>();
   auto state_projector = std::make_shared<RetainedKinematicStateProjector>(
       RetainedKinematicStateProjector::create_verified(
@@ -2610,7 +2844,7 @@ TEST(RetainedProductCrossConsumer,
                                  stage.loader_urdf_path(),
                                  stage.srdf_path(),
                                  stage.package_paths(),
-                                 std::nullopt,
+                                 joint_limits,
                                  {},
                                  {}},
           candidate_binding, RoboPlanCandidateComputerConfig{.rng_seed = 7U},
@@ -2992,6 +3226,7 @@ TEST(RetainedProductCrossConsumer,
   auto model_stage =
       RetainedPlanningModelStage::create_verified(retained, staging_parent);
   ScopedCurrentDirectory no_ambient_lookup(empty_ambient_root);
+  const auto joint_limits = retained_joint_limit_rows(retained);
   const auto initial_scene = make_projection_runtime_shadow_snapshot(
       bundle.value().cell_graph.cell_id);
   std::vector<std::shared_ptr<RetainedNativeRuntime>> runtimes;
@@ -3000,9 +3235,10 @@ TEST(RetainedProductCrossConsumer,
     const auto &physical = physical_bindings[index];
     const auto runtime_name =
         "retained_lite6_joined_teardown_" + std::to_string(index + 1U);
-    auto scene = std::make_shared<roboplan::Scene>(
+    auto scene = make_roboplan_scene(RoboPlanSceneInput{
         runtime_name, std::string(model_stage.loader_urdf_bytes()),
-        std::string(model_stage.srdf_bytes()), model_stage.package_paths());
+        std::string(model_stage.srdf_bytes()), model_stage.package_paths(),
+        joint_limits});
     auto scene_mutex = std::make_shared<std::mutex>();
     auto state_projector = std::make_shared<RetainedKinematicStateProjector>(
         RetainedKinematicStateProjector::create_verified(
@@ -3051,7 +3287,7 @@ TEST(RetainedProductCrossConsumer,
             RoboPlanWorkerModelDTO{runtime_name + "_worker",
                                    model_stage.loader_urdf_path(),
                                    model_stage.srdf_path(),
-                                   model_stage.package_paths(), std::nullopt,
+                                   model_stage.package_paths(), joint_limits,
                                    {}, {}},
             candidate_binding,
             RoboPlanCandidateComputerConfig{
@@ -3328,9 +3564,12 @@ TEST(RetainedProductCrossConsumer,
   auto stage =
       RetainedPlanningModelStage::create_verified(retained, staging_parent);
   ScopedCurrentDirectory no_ambient_lookup(empty_ambient_root);
-  roboplan::Scene planning_scene(
-      "retained_lite6_cross_consumer", std::string(stage.loader_urdf_bytes()),
-      std::string(stage.srdf_bytes()), stage.package_paths());
+  const auto planning_scene_owner = make_roboplan_scene(RoboPlanSceneInput{
+      "retained_lite6_cross_consumer",
+      std::string(stage.loader_urdf_bytes()),
+      std::string(stage.srdf_bytes()), stage.package_paths(),
+      retained_joint_limit_rows(retained)});
+  auto& planning_scene = *planning_scene_owner;
   auto shared_collision_model = ManyForgeCollisionEngine::load_shared_model(
       "retained_lite6_cross_consumer", stage.loader_urdf_path(),
       stage.srdf_path(), stage.package_paths(), arm_group->compiled_group_name);

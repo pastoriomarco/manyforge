@@ -49,9 +49,16 @@ if [[ ! "$BUILD_PARALLEL_LEVEL" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
+# RoboPlan's split packages otherwise derive an absolute Python site-packages
+# path from the build interpreter. Keep every Python artifact under the exact
+# package install prefix just like the C++ artifacts.
+PYTHON_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+PYTHON_INSTALL_DIR="lib/python${PYTHON_VERSION}/site-packages"
+
 PROJECTS=(
+    roboplan_common
     roboplan_example_models
-    roboplan
+    roboplan_core
     roboplan_simple_ik
     roboplan_oink
     roboplan_toppra
@@ -81,6 +88,7 @@ for project in "${PROJECTS[@]}"; do
         exit 1
     fi
 
+    printf '[RoboPlan package] configure %s\n' "$project"
     # Put the caller-owned cache arguments first and the exact source, build,
     # and install locations last. CMake resolves repeated options from the
     # right, so a caller cannot accidentally redirect one package into an
@@ -88,15 +96,18 @@ for project in "${PROJECTS[@]}"; do
     cmake "$@" \
         -S "$source_dir" \
         -B "$build_dir" \
-        -DCMAKE_INSTALL_PREFIX="$install_dir"
+        -DCMAKE_INSTALL_PREFIX="$install_dir" \
+        -DPYTHON_SITELIB="$PYTHON_INSTALL_DIR"
     # RoboPlan's nanobind stub targets import the extension during the build.
     # Put this package's just-built shared libraries ahead of any ambient or
     # previously selected RoboPlan generation so stub generation cannot load a
     # same-soname library from the base image.
     project_build_libraries="${build_dir}:${build_dir}/lib"
     build_ld_library_path="$(prepend_path "$project_build_libraries" "${LD_LIBRARY_PATH:-}")"
+    printf '[RoboPlan package] build %s\n' "$project"
     LD_LIBRARY_PATH="$build_ld_library_path" \
         cmake --build "$build_dir" --parallel "$BUILD_PARALLEL_LEVEL"
+    printf '[RoboPlan package] install %s\n' "$project"
     cmake --install "$build_dir"
 
     CMAKE_PREFIX_PATH="$(prepend_path "$install_dir" "${CMAKE_PREFIX_PATH:-}")"

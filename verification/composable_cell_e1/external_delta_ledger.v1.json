@@ -116,7 +116,25 @@
         "spdx": "MIT",
         "sha256": "eb1aefeda6ceb10afdf5f0a35fdd9c372d643fc7632a561c32b3226e68ed4d4d"
       },
-      "role": "selected RoboPlan 0.6.0 production dependency source"
+      "role": "frozen RoboPlan 0.6.0 operator-directed restoration source retained until UA7 qualification"
+    },
+    {
+      "id": "roboplan_0_7_0_ua1_foundation",
+      "identity": {
+        "commit": "099dfa5ccd80b191eb3d6da9f4795f808a63913f",
+        "source_content_sha256": "d117c17658a0765f66c39187739e7af4b6533dac68a8aeb5f7dabc3b8fc67bef",
+        "build_content_sha256": "f1da8fab0782f5114b88ff20da36bf51ceddb483f46c78819de4c0b23d34e777",
+        "git_archive_sha256": "189ba1dccb9d30c0dd2cc7fbfcc4de0d710060cf56c36dd1a2144a904cf27345",
+        "tree": "3ce46cce8b51b21a0eb7b803858cb0750524e5be",
+        "version": "0.7.0"
+      },
+      "source_url": "https://github.com/open-planning/roboplan.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "MIT",
+        "sha256": "eb1aefeda6ceb10afdf5f0a35fdd9c372d643fc7632a561c32b3226e68ed4d4d"
+      },
+      "role": "UI6-I-UA1 exact RoboPlan 0.7.0 foundation source; the frozen 0.6 record remains operator-directed restoration evidence until UA7 qualification"
     },
     {
       "id": "proxsuite_0_7_3_candidate_dependency",
@@ -154,7 +172,7 @@
           "state": "uninitialized"
         }
       ],
-      "role": "selected RoboPlan 0.6 OInK solver dependency"
+      "role": "exact ProxSuite solver dependency shared by the frozen RoboPlan 0.6 restoration closure and the UI6-I-UA1 RoboPlan 0.7 foundation"
     },
     {
       "id": "proxsuite_cmake_module_candidate_dependency",
@@ -190,6 +208,24 @@
         "sha256": "80d9415117d2a3cbee058702e8776bcb1986c7c6fcb69f1b81176f10d88db952"
       },
       "role": "selected RoboPlan 0.6 time-parameterization dependency"
+    },
+    {
+      "id": "toppra_0_6_10_ua1_dependency",
+      "identity": {
+        "commit": "8121e9af72f5aa589b515aa15e0dc408344c3220",
+        "source_content_sha256": "f8f1f5e8cdc0eeac08dc3e2f9302324ccb58f172ec9045ceef7f35c54c34bb1f",
+        "build_content_sha256": "f8f1f5e8cdc0eeac08dc3e2f9302324ccb58f172ec9045ceef7f35c54c34bb1f",
+        "git_archive_sha256": "317d40160fd514adf1738ef24840dd81e62782740065b7e79179fde848a49e6c",
+        "tree": "bb6b2027b5834755c9db2cae0a9a6d924d5f8db7",
+        "version": "0.6.10"
+      },
+      "source_url": "https://github.com/hungpham2511/toppra.git",
+      "license": {
+        "path": "LICENSE",
+        "spdx": "MIT",
+        "sha256": "80d9415117d2a3cbee058702e8776bcb1986c7c6fcb69f1b81176f10d88db952"
+      },
+      "role": "UI6-I-UA1 exact RoboPlan 0.7 time-parameterization dependency"
     },
     {
       "id": "xarm_jazzy_functional_base",

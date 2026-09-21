@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <manyforge_core/types/scene_edit.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
+#include <manyforge_roboplan/roboplan_scene_factory.hpp>
 #include <memory>
 #include <optional>
 #include <string>
@@ -29,7 +30,7 @@ struct RoboPlanWorkerModelDTO final {
   std::filesystem::path urdf_path;
   std::filesystem::path srdf_path;
   std::vector<std::filesystem::path> package_paths;
-  std::optional<std::filesystem::path> yaml_config_path;
+  std::vector<RoboPlanJointLimitInput> joint_limits;
   std::vector<RoboPlanWorkerGeometryDTO> geometries;
   /// Native body-name pairs disabled only after collision-policy resolution.
   std::vector<std::pair<std::string, std::string>> allowed_collision_pairs;

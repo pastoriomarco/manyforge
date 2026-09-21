@@ -702,10 +702,18 @@ std::string encode_initialization(const WorkerInitializationDTO& value) {
       [](Encoder& out, const std::filesystem::path& path) {
         out.string(path.string());
       });
-  encoder.optional(
-      value.model.yaml_config_path,
-      [](Encoder& out, const std::filesystem::path& path) {
-        out.string(path.string());
+  encoder.vector(
+      value.model.joint_limits,
+      [](Encoder& out, const RoboPlanJointLimitInput& row) {
+        out.string(row.joint_name);
+        const auto write_values = [](Encoder& nested,
+                                     const std::vector<double>& values) {
+          write_double_vector(nested, values);
+        };
+        out.optional(row.minimum_position, write_values);
+        out.optional(row.maximum_position, write_values);
+        write_double_vector(out, row.maximum_velocity);
+        out.optional(row.maximum_acceleration, write_values);
       });
   encoder.vector(
       value.model.geometries,
@@ -743,8 +751,18 @@ WorkerInitializationDTO decode_initialization(std::string_view bytes) {
   model.srdf_path = decoder.string();
   model.package_paths = decoder.vector<std::filesystem::path>(
       [](Decoder& input) { return std::filesystem::path(input.string()); });
-  model.yaml_config_path = decoder.optional<std::filesystem::path>(
-      [](Decoder& input) { return std::filesystem::path(input.string()); });
+  model.joint_limits = decoder.vector<RoboPlanJointLimitInput>(
+      [](Decoder& input) {
+        return RoboPlanJointLimitInput{
+            input.string(),
+            input.optional<std::vector<double>>(
+                [](Decoder& nested) { return read_double_vector(nested); }),
+            input.optional<std::vector<double>>(
+                [](Decoder& nested) { return read_double_vector(nested); }),
+            read_double_vector(input),
+            input.optional<std::vector<double>>(
+                [](Decoder& nested) { return read_double_vector(nested); })};
+      });
   model.geometries = decoder.vector<RoboPlanWorkerGeometryDTO>(
       [](Decoder& input) {
         return RoboPlanWorkerGeometryDTO{

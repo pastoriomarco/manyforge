@@ -1,4 +1,4 @@
-00ca95fea84dcf1180d80f8abd2782897a3911fef80ae639131d75f834250184  patches/0005-construct-roboplan-060-scene-scratch-without-assignment.patch
-ba886434bdca4eafb6f59ce630b1b4a4957a2c7ffb0c7e3c140a1bab5c5fac6a  patches/0006-bound-roboplan-060-toppra-output-samples.patch
-e705472bfa05feecc8cf0b669018968966687a5a911047307be01f421ac2cbdd  patches/0008-initialize-roboplan-060-dynotree-variant-state.patch
-af8526dad047c046c6cd5a33a0513a3c94fca321da22c658d54e0efa33a5f858  patches/0009-direct-initialize-roboplan-060-pinocchio-scratch.patch
+57b699cb2dec5604f091ad5170c6e187caa7132cc14dd2b0b58b726c04d4930b  patches/0010-construct-roboplan-070-scene-scratch-without-assignment.patch
+7ddf2e2f899678876d36016a334743d03daff9ed8c9c7c51b39f5dc1936ecb05  patches/0011-bound-roboplan-070-toppra-output-samples.patch
+aab3c280517c7759ab28f094a87cb3aa6bd261f8ec7e727ff12d9adfc7db980a  patches/0012-initialize-roboplan-070-dynotree-variant-state.patch
+db7acbac01e3868495966bc79fa0fbc0f0d37f0a3af88596a5a76b66a29998ce  patches/0013-direct-initialize-roboplan-070-pose-constraint-scratch.patch

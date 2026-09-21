@@ -104,7 +104,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
     && CMEEL_LIB=$(python3 -c "import site; print(site.getsitepackages()[0])")/cmeel.prefix/lib \
     && if [ -d "$CMEEL_LIB" ]; then echo "$CMEEL_LIB" > /etc/ld.so.conf.d/cmeel.conf && ldconfig; fi
 
-# Exact RoboPlan 0.6 source closure with source-built ProxSuite and TOPPRA.
+# Exact RoboPlan 0.7 source closure with source-built ProxSuite and TOPPRA.
 # Prepared on the host by scripts/setup-docker.sh.
 COPY .docker/roboplan/ /tmp/roboplan/
 COPY .docker/proxsuite/ /tmp/proxsuite/
@@ -121,7 +121,7 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
     && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then \
          python3 /tmp/verify-external-source-closure.py \
            --ledger /tmp/external-delta-ledger.v1.json \
-           --source-id roboplan_0_6_0_candidate --root /tmp/roboplan \
+           --source-id roboplan_0_7_0_ua1_foundation --root /tmp/roboplan \
            --content-kind source --allow-stripped-git; \
        elif [ "$ROBOPLAN_SOURCE_MODE" = development_override ]; then \
          echo "RoboPlan development override: exact-source qualification disabled" >&2; \
@@ -142,7 +142,7 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
     && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then DEVELOPMENT_SOURCE=0; else DEVELOPMENT_SOURCE=1; fi \
     && ROBOPLAN_SOURCE_LEDGER=/tmp/external-delta-ledger.v1.json \
        ROBOPLAN_SOURCE_VERIFIER=/tmp/verify-external-source-closure.py \
-       ROBOPLAN_SOURCE_ID=roboplan_0_6_0_candidate \
+       ROBOPLAN_SOURCE_ID=roboplan_0_7_0_ua1_foundation \
        ROBOPLAN_ALLOW_STRIPPED_GIT=1 \
        ROBOPLAN_ALLOW_DEVELOPMENT_SOURCE="$DEVELOPMENT_SOURCE" \
        bash /tmp/build-roboplan-source-closure.sh \
@@ -161,7 +161,7 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
     && export CMAKE_PREFIX_PATH="${ROBOPLAN_SITE_PACKAGES}:/usr/local:${PINOCCHIO_PREFIX}" \
     && export LD_LIBRARY_PATH="${ROBOPLAN_SITE_PACKAGES}/lib:/usr/local/lib:${PINOCCHIO_PREFIX}/lib" \
     && export CMAKE_ARGS="-DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_UPDATES_DISCONNECTED=ON" \
-    && for py_pkg in roboplan roboplan_example_models roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt roboplan_cartesian_planning; do \
+    && for py_pkg in roboplan_common roboplan_example_models roboplan_core roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt roboplan_cartesian_planning roboplan; do \
          cd "/tmp/roboplan/${py_pkg}"; \
          pip install --no-build-isolation --no-deps --no-cache-dir -v .; \
        done \

@@ -45,8 +45,8 @@ if [[ "$ALLOW_STRIPPED_GIT" != "0" && "$ALLOW_STRIPPED_GIT" != "1" ]]; then
 fi
 PROXSUITE_SOURCE_ID="${PROXSUITE_SOURCE_ID:-proxsuite_0_7_3_candidate_dependency}"
 PROXSUITE_CMAKE_MODULE_SOURCE_ID="${PROXSUITE_CMAKE_MODULE_SOURCE_ID:-proxsuite_cmake_module_candidate_dependency}"
-TOPPRA_SOURCE_ID="${TOPPRA_SOURCE_ID:-toppra_0_6_8_candidate_dependency}"
-ROBOPLAN_SOURCE_ID="${ROBOPLAN_SOURCE_ID:-roboplan_0_6_0_candidate}"
+TOPPRA_SOURCE_ID="${TOPPRA_SOURCE_ID:-toppra_0_6_10_ua1_dependency}"
+ROBOPLAN_SOURCE_ID="${ROBOPLAN_SOURCE_ID:-roboplan_0_7_0_ua1_foundation}"
 verifier_git_args=()
 if [[ "$ALLOW_STRIPPED_GIT" == "1" ]]; then
     verifier_git_args+=(--allow-stripped-git)
@@ -121,6 +121,7 @@ proxsuite_install="${INSTALL_ROOT}/proxsuite"
 toppra_build="${BUILD_ROOT}/toppra"
 toppra_install="${INSTALL_ROOT}/toppra"
 
+printf '[RoboPlan closure] configure ProxSuite\n'
 cmake -S "$PROXSUITE_SOURCE" -B "$proxsuite_build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$proxsuite_install" \
@@ -129,7 +130,9 @@ cmake -S "$PROXSUITE_SOURCE" -B "$proxsuite_build" \
     -DBUILD_WITH_VECTORIZATION_SUPPORT=OFF \
     -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
     -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+printf '[RoboPlan closure] build ProxSuite\n'
 cmake --build "$proxsuite_build" --parallel "$BUILD_PARALLEL_LEVEL"
+printf '[RoboPlan closure] install ProxSuite\n'
 cmake --install "$proxsuite_build"
 if [[ ! -f "${proxsuite_install}/include/proxsuite/proxqp/dense/dense.hpp" ]]; then
     echo "exact ProxSuite install has an invalid public-header layout" >&2
@@ -137,6 +140,7 @@ if [[ ! -f "${proxsuite_install}/include/proxsuite/proxqp/dense/dense.hpp" ]]; t
 fi
 
 dependency_prefix="$(prepend_path "$proxsuite_install" "${CMAKE_PREFIX_PATH:-}")"
+printf '[RoboPlan closure] configure TOPPRA\n'
 CMAKE_PREFIX_PATH="$dependency_prefix" \
     cmake -S "${TOPPRA_SOURCE}/cpp" -B "$toppra_build" \
         -DCMAKE_BUILD_TYPE=Release \
@@ -145,10 +149,12 @@ CMAKE_PREFIX_PATH="$dependency_prefix" \
         -DPYTHON_BINDINGS=OFF \
         -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
         -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+printf '[RoboPlan closure] build TOPPRA\n'
 cmake --build "$toppra_build" --parallel "$BUILD_PARALLEL_LEVEL"
 if [[ "$DEPENDENCY_BUILD_TESTING" == "ON" ]]; then
     ctest --test-dir "$toppra_build" --output-on-failure
 fi
+printf '[RoboPlan closure] install TOPPRA\n'
 cmake --install "$toppra_build"
 
 dependency_prefix="$(prepend_path "$toppra_install" "$dependency_prefix")"
@@ -177,6 +183,7 @@ else
         "ROBOPLAN_ALLOW_STRIPPED_GIT=0"
     )
 fi
+printf '[RoboPlan closure] build split RoboPlan packages\n'
 env "${stack_environment[@]}" \
     bash "$(dirname "$0")/build-roboplan-source-stack.sh" \
     "$ROBOPLAN_SOURCE" \

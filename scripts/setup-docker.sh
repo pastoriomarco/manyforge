@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Materialize the exact RoboPlan 0.6 source closure and build ManyForge images.
+# Materialize the exact RoboPlan 0.7 source closure and build ManyForge images.
 #
 # Usage:
 #   ./scripts/setup-docker.sh
@@ -19,12 +19,12 @@ PROXSUITE_DIR="$SOURCE_ROOT/proxsuite"
 TOPPRA_DIR="$SOURCE_ROOT/toppra"
 
 ROBOPLAN_URL="https://github.com/open-planning/roboplan.git"
-ROBOPLAN_PINNED_REF="d2e5162eda2f51f5599ecd60375b65346d0b2944"
+ROBOPLAN_PINNED_REF="099dfa5ccd80b191eb3d6da9f4795f808a63913f"
 ROBOPLAN_REF="${ROBOPLAN_REF:-$ROBOPLAN_PINNED_REF}"
 PROXSUITE_URL="https://github.com/Simple-Robotics/proxsuite.git"
 PROXSUITE_PINNED_REF="b93d7778ffc3299d84b5cb0851022a29bf24a596"
 TOPPRA_URL="https://github.com/hungpham2511/toppra.git"
-TOPPRA_PINNED_REF="cbbc89d46208fddfaa3e1aab52ab44553751b510"
+TOPPRA_PINNED_REF="8121e9af72f5aa589b515aa15e0dc408344c3220"
 
 ROBOPLAN_SOURCE_LEDGER="$REPO_DIR/verification/composable_cell_e1/external_delta_ledger.v1.json"
 ROBOPLAN_SOURCE_VERIFIER="$REPO_DIR/scripts/ci/verify-external-source-closure.py"
@@ -111,7 +111,7 @@ python3 "$ROBOPLAN_SOURCE_VERIFIER" \
     || fail "ProxSuite CMake-module identity/license preflight failed."
 python3 "$ROBOPLAN_SOURCE_VERIFIER" \
     --ledger "$ROBOPLAN_SOURCE_LEDGER" \
-    --source-id toppra_0_6_8_candidate_dependency \
+    --source-id toppra_0_6_10_ua1_dependency \
     --root "$TOPPRA_DIR" --content-kind source \
     || fail "TOPPRA source identity/license preflight failed."
 
@@ -119,7 +119,7 @@ ROBOPLAN_SOURCE_MODE=qualified
 if [ "$ROBOPLAN_REF" = "$ROBOPLAN_PINNED_REF" ]; then
     python3 "$ROBOPLAN_SOURCE_VERIFIER" \
         --ledger "$ROBOPLAN_SOURCE_LEDGER" \
-        --source-id roboplan_0_6_0_candidate \
+        --source-id roboplan_0_7_0_ua1_foundation \
         --root "$ROBOPLAN_DIR" --content-kind source \
         || fail "RoboPlan source identity/license preflight failed."
 else
@@ -129,7 +129,7 @@ fi
 
 if [ "$prepare_only" = true ]; then
     if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then
-        info "Exact RoboPlan 0.6 source closure is ready."
+        info "Exact RoboPlan 0.7 source closure is ready."
     else
         info "Exact dependencies and experimental RoboPlan source are ready."
     fi

@@ -4,12 +4,14 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <roboplan/core/scene.hpp>
@@ -100,6 +102,33 @@ private:
   return {vector.data(), vector.data() + vector.size()};
 }
 
+[[nodiscard]] std::vector<RoboPlanJointLimitInput>
+joint_limit_rows(const roboplan::Scene &scene) {
+  std::vector<RoboPlanJointLimitInput> rows;
+  for (const auto &joint_name : scene.getJointNames()) {
+    const auto info = scene.getJointInfo(joint_name);
+    if (!info.has_value() || info->mimic_info.has_value()) {
+      continue;
+    }
+    RoboPlanJointLimitInput row;
+    row.joint_name = joint_name;
+    if (info->type == roboplan::JointType::PRISMATIC ||
+        info->type == roboplan::JointType::REVOLUTE) {
+      row.minimum_position = values(info->limits.min_position);
+      row.maximum_position = values(info->limits.max_position);
+    }
+    row.maximum_velocity = values(info->limits.max_velocity);
+    const auto acceleration = values(info->limits.max_acceleration);
+    if (std::all_of(acceleration.begin(), acceleration.end(), [](double value) {
+          return value != std::numeric_limits<double>::max();
+        })) {
+      row.maximum_acceleration = acceleration;
+    }
+    rows.push_back(std::move(row));
+  }
+  return rows;
+}
+
 [[nodiscard]] Pose3DTO pose(const Eigen::Matrix4d &transform) {
   const Eigen::Quaterniond orientation(transform.block<3, 3>(0, 0));
   return {{transform(0, 3), transform(1, 3), transform(2, 3)},
@@ -109,16 +138,26 @@ private:
 [[nodiscard]] ProcessFixture make_fixture() {
   const auto models = roboplan::example_models::get_package_models_dir();
   const auto package_share = roboplan::example_models::get_package_share_dir();
-  RoboPlanWorkerModelDTO model{"process-candidate-scene",
-                               models / "ur_robot_model/ur5_gripper.urdf",
-                               models / "ur_robot_model/ur5_gripper.srdf",
-                               {package_share},
-                               models / "ur_robot_model/ur5_config.yaml",
-                               {},
-                               {}};
-  auto scene = std::make_shared<roboplan::Scene>(
-      model.native_scene_name, model.urdf_path, model.srdf_path,
-      model.package_paths, *model.yaml_config_path);
+  const auto urdf_path = models / "ur_robot_model/ur5_gripper.urdf";
+  const auto srdf_path = models / "ur_robot_model/ur5_gripper.srdf";
+  auto source_scene = std::make_shared<roboplan::Scene>(
+      "process-candidate-source",
+      roboplan::loadUrdfSceneDescription(urdf_path, {package_share}));
+  source_scene->importJointLimitsFromConfig(roboplan::loadJointLimitsConfig(
+      models / "ur_robot_model/ur5_config.yaml"));
+  if (const auto imported =
+          source_scene->importSrdf(roboplan::loadTextFile(srdf_path));
+      !imported.has_value()) {
+    throw std::runtime_error(imported.error());
+  }
+  RoboPlanWorkerModelDTO model{"process-candidate-scene", urdf_path,
+                               srdf_path, {package_share},
+                               joint_limit_rows(*source_scene), {}, {}};
+  auto scene = make_roboplan_scene(
+      RoboPlanSceneInput{model.native_scene_name,
+                         roboplan::loadTextFile(model.urdf_path),
+                         roboplan::loadTextFile(model.srdf_path),
+                         model.package_paths, model.joint_limits});
   const auto group = scene->getJointGroupInfo("arm");
   if (!group.has_value()) {
     throw std::runtime_error(group.error());

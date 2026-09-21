@@ -3,24 +3,106 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
+#include <manyforge_roboplan/roboplan_scene_factory.hpp>
 #include <roboplan/core/geometry_wrappers.hpp>
 #include <roboplan/core/scene.hpp>
 #include <roboplan_example_models/resources.hpp>
 
 namespace {
 
+using manyforge::roboplan_backend::RoboPlanJointLimitInput;
+using manyforge::roboplan_backend::RoboPlanSceneInput;
+using manyforge::roboplan_backend::make_roboplan_scene;
+
+constexpr std::string_view kBoundedRobot = R"(
+<robot name="bounded_robot" version="1.0">
+  <link name="base"/>
+  <link name="tip"/>
+  <joint name="joint1" type="revolute">
+    <parent link="base"/>
+    <child link="tip"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="5" velocity="2"/>
+  </joint>
+</robot>)";
+
+constexpr std::string_view kBoundedSemanticRobot = R"(
+<robot name="bounded_robot">
+  <group name="arm"><joint name="joint1"/></group>
+</robot>)";
+
+RoboPlanSceneInput bounded_input() {
+  return RoboPlanSceneInput{
+      "bounded", std::string(kBoundedRobot),
+      std::string(kBoundedSemanticRobot), {},
+      {RoboPlanJointLimitInput{"joint1", std::vector<double>{-0.75},
+                               std::vector<double>{0.75},
+                               std::vector<double>{1.5},
+                               std::vector<double>{10.0}}}};
+}
+
 std::shared_ptr<roboplan::Scene> make_scene(const std::string& name) {
   const auto models = roboplan::example_models::get_package_models_dir();
   const auto package_share =
       roboplan::example_models::get_package_share_dir();
-  return std::make_shared<roboplan::Scene>(
-      name, models / "ur_robot_model/ur5_gripper.urdf",
-      models / "ur_robot_model/ur5_gripper.srdf",
-      std::vector<std::filesystem::path>{package_share});
+  auto scene = std::make_shared<roboplan::Scene>(
+      name, roboplan::loadUrdfSceneDescription(
+                models / "ur_robot_model/ur5_gripper.urdf", {package_share}));
+  scene->importJointLimitsFromConfig(roboplan::loadJointLimitsConfig(
+      models / "ur_robot_model/ur5_config.yaml"));
+  if (const auto imported = scene->importSrdf(roboplan::loadTextFile(
+          models / "ur_robot_model/ur5_gripper.srdf"));
+      !imported.has_value()) {
+    throw std::runtime_error(imported.error());
+  }
+  return scene;
+}
+
+TEST(RoboPlanSceneGenerationTest,
+     SharedFactoryAppliesVerifiedLimitsBeforeSemanticGroups) {
+  auto scene = make_roboplan_scene(bounded_input());
+  ASSERT_NE(scene, nullptr);
+  const auto joint = scene->getJointInfo("joint1");
+  ASSERT_TRUE(joint.has_value());
+  EXPECT_DOUBLE_EQ(joint->limits.min_position[0], -0.75);
+  EXPECT_DOUBLE_EQ(joint->limits.max_position[0], 0.75);
+  EXPECT_DOUBLE_EQ(joint->limits.max_velocity[0], 1.5);
+  EXPECT_DOUBLE_EQ(joint->limits.max_acceleration[0], 10.0);
+  const auto group = scene->getJointGroupInfo("arm");
+  ASSERT_TRUE(group.has_value());
+  EXPECT_EQ(group->joint_names, std::vector<std::string>{"joint1"});
+}
+
+TEST(RoboPlanSceneGenerationTest,
+     SharedFactoryRejectsIncompleteDuplicateAndForeignLimitRows) {
+  auto missing = bounded_input();
+  missing.joint_limits.clear();
+  EXPECT_THROW(static_cast<void>(make_roboplan_scene(std::move(missing))),
+               std::runtime_error);
+
+  auto duplicate = bounded_input();
+  duplicate.joint_limits.push_back(duplicate.joint_limits.front());
+  EXPECT_THROW(static_cast<void>(make_roboplan_scene(std::move(duplicate))),
+               std::runtime_error);
+
+  auto foreign = bounded_input();
+  foreign.joint_limits.front().joint_name = "not-in-model";
+  EXPECT_THROW(static_cast<void>(make_roboplan_scene(std::move(foreign))),
+               std::runtime_error);
+
+  auto malformed = bounded_input();
+  malformed.joint_limits.front().maximum_acceleration =
+      std::vector<double>{-1.0};
+  EXPECT_THROW(static_cast<void>(make_roboplan_scene(std::move(malformed))),
+               std::runtime_error);
 }
 
 TEST(RoboPlanSceneGenerationTest,

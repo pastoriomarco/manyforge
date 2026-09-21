@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -15,8 +16,9 @@ _CLOSURE_SCRIPT = _REPO_ROOT / "scripts/ci/build-roboplan-source-closure.sh"
 _VERIFIER_SCRIPT = _REPO_ROOT / "scripts/ci/verify-external-source-closure.py"
 _DOCKERFILES = (_REPO_ROOT / "Dockerfile", _REPO_ROOT / "Dockerfile.ros-jazzy-full")
 _PROJECTS = (
+    "roboplan_common",
     "roboplan_example_models",
-    "roboplan",
+    "roboplan_core",
     "roboplan_simple_ik",
     "roboplan_oink",
     "roboplan_toppra",
@@ -43,7 +45,7 @@ def test_native_and_ros_images_use_the_checked_manyforge_builder() -> None:
         )
         assert "bash /tmp/build-roboplan-source-closure.sh" in source
         assert "/tmp/proxsuite /tmp/toppra /tmp/roboplan" in source
-        assert "ROBOPLAN_SOURCE_ID=roboplan_0_6_0_candidate" in source
+        assert "ROBOPLAN_SOURCE_ID=roboplan_0_7_0_ua1_foundation" in source
         assert "ROBOPLAN_ALLOW_DEVELOPMENT_SOURCE" in source
         assert "-DFETCHCONTENT_FULLY_DISCONNECTED=ON" in source
         assert "-DBUILD_PYTHON_BINDINGS=OFF" in source
@@ -60,11 +62,11 @@ def test_native_and_ros_images_use_the_checked_manyforge_builder() -> None:
     )
 
     setup = (_REPO_ROOT / "scripts/setup-docker.sh").read_text(encoding="utf-8")
-    assert "d2e5162eda2f51f5599ecd60375b65346d0b2944" in setup
+    assert "099dfa5ccd80b191eb3d6da9f4795f808a63913f" in setup
     assert "b93d7778ffc3299d84b5cb0851022a29bf24a596" in setup
-    assert "cbbc89d46208fddfaa3e1aab52ab44553751b510" in setup
+    assert "8121e9af72f5aa589b515aa15e0dc408344c3220" in setup
     assert '"$PROXSUITE_DIR" cmake-module' in setup
-    assert "roboplan_0_6_0_candidate" in setup
+    assert "roboplan_0_7_0_ua1_foundation" in setup
 
 
 def _fake_cmake(path: Path) -> None:
@@ -255,6 +257,7 @@ def test_builder_owns_arguments_and_prefixes_each_fresh_install(
             "-B",
             str(build / project),
             f"-DCMAKE_INSTALL_PREFIX={project_install}",
+            f"-DPYTHON_SITELIB=lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages",
         ]
         assert configure["cmake_prefix_path"] == expected_prefix
         assert configure["ld_library_path"] == expected_libraries
@@ -279,8 +282,8 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
     tmp_path: Path,
 ) -> None:
     proxsuite = tmp_path / "proxsuite-v0.7.3"
-    toppra = tmp_path / "toppra-v0.6.8"
-    roboplan = tmp_path / "roboplan-v0.6.0"
+    toppra = tmp_path / "toppra-v0.6.10"
+    roboplan = tmp_path / "roboplan-v0.7.0"
     proxsuite.mkdir()
     (proxsuite / "cmake-module").mkdir()
     (proxsuite / "CMakeLists.txt").write_text("project(proxsuite)\n", encoding="utf-8")

@@ -24,7 +24,9 @@ def test_required_module_inventory_uses_upstream_package_namespaces() -> None:
     assert _MODULE.REQUIRED_MODULES == (
         "pinocchio",
         "coal",
+        "roboplan_common",
         "roboplan.core",
+        "roboplan.filters",
         "roboplan.example_models",
         "roboplan.simple_ik",
         "roboplan.optimal_ik",

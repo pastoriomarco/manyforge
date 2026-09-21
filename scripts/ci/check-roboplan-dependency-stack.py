@@ -16,18 +16,22 @@ EXPECTED_DISTRIBUTIONS = {
     "libpinocchio": "4.1.0",
     "coal": "3.0.3",
     "libcoal": "3.0.3",
-    "roboplan-core": "0.6.0",
-    "roboplan-example-models": "0.6.0",
-    "roboplan-simple-ik": "0.6.0",
-    "roboplan-oink": "0.6.0",
-    "roboplan-rrt": "0.6.0",
-    "roboplan-toppra": "0.6.0",
-    "roboplan-cartesian-planning": "0.6.0",
+    "roboplan": "0.7.0",
+    "roboplan-common": "0.7.0",
+    "roboplan-core": "0.7.0",
+    "roboplan-example-models": "0.7.0",
+    "roboplan-simple-ik": "0.7.0",
+    "roboplan-oink": "0.7.0",
+    "roboplan-rrt": "0.7.0",
+    "roboplan-toppra": "0.7.0",
+    "roboplan-cartesian-planning": "0.7.0",
 }
 REQUIRED_MODULES = (
     "pinocchio",
     "coal",
+    "roboplan_common",
     "roboplan.core",
+    "roboplan.filters",
     "roboplan.example_models",
     "roboplan.simple_ik",
     "roboplan.optimal_ik",
@@ -36,10 +40,13 @@ REQUIRED_MODULES = (
     "roboplan.cartesian_planning",
 )
 ROBOPLAN_DISTRIBUTIONS = tuple(
-    name for name in EXPECTED_DISTRIBUTIONS if name.startswith("roboplan-")
+    name
+    for name in EXPECTED_DISTRIBUTIONS
+    if name == "roboplan" or name.startswith("roboplan-")
 )
 ROBOPLAN_NATIVE_MODULES = (
     "roboplan.core._core_ext",
+    "roboplan.filters._filters_ext",
     "roboplan.example_models._example_models_ext",
     "roboplan.simple_ik._simple_ik_ext",
     "roboplan.optimal_ik._optimal_ik_ext",
@@ -244,7 +251,7 @@ def main() -> int:
         return 1
 
     print(
-        "RoboPlan dependency stack verified: RoboPlan 0.6.0, "
+        "RoboPlan dependency stack verified: RoboPlan 0.7.0, "
         "Pinocchio 4.1.0, Coal 3.0.3, one recorded planner ABI"
     )
     return 0

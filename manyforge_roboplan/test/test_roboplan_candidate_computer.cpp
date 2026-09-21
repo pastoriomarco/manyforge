@@ -47,10 +47,16 @@ struct CandidateFixture final {
   const auto package_share =
       roboplan::example_models::get_package_share_dir();
   auto scene = std::make_shared<roboplan::Scene>(
-      "candidate-scene", models / "ur_robot_model/ur5_gripper.urdf",
-      models / "ur_robot_model/ur5_gripper.srdf",
-      std::vector<std::filesystem::path>{package_share},
-      models / "ur_robot_model/ur5_config.yaml");
+      "candidate-scene", roboplan::loadUrdfSceneDescription(
+                             models / "ur_robot_model/ur5_gripper.urdf",
+                             {package_share}));
+  scene->importJointLimitsFromConfig(roboplan::loadJointLimitsConfig(
+      models / "ur_robot_model/ur5_config.yaml"));
+  if (const auto imported = scene->importSrdf(roboplan::loadTextFile(
+          models / "ur_robot_model/ur5_gripper.srdf"));
+      !imported.has_value()) {
+    throw std::runtime_error(imported.error());
+  }
   const auto group = scene->getJointGroupInfo("arm");
   if (!group.has_value()) {
     throw std::runtime_error(group.error());

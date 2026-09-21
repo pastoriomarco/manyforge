@@ -74,6 +74,7 @@
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
 #include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
+#include <manyforge_roboplan/roboplan_scene_factory.hpp>
 #include <manyforge_scene/canonical_empty_scene_owner.hpp>
 #include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <manyforge_scene/scene_transaction_codec.hpp>
@@ -237,6 +238,57 @@ void Require(bool condition, std::string detail) {
   if (!condition) {
     Fail(std::move(detail));
   }
+}
+
+[[nodiscard]] std::vector<RoboPlanJointLimitInput>
+RoboPlanJointLimitsFromRetainedModel(
+    const deployment::UrdfDocumentIr &urdf) {
+  std::vector<RoboPlanJointLimitInput> result;
+  result.reserve(urdf.joints.size());
+  for (const auto &joint : urdf.joints) {
+    if (joint.type == deployment::UrdfJointType::kFixed ||
+        joint.type == deployment::UrdfJointType::kFloating ||
+        joint.type == deployment::UrdfJointType::kPlanar ||
+        joint.mimic.has_value()) {
+      continue;
+    }
+    Require(joint.limit.has_value(),
+            "retained movable joint '" + joint.name +
+                "' has no explicit dynamics limits");
+    const auto &limit = *joint.limit;
+    Require(std::isfinite(limit.velocity) && limit.velocity > 0.0,
+            "retained movable joint '" + joint.name +
+                "' has no positive velocity limit");
+
+    RoboPlanJointLimitInput row;
+    row.joint_name = joint.name;
+    row.maximum_velocity = {limit.velocity};
+    if (joint.type == deployment::UrdfJointType::kRevolute ||
+        joint.type == deployment::UrdfJointType::kPrismatic) {
+      Require(limit.authored_lower.has_value() &&
+                  limit.authored_upper.has_value(),
+              "retained bounded joint '" + joint.name +
+                  "' has incomplete position limits");
+      row.minimum_position = std::vector<double>{limit.lower};
+      row.maximum_position = std::vector<double>{limit.upper};
+    }
+    if (limit.acceleration.has_value()) {
+      row.maximum_acceleration =
+          std::vector<double>{*limit.acceleration};
+    }
+    result.push_back(std::move(row));
+  }
+  std::sort(result.begin(), result.end(), [](const auto &left,
+                                              const auto &right) {
+    return left.joint_name < right.joint_name;
+  });
+  Require(std::adjacent_find(
+              result.begin(), result.end(), [](const auto &left,
+                                                const auto &right) {
+                return left.joint_name == right.joint_name;
+              }) == result.end(),
+          "retained model repeats a movable joint limit");
+  return result;
 }
 
 [[nodiscard]] std::filesystem::path
@@ -8703,12 +8755,21 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           products.planning_collision_model.product_id});
   Require(retained_model.has_value(),
           "active retained planning model is absent or invalid");
+  const auto retained_srdf = retained_model->srdf_bytes();
+  const auto retained_model_documents =
+      deployment::parse_model_documents_for_projection(
+          retained_model->urdf_bytes(),
+          retained_srdf.empty()
+              ? std::optional<std::string_view>{}
+              : std::optional<std::string_view>{retained_srdf});
+  const auto roboplan_joint_limits = RoboPlanJointLimitsFromRetainedModel(
+      retained_model_documents.urdf);
   auto stage = RetainedPlanningModelStage::create_verified(
       *retained_model, input.execution_run_root);
-  auto scene = std::make_shared<roboplan::Scene>(
+  auto scene = make_roboplan_scene(RoboPlanSceneInput{
       "manyforge_i6_native_execution_host",
       std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
-      stage.package_paths());
+      stage.package_paths(), roboplan_joint_limits});
   auto scene_mutex = std::make_shared<std::mutex>();
   std::vector<core::RuntimeParticipantBinding> projected_state_bindings{
       direct_control_motion_binding.value()};
@@ -8772,7 +8833,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                                  stage.loader_urdf_path(),
                                  stage.srdf_path(),
                                  stage.package_paths(),
-                                 std::nullopt,
+                                 roboplan_joint_limits,
                                  {},
                                  {}},
           candidate_binding,
@@ -9066,13 +9127,6 @@ BuildSingleProductComposition(CompositionBuildInput input) {
     Fail("direct-control joint limits are unavailable: " +
          direct_control_joint_limits.error().message);
   }
-  const auto retained_srdf = retained_model->srdf_bytes();
-  const auto manual_control_documents =
-      deployment::parse_model_documents_for_projection(
-          retained_model->urdf_bytes(),
-          retained_srdf.empty()
-              ? std::optional<std::string_view>{}
-              : std::optional<std::string_view>{retained_srdf});
   auto manual_control_descriptors = BuildManualControlDescriptors(
       direct_control_motion_binding.value(),
       direct_control_gripper_binding.value(),
@@ -9086,7 +9140,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
 #endif
       retained_runtime_configuration.direct_control_joint_limits,
       retained_runtime_configuration.gripper_target_configurations,
-      input.model_map, manual_control_documents);
+      input.model_map, retained_model_documents);
   auto composition = std::make_unique<Composition>(
       std::move(input.bundle), std::move(input.status_program),
       std::move(input.status_program_binding),

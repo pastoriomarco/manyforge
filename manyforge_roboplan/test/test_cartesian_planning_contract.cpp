@@ -359,7 +359,10 @@ TEST(CartesianTrajectoryContractTest,
   </group>
 </robot>)";
   auto scene = std::make_shared<roboplan::Scene>(
-      "cartesian_mimic_chain", urdf, srdf);
+      "cartesian_mimic_chain",
+      roboplan::loadUrdfSceneDescriptionFromXml(urdf));
+  const auto imported = scene->importSrdf(srdf);
+  ASSERT_TRUE(imported.has_value()) << imported.error();
   const auto group = scene->getJointGroupInfo("arm");
   ASSERT_TRUE(group.has_value()) << group.error();
   ASSERT_EQ(group->joint_names, std::vector<std::string>{"source"});

@@ -35,7 +35,7 @@ endforeach()
 set(COAL_DISABLE_HPP_FCL_WARNINGS ON)
 find_package(Eigen3 REQUIRED)
 find_package(pinocchio REQUIRED)
-find_package(roboplan REQUIRED)
+find_package(roboplan_core REQUIRED)
 find_package(roboplan_rrt REQUIRED)
 find_package(roboplan_simple_ik REQUIRED)
 find_package(roboplan_toppra REQUIRED)
@@ -133,6 +133,16 @@ target_include_directories(manyforge_roboplan_retained_consumer PUBLIC
 
 target_link_libraries(manyforge_roboplan_retained_consumer
   PUBLIC OpenSSL::Crypto)
+
+add_library(manyforge_roboplan_scene_factory
+  src/roboplan_scene_factory.cpp)
+target_include_directories(manyforge_roboplan_scene_factory PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_compile_definitions(manyforge_roboplan_scene_factory PRIVATE
+  COAL_DISABLE_HPP_FCL_WARNINGS)
+target_link_libraries(manyforge_roboplan_scene_factory PUBLIC
+  roboplan::roboplan)
 
 add_library(manyforge_roboplan_collision_projection
   src/retained_collision_world_projector.cpp
@@ -359,7 +369,8 @@ target_compile_definitions(manyforge_roboplan_candidate_worker PRIVATE
   COAL_DISABLE_HPP_FCL_WARNINGS)
 target_link_libraries(manyforge_roboplan_candidate_worker PRIVATE
   manyforge_roboplan_worker_protocol
-  manyforge_roboplan_native_candidate)
+  manyforge_roboplan_native_candidate
+  manyforge_roboplan_scene_factory)
 
 add_library(manyforge_roboplan_managed_kernel_apply_fence
   src/managed_kernel_apply_fence_owner.cpp)
@@ -402,6 +413,7 @@ target_link_libraries(manyforge_native_execution_host PRIVATE
   manyforge_roboplan_native_runtime
   manyforge_roboplan_process_candidate_client
   manyforge_roboplan_retained_consumer
+  manyforge_roboplan_scene_factory
   manyforge_component_manager
   manyforge::content_identity
   manyforge::scene
@@ -434,6 +446,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     manyforge_roboplan_ros2_control_runtime
     manyforge_roboplan_process_candidate_client
     manyforge_roboplan_retained_consumer
+    manyforge_roboplan_scene_factory
     manyforge_component_manager
     manyforge::content_identity
     manyforge::scene
@@ -488,6 +501,7 @@ if(BUILD_TESTING)
       manyforge_roboplan_native_runtime
       manyforge_roboplan_process_candidate_client
       manyforge_roboplan_retained_consumer
+      manyforge_roboplan_scene_factory
       manyforge_component_manager
       manyforge::content_identity
       manyforge::scene
@@ -518,6 +532,7 @@ if(BUILD_TESTING)
       manyforge_roboplan_native_runtime
       manyforge_roboplan_process_candidate_client
       manyforge_roboplan_retained_consumer
+      manyforge_roboplan_scene_factory
       manyforge_component_manager
       manyforge::content_identity
       manyforge::scene
@@ -557,6 +572,7 @@ if(BUILD_TESTING)
       manyforge_roboplan_native_runtime
       manyforge_roboplan_process_candidate_client
       manyforge_roboplan_retained_consumer
+      manyforge_roboplan_scene_factory
       manyforge_component_manager
       manyforge::content_identity
       manyforge::scene
@@ -730,6 +746,7 @@ if(BUILD_TESTING)
       MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH="$<TARGET_FILE:fake_process_candidate_worker>")
     target_link_libraries(test_process_contained_candidate_client PRIVATE
       manyforge_roboplan_process_candidate_client
+      manyforge_roboplan_scene_factory
       roboplan_example_models::roboplan_example_models
       Threads::Threads
       GTest::gtest_main)
@@ -751,6 +768,7 @@ if(BUILD_TESTING)
     target_compile_definitions(test_roboplan_scene_generation PRIVATE
       COAL_DISABLE_HPP_FCL_WARNINGS)
     target_link_libraries(test_roboplan_scene_generation PRIVATE
+      manyforge_roboplan_scene_factory
       roboplan::roboplan
       roboplan_example_models::roboplan_example_models
       Threads::Threads
@@ -817,49 +835,87 @@ if(BUILD_TESTING)
     endif()
     set(_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_example_models/models/lite6_lite_gripper")
-    set(_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT
-      "${CMAKE_CURRENT_BINARY_DIR}/lite6_structural_consumer_fixture")
+    set(_MANYFORGE_ROBOPLAN_UR5E_SOURCE_ROOT
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_example_models/models/ur5e_robotiq_2f_85")
     set(_MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL
       "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_deployment/tools/prepare_structural_model.py")
     get_filename_component(
       _MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL
       "${_MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL}"
       REALPATH)
-    file(GLOB_RECURSE _MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS
-      CONFIGURE_DEPENDS
-      LIST_DIRECTORIES false
-      "${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}/meshes/*")
-    file(MAKE_DIRECTORY "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}")
-    execute_process(
-      COMMAND
-        "${Python3_EXECUTABLE}"
+    function(_manyforge_prepare_roboplan_model_fixture
+        document_root resource_root model_asset_id urdf_name srdf_name
+        package_uri_prefix output_root output_resources)
+      set(fixture_root
+        "${CMAKE_CURRENT_BINARY_DIR}/${model_asset_id}_structural_consumer_fixture")
+      file(GLOB_RECURSE resource_inputs
+        CONFIGURE_DEPENDS LIST_DIRECTORIES false "${resource_root}/meshes/*")
+      file(MAKE_DIRECTORY "${fixture_root}")
+      execute_process(
+        COMMAND "${Python3_EXECUTABLE}"
+          "${_MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL}"
+          --urdf "${document_root}/${urdf_name}"
+          --srdf "${document_root}/${srdf_name}"
+          --model-asset-id "${model_asset_id}"
+          --accepted-package-uri-prefix "${package_uri_prefix}"
+          --resource-root "${resource_root}"
+          --output-directory "${fixture_root}"
+        RESULT_VARIABLE preparation_result
+        OUTPUT_VARIABLE preparation_output
+        ERROR_VARIABLE preparation_error)
+      if(NOT preparation_result EQUAL 0)
+        message(FATAL_ERROR
+          "RoboPlan consumer fixture preparation failed for ${model_asset_id}:\n"
+          "${preparation_output}${preparation_error}")
+      endif()
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         "${_MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL}"
-        --urdf
-        "${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}/lite6_lite_gripper.urdf"
-        --srdf
-        "${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}/lite6_lite_gripper.srdf"
-        --model-asset-id
-        lite6_lite_gripper
-        --accepted-package-uri-prefix
-        "package://manyforge_example_models/models/lite6_lite_gripper/"
-        --resource-root
-        "${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}"
-        --output-directory
-        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}"
-      RESULT_VARIABLE _MANYFORGE_ROBOPLAN_LITE6_PREPARATION_RESULT
-      OUTPUT_VARIABLE _MANYFORGE_ROBOPLAN_LITE6_PREPARATION_OUTPUT
-      ERROR_VARIABLE _MANYFORGE_ROBOPLAN_LITE6_PREPARATION_ERROR)
-    if(NOT _MANYFORGE_ROBOPLAN_LITE6_PREPARATION_RESULT EQUAL 0)
+        "${document_root}/${urdf_name}" "${document_root}/${srdf_name}"
+        ${resource_inputs})
+      set(${output_root} "${fixture_root}" PARENT_SCOPE)
+      set(${output_resources} "${resource_inputs}" PARENT_SCOPE)
+    endfunction()
+    _manyforge_prepare_roboplan_model_fixture(
+      "${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}"
+      "${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}"
+      lite6_lite_gripper lite6_lite_gripper.urdf lite6_lite_gripper.srdf
+      "package://manyforge_example_models/models/lite6_lite_gripper/"
+      _MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT
+      _MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS)
+
+    set(_MANYFORGE_ROBOPLAN_IMPORT_VIEW_TOOL
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/prepare_roboplan_import_view.py")
+    set(_MANYFORGE_ROBOPLAN_UR5E_IMPORT_VIEW_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/ur5e_robotiq_2f_85_roboplan_import_view")
+    file(MAKE_DIRECTORY "${_MANYFORGE_ROBOPLAN_UR5E_IMPORT_VIEW_ROOT}")
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E env
+        "PYTHONPATH=${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_behavior"
+        "${Python3_EXECUTABLE}" "${_MANYFORGE_ROBOPLAN_IMPORT_VIEW_TOOL}"
+        --model-root "${_MANYFORGE_ROBOPLAN_UR5E_SOURCE_ROOT}"
+        --package-root "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}"
+        --model-name ur5e_robotiq_2f_85
+        --output-directory "${_MANYFORGE_ROBOPLAN_UR5E_IMPORT_VIEW_ROOT}"
+      RESULT_VARIABLE import_view_result
+      OUTPUT_VARIABLE import_view_output
+      ERROR_VARIABLE import_view_error)
+    if(NOT import_view_result EQUAL 0)
       message(FATAL_ERROR
-        "I3 non-empty RoboPlan consumer fixture preparation failed:\n"
-        "${_MANYFORGE_ROBOPLAN_LITE6_PREPARATION_OUTPUT}"
-        "${_MANYFORGE_ROBOPLAN_LITE6_PREPARATION_ERROR}")
+        "RoboPlan UR5e import-view preparation failed:\n"
+        "${import_view_output}${import_view_error}")
     endif()
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-      "${_MANYFORGE_ROBOPLAN_STRUCTURAL_PREPARATION_TOOL}"
-      "${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}/lite6_lite_gripper.urdf"
-      "${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}/lite6_lite_gripper.srdf"
-      ${_MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS})
+      "${_MANYFORGE_ROBOPLAN_IMPORT_VIEW_TOOL}"
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_behavior/manyforge_behavior/robot_model_authority.py"
+      "${_MANYFORGE_ROBOPLAN_UR5E_SOURCE_ROOT}/ur5e_robotiq_2f_85.urdf"
+      "${_MANYFORGE_ROBOPLAN_UR5E_SOURCE_ROOT}/ur5e_robotiq_2f_85.srdf")
+    _manyforge_prepare_roboplan_model_fixture(
+      "${_MANYFORGE_ROBOPLAN_UR5E_IMPORT_VIEW_ROOT}"
+      "${_MANYFORGE_ROBOPLAN_UR5E_SOURCE_ROOT}"
+      ur5e_robotiq_2f_85 ur5e_robotiq_2f_85.urdf ur5e_robotiq_2f_85.srdf
+      "package://manyforge_example_models/models/ur5e_robotiq_2f_85/"
+      _MANYFORGE_ROBOPLAN_UR5E_FIXTURE_ROOT
+      _MANYFORGE_ROBOPLAN_UR5E_RESOURCE_INPUTS)
 
     # Deployment owns this deterministic test-only generator. It publishes
     # exact retained bytes and compiler maps, without importing any RoboPlan,
@@ -1032,6 +1088,9 @@ if(BUILD_TESTING)
       MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE_ROOT="${_MANYFORGE_CANONICAL_EMPTY_PRODUCT_PACKAGE}"
       MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}"
       MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_ROBOPLAN_LITE6_SOURCE_ROOT}"
+      MANYFORGE_UR5E_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_example_models/models/ur5e_robotiq_2f_85"
+      MANYFORGE_UR5E_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_ROBOPLAN_UR5E_FIXTURE_ROOT}"
+      MANYFORGE_UR5E_ROBOPLAN_IMPORT_JOINT_MAP="${_MANYFORGE_ROBOPLAN_UR5E_IMPORT_VIEW_ROOT}/joint-map.tsv"
       MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT="${_MANYFORGE_LITE6_RETAINED_CONSUMER_FIXTURE_ROOT}"
       MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH="$<TARGET_FILE:manyforge_roboplan_candidate_worker>")
     target_include_directories(test_retained_product_consumer PRIVATE
@@ -1044,6 +1103,7 @@ if(BUILD_TESTING)
       manyforge_roboplan_native_state_projection
       manyforge_roboplan_native_runtime
       manyforge_roboplan_process_candidate_client
+      manyforge_roboplan_scene_factory
       manyforge_roboplan_managed_kernel_apply_fence
       manyforge_collision
       manyforge_core

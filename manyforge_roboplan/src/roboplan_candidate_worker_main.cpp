@@ -32,6 +32,8 @@
 #include <roboplan/core/scene.hpp>
 #include <tl/expected.hpp>
 
+#include "manyforge_roboplan/roboplan_scene_factory.hpp"
+
 namespace manyforge::roboplan_backend {
 namespace {
 
@@ -305,15 +307,10 @@ void add_geometry(roboplan::Scene& scene,
       fail("retained package path is invalid");
     }
   }
-  if (model.yaml_config_path.has_value() &&
-      (!model.yaml_config_path->is_absolute() ||
-       !std::filesystem::is_regular_file(*model.yaml_config_path))) {
-    fail("retained planner configuration path is invalid");
-  }
-  auto scene = std::make_shared<roboplan::Scene>(
-      model.native_scene_name, model.urdf_path, model.srdf_path,
-      model.package_paths,
-      model.yaml_config_path.value_or(std::filesystem::path{}));
+  auto scene = make_roboplan_scene(RoboPlanSceneInput{
+      model.native_scene_name, roboplan::loadTextFile(model.urdf_path),
+      roboplan::loadTextFile(model.srdf_path), model.package_paths,
+      model.joint_limits});
   std::string staging_frame;
   if (!model.geometries.empty()) {
     staging_frame = staging_frame_for(*scene, model);

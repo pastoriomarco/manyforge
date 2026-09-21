@@ -107,7 +107,10 @@ TEST(RoboPlanWorkerProtocolTest,
           "/retained/model.urdf",
           "/retained/model.srdf",
           {"/retained", "/resources"},
-          "/retained/planner.yaml",
+          {RoboPlanJointLimitInput{
+              "joint-a", std::vector<double>{-1.0},
+              std::vector<double>{1.0}, std::vector<double>{2.0},
+              std::vector<double>{3.0}}},
           {RoboPlanWorkerGeometryDTO{
                "box-a", "cell-frame", BoxShapeDTO{{1.0, 2.0, 3.0}},
                {{0.1, 0.2, 0.3}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt},
@@ -131,7 +134,7 @@ TEST(RoboPlanWorkerProtocolTest,
   EXPECT_EQ(decoded.model.urdf_path, input.model.urdf_path);
   EXPECT_EQ(decoded.model.srdf_path, input.model.srdf_path);
   EXPECT_EQ(decoded.model.package_paths, input.model.package_paths);
-  EXPECT_EQ(decoded.model.yaml_config_path, input.model.yaml_config_path);
+  EXPECT_EQ(decoded.model.joint_limits, input.model.joint_limits);
   EXPECT_EQ(decoded.model.allowed_collision_pairs,
             input.model.allowed_collision_pairs);
   ASSERT_EQ(decoded.model.geometries.size(), 4U);
