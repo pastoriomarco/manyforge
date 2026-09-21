@@ -18,9 +18,14 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
+#include <fstream>
+#endif
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -87,7 +92,6 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -758,6 +762,37 @@ ReceiveManagedRuntimePacket(const int fd) {
 using ManagedProjectionKey = std::pair<core::CapabilityProviderBindingId,
                                        core::CapabilityProviderBindingRevision>;
 
+#if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
+void AppendNativeProjectionTestTrace(const std::string &line) {
+  const char *const root =
+      std::getenv("MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR");
+  if (root == nullptr || *root == '\0') {
+    return;
+  }
+  static std::mutex trace_mutex;
+  std::lock_guard lock(trace_mutex);
+  std::ofstream stream(std::filesystem::path(root) / "trace.log",
+                       std::ios::binary | std::ios::app);
+  Require(static_cast<bool>(stream),
+          "native projection test trace could not be opened");
+  stream << line << '\n';
+  Require(static_cast<bool>(stream),
+          "native projection test trace could not be written");
+}
+#endif
+
+/// Registry of the exact native projections owned by this runtime child.
+///
+/// Lock order (AP-R1): the registry mutex_ is never held across a projection
+/// call, a future wait, or retained-artifact/model construction. A Stage or
+/// Rebuild worker owns the projection's own mutex for the whole collision-world
+/// construction, so every request path resolves the exact projection handle and
+/// the pending-job identity under mutex_, releases it, and only then calls into
+/// the projection. Worker threads acquire no registry lock at all, so joining a
+/// settled worker under mutex_ cannot deadlock, and one provider's pending job
+/// can never delay another provider's submission or an ordinary health/status
+/// read. Drain() is the single documented exception: it runs only after request
+/// ingress has closed, when no worker can still be waiting on the strand.
 class ManagedProjectionRegistry final {
 public:
   explicit ManagedProjectionRegistry(const ManagedRuntimeChildConfig &config)
@@ -767,7 +802,8 @@ public:
 
   [[nodiscard]] component_manager::detail::NativeProjectionRpcResponse Dispatch(
       const component_manager::detail::NativeProjectionRpcRequest &request) {
-    std::lock_guard lock(mutex_);
+    // No registry lock is taken here. Each branch below performs its own short
+    // locked resolution and then runs the projection effect unlocked.
     return std::visit(
         [&](const auto &value)
             -> component_manager::detail::NativeProjectionRpcResponse {
@@ -780,57 +816,46 @@ public:
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
                                           NativeProjectionHealthQuery>) {
-            return Projection(value.native_runtime_binding).ProjectionHealth();
+            return ProjectionHealth(value.native_runtime_binding);
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
                                           NativeProjectionTransactionRequest>) {
-            return Projection(value.native_runtime_binding)
-                .ApplyTransaction(value.transaction);
+            return ApplyTransaction(value);
           } else if constexpr (std::is_same_v<
                                    T, core::NativeProjectionRebuildDTO>) {
-            return Projection(value.expected_native_runtime_binding)
-                .RebuildProjection(value);
+            return BeginRebuild(value);
           } else if constexpr (std::is_same_v<
                                    T,
                                    core::NativeProjectionBootstrapRebuildDTO>) {
-            return Projection(value.native_runtime_binding)
-                .RebuildBootstrapProjection(value);
+            return BootstrapRebuild(value);
           } else if constexpr (
               std::is_same_v<T,
                              core::NativeProjectionBootstrapStatusQueryDTO>) {
-            return Projection(value.native_runtime_binding)
-                .BootstrapProjectionStatus(value);
+            return BootstrapStatus(value);
           } else if constexpr (std::is_same_v<T,
                                               core::NativeProjectionStageDTO>) {
-            return Projection(value.transition_row.native_runtime_binding)
-                .StageProjection(value);
+            return BeginStage(value);
           } else if constexpr (std::is_same_v<
                                    T, core::NativeProjectionActivationDTO>) {
-            return Projection(value.transition_row.native_runtime_binding)
-                .ActivateStagedProjection(value);
+            return ActivateStage(value);
           } else if constexpr (std::is_same_v<
                                    T, core::NativeProjectionRetireDTO>) {
-            return Projection(value.transition_row.native_runtime_binding)
-                .RetireProjection(value);
+            return BeginRetire(value);
           } else if constexpr (
               std::is_same_v<T, core::NativeProjectionRetireStatusQueryDTO>) {
-            return Projection(
-                       value.request.transition_row.native_runtime_binding)
-                .ProjectionRetireStatus(value);
+            return RetireStatus(value);
           } else if constexpr (std::is_same_v<
                                    T, core::NativeProjectionDiscardDTO>) {
-            return Projection(value.transition_row.native_runtime_binding)
-                .DiscardStagedProjection(value);
+            return BeginDiscard(value);
           } else if constexpr (std::is_same_v<
                                    T, core::NativeProjectionStatusQueryDTO>) {
-            return Projection(value.transition_row.native_runtime_binding)
-                .ProjectionStageStatus(value);
+            return StageStatus(value);
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
                                           NativeProjectionRetainRequest>) {
             auto retained =
-                Projection(value.native_runtime_binding)
-                    .RetainProjectionBinding(value.projection_revision,
+                IdleHandle(value.native_runtime_binding, "retain")
+                    ->RetainProjectionBinding(value.projection_revision,
                                              value.projection_lease_id);
             if (!retained.ok()) {
               return component_manager::detail::NativeProjectionRpcFailure{
@@ -841,25 +866,27 @@ public:
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
                                           NativeProjectionReleaseRequest>) {
-            Projection(value.native_runtime_binding)
-                .ReleaseProjection(value.projection_lease_id);
+            IdleHandle(value.native_runtime_binding, "release")
+                ->ReleaseProjection(value.projection_lease_id);
             return component_manager::detail::NativeProjectionReleaseResult{
                 value.projection_lease_id};
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
                                           NativeProjectionSceneFrameRequest>) {
-            auto resolved = Projection(value.native_runtime_binding)
-                                .ResolveSceneFrame(value.query);
+            auto resolved =
+                IdleHandle(value.native_runtime_binding, "frame_resolution")
+                    ->ResolveSceneFrame(value.query);
             if (!resolved.ok()) {
               return component_manager::detail::NativeProjectionRpcFailure{
                   resolved.error()};
             }
             return std::move(resolved.value());
           } else {
-            auto projected = Projection(value.native_runtime_binding)
-                                 .ProjectEffectiveCollisionPolicy(
-                                     value.logical_scene,
-                                     value.effective_policy_revision_id);
+            auto projected =
+                IdleHandle(value.native_runtime_binding, "policy_projection")
+                    ->ProjectEffectiveCollisionPolicy(
+                        value.logical_scene,
+                        value.effective_policy_revision_id);
             if (!projected.ok()) {
               return component_manager::detail::NativeProjectionRpcFailure{
                   projected.error()};
@@ -870,13 +897,36 @@ public:
         request);
   }
 
+  void Drain() {
+    // Request ingress is stopped before this is called. Keep the registry and
+    // every active composition dependency alive until all accepted projection
+    // work has reached a terminal result. Waiting here is allowed only because
+    // ingress is closed: a projection worker acquires no registry lock and
+    // never waits for the request strand, so neither the wait nor the join of
+    // an already accepted worker can deadlock against work owned here. The
+    // deferred Stage worker only waits on a retained Rebuild job whose own
+    // worker never needs registry state.
+    std::lock_guard lock(mutex_);
+    for (auto &[_, pending] : pending_stages_) {
+      pending.result.wait();
+      pending.worker.join();
+    }
+    for (auto &[_, pending] : pending_rebuilds_) {
+      pending.result.wait();
+      pending.worker.join();
+    }
+  }
+
   // A readiness hint only: callers must still verify the retained bundle,
   // exact provider binding and current projection before composition.
   [[nodiscard]] bool
   HasCurrentProjectionFor(const core::ProjectionRevisionDTO &expected) const {
-    std::lock_guard lock(mutex_);
-    for (const auto &[key, projection] : projections_) {
-      if (projection == nullptr) {
+    // Handles are resolved under mutex_ and then read without holding it, so
+    // a provider whose Stage/Rebuild worker owns the projection mutex cannot
+    // block this readiness hint.
+    for (const auto &[key, registered] : Registered()) {
+      const auto &projection = registered.projection;
+      if (projection == nullptr || WorkPending(key)) {
         continue;
       }
       const auto health = projection->ProjectionHealth();
@@ -898,18 +948,14 @@ public:
   FindActiveProjection(
       const core::ProjectionRevisionDTO &expected,
       const core::ProjectionNativeRuntimeBindingDTO &binding) const {
-    std::lock_guard lock(mutex_);
-    RequireLocalBinding(binding);
-    const auto found = projections_.find(Key(binding));
-    if (found == projections_.end() || found->second == nullptr ||
-        found->second->ProjectionHealth().native_runtime_binding != binding) {
+    const auto projection = Find(binding);
+    if (projection == nullptr || WorkPending(Key(binding))) {
       return nullptr;
     }
-    const auto inventory =
-        found->second->current_scene_snapshot_lease_inventory();
+    const auto inventory = projection->current_scene_snapshot_lease_inventory();
     return inventory.has_value() &&
                    inventory->projection_binding.projection_revision == expected
-               ? found->second
+               ? projection
                : nullptr;
   }
 
@@ -917,15 +963,11 @@ public:
   FindCurrentProjectionRevision(
       const core::ProjectionRevisionDTO &expected,
       const core::ProjectionNativeRuntimeBindingDTO &binding) const {
-    std::lock_guard lock(mutex_);
-    RequireLocalBinding(binding);
-    const auto found = projections_.find(Key(binding));
-    if (found == projections_.end() || found->second == nullptr ||
-        found->second->ProjectionHealth().native_runtime_binding != binding) {
+    const auto handle = Find(binding);
+    if (handle == nullptr || WorkPending(Key(binding))) {
       return std::nullopt;
     }
-    const auto inventory =
-        found->second->current_scene_snapshot_lease_inventory();
+    const auto inventory = handle->current_scene_snapshot_lease_inventory();
     if (!inventory.has_value()) {
       return std::nullopt;
     }
@@ -935,27 +977,21 @@ public:
         projection.graph_revision != expected.graph_revision ||
         projection.scene_revision.scene_id !=
             expected.scene_revision.scene_id ||
-        !found->second->ProjectionHealth().healthy_for_target(projection)) {
+        !handle->ProjectionHealth().healthy_for_target(projection)) {
       return std::nullopt;
     }
     return projection;
   }
 
-  void InstallActiveFrameResolverSet(
+  [[nodiscard]] bool AllRequiredProjectionsHealthy(
       const deployment::RetainedBundle &bundle,
-      const core::ProjectionRevisionDTO &expected,
-      std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver) {
-    std::lock_guard lock(mutex_);
-    Require(expected.valid() && frame_resolver != nullptr &&
-                frame_resolver->matches_structural_revision(
-                    expected.retained_bundle_id, expected.graph_revision) &&
-                bundle.retained_bundle_id() == expected.retained_bundle_id &&
-                bundle.value().cell_graph.graph_revision ==
-                    expected.graph_revision,
-            "active frame-resolver set does not name one retained product");
-
-    std::set<ManagedProjectionKey> required_keys;
-    std::vector<std::shared_ptr<RetainedPlannerSceneProjection>> required;
+      const core::ProjectionRevisionDTO &expected) const {
+    // Handles and pending-job identity are resolved with a short lock, and
+    // every ProjectionHealth read happens after that lock is released. A
+    // provider whose worker is constructing a candidate therefore cannot hold
+    // up this readiness hint, nor any other provider's assessment.
+    const auto registered = Registered();
+    bool found = false;
     for (const auto &provider : bundle.value().capability_provider_bindings) {
       if (!core::RequiresNativeSceneProjection(
               provider.capability_id,
@@ -970,39 +1006,122 @@ public:
         }
         const auto *runtime_unit =
             std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
-        Require(runtime_unit != nullptr && !runtime_unit->empty(),
-                "active native projection has a malformed runtime endpoint");
+        if (runtime_unit == nullptr || runtime_unit->empty()) {
+          return false;
+        }
         runtime_sources.insert(*runtime_unit);
       }
-      Require(runtime_sources.size() == 1U,
-              "active native projection does not resolve one runtime unit");
-      if (runtime_sources.begin()->value() != config_.runtime_unit_id) {
+      if (runtime_sources.size() != 1U ||
+          runtime_sources.begin()->value() != config_.runtime_unit_id) {
         continue;
       }
-
       const ManagedProjectionKey key{
           provider.capability_provider_binding_id,
           provider.capability_provider_binding_revision};
-      Require(required_keys.insert(key).second,
-              "active native projection binding is repeated");
-      const auto found = projections_.find(key);
-      Require(found != projections_.end() && found->second != nullptr,
-              "active frame-resolver set lacks a required projection");
-      const core::ProjectionNativeRuntimeBindingDTO expected_binding{
+      if (WorkPending(key)) {
+        ReportProjectionReadiness("waiting for " + key.first.value());
+        return false;
+      }
+      const auto entry = std::find_if(
+          registered.begin(), registered.end(), [&](const auto &candidate) {
+            return candidate.first == key;
+          });
+      if (entry == registered.end() || entry->second.projection == nullptr) {
+        ReportProjectionReadiness("missing " + key.first.value());
+        return false;
+      }
+      const core::ProjectionNativeRuntimeBindingDTO binding{
           provider.capability_provider_binding_id,
           provider.capability_provider_binding_revision,
           core::RuntimeUnitId(config_.runtime_unit_id),
           core::RuntimeEpoch(config_.runtime_epoch)};
-      const auto health = found->second->ProjectionHealth();
-      Require(health.native_runtime_binding == expected_binding &&
-                  health.healthy_for_target(expected),
-              "active frame-resolver set contains a stale projection");
-      required.push_back(found->second);
+      const auto health = entry->second.projection->ProjectionHealth();
+      if (health.native_runtime_binding != binding ||
+          !health.healthy_for_target(expected)) {
+        ReportProjectionReadiness("not healthy " + key.first.value());
+        return false;
+      }
+      found = true;
+    }
+    ReportProjectionReadiness(found ? "ready" : "no required projection");
+    return found;
+  }
+
+  void InstallActiveFrameResolverSet(
+      const deployment::RetainedBundle &bundle,
+      const core::ProjectionRevisionDTO &expected,
+      std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver) {
+    Require(expected.valid() && frame_resolver != nullptr &&
+                frame_resolver->matches_structural_revision(
+                    expected.retained_bundle_id, expected.graph_revision) &&
+                bundle.retained_bundle_id() == expected.retained_bundle_id &&
+                bundle.value().cell_graph.graph_revision ==
+                    expected.graph_revision,
+            "active frame-resolver set does not name one retained product");
+
+    // Required handles are resolved under mutex_; the stale-row validation and
+    // the resolver installation itself run afterwards, so a provider whose
+    // worker holds the projection mutex cannot block this composition step.
+    std::set<ManagedProjectionKey> required_keys;
+    std::vector<std::pair<core::ProjectionNativeRuntimeBindingDTO,
+                          std::shared_ptr<RetainedPlannerSceneProjection>>>
+        required;
+    {
+      std::lock_guard lock(mutex_);
+      for (const auto &provider :
+           bundle.value().capability_provider_bindings) {
+        if (!core::RequiresNativeSceneProjection(
+                provider.capability_id,
+                provider.capability_definition_revision)) {
+          continue;
+        }
+        std::set<core::RuntimeUnitId> runtime_sources;
+        for (const auto &endpoint : provider.endpoint_bindings) {
+          if (endpoint.source_kind !=
+              core::CapabilityEndpointSourceKind::kRuntimeUnit) {
+            continue;
+          }
+          const auto *runtime_unit =
+              std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
+          Require(runtime_unit != nullptr && !runtime_unit->empty(),
+                  "active native projection has a malformed runtime endpoint");
+          runtime_sources.insert(*runtime_unit);
+        }
+        Require(runtime_sources.size() == 1U,
+                "active native projection does not resolve one runtime unit");
+        if (runtime_sources.begin()->value() != config_.runtime_unit_id) {
+          continue;
+        }
+
+        const ManagedProjectionKey key{
+            provider.capability_provider_binding_id,
+            provider.capability_provider_binding_revision};
+        Require(required_keys.insert(key).second,
+                "active native projection binding is repeated");
+        const auto found = projections_.find(key);
+        Require(found != projections_.end() &&
+                    found->second.projection != nullptr,
+                "active frame-resolver set lacks a required projection");
+        Require(!WorkPendingLocked(key),
+                "active frame-resolver set names progressing projection work");
+        const core::ProjectionNativeRuntimeBindingDTO expected_binding{
+            provider.capability_provider_binding_id,
+            provider.capability_provider_binding_revision,
+            core::RuntimeUnitId(config_.runtime_unit_id),
+            core::RuntimeEpoch(config_.runtime_epoch)};
+        required.emplace_back(expected_binding, found->second.projection);
+      }
     }
     Require(!required.empty(),
             "active retained product has no native projection set");
 
-    for (const auto &projection : required) {
+    for (const auto &[binding, projection] : required) {
+      const auto health = projection->ProjectionHealth();
+      Require(health.native_runtime_binding == binding &&
+                  health.healthy_for_target(expected),
+              "active frame-resolver set contains a stale projection");
+    }
+    for (const auto &[_, projection] : required) {
       auto installed =
           projection->InstallActiveFrameResolver(expected, frame_resolver);
       if (!installed.ok()) {
@@ -1013,11 +1132,303 @@ public:
   }
 
 private:
+  struct JobProgress final {
+    JobProgress(std::string operation_value,
+                core::ProjectionNativeRuntimeBindingDTO binding_value,
+                std::string initial_milestone)
+        : operation(std::move(operation_value)),
+          binding(std::move(binding_value)),
+          started_at(std::chrono::steady_clock::now()),
+          last_progress_at(started_at) {
+      Advance(std::move(initial_milestone));
+    }
+
+    void Advance(std::string next_milestone) {
+      std::lock_guard lock(mutex);
+      const auto now = std::chrono::steady_clock::now();
+      const auto since_start =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now -
+                                                                started_at)
+              .count();
+      const auto since_last =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - last_progress_at)
+              .count();
+      milestone = std::move(next_milestone);
+      ++sequence;
+      last_progress_at = now;
+      std::cerr << "native projection job progress: operation=" << operation
+                << " provider=" << binding.provider_binding_id.value()
+                << " milestone=" << milestone << " sequence=" << sequence
+                << " elapsed_ms=" << since_start
+                << " since_last_progress_ms=" << since_last << '\n';
+#if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
+      AppendNativeProjectionTestTrace(
+          "progress " + operation + " " +
+          binding.provider_binding_id.value() + " " +
+          std::to_string(sequence) + " " + milestone);
+#endif
+    }
+
+    std::string operation;
+    core::ProjectionNativeRuntimeBindingDTO binding;
+    std::chrono::steady_clock::time_point started_at;
+    std::chrono::steady_clock::time_point last_progress_at;
+    std::uint64_t sequence{};
+    std::string milestone;
+    std::mutex mutex;
+  };
+
+  struct JoinedWorker final {
+    std::thread thread;
+
+    JoinedWorker() = default;
+    explicit JoinedWorker(std::thread value) : thread(std::move(value)) {}
+    JoinedWorker(JoinedWorker &&) noexcept = default;
+    JoinedWorker &operator=(JoinedWorker &&) noexcept = default;
+    JoinedWorker(const JoinedWorker &) = delete;
+    JoinedWorker &operator=(const JoinedWorker &) = delete;
+    ~JoinedWorker() { join(); }
+
+    void join() {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  };
+
+  struct PendingStage final {
+    core::NativeProjectionStageDTO request;
+    /// Predecessor health captured at acceptance. It can describe what the
+    /// runtime had before this job; it can never prove candidate readiness.
+    core::ProjectionHealthDTO accepted_health;
+    std::shared_future<core::NativeProjectionStageResultDTO> result;
+    /// A Stage retained behind a pending Rebuild carries that dependency and
+    /// is executed by its own worker once the Rebuild has settled.
+    std::shared_future<core::ProjectionCommitResultDTO> dependency;
+    std::shared_ptr<JobProgress> progress;
+    JoinedWorker worker;
+  };
+
+  struct PendingRebuild final {
+    core::NativeProjectionRebuildDTO request;
+    core::ProjectionHealthDTO accepted_health;
+    std::shared_future<core::ProjectionCommitResultDTO> result;
+    std::shared_ptr<JobProgress> progress;
+    JoinedWorker worker;
+  };
+
+  struct RegisteredProjection final {
+    /// The complete binding this projection instance was created for. Registry
+    /// identity is authoritative: a projection is created once per exact
+    /// binding and is never re-bound, so the pending-job fast paths can be
+    /// gated on registry state alone instead of acquiring a busy projection
+    /// mutex under the registry mutex.
+    core::ProjectionNativeRuntimeBindingDTO binding;
+    std::shared_ptr<RetainedPlannerSceneProjection> projection;
+  };
+
   struct PreparedIdentity final {
     core::RetainedBundleId retained_bundle_id;
     core::GraphRevision graph_revision;
     core::RetainedProductDTO planning_collision_model;
   };
+
+  template <typename Value>
+  [[nodiscard]] static bool Settled(
+      const std::shared_future<Value> &future) {
+    // A zero-timeout poll is a state read, not a wait: it never parks the
+    // request strand on projection work.
+    return future.valid() && future.wait_for(std::chrono::seconds::zero()) ==
+                                 std::future_status::ready;
+  }
+
+  template <typename Value>
+  [[nodiscard]] static std::optional<Value> ReadSettled(
+      const std::shared_future<Value> &future) {
+    try {
+      return future.get();
+    } catch (...) {
+      // A worker that terminated abnormally still has exactly one outcome to
+      // report; the caller turns the absence into the typed uncertain result.
+      return std::nullopt;
+    }
+  }
+
+  [[nodiscard]] bool WorkPendingLocked(const ManagedProjectionKey &key) const {
+    const auto stage = pending_stages_.find(key);
+    if (stage != pending_stages_.end() && !Settled(stage->second.result)) {
+      return true;
+    }
+    const auto rebuild = pending_rebuilds_.find(key);
+    return rebuild != pending_rebuilds_.end() &&
+           !Settled(rebuild->second.result);
+  }
+
+  [[nodiscard]] bool WorkPending(const ManagedProjectionKey &key) const {
+    std::lock_guard lock(mutex_);
+    return WorkPendingLocked(key);
+  }
+
+  /// Health captured for the job currently owned by this provider, if any.
+  /// Pending work must be observed as pending predecessor health rather than
+  /// by acquiring the mutex of the projection its worker is holding.
+  [[nodiscard]] std::optional<core::ProjectionHealthDTO>
+  CapturedJobHealthLocked(const ManagedProjectionKey &key) const {
+    const auto rebuild = pending_rebuilds_.find(key);
+    if (rebuild != pending_rebuilds_.end() &&
+        !Settled(rebuild->second.result)) {
+      return rebuild->second.accepted_health;
+    }
+    const auto stage = pending_stages_.find(key);
+    if (stage != pending_stages_.end() && !Settled(stage->second.result)) {
+      return stage->second.accepted_health;
+    }
+    return std::nullopt;
+  }
+
+  /// One stable terminal result per retained job. An abnormal worker
+  /// termination becomes the existing typed uncertain contract, carrying the
+  /// operation and provider identity needed to reconcile a lost response.
+  [[nodiscard]] static core::NativeProjectionStageResultDTO StageOutcome(
+      const PendingStage &job) {
+    if (const auto settled = ReadSettled(job.result); settled.has_value()) {
+      return *settled;
+    }
+    return UncertainStage(job.request, job.accepted_health,
+                          WorkerFailure("stage", job.request.transition_row
+                                                    .native_runtime_binding,
+                                        "native_projection_stage_aborted",
+                                        "the Stage worker did not settle"));
+  }
+
+  [[nodiscard]] static core::ProjectionCommitResultDTO RebuildOutcome(
+      const PendingRebuild &job) {
+    if (const auto settled = ReadSettled(job.result); settled.has_value()) {
+      return *settled;
+    }
+    return UncertainRebuild(
+        job.request, job.accepted_health,
+        WorkerFailure("rebuild", job.request.expected_native_runtime_binding,
+                      "native_projection_rebuild_aborted",
+                      "the Rebuild worker did not settle"));
+  }
+
+  [[nodiscard]] static core::ErrorDTO WorkerFailure(
+      const std::string_view operation,
+      const core::ProjectionNativeRuntimeBindingDTO &binding,
+      const std::string_view reason, const std::string_view detail) {
+    return core::ErrorDTO{
+        "projection_state_uncertain",
+        std::string(operation) + " for native projection provider " +
+            binding.provider_binding_id.value() +
+            " ended without a terminal result: " + std::string(detail),
+        {{"reason", std::string(reason)},
+         {"operation", std::string(operation)},
+         {"provider_binding_id", binding.provider_binding_id.value()}}};
+  }
+
+  /// Forces only the state needed to say "candidate readiness is not proven".
+  /// Observed revisions and any staged candidate are left untouched: an
+  /// exception alone does not prove that an effect rolled back.
+  [[nodiscard]] static core::ProjectionHealthDTO UncertainHealth(
+      core::ProjectionHealthDTO health, const core::ErrorDTO &failure) {
+    if (health.state != core::ProjectionHealthState::kDesynchronized) {
+      health.state = core::ProjectionHealthState::kUnavailable;
+    }
+    health.error = failure;
+    return health;
+  }
+
+  [[nodiscard]] static core::NativeProjectionStageResultDTO UncertainStage(
+      const core::NativeProjectionStageDTO &request,
+      core::ProjectionHealthDTO health, const core::ErrorDTO &failure) {
+    auto uncertain = UncertainHealth(std::move(health), failure);
+    return core::NativeProjectionStageResultDTO{
+        request.apply_id,
+        request.apply_generation,
+        request.projection_stage_generation,
+        request.transition_row,
+        request.expected_predecessor_projection_revision,
+        request.candidate_projection_revision,
+        core::NativeProjectionStageResultState::kFailedProjectionUncertain,
+        std::nullopt,
+        uncertain.active_projection_revision,
+        uncertain.native_projection_generation,
+        uncertain.projection_content_digest,
+        std::move(uncertain),
+        failure};
+  }
+
+  [[nodiscard]] static core::ProjectionCommitResultDTO UncertainRebuild(
+      const core::NativeProjectionRebuildDTO &request,
+      core::ProjectionHealthDTO health, const core::ErrorDTO &failure) {
+    auto uncertain = UncertainHealth(std::move(health), failure);
+    return core::ProjectionCommitResultDTO{
+        std::nullopt,
+        request.target_projection_revision,
+        core::ProjectionCommitResultStateDTO::kFailedProjectionUncertain,
+        std::nullopt,
+        uncertain.native_projection_generation,
+        false,
+        std::move(uncertain),
+        failure};
+  }
+
+  /// Detaches one provider's settled Stage record, if any. Unsettled work is
+  /// never erased: its worker can still publish, so the job stays registered
+  /// until it settles. The caller owns the returned record and lets it go after
+  /// mutex_ is released, which keeps the bounded join of an already settled
+  /// worker outside the registry lock.
+  [[nodiscard]] std::optional<PendingStage> TakeSettledStageLocked(
+      const ManagedProjectionKey &key) {
+    const auto stage = pending_stages_.find(key);
+    if (stage == pending_stages_.end() || !Settled(stage->second.result)) {
+      return std::nullopt;
+    }
+    auto taken = std::make_optional(std::move(stage->second));
+    pending_stages_.erase(stage);
+    return taken;
+  }
+
+  /// The Rebuild counterpart of TakeSettledStageLocked.
+  [[nodiscard]] std::optional<PendingRebuild> TakeSettledRebuildLocked(
+      const ManagedProjectionKey &key) {
+    const auto rebuild = pending_rebuilds_.find(key);
+    if (rebuild == pending_rebuilds_.end() ||
+        !Settled(rebuild->second.result)) {
+      return std::nullopt;
+    }
+    auto taken = std::make_optional(std::move(rebuild->second));
+    pending_rebuilds_.erase(rebuild);
+    return taken;
+  }
+
+  [[nodiscard]] std::vector<
+      std::pair<ManagedProjectionKey, RegisteredProjection>>
+  Registered() const {
+    std::lock_guard lock(mutex_);
+    std::vector<std::pair<ManagedProjectionKey, RegisteredProjection>>
+        registered;
+    registered.reserve(projections_.size());
+    for (const auto &[key, entry] : projections_) {
+      registered.emplace_back(key, entry);
+    }
+    return registered;
+  }
+
+  void ReportProjectionReadiness(std::string detail) const {
+    // Readiness lines are emitted from the request strand and the composition
+    // builders, so this deduplication has its own lock instead of borrowing the
+    // registry mutex that callers deliberately release early.
+    std::lock_guard lock(readiness_report_mutex_);
+    if (detail == last_projection_readiness_detail_) {
+      return;
+    }
+    last_projection_readiness_detail_ = std::move(detail);
+    std::cerr << "native projection readiness: "
+              << last_projection_readiness_detail_ << '\n';
+  }
 
   [[nodiscard]] static ManagedProjectionKey
   Key(const core::ProjectionNativeRuntimeBindingDTO &binding) {
@@ -1032,15 +1443,946 @@ private:
             "native projection request names another runtime child");
   }
 
-  [[nodiscard]] RetainedPlannerSceneProjection &
-  Projection(const core::ProjectionNativeRuntimeBindingDTO &binding) {
+  /// Resolves the exact projection for one complete local binding. The whole
+  /// binding, runtime unit and epoch included, is validated here, before any
+  /// caller reaches a pending-map fast path, and the projection's own mutex is
+  /// never acquired while the registry mutex is held.
+  [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection>
+  Find(const core::ProjectionNativeRuntimeBindingDTO &binding) const {
     RequireLocalBinding(binding);
+    std::lock_guard lock(mutex_);
     const auto found = projections_.find(Key(binding));
-    Require(found != projections_.end() && found->second != nullptr &&
-                found->second->ProjectionHealth().native_runtime_binding ==
-                    binding,
+    if (found == projections_.end() || found->second.projection == nullptr ||
+        found->second.binding != binding) {
+      return nullptr;
+    }
+    return found->second.projection;
+  }
+
+  [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection>
+  Handle(const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+    auto projection = Find(binding);
+    Require(projection != nullptr,
             "native projection request names an unprepared binding");
-    return *found->second;
+    return projection;
+  }
+
+  [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection> IdleHandle(
+      const core::ProjectionNativeRuntimeBindingDTO &binding,
+      const std::string_view operation) const {
+    // Resolve the complete binding first. Only then may a pending job reject a
+    // direct operation; a foreign epoch must never learn or steer local work.
+    auto projection = Handle(binding);
+    std::lock_guard lock(mutex_);
+    Require(!WorkPendingLocked(Key(binding)),
+            "native projection " + std::string(operation) +
+                " conflicts with progressing projection work");
+    return projection;
+  }
+
+  [[nodiscard]] static core::ErrorDTO PendingOperationError(
+      const std::string_view operation,
+      const core::ProjectionNativeRuntimeBindingDTO &binding) {
+    return core::ErrorDTO{
+        "projection_state_uncertain",
+        "native projection " + std::string(operation) +
+            " cannot settle while projection construction is progressing",
+        {{"reason", "native_projection_" + std::string(operation) +
+                        "_progressing"},
+         {"operation", std::string(operation)},
+         {"provider_binding_id", binding.provider_binding_id.value()}}};
+  }
+
+  [[nodiscard]] core::ProjectionCommitResultDTO ApplyTransaction(
+      const component_manager::detail::NativeProjectionTransactionRequest
+          &request) {
+    Require(request.valid(), "native projection transaction is invalid");
+    auto projection = Handle(request.native_runtime_binding);
+    std::optional<core::ProjectionHealthDTO> pending;
+    {
+      std::lock_guard lock(mutex_);
+      pending = CapturedJobHealthLocked(Key(request.native_runtime_binding));
+    }
+    if (!pending.has_value()) {
+      return projection->ApplyTransaction(request.transaction);
+    }
+    const auto failure =
+        PendingOperationError("transaction", request.native_runtime_binding);
+    auto uncertain = UncertainHealth(*pending, failure);
+    core::ProjectionCommitResultDTO result{
+        request.transaction.transaction_sequence,
+        request.transaction.proposed_projection_revision,
+        core::ProjectionCommitResultStateDTO::kFailedProjectionUncertain,
+        std::nullopt,
+        uncertain.native_projection_generation,
+        false,
+        std::move(uncertain),
+        failure,
+    };
+    Require(result.presence_valid(),
+            "progressing native projection transaction result is invalid");
+    return result;
+  }
+
+  [[nodiscard]] core::NativeProjectionBootstrapRebuildResultDTO
+  BootstrapRebuild(const core::NativeProjectionBootstrapRebuildDTO &request) {
+    Require(request.valid(), "native projection bootstrap rebuild is invalid");
+    auto projection = Handle(request.native_runtime_binding);
+    std::optional<core::ProjectionHealthDTO> pending;
+    {
+      std::lock_guard lock(mutex_);
+      pending = CapturedJobHealthLocked(Key(request.native_runtime_binding));
+    }
+    if (!pending.has_value()) {
+      return projection->RebuildBootstrapProjection(request);
+    }
+    const auto failure = PendingOperationError(
+        "bootstrap_rebuild", request.native_runtime_binding);
+    core::NativeProjectionBootstrapRebuildResultDTO result{
+        request.bootstrap_id,
+        request.bootstrap_generation,
+        request.native_runtime_binding,
+        request.canonical_empty_target,
+        request.planning_collision_model,
+        request.initialized_logical_scene,
+        core::NativeProjectionBootstrapRebuildState::
+            kFailedProjectionUncertain,
+        std::nullopt,
+        pending->native_projection_generation,
+        pending->projection_content_digest,
+        *pending,
+        failure,
+    };
+    Require(result.presence_valid(),
+            "progressing native bootstrap rebuild result is invalid");
+    return result;
+  }
+
+  [[nodiscard]] core::NativeProjectionBootstrapStatusDTO BootstrapStatus(
+      const core::NativeProjectionBootstrapStatusQueryDTO &query) {
+    Require(query.valid(), "native projection bootstrap status is invalid");
+    auto projection = Handle(query.native_runtime_binding);
+    std::optional<core::ProjectionHealthDTO> pending;
+    {
+      std::lock_guard lock(mutex_);
+      pending = CapturedJobHealthLocked(Key(query.native_runtime_binding));
+    }
+    if (!pending.has_value()) {
+      return projection->BootstrapProjectionStatus(query);
+    }
+    const auto failure =
+        PendingOperationError("bootstrap_status", query.native_runtime_binding);
+    core::NativeProjectionBootstrapStatusDTO result{
+        query.bootstrap_id,
+        query.bootstrap_generation,
+        query.native_runtime_binding,
+        query.canonical_empty_target,
+        core::NativeProjectionBootstrapStatusState::
+            kFailedProjectionUncertain,
+        std::nullopt,
+        pending->native_projection_generation,
+        pending->projection_content_digest,
+        *pending,
+        failure,
+    };
+    Require(result.presence_valid(),
+            "progressing native bootstrap status result is invalid");
+    return result;
+  }
+
+  [[nodiscard]] core::NativeProjectionRetireStatusDTO RetireStatus(
+      const core::NativeProjectionRetireStatusQueryDTO &query) {
+    Require(query.valid(), "native projection retire status is invalid");
+    const auto &binding =
+        query.request.transition_row.native_runtime_binding;
+    auto projection = Handle(binding);
+    std::optional<core::ProjectionHealthDTO> pending;
+    {
+      std::lock_guard lock(mutex_);
+      pending = CapturedJobHealthLocked(Key(binding));
+    }
+    if (!pending.has_value()) {
+      return projection->ProjectionRetireStatus(query);
+    }
+    const auto failure = PendingOperationError("retire_status", binding);
+    core::NativeProjectionRetireStatusDTO result{
+        query.request,
+        core::NativeProjectionRetireStatusState::kFailedProjectionUncertain,
+        pending->active_projection_revision,
+        pending->native_projection_generation,
+        pending->projection_content_digest,
+        *pending,
+        failure,
+    };
+    Require(result.presence_valid(),
+            "progressing native retire status result is invalid");
+    return result;
+  }
+
+  /// Accepts one exact Stage for one provider.
+  ///
+  /// The complete binding is validated, the one job that answers this request
+  /// is registered, and only then is Accepted returned. Nothing here waits for
+  /// a worker or for the projection mutex that the worker owns.
+  [[nodiscard]] core::NativeProjectionStageResultDTO
+  BeginStage(const core::NativeProjectionStageDTO &request) {
+    Require(request.valid(), "native projection stage request is invalid");
+    const auto &binding = request.transition_row.native_runtime_binding;
+    auto projection = Handle(binding);
+    const auto key = Key(binding);
+    std::optional<PendingStage> superseded;
+    bool live_stage_conflict = false;
+
+    // Resolve an existing job before touching the projection. In particular,
+    // a Stage arriving behind Rebuild is registered against that dependency
+    // without waiting for the Rebuild worker's projection mutex.
+    {
+      std::lock_guard lock(mutex_);
+      if (const auto pending = pending_stages_.find(key);
+          pending != pending_stages_.end()) {
+        if (!Settled(pending->second.result)) {
+          Require(pending->second.request == request,
+                  "another native projection stage is already progressing");
+          // The same registered job is observed again; no second worker starts
+          // and no second Accepted identity is minted.
+          return AcceptedStage(request, pending->second.accepted_health);
+        }
+        if (pending->second.request == request) {
+          return StageOutcome(pending->second);
+        }
+        const auto prior = StageOutcome(pending->second);
+        if (prior.state == core::NativeProjectionStageResultState::kStaged) {
+          // A still-publishable candidate owns this provider. Adjudicate the
+          // conflict synchronously below; do not register a second worker or
+          // return Accepted for work that cannot start.
+          live_stage_conflict = true;
+        } else if (prior.state == core::NativeProjectionStageResultState::
+                                      kFailedProjectionUncertain) {
+          return UncertainStage(
+              request, prior.resulting_health,
+              prior.error.value_or(WorkerFailure(
+                  "stage", binding, "native_projection_stage_predecessor_failed",
+                  "the preceding Stage ended without a proven state")));
+        } else {
+          superseded = TakeSettledStageLocked(key);
+        }
+      }
+
+      if (!live_stage_conflict) {
+        const auto rebuild = pending_rebuilds_.find(key);
+        if (rebuild == pending_rebuilds_.end()) {
+          // No prerequisite owns this provider.
+        } else if (!Settled(rebuild->second.result)) {
+          const auto accepted =
+              AcceptedStage(request, rebuild->second.accepted_health);
+          StartStageLocked(key, request, accepted.resulting_health, projection,
+                           rebuild->second.result);
+          return accepted;
+        } else {
+          const auto prerequisite = RebuildOutcome(rebuild->second);
+          if (prerequisite.result !=
+              core::ProjectionCommitResultStateDTO::kCommitted) {
+            return UncertainStage(
+                request, prerequisite.resulting_health,
+                prerequisite.error.value_or(WorkerFailure(
+                    "stage", binding, "native_projection_stage_rebuild_failed",
+                    "the preceding Rebuild did not commit")));
+          }
+        }
+      }
+    }
+
+    if (live_stage_conflict) {
+      return projection->StageProjection(request);
+    }
+
+    // No worker owns this projection now. Observe its predecessor outside the
+    // registry lock. A stale or still-staged predecessor is answered directly
+    // by the projection, which rejects/replays it without heavy construction.
+    const auto observed = projection->ProjectionHealth();
+    const bool expected_present =
+        request.transition_row.expected_local_active.has_value();
+    const bool predecessor_exact =
+        expected_present
+            ? observed.healthy_for_target(
+                  request.expected_predecessor_projection_revision)
+            : observed.state == core::ProjectionHealthState::kUninitialized &&
+                  !observed.active_projection_revision.has_value() &&
+                  !observed.staged_candidate.has_value() &&
+                  !observed.error.has_value();
+    if (!predecessor_exact) {
+      return projection->StageProjection(request);
+    }
+    const auto accepted = AcceptedStage(request, observed);
+    {
+      std::lock_guard lock(mutex_);
+      StartStageLocked(
+          key, request, accepted.resulting_health, projection,
+          std::shared_future<core::ProjectionCommitResultDTO>{});
+    }
+    return accepted;
+  }
+
+  /// Accepts one exact recovery Rebuild for one provider.
+  [[nodiscard]] core::ProjectionCommitResultDTO
+  BeginRebuild(const core::NativeProjectionRebuildDTO &request) {
+    Require(request.valid(), "native projection rebuild request is invalid");
+    const auto &binding = request.expected_native_runtime_binding;
+    auto projection = Handle(binding);
+    const auto key = Key(binding);
+    std::optional<PendingStage> superseded_stage;
+    std::optional<PendingRebuild> superseded_rebuild;
+    {
+      std::lock_guard lock(mutex_);
+      // Exact replay observes its already-retained Rebuild before a deferred
+      // Stage registered behind that job is considered. Only a genuinely new
+      // recovery request reaches Stage conflict/supersession handling.
+      if (const auto pending = pending_rebuilds_.find(key);
+          pending != pending_rebuilds_.end() &&
+          pending->second.request == request) {
+        if (!Settled(pending->second.result)) {
+          return AcceptedRebuild(request, pending->second.accepted_health);
+        }
+        return RebuildOutcome(pending->second);
+      }
+      if (const auto stage = pending_stages_.find(key);
+          stage != pending_stages_.end()) {
+        Require(Settled(stage->second.result),
+                "native projection stage is already progressing");
+        Require(StageOutcome(stage->second).state !=
+                    core::NativeProjectionStageResultState::kStaged,
+                "a staged native projection candidate is already progressing");
+        superseded_stage = TakeSettledStageLocked(key);
+      }
+      if (const auto pending = pending_rebuilds_.find(key);
+          pending != pending_rebuilds_.end()) {
+        if (!Settled(pending->second.result)) {
+          Fail("another native projection rebuild is already progressing");
+        }
+        // A recovery for a different target supersedes the retained record so
+        // the retry can run; the projection still refuses an unnecessary or
+        // mismatched rebuild with its own typed result.
+        superseded_rebuild = TakeSettledRebuildLocked(key);
+      }
+    }
+
+    auto accepted_health = projection->ProjectionHealth();
+    if (accepted_health.state == core::ProjectionHealthState::kHealthy) {
+      // An exact healthy target is an idempotent terminal replay; a different
+      // healthy target is a proven recovery conflict. Neither needs a worker.
+      return projection->RebuildProjection(request);
+    }
+    accepted_health.state = core::ProjectionHealthState::kRebuilding;
+    accepted_health.active_projection_revision = std::nullopt;
+    accepted_health.staged_candidate = std::nullopt;
+    accepted_health.error = std::nullopt;
+    if (accepted_health.source_sequence !=
+        std::numeric_limits<std::uint64_t>::max()) {
+      ++accepted_health.source_sequence;
+    }
+    const auto accepted = AcceptedRebuild(request, accepted_health);
+    {
+      std::lock_guard lock(mutex_);
+      StartRebuildLocked(key, request, accepted.resulting_health, projection);
+    }
+    return accepted;
+  }
+
+  /// Registers one Stage job and starts its single worker. Callers hold mutex_.
+  void StartStageLocked(
+      const ManagedProjectionKey &key,
+      const core::NativeProjectionStageDTO &request,
+      const core::ProjectionHealthDTO &accepted_health,
+      const std::shared_ptr<RetainedPlannerSceneProjection> &projection,
+      std::shared_future<core::ProjectionCommitResultDTO> dependency) {
+    auto job = std::make_shared<
+        std::promise<core::NativeProjectionStageResultDTO>>();
+    auto result = job->get_future().share();
+    const auto binding = request.transition_row.native_runtime_binding;
+    auto progress = std::make_shared<JobProgress>(
+        "stage", binding,
+        dependency.valid() ? "waiting_for_rebuild" : "input_ready");
+    const auto [inserted, unique] = pending_stages_.emplace(
+        key, PendingStage{request, accepted_health, result,
+                          std::move(dependency), progress, JoinedWorker{}});
+    Require(unique, "native projection stage registration conflicted");
+    try {
+      inserted->second.worker = JoinedWorker{std::thread(
+          [job, projection, request, dependency = inserted->second.dependency,
+           binding, progress = std::move(progress)]() mutable {
+            try {
+              if (dependency.valid()) {
+                // Retained deferred Stage work settles its dependency first.
+                // This wait belongs to the job's own worker; it never holds up
+                // the request strand or the registry mutex.
+                const auto rebuilt = ReadSettled(dependency);
+                const bool rebuild_committed =
+                    rebuilt.has_value() &&
+                    rebuilt->result ==
+                        core::ProjectionCommitResultStateDTO::kCommitted;
+                if (!rebuild_committed) {
+                  // The prerequisite Rebuild ended in a terminal failure, so
+                  // this Stage must not run and publish a candidate into a
+                  // runtime the Rebuild left unhealthy. The Stage effect
+                  // itself never happened, which proves candidate readiness
+                  // absent rather than a proven rollback, so the Rebuild's
+                  // health row and error are propagated verbatim as the typed
+                  // uncertain result.
+                  progress->Advance("dependency_failed");
+                  job->set_value(UncertainStage(
+                      request,
+                      rebuilt.has_value() ? rebuilt->resulting_health
+                                          : ObservedHealth(projection, binding),
+                      rebuilt.has_value() && rebuilt->error.has_value()
+                          ? *rebuilt->error
+                          : WorkerFailure(
+                                "stage", binding,
+                                "native_projection_stage_rebuild_failed",
+                                "the Rebuild this Stage waits for did not "
+                                "commit")));
+                  return;
+                }
+                progress->Advance("input_ready");
+              }
+              progress->Advance("collision_world_construction");
+              auto outcome = projection->StageProjection(request);
+              progress->Advance(
+                  outcome.state ==
+                          core::NativeProjectionStageResultState::kStaged
+                      ? "prepared_publication"
+                      : "terminal_result");
+              job->set_value(std::move(outcome));
+            } catch (const std::exception &error) {
+              progress->Advance("worker_failed");
+              job->set_value(UncertainStage(
+                  request, ObservedHealth(projection, binding),
+                  WorkerFailure("stage", binding,
+                                "native_projection_stage_worker_failed",
+                                error.what())));
+            } catch (...) {
+              progress->Advance("worker_failed");
+              job->set_value(UncertainStage(
+                  request, ObservedHealth(projection, binding),
+                  WorkerFailure("stage", binding,
+                                "native_projection_stage_worker_failed",
+                                "unknown Stage worker failure")));
+            }
+          })};
+    } catch (...) {
+      // The registration is removed before the exception reaches the caller, so
+      // an Accepted result is never returned for work this child cannot run.
+      pending_stages_.erase(key);
+      throw;
+    }
+  }
+
+  /// Registers one Rebuild job and starts its single worker. Callers hold
+  /// mutex_.
+  void StartRebuildLocked(
+      const ManagedProjectionKey &key,
+      const core::NativeProjectionRebuildDTO &request,
+      const core::ProjectionHealthDTO &accepted_health,
+      const std::shared_ptr<RetainedPlannerSceneProjection> &projection) {
+    auto job = std::make_shared<
+        std::promise<core::ProjectionCommitResultDTO>>();
+    auto result = job->get_future().share();
+    const auto binding = request.expected_native_runtime_binding;
+    auto progress =
+        std::make_shared<JobProgress>("rebuild", binding, "input_ready");
+    const auto [inserted, unique] = pending_rebuilds_.emplace(
+        key, PendingRebuild{request, accepted_health, result, progress,
+                            JoinedWorker{}});
+    Require(unique, "native projection rebuild registration conflicted");
+    try {
+      inserted->second.worker = JoinedWorker{std::thread(
+          [job, projection, request, binding,
+           progress = std::move(progress)]() {
+            try {
+              progress->Advance("collision_world_construction");
+              auto outcome = projection->RebuildProjection(request);
+              progress->Advance(
+                  outcome.result ==
+                          core::ProjectionCommitResultStateDTO::kCommitted
+                      ? "prepared_publication"
+                      : "terminal_result");
+              job->set_value(std::move(outcome));
+            } catch (const std::exception &error) {
+              progress->Advance("worker_failed");
+              job->set_value(UncertainRebuild(
+                  request, ObservedHealth(projection, binding),
+                  WorkerFailure("rebuild", binding,
+                                "native_projection_rebuild_worker_failed",
+                                error.what())));
+            } catch (...) {
+              progress->Advance("worker_failed");
+              job->set_value(UncertainRebuild(
+                  request, ObservedHealth(projection, binding),
+                  WorkerFailure("rebuild", binding,
+                                "native_projection_rebuild_worker_failed",
+                                "unknown Rebuild worker failure")));
+            }
+          })};
+    } catch (...) {
+      pending_rebuilds_.erase(key);
+      throw;
+    }
+  }
+
+  [[nodiscard]] static core::ProjectionHealthDTO ObservedHealth(
+      const std::shared_ptr<RetainedPlannerSceneProjection> &projection,
+      const core::ProjectionNativeRuntimeBindingDTO &binding) {
+    try {
+      return projection->ProjectionHealth();
+    } catch (...) {
+      return core::ProjectionHealthDTO{binding, 1U,
+                                       core::ProjectionHealthState::
+                                           kUnavailable,
+                                       std::nullopt, std::nullopt, std::nullopt,
+                                       std::nullopt, std::nullopt};
+    }
+  }
+
+  [[nodiscard]] static core::ProjectionCommitResultDTO AcceptedRebuild(
+      const core::NativeProjectionRebuildDTO &request,
+      const core::ProjectionHealthDTO &health) {
+    core::ProjectionCommitResultDTO accepted{
+        std::nullopt,
+        request.target_projection_revision,
+        core::ProjectionCommitResultStateDTO::kAccepted,
+        std::nullopt,
+        health.native_projection_generation,
+        false,
+        health,
+        std::nullopt,
+    };
+    Require(accepted.presence_valid(),
+            "accepted native projection rebuild result is invalid");
+    return accepted;
+  }
+
+  /// Observes current projection health.
+  ///
+  /// While a job runs, the answer is the predecessor health captured at
+  /// acceptance plus the truthful statement that the job is unsettled; the
+  /// captured row never proves candidate readiness. A retained job whose
+  /// terminal result reported an uncertain effect keeps reporting that result
+  /// instead of reverting to the predecessor row after one read.
+  [[nodiscard]] core::ProjectionHealthDTO ProjectionHealth(
+      const core::ProjectionNativeRuntimeBindingDTO &binding) {
+    auto projection = Find(binding);
+    const auto key = Key(binding);
+    std::optional<core::ProjectionHealthDTO> captured;
+    std::optional<core::ProjectionHealthDTO> terminal;
+    {
+      std::lock_guard lock(mutex_);
+      Require(projection != nullptr,
+              "native projection request names an unprepared binding");
+      if (const auto pending = CapturedJobHealthLocked(key);
+          pending.has_value()) {
+        captured = pending;
+      } else if (const auto stage = pending_stages_.find(key);
+                 stage != pending_stages_.end()) {
+        const auto outcome = StageOutcome(stage->second);
+        if (outcome.state == core::NativeProjectionStageResultState::
+                                 kFailedProjectionUncertain) {
+          terminal = outcome.resulting_health;
+        }
+      }
+      if (!captured.has_value() && !terminal.has_value()) {
+        if (const auto rebuild = pending_rebuilds_.find(key);
+            rebuild != pending_rebuilds_.end()) {
+          const auto outcome = RebuildOutcome(rebuild->second);
+          if (outcome.result == core::ProjectionCommitResultStateDTO::
+                                    kFailedProjectionUncertain) {
+            terminal = outcome.resulting_health;
+          }
+        }
+      }
+    }
+    if (captured.has_value()) {
+      return *captured;
+    }
+    if (terminal.has_value()) {
+      return *terminal;
+    }
+    return projection->ProjectionHealth();
+  }
+
+  [[nodiscard]] static core::NativeProjectionStageResultDTO
+  AcceptedStage(const core::NativeProjectionStageDTO &request,
+                const core::ProjectionHealthDTO &health) {
+    core::NativeProjectionStageResultDTO accepted{
+        request.apply_id,
+        request.apply_generation,
+        request.projection_stage_generation,
+        request.transition_row,
+        request.expected_predecessor_projection_revision,
+        request.candidate_projection_revision,
+        core::NativeProjectionStageResultState::kAccepted,
+        std::nullopt,
+        health.active_projection_revision,
+        health.native_projection_generation,
+        health.projection_content_digest,
+        health,
+        std::nullopt,
+    };
+    Require(accepted.presence_valid(),
+            "accepted native projection stage result is invalid");
+    return accepted;
+  }
+
+  /// Observes one Stage operation. Polling never starts, replaces or repeats
+  /// projection computation.
+  [[nodiscard]] core::NativeProjectionStatusDTO
+  StageStatus(const core::NativeProjectionStatusQueryDTO &query) {
+    Require(query.valid(), "native projection stage status query is invalid");
+    const auto &binding = query.transition_row.native_runtime_binding;
+    // Full binding identity first, pending-map reads second.
+    auto projection = Handle(binding);
+    const auto key = Key(binding);
+    std::optional<core::NativeProjectionStageResultDTO> outcome;
+    std::optional<core::NativeProjectionStageDTO> progressing;
+    std::optional<core::ProjectionHealthDTO> accepted_health;
+    std::optional<core::ProjectionHealthDTO> incompatible_rebuild;
+    {
+      std::lock_guard lock(mutex_);
+      const auto pending = pending_stages_.find(key);
+      if (pending != pending_stages_.end()) {
+        const auto &job = pending->second;
+        const bool exact =
+            job.request.apply_id == query.apply_id &&
+            job.request.apply_generation == query.apply_generation &&
+            job.request.projection_stage_generation ==
+                query.projection_stage_generation &&
+            job.request.transition_row == query.transition_row;
+        Require(exact, "another native projection stage owns this runtime");
+        if (Settled(job.result)) {
+          outcome = StageOutcome(job);
+        } else {
+          progressing = job.request;
+          accepted_health = job.accepted_health;
+        }
+      } else if (const auto rebuild = pending_rebuilds_.find(key);
+                 rebuild != pending_rebuilds_.end() &&
+                 !Settled(rebuild->second.result)) {
+        incompatible_rebuild = rebuild->second.accepted_health;
+      }
+    }
+    if (incompatible_rebuild.has_value()) {
+      const auto failure = PendingOperationError("stage_status", binding);
+      core::NativeProjectionStatusDTO pending_status{
+          query,
+          core::NativeProjectionStatusState::kFailedProjectionUncertain,
+          std::nullopt,
+          incompatible_rebuild->active_projection_revision,
+          incompatible_rebuild->native_projection_generation,
+          incompatible_rebuild->projection_content_digest,
+          *incompatible_rebuild,
+          failure,
+      };
+      Require(pending_status.presence_valid(),
+              "rebuilding native projection stage status is invalid");
+      return pending_status;
+    }
+    if (progressing.has_value()) {
+      Require(accepted_health.has_value(),
+              "progressing native projection stage has no accepted health");
+      core::NativeProjectionStatusDTO pending_status{
+          query,
+          core::NativeProjectionStatusState::kProgressing,
+          progressing->candidate_projection_revision,
+          accepted_health->active_projection_revision,
+          accepted_health->native_projection_generation,
+          accepted_health->projection_content_digest,
+          *accepted_health,
+          std::nullopt,
+      };
+      Require(pending_status.presence_valid(),
+              "progressing native projection stage status is invalid");
+      return pending_status;
+    }
+    if (outcome.has_value() &&
+        outcome->state != core::NativeProjectionStageResultState::kStaged) {
+      // A settled job never reports kProgressing: its terminal result is
+      // either a rejection whose runtime is unchanged or an uncertain effect.
+      const auto state =
+          outcome->state == core::NativeProjectionStageResultState::kRejected
+              ? core::NativeProjectionStatusState::kAbsent
+              : core::NativeProjectionStatusState::kFailedProjectionUncertain;
+      core::NativeProjectionStatusDTO completed{
+          query,
+          state,
+          std::nullopt,
+          outcome->observed_local_active,
+          outcome->native_projection_generation,
+          outcome->projection_content_digest,
+          outcome->resulting_health,
+          state == core::NativeProjectionStatusState::kAbsent
+              ? std::nullopt
+              : outcome->error,
+      };
+      Require(completed.presence_valid(),
+              "completed native projection stage status is invalid");
+      return completed;
+    }
+    // A staged result is owned by the projection's own bounded terminal record,
+    // which also carries the activated and discarded outcomes.
+    return projection->ProjectionStageStatus(query);
+  }
+
+  /// Discards one staged candidate through the existing discard lifecycle.
+  ///
+  /// Pending work is neither erased nor reported discarded before it settles:
+  /// its worker can still publish the candidate, so a discard cannot be
+  /// confirmed and the answer is the existing uncertain-reconciliation result
+  /// while the job stays registered. Because confirmation is only ever reached
+  /// once that worker has settled - and the projection then releases every
+  /// candidate capture - no worker can publish after a confirmed discard.
+  /// Repeating the discard is stable: the projection's own terminal record
+  /// keeps reporting the same lifecycle instead of a reconstructed success.
+  [[nodiscard]] core::NativeProjectionDiscardResultDTO BeginDiscard(
+      const core::NativeProjectionDiscardDTO &request) {
+    Require(request.valid(), "native projection discard request is invalid");
+    const auto &binding = request.transition_row.native_runtime_binding;
+    auto projection = Handle(binding);
+    const auto key = Key(binding);
+    {
+      std::lock_guard lock(mutex_);
+      const auto stage = pending_stages_.find(key);
+      if (stage != pending_stages_.end() && !Settled(stage->second.result)) {
+        Require(stage->second.request.apply_id == request.apply_id &&
+                    stage->second.request.apply_generation ==
+                        request.apply_generation &&
+                    stage->second.request.projection_stage_generation ==
+                        request.projection_stage_generation &&
+                    stage->second.request.transition_row ==
+                        request.transition_row &&
+                    stage->second.request.candidate_projection_revision ==
+                        request.candidate_projection_revision,
+                "another native projection stage is already progressing");
+        const auto &health = stage->second.accepted_health;
+        core::NativeProjectionDiscardResultDTO pending{
+            request,
+            core::NativeProjectionDiscardResultState::
+                kFailedProjectionUncertain,
+            health.active_projection_revision,
+            health.native_projection_generation,
+            health.projection_content_digest,
+            health,
+            core::ErrorDTO{"projection_state_uncertain",
+                           "native stage discard cannot settle while Stage "
+                           "work is progressing",
+                           {{"reason",
+                             "native_projection_discard_progressing"},
+                            {"operation", "discard"},
+                            {"provider_binding_id",
+                             binding.provider_binding_id.value()}}},
+        };
+        Require(pending.presence_valid(),
+                "progressing native projection discard result is invalid");
+        return pending;
+      }
+      if (const auto rebuild = pending_rebuilds_.find(key);
+          rebuild != pending_rebuilds_.end() &&
+          !Settled(rebuild->second.result)) {
+        const auto &health = rebuild->second.accepted_health;
+        const auto failure = PendingOperationError("discard", binding);
+        core::NativeProjectionDiscardResultDTO pending{
+            request,
+            core::NativeProjectionDiscardResultState::
+                kFailedProjectionUncertain,
+            health.active_projection_revision,
+            health.native_projection_generation,
+            health.projection_content_digest,
+            health,
+            failure,
+        };
+        Require(pending.presence_valid(),
+                "rebuilding native projection discard result is invalid");
+        return pending;
+      }
+    }
+    auto discarded = projection->DiscardStagedProjection(request);
+    std::optional<PendingStage> superseded;
+    if (discarded.state ==
+            core::NativeProjectionDiscardResultState::kDiscarded ||
+        discarded.state ==
+            core::NativeProjectionDiscardResultState::kAlreadyAbsent) {
+      // Only a confirmed discard releases the registry's view of this
+      // operation, and only the Stage record it discards. The projection has
+      // already released the candidate captures - so no worker can publish
+      // them - and keeps its own terminal record, which is what keeps the
+      // exact repeat answering from the discard lifecycle instead of a
+      // reconstructed success. The detached record is released below, after
+      // mutex_ is released.
+      std::lock_guard lock(mutex_);
+      superseded = TakeSettledStageLocked(key);
+    }
+    return discarded;
+  }
+
+  /// Retires one provider through the registry lifecycle, refusing to retire
+  /// while that provider still owns unsettled work.
+  [[nodiscard]] core::NativeProjectionRetireResultDTO BeginRetire(
+      const core::NativeProjectionRetireDTO &request) {
+    Require(request.valid(), "native projection retire request is invalid");
+    const auto &binding = request.transition_row.native_runtime_binding;
+    auto projection = Handle(binding);
+    const auto key = Key(binding);
+    {
+      std::lock_guard lock(mutex_);
+      if (const auto captured = CapturedJobHealthLocked(key);
+          captured.has_value()) {
+        core::NativeProjectionRetireResultDTO pending{
+            request,
+            core::NativeProjectionRetireResultState::kStale,
+            captured->active_projection_revision,
+            captured->native_projection_generation,
+            captured->projection_content_digest,
+            *captured,
+            core::ErrorDTO{"invariant_violation",
+                           "native retirement cannot settle while projection "
+                           "work is progressing",
+                           {{"reason",
+                             "native_projection_retire_progressing"},
+                            {"operation", "retire"},
+                            {"provider_binding_id",
+                             binding.provider_binding_id.value()}}},
+        };
+        Require(pending.presence_valid(),
+                "progressing native projection retire result is invalid");
+        return pending;
+      }
+    }
+    auto retired = projection->RetireProjection(request);
+    std::optional<PendingStage> superseded_stage;
+    std::optional<PendingRebuild> superseded_rebuild;
+    if (retired.state == core::NativeProjectionRetireResultState::kRetired ||
+        retired.state ==
+            core::NativeProjectionRetireResultState::kAlreadyAbsent) {
+      // Retirement is the terminal lifecycle of this provider's projection, so
+      // both settled job records go with it; the projection's own retirement
+      // record keeps answering the exact repeat. Both are released below, after
+      // mutex_ is released.
+      std::lock_guard lock(mutex_);
+      superseded_stage = TakeSettledStageLocked(key);
+      superseded_rebuild = TakeSettledRebuildLocked(key);
+    }
+    return retired;
+  }
+
+  [[nodiscard]] core::NativeProjectionActivationResultDTO
+  ActivateStage(const core::NativeProjectionActivationDTO &request) {
+    Require(request.valid(),
+            "native projection activation request is invalid");
+    const auto &binding = request.transition_row.native_runtime_binding;
+    auto projection = Handle(binding);
+    const auto key = Key(binding);
+    std::optional<core::NativeProjectionActivationResultDTO> uncertain;
+    {
+      std::lock_guard lock(mutex_);
+      // With no job registered for this provider there is nothing to observe
+      // here: the projection's own terminal record decides between an exact
+      // activation replay and a stale request.
+      if (const auto pending = pending_stages_.find(key);
+          pending != pending_stages_.end()) {
+        if (!Settled(pending->second.result)) {
+          const auto &stage = pending->second.request;
+          Require(stage.apply_id == request.apply_id &&
+                      stage.apply_generation == request.apply_generation &&
+                      stage.projection_stage_generation ==
+                          request.projection_stage_generation &&
+                      stage.transition_row == request.transition_row &&
+                      stage.candidate_projection_revision ==
+                          request.candidate_projection_revision,
+                  "activation does not match the progressing native stage");
+          return AcceptedActivation(request, pending->second.accepted_health);
+        }
+        if (MatchesActivation(pending->second.request, request)) {
+          const auto outcome = StageOutcome(pending->second);
+          if (outcome.state == core::NativeProjectionStageResultState::
+                                   kFailedProjectionUncertain) {
+            // A Stage worker that ended uncertain cannot be acknowledged as an
+            // activation; the same failure is replayed instead.
+            auto failed = core::NativeProjectionActivationResultDTO{
+                request,
+                core::NativeProjectionActivationResultState::
+                    kFailedProjectionUncertain,
+                std::nullopt,
+                outcome.resulting_health.native_projection_generation,
+                outcome.resulting_health.projection_content_digest,
+                outcome.resulting_health,
+                outcome.error};
+            if (failed.presence_valid()) {
+              uncertain = failed;
+            }
+          }
+        }
+      }
+      if (const auto rebuild = pending_rebuilds_.find(key);
+          rebuild != pending_rebuilds_.end() &&
+          !Settled(rebuild->second.result)) {
+        const auto failure = PendingOperationError("activation", binding);
+        core::NativeProjectionActivationResultDTO blocked{
+            request,
+            core::NativeProjectionActivationResultState::kStale,
+            std::nullopt,
+            rebuild->second.accepted_health.native_projection_generation,
+            rebuild->second.accepted_health.projection_content_digest,
+            rebuild->second.accepted_health,
+            failure,
+        };
+        Require(blocked.presence_valid(),
+                "rebuilding native projection activation result is invalid");
+        return blocked;
+      }
+    }
+    if (uncertain.has_value()) {
+      return *uncertain;
+    }
+    auto activated = projection->ActivateStagedProjection(request);
+    std::optional<PendingStage> consumed;
+    if (activated.state ==
+        core::NativeProjectionActivationResultState::kActivated) {
+      std::lock_guard lock(mutex_);
+      const auto pending = pending_stages_.find(key);
+      if (pending != pending_stages_.end() &&
+          MatchesActivation(pending->second.request, request)) {
+        consumed = TakeSettledStageLocked(key);
+      }
+    }
+    std::cerr << "native projection activation completed: "
+              << binding.provider_binding_id.value() << '\n';
+    return activated;
+  }
+
+  [[nodiscard]] static bool MatchesActivation(
+      const core::NativeProjectionStageDTO &stage,
+      const core::NativeProjectionActivationDTO &request) {
+    return stage.apply_id == request.apply_id &&
+           stage.apply_generation == request.apply_generation &&
+           stage.projection_stage_generation ==
+               request.projection_stage_generation &&
+           stage.transition_row == request.transition_row &&
+           stage.candidate_projection_revision ==
+               request.candidate_projection_revision;
+  }
+
+  [[nodiscard]] static core::NativeProjectionActivationResultDTO
+  AcceptedActivation(const core::NativeProjectionActivationDTO &request,
+                     const core::ProjectionHealthDTO &health) {
+    core::NativeProjectionActivationResultDTO accepted{
+        request,
+        core::NativeProjectionActivationResultState::kAccepted,
+        std::nullopt,
+        health.native_projection_generation,
+        health.projection_content_digest,
+        health,
+        std::nullopt,
+    };
+    Require(accepted.presence_valid(),
+            "accepted native projection activation result is invalid");
+    return accepted;
   }
 
   [[nodiscard]] const core::CapabilityProviderBindingDTO &
@@ -1142,14 +2484,6 @@ private:
     Require(model_map.has_value(),
             "native projection retained model map is absent or invalid");
     const auto group = SelectProjectionGroup(provider, *model_map);
-    const auto cache_key =
-        std::make_tuple(request.candidate_retained_bundle_id.value(),
-                        request.candidate_graph_revision.value(), group);
-    if (const auto cached = projection_asset_cache_.find(cache_key);
-        cached != projection_asset_cache_.end()) {
-      return cached->second;
-    }
-
     auto planning_model =
         planning_source_.get_verified(deployment::RetainedPlanningModelQuery{
             bundle->retained_bundle_id(),
@@ -1165,31 +2499,33 @@ private:
         stage.srdf_path(), package_paths, group);
     auto projector = RetainedCollisionWorldProjector::create_verified(
         shared_model, *bundle, *model_map, *planning_model);
-    ProjectionAssets assets{std::move(projector)};
-    const auto [inserted, unique] =
-        projection_asset_cache_.emplace(cache_key, std::move(assets));
-    Require(unique, "native projection model cache insertion conflicted");
-    return inserted->second;
+    return ProjectionAssets{std::move(projector)};
   }
 
+  /// Prepares one exact candidate model for a provider.
+  ///
+  /// Artifact verification and shared-model construction are the expensive
+  /// part of preparation and deliberately run before the registry mutex is
+  /// taken. Assets are handed directly to the one prepared projection rather
+  /// than retained in a second unbounded cache.
   void Prepare(const component_manager::detail::NativeProjectionPrepareRequest
                    &request) {
     Require(request.valid(), "native projection preparation is invalid");
     RequireLocalBinding(request.native_runtime_binding);
     const auto key = Key(request.native_runtime_binding);
-    if (const auto prior = prepared_.find(key);
-        prior != prepared_.end() &&
-        prior->second.retained_bundle_id ==
-            request.candidate_retained_bundle_id &&
-        prior->second.graph_revision == request.candidate_graph_revision &&
-        prior->second.planning_collision_model ==
-            request.planning_collision_model) {
+    {
+      std::lock_guard lock(mutex_);
+      Require(!WorkPendingLocked(key),
+              "native projection preparation conflicts with progressing "
+              "projection work");
+    }
+    if (IsPrepared(key, request)) {
       return;
     }
 
     auto assets = BuildProjectionAssets(request);
-    const auto found = projections_.find(key);
-    if (found == projections_.end()) {
+    auto existing = Find(request.native_runtime_binding);
+    if (existing == nullptr) {
       auto created = RetainedPlannerSceneProjection::CreateUninitialized(
           std::move(assets.projector), request.planning_collision_model,
           request.native_runtime_binding,
@@ -1202,36 +2538,60 @@ private:
         Fail("native projection construction failed: " +
              created.error().message);
       }
+      std::lock_guard lock(mutex_);
       const auto [inserted, unique] =
-          projections_.emplace(key, std::move(created.value()));
-      Require(unique && inserted->second != nullptr,
+          projections_.emplace(key, RegisteredProjection{
+                                        request.native_runtime_binding,
+                                        std::move(created.value())});
+      Require(unique && inserted->second.projection != nullptr,
               "native projection registry insertion conflicted");
-    } else {
-      Require(found->second != nullptr,
-              "native projection registry contains an empty participant");
-      auto prepared = found->second->PrepareCandidateProjection(
-          std::move(assets.projector), request.planning_collision_model);
-      if (!prepared.ok()) {
-        Fail("native projection candidate preparation failed: " +
-             prepared.error().message);
-      }
+      prepared_.insert_or_assign(
+          key, PreparedIdentity{request.candidate_retained_bundle_id,
+                                request.candidate_graph_revision,
+                                request.planning_collision_model});
+      return;
     }
+    auto prepared = existing->PrepareCandidateProjection(
+        std::move(assets.projector), request.planning_collision_model);
+    if (!prepared.ok()) {
+      Fail("native projection candidate preparation failed: " +
+           prepared.error().message);
+    }
+    std::lock_guard prepared_lock(mutex_);
     prepared_.insert_or_assign(
         key, PreparedIdentity{request.candidate_retained_bundle_id,
                               request.candidate_graph_revision,
                               request.planning_collision_model});
   }
 
+  [[nodiscard]] bool IsPrepared(
+      const ManagedProjectionKey &key,
+      const component_manager::detail::NativeProjectionPrepareRequest
+          &request) const {
+    std::lock_guard lock(mutex_);
+    const auto prior = prepared_.find(key);
+    return prior != prepared_.end() &&
+           prior->second.retained_bundle_id ==
+               request.candidate_retained_bundle_id &&
+           prior->second.graph_revision == request.candidate_graph_revision &&
+           prior->second.planning_collision_model ==
+               request.planning_collision_model;
+  }
+
   const ManagedRuntimeChildConfig &config_;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
   deployment::FilesystemVerifiedRetainedModelMapSource map_source_;
   deployment::FilesystemVerifiedRetainedPlanningModelSource planning_source_;
-  std::map<std::tuple<std::string, std::string, std::string>, ProjectionAssets>
-      projection_asset_cache_;
-  std::map<ManagedProjectionKey,
-           std::shared_ptr<RetainedPlannerSceneProjection>>
-      projections_;
+  std::map<ManagedProjectionKey, RegisteredProjection> projections_;
   std::map<ManagedProjectionKey, PreparedIdentity> prepared_;
+  // Retained one exact job per provider. A settled record is kept only as the
+  // single stable terminal observation for that operation and is released when
+  // a later submission or a confirmed discard/retirement supersedes it; it is
+  // never a second history database.
+  std::map<ManagedProjectionKey, PendingStage> pending_stages_;
+  std::map<ManagedProjectionKey, PendingRebuild> pending_rebuilds_;
+  mutable std::string last_projection_readiness_detail_;
+  mutable std::mutex readiness_report_mutex_;
   mutable std::mutex mutex_;
 };
 
@@ -1248,6 +2608,17 @@ SelectManagedComponentProjections(const ManagedRuntimeChildConfig &config,
                                   const ManagedProjectionRegistry &projections,
                                   const core::ProjectionRevisionDTO &expected,
                                   const bool allow_current_scene_revision) {
+  const auto unavailable = [](const std::string &detail) {
+    static std::mutex mutex;
+    static std::string last_detail;
+    std::lock_guard lock(mutex);
+    if (last_detail != detail) {
+      last_detail = detail;
+      std::cerr << "managed component projection selection: " << detail
+                << '\n';
+    }
+    return std::optional<ManagedComponentProjectionSet>{};
+  };
   ManagedComponentProjectionSet selected;
   bool revision_selected = false;
   for (const auto &provider : bundle.value().capability_provider_bindings) {
@@ -1288,18 +2659,20 @@ SelectManagedComponentProjections(const ManagedRuntimeChildConfig &config,
       const auto current =
           projections.FindCurrentProjectionRevision(expected, binding);
       if (!current.has_value())
-        return std::nullopt;
+        return unavailable("no current revision for " +
+                           binding.provider_binding_id.value());
       revision = *current;
       projection = projections.FindActiveProjection(revision, binding);
     }
     if (projection == nullptr)
-      return std::nullopt;
+      return unavailable("no active projection for " +
+                         binding.provider_binding_id.value());
     if (!revision_selected) {
       selected.projection_revision = revision;
       revision_selected = true;
     } else {
       if (selected.projection_revision != revision)
-        return std::nullopt;
+        return unavailable("component projections have different revisions");
     }
     Require(
         selected.by_component
@@ -1515,7 +2888,10 @@ DecodeMotionSpec(const CanonicalValue &value) {
   }
   if (kind == "cartesian_path") {
     const auto *blend = value.find_object_member("max_blend_deviation_rad");
-    RequireExactObjectSize(value, blend == nullptr ? 10U : 11U,
+    // A Cartesian path has nine required fields; the blend-deviation field is
+    // the one optional tenth field.  Keep the decoder aligned with the
+    // frontend/headless CartesianPath contract.
+    RequireExactObjectSize(value, blend == nullptr ? 9U : 10U,
                            "Cartesian path");
     const auto &encoded_waypoints = Array(value, "waypoints");
     Require(!encoded_waypoints.empty() &&
@@ -6657,7 +8033,7 @@ struct Composition final {
 #endif
   std::unique_ptr<deployment::CCLCRuntimeComposition> cclc_runtime;
   std::atomic_bool cclc_attached{false};
-  std::atomic_bool cclc_route_recovery_pending{false};
+  std::atomic_bool route_recovery_pending{false};
   bool direct_control_mode_selected{};
   std::vector<std::unique_ptr<Composition>> participant_compositions;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
@@ -8171,8 +9547,7 @@ void SelectDirectNativeControlMode(Composition &composition,
   // bindings here; attachment publishes their exact observed route and
   // artifact-backed Stop readiness without changing controllers.
   composition.direct_control_mode_selected = true;
-  composition.cclc_route_recovery_pending.store(false,
-                                                std::memory_order_release);
+  composition.route_recovery_pending.store(false, std::memory_order_release);
 }
 
 void PublishDirectNativeControlRoutes(
@@ -8314,6 +9689,24 @@ void PublishDirectNativeControlRoutes(
 
 void DetachRetainedCCLC(Composition &composition);
 
+void PublishReconciledDirectNativeControlRoutes(
+    Composition &composition, const std::filesystem::path &package_root,
+    const std::filesystem::path &execution_run_root) {
+  PublishDirectNativeControlRoutes(composition, package_root,
+                                   execution_run_root);
+  auto reconciled = composition.runtime->ReconcileCommandFreeOrphans();
+  if (!reconciled.ok()) {
+    Fail("direct route attachment could not reconcile command-free orphan "
+         "resources: " +
+         reconciled.error().message);
+  }
+  Require(composition.runtime->addressed_kernel
+              ->SetRouteRecoveryPending(false)
+              .ok(),
+          "direct route attachment could not release admission");
+  composition.route_recovery_pending.store(false, std::memory_order_release);
+}
+
 void AttachRetainedNativeCCLC(Composition &composition,
                               const HostConfig &config,
                               ManagedKernelApplyFenceOwner &fence_owner) {
@@ -8329,11 +9722,9 @@ void AttachRetainedNativeCCLC(Composition &composition,
   // there is no CCLC service or recovery barrier to start.
   SelectDirectNativeControlMode(composition, config.package_root);
   if (composition.direct_control_mode_selected) {
-    PublishDirectNativeControlRoutes(composition, config.package_root,
-                                     config.execution_run_root);
-    Require(kernel.SetRouteRecoveryPending(false).ok(),
-            "direct native control mode could not release recovery "
-            "admission");
+    std::cerr << "native composition phase: publishing direct routes\n";
+    PublishReconciledDirectNativeControlRoutes(
+        composition, config.package_root, config.execution_run_root);
     return;
   }
   if (composition.cclc_runtime) {
@@ -8343,8 +9734,7 @@ void AttachRetainedNativeCCLC(Composition &composition,
   }
   Require(kernel.SetRouteRecoveryPending(true).ok(),
           "route recovery could not retain closed admission");
-  composition.cclc_route_recovery_pending.store(true,
-                                                std::memory_order_release);
+  composition.route_recovery_pending.store(true, std::memory_order_release);
 
   auto active_publication_reader =
       std::make_unique<component_manager::SqliteActiveBundlePublicationStore>(
@@ -8461,8 +9851,7 @@ void AttachRetainedNativeCCLC(Composition &composition,
 
 void DetachRetainedCCLC(Composition &composition) {
   composition.cclc_attached.store(false, std::memory_order_release);
-  composition.cclc_route_recovery_pending.store(false,
-                                                std::memory_order_release);
+  composition.route_recovery_pending.store(false, std::memory_order_release);
   composition.runtime->stop_recovery_configuration_source = {};
   composition.runtime->reconcile_controller_routes = {};
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
@@ -8475,27 +9864,19 @@ void DetachRetainedCCLC(Composition &composition) {
   composition.cclc_active_publication_reader.reset();
 }
 
-void TryAttachManagedCCLC(Composition &composition,
-                          const ManagedRuntimeChildConfig &config,
-                          ManagedKernelApplyFenceOwner &fence_owner) {
+[[nodiscard]] bool TryAttachManagedCCLC(
+    Composition &composition, const ManagedRuntimeChildConfig &config,
+    ManagedKernelApplyFenceOwner &fence_owner) {
   auto &kernel = *composition.runtime->addressed_kernel;
   if (composition.cclc_attached.load(std::memory_order_acquire))
-    return;
+    return true;
   if (composition.direct_control_mode_selected) {
-    PublishDirectNativeControlRoutes(composition, config.package_root,
-                                     config.execution_run_root);
-    Require(kernel.SetRouteRecoveryPending(false).ok(),
-            "completed route attachment could not release admission");
-    return;
+    PublishReconciledDirectNativeControlRoutes(
+        composition, config.package_root, config.execution_run_root);
+    return true;
   }
   Require(kernel.SetRouteRecoveryPending(true).ok(),
           "route attachment could not close admission");
-  // Another owner's unresolved recovery remains authoritative. The existing
-  // reconciliation wake retries attachment after it settles; never create a
-  // competing claim here.
-  if (kernel.has_external_route_recovery_claims()) {
-    return;
-  }
   component_manager::SqliteActiveBundlePublicationStore publication_store(
       config.manager_state_root /
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
@@ -8503,7 +9884,7 @@ void TryAttachManagedCCLC(Composition &composition,
   const auto integrity = publication_store.VerifyIntegrity();
   publication_store.Close();
   if (integrity.current_generation != composition.publication_generation) {
-    return;
+    return false;
   }
   HostConfig attachment_config;
   attachment_config.package_root = config.package_root;
@@ -8514,13 +9895,13 @@ void TryAttachManagedCCLC(Composition &composition,
   attachment_config.cell_id = config.cell_id;
   SelectDirectNativeControlMode(composition, config.package_root);
   if (composition.direct_control_mode_selected) {
-    PublishDirectNativeControlRoutes(composition, config.package_root,
-                                     config.execution_run_root);
-    Require(kernel.SetRouteRecoveryPending(false).ok(),
-            "direct route attachment could not release admission");
-    return;
+    PublishReconciledDirectNativeControlRoutes(
+        composition, config.package_root, config.execution_run_root);
+    std::cerr << "native composition phase: direct routes reconciled\n";
+    return true;
   }
   AttachRetainedNativeCCLC(composition, attachment_config, fence_owner);
+  return composition.cclc_attached.load(std::memory_order_acquire);
 }
 
 [[nodiscard]] std::optional<CompositionBuildInput>
@@ -8569,6 +9950,10 @@ TryBuildCurrentManagedCompositionInput(
                   receipt.request.candidate_projection_revision.graph_revision,
           "managed active publication and retained bundle disagree");
   if (bundle->value().cell_graph.controllable_components.empty()) {
+    return std::nullopt;
+  }
+  if (!projections.AllRequiredProjectionsHealthy(
+          *bundle, receipt.request.candidate_projection_revision)) {
     return std::nullopt;
   }
 
@@ -8870,6 +10255,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                        std::chrono::steady_clock::now().time_since_epoch())
                 .count();
           },
+          config.program_artifact_root,
       },
       admission_gate);
   ManagedProjectionRegistry projections(config);
@@ -9015,43 +10401,82 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   ExecutionCompositionAccess execution_composition;
   execution_composition.addressed_kernel = detached_addressed_kernel.get();
   bool current_composition_building = false;
+  std::mutex deferred_attachment_mutex;
+  std::condition_variable_any deferred_attachment_changed;
+  bool deferred_attachment_requested = false;
   execution_composition.on_cell_admission_settled = [&] {
-    Composition *composition = nullptr;
-    bool skip_attachment = false;
+    bool attachment_pending = false;
     {
       std::lock_guard lock(managed_composition_mutex);
-      if (current_composition_building ||
-          active_managed_composition == nullptr ||
-          active_managed_composition->runtime->addressed_kernel
-              ->has_external_route_recovery_claims()) {
-        skip_attachment = true;
-      } else {
-        // Do not reserve while an external claim remains held: its release
-        // callback must be able to take over after this short decision.
-        // The same reservation that protects initial construction prevents
-        // replacement while controller I/O runs without the observation mutex.
-        current_composition_building = true;
-        composition = active_managed_composition.get();
-      }
+      attachment_pending =
+          active_managed_composition != nullptr &&
+          active_managed_composition->route_recovery_pending.load(
+              std::memory_order_acquire) &&
+          (active_managed_composition->direct_control_mode_selected ||
+           !active_managed_composition->cclc_attached.load(
+               std::memory_order_acquire));
     }
-    if (skip_attachment) {
+    if (!attachment_pending) {
       return;
     }
-    try {
-      TryAttachManagedCCLC(*composition, config, fence_owner);
-    } catch (const std::exception &error) {
-      // Claim settlement is already durable. Attachment owns its separate
-      // closed admission barrier; its failure cannot undo that receipt.
-      std::cerr << "native CCLC attachment after claim settlement failed: "
-                << error.what() << '\n';
-    } catch (...) {
-      std::cerr << "native CCLC attachment after claim settlement failed\n";
-    }
+    // Releasing the authoring claim can otherwise expose one transient ready
+    // sample before the deferred route attachment starts. Close that cheap
+    // admission barrier on the request lane; all materialization stays on the
+    // worker below.
+    Require(stable_kernel_owner->SetRouteRecoveryPending(true).ok(),
+            "deferred route attachment could not close admission");
     {
-      std::lock_guard lock(managed_composition_mutex);
-      current_composition_building = false;
+      std::lock_guard lock(deferred_attachment_mutex);
+      deferred_attachment_requested = true;
     }
+    deferred_attachment_changed.notify_one();
   };
+  std::jthread deferred_attachment_worker(
+      [&](const std::stop_token stop_token) {
+        while (!stop_token.stop_requested()) {
+          {
+            std::unique_lock lock(deferred_attachment_mutex);
+            if (!deferred_attachment_changed.wait(
+                    lock, stop_token,
+                    [&] { return deferred_attachment_requested; })) {
+              return;
+            }
+            deferred_attachment_requested = false;
+          }
+          Composition *composition = nullptr;
+          {
+            std::lock_guard lock(managed_composition_mutex);
+            if (current_composition_building ||
+                active_managed_composition == nullptr) {
+              continue;
+            }
+            // Claim release is already durable. Reserve the current
+            // composition here, off the request lane, while its routes catch
+            // up to that release.
+            current_composition_building = true;
+            composition = active_managed_composition.get();
+          }
+          try {
+            const bool attached =
+                TryAttachManagedCCLC(*composition, config, fence_owner);
+            if (!attached) {
+              std::cerr << "native deferred route attachment is waiting for "
+                           "the current publication\n";
+            }
+          } catch (const std::exception &error) {
+            std::cerr
+                << "native CCLC attachment after claim settlement failed: "
+                << error.what() << '\n';
+          } catch (...) {
+            std::cerr
+                << "native CCLC attachment after claim settlement failed\n";
+          }
+          {
+            std::lock_guard lock(managed_composition_mutex);
+            current_composition_building = false;
+          }
+        }
+      });
   ManagedExecutionSurfaceControl execution_surface_control(
       config.execution_run_root, &execution_composition,
       &manager_liveness_admission,
@@ -9205,7 +10630,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     current_composition_builder =
         std::jthread([&, input = std::move(*input)]() mutable {
           try {
+            std::cerr << "native composition phase: materializing runtime\n";
             auto built = BuildProductComposition(std::move(input));
+            std::cerr << "native composition phase: runtime materialized\n";
             InstallDirectSceneFrameResolver(projections, *built);
             Composition *installed = nullptr;
             {
@@ -9249,11 +10676,15 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   std::memory_order_release);
               installed = active_managed_composition.get();
             }
+            std::cerr << "native composition phase: stable Kernel bound\n";
             // Initial CCLC recovery is part of composing a usable runtime.  It
             // runs on the existing builder lane so the ordinary Manager
             // command channel remains responsive and cannot advertise an
             // installed composition before its exact routes are current.
-            TryAttachManagedCCLC(*installed, config, fence_owner);
+            const auto routes_attached =
+                TryAttachManagedCCLC(*installed, config, fence_owner);
+            std::cerr << "native composition phase: control routes "
+                      << (routes_attached ? "attached" : "deferred") << '\n';
             {
               std::lock_guard lock(managed_composition_mutex);
               Require(active_managed_composition.get() == installed,
@@ -9315,22 +10746,37 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             ? LoadExactManagedCandidateBundle(config, request)
             : std::shared_ptr<const deployment::RetainedBundle>{};
     bool reconcile_installed_candidate = false;
+    Composition *published_installed_composition = nullptr;
     {
       std::lock_guard lock(managed_composition_mutex);
       if (installed_composition_request.has_value()) {
         if (*installed_composition_request == request) {
-          return {request,
-                  component_manager::ManagerSelectedRuntimeCompositionState::
-                      kInstalled};
+          if (!publication_is_successor) {
+            return {request,
+                    component_manager::ManagerSelectedRuntimeCompositionState::
+                        kInstalled};
+          }
+          if (current_composition_building) {
+            return {request,
+                    component_manager::ManagerSelectedRuntimeCompositionState::
+                        kPreparing};
+          }
+          Require(active_managed_composition != nullptr,
+                  "published installed runtime has no active composition");
+          current_composition_building = true;
+          published_installed_composition =
+              active_managed_composition.get();
         }
       }
-      if (installed_under_fence_composition_request.has_value()) {
+      if (published_installed_composition == nullptr &&
+          installed_under_fence_composition_request.has_value()) {
         Require(*installed_under_fence_composition_request == request,
                 "another selected runtime composition is installed under "
                 "the held fence");
         reconcile_installed_candidate = true;
       }
-      if (!reconcile_installed_candidate) {
+      if (published_installed_composition == nullptr &&
+          !reconcile_installed_candidate) {
         if (current_composition_building) {
           return {request,
                   component_manager::ManagerSelectedRuntimeCompositionState::
@@ -9375,6 +10821,35 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       kPreparing};
         }
       }
+    }
+    if (published_installed_composition != nullptr) {
+      bool attached = false;
+      try {
+        attached = TryAttachManagedCCLC(*published_installed_composition,
+                                        config, fence_owner);
+      } catch (...) {
+        std::lock_guard lock(managed_composition_mutex);
+        current_composition_building = false;
+        throw;
+      }
+      {
+        std::lock_guard lock(managed_composition_mutex);
+        Require(active_managed_composition.get() ==
+                    published_installed_composition,
+                "published installed runtime changed during route recovery");
+        current_composition_building = false;
+      }
+      // A claim settlement may have requested attachment while this observer
+      // held the composition reservation. Re-evaluate that retained request
+      // once, now that the worker can safely reserve the current runtime.
+      execution_composition.on_cell_admission_settled();
+      return {
+          request,
+          attached
+              ? component_manager::ManagerSelectedRuntimeCompositionState::
+                    kInstalled
+              : component_manager::ManagerSelectedRuntimeCompositionState::
+                    kPreparing};
     }
     if (reconcile_installed_candidate) {
       require_installed_candidate_configuration();
@@ -9462,11 +10937,31 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         prepared_is_empty = true;
         prepared_managed_composition_is_empty = false;
       } else {
-        Require(managed_composition_building,
-                "managed composition has no preparation outcome");
-        return {request,
-                component_manager::ManagerSelectedRuntimeCompositionState::
-                    kPreparing};
+        if (managed_composition_building) {
+          return {request,
+                  component_manager::ManagerSelectedRuntimeCompositionState::
+                      kPreparing};
+        }
+        // A previous preparation may have been consumed by an installation
+        // attempt that failed before the candidate became installed.  Keep
+        // the exact held request recoverable: clear only that stale in-memory
+        // marker and rebuild the same request under the still-held fence.
+        // Without this transition the next retry reported the misleading
+        // "no preparation outcome" error forever and left Manager recovery
+        // nonterminal until the whole workbench was recreated.
+        std::cerr << "retrying selected runtime composition preparation after "
+                     "an incomplete installation\n";
+        preparing_composition_request.reset();
+        preparing_composition_request = request;
+        managed_composition_building = true;
+        start_builder = true;
+        if (active_managed_composition != nullptr) {
+          shared_clock = active_managed_composition->runtime->clock;
+          shared_scheduler = active_managed_composition->runtime->scheduler;
+        } else if (detached_addressed_kernel != nullptr) {
+          shared_clock = detached_owner_clock;
+          shared_scheduler = detached_owner_scheduler;
+        }
       }
     }
     if (managed_composition_builder.joinable()) {
@@ -9605,6 +11100,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     .ok(),
                 "selected runtime could not close route recovery admission");
             SelectDirectNativeControlMode(*prepared, config.package_root);
+            prepared->route_recovery_pending.store(true,
+                                                   std::memory_order_release);
             auto staged =
                 prepared->runtime->addressed_kernel
                     ->stage_current_runtime_configuration_facts_under_apply_fence(
@@ -9962,7 +11459,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   // Otherwise reverse declaration order stops renewal before that drain while
   // the receiver's independent watchdog is still armed.
   struct DrainBeforeLivenessShutdown {
-    std::array<std::jthread *, 3> workers;
+    std::array<std::jthread *, 4> workers;
+    ManagedProjectionRegistry *projections;
     ~DrainBeforeLivenessShutdown() {
       for (auto *worker : workers)
         worker->request_stop();
@@ -9970,10 +11468,13 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         if (worker->joinable())
           worker->join();
       }
+      projections->Drain();
     }
   } drain_before_liveness_shutdown{{&execution_surface,
                                     &current_composition_builder,
-                                    &managed_composition_builder}};
+                                    &managed_composition_builder,
+                                    &deferred_attachment_worker},
+                                   &projections};
 
   while (g_stop_requested == 0) {
     rethrow_manager_liveness_failure();
@@ -9994,6 +11495,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     if ((descriptor.revents & POLLHUP) != 0 &&
         (descriptor.revents & POLLIN) == 0) {
       await_manager_loss_containment();
+      rethrow_manager_liveness_failure();
       return 0;
     }
     Require((descriptor.revents & (POLLERR | POLLNVAL)) == 0,
@@ -11197,7 +12699,7 @@ private:
         {"control_management_mode",
          CanonicalValue(
              composition.cclc_attached.load(std::memory_order_acquire)
-                 ? (composition.cclc_route_recovery_pending.load(
+                 ? (composition.route_recovery_pending.load(
                         std::memory_order_acquire)
                         ? "pending"
                         : "component_lifecycle")
@@ -11737,6 +13239,32 @@ private:
     });
   }
 
+  [[nodiscard]] CanonicalValue ReadStopFault(
+      core::ResourceAddressedExecutionKernel &addressed_kernel) const {
+    const auto offer = addressed_kernel.get_stop_fault_recovery_offer();
+    if (!offer.ok()) {
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"error", ErrorValue(offer.error())},
+          {"ok", CanonicalValue(false)},
+      });
+    }
+    if (!offer.value().has_value()) {
+      return CanonicalValue(CanonicalValue::Object{
+          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+          {"command", CanonicalValue("get_stop_fault")},
+          {"ok", CanonicalValue(true)},
+          {"stop_fault", CanonicalValue(nullptr)},
+      });
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+        {"command", CanonicalValue("get_stop_fault")},
+        {"ok", CanonicalValue(true)},
+        {"stop_fault", StopFaultOfferValue(*offer.value())},
+    });
+  }
+
   [[nodiscard]] CanonicalValue
   Execute(const Command &command, Composition &composition,
           const core::ProjectionRevisionDTO &projection) {
@@ -11828,29 +13356,7 @@ private:
       return QueryOperationResponse(*command.operation_query, composition);
     }
     if (command.kind == CommandKind::kGetStopFault) {
-      const auto offer = composition.runtime->addressed_kernel
-                             ->get_stop_fault_recovery_offer();
-      if (!offer.ok()) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-            {"error", ErrorValue(offer.error())},
-            {"ok", CanonicalValue(false)},
-        });
-      }
-      if (!offer.value().has_value()) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-            {"command", CanonicalValue("get_stop_fault")},
-            {"ok", CanonicalValue(true)},
-            {"stop_fault", CanonicalValue(nullptr)},
-        });
-      }
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("get_stop_fault")},
-          {"ok", CanonicalValue(true)},
-          {"stop_fault", StopFaultOfferValue(*offer.value())},
-      });
+      return ReadStopFault(*composition.runtime->addressed_kernel);
     }
     if (command.kind == CommandKind::kRecoverStopFault) {
       Require(command.stop_fault_recovery.has_value(),
@@ -12434,13 +13940,15 @@ private:
                 now - *last_recovery_observation >=
                     kRecoveryObservationPeriodNs) {
               last_recovery_observation = now;
+              const bool has_route_reconciler = static_cast<bool>(
+                  composition.runtime->reconcile_controller_routes);
               const auto routes =
-                  composition.runtime->reconcile_controller_routes
+                  has_route_reconciler
                       ? composition.runtime->reconcile_controller_routes()
                       : core::Result<void>::Ok();
-              if (routes.ok()) {
-                composition.cclc_route_recovery_pending.store(
-                    false, std::memory_order_release);
+              if (has_route_reconciler && routes.ok()) {
+                composition.route_recovery_pending.store(false,
+                                                         std::memory_order_release);
               }
               const auto assessed =
                   composition.runtime->addressed_kernel
@@ -12644,6 +14152,9 @@ private:
                 } else if (lane == CommandLane::kOrdinary &&
                            command.kind == CommandKind::kReadStop) {
                   response = ReadStop(command, *owner);
+                } else if (lane == CommandLane::kOrdinary &&
+                           command.kind == CommandKind::kGetStopFault) {
+                  response = ReadStopFault(*owner);
                 } else if (lane == CommandLane::kOrdinary &&
                            command.kind == CommandKind::kIdentity) {
                   response = ExecutionOwnerNotReadyIdentityResponse(

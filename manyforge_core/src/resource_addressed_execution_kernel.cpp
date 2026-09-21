@@ -3002,6 +3002,64 @@ struct ResourceAddressedExecutionKernel::EngineSubscription final {
   SubscriptionHandle handle{};
 };
 
+struct ResourceAddressedExecutionKernel::EngineEventIngress final
+    : std::enable_shared_from_this<EngineEventIngress> {
+  class Entry final {
+   public:
+    Entry() = default;
+    Entry(std::shared_ptr<EngineEventIngress> ingress,
+          ResourceAddressedExecutionKernel* owner)
+        : ingress_(std::move(ingress)), owner_(owner) {}
+    Entry(Entry&& other) noexcept
+        : ingress_(std::move(other.ingress_)), owner_(std::exchange(other.owner_, nullptr)) {}
+    Entry& operator=(Entry&&) = delete;
+    Entry(const Entry&) = delete;
+    Entry& operator=(const Entry&) = delete;
+    ~Entry() {
+      if (ingress_ == nullptr || owner_ == nullptr) return;
+      std::lock_guard lock(ingress_->mutex);
+      if (--ingress_->entered == 0U) ingress_->drained.notify_all();
+    }
+
+    [[nodiscard]] ResourceAddressedExecutionKernel* owner() const noexcept { return owner_; }
+
+   private:
+    std::shared_ptr<EngineEventIngress> ingress_;
+    ResourceAddressedExecutionKernel* owner_{};
+  };
+
+  [[nodiscard]] Entry Enter() {
+    std::lock_guard lock(mutex);
+    if (owner == nullptr) return {};
+    ++entered;
+    return Entry(shared_from_this(), owner);
+  }
+
+  void Open(ResourceAddressedExecutionKernel& value) {
+    std::lock_guard lock(mutex);
+    if (owner != nullptr || entered != 0U) {
+      throw std::logic_error("Kernel event ingress was opened more than once");
+    }
+    owner = &value;
+  }
+
+  void Close() {
+    std::lock_guard lock(mutex);
+    owner = nullptr;
+  }
+
+  void Drain() {
+    std::unique_lock lock(mutex);
+    drained.wait(lock, [&] { return entered == 0U; });
+  }
+
+ private:
+  std::mutex mutex;
+  std::condition_variable drained;
+  ResourceAddressedExecutionKernel* owner{};
+  std::size_t entered{};
+};
+
 ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     std::vector<RuntimeParticipantExecutionRegistration> registrations, IClock& clock,
     IScheduler& scheduler, IOperationJournal& journal,
@@ -3019,6 +3077,7 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
       scheduler_(scheduler),
       journal_(journal),
       config_(std::move(config)),
+      engine_event_ingress_(std::make_shared<EngineEventIngress>()),
       emergency_stop_reserve_(config_.emergency_stop_correlation_capacity),
       stop_transactions_(config_.emergency_stop_correlation_capacity + 1U),
       stop_correlations_(config_.emergency_stop_correlation_capacity + 1U),
@@ -3303,17 +3362,6 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     }
   }
 
-  for (const auto& registration : registrations_) {
-    if (std::any_of(
-            engine_subscriptions_.begin(), engine_subscriptions_.end(),
-            [&](const EngineSubscription& item) { return item.engine == registration.engine; })) {
-      continue;
-    }
-    auto* engine = registration.engine;
-    const auto handle = engine->subscribe_events(
-        [this, engine](const KernelEvent& event) { on_engine_event(engine, event); });
-    engine_subscriptions_.push_back(EngineSubscription{engine, handle});
-  }
   for (const auto& record : stop_terminal_history_) {
     if (record != nullptr && record->surveillance_state != nullptr &&
         record->surveillance_state->projection.state ==
@@ -3322,9 +3370,49 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
                                record->next_surveillance_sample_ns);
     }
   }
+  try {
+    for (const auto& registration : registrations_) {
+      if (std::any_of(engine_subscriptions_.begin(), engine_subscriptions_.end(),
+                      [&](const EngineSubscription& item) {
+                        return item.engine == registration.engine;
+                      })) {
+        continue;
+      }
+      auto* engine = registration.engine;
+      auto ingress = engine_event_ingress_;
+      const auto handle = engine->subscribe_events(
+          [ingress = std::move(ingress), engine](const KernelEvent& event) {
+            auto entered = ingress->Enter();
+            if (auto* owner = entered.owner()) owner->on_engine_event(engine, event);
+          });
+      engine_subscriptions_.push_back(EngineSubscription{engine, handle});
+    }
+    // Opening is the final construction step. A callback captured while the
+    // constructor was still assembling subscriptions observes closed ingress
+    // rather than a partially constructed Kernel.
+    engine_event_ingress_->Open(*this);
+  } catch (...) {
+    for (const auto& subscription : engine_subscriptions_) {
+      subscription.engine->unsubscribe_events(subscription.handle);
+    }
+    engine_subscriptions_.clear();
+    throw;
+  }
 }
 
 ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
+  // Engine callbacks are the outermost asynchronous ingress. Closing the
+  // guard first prevents a callback already copied by a publisher from
+  // acquiring the Kernel. Unsubscribe removes future snapshots, and Drain
+  // waits for callbacks that entered before Close while all state, scheduled
+  // surveillance, and worker lanes they may reach are still alive and open.
+  engine_event_ingress_->Close();
+  for (const auto& subscription : engine_subscriptions_) {
+    subscription.engine->unsubscribe_events(subscription.handle);
+  }
+  engine_subscriptions_.clear();
+  engine_event_ingress_->Drain();
+
   std::vector<ScheduleHandle> surveillance_handles;
   if (config_.stop_surveillance.has_value()) {
     {
@@ -3358,12 +3446,13 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
       std::terminate();
     }
   }
+  // With participant events drained, each lane can close its own ingress and
+  // settle all causally accepted work before its worker object is retired.
   if (operation_control_executor_ != nullptr) {
     operation_control_executor_->CloseIngress();
     if (!operation_control_executor_->DrainFor(std::chrono::seconds(5))) {
       std::terminate();
     }
-    operation_control_executor_.reset();
   }
   if (stop_stage_attempt_executor_ != nullptr) {
     stop_stage_attempt_executor_->CloseIngress();
@@ -3379,16 +3468,21 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
       std::terminate();
     }
     stop_control_executor_->CloseIngress();
-    stop_control_executor_.reset();
   }
-  stop_stage_attempt_executor_.reset();
   if (stop_projection_worker_ != nullptr) {
+    // Accepted Stop projections settle here, while the journal, clock,
+    // scheduler and every participant engine are still alive.
     stop_projection_worker_->Close();
     if (!stop_projection_worker_->DrainFor(std::chrono::seconds(5))) {
       std::terminate();
     }
-    stop_projection_worker_.reset();
   }
+  // Only now may the drained lanes themselves be destroyed. Nothing can reach
+  // them afterwards, so a lane cannot publish into the journal below.
+  operation_control_executor_.reset();
+  stop_control_executor_.reset();
+  stop_stage_attempt_executor_.reset();
+  stop_projection_worker_.reset();
   // The durable journal is the final authority for clean-close eligibility.
   // At this point every Kernel-owned asynchronous lane has drained, so it can
   // atomically prove that all operations and Stop projections are terminal.
@@ -3404,9 +3498,6 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
       static_cast<void>(journal_.CloseOwnerEpoch(config_.request_owner_epoch, clock_.now()));
     } catch (...) {
     }
-  }
-  for (const auto& subscription : engine_subscriptions_) {
-    subscription.engine->unsubscribe_events(subscription.handle);
   }
 }
 
@@ -4012,8 +4103,12 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
         continue;
       }
       auto* engine = registration.engine;
+      auto ingress = engine_event_ingress_;
       const auto handle = engine->subscribe_events(
-          [this, engine](const KernelEvent& event) { on_engine_event(engine, event); });
+          [ingress = std::move(ingress), engine](const KernelEvent& event) {
+            auto entered = ingress->Enter();
+            if (auto* owner = entered.owner()) owner->on_engine_event(engine, event);
+          });
       added_subscriptions.push_back(EngineSubscription{engine, handle});
     }
   } catch (const std::exception& exception) {
@@ -5782,7 +5877,8 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       return Result<OperationAcceptedDTO>::Err(built.error());
     }
     motion_request = std::move(built.value());
-    motion_request->trajectory_relative_timeout = resolved.value().intrinsic_direct_control;
+    motion_request->trajectory_relative_timeout =
+        resolved.value().intrinsic_direct_control;
   } else {
     const auto& command = std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload);
     auto built = build_command_request(command, binding);

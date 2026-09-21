@@ -37,6 +37,7 @@ export function useDeploymentWorkspace(
   const [workspace, setWorkspace] = useState<DeploymentWorkspaceResponse | null>(null);
   const [loading, setLoading] = useState(enabled);
   const [busy, setBusy] = useState(false);
+  const [applying, setApplying] = useState(false);
   const [completedAdmission, setCompletedAdmission] = useState<{
     receiverEpoch: string;
     generation: number;
@@ -169,6 +170,7 @@ export function useDeploymentWorkspace(
     if (requestFence === null || snapshot === null || inFlight.current) return null;
     inFlight.current = true;
     setBusy(true);
+    setApplying(true);
     setError(null);
     setFeedback(null);
     try {
@@ -208,6 +210,7 @@ export function useDeploymentWorkspace(
     } finally {
       inFlight.current = false;
       if (mounted.current) setBusy(false);
+      if (mounted.current) setApplying(false);
     }
   }, [fence, refresh, snapshot]);
 
@@ -274,9 +277,17 @@ export function useDeploymentWorkspace(
     },
     confirmApply: () => {
       const token = pendingApplyConfirmation?.result.confirmationToken ?? null;
-      if (token === null) return Promise.resolve(null);
+      const preparation = pendingApplyConfirmation?.result.preparation ?? null;
+      if (token === null || preparation === null) return Promise.resolve(null);
+      // Confirmation is only the user's authorization boundary. Once the
+      // exact token and preparation identity have been captured, close the
+      // overlay before dispatching the potentially long-running Apply. The
+      // ordinary workspace busy/error state owns progress from this point.
+      setPendingApplyConfirmation(null);
       return runApply(
-        (requestFence) => api.deploymentWorkspace.applyDraft(requestFence, token),
+        (requestFence) => api.deploymentWorkspace.applyDraft(
+          requestFence, { token, preparation },
+        ),
         'Deployment Draft compiled, applied by Manager, and rebound to the current Program.',
       );
     },
@@ -287,6 +298,7 @@ export function useDeploymentWorkspace(
     workspace,
     loading,
     busy,
+    applying,
     error,
     feedback,
     pendingApplyConfirmation,

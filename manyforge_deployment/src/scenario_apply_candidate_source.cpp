@@ -614,7 +614,14 @@ FilesystemScenarioApplyCandidateSource::TryLoadExactProgramSelectionForActive(
           "active Scenario selection identity is invalid");
   if (const auto candidate = candidate_catalog_path(); candidate.has_value()) {
     auto selection = LoadExactProgramSelectionFrom(scenario_id, *candidate);
-    if (selection.retained_bundle_id == retained_bundle_id &&
+    std::error_code error;
+    const bool candidate_owns_binding = std::filesystem::exists(
+        DigestPath(*candidate_package_root_, "program-bindings",
+                   selection.program_binding_id.value()),
+        error);
+    Require(!error, "candidate Program Binding lookup failed");
+    if (candidate_owns_binding &&
+        selection.retained_bundle_id == retained_bundle_id &&
         selection.graph_revision == graph_revision) {
       return selection;
     }
@@ -656,16 +663,22 @@ FilesystemScenarioApplyCandidateSource::LoadExactProgramSelectionFrom(
   const auto &typed_parameter_overrides =
       Member(row, "typed_parameter_overrides", "$.scenarios[]");
 
+  // Candidate packages are sparse overlays.  Their catalog retains installed
+  // rows, and multiple rows may share one retained bundle, so neither catalog
+  // nor bundle presence establishes ownership of a row's exact Program
+  // closure.  The generated Program Binding is the row-specific seam: use the
+  // overlay only when it carries that exact binding, otherwise resolve the
+  // unchanged row from the installed package.
   const auto selected_package_root = [&]() -> const std::filesystem::path & {
     if (!candidate_package_root_.has_value()) {
       return package_root_;
     }
-    const auto candidate_bundle =
-        DigestPath(*candidate_package_root_, "retained-bundles",
-                   retained_bundle_id.value());
+    const auto candidate_binding =
+        DigestPath(*candidate_package_root_, "program-bindings",
+                   program_binding_id.value());
     std::error_code error;
-    const bool exists = std::filesystem::exists(candidate_bundle, error);
-    Require(!error, "candidate retained-bundle lookup failed");
+    const bool exists = std::filesystem::exists(candidate_binding, error);
+    Require(!error, "candidate Program Binding lookup failed");
     return exists ? *candidate_package_root_ : package_root_;
   }();
   const FilesystemVerifiedRetainedBundleSource bundle_source(

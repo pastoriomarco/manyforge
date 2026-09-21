@@ -840,7 +840,14 @@ CreateRetainedNativeCCLCRuntime(
     return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
         Err(adopted.error());
   }
-  // Adoption reconciles orphan resources from fresh command-free evidence.
+  // Route adoption/publication establishes complete command-free physical
+  // evidence for the cell. Reconcile predecessor-owner markers once, after
+  // every domain is current, rather than during partial domain replacement.
+  auto orphans_reconciled = runtime.ReconcileCommandFreeOrphans();
+  if (!orphans_reconciled.ok()) {
+    return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
+        Err(orphans_reconciled.error());
+  }
   // Retire the predecessor's manual claim before requesting route authority;
   // the regular host reconciliation lane starts only after this composition.
   auto manual_reconciled =

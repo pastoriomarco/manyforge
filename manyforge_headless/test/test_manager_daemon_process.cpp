@@ -2398,8 +2398,11 @@ TEST(ManagerDaemonProcess,
                 "\"details\":{\"owner_epoch\":\"kernel-owner-"),
             std::string::npos)
       << recovered_execution_status;
-  const auto stale = SendCommand(directory.socket_path(), request);
-  EXPECT_NE(stale.find("\"stale_request_owner_epoch\""), std::string::npos);
+  const auto replay = SendCommand(directory.socket_path(), request);
+  EXPECT_NE(replay.find("\"state\":\"succeeded\""), std::string::npos)
+      << replay;
+  EXPECT_NE(replay.find("\"request_replayed\":true"), std::string::npos)
+      << replay;
   const auto stopped = replacement.Stop(SIGTERM);
   EXPECT_TRUE(WIFEXITED(stopped));
 }
@@ -2559,8 +2562,11 @@ TEST(ManagerDaemonProcess,
   EXPECT_NE(content_identity::canonical_json(manager_recovered->payload)
                 .find(fixture.physical_candidate_retained_bundle_id),
             std::string::npos);
-  const auto stale = SendCommand(directory.socket_path(), apply_request);
-  EXPECT_NE(stale.find("\"stale_request_owner_epoch\""), std::string::npos);
+  const auto replay = SendCommand(directory.socket_path(), apply_request);
+  EXPECT_NE(replay.find("\"state\":\"succeeded\""), std::string::npos)
+      << replay;
+  EXPECT_NE(replay.find("\"request_replayed\":true"), std::string::npos)
+      << replay;
   const auto stopped = replacement.Stop(SIGTERM);
   EXPECT_TRUE(WIFEXITED(stopped));
   EXPECT_EQ(WEXITSTATUS(stopped), 0);

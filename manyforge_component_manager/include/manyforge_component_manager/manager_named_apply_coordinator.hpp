@@ -67,7 +67,7 @@ struct ManagerNamedApplyResult final {
   std::optional<ManagerApplyTerminalOutcomeDTO> terminal_outcome;
 };
 
-/// Sole-strand production composition of the I4 named-Apply phase owners.
+/// Single-progression-owner composition of the I4 named-Apply phase owners.
 ///
 /// This class adds no replacement state machine: it routes each durable phase
 /// to the already qualified I4 coordinator that owns it. A new request first
@@ -105,12 +105,16 @@ public:
       RuntimePreStartGuard pre_start_guard = {},
       ApplyProgressObserver apply_progress_observer = {});
 
+  /// Validate and durably accept one exact request without advancing any
+  /// runtime effect. Exact replay returns terminal evidence when it already
+  /// exists; otherwise the sole progression owner resumes it through
+  /// RecoverIncompleteApply().
   [[nodiscard]] ManagerNamedApplyResult
-  ApplyOrRecover(const ManagerNamedApplyRequestDTO &request);
+  AcceptOrReplay(const ManagerNamedApplyRequestDTO &request);
 
   /// Resume the sole nonterminal Apply, if any. More than one nonterminal
   /// transaction is an integrity failure because this coordinator owns one
-  /// serialized Manager command strand.
+  /// serialized progression lane.
   [[nodiscard]] std::optional<ManagerNamedApplyResult> RecoverIncompleteApply();
 
   ManagerNamedApplyCoordinator(const ManagerNamedApplyCoordinator &) = delete;

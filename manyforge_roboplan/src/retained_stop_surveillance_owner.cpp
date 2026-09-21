@@ -677,7 +677,8 @@ struct RefreshedCurrentQuiescenceObservation final {
 observe_current_quiescence(const RetainedStopSurveillanceSourceInput &source,
                            const std::vector<core::ResourceId> &resources,
                            const std::int64_t assessed_at_ns,
-                           const std::int64_t read_deadline_ns = -1) {
+                           const std::int64_t read_deadline_ns = -1,
+                           const bool allow_retained_predicted_state = false) {
   if (!source.no_active_goal_evidence_source || resources.empty()) {
     return invalid<CurrentQuiescenceObservation>(
         "native_no_active_goal_source_missing",
@@ -696,9 +697,13 @@ observe_current_quiescence(const RetainedStopSurveillanceSourceInput &source,
   // predecessor publication (especially its runtime epoch) into one fact.
   const auto expected_context = core::make_observed_state_query_context(
       source.binding, snapshot.freshness_budget_ns);
+  const auto snapshot_valid =
+      core::validate_observed_state_snapshot(snapshot, assessed_at_ns).ok();
+  const auto context_matches =
+      expected_context.ok() &&
+      snapshot_matches_context(snapshot, expected_context.value());
   if (!expected_context.ok() ||
-      !core::validate_observed_state_snapshot(snapshot, assessed_at_ns).ok() ||
-      !snapshot_matches_context(snapshot, expected_context.value()) ||
+      !snapshot_valid || !context_matches ||
       assessed_at_ns < snapshot.received_timestamp_ns) {
     return invalid<CurrentQuiescenceObservation>(
         "native_current_resource_identity_mismatch",
@@ -706,7 +711,10 @@ observe_current_quiescence(const RetainedStopSurveillanceSourceInput &source,
         "binding");
   }
   const auto age_ns = assessed_at_ns - snapshot.received_timestamp_ns;
-  if (age_ns > kRetainedNativeReconciliationFreshnessBudgetNs) {
+  if (age_ns > kRetainedNativeReconciliationFreshnessBudgetNs &&
+      (!allow_retained_predicted_state ||
+       snapshot.state_authority_class !=
+           core::StateAuthorityClass::kPredicted)) {
     return invalid<CurrentQuiescenceObservation>(
         "native_current_resource_state_stale",
         "native current-resource state is too old for reconciliation");
@@ -753,7 +761,8 @@ observe_current_quiescence(const RetainedStopSurveillanceSourceInput &source,
 observe_current_quiescence_after_refresh(
     const RetainedStopSurveillanceSourceInput &source,
     const std::vector<core::ResourceId> &resources,
-    const std::int64_t assessed_at_ns, core::IClock *clock) {
+    const std::int64_t assessed_at_ns, core::IClock *clock,
+    const bool allow_retained_predicted_state = false) {
   const auto deadline_for = [](const std::int64_t assessed) {
     return assessed > std::numeric_limits<std::int64_t>::max() -
                           kRetainedNativeReconciliationFreshnessBudgetNs
@@ -762,7 +771,8 @@ observe_current_quiescence_after_refresh(
   };
   auto assessed = assessed_at_ns;
   auto observed = observe_current_quiescence(source, resources, assessed,
-                                             deadline_for(assessed));
+                                             deadline_for(assessed),
+                                             allow_retained_predicted_state);
   if (observed.ok() || !quiescence_refreshable(observed.error())) {
     if (!observed.ok()) {
       return core::Result<RefreshedCurrentQuiescenceObservation>::Err(
@@ -781,7 +791,8 @@ observe_current_quiescence_after_refresh(
     assessed = std::max(assessed, clock->now());
   }
   observed = observe_current_quiescence(source, resources, assessed,
-                                        deadline_for(assessed));
+                                        deadline_for(assessed),
+                                        allow_retained_predicted_state);
   if (!observed.ok()) {
     return core::Result<RefreshedCurrentQuiescenceObservation>::Err(
         observed.error());
@@ -1505,7 +1516,7 @@ RetainedStopSurveillanceOwner::BuildOrphanResourceReconciliationFacts(
     for (const auto &[source_index, selected_resources] : resources_by_source) {
       const auto &source = sources[source_index];
       auto observed = observe_current_quiescence_after_refresh(
-          source, selected_resources, assessed_at_ns, clock_);
+          source, selected_resources, assessed_at_ns, clock_, true);
       if (!observed.ok()) {
         return core::Result<core::OrphanResourceReconciliationFactsDTO>::Err(
             observed.error());
@@ -1524,12 +1535,24 @@ RetainedStopSurveillanceOwner::BuildOrphanResourceReconciliationFacts(
       const auto &observed = pending_observation.observation;
       const auto source_age_ns =
           effective_assessed_at_ns - observed.snapshot.received_timestamp_ns;
+      const auto retained_predicted =
+          observed.snapshot.state_authority_class ==
+          core::StateAuthorityClass::kPredicted;
       if (source_age_ns < 0 ||
-          source_age_ns > kRetainedNativeReconciliationFreshnessBudgetNs) {
+          (source_age_ns > kRetainedNativeReconciliationFreshnessBudgetNs &&
+           !retained_predicted) ||
+          (retained_predicted &&
+           source_age_ns >
+               std::numeric_limits<std::int64_t>::max() -
+                   kRetainedNativeReconciliationFreshnessBudgetNs)) {
         return invalid<core::OrphanResourceReconciliationFactsDTO>(
             "native_current_resource_state_stale",
             "native current-resource state became stale before reconciliation");
       }
+      const auto freshness_budget_ns =
+          retained_predicted
+              ? source_age_ns + kRetainedNativeReconciliationFreshnessBudgetNs
+              : kRetainedNativeReconciliationFreshnessBudgetNs;
       const auto &binding = source.binding.value();
       const auto &path = *binding.control_path;
       for (const auto &resource : pending_observation.resources) {
@@ -1547,7 +1570,7 @@ RetainedStopSurveillanceOwner::BuildOrphanResourceReconciliationFacts(
             core::StopFaultRecoveryResourceFactDTO{
                 resource, core::StopFaultRecoveryResourceStateDTO::kSettled,
                 observed.snapshot.source_epoch, observed.snapshot.sequence,
-                source_age_ns, kRetainedNativeReconciliationFreshnessBudgetNs,
+                source_age_ns, freshness_budget_ns,
                 std::nullopt, std::nullopt},
             observed.no_active_goal_evidence_digest,
             observed.configuration_evidence_digest};

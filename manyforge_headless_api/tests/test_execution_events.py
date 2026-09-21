@@ -1244,14 +1244,64 @@ class _StreamingExecution(_PagedExecution):
         }
 
 
+def _stop_fault_response(stop_fault: Any) -> dict[str, Any]:
+    return {
+        "api_version": "manyforge.execution_command_response.v1",
+        "command": "get_stop_fault",
+        "ok": True,
+        "stop_fault": stop_fault,
+    }
+
+
+def _active_stop_fault_offer() -> dict[str, Any]:
+    return {
+        "configuration_expectations": [],
+        "latch": {
+            "captured_operation_ids": [],
+            "captured_resources": [],
+            "cell_id": "cell.test",
+            "clear_projection": {
+                "error": None,
+                "retry_generation": None,
+                "state": "not_applicable",
+            },
+            "evidence_refs": [],
+            "graph_revision": "sha256:" + "2" * 64,
+            "latch_generation": 1,
+            "latch_id": "stop-fault.test.idle",
+            "persistence_degraded": False,
+            "reason_code": "stop_fault_latched",
+            "recovery_assessment_revision": 1,
+            "recovery_status": "waiting_for_observation",
+            "retained_bundle_id": "sha256:" + "3" * 64,
+            "state": "latched",
+            "stop_certificate": None,
+            "stop_generation": 1,
+            "stop_id": "stop.test.idle",
+            "terminal_projection": {
+                "error": None,
+                "retry_generation": None,
+                "state": "pending",
+            },
+            "trigger": "physical_rest_unproven",
+        },
+    }
+
+
 class _IdleExecution:
-    def __init__(self, *, include_epoch: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        include_epoch: bool = True,
+        stop_fault_response: dict[str, Any] | None = None,
+    ) -> None:
         self.owner_epoch = "kernel-owner.runtime-epoch"
         self.admission_generation = 1
         self.include_epoch = include_epoch
         self.status_calls = 0
         self.events_calls = 0
         self.stop_fault_calls = 0
+        self.stop_fault_response = stop_fault_response
 
     def identity(self) -> dict[str, Any]:
         self.status_calls += 1
@@ -1276,12 +1326,9 @@ class _IdleExecution:
 
     def stop_fault(self) -> dict[str, Any]:
         self.stop_fault_calls += 1
-        return {
-            "api_version": "manyforge.execution_command_response.v1",
-            "command": "get_stop_fault",
-            "ok": True,
-            "stop_fault": None,
-        }
+        if self.stop_fault_response is not None:
+            return self.stop_fault_response
+        return _stop_fault_response(None)
 
 
 class _RetiringExecution(_PagedExecution):
@@ -1471,6 +1518,81 @@ def test_event_pump_reconciles_typed_idle_owner_without_querying_events() -> Non
         "source_owner_epoch": execution.owner_epoch,
         "through_source_sequence": 0,
     }
+
+
+def test_event_pump_completes_idle_snapshot_with_active_stop_fault_offer() -> None:
+    core = _RecordingCore()
+    offer = _active_stop_fault_offer()
+    assert ExecutionCommandClient._valid_stop_fault_offer(offer)
+    execution = _IdleExecution(
+        stop_fault_response=_stop_fault_response(offer)
+    )
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+    pump.start()
+    assert core.completed.wait(timeout=1.0)
+    pump.shutdown()
+
+    assert pump.last_error is None
+    assert execution.events_calls == 0
+    assert execution.stop_fault_calls >= 1
+    assert core.completed_calls[0] == {
+        "current_stop_fault_json": rfc8785.dumps(offer["latch"]).decode("utf-8"),
+        "source_owner_epoch": execution.owner_epoch,
+        "through_source_sequence": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("stop_fault_response", "expected_error"),
+    [
+        (
+            {
+                "api_version": "manyforge.execution_command_response.v1",
+                "error": {
+                    "code": "execution_command_unavailable",
+                    "details": {},
+                    "message": "the stop-fault snapshot is temporarily unavailable",
+                },
+                "ok": False,
+            },
+            "execution_command_unavailable",
+        ),
+        (
+            {
+                "api_version": "manyforge.execution_command_response.v1",
+                "command": "get_stop_fault",
+                "ok": False,
+            },
+            "execution_command_response_invalid",
+        ),
+    ],
+    ids=["unavailable", "malformed_error_envelope"],
+)
+def test_event_pump_keeps_idle_source_open_when_stop_fault_read_fails(
+    stop_fault_response: dict[str, Any],
+    expected_error: str,
+) -> None:
+    core = _RecordingCore()
+    execution = _IdleExecution(stop_fault_response=stop_fault_response)
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+    pump.start()
+    deadline = threading.Event()
+    for _ in range(100):
+        if pump.last_error is not None:
+            break
+        deadline.wait(0.01)
+    pump.shutdown()
+
+    assert pump.last_error is not None
+    assert expected_error in pump.last_error
+    assert execution.events_calls == 0
+    assert execution.stop_fault_calls >= 1
+    assert core.completed_calls == []
+    assert not core.completed.is_set()
 
 
 def test_event_pump_wakes_cold_state_when_idle_kernel_admission_advances() -> None:

@@ -115,6 +115,9 @@ export interface RobotControlState {
   operation: OperationObservation | null;
   previewIssue: string | null;
   error: string | null;
+  /** Informational-only surface: uncommitted manual work discarded by an
+   * owner/binding replacement. Never an operational error. */
+  ownerNotice: string | null;
 }
 
 export type RobotControlAction =
@@ -180,6 +183,7 @@ export const initialRobotControlState: RobotControlState = {
   operation: null,
   previewIssue: null,
   error: null,
+  ownerNotice: null,
 };
 
 /**
@@ -626,6 +630,20 @@ function resolveStatus(
     || state.status.graphRevision !== status.graphRevision
     || selectedBindingChanged
   )) {
+    // Owner/bundle/graph replacement always discards the prior preview
+    // evidence. An accepted, uncertain or resident operation keeps its
+    // explicit outcome and attention. Discarded uncommitted manual work gets
+    // exactly one informational notice; a purely idle replacement rebases
+    // silently without producing an operational error.
+    const discardedEvidence = state.status.ownerEpoch !== status.ownerEpoch
+      ? 'The execution owner restarted. The prior preview was discarded.'
+      : 'The target binding changed. The prior preview was discarded.';
+    const discardedUncommittedWork = robotControlHasLocalDraft(state)
+      || state.intent !== null
+      || state.preview !== null
+      || state.ghost !== null;
+    const replacementRequiresAttention = resolvedOperation !== null
+      && (resolvedOperation.resident || resolvedOperation.terminalError !== null);
     return {
       ...initialRobotControlState,
       mode: state.mode,
@@ -637,9 +655,10 @@ function resolveStatus(
       generation: state.generation + 1,
       operation: resolvedOperation,
       error: projectionError
-        ?? (state.status.ownerEpoch !== status.ownerEpoch
-          ? 'The execution owner restarted. The prior preview was discarded.'
-          : 'The target binding changed. The prior preview was discarded.'),
+        ?? (replacementRequiresAttention ? discardedEvidence : null),
+      ownerNotice: !replacementRequiresAttention && discardedUncommittedWork
+        ? 'The execution owner changed; uncommitted manual work was discarded.'
+        : null,
     };
   }
   if (initialize || state.status === null) {
@@ -659,6 +678,7 @@ function resolveStatus(
       operation: resolvedOperation,
       previewIssue: null,
       error: projectionError ?? resolvedOperation?.terminalError ?? null,
+      ownerNotice: null,
     };
   }
   if (selectionChanged) {
@@ -676,6 +696,7 @@ function resolveStatus(
       operation: resolvedOperation,
       previewIssue: null,
       error: resolvedOperation?.terminalError ?? null,
+      ownerNotice: null,
     };
   }
   if (projectionError !== null) {
@@ -686,6 +707,7 @@ function resolveStatus(
       operation: null,
       previewIssue: null,
       error: projectionError,
+      ownerNotice: null,
     };
   }
   // The latest settled result stays visible through the same owner snapshot,
@@ -762,6 +784,7 @@ function invalidateDraft(
     operation: null,
     previewIssue: null,
     error: null,
+    ownerNotice: null,
   };
 }
 
@@ -794,6 +817,7 @@ function changeSelection(
     ghostStale: false,
     previewIssue: null,
     error: state.operation?.terminalError ?? null,
+    ownerNotice: null,
   };
 }
 
@@ -806,8 +830,8 @@ export function robotControlReducer(
   switch (action.type) {
     case 'load':
       return state.status === null
-        ? { ...state, phase: 'loading', error: null }
-        : { ...state, error: null };
+        ? { ...state, phase: 'loading', error: null, ownerNotice: null }
+        : { ...state, error: null, ownerNotice: null };
     case 'status_resolved':
       return resolveStatus(state, action.status, true, action.cartesianDefaults);
     case 'status_refreshed':
@@ -867,6 +891,7 @@ export function robotControlReducer(
         operation: null,
         previewIssue: null,
         error: null,
+        ownerNotice: null,
       };
     case 'select_mode':
       if (
@@ -890,6 +915,7 @@ export function robotControlReducer(
         operation: null,
         previewIssue: null,
         error: null,
+        ownerNotice: null,
       }, state.status, false);
     case 'edit':
     case 'edit_joint': {
@@ -1112,6 +1138,7 @@ export function robotControlReducer(
           : state.ghost !== null,
         previewIssue: null,
         error: null,
+        ownerNotice: null,
       };
     case 'preview_rejected':
       if (action.generation !== state.generation || state.poseDragging) return state;
@@ -1188,6 +1215,7 @@ export function robotControlReducer(
         operation: state.operation?.resident ? state.operation : null,
         previewIssue: null,
         error: state.operation?.resident ? state.operation.terminalError : null,
+        ownerNotice: null,
       };
     }
     case 'clear':

@@ -75,9 +75,9 @@ void VerifyApplyInputs(const ManagerApplyIntentDTO &apply_intent,
   const auto &receipt = read.value();
   if (!receipt.valid() ||
       receipt.publication_generation != publication_generation ||
-      !SameDeploymentRevision(receipt.request.candidate_projection_revision,
-                              apply_intent
-                                  .expected_active_projection_revision) ||
+      !SameDeploymentRevision(
+          receipt.request.candidate_projection_revision,
+          apply_intent.expected_active_projection_revision) ||
       receipt.request.candidate_retained_bundle_id !=
           apply_intent.expected_active_projection_revision.retained_bundle_id ||
       receipt.request.candidate_graph_revision !=
@@ -160,17 +160,16 @@ VerifyRuntimeProducts(
         [&](const auto &candidate) {
           return candidate.runtime_unit_id == runtime_unit.runtime_unit_id;
         });
-    if (requirement_row ==
-        bundle.value().runtime_contract_requirements.end()) {
+    if (requirement_row == bundle.value().runtime_contract_requirements.end()) {
       Fail("runtime unit has no retained contract-manifest requirement: " +
            runtime_unit.runtime_unit_id.value());
     }
     const auto *contract =
-        manyforge::deployment::runtime_contract_declaration_registry()
-            .find(runtime_unit.runtime_profile_id,
-                  runtime_unit.runtime_profile_revision,
-                  product->product_contract_id(),
-                  product->product_contract_revision());
+        manyforge::deployment::runtime_contract_declaration_registry().find(
+            runtime_unit.runtime_profile_id,
+            runtime_unit.runtime_profile_revision,
+            product->product_contract_id(),
+            product->product_contract_revision());
     if (contract == nullptr) {
       Fail("runtime unit has no selected component contract offer: " +
            runtime_unit.runtime_unit_id.value());
@@ -182,10 +181,10 @@ VerifyRuntimeProducts(
            "its selected offer: " +
            runtime_unit.runtime_unit_id.value());
     }
-    auto row =
-        MakeVerifiedPlanRow(runtime_unit, *product, requirement_row->requirement,
-                            contract->offer().offer_digest,
-                            RuntimeUnitCandidateDisposition::kRetainedExact);
+    auto row = MakeVerifiedPlanRow(
+        runtime_unit, *product, requirement_row->requirement,
+        contract->offer().offer_digest,
+        RuntimeUnitCandidateDisposition::kRetainedExact);
     if (!plans.emplace(runtime_unit.runtime_unit_id.value(), std::move(row))
              .second) {
       Fail("retained bundle contains a duplicate runtime-unit identity");
@@ -194,9 +193,9 @@ VerifyRuntimeProducts(
   return plans;
 }
 
-[[nodiscard]] bool CompatibleRuntimeSuccessor(
-    const RuntimeUnitConvergencePlanRowDTO &predecessor,
-    const RuntimeUnitConvergencePlanRowDTO &candidate) {
+[[nodiscard]] bool
+CompatibleRuntimeSuccessor(const RuntimeUnitConvergencePlanRowDTO &predecessor,
+                           const RuntimeUnitConvergencePlanRowDTO &candidate) {
   // Each bundle was already verified against its own exact product, bindings,
   // endpoints, configuration, semantic requirement, and selected offer.
   // Runtime reports must still match the exact candidate facts before staged
@@ -440,21 +439,6 @@ MakeStagedEvidence(const RuntimeUnitConvergencePlanRowDTO &plan,
   return evidence;
 }
 
-[[nodiscard]] bool
-SameCurrentStagedEvidence(const ManagerApplyRuntimeStagedReadyDTO &left,
-                          const ManagerApplyRuntimeStagedReadyDTO &right) {
-  return left.apply_id == right.apply_id &&
-         left.apply_generation == right.apply_generation &&
-         left.runtime_convergence_intent_digest ==
-             right.runtime_convergence_intent_digest &&
-         left.predecessor_publication_generation ==
-             right.predecessor_publication_generation &&
-         left.predecessor_public_pointer_digest ==
-             right.predecessor_public_pointer_digest &&
-         left.evaluated_at_ns == right.evaluated_at_ns &&
-         left.runtime_units == right.runtime_units;
-}
-
 } // namespace
 
 std::vector<RuntimeUnitConvergencePlanRowDTO>
@@ -601,21 +585,21 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       [&](const RuntimeUnitConvergencePlanRowDTO &plan,
           const ProcessPresenceObservation &process) {
         if (!prior_staged_ready.has_value() ||
-            prior_staged_ready->staged_ready.runtime_convergence_intent_digest !=
+            prior_staged_ready->staged_ready
+                    .runtime_convergence_intent_digest !=
                 durable_intent.record.runtime_convergence_intent_digest ||
             process.state() != ProcessPresenceState::kPresent) {
           return false;
         }
         const auto &rows = prior_staged_ready->staged_ready.runtime_units;
-        const auto found = std::lower_bound(
-            rows.begin(), rows.end(), plan.runtime_unit_id,
-            [](const auto &row, const auto &runtime_unit_id) {
-              return row.runtime_unit_id < runtime_unit_id;
-            });
+        const auto found =
+            std::lower_bound(rows.begin(), rows.end(), plan.runtime_unit_id,
+                             [](const auto &row, const auto &runtime_unit_id) {
+                               return row.runtime_unit_id < runtime_unit_id;
+                             });
         return found != rows.end() &&
                found->runtime_unit_id == plan.runtime_unit_id &&
-               found->runtime_epoch.value() ==
-                   process.process_incarnation() &&
+               found->runtime_epoch.value() == process.process_incarnation() &&
                found->observed_product_identity == plan.product_identity &&
                found->observed_configuration_identity ==
                    plan.configuration_identity &&
@@ -632,7 +616,8 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
     expectations.push_back(MakeExpectation(plan));
   }
   RuntimeObservationReducer reducer(clock_ns_, std::move(declared_runtime_ids));
-  std::map<std::string, manyforge::core::ManagedRuntimeWithdrawalDTO> withdrawals;
+  std::map<std::string, manyforge::core::ManagedRuntimeWithdrawalDTO>
+      withdrawals;
 
   for (const auto index : dependency_order) {
     const auto &plan = convergence_intent.runtime_units[index];
@@ -660,9 +645,41 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
     ProcessPresenceObservation process =
         ObserveProcessSafely(process_port_, query);
     IngestObservedPresence(reducer, query, process);
+    if (prior_staged_ready.has_value()) {
+      const auto &retained_rows =
+          prior_staged_ready->staged_ready.runtime_units;
+      const auto retained = std::lower_bound(
+          retained_rows.begin(), retained_rows.end(), plan.runtime_unit_id,
+          [](const auto &row, const auto &runtime_unit_id) {
+            return row.runtime_unit_id < runtime_unit_id;
+          });
+      if (retained == retained_rows.end() ||
+          retained->runtime_unit_id != plan.runtime_unit_id) {
+        Fail("retained runtime readiness has no exact component epoch for " +
+             plan.runtime_unit_id.value());
+      }
+      if (process.state() != ProcessPresenceState::kPresent) {
+        Fail("retained component epoch is not currently present for " +
+             plan.runtime_unit_id.value() +
+             " [retained_epoch=" + retained->runtime_epoch.value() + "]");
+      }
+      if (process.process_incarnation() != retained->runtime_epoch.value()) {
+        Fail("current component epoch differs from retained Apply evidence "
+             "for " +
+             plan.runtime_unit_id.value() +
+             " [retained_epoch=" + retained->runtime_epoch.value() +
+             ", current_epoch=" + process.process_incarnation() + "]");
+      }
+      if (!prior_proves_candidate_preparation(plan, process)) {
+        Fail("current component identity differs from retained Apply evidence "
+             "for " +
+             plan.runtime_unit_id.value() +
+             " [retained_epoch=" + retained->runtime_epoch.value() + "]");
+      }
+    }
     if (plan.lifecycle_control ==
             manyforge::core::RuntimeLifecycleControl::kManagerManaged &&
-        !prior_proves_candidate_preparation(plan, process)) {
+        !prior_staged_ready.has_value()) {
       // Re-read the durable row's sealed requirement immediately before the
       // only managed lifecycle effect.  A journal replay cannot bypass this
       // admission by reusing an old process query.
@@ -738,6 +755,21 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       snapshot.observations().begin(), snapshot.observations().end(),
       [](const auto &observation) { return observation.converged(); });
   if (!all_converged) {
+    if (prior_staged_ready.has_value()) {
+      std::string detail =
+          "current readiness is unavailable for the retained component "
+          "epochs";
+      for (const auto &observation : snapshot.observations()) {
+        if (!observation.converged()) {
+          detail += " [runtime_unit_id=" + observation.runtime_unit_id();
+          for (const auto &reason : observation.reason_codes()) {
+            detail += ", reason=" + reason;
+          }
+          detail += "]";
+        }
+      }
+      Fail(detail);
+    }
     return {
         std::move(fence),
         durable_intent,
@@ -751,6 +783,20 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       publication_reader_, apply_intent, predecessor_publication_generation);
   if (final_publication != initial_publication) {
     Fail("predecessor publication changed before runtime staged-ready commit");
+  }
+
+  // The first durable staged-ready set is the runtime authority bound to this
+  // named Apply. Re-observation proves that its exact component epochs remain
+  // present and ready; it must never mint a fresher generation or rebind the
+  // original intent to newly observed children.
+  if (prior_staged_ready.has_value()) {
+    return {
+        std::move(fence),
+        durable_intent,
+        std::move(snapshot),
+        ManagerApplyRuntimeStagedReadyWriteResult{*prior_staged_ready, false},
+        ManagerRuntimeConvergenceResultState::kStagedReady,
+    };
   }
 
   std::vector<RuntimeUnitStagedReadyEvidenceDTO> staged_rows;
@@ -776,13 +822,10 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
               return left.runtime_unit_id < right.runtime_unit_id;
             });
 
-  const auto latest = apply_journal_.ReadLatestRuntimeStagedReady(
-      apply_intent.apply_id, apply_intent.apply_generation);
   ManagerApplyRuntimeStagedReadyDTO staged_ready{
       apply_intent.apply_id,
       apply_intent.apply_generation,
-      latest.has_value() ? latest->staged_ready.staged_ready_generation + 1U
-                         : 1U,
+      1U,
       durable_intent.record.runtime_convergence_intent_digest,
       initial_publication.publication_generation,
       initial_publication.durable_public_pointer_content_digest,
@@ -790,10 +833,7 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       std::move(staged_rows),
   };
   const auto durable_staged_ready =
-      latest.has_value() &&
-              SameCurrentStagedEvidence(latest->staged_ready, staged_ready)
-          ? ManagerApplyRuntimeStagedReadyWriteResult{*latest, false}
-          : apply_journal_.EnsureRuntimeStagedReady(staged_ready);
+      apply_journal_.EnsureRuntimeStagedReady(staged_ready);
 
   return {
       std::move(fence),

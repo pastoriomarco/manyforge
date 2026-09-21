@@ -1165,6 +1165,48 @@ TEST(HeadlessApiCore, PackageReadsRemainPinnedToTheStartupDirectoryDescriptor) {
 }
 
 TEST(HeadlessApiCore,
+     SparseCandidateOverlayDoesNotShadowInstalledScenarioClosure) {
+  TemporaryDirectory directory;
+  const auto package = directory.path() / "installed-package";
+  const auto candidate = directory.path() / "candidate-package";
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT, package,
+                        std::filesystem::copy_options::recursive);
+  std::filesystem::create_directories(candidate / "retained-bundles" /
+                                      "sha256");
+
+  const deployment::FilesystemScenarioApplyCandidateSource installed(
+      package, "maintained");
+  const auto expected =
+      installed.LoadExactProgramSelection("program_apply_fixture");
+  std::filesystem::copy_file(package / "maintained.scenario-catalog.yaml",
+                             candidate / "maintained.scenario-catalog.yaml");
+  const auto bundle_name =
+      expected.retained_bundle_id.value().substr(7U) + ".json";
+  std::filesystem::copy_file(
+      package / "retained-bundles" / "sha256" / bundle_name,
+      candidate / "retained-bundles" / "sha256" / bundle_name);
+
+  // A generated candidate is a sparse overlay.  Reusing the installed bundle
+  // does not make the overlay the owner of an unchanged scenario's Program
+  // Binding and Program.
+  const deployment::FilesystemScenarioApplyCandidateSource overlaid(
+      package, "maintained", candidate);
+  const auto selected =
+      overlaid.LoadExactProgramSelection("program_apply_fixture");
+  EXPECT_EQ(selected.program_binding_id, expected.program_binding_id);
+  EXPECT_EQ(selected.program_revision, expected.program_revision);
+  EXPECT_EQ(selected.retained_bundle_id, expected.retained_bundle_id);
+  EXPECT_FALSE(std::filesystem::exists(candidate / "program-bindings"));
+
+  const auto active = overlaid.TryLoadExactProgramSelectionForActive(
+      "program_apply_fixture", expected.retained_bundle_id,
+      expected.graph_revision);
+  ASSERT_TRUE(active.has_value());
+  EXPECT_EQ(active->scenario_catalog_revision,
+            expected.scenario_catalog_revision);
+}
+
+TEST(HeadlessApiCore,
      ProgramApplyDependsOnFreshManagerButNotUnrelatedSceneAvailability) {
   TemporaryDirectory directory;
   const auto package = directory.path() / "program-apply-package";

@@ -214,6 +214,8 @@ struct RetainedNativeRuntime final
       : motion_binding(std::move(motion)), gripper_binding(std::move(gripper)) {
   }
 
+  ~RetainedNativeRuntime();
+
   RetainedNativeRuntime(const RetainedNativeRuntime &) = delete;
   RetainedNativeRuntime &operator=(const RetainedNativeRuntime &) = delete;
 
@@ -309,6 +311,10 @@ struct RetainedNativeRuntime final
   [[nodiscard]] core::Result<core::RuntimeRouteConfigurationReadbackDTO>
   AdoptAndReadBackRouteConfigurationPredecessor(
       const core::ActiveControlConfigurationDTO &configuration);
+
+  /// Settle restart-orphaned resources after every retained route has been
+  /// re-established from fresh, command-free physical evidence.
+  [[nodiscard]] core::Result<void> ReconcileCommandFreeOrphans();
 
   [[nodiscard]] core::Result<std::optional<core::ActiveControlConfigurationDTO>>
   ReadCurrentPublishedRouteConfiguration(

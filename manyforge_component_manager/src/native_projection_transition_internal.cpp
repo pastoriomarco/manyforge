@@ -213,7 +213,7 @@ DeriveActiveNativeProjectionRuntimeBindings(
   for (const auto &requirement : requirements) {
     const auto *observation =
         observations.observation(requirement.runtime_unit_id.value());
-    if (observation == nullptr || !observation->converged() ||
+    if (observation == nullptr ||
         observation->lifecycle_control() !=
             RuntimeLifecycleControl::kManagerManaged ||
         observation->process_presence() != ProcessPresenceState::kPresent ||

@@ -253,9 +253,17 @@ RecoveryQuery(const PersistedManagerApplyFenceAttempt &attempt,
        rehydration->fence_results.front().state ==
            core::ApplyFenceReconcileState::kRecreated);
   if (!reconciled) {
-    FailUncertain(
+    std::string detail =
         "Kernel returned invalid, unresolved, or fail-closed Apply-fence "
-        "rehydration evidence",
+        "rehydration evidence";
+    if (rehydration->error.has_value()) {
+      detail += ": [" + rehydration->error->code + "] " +
+                rehydration->error->message;
+    } else if (rehydration->admission_fenced) {
+      detail += ": admission remains fenced";
+    }
+    FailUncertain(
+        std::move(detail),
         ManagerApplyFenceUncertaintyPhase::kRehydrateResponse,
         acquire_invoked_in_this_call, recovery_query, acceptance,
         observed_attempt_reconciliation, *rehydration);

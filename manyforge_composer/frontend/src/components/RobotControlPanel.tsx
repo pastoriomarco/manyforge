@@ -1313,6 +1313,9 @@ export function RobotControlPanelView({
               {state.error !== null && state.phase !== 'blocked' && (
                 <p className="robot-control-error" role="alert">{state.error}</p>
               )}
+              {state.ownerNotice !== null && (
+                <p className="robot-control-owner-notice">{state.ownerNotice}</p>
+              )}
               {recoveryRequired && (
                 <p className="robot-control-recovery-guidance">
                   {controller.currentStatus == null ? <>Robot status unavailable.

@@ -138,6 +138,71 @@ describe('runtime-scale control reads', () => {
   });
 });
 
+it('composes an identity-fenced stop-fault recovery from the live offer', async () => {
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(response({
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'get_stop_fault',
+      ok: true,
+      stop_fault: {
+        configuration_expectations: [{
+          active_control_configuration_generation: 4,
+          active_control_configuration_id: 'active.arm',
+          control_domain_id: 'robot.arm.control',
+        }],
+        latch: {
+          cell_id: 'cell.1',
+          graph_revision: 'sha256:graph',
+          latch_generation: 2,
+          latch_id: 'stop-fault.1',
+          recovery_assessment_revision: 3,
+          recovery_status: 'ready',
+          retained_bundle_id: 'sha256:bundle',
+          state: 'latched',
+          stop_certificate: {
+            stop_certificate_id: 'stop-certificate.1',
+            stop_certificate_revision: 1,
+            stop_generation: 4,
+            stop_id: 'stop.1',
+          },
+        },
+      },
+    }))
+    .mockResolvedValueOnce(response({
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'recover_stop_fault',
+      ok: true,
+      result: {
+        accepted: true,
+        error: null,
+        latch: {},
+        replay_status: 'accepted_new',
+        request_id: 'request.recover.1',
+      },
+    }));
+  vi.stubGlobal('fetch', fetchMock);
+
+  await api.execution.recoverStopFault('owner.1', 'request.recover.1');
+
+  const [, options] = fetchMock.mock.calls[1] as [string, RequestInit];
+  expect(JSON.parse(String(options.body))).toMatchObject({
+    request_context: {
+      request_id: 'request.recover.1',
+      request_owner_epoch: 'owner.1',
+      source_label: 'composer_ui',
+      correlation_id: null,
+    },
+    expected_latch_id: 'stop-fault.1',
+    expected_recovery_assessment_revision: 3,
+    expected_stop_certificate_id: 'stop-certificate.1',
+    configuration_expectations: [{
+      control_domain_id: 'robot.arm.control',
+      active_control_configuration_id: 'active.arm',
+      active_control_configuration_generation: 4,
+    }],
+  });
+});
+
 function response(
   payload: unknown,
   options: { ok?: boolean; status?: number; statusText?: string } = {},
@@ -596,6 +661,29 @@ describe('structural API client', () => {
     expect(applyUrl).toBe('/api/program/apply');
     expect(JSON.parse(String(applyOptions.body))).toEqual({
       ...draftFence(),
+    });
+  });
+
+  it('references the retained Deployment preparation when confirming Apply', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({}));
+    vi.stubGlobal('fetch', fetchMock);
+    const fence = draftFence();
+
+    await api.deploymentWorkspace.applyDraft(fence, {
+      token: `sha256:${'c'.repeat(64)}`,
+      preparation: {
+        requestOwnerEpoch: 'browser-owner-1',
+        requestId: 'prepare-1',
+      },
+    }).catch(() => null);
+
+    const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/deployment/draft/apply');
+    expect(JSON.parse(String(options.body))).toEqual({
+      ...fence,
+      confirmationToken: `sha256:${'c'.repeat(64)}`,
+      preparationRequestOwnerEpoch: 'browser-owner-1',
+      preparationRequestId: 'prepare-1',
     });
   });
 

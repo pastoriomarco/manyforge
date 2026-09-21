@@ -1103,10 +1103,12 @@ void WriteProjectionCommit(Writer &writer,
 ReadProjectionCommitState(Reader &reader) {
   switch (reader.Byte()) {
   case 0U:
-    return core::ProjectionCommitResultStateDTO::kCommitted;
+    return core::ProjectionCommitResultStateDTO::kAccepted;
   case 1U:
-    return core::ProjectionCommitResultStateDTO::kRejectedRollbackProven;
+    return core::ProjectionCommitResultStateDTO::kCommitted;
   case 2U:
+    return core::ProjectionCommitResultStateDTO::kRejectedRollbackProven;
+  case 3U:
     return core::ProjectionCommitResultStateDTO::kFailedProjectionUncertain;
   default:
     Fail("projection commit result state is unknown");
@@ -1291,10 +1293,12 @@ void WriteStageResult(Writer &writer,
 ReadStageResultState(Reader &reader) {
   switch (reader.Byte()) {
   case 0U:
-    return core::NativeProjectionStageResultState::kStaged;
+    return core::NativeProjectionStageResultState::kAccepted;
   case 1U:
-    return core::NativeProjectionStageResultState::kRejected;
+    return core::NativeProjectionStageResultState::kStaged;
   case 2U:
+    return core::NativeProjectionStageResultState::kRejected;
+  case 3U:
     return core::NativeProjectionStageResultState::kFailedProjectionUncertain;
   default:
     Fail("projection stage result state is unknown");
@@ -1350,10 +1354,12 @@ void WriteActivationResult(
 ReadActivationResultState(Reader &reader) {
   switch (reader.Byte()) {
   case 0U:
-    return core::NativeProjectionActivationResultState::kActivated;
+    return core::NativeProjectionActivationResultState::kAccepted;
   case 1U:
-    return core::NativeProjectionActivationResultState::kStale;
+    return core::NativeProjectionActivationResultState::kActivated;
   case 2U:
+    return core::NativeProjectionActivationResultState::kStale;
+  case 3U:
     return core::NativeProjectionActivationResultState::
         kFailedProjectionUncertain;
   default:
@@ -1547,12 +1553,14 @@ ReadStatusState(Reader &reader) {
   case 0U:
     return core::NativeProjectionStatusState::kAbsent;
   case 1U:
-    return core::NativeProjectionStatusState::kStaged;
+    return core::NativeProjectionStatusState::kProgressing;
   case 2U:
-    return core::NativeProjectionStatusState::kActivated;
+    return core::NativeProjectionStatusState::kStaged;
   case 3U:
-    return core::NativeProjectionStatusState::kDiscarded;
+    return core::NativeProjectionStatusState::kActivated;
   case 4U:
+    return core::NativeProjectionStatusState::kDiscarded;
+  case 5U:
     return core::NativeProjectionStatusState::kFailedProjectionUncertain;
   default:
     Fail("projection status state is unknown");

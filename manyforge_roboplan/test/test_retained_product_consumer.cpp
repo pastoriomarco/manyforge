@@ -10,12 +10,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/geometry/pose_math.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/runtime_participant_registry.hpp>
 #include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
@@ -34,6 +36,7 @@
 #include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <roboplan/core/geometry_wrappers.hpp>
 #include <roboplan/core/scene.hpp>
@@ -76,6 +79,217 @@ static_assert(!std::is_default_constructible_v<
               deployment::VerifiedRetainedProjectionInput>);
 static_assert(
     !std::is_aggregate_v<deployment::VerifiedRetainedProjectionInput>);
+
+struct SubscriptionObservationSnapshot final {
+  std::size_t active_subscriptions{};
+  std::size_t subscriptions{};
+  std::size_t unsubscriptions{};
+  std::size_t observer_destructions{};
+  std::size_t destructions_with_active_subscription{};
+  std::size_t peer_back_pointer_observations{};
+  std::size_t uncleared_peer_back_pointers{};
+};
+
+/// External observation state for joined-engine teardown. It owns neither an
+/// observer nor an underlying engine, so keeping this ledger after root reset
+/// cannot extend any production lifetime under test.
+class SubscriptionObservationLedger final {
+public:
+  void Subscribed(const std::string &observer,
+                  const std::uint64_t handle) {
+    std::lock_guard lock(mutex_);
+    if (!active_.emplace(observer, handle).second) {
+      throw std::logic_error(
+          "real participant returned a duplicate subscription handle");
+    }
+    ++subscriptions_;
+  }
+
+  void Unsubscribed(const std::string &observer,
+                    const std::uint64_t handle) {
+    std::lock_guard lock(mutex_);
+    if (active_.erase({observer, handle}) == 1U) {
+      ++unsubscriptions_;
+    }
+  }
+
+  void ObserverDestroyed(const std::string &observer,
+                         const bool observes_peer,
+                         const bool peer_back_pointers_cleared) {
+    std::lock_guard lock(mutex_);
+    ++observer_destructions_;
+    if (std::any_of(active_.begin(), active_.end(), [&](const auto &entry) {
+          return entry.first == observer;
+        })) {
+      ++destructions_with_active_subscription_;
+    }
+    if (observes_peer) {
+      ++peer_back_pointer_observations_;
+      if (!peer_back_pointers_cleared) {
+        ++uncleared_peer_back_pointers_;
+      }
+    }
+  }
+
+  [[nodiscard]] SubscriptionObservationSnapshot Snapshot() const {
+    std::lock_guard lock(mutex_);
+    return {active_.size(),
+            subscriptions_,
+            unsubscriptions_,
+            observer_destructions_,
+            destructions_with_active_subscription_,
+            peer_back_pointer_observations_,
+            uncleared_peer_back_pointers_};
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::set<std::pair<std::string, std::uint64_t>> active_;
+  std::size_t subscriptions_{};
+  std::size_t unsubscriptions_{};
+  std::size_t observer_destructions_{};
+  std::size_t destructions_with_active_subscription_{};
+  std::size_t peer_back_pointer_observations_{};
+  std::size_t uncleared_peer_back_pointers_{};
+};
+
+/// Runtime-owned observer that delegates to and owns one real participant
+/// engine. Only the non-owning addressed registration points at this wrapper;
+/// an aliasing participant_engine shared_ptr below makes the runtime itself the
+/// wrapper owner without changing the production runtime shape.
+class SubscriptionObservedParticipantEngine final
+    : public core::IResolvedParticipantExecutionEngine {
+public:
+  SubscriptionObservedParticipantEngine(
+      std::shared_ptr<core::IResolvedParticipantExecutionEngine> engine,
+      std::shared_ptr<SubscriptionObservationLedger> ledger,
+      std::string observer,
+      std::function<bool()> peer_back_pointers_cleared = {})
+      : engine_(std::move(engine)), ledger_(std::move(ledger)),
+        observer_(std::move(observer)),
+        peer_back_pointers_cleared_(
+            std::move(peer_back_pointers_cleared)) {
+    if (engine_ == nullptr || ledger_ == nullptr || observer_.empty()) {
+      throw std::invalid_argument("observed participant engine is absent");
+    }
+  }
+
+  ~SubscriptionObservedParticipantEngine() override {
+    ledger_->ObserverDestroyed(
+        observer_, static_cast<bool>(peer_back_pointers_cleared_),
+        !peer_back_pointers_cleared_ || peer_back_pointers_cleared_());
+  }
+
+  core::Result<std::uint64_t>
+  execute(const core::ExecuteRequestDTO &request) override {
+    return Require()->execute(request);
+  }
+  core::AddressedParticipantStopFenceDisposition
+  fence_addressed_participant_stop(
+      const std::uint64_t execution_id) noexcept override {
+    return engine_->fence_addressed_participant_stop(execution_id);
+  }
+  core::Result<core::AddressedParticipantStopSettlementDTO>
+  settle_addressed_participant_stop(
+      const core::AddressedParticipantStopSettlementRequestDTO &request)
+      override {
+    return Require()->settle_addressed_participant_stop(request);
+  }
+  core::PauseResultDTO pause() override { return Require()->pause(); }
+  core::ResumeResultDTO resume(
+      std::optional<std::uint64_t> expected_epoch = std::nullopt) override {
+    return Require()->resume(expected_epoch);
+  }
+  core::ResetResultDTO reset(
+      std::optional<std::uint64_t> expected_epoch = std::nullopt) override {
+    return Require()->reset(expected_epoch);
+  }
+  core::ResetResultDTO reset_after_certified_containment(
+      const std::uint64_t execution_id,
+      std::optional<std::uint64_t> expected_epoch = std::nullopt) override {
+    return Require()->reset_after_certified_containment(execution_id,
+                                                        expected_epoch);
+  }
+  core::AcknowledgeCompletedResultDTO acknowledge_completed(
+      const std::uint64_t execution_id,
+      std::optional<std::uint64_t> expected_epoch = std::nullopt) override {
+    return Require()->acknowledge_completed(execution_id, expected_epoch);
+  }
+  core::Result<core::ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
+      const core::ResolvedRuntimeScaleCommandDTO &command) override {
+    return Require()->set_runtime_scale(command);
+  }
+  core::Result<core::ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
+      const core::OperationId &operation_id,
+      const core::ControlBindingId &control_binding_id) const override {
+    return Require()->runtime_scale_status(operation_id, control_binding_id);
+  }
+  core::GripperCommandResultDTO command_gripper(
+      const core::GripperCommandRequestDTO &request) override {
+    return Require()->command_gripper(request);
+  }
+  core::Result<void> validate_gripper_command(
+      const core::GripperCommandRequestDTO &request) const override {
+    return Require()->validate_gripper_command(request);
+  }
+  core::GripperCommandStatusDTO
+  get_gripper_status(const std::string &gripper_id) const override {
+    return Require()->get_gripper_status(gripper_id);
+  }
+  core::Result<std::uint64_t>
+  stop_gripper(const std::string &gripper_id,
+               const std::uint64_t expected_command_id,
+               const std::uint64_t expected_generation) override {
+    return Require()->stop_gripper(gripper_id, expected_command_id,
+                                   expected_generation);
+  }
+  core::Result<void>
+  reset_gripper(const std::string &gripper_id,
+                const std::uint64_t expected_command_id,
+                const std::uint64_t expected_generation) override {
+    return Require()->reset_gripper(gripper_id, expected_command_id,
+                                    expected_generation);
+  }
+  core::ExecutionStatus get_status() const override {
+    return Require()->get_status();
+  }
+  core::KernelRecoveryAssessmentDTO
+  get_recovery_assessment() const override {
+    return Require()->get_recovery_assessment();
+  }
+  core::KernelRecoveryActionResultDTO apply_recovery_action(
+      const core::KernelRecoveryActionRequestDTO &request) override {
+    return Require()->apply_recovery_action(request);
+  }
+
+  core::SubscriptionHandle
+  subscribe_events(core::EventCallback callback) override {
+    const auto engine = Require();
+    const auto handle = engine->subscribe_events(std::move(callback));
+    try {
+      ledger_->Subscribed(observer_, handle.id);
+    } catch (...) {
+      engine->unsubscribe_events(handle);
+      throw;
+    }
+    return handle;
+  }
+  void unsubscribe_events(const core::SubscriptionHandle handle) override {
+    Require()->unsubscribe_events(handle);
+    ledger_->Unsubscribed(observer_, handle.id);
+  }
+
+private:
+  [[nodiscard]] std::shared_ptr<core::IResolvedParticipantExecutionEngine>
+  Require() const {
+    return engine_;
+  }
+
+  std::shared_ptr<core::IResolvedParticipantExecutionEngine> engine_;
+  std::shared_ptr<SubscriptionObservationLedger> ledger_;
+  std::string observer_;
+  std::function<bool()> peer_back_pointers_cleared_;
+};
 
 [[nodiscard]] core::LogicalSceneSnapshotRoot
 make_projection_runtime_shadow_snapshot(const core::CellId &cell_id) {
@@ -2460,6 +2674,7 @@ TEST(RetainedProductCrossConsumer,
       {},
       {},
       {}};
+  runtime_input.deployment_maximum_tcp_linear_speed_mps = 0.15;
   core::OrdinaryMotionJerkPolicy jerk_profile{true, false, {}};
   for (const auto &resource : arm_binding.value().resources)
     jerk_profile.limits.emplace(*resource.source_joint_name,
@@ -2701,6 +2916,360 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(idle.affected_active_operation_count, 0U);
   EXPECT_EQ(runtime->participant_engine->get_metrics().executions_completed,
             0U);
+}
+
+TEST(RetainedProductCrossConsumer,
+     RootOwnedJoinedTwoLite6TeardownRetiresKernelBeforePeerEngines) {
+  ScopedTemporaryRoot temporary;
+  const std::filesystem::path package_root =
+      temporary.path() / "retained-package";
+  const std::filesystem::path staging_parent =
+      temporary.path() / "private-stages";
+  const std::filesystem::path empty_ambient_root =
+      temporary.path() / "empty-ambient";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+  ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
+  ASSERT_TRUE(std::filesystem::create_directory(empty_ambient_root));
+
+  constexpr std::string_view cell_id = "i6_joined_teardown_cell";
+  const auto materialized = deployment::test::
+      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+          package_root, cell_id);
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto &bundle = *materialized.bundle;
+  const auto &products = bundle.value().compiled_products;
+  ASSERT_EQ(products.symbol_role_maps.size(), 1U);
+  const auto retained = load_lite6_planning_model(
+      package_root,
+      {bundle.retained_bundle_id(),
+       products.planning_collision_model.product_id});
+  const auto model_map = load_lite6_model_map(
+      package_root,
+      {bundle.retained_bundle_id(),
+       products.symbol_role_maps.front().product_id});
+  deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
+  const auto program_inventory =
+      deployment::compile_direct_control_program_binding_inventory(
+          bundle, model_map, catalog_store);
+  ASSERT_EQ(program_inventory.motion.size(), 2U);
+  ASSERT_TRUE(program_inventory.gripper.empty());
+
+  std::vector<core::RuntimeParticipantBinding> physical_bindings;
+  physical_bindings.reserve(program_inventory.motion.size());
+  std::set<core::ResourceId> physical_resources;
+  std::set<core::ControllableComponentId> component_ids;
+  std::set<core::RuntimeUnitId> runtime_unit_ids;
+  std::size_t physical_resource_count = 0U;
+  for (const auto &program_binding : program_inventory.motion) {
+    ASSERT_NE(program_binding, nullptr);
+    ASSERT_EQ(program_binding->value().component_role_bindings.size(), 1U);
+    const auto component_id = program_binding->value()
+                                  .component_role_bindings.front()
+                                  .controllable_component_id;
+    auto physical = with_program_binding_identity(
+        make_fixture_runtime_participant(
+            bundle, model_map, component_id,
+            core::CommandTargetId(
+                std::string(deployment::test::kLite6ArmTargetId))),
+        *program_binding);
+    ASSERT_TRUE(physical.value().control_path.has_value());
+    EXPECT_TRUE(component_ids.insert(component_id).second);
+    EXPECT_TRUE(runtime_unit_ids
+                    .insert(physical.value()
+                                .control_path->provider_runtime_unit_id)
+                    .second);
+    for (const auto &resource : physical.value().resources) {
+      ++physical_resource_count;
+      EXPECT_TRUE(physical_resources.insert(resource.resource_id).second)
+          << resource.resource_id.value();
+    }
+    physical_bindings.push_back(std::move(physical));
+  }
+  ASSERT_EQ(component_ids.size(), 2U);
+  ASSERT_EQ(runtime_unit_ids.size(), 2U);
+  ASSERT_EQ(physical_resources.size(), physical_resource_count);
+
+  auto model_stage =
+      RetainedPlanningModelStage::create_verified(retained, staging_parent);
+  ScopedCurrentDirectory no_ambient_lookup(empty_ambient_root);
+  const auto initial_scene = make_projection_runtime_shadow_snapshot(
+      bundle.value().cell_graph.cell_id);
+  std::vector<std::shared_ptr<RetainedNativeRuntime>> runtimes;
+  runtimes.reserve(physical_bindings.size());
+  for (std::size_t index = 0U; index < physical_bindings.size(); ++index) {
+    const auto &physical = physical_bindings[index];
+    const auto runtime_name =
+        "retained_lite6_joined_teardown_" + std::to_string(index + 1U);
+    auto scene = std::make_shared<roboplan::Scene>(
+        runtime_name, std::string(model_stage.loader_urdf_bytes()),
+        std::string(model_stage.srdf_bytes()), model_stage.package_paths());
+    auto scene_mutex = std::make_shared<std::mutex>();
+    auto state_projector = std::make_shared<RetainedKinematicStateProjector>(
+        RetainedKinematicStateProjector::create_verified(
+            scene, scene_mutex, bundle, model_map, retained,
+            std::vector<core::RuntimeParticipantBinding>{physical}, 0));
+
+    ASSERT_EQ(physical.value().model_groups.size(), 1U);
+    auto shared_collision_model = ManyForgeCollisionEngine::load_shared_model(
+        runtime_name, model_stage.loader_urdf_path(), model_stage.srdf_path(),
+        model_stage.package_paths(),
+        physical.value().model_groups.front().compiled_group_name);
+    auto collision_projector =
+        RetainedCollisionWorldProjector::create_verified(
+            shared_collision_model, bundle, model_map, retained);
+    const auto &control = *physical.value().control_path;
+    const core::ProjectionNativeRuntimeBindingDTO native_binding{
+        core::CapabilityProviderBindingId("lite6.joined.projection." +
+                                          std::to_string(index + 1U)),
+        core::CapabilityProviderBindingRevision(
+            "lite6-joined-projection-v1"),
+        control.provider_runtime_unit_id, control.provider_runtime_epoch};
+    auto projection_clock = std::make_shared<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    auto projection_result = RetainedPlannerSceneProjection::CreateInitialized(
+        std::move(collision_projector), products.planning_collision_model,
+        native_binding, *initial_scene.shared(),
+        RetainedPlannerSceneProjectionConfig{runtime_name, 32U, 32U},
+        [projection_clock] { return (*projection_clock)++; });
+    ASSERT_TRUE(projection_result.ok())
+        << projection_result.error().message;
+    auto projection = std::move(projection_result.value());
+    const auto projection_inventory =
+        projection->current_scene_snapshot_lease_inventory();
+    ASSERT_TRUE(projection_inventory.has_value());
+
+    const auto candidate_binding = make_candidate_binding(physical);
+    ProcessContainedCandidateClientConfig candidate_config;
+    candidate_config.worker_executable =
+        MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH;
+    candidate_config.require_retained_projection = true;
+    auto planner = std::make_unique<RoboPlanPlannerBackend>(
+        projection_inventory->projection_binding, candidate_binding,
+        std::make_unique<ProcessContainedRoboPlanCandidateClient>(
+            RoboPlanWorkerModelDTO{runtime_name + "_worker",
+                                   model_stage.loader_urdf_path(),
+                                   model_stage.srdf_path(),
+                                   model_stage.package_paths(), std::nullopt,
+                                   {}, {}},
+            candidate_binding,
+            RoboPlanCandidateComputerConfig{
+                .rng_seed = static_cast<std::uint64_t>(17U + index)},
+            std::move(candidate_config)));
+    RetainedNativeRuntimeConfig runtime_config{
+        core::RequestOwnerEpoch("i6.joined.prejoin." +
+                                std::to_string(index + 1U)),
+        bundle.value().cell_graph.cell_id,
+        temporary.path() /
+            ("unused-joined-" + std::to_string(index + 1U) + ".sqlite3"),
+        1024U,
+        core::CacheConfig{},
+        core::ExecutionKernelConfig{},
+        RoboPlanExecutionBackendConfig{},
+        SimpleSchedulerConfig{},
+        10'000'000,
+        std::vector<double>(physical.value().resources.size(), 0.0),
+        core::StopDeadlineBudgetDTO{1'000'000'000, 100'000'000, {}},
+        kMaintainedNativeStopSurveillancePolicy,
+        {},
+        {},
+        {},
+        {}};
+    runtime_config.kernel.runtime_collision_stop_owned_by_addressed_kernel =
+        true;
+    const auto local_runtime_unit_id = control.provider_runtime_unit_id;
+    const auto local_runtime_epoch = control.provider_runtime_epoch;
+    const auto local_component_id = physical.value().controllable_component_id;
+    auto runtime_input = RetainedNativeRuntimeInput{
+        physical,
+        std::nullopt,
+        {},
+        {},
+        {},
+        {},
+        scene,
+        scene_mutex,
+        state_projector,
+        projection,
+        shared_collision_model,
+        std::move(planner),
+        [shared_collision_model, bundle_root = materialized.bundle, &model_map,
+         &retained, local_runtime_unit_id, local_runtime_epoch,
+         local_component_id](const auto &channels) {
+          std::vector<RetainedSceneFrameStateSourceInput> state_sources;
+          state_sources.reserve(channels.size());
+          for (const auto &channel : channels) {
+            state_sources.push_back(RetainedSceneFrameStateSourceInput{
+                channel->query_context(), channel->source_kind(),
+                std::shared_ptr<const core::IObservedStateProvider>(
+                    channel, channel->addressed_publication())});
+          }
+          return RetainedSceneFrameResolver::create_verified(
+              shared_collision_model, *bundle_root, model_map, retained,
+              local_runtime_unit_id, local_runtime_epoch,
+              std::move(state_sources), local_component_id);
+        },
+        {},
+        {},
+        nullptr,
+        {},
+        {},
+        {},
+        {},
+        {},
+        {}};
+    runtime_input.deployment_maximum_tcp_linear_speed_mps = 0.15;
+
+    std::shared_ptr<RetainedNativeRuntime> runtime;
+    if (runtimes.empty()) {
+      runtime = create_retained_native_runtime_participants(
+          std::move(runtime_input), std::move(runtime_config));
+    } else {
+      runtime = create_retained_native_runtime_participants(
+          std::move(runtime_input), std::move(runtime_config),
+          runtimes.front()->clock, runtimes.front()->scheduler);
+    }
+    ASSERT_NE(runtime, nullptr);
+    ASSERT_NE(runtime->participant_engine, nullptr);
+    ASSERT_NE(runtime->motion_state_channel, nullptr);
+    ASSERT_NE(runtime->reference_resolver, nullptr);
+    EXPECT_EQ(runtime->motion_binding.value(), physical.value());
+    EXPECT_EQ(runtime->motion_state_channel->binding().value(),
+              physical.value());
+    EXPECT_FALSE(runtime->gripper_binding.has_value());
+    EXPECT_EQ(runtime->gripper_state_channel, nullptr);
+    runtimes.push_back(std::move(runtime));
+  }
+
+  ASSERT_EQ(runtimes.size(), 2U);
+  auto primary = std::move(runtimes[0]);
+  auto peer = std::move(runtimes[1]);
+  runtimes.clear();
+  ASSERT_EQ(primary->clock, peer->clock);
+  ASSERT_EQ(primary->scheduler, peer->scheduler);
+
+  auto subscription_ledger =
+      std::make_shared<SubscriptionObservationLedger>();
+  auto retained_primary_engine = primary->participant_engine;
+  auto retained_peer_engine = peer->participant_engine;
+  std::weak_ptr<core::ExecutionKernel> primary_engine_lifetime =
+      retained_primary_engine;
+  std::weak_ptr<core::ExecutionKernel> peer_engine_lifetime =
+      retained_peer_engine;
+  auto primary_subscription =
+      std::make_shared<SubscriptionObservedParticipantEngine>(
+          retained_primary_engine, subscription_ledger, "primary");
+  auto *const peer_observation = peer.get();
+  auto peer_subscription =
+      std::make_shared<SubscriptionObservedParticipantEngine>(
+          retained_peer_engine, subscription_ledger, "peer",
+          [peer_observation] {
+            return peer_observation->cell_addressed_kernel == nullptr &&
+                   peer_observation->cell_runtime_root == nullptr;
+          });
+  std::weak_ptr<SubscriptionObservedParticipantEngine>
+      primary_subscription_lifetime = primary_subscription;
+  std::weak_ptr<SubscriptionObservedParticipantEngine>
+      peer_subscription_lifetime = peer_subscription;
+
+  primary->participant_engine = std::shared_ptr<core::ExecutionKernel>(
+      primary_subscription, retained_primary_engine.get());
+  peer->participant_engine = std::shared_ptr<core::ExecutionKernel>(
+      peer_subscription, retained_peer_engine.get());
+  std::size_t primary_observed_registrations = 0U;
+  for (auto &registration : primary->participant_registrations) {
+    if (registration.engine == retained_primary_engine.get()) {
+      registration.engine = primary_subscription.get();
+      ++primary_observed_registrations;
+    }
+  }
+  std::size_t peer_observed_registrations = 0U;
+  for (auto &registration : peer->participant_registrations) {
+    if (registration.engine == retained_peer_engine.get()) {
+      registration.engine = peer_subscription.get();
+      ++peer_observed_registrations;
+    }
+  }
+  ASSERT_EQ(primary_observed_registrations, 1U);
+  ASSERT_EQ(peer_observed_registrations, 1U);
+
+  RetainedRuntimeParticipantResolverFactory joined_resolver_factory =
+      [](std::vector<core::RuntimeParticipantBinding> joined_bindings)
+          -> RetainedRuntimeParticipantResolver {
+        auto registry = std::make_shared<core::RuntimeParticipantRegistry>(
+            std::move(joined_bindings));
+        return [registry](const core::OperationIntentDTO &operation,
+                          const std::size_t participant_index)
+                   -> core::Result<RetainedResolvedParticipant> {
+          auto binding = registry->resolve(operation, participant_index);
+          if (!binding.ok()) {
+            return core::Result<RetainedResolvedParticipant>::Err(
+                binding.error());
+          }
+          return core::Result<RetainedResolvedParticipant>::Ok(
+              {std::move(binding.value()), false});
+        };
+      };
+  join_retained_native_runtime_participants(
+      primary, {peer}, std::move(joined_resolver_factory));
+  attach_retained_native_addressed_owner(
+      primary,
+      RetainedNativeAddressedOwnerConfig{
+          core::RequestOwnerEpoch("i6.joined.owner.epoch.1"),
+          bundle.value().cell_graph.cell_id,
+          temporary.path() / "joined-operation-journal.sqlite3",
+          1024U,
+          nullptr,
+          bundle.value().cell_graph.graph_revision,
+          core::StopDeadlineBudgetDTO{1'000'000'000, 100'000'000, {}},
+          {},
+          {},
+          {},
+          {}});
+
+  ASSERT_NE(primary->addressed_kernel, nullptr);
+  EXPECT_TRUE(primary->addressed_kernel->participant_engine_in_use(
+      primary_subscription.get()));
+  EXPECT_TRUE(primary->addressed_kernel->participant_engine_in_use(
+      peer_subscription.get()));
+  const auto subscribed = subscription_ledger->Snapshot();
+  ASSERT_EQ(subscribed.active_subscriptions, 2U);
+  ASSERT_EQ(subscribed.subscriptions, 2U);
+  ASSERT_EQ(subscribed.unsubscriptions, 0U);
+  ASSERT_EQ(peer->cell_addressed_kernel, primary->addressed_kernel.get());
+  ASSERT_EQ(peer->cell_runtime_root, primary.get());
+
+  std::weak_ptr<RetainedNativeRuntime> primary_runtime_lifetime = primary;
+  std::weak_ptr<RetainedNativeRuntime> peer_runtime_lifetime = peer;
+  primary_subscription.reset();
+  peer_subscription.reset();
+  retained_primary_engine.reset();
+  retained_peer_engine.reset();
+  peer.reset();
+  ASSERT_EQ(primary.use_count(), 1U);
+  ASSERT_FALSE(peer_runtime_lifetime.expired());
+  ASSERT_FALSE(primary_subscription_lifetime.expired());
+  ASSERT_FALSE(peer_subscription_lifetime.expired());
+  ASSERT_FALSE(primary_engine_lifetime.expired());
+  ASSERT_FALSE(peer_engine_lifetime.expired());
+
+  primary.reset();
+
+  EXPECT_TRUE(primary_runtime_lifetime.expired());
+  EXPECT_TRUE(peer_runtime_lifetime.expired());
+  EXPECT_TRUE(primary_subscription_lifetime.expired());
+  EXPECT_TRUE(peer_subscription_lifetime.expired());
+  EXPECT_TRUE(primary_engine_lifetime.expired());
+  EXPECT_TRUE(peer_engine_lifetime.expired());
+  const auto retired = subscription_ledger->Snapshot();
+  EXPECT_EQ(retired.active_subscriptions, 0U);
+  EXPECT_EQ(retired.subscriptions, 2U);
+  EXPECT_EQ(retired.unsubscriptions, 2U);
+  EXPECT_EQ(retired.observer_destructions, 2U);
+  EXPECT_EQ(retired.destructions_with_active_subscription, 0U);
+  EXPECT_EQ(retired.peer_back_pointer_observations, 1U);
+  EXPECT_EQ(retired.uncleared_peer_back_pointers, 0U);
 }
 
 TEST(RetainedProductCrossConsumer,

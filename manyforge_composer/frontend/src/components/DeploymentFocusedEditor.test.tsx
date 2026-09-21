@@ -95,6 +95,7 @@ function controller(): DeploymentWorkspaceController {
     },
     loading: false,
     busy: false,
+    applying: false,
     error: null,
     feedback: null,
     pendingApplyConfirmation: null,

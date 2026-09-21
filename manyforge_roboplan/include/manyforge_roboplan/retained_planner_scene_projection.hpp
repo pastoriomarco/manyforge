@@ -162,15 +162,44 @@ private:
     core::ProjectionRevisionDTO target;
   };
 
+  enum class RebuildConstructionContext {
+    kOrdinary,
+    kBootstrap,
+  };
+
+  /// Terminal record for the one native stage that owns this runtime.
+  ///
+  /// It is the bounded replay record for Stage, activation, status and discard.
+  /// A confirmed discard or a consumed activation releases every heavy capture
+  /// - the candidate projector with its shared collision model, the candidate
+  /// planning collision model, the candidate frame resolver and the candidate
+  /// publisher - while the exact identity and the one stored result stay
+  /// available, so replay describes what happened instead of depending on a
+  /// candidate that can no longer be published.
   struct StageRecord final {
     core::NativeProjectionStageDTO request;
-    RetainedCollisionWorldProjector candidate_projector;
-    core::RetainedProductDTO candidate_planning_collision_model;
+    std::optional<RetainedCollisionWorldProjector> candidate_projector;
+    std::optional<core::RetainedProductDTO> candidate_planning_collision_model;
     std::shared_ptr<const RetainedSceneFrameResolver> candidate_frame_resolver;
     std::shared_ptr<RetainedCollisionWorldPublisher> candidate_publisher;
     core::NativeProjectionStageResultDTO stage_result;
     bool activated{};
     bool discarded{};
+
+    /// Drops everything except the exact identity and the stored result.
+    void ReleaseCaptures() {
+      candidate_projector.reset();
+      candidate_planning_collision_model.reset();
+      candidate_frame_resolver.reset();
+      candidate_publisher.reset();
+    }
+
+    /// The staged-candidate identity this record was created for.
+    [[nodiscard]] core::ProjectionStagedCandidateDTO staged_candidate() const {
+      return {request.apply_id, request.apply_generation,
+              request.projection_stage_generation,
+              request.candidate_projection_revision};
+    }
   };
 
   struct RetireRecord final {
@@ -205,8 +234,17 @@ private:
                 core::ErrorDTO error);
   [[nodiscard]] bool
   HealthyAt(const core::ProjectionRevisionDTO &revision) const noexcept;
+  /// True when the retained StageRecord can still be honored as staged: it is
+  /// either already activated - a historical truth whose duplicate captures
+  /// have been released - or its candidate publisher is still the one the
+  /// health row publishes. A confirmed discard or a recovery Rebuild that
+  /// replaced the staged candidate makes this false, so no observation path can
+  /// reconstruct a Staged success for a candidate that can never publish.
+  [[nodiscard]] bool RetainedStageReplayable() const;
   [[nodiscard]] core::ProjectionCommitResultDTO
-  RebuildProjectionLocked(const core::NativeProjectionRebuildDTO &request);
+  RebuildProjectionLocked(
+      const core::NativeProjectionRebuildDTO &request,
+      RebuildConstructionContext construction_context);
 
   RetainedCollisionWorldProjector projector_;
   core::RetainedProductDTO planning_collision_model_;

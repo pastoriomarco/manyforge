@@ -33,6 +33,11 @@ export type ExecutionObservationTransportPhase =
   | 'connecting'
   | 'waiting'
   | 'live'
+  /**
+   * The current frame belongs to the previous runtime/model identity. The
+   * transport is being replaced deliberately; this is not a network fault.
+   */
+  | 'synchronizing'
   | 'reconnecting';
 
 export interface ExecutionObservationTransportStatus {

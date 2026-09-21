@@ -23,9 +23,9 @@ using core::ProjectionApplyStatusState;
 using core::ProjectionTransitionRowDTO;
 using deployment::RetainedBundle;
 
-[[nodiscard]] bool SameDeploymentRevision(
-    const core::ProjectionRevisionDTO &left,
-    const core::ProjectionRevisionDTO &right) noexcept {
+[[nodiscard]] bool
+SameDeploymentRevision(const core::ProjectionRevisionDTO &left,
+                       const core::ProjectionRevisionDTO &right) noexcept {
   return left.retained_bundle_id == right.retained_bundle_id &&
          left.graph_revision == right.graph_revision;
 }
@@ -97,9 +97,9 @@ VerifyCurrentPredecessor(const core::IActiveBundlePublicationReader &reader,
           stage_intent.predecessor_publication_generation ||
       receipt.durable_public_pointer_content_digest !=
           stage_intent.predecessor_public_pointer_digest ||
-      !SameDeploymentRevision(receipt.request.candidate_projection_revision,
-                              stage_intent
-                                  .expected_active_projection_revision) ||
+      !SameDeploymentRevision(
+          receipt.request.candidate_projection_revision,
+          stage_intent.expected_active_projection_revision) ||
       receipt.request.candidate_retained_bundle_id !=
           stage_intent.expected_active_projection_revision.retained_bundle_id ||
       receipt.request.candidate_graph_revision !=
@@ -128,7 +128,8 @@ ObservePredecessorNativeHealth(
       if (!status.presence_valid() ||
           status.state != core::ProjectionBootstrapStatusState::kFinalized ||
           status.canonical_empty_target !=
-              std::optional<core::ProjectionRevisionDTO>{expected_predecessor} ||
+              std::optional<core::ProjectionRevisionDTO>{
+                  expected_predecessor} ||
           status.publication_receipt !=
               std::optional<ActiveBundlePublicationReceiptDTO>{
                   current_publication} ||
@@ -277,11 +278,13 @@ ManagerSceneStageCoordinator::ManagerSceneStageCoordinator(
     const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
     const core::IActiveBundlePublicationReader &publication_reader,
     core::IManagerSceneProjectionHandoffPort &scene_owner,
-    core::IManagerSceneProjectionBootstrapPort *bootstrap_scene_owner)
+    core::IManagerSceneProjectionBootstrapPort *bootstrap_scene_owner,
+    IRuntimeUnitProcessPort *runtime_process_port)
     : apply_journal_(apply_journal),
       retained_bundle_source_(retained_bundle_source),
       publication_reader_(publication_reader), scene_owner_(scene_owner),
-      bootstrap_scene_owner_(bootstrap_scene_owner) {}
+      bootstrap_scene_owner_(bootstrap_scene_owner),
+      runtime_process_port_(runtime_process_port) {}
 
 ManagerSceneStageResult ManagerSceneStageCoordinator::StageOrRecover(
     const ApplyId &apply_id, const ApplyGeneration apply_generation) {
@@ -302,58 +305,65 @@ ManagerSceneStageResult ManagerSceneStageCoordinator::StageOrRecover(
                                    apply->intent.candidate_retained_bundle_id);
   VerifyBundleBindings(apply->intent, *predecessor, *candidate);
 
-  ManagerApplySceneStageIntentWriteResult durable_intent = [&] {
+  const auto append_intent =
+      [&](const PersistedManagerApplyRuntimeStagedReady &ready) {
+        std::vector<core::ProjectionHealthDTO> predecessor_health;
+        if (detail::HasNativeProjectionRequirements(predecessor->value())) {
+          const auto current = VerifyCurrentPredecessor(
+              publication_reader_,
+              ManagerApplySceneStageIntentDTO{
+                  apply_id,
+                  apply_generation,
+                  ready.staged_ready_digest,
+                  ready.staged_ready.predecessor_publication_generation,
+                  ready.staged_ready.predecessor_public_pointer_digest,
+                  apply->intent.expected_active_projection_revision,
+                  apply->intent.candidate_retained_bundle_id,
+                  apply->intent.candidate_graph_revision,
+                  {},
+              });
+          predecessor_health = ObservePredecessorNativeHealth(
+              current, apply->intent.expected_active_projection_revision,
+              scene_owner_, bootstrap_scene_owner_);
+        }
+        auto transition_rows = detail::DeriveNativeProjectionTransitionRows(
+            predecessor->value(), candidate->value(),
+            apply->intent.expected_active_projection_revision,
+            predecessor_health, ready.staged_ready);
+        ManagerApplySceneStageIntentDTO intent{
+            apply_id,
+            apply_generation,
+            ready.staged_ready_digest,
+            ready.staged_ready.predecessor_publication_generation,
+            ready.staged_ready.predecessor_public_pointer_digest,
+            apply->intent.expected_active_projection_revision,
+            apply->intent.candidate_retained_bundle_id,
+            apply->intent.candidate_graph_revision,
+            std::move(transition_rows),
+        };
+        return apply_journal_.EnsureSceneStageIntent(intent);
+      };
+
+  auto durable_intent = [&] {
     const auto existing =
         apply_journal_.ReadSceneStageIntent(apply_id, apply_generation);
-    if (existing.has_value()) {
-      return ManagerApplySceneStageIntentWriteResult{*existing, false};
-    }
-    std::vector<core::ProjectionHealthDTO> predecessor_health;
-    if (detail::HasNativeProjectionRequirements(predecessor->value())) {
-      const auto current = VerifyCurrentPredecessor(
-          publication_reader_,
-          ManagerApplySceneStageIntentDTO{
-              apply_id,
-              apply_generation,
-              staged_ready->staged_ready_digest,
-              staged_ready->staged_ready.predecessor_publication_generation,
-              staged_ready->staged_ready.predecessor_public_pointer_digest,
-              apply->intent.expected_active_projection_revision,
-              apply->intent.candidate_retained_bundle_id,
-              apply->intent.candidate_graph_revision,
-              {},
-          });
-      predecessor_health = ObservePredecessorNativeHealth(
-          current, apply->intent.expected_active_projection_revision,
-          scene_owner_, bootstrap_scene_owner_);
-    }
-    auto transition_rows = detail::DeriveNativeProjectionTransitionRows(
-        predecessor->value(), candidate->value(),
-        apply->intent.expected_active_projection_revision,
-        predecessor_health, staged_ready->staged_ready);
-    ManagerApplySceneStageIntentDTO intent{
-        apply_id,
-        apply_generation,
-        staged_ready->staged_ready_digest,
-        staged_ready->staged_ready.predecessor_publication_generation,
-        staged_ready->staged_ready.predecessor_public_pointer_digest,
-        apply->intent.expected_active_projection_revision,
-        apply->intent.candidate_retained_bundle_id,
-        apply->intent.candidate_graph_revision,
-        std::move(transition_rows),
-    };
-    return apply_journal_.EnsureSceneStageIntent(intent);
+    return existing.has_value()
+               ? ManagerApplySceneStageIntentWriteResult{*existing, false}
+               : append_intent(*staged_ready);
   }();
 
-  const ProjectionApplyStageDTO request{
-      apply_id,
-      apply_generation,
-      durable_intent.record.scene_stage_intent
-          .expected_active_projection_revision,
-      predecessor->value(),
-      candidate->value(),
-      durable_intent.record.scene_stage_intent.native_transition_rows,
+  const auto make_request = [&] {
+    return ProjectionApplyStageDTO{
+        apply_id,
+        apply_generation,
+        durable_intent.record.scene_stage_intent
+            .expected_active_projection_revision,
+        predecessor->value(),
+        candidate->value(),
+        durable_intent.record.scene_stage_intent.native_transition_rows,
+    };
   };
+  const auto request = make_request();
   if (!request.valid()) {
     Fail("durable scene-stage records reconstruct an invalid owner request");
   }
@@ -367,6 +377,97 @@ ManagerSceneStageResult ManagerSceneStageCoordinator::StageOrRecover(
         ManagerSceneStagePath::kDurableStagedReplay,
     };
   }
+
+  const auto cleanup_failed_candidate = [&] {
+    // Stop only an exact Manager-owned process launched solely for this
+    // candidate. A retained-exact process may still be the healthy
+    // predecessor and remains authoritative.
+    const auto runtime_intent =
+        apply_journal_.ReadRuntimeConvergenceIntent(apply_id, apply_generation);
+    const auto current_ready =
+        apply_journal_.ReadLatestRuntimeStagedReady(apply_id, apply_generation);
+    if (!runtime_intent.has_value() || !current_ready.has_value() ||
+        current_ready->staged_ready_digest !=
+            durable_intent.record.scene_stage_intent
+                .runtime_staged_ready_digest) {
+      Fail("failed candidate cleanup lacks its exact retained runtime "
+           "evidence");
+    }
+    const auto has_added_manager_process = std::any_of(
+        runtime_intent->runtime_convergence_intent.runtime_units.begin(),
+        runtime_intent->runtime_convergence_intent.runtime_units.end(),
+        [](const auto &plan) {
+          return plan.lifecycle_control ==
+                     core::RuntimeLifecycleControl::kManagerManaged &&
+                 plan.candidate_disposition ==
+                     RuntimeUnitCandidateDisposition::kAdded;
+        });
+    if (has_added_manager_process && runtime_process_port_ == nullptr) {
+      Fail("scene rejected a Manager-owned candidate, but exact process "
+           "cleanup is unavailable");
+    }
+    const auto &ready_rows = current_ready->staged_ready.runtime_units;
+    for (const auto &plan :
+         runtime_intent->runtime_convergence_intent.runtime_units) {
+      if (plan.lifecycle_control !=
+              core::RuntimeLifecycleControl::kManagerManaged ||
+          plan.candidate_disposition !=
+              RuntimeUnitCandidateDisposition::kAdded) {
+        continue;
+      }
+      const auto evidence = std::lower_bound(
+          ready_rows.begin(), ready_rows.end(), plan.runtime_unit_id,
+          [](const auto &row, const auto &runtime_unit_id) {
+            return row.runtime_unit_id < runtime_unit_id;
+          });
+      if (evidence == ready_rows.end() ||
+          evidence->runtime_unit_id != plan.runtime_unit_id) {
+        Fail("failed candidate cleanup cannot identify its exact runtime "
+             "unit");
+      }
+      RuntimeUnitConvergenceQueryDTO cleanup_query{
+          apply_id,
+          apply_generation,
+          runtime_intent->runtime_convergence_intent
+              .candidate_retained_bundle_id,
+          runtime_intent->runtime_convergence_intent.candidate_graph_revision,
+          runtime_intent->runtime_convergence_intent_digest,
+          plan,
+      };
+      try {
+        const auto before =
+            runtime_process_port_->ObserveProcess(cleanup_query);
+        if (before.runtime_unit_id() != plan.runtime_unit_id.value() ||
+            (before.state() == ProcessPresenceState::kPresent &&
+             before.process_incarnation() != evidence->runtime_epoch.value())) {
+          Fail("failed candidate cleanup observed a foreign or stale process "
+               "instance");
+        }
+        if (before.state() == ProcessPresenceState::kPresent) {
+          const auto stopped =
+              runtime_process_port_->EnsureStopped(cleanup_query);
+          if (stopped.runtime_unit_id() != plan.runtime_unit_id.value() ||
+              stopped.state() != ProcessPresenceState::kAbsent) {
+            Fail("Manager stop did not return exact process absence");
+          }
+        }
+        const auto confirmed =
+            runtime_process_port_->ObserveProcess(cleanup_query);
+        if (confirmed.runtime_unit_id() != plan.runtime_unit_id.value() ||
+            confirmed.state() != ProcessPresenceState::kAbsent) {
+          Fail("Manager could not confirm failed candidate process "
+               "termination");
+        }
+      } catch (const ManagerSceneStageCoordinatorError &) {
+        throw;
+      } catch (const std::exception &error) {
+        Fail("failed candidate process cleanup failed: " +
+             std::string(error.what()));
+      } catch (...) {
+        Fail("failed candidate process cleanup failed");
+      }
+    }
+  };
 
   const ProjectionApplyStatusQueryDTO recovery_query{apply_id,
                                                      apply_generation};
@@ -398,11 +499,22 @@ ManagerSceneStageResult ManagerSceneStageCoordinator::StageOrRecover(
     const auto result = StagedResultFromStatus(status, request);
     return persist_staged(result, ManagerSceneStagePath::kRecoveredOwnerStatus);
   }
-  if (status.state != ProjectionApplyStatusState::kAbsent) {
+  if (status.state == ProjectionApplyStatusState::kDiscarded) {
+    cleanup_failed_candidate();
+    Fail("scene owner definitively discarded the exact durable stage intent");
+  }
+  if (status.state != ProjectionApplyStatusState::kAbsent &&
+      status.state != ProjectionApplyStatusState::kQuiescing) {
     throw ManagerSceneStageEffectUncertainError(
         "scene owner is not absent or exactly staged for the durable Apply",
         recovery_query, status);
   }
+
+  // Authoritative absence makes an exact same-intent replay safe; quiescing
+  // proves that Scene already captured the exact intent and needs the same
+  // owner-level replay to settle/discard its recorded participants. Scene
+  // recovers exact participant statuses and never submits a duplicate native
+  // Stage job for an already captured intent.
 
   static_cast<void>(VerifyCurrentPredecessor(
       publication_reader_, durable_intent.record.scene_stage_intent));
@@ -418,6 +530,14 @@ ManagerSceneStageResult ManagerSceneStageCoordinator::StageOrRecover(
           "scene Stage outcome is uncertain", recovery_query);
     }
   }();
+  if (result.presence_valid() &&
+      result.state == ProjectionApplyStageResultState::kAccepted &&
+      result.apply_id == request.apply_id &&
+      result.apply_generation == request.apply_generation &&
+      result.expected_active_projection_revision ==
+          request.expected_active_projection_revision) {
+    throw ManagerSceneStagePending("scene Stage was accepted");
+  }
   if (!ExactStagedResult(result, request)) {
     if (result.presence_valid() &&
         result.state == ProjectionApplyStageResultState::kRejected &&
@@ -425,18 +545,34 @@ ManagerSceneStageResult ManagerSceneStageCoordinator::StageOrRecover(
         result.apply_generation == request.apply_generation &&
         result.expected_active_projection_revision ==
             request.expected_active_projection_revision) {
-      Fail("scene owner rejected the exact durable stage request" +
-           (result.error.has_value()
-                ? " [" + result.error->code + "]: " +
-                      result.error->message
-                : std::string{}));
+      // A participant rejection is not proof that Scene has finished
+      // discarding every sibling candidate. Stop the Manager-owned process
+      // only after Scene reports durable terminal discard (or authoritative
+      // absence when it captured no transition at all).
+      const auto rejected_status = QueryStatus(scene_owner_, recovery_query);
+      if (rejected_status.state == ProjectionApplyStatusState::kQuiescing) {
+        throw ManagerSceneStagePending(
+            "scene rejected candidate staging and is settling exact sibling "
+            "cleanup");
+      }
+      if (rejected_status.state == ProjectionApplyStatusState::kDiscarded ||
+          rejected_status.state == ProjectionApplyStatusState::kAbsent) {
+        cleanup_failed_candidate();
+        Fail("scene owner rejected the exact durable stage request" +
+             (result.error.has_value()
+                  ? " [" + result.error->code + "]: " + result.error->message
+                  : std::string{}));
+      }
+      throw ManagerSceneStageEffectUncertainError(
+          "scene rejected candidate staging without terminal cleanup "
+          "evidence",
+          recovery_query, rejected_status, result);
     }
     throw ManagerSceneStageEffectUncertainError(
         "scene owner returned uncertain, malformed, or foreign Stage "
         "evidence" +
             (result.error.has_value()
-                 ? " [" + result.error->code + "]: " +
-                       result.error->message
+                 ? " [" + result.error->code + "]: " + result.error->message
                  : std::string{}),
         recovery_query, std::nullopt, result);
   }

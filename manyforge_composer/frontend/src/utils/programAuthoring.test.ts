@@ -291,7 +291,6 @@ describe('Program parameter binding continuity', () => {
       parameters: [
         parameter('velocity_scale', 'number'),
         parameter('acceleration_scale', 'number'),
-        parameter('max_tcp_linear_speed_mps', 'number'),
         parameter('translation_tol_m', 'number'),
         parameter('max_blend_deviation_rad', 'number'),
       ],
@@ -310,7 +309,6 @@ describe('Program parameter binding continuity', () => {
       parameters: [
         { ...declaration, parameter_id: 'cycle_velocity', default: 0.35 },
         { ...declaration, parameter_id: 'cycle_acceleration', default: 0.7 },
-        { ...declaration, parameter_id: 'cycle_tcp_cap', default: 0.12 },
         { ...declaration, parameter_id: 'path_tolerance', default: 0.005 },
         { ...declaration, parameter_id: 'path_blend', default: 0.01 },
       ],
@@ -324,10 +322,6 @@ describe('Program parameter binding continuity', () => {
           acceleration_scale: {
             kind: 'program_parameter',
             reference: 'cycle_acceleration',
-          },
-          max_tcp_linear_speed_mps: {
-            kind: 'program_parameter',
-            reference: 'cycle_tcp_cap',
           },
           translation_tol_m: {
             kind: 'program_parameter',
@@ -348,28 +342,24 @@ describe('Program parameter binding continuity', () => {
         bindings: {
           velocity_scale: 'cycle_velocity',
           acceleration_scale: 'cycle_acceleration',
-          max_tcp_linear_speed_mps: 'cycle_tcp_cap',
           translation_tol_m: 'path_tolerance',
           max_blend_deviation_rad: 'path_blend',
         },
         values: {
           velocity_scale: 0.35,
           acceleration_scale: 0.7,
-          max_tcp_linear_speed_mps: 0.12,
           translation_tol_m: 0.005,
           max_blend_deviation_rad: 0.01,
         },
         usageCounts: {
           velocity_scale: 1,
           acceleration_scale: 1,
-          max_tcp_linear_speed_mps: 1,
           translation_tol_m: 1,
           max_blend_deviation_rad: 1,
         },
         applicableCounts: {
           velocity_scale: 1,
           acceleration_scale: 1,
-          max_tcp_linear_speed_mps: 1,
           translation_tol_m: 1,
           max_blend_deviation_rad: 1,
         },

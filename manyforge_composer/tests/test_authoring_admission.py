@@ -14,6 +14,7 @@ from manyforge_composer.backend.authoring_admission import (
     headless_client_http_exception,
 )
 from manyforge_composer.backend.authoring_transaction_journal import (
+    AuthoringJournalError,
     ComposerAuthoringTransactionJournal,
     canonical_digest,
     owner_transaction_id,
@@ -105,7 +106,12 @@ def _durable_transaction(root, *, effect_class: str | None = None):
             "intervention_evidence": None,
         },
     )
-    claim = {"intent": transaction.claim_intent, "claim_generation": 1}
+    claim = {
+        "intent": transaction.claim_intent,
+        "claim_generation": 1,
+        "acquired_admission_generation": 7,
+        "accepted_at_ns": 1,
+    }
     journal.record(transaction, "claim_json", claim)
     if effect_class is not None:
         journal.record(
@@ -131,6 +137,13 @@ def _startup_receipt(*, status="unknown", claim=None, **extra):
         receipt["matched_claim"] = claim
     receipt.update(extra)
     return receipt
+
+
+def _owner_commit_settlement() -> dict[str, str]:
+    return {
+        "settlement_kind": "owner_commit",
+        "evidence_digest": "sha256:" + "2" * 64,
+    }
 
 
 def _envelope(
@@ -321,7 +334,7 @@ def test_backend_validation_under_claim_precedes_effect_intent(tmp_path) -> None
 
     assert rejected.value.detail["code"] == "assistant_callback_context_stale"
     assert effects == []
-    transaction = coordinator._journal.lookup(
+    transaction = coordinator.prepared_authoring_transaction(
         envelope.request_owner_epoch, envelope.request_id
     )
     assert transaction is not None
@@ -440,6 +453,230 @@ def test_post_release_followup_runs_only_after_durable_release_and_on_replay(
     assert coordinator.execute(envelope, **arguments) == {"applied": True}
     assert observations == [1, 1]
     assert len(headless.claims) == 1
+
+
+def test_post_release_failure_does_not_turn_committed_mutation_into_error(
+    tmp_path,
+) -> None:
+    """Apply/Revert remain committed when scene preparation is temporarily unavailable."""
+
+    headless = _Headless()
+    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
+    coordinator.recover()
+    envelope = _envelope(coordinator, "activation-followup")
+    attempts: list[int] = []
+
+    def after_release() -> None:
+        attempts.append(len(headless.settlements))
+        raise AuthoringJournalError(
+            "program_scene_preparation_unavailable",
+            "runtime status is still converging",
+        )
+
+    arguments = {
+        "operation_kind": "apply_draft",
+        "draft_id": "draft.1",
+        "draft_revision": 3,
+        "payload": {"operation": "apply"},
+        "effect": lambda _claim: {"applied": True},
+        "post_image": lambda: {"draft_id": "draft.1", "revision": 3},
+        "after_release": after_release,
+    }
+
+    assert coordinator.execute(envelope, **arguments) == {"applied": True}
+    # Replaying the exact request must remain an ordinary committed replay,
+    # not a second owner transaction or a false failed Apply.
+    assert coordinator.execute(envelope, **arguments) == {"applied": True}
+    assert attempts == [1, 1]
+    assert len(headless.claims) == 1
+    assert len(headless.settlements) == 1
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "manager_apply_observation_timeout",
+        "manager_apply_observation_interrupted",
+        "deployment_candidate_selection_timeout",
+    ],
+)
+def test_partial_effect_observation_timeout_keeps_its_typed_error(
+    tmp_path,
+    code: str,
+) -> None:
+    headless = _Headless()
+    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)  # type: ignore[arg-type]
+    coordinator.recover()
+
+    def time_out(_claim: dict[str, Any]) -> None:
+        raise AuthoringJournalError(code, "authoritative observation deadline elapsed")
+
+    with pytest.raises(AuthoringJournalError) as rejected:
+        coordinator.execute(
+            _envelope(coordinator, f"timeout-{code}"),
+            operation_kind="apply_draft",
+            draft_id="draft.1",
+            draft_revision=3,
+            payload={"operation": "apply"},
+            effect=time_out,
+            post_image=lambda: {},
+            prepare_effect=lambda: {
+                "effect_class": "external",
+                "external_kind": "deployment_apply",
+            },
+        )
+
+    assert rejected.value.code == code
+    assert coordinator.mutation_ready is False
+
+
+def test_exact_recovery_settles_before_mutable_current_state_is_consulted(
+    tmp_path,
+) -> None:
+    """A retained external intent is enough to finish its exact operation."""
+
+    headless = _RecoveryHeadless({})
+    recovered_effects: list[dict[str, Any]] = []
+
+    def recover_effect(transaction, claim):
+        recovered_effects.append(dict(transaction.effect_intent or {}))
+        assert claim == transaction.claim
+        return {"status": "applied"}, {"workspace": "recovered"}
+
+    coordinator = AuthoringAdmissionCoordinator(
+        headless, tmp_path, recover_effect=recover_effect  # type: ignore[arg-type]
+    )
+    envelope = AuthoringMutationEnvelope(
+        expected_admission_generation=7,
+        request_owner_epoch="browser.1",
+        request_id="apply.1",
+    )
+    payload = {"operation": "apply", "draftId": "draft.1"}
+    transaction = coordinator._journal.record_intent(
+        request_owner_epoch=envelope.request_owner_epoch,
+        request_id=envelope.request_id,
+        operation_kind="apply_deployment_candidate",
+        payload_digest=canonical_digest(payload),
+        draft_id="draft.1",
+        draft_revision=3,
+        admission_generation=7,
+        claim_intent={
+            "claim_kind": "authoring_mutation",
+            "owner_role": "authoring_owner",
+            "owner_epoch": coordinator.owner_epoch,
+            "owner_transaction_id": owner_transaction_id(
+                envelope.request_owner_epoch, envelope.request_id
+            ),
+            "request_id": envelope.request_id,
+            "request_payload_digest": canonical_digest(payload),
+            "expected_admission_generation": 7,
+            "scope": {"resources": [], "configurations": []},
+            "program_cycle_evidence": None,
+            "intervention_evidence": None,
+        },
+    )
+    claim = {
+        "intent": transaction.claim_intent,
+        "claim_generation": 1,
+        "acquired_admission_generation": 7,
+        "accepted_at_ns": 1,
+    }
+    coordinator._journal.record(transaction, "claim_json", claim)
+    transaction = coordinator._journal.lookup(
+        envelope.request_owner_epoch, envelope.request_id
+    )
+    assert transaction is not None
+    coordinator._journal.record(
+        transaction,
+        "effect_intent_json",
+        {
+            "schema_version": "manyforge.composer_authoring_effect.v1",
+            "effect_class": "external",
+            "external_kind": "deployment_candidate_apply",
+        },
+    )
+    headless.receipt = _startup_receipt(status="held_exact", claim=claim)
+
+    found, result = coordinator.replay_or_recover_exact(
+        envelope,
+        operation_kind="apply_deployment_candidate",
+        draft_id="draft.1",
+        draft_revision=3,
+        payload=payload,
+    )
+
+    assert found is True
+    assert result == {"status": "applied"}
+    assert len(recovered_effects) == 1
+    assert len(headless.settlements) == 1
+    assert coordinator.mutation_ready
+
+
+def test_startup_recovers_external_effect_before_restoring_workspace(tmp_path) -> None:
+    headless = _RecoveryHeadless({})
+    order: list[str] = []
+
+    def restore(post_image: dict[str, Any]) -> None:
+        assert post_image == {"workspace": "successor"}
+        order.append("restore")
+
+    def recover_effect(transaction, claim):
+        assert claim == transaction.claim
+        order.append("effect")
+        return {"status": "applied"}, {"workspace": "successor"}
+
+    coordinator = AuthoringAdmissionCoordinator(
+        headless,
+        tmp_path,
+        restore_post_image=restore,
+        recover_effect=recover_effect,  # type: ignore[arg-type]
+    )
+    transaction = coordinator._journal.record_intent(
+        request_owner_epoch="browser.1",
+        request_id="apply.1",
+        operation_kind="apply_deployment_candidate",
+        payload_digest=canonical_digest({"operation": "apply"}),
+        draft_id="draft.1",
+        draft_revision=3,
+        admission_generation=7,
+        claim_intent={
+            "claim_kind": "authoring_mutation",
+            "owner_role": "authoring_owner",
+            "owner_epoch": coordinator.owner_epoch,
+            "owner_transaction_id": owner_transaction_id("browser.1", "apply.1"),
+            "request_id": "apply.1",
+            "request_payload_digest": canonical_digest({"operation": "apply"}),
+            "expected_admission_generation": 7,
+            "scope": {"resources": [], "configurations": []},
+            "program_cycle_evidence": None,
+            "intervention_evidence": None,
+        },
+    )
+    claim = {
+        "intent": transaction.claim_intent,
+        "claim_generation": 1,
+        "acquired_admission_generation": 7,
+        "accepted_at_ns": 1,
+    }
+    coordinator._journal.record(transaction, "claim_json", claim)
+    transaction = coordinator._journal.lookup("browser.1", "apply.1")
+    assert transaction is not None
+    coordinator._journal.record(
+        transaction,
+        "effect_intent_json",
+        {
+            "schema_version": "manyforge.composer_authoring_effect.v1",
+            "effect_class": "external",
+            "external_kind": "deployment_candidate_apply",
+        },
+    )
+    headless.receipt = _startup_receipt(status="held_exact", claim=claim)
+
+    coordinator.recover()
+
+    assert coordinator.mutation_ready
+    assert order[0] == "effect"
+    assert order[1:] == ["restore"]
 
 
 def test_owner_proven_external_rejection_settles_and_replays_exactly(
@@ -606,19 +843,28 @@ def test_successor_restores_completed_local_post_image_before_opening(tmp_path) 
             "body": {"ok": True},
         },
     )
-    journal.record(transaction, "release_intent_json", {"settlement_kind": "owner_commit"})
+    journal.record(
+        transaction, "release_intent_json", _owner_commit_settlement()
+    )
+    transaction = journal.lookup(
+        transaction.request_owner_epoch, transaction.request_id
+    )
+    assert transaction is not None
+    expected_release = AuthoringAdmissionCoordinator._kernel_release(transaction)
     restored: list[dict[str, Any]] = []
     receipt = _startup_receipt(
         status="released_exact",
         claim=claim,
-        matched_release={"settlement_kind": "owner_commit"},
+        matched_release=expected_release,
     )
+    headless = _RecoveryHeadless(receipt)
     coordinator = AuthoringAdmissionCoordinator(
-        _RecoveryHeadless(receipt), tmp_path, restore_post_image=restored.append
+        headless, tmp_path, restore_post_image=restored.append
     )
     coordinator.recover()
     assert coordinator.mutation_ready
     assert restored == [{"draft_id": "draft.2", "revision": 4}]
+    assert headless.recoveries[0]["expected_release"] == expected_release
 
 
 def test_successor_proves_local_interrupted_effect_had_no_effect(tmp_path) -> None:
@@ -734,7 +980,9 @@ def test_successor_rejects_mismatched_release_receipt(tmp_path) -> None:
             "body": {},
         },
     )
-    journal.record(transaction, "release_intent_json", {"settlement_kind": "owner_commit"})
+    journal.record(
+        transaction, "release_intent_json", _owner_commit_settlement()
+    )
     receipt = _startup_receipt(
         status="released_exact",
         claim=claim,
@@ -761,7 +1009,9 @@ def test_successor_retires_unresolved_release_from_exact_reconciliation(tmp_path
             "body": {},
         },
     )
-    journal.record(transaction, "release_intent_json", {"settlement_kind": "owner_commit"})
+    journal.record(
+        transaction, "release_intent_json", _owner_commit_settlement()
+    )
     receipt = _startup_receipt(
         status="reconciled_exact",
         claim=claim,
@@ -791,7 +1041,9 @@ def test_successor_rejects_mismatched_reconciliation_predecessor_claim(
             "body": {},
         },
     )
-    journal.record(transaction, "release_intent_json", {"settlement_kind": "owner_commit"})
+    journal.record(
+        transaction, "release_intent_json", _owner_commit_settlement()
+    )
     receipt = _startup_receipt(
         status="reconciled_exact",
         claim=claim,

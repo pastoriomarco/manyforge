@@ -453,6 +453,7 @@ struct ProjectionApplyStageDTO final {
 };
 
 enum class ProjectionApplyStageResultState {
+  kAccepted,
   kStaged,
   kRejected,
   kFailedProjectionUncertain,
@@ -496,6 +497,9 @@ struct ProjectionApplyStageResultDTO final {
       return false;
     }
     switch (state) {
+      case ProjectionApplyStageResultState::kAccepted:
+        return has_stage && !has_candidate && !has_evidence &&
+               !error.has_value();
       case ProjectionApplyStageResultState::kStaged:
         return has_stage && has_candidate &&
                transition_evidence->phase_consistent(ProjectionTransitionEvidenceState::kStaged) &&
@@ -503,7 +507,10 @@ struct ProjectionApplyStageResultDTO final {
       case ProjectionApplyStageResultState::kRejected:
         return error.has_value() &&
                (!has_evidence ||
-                transition_evidence->phase_consistent(ProjectionTransitionEvidenceState::kAborted));
+                transition_evidence->phase_consistent(
+                    ProjectionTransitionEvidenceState::kAborted) ||
+                transition_evidence->phase_consistent(
+                    ProjectionTransitionEvidenceState::kUncertain));
       case ProjectionApplyStageResultState::kFailedProjectionUncertain:
         return error.has_value() &&
                (!has_evidence || transition_evidence->phase_consistent(
@@ -528,6 +535,7 @@ struct ProjectionApplyActivationDTO final {
 };
 
 enum class ProjectionApplyActivationResultState {
+  kAccepted,
   kActivated,
   kStale,
   kFailedProjectionUncertain,
@@ -551,6 +559,14 @@ struct ProjectionApplyActivationResultDTO final {
       return false;
     }
     switch (state) {
+      case ProjectionApplyActivationResultState::kAccepted:
+        return transition_evidence.matches_apply_phase(
+                   apply_id, apply_generation, projection_stage_generation,
+                   expected_active_projection_revision,
+                   candidate_projection_revision,
+                   ProjectionTransitionEvidenceState::kStaged) &&
+               !acknowledged_candidate_projection_revision.has_value() &&
+               !error.has_value();
       case ProjectionApplyActivationResultState::kActivated:
         return transition_evidence.matches_apply_phase(
                    apply_id, apply_generation, projection_stage_generation,

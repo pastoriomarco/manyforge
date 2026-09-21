@@ -401,6 +401,11 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             str(config.program_selection_state_root),
             "--node-catalog-path",
             str(config.node_catalog_path),
+            "--node-environment-manifest-path",
+            str(
+                config.source_root
+                / "manyforge_behavior/resources/node_environment_manifest.yaml"
+            ),
             "--alarm-catalog-path",
             str(config.alarm_catalog_path),
             "--historian-database-path",

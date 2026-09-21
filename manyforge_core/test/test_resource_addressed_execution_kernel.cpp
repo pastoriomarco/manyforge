@@ -31,6 +31,7 @@
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -120,7 +121,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       status.execution_id = next_execution_id;
     }
     if (event_during_execute.has_value()) {
-      const auto snapshot = callbacks;
+      const auto snapshot = CallbackSnapshot();
       for (const auto& [id, callback] : snapshot) {
         (void)id;
         callback(*event_during_execute);
@@ -846,14 +847,24 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   }
 
   SubscriptionHandle subscribe_events(EventCallback callback) override {
+    std::lock_guard lock(callbacks_mutex_);
     const auto id = next_subscription_id++;
     callbacks.emplace(id, std::move(callback));
     return SubscriptionHandle{id};
   }
 
-  void unsubscribe_events(SubscriptionHandle handle) override { callbacks.erase(handle.id); }
+  void unsubscribe_events(SubscriptionHandle handle) override {
+    {
+      std::lock_guard lock(callbacks_mutex_);
+      callbacks.erase(handle.id);
+    }
+    if (unsubscribe_hook) unsubscribe_hook();
+  }
 
-  [[nodiscard]] std::size_t subscription_count() const noexcept { return callbacks.size(); }
+  [[nodiscard]] std::size_t subscription_count() const noexcept {
+    std::lock_guard lock(callbacks_mutex_);
+    return callbacks.size();
+  }
 
   void emit_transition(ExecutionState from, ExecutionState to,
                        std::optional<ErrorDTO> error = std::nullopt) {
@@ -871,8 +882,40 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     deliver_event(event);
   }
 
+  // Models KernelEventPublisher dispatch exactly: copy the callback set first,
+  // expose that capture to the test, and invoke only after an explicit release.
+  // Unsubscribe therefore cannot revoke the already-copied callback object.
+  void emit_transition_after_callback_capture(
+      ExecutionState from, ExecutionState to,
+      const std::function<void()>& captured_boundary,
+      std::optional<ErrorDTO> error = std::nullopt) {
+    {
+      std::lock_guard lock(status_mutex_);
+      status.state = to;
+      status.progress = to == ExecutionState::kCompleted ? 1.0 : 0.4;
+      if (error.has_value()) {
+        status.last_error = ErrorCode::kExecutionAborted;
+      }
+    }
+    runtime_scale.active = to == ExecutionState::kExecuting ||
+                           to == ExecutionState::kPaused;
+    const KernelEvent event{KernelEventType::kStateTransition,
+                            next_execution_id,
+                            0,
+                            from,
+                            to,
+                            std::move(error),
+                            {}};
+    const auto snapshot = CallbackSnapshot();
+    captured_boundary();
+    for (const auto& [id, callback] : snapshot) {
+      (void)id;
+      callback(event);
+    }
+  }
+
   void deliver_event(const KernelEvent& event) {
-    const auto snapshot = callbacks;
+    const auto snapshot = CallbackSnapshot();
     for (const auto& [id, callback] : snapshot) {
       (void)id;
       callback(event);
@@ -893,7 +936,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                             current,
                             std::move(error),
                             {}};
-    const auto snapshot = callbacks;
+    const auto snapshot = CallbackSnapshot();
     for (const auto& [id, callback] : snapshot) {
       (void)id;
       callback(event);
@@ -910,7 +953,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                             current,
                             std::nullopt,
                             std::move(details)};
-    const auto snapshot = callbacks;
+    const auto snapshot = CallbackSnapshot();
     for (const auto& [id, callback] : snapshot) {
       (void)id;
       callback(event);
@@ -920,7 +963,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   void notify_prepared_motion() {
     const KernelEvent event{
         KernelEventType::kParticipantPrepared, next_execution_id, 0, {}, {}, std::nullopt, {}};
-    const auto snapshot = callbacks;
+    const auto snapshot = CallbackSnapshot();
     for (const auto& [id, callback] : snapshot) {
       (void)id;
       callback(event);
@@ -928,6 +971,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   }
 
   std::atomic<int> execute_calls{};
+  std::function<void()> unsubscribe_hook;
   std::atomic<int> prepare_motion_calls{};
   std::atomic<int> prepare_resume_motion_calls{};
   mutable std::atomic<int> observe_prepared_motion_calls{};
@@ -1319,7 +1363,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
             {{"prepared_contract_digest", retained->prepared_contract_digest.value()}}});
       }
     }
-    const auto snapshot = callbacks;
+    const auto snapshot = CallbackSnapshot();
     for (const auto& [id, callback] : snapshot) {
       (void)id;
       callback(*event);
@@ -1334,7 +1378,13 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     }
   }
 
+  [[nodiscard]] std::map<std::uint64_t, EventCallback> CallbackSnapshot() const {
+    std::lock_guard lock(callbacks_mutex_);
+    return callbacks;
+  }
+
   std::mutex fallback_timeline_mutex_;
+  mutable std::mutex callbacks_mutex_;
   std::uint64_t next_subscription_id{1U};
   std::map<std::uint64_t, EventCallback> callbacks;
 };
@@ -3151,6 +3201,46 @@ TEST(ResourceAddressedExecutionKernelTest, ManualNoEffectAndTerminalReleaseRemai
     EXPECT_TRUE(kernel.GetAuthoringAdmission().authoring_allowed);
   }
   EXPECT_TRUE(claim_program_execution(kernel).ok());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ExecutionRequestTimeoutPolicyDistinguishesManualAndProgramMotion) {
+  for (const bool manual : {false, true}) {
+    SCOPED_TRACE(manual);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    auto target = registration(
+        make_binding("arm", "arm", "execution.trajectory.execute",
+                     CoordinateKind::kAngular),
+        engine);
+    target.intrinsic_direct_control = manual;
+    ResourceAddressedExecutionKernelConfig config{
+        RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    ResourceAddressedExecutionKernel kernel(
+        {target}, clock, scheduler, journal, std::move(config));
+
+    if (manual) {
+      ASSERT_TRUE(ready_cell_admission(kernel).ok());
+    } else {
+      ASSERT_TRUE(claim_program_execution(kernel).ok());
+      ASSERT_TRUE(
+          kernel.register_program_run_capture(program_execution_capture()).ok());
+      start_program_motion(kernel);
+    }
+
+    auto intent = manual
+                      ? motion_operation("request.timeout-policy.manual")
+                      : scoped_motion_operation("request.timeout-policy.program");
+    const auto accepted = kernel.execute(intent);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(engine.last_prepared_request.has_value());
+    EXPECT_EQ(engine.last_prepared_request->execution_request
+                  .trajectory_relative_timeout,
+              manual);
+  }
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -15874,6 +15964,276 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_FALSE(unavailable.ok());
   EXPECT_EQ(unavailable.error().details.at("reason"), "runtime_participant_unavailable");
   EXPECT_EQ(predecessor_engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     KernelRetirementDrainsAnAlreadyEnteredCapturedEngineCallback) {
+  using namespace std::chrono_literals;
+
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto kernel = std::make_unique<ResourceAddressedExecutionKernel>(
+      std::vector<RuntimeParticipantExecutionRegistration>{registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"),
+                                             8U});
+  const auto executed = kernel->execute(motion_operation("request.retirement.captured-event"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+
+  HeldSettlementCall callback;
+  journal.record_hook = [hold = callback.Blocker()](const std::string_view kind) {
+    if (kind == "state:subordinate_state_observed") hold();
+  };
+  std::promise<void> unsubscribed_promise;
+  auto unsubscribed = unsubscribed_promise.get_future();
+  std::atomic_bool unsubscribe_observed{};
+  engine.unsubscribe_hook = [&] {
+    if (!unsubscribe_observed.exchange(true)) unsubscribed_promise.set_value();
+  };
+
+  auto dispatched = std::async(std::launch::async, [&] {
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+  });
+  ASSERT_TRUE(callback.Entered());
+
+  auto retiring = std::async(std::launch::async, [owner = kernel.release()] { delete owner; });
+  ASSERT_EQ(unsubscribed.wait_for(10s), std::future_status::ready)
+      << "Kernel destruction did not close and unsubscribe event ingress";
+  EXPECT_EQ(engine.subscription_count(), 0U);
+  EXPECT_EQ(retiring.wait_for(0s), std::future_status::timeout)
+      << "Kernel state retired while an entered callback still referenced it";
+  {
+    std::lock_guard lock(journal.mutex);
+    EXPECT_EQ(std::find(journal.calls.begin(), journal.calls.end(),
+                        "owner_closed"),
+              journal.calls.end())
+        << "durable owner epoch closed before captured callback drained";
+  }
+
+  callback.Release();
+  dispatched.get();
+  retiring.get();
+  EXPECT_NE(std::find(journal.calls.begin(), journal.calls.end(),
+                      "state:subordinate_state_observed"),
+            journal.calls.end());
+  EXPECT_NE(std::find(journal.calls.begin(), journal.calls.end(), "owner_closed"),
+            journal.calls.end());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CapturedBeforeUnsubscribeCallbackCannotEnterRetiredKernel) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto kernel = std::make_unique<ResourceAddressedExecutionKernel>(
+      std::vector<RuntimeParticipantExecutionRegistration>{registration(
+          make_binding("arm", "arm", "execution.trajectory.execute",
+                       CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto executed =
+      kernel->execute(motion_operation("request.retirement.stale-capture"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+
+  HeldSettlementCall captured;
+  auto dispatch = std::async(std::launch::async, [&] {
+    engine.emit_transition_after_callback_capture(
+        ExecutionState::kPlanning, ExecutionState::kCompleted,
+        captured.Blocker());
+  });
+  ASSERT_TRUE(captured.Entered())
+      << "fake publisher did not snapshot the Kernel callback";
+
+  // The callback object now exists independently of the publisher's registry.
+  // Complete Close, unsubscribe, ingress drain and owner retirement before it
+  // is invoked; unlike the entered-callback test above, Drain has nothing to
+  // wait for here.
+  kernel.reset();
+  ASSERT_EQ(engine.subscription_count(), 0U);
+  const auto journal_calls_after_retirement = journal.calls;
+  const auto status_reads_after_retirement = engine.status_read_calls.load();
+  ASSERT_NE(std::find(journal_calls_after_retirement.begin(),
+                      journal_calls_after_retirement.end(), "owner_closed"),
+            journal_calls_after_retirement.end());
+
+  captured.Release();
+  dispatch.get();
+
+  // Invocation of the stale snapshot returns through closed ingress. It does
+  // not sample the participant, submit lane work, or touch the retired owner's
+  // journal/state.
+  EXPECT_EQ(engine.status_read_calls.load(), status_reads_after_retirement);
+  EXPECT_EQ(journal.calls, journal_calls_after_retirement);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     KernelRetirementSettlesAcceptedCompletionThatLandsDuringShutdown) {
+  using namespace std::chrono_literals;
+
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto kernel = std::make_unique<ResourceAddressedExecutionKernel>(
+      std::vector<RuntimeParticipantExecutionRegistration>{registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"),
+                                             8U});
+  const auto executed = kernel->execute(motion_operation("request.retirement.completion"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+  // Hold the actual participant effect after the accepted request has entered
+  // its operation-control lane, not a later journal write that the worker may
+  // or may not reach before retirement.
+  HeldSettlementCall acknowledgement_effect;
+  auto retirement_started = std::make_shared<std::atomic_bool>();
+  auto effect_finished_after_retirement_start =
+      std::make_shared<std::atomic_bool>();
+  engine.acknowledge_effect_hook =
+      [hold_effect = acknowledgement_effect.Blocker(), retirement_started,
+       effect_finished_after_retirement_start] {
+        hold_effect();
+        effect_finished_after_retirement_start->store(
+            retirement_started->load(std::memory_order_acquire),
+            std::memory_order_release);
+      };
+  auto retirement_started_promise = std::make_shared<std::promise<void>>();
+  auto retirement_entered = retirement_started_promise->get_future();
+  auto retirement_observed = std::make_shared<std::atomic_bool>();
+  engine.unsubscribe_hook = [retirement_started, retirement_started_promise,
+                             retirement_observed] {
+    retirement_started->store(true, std::memory_order_release);
+    if (!retirement_observed->exchange(true)) {
+      retirement_started_promise->set_value();
+    }
+  };
+  ASSERT_TRUE(kernel->acknowledge_completed(
+                  control_request("request.retirement.completion.ack", executed.value(), 1U))
+                  .ok());
+  ASSERT_TRUE(acknowledgement_effect.Entered());
+
+  auto retiring =
+      std::async(std::launch::async, [owner = kernel.release()] { delete owner; });
+  if (retirement_entered.wait_for(10s) != std::future_status::ready) {
+    acknowledgement_effect.Release();
+    retiring.get();
+    FAIL() << "Kernel retirement did not close and unsubscribe event ingress";
+  }
+  EXPECT_EQ(engine.subscription_count(), 0U);
+  EXPECT_EQ(retiring.wait_for(0s), std::future_status::timeout)
+      << "Kernel retirement did not wait for its accepted acknowledgement effect";
+  EXPECT_FALSE(effect_finished_after_retirement_start->load(
+      std::memory_order_acquire));
+  {
+    std::lock_guard lock(journal.mutex);
+    EXPECT_EQ(std::find(journal.calls.begin(), journal.calls.end(),
+                        "owner_closed"),
+              journal.calls.end())
+        << "durable owner epoch closed before the accepted effect settled";
+  }
+
+  acknowledgement_effect.Release();
+  retiring.get();
+
+  // The accepted effect finished after retirement began and before the lane
+  // retired and permitted the durable owner epoch to close.
+  EXPECT_TRUE(effect_finished_after_retirement_start->load(
+      std::memory_order_acquire));
+  EXPECT_EQ(engine.subscription_count(), 0U);
+  const auto closed = std::find(journal.calls.begin(), journal.calls.end(), "owner_closed");
+  ASSERT_NE(closed, journal.calls.end());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     FailedRetirementSettlementRetiresIngressWithoutClaimingSuccess) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto kernel = std::make_unique<ResourceAddressedExecutionKernel>(
+      std::vector<RuntimeParticipantExecutionRegistration>{registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"),
+                                             8U});
+  const auto executed = kernel->execute(motion_operation("request.retirement.failure"));
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+  engine.next_acknowledge_result = {false, ErrorDTO{"cleanup_rejected", "cleanup rejected", {}}};
+  HeldSettlementCall settlement;
+  std::atomic_bool retirement_started{};
+  std::atomic_bool settled_after_retirement_start{};
+  const auto test_thread = std::this_thread::get_id();
+  journal.record_hook = [&, hold_write = settlement.Blocker()](const std::string_view kind) {
+    if (kind != "state:operation_acknowledge_completed_failed" ||
+        std::this_thread::get_id() == test_thread) {
+      return;
+    }
+    hold_write();
+    if (retirement_started.load(std::memory_order_acquire)) {
+      settled_after_retirement_start.store(true, std::memory_order_release);
+    }
+  };
+  ASSERT_TRUE(kernel->acknowledge_completed(
+                  control_request("request.retirement.failure.ack", executed.value(), 1U))
+                  .ok());
+  ASSERT_TRUE(settlement.Entered());
+
+  retirement_started.store(true, std::memory_order_release);
+  std::thread retiring([owner = kernel.release()] { delete owner; });
+  settlement.Release();
+  retiring.join();
+
+  // The exceptional settlement still drains before the lanes and subscriptions
+  // disappear, and an unsuccessful cleanup is never recorded as success.
+  EXPECT_TRUE(settled_after_retirement_start.load(std::memory_order_acquire));
+  EXPECT_EQ(engine.subscription_count(), 0U);
+  ASSERT_FALSE(journal.states.empty());
+  EXPECT_NE(journal.states.back().state, OperationStateKind::kCompleted);
+  EXPECT_NE(journal.states.back().state, OperationStateKind::kStopped);
+  const auto closed =
+      std::find(journal.calls.begin(), journal.calls.end(), "owner_closed");
+  ASSERT_NE(closed, journal.calls.end());
+  EXPECT_NE(std::find(journal.calls.begin(), closed,
+                      "state:operation_acknowledge_completed_failed"),
+            closed);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ReplacedUnclosedEpochRetiresWithoutCleanCloseOrReadiness) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  // Process loss of the previous owner: the durable epoch never closed, so
+  // clean-close eligibility stays withheld from this successor.
+  journal.recovery.replaced_unclosed_owner_epoch = RequestOwnerEpoch("kernel.epoch.predecessor");
+  auto kernel = std::make_unique<ResourceAddressedExecutionKernel>(
+      std::vector<RuntimeParticipantExecutionRegistration>{registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"),
+                                             8U});
+  EXPECT_EQ(std::count(journal.calls.begin(), journal.calls.end(), "owner_closed"), 0);
+
+  kernel.reset();
+
+  // Teardown still removed the subscription, but it must not have asserted that
+  // this owner cleanly closed the durable epoch.
+  EXPECT_EQ(engine.subscription_count(), 0U);
+  EXPECT_EQ(std::find(journal.calls.begin(), journal.calls.end(), "owner_closed"),
+            journal.calls.end());
 }
 
 }  // namespace

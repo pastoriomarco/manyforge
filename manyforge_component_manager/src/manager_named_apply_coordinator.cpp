@@ -280,7 +280,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
                            std::move(clock_ns), std::move(pre_start_guard)),
       scene_stage_coordinator_(apply_journal_, retained_bundle_source_,
                                publication_store, scene_owner,
-                               bootstrap_scene_owner),
+                               bootstrap_scene_owner, &process_port),
       scene_activation_coordinator_(apply_journal_, scene_owner),
       runtime_composition_coordinator_(apply_journal_, retained_bundle_source_,
                                        runtime_composition,
@@ -307,7 +307,7 @@ core::ApplyId ManagerNamedApplyCoordinator::MintApplyId() {
   Fail("Apply ID factory did not produce a fresh bounded identity");
 }
 
-ManagerNamedApplyResult ManagerNamedApplyCoordinator::ApplyOrRecover(
+ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
     const ManagerNamedApplyRequestDTO &request) {
   std::lock_guard lock(operation_mutex_);
   Require(request.valid(), "named Apply request is invalid");
@@ -318,7 +318,14 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ApplyOrRecover(
       existing.has_value()) {
     Require(MatchesRequest(existing->intent, request),
             "public request identity is already bound to another Apply");
-    return Continue(existing->intent, true);
+    const auto terminal = apply_journal_.ReadTerminalOutcome(
+        existing->intent.apply_id, existing->intent.apply_generation);
+    return {existing->intent.apply_id, existing->intent.apply_generation,
+            terminal.has_value() ? ManagerNamedApplyResultState::kSucceeded
+                                 : ManagerNamedApplyResultState::kPending,
+            true,
+            terminal.has_value() ? std::optional(terminal->terminal_outcome)
+                                 : std::nullopt};
   }
 
   const auto candidate =
@@ -338,7 +345,7 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ApplyOrRecover(
   for (const auto &status : inventory) {
     if (!IsTerminal(status)) {
       throw ManagerNamedApplyBusyError(
-          "another named Apply remains nonterminal on this Manager strand");
+          "another named Apply remains nonterminal on this Manager lane");
     }
   }
 
@@ -369,7 +376,12 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ApplyOrRecover(
       request.parent_authoring_claim,
   };
   Require(intent.valid(), "Manager could not construct a valid Apply intent");
-  return Continue(intent, false);
+  const auto durable_intent = apply_journal_.EnsureIntent(intent).record;
+  if (apply_progress_observer_) {
+    apply_progress_observer_(durable_intent.intent);
+  }
+  return {intent.apply_id, intent.apply_generation,
+          ManagerNamedApplyResultState::kPending, false, std::nullopt};
 }
 
 ManagerNamedApplyResult
@@ -412,6 +424,34 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   const auto release_started = apply_journal_.ReadFenceReleaseIntent(
       intent.apply_id, intent.apply_generation);
   if (finalized.has_value() || release_started.has_value()) {
+    // Scene Finalize and the public successor can be durable while the
+    // Manager/native child is replaced.  The Scene activation row is the
+    // durable owner of native projection membership, so replay it before
+    // composing the successor.  Otherwise BuildManagedCompositionInput sees
+    // a live child whose candidate projections are still only prepared and
+    // correctly rejects the composition as not active at the candidate
+    // revision.  Only after that replay do we install the exact composition
+    // under the still-held Apply fence and query/release the fence.
+    if (apply_journal_.ReadSceneActivated(intent.apply_id,
+                                          intent.apply_generation)
+            .has_value()) {
+      try {
+        static_cast<void>(scene_activation_coordinator_.ActivateOrRecover(
+            intent.apply_id, intent.apply_generation));
+      } catch (const ManagerSceneActivationPending &) {
+        return {intent.apply_id, intent.apply_generation,
+                ManagerNamedApplyResultState::kPending, request_replayed,
+                std::nullopt};
+      }
+    }
+    const auto composition = runtime_composition_coordinator_.InstallOrRecover(
+        intent.apply_id, intent.apply_generation);
+    if (composition.state ==
+        ManagerSelectedRuntimeCompositionResultState::kPending) {
+      return {intent.apply_id, intent.apply_generation,
+              ManagerNamedApplyResultState::kPending, request_replayed,
+              std::nullopt};
+    }
     const auto release = fence_release_coordinator_.ReleaseOrRecover(
         intent.apply_id, intent.apply_generation);
     const auto terminal = apply_journal_.ReadTerminalOutcome(
@@ -424,40 +464,115 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
             release.durable_terminal_outcome.record.terminal_outcome};
   }
 
-  if (!apply_journal_
-           .ReadSceneActivated(intent.apply_id, intent.apply_generation)
-           .has_value()) {
+  // Runtime convergence and scene projection activation form one ordered
+  // hand-off.  The candidate native child may be launched and prepared before
+  // staging, but its candidate projection is not usable for composition until
+  // Scene activates it. On restart, an already-activated scene must still
+  // verify the exact retained child epoch before authority can advance.
+  bool scene_was_activated =
+      apply_journal_.ReadSceneActivated(intent.apply_id,
+                                        intent.apply_generation)
+          .has_value();
+  if (scene_was_activated) {
+    // Scene activation is durable, but it cannot substitute for current
+    // readiness of the exact retained component epochs. Convergence is an
+    // observe-only replay once staged-ready evidence exists and fails closed
+    // on loss or epoch drift; it never recreates a child for this Apply.
+    const auto active_plan = active_plan_source_.ReadCurrentPlan();
+    Require(active_plan.valid() &&
+                SameDeploymentRevision(
+                    active_plan.active_publication.request
+                        .candidate_projection_revision,
+                    intent.expected_active_projection_revision),
+            "predecessor publication changed before runtime convergence");
+    const auto expectation = FenceExpectation(
+        intent, *predecessor, *candidate, active_plan, apply_journal_,
+        kernel_fence_, manager_runtime_epoch_);
+    const auto runtime = runtime_coordinator_.ConvergeOrRecover(
+        intent, *predecessor, *candidate, expectation,
+        active_plan.active_publication.publication_generation);
+    if (runtime.state == ManagerRuntimeConvergenceResultState::kPending) {
+      return {intent.apply_id, intent.apply_generation,
+              ManagerNamedApplyResultState::kPending, request_replayed,
+              std::nullopt};
+    }
+    try {
+      static_cast<void>(scene_activation_coordinator_.ActivateOrRecover(
+          intent.apply_id, intent.apply_generation));
+    } catch (const ManagerSceneActivationPending &) {
+      return {intent.apply_id, intent.apply_generation,
+              ManagerNamedApplyResultState::kPending, request_replayed,
+              std::nullopt};
+    }
+  }
+  if (!scene_was_activated) {
+    // Durable Scene Stage success only records what an earlier runtime process
+    // prepared.  It does not prove that the intended component epochs are
+    // currently ready, so converge before either staging or activating.  The
+    // coordinator is idempotent when the exact current child still matches.
+    const auto active_plan = active_plan_source_.ReadCurrentPlan();
+    Require(active_plan.valid() &&
+                SameDeploymentRevision(
+                    active_plan.active_publication.request
+                        .candidate_projection_revision,
+                    intent.expected_active_projection_revision),
+            "predecessor publication changed before runtime convergence");
+    const auto expectation = FenceExpectation(
+        intent, *predecessor, *candidate, active_plan, apply_journal_,
+        kernel_fence_, manager_runtime_epoch_);
+    const auto runtime = runtime_coordinator_.ConvergeOrRecover(
+        intent, *predecessor, *candidate, expectation,
+        active_plan.active_publication.publication_generation);
+    if (runtime.state == ManagerRuntimeConvergenceResultState::kPending) {
+      return {intent.apply_id, intent.apply_generation,
+              ManagerNamedApplyResultState::kPending, request_replayed,
+              std::nullopt};
+    }
     if (!apply_journal_
              .ReadSceneStaged(intent.apply_id, intent.apply_generation)
              .has_value()) {
-      if (!apply_journal_
-               .ReadLatestRuntimeStagedReady(intent.apply_id,
-                                             intent.apply_generation)
-               .has_value()) {
-        const auto active_plan = active_plan_source_.ReadCurrentPlan();
-        Require(active_plan.valid() &&
-                    SameDeploymentRevision(
-                        active_plan.active_publication.request
-                            .candidate_projection_revision,
-                        intent.expected_active_projection_revision),
-                "predecessor publication changed before Apply selection");
-        const auto expectation = FenceExpectation(
-            intent, *predecessor, *candidate, active_plan, apply_journal_,
-            kernel_fence_, manager_runtime_epoch_);
-        const auto runtime = runtime_coordinator_.ConvergeOrRecover(
-            intent, *predecessor, *candidate, expectation,
-            active_plan.active_publication.publication_generation);
-        if (runtime.state == ManagerRuntimeConvergenceResultState::kPending) {
-          return {intent.apply_id, intent.apply_generation,
-                  ManagerNamedApplyResultState::kPending, request_replayed,
-                  std::nullopt};
-        }
+      try {
+        static_cast<void>(scene_stage_coordinator_.StageOrRecover(
+            intent.apply_id, intent.apply_generation));
+      } catch (const ManagerSceneStagePending &) {
+        return {intent.apply_id, intent.apply_generation,
+                ManagerNamedApplyResultState::kPending, request_replayed,
+                std::nullopt};
       }
-      static_cast<void>(scene_stage_coordinator_.StageOrRecover(
-          intent.apply_id, intent.apply_generation));
     }
-    static_cast<void>(scene_activation_coordinator_.ActivateOrRecover(
-        intent.apply_id, intent.apply_generation));
+    try {
+      static_cast<void>(scene_activation_coordinator_.ActivateOrRecover(
+          intent.apply_id, intent.apply_generation));
+    } catch (const ManagerSceneActivationPending &) {
+      return {intent.apply_id, intent.apply_generation,
+              ManagerNamedApplyResultState::kPending, request_replayed,
+              std::nullopt};
+    }
+    scene_was_activated = true;
+  }
+
+  // Once Scene has activated the candidate, recheck aggregate readiness of
+  // the same retained epochs before installation. Pending or failed current
+  // readiness cannot switch runtime authority.
+  if (scene_was_activated) {
+    const auto active_plan = active_plan_source_.ReadCurrentPlan();
+    Require(active_plan.valid() &&
+                SameDeploymentRevision(
+                    active_plan.active_publication.request
+                        .candidate_projection_revision,
+                    intent.expected_active_projection_revision),
+            "predecessor publication changed before runtime convergence");
+    const auto expectation = FenceExpectation(
+        intent, *predecessor, *candidate, active_plan, apply_journal_,
+        kernel_fence_, manager_runtime_epoch_);
+    const auto runtime = runtime_coordinator_.ConvergeOrRecover(
+        intent, *predecessor, *candidate, expectation,
+        active_plan.active_publication.publication_generation);
+    if (runtime.state == ManagerRuntimeConvergenceResultState::kPending) {
+      return {intent.apply_id, intent.apply_generation,
+              ManagerNamedApplyResultState::kPending, request_replayed,
+              std::nullopt};
+    }
   }
 
   const auto composition = runtime_composition_coordinator_.InstallOrRecover(
@@ -500,8 +615,9 @@ ManagerNamedApplyCoordinator::RecoverIncompleteApply() {
     if (IsTerminal(status)) {
       continue;
     }
-    Require(pending == nullptr,
-            "multiple nonterminal Applies contradict the sole Manager strand");
+    Require(
+        pending == nullptr,
+        "multiple nonterminal Applies contradict the sole progression owner");
     pending = &status;
   }
   if (pending == nullptr) {

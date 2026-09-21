@@ -15,6 +15,14 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+/// The exact activation is waiting for its accepted native stage to finish.
+class ManagerSceneActivationPending final
+    : public ManagerSceneActivationCoordinatorError {
+public:
+  using ManagerSceneActivationCoordinatorError::
+      ManagerSceneActivationCoordinatorError;
+};
+
 /// Recovery context when activation/retirement may have reached the owner but
 /// the Manager cannot yet prove one exact durable result.
 class ManagerSceneActivationEffectUncertainError final

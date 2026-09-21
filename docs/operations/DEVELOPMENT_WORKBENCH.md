@@ -10,17 +10,28 @@ Browser mount, reload, and disconnect are read-only reconstruction events.
 
 ## Prerequisites
 
-Prepare the normal development image once:
+This public runbook is sufficient for operation; no private documentation
+checkout is needed. The supported host path uses Linux host networking, Docker
+Engine with Compose v2/BuildKit, Git and Python 3. Allow network access for pinned
+dependency downloads and enough disk/RAM for the native build. This is source-based
+workbench setup, not a packaged production installer.
+
+Prepare only the required image once, from the repository root:
 
 ```bash
-./scripts/setup-docker.sh
+./scripts/setup-docker.sh --prepare-only
+docker compose build dev
 ```
 
-A fresh workbench cache also needs an existing qualified build root containing `maintained-package/` and
-`native-install/` with its exact native execution host and candidate worker.
-The launcher imports these immutable products and compiles only stale current
-Manager/Headless production targets in the same qualified development image.
-It does not regenerate the package or rerun tests or proofs.
+A fresh workbench cache also needs a compatible build root containing
+`maintained-package/`, supplied by the maintainer/distributor with the matching
+source revision. The image alone does not supply this package; if unavailable,
+report the missing artifact. Do not substitute legacy examples or generate a
+package with guessed inputs. `native-install/` is not imported: the launcher
+builds current native owners from this checkout. It does not regenerate the
+scenario package or run tests/proofs.
+The setup script may recreate stale or modified dependency directories under
+`.docker/`; preserve wanted local dependency edits before running it.
 The selected package must contain the same Deployment revision as the matching
 workspace example. If retained scenario contracts change, refresh the qualified
 package cache; the launcher rejects the stale package instead of silently
@@ -42,9 +53,10 @@ Later starts reuse the imported package, runtime, and npm caches:
 ```
 
 Open `http://localhost:3000`. Frontend source edits update through HMR. Backend
-startup incrementally builds only the current `manyforge_manager_daemon` and
-`manyforge_headless_py` production targets and reuses the exact qualified
-native runtime; it deliberately runs no tests, sanitizers, qualification
+startup incrementally builds the current `manyforge_manager_daemon`,
+`manyforge_headless_py`, `manyforge_native_execution_host`,
+`manyforge_roboplan_candidate_worker` and Deployment authoring compiler targets
+with their dependencies. It deliberately runs no tests, sanitizers, qualification
 matrices, package materializers, or proof generators.
 
 Inspect the exact owner-issued active tuple or stop all workbench processes:
@@ -67,6 +79,46 @@ retaining build, npm, and imported-package caches under `.manyforge-dev/`.
 The current fixed ports are frontend `3000`, Headless API `9010`, Program
 runner `9011`, and internal Composer API `9020`. If one is occupied, startup
 fails with a direct diagnostic rather than taking over the process.
+
+## Operation and troubleshooting
+
+Use Composer at `http://localhost:3000` for Program, Scene and Deployment work.
+Read Runtime/history and component readiness before issuing commands. Apply
+activates configuration; Save persists an artifact. Motion requires a separate
+authorized command. Browser closure does not Stop the runtime, and an unconfirmed
+viewer pose must not be treated as current measured state.
+
+Inspect before restarting:
+
+```bash
+./scripts/compose-dev.sh status
+docker logs --tail 200 manyforge-development-workbench
+docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' manyforge-development-workbench
+```
+
+Use the selected `MANYFORGE_DEV_CONTAINER_NAME` if overridden. Child-process
+output is inherited by the container log. Capture logs/status before `stop`,
+which removes the container and runtime state; persist wanted artifacts first.
+On a failed new start, the launcher prints the last logs before removing the
+container it created, so retain the startup terminal output too.
+
+| Symptom | Action |
+| --- | --- |
+| Image missing | Prepare dependencies and build `dev` using the commands above. |
+| Package missing, incomplete or revision mismatch | Obtain matching scenario products; preserve the diagnostic and inspect the named cache. Do not bypass identity checks or delete caches blindly. |
+| Port occupied | Identify the listener on 3000/9010/9011/9020; do not kill an unrelated process. |
+| Different or unhealthy workbench already running | Read status/logs first. Stop only with authorization before switching scenarios; do not spawn another stack to hide the failure. |
+| Slow first start | Inspect build output. Lower `MANYFORGE_DEV_BUILD_JOBS` if compilation exhausts memory; avoid repeated startup attempts. |
+| Stale viewer or failed command | Inspect Runtime/history and owner status. Do not infer rejection from a lost response or resend motion/Apply automatically. |
+
+For API clients, use the public generated
+[Composer contract](../reference/REST_API.md),
+[Headless contract](../reference/HEADLESS_REST_API.md) and
+[optional MCP contract](../reference/MCP_RUNTIME_CONTRACT.md).
+Running OpenAPI schemas are at `http://localhost:9020/openapi.json` and
+`http://localhost:9010/openapi.json`. Schema availability is not readiness.
+Host networking and the frontend's `0.0.0.0` binding require a trusted network
+or appropriate firewall/access controls; do not expose this workbench publicly.
 
 ## Classification and limits
 

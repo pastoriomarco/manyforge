@@ -698,6 +698,9 @@ def _focused_document() -> dict[str, Any]:
 
 
 class _Coordinator:
+    def replay_or_recover_exact(self, *_args, **_kwargs):
+        return False, None
+
     def execute(
         self,
         _envelope,
@@ -728,7 +731,10 @@ class _Headless:
     def scenario_program_selection(self, _scenario_id: str):
         return {"program_binding": {"program_binding_id": _DIGEST}}
 
-    def scenario_load_selection(self, _scenario_id: str):
+    def scenario_load_selection(
+        self, _scenario_id: str, *, timeout_seconds: float | None = None
+    ):
+        assert timeout_seconds is None or timeout_seconds > 0
         return {"deployment": deepcopy(self.applied_deployment)}
 
 
@@ -946,8 +952,14 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
 
     confirmation_token = "sha256:" + "c" * 64
 
-    def execute_candidate(intent, _claim, *, apply):
-        effects.append((deepcopy(intent), apply))
+    def execute_candidate(
+        intent,
+        _claim,
+        *,
+        apply,
+        prepared=None,
+        prepare_only=False,
+    ):
         compilation = {
             "schema_version": "manyforge.deployment_candidate_compilation.v1",
             "scenario_id": current["scenario_id"],
@@ -960,19 +972,51 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
             "program_revision": program["program_revision"],
             "program_binding_id": "sha256:" + "b" * 64,
         }
-        if apply and intent.get("confirmation_token") != confirmation_token:
-            return {
-                "status": "confirmation_required",
-                "confirmation_token": confirmation_token,
+        if prepared is None:
+            confirmation_required = (
+                apply and intent.get("confirmation_token") != confirmation_token
+            )
+            result = {
+                "status": (
+                    "confirmation_required"
+                    if confirmation_required
+                    else "applied" if apply else "previewed"
+                ),
+                "confirmation_token": (
+                    confirmation_token if confirmation_required else None
+                ),
                 "compilation": compilation,
-                "candidate_preview": {"diff": {"runtime_units": {"changed": ["runtime"]}}},
+                "candidate_preview": (
+                    {"diff": {"runtime_units": {"changed": ["runtime"]}}}
+                    if confirmation_required
+                    else None
+                ),
                 "manager_apply": None,
                 "selection": {
                     key: value
                     for key, value in compilation.items()
                     if key != "schema_version"
                 },
+                "preparation": (
+                    {
+                        "request_owner_epoch": intent[
+                            "preparation_request_owner_epoch"
+                        ],
+                        "request_id": intent["preparation_request_id"],
+                    }
+                    if confirmation_required
+                    else None
+                ),
+                "phases_ms": {"compile_ms": 1.0},
+                "apply_id": None,
             }
+            prepared = {"result": result}
+        if prepare_only:
+            return prepared
+        effects.append((deepcopy(intent), apply))
+        result = deepcopy(prepared["result"])
+        if result["status"] == "confirmation_required":
+            return result
         if apply:
             current.update(
                 {
@@ -981,18 +1025,7 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
                     if key != "schema_version"
                 }
             )
-        return {
-            "status": "applied" if apply else "previewed",
-            "confirmation_token": None,
-            "compilation": compilation,
-            "candidate_preview": None,
-            "manager_apply": None,
-            "selection": {
-                key: value
-                for key, value in compilation.items()
-                if key != "schema_version"
-            },
-        }
+        return result
 
     state.execute_authored_deployment_candidate = execute_candidate  # type: ignore[method-assign]
     prepared: list[tuple[str, str]] = []
@@ -1018,6 +1051,12 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
             edited,
             kind="apply-confirmed",
             confirmationToken=confirmation_token,
+            preparationRequestOwnerEpoch=confirmation.json()["result"][
+                "preparation"
+            ]["request_owner_epoch"],
+            preparationRequestId=confirmation.json()["result"]["preparation"][
+                "request_id"
+            ],
         ),
     )
     assert applied.status_code == 200, applied.text
@@ -1025,6 +1064,178 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
     assert applied.json()["workspace"]["runAdmission"]["ready"] is True
     assert current["program_revision"] == program["program_revision"]
     assert prepared == [("browser-test", "request-2-apply-confirmed")]
+
+
+def test_candidate_apply_partial_timeout_returns_one_typed_gateway_error(
+    tmp_path: Path,
+) -> None:
+    """One post-Apply observation timeout is a typed 504, never a silent 500."""
+
+    client, state = _client(tmp_path)
+    source = tmp_path / "cell_a.deployment.yaml"
+    source.write_text(json.dumps(_document()), encoding="utf-8")
+    initial = client.get("/api/deployment/workspace").json()
+    opened = client.post(
+        "/api/deployment/open-draft",
+        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
+    ).json()
+    program = {
+        "api_version": "manyforge.program.v2",
+        "program_id": "program_a",
+        "program_revision": "sha256:" + "7" * 64,
+    }
+    current = {
+        "scenario_id": "cell_a",
+        "scenario_catalog_revision": "sha256:" + "6" * 64,
+        "deployment_artifact_id": "cell_a",
+        "deployment_revision": opened["draft"]["deploymentRevision"],
+        "retained_bundle_id": "sha256:" + "2" * 64,
+        "graph_revision": "sha256:" + "3" * 64,
+        "program_id": "program_a",
+        "program_revision": program["program_revision"],
+        "program_binding_id": "sha256:" + "5" * 64,
+    }
+
+    class TimeoutHeadless(_Headless):
+        def program_applied(self):
+            return {
+                **current,
+                "program": deepcopy(program),
+                "source": {"record_digest": "sha256:" + "8" * 64},
+            }
+
+        def manager_status(self):
+            return {
+                "source": {
+                    "available": True,
+                    "freshness": "fresh",
+                    "known_gaps": [],
+                    "source_owner_epoch": "manager.epoch.1",
+                },
+                "status": {
+                    "manager_ready": True,
+                    "active": {
+                        "retained_bundle_id": current["retained_bundle_id"],
+                        "graph_revision": current["graph_revision"],
+                    },
+                },
+            }
+
+    state.headless_client = TimeoutHeadless()  # type: ignore[assignment]
+    state.current_scenario = lambda: {  # type: ignore[method-assign]
+        "ready": True,
+        "current_scenario": deepcopy(current),
+        "unavailable_reasons": [],
+    }
+    scene_preparations: list[tuple[str, str]] = []
+    state.prepare_current_applied_scene = lambda **kwargs: scene_preparations.append(  # type: ignore[method-assign]
+        (kwargs["request_owner_epoch"], kwargs["request_id"])
+    )
+    activations: list[bool] = []
+
+    def timeout_candidate(
+        intent,
+        _claim,
+        *,
+        apply,
+        prepared=None,
+        prepare_only=False,
+    ):
+        if prepare_only:
+            return {
+                "compilation": {
+                    **{field: current[field] for field in current},
+                    "schema_version": (
+                        "manyforge.deployment_candidate_compilation.v1"
+                    ),
+                    "program": deepcopy(program),
+                },
+                "candidate_preview": None,
+                "manager_apply": {"request_id": intent["manager_request_id"]},
+                "confirmation_required": False,
+                "confirmation_token": None,
+                "preparation": None,
+                "phases_ms": {"compile_ms": 1.0, "manager_apply_ms": 1.0},
+            }
+        activations.append(apply)
+        raise AuthoringJournalError(
+            "deployment_candidate_selection_timeout",
+            "Manager applied; selection confirmation timed out"
+            " for Apply apply-1 generation 1",
+        )
+
+    state.execute_authored_deployment_candidate = timeout_candidate  # type: ignore[method-assign]
+
+    response = client.post(
+        "/api/deployment/draft/apply",
+        json=_request(opened, kind="apply"),
+    )
+
+    assert response.status_code == 504, response.text
+    assert response.json()["detail"] == {
+        "code": "deployment_candidate_selection_timeout",
+        "message": (
+            "Manager applied; selection confirmation timed out for Apply "
+            "apply-1 generation 1"
+        ),
+    }
+    # The response names the accepted Apply's partial timeout.  It claims no
+    # rollback: the activation ran once, no post-Apply scene preparation was
+    # attempted, and the Draft was left intact.
+    assert activations == [True]
+    assert scene_preparations == []
+    untouched = state.deployment_draft_session.snapshot()["draft"]
+    assert untouched["revision"] == opened["draft"]["revision"]
+    assert untouched["document"] == opened["draft"]["document"]
+
+
+def test_exact_candidate_replay_precedes_fresh_runtime_prerequisites(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    source = tmp_path / "cell_a.deployment.yaml"
+    source.write_text(json.dumps(_document()), encoding="utf-8")
+    workspace = client.get("/api/deployment/workspace").json()
+    opened = client.post(
+        "/api/deployment/open-draft",
+        json=_request(workspace, path=str(source), confirmDiscard=False, kind="open"),
+    ).json()
+    request = _request(opened, kind="apply-replay")
+    expected = {
+        "schemaVersion": "manyforge.composer_deployment_candidate_operation.v1",
+        "workspace": opened,
+        "result": {"status": "applied"},
+    }
+
+    class ExactReplay:
+        def replay_or_recover_exact(self, envelope, **kwargs):
+            assert envelope.request_id == request["requestId"]
+            assert kwargs["operation_kind"] == "apply_deployment_candidate"
+            return True, deepcopy(expected)
+
+        def execute(self, *_args, **_kwargs):
+            pytest.fail("exact replay must not start a fresh operation")
+
+    state.authoring_admission = ExactReplay()  # type: ignore[assignment]
+    state.headless_client = None
+    state.current_scenario = lambda: pytest.fail(  # type: ignore[method-assign]
+        "exact replay consulted mutable current Scenario state"
+    )
+    preparations: list[dict[str, Any]] = []
+    state.prepare_current_applied_scene = lambda **kwargs: preparations.append(  # type: ignore[method-assign]
+        kwargs
+    )
+
+    response = client.post("/api/deployment/draft/apply", json=request)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == expected
+    assert preparations == [
+        {
+            "request_owner_epoch": request["requestOwnerEpoch"],
+            "request_id": request["requestId"],
+        }
+    ]
 
 
 def test_focused_motion_target_limit_updates_one_exact_target_atomically(

@@ -115,12 +115,13 @@ MANYFORGE_DEV_QUALIFIED_BUILD_ROOT=/path/to/qualified/build \
   ./scripts/compose-dev.sh start --scenario lite6_pick_and_place
 ```
 
-The build-root setting is needed only when importing the maintained package
-and matching native products into a fresh
-image-keyed development cache. Later starts use `./scripts/compose-dev.sh start
+The build-root setting is needed only when importing a compatible
+`maintained-package/` into a fresh image-keyed cache. Obtain that artifact with
+its matching source revision from the maintainer/distributor; building the image
+alone does not provide it. Later starts use `./scripts/compose-dev.sh start
 --scenario lite6_pick_and_place`; `status` and `stop` are separate commands. The launcher
-incrementally builds only stale Manager/Headless production targets against the
-matching workbench ABI, starts their owners in order,
+incrementally builds stale Manager/Headless, native execution/candidate-worker
+and Deployment authoring compiler targets with their dependencies, starts owners in order,
 establishes the exact active Deployment and Applied Program/Binding, and serves
 Vite HMR at `http://localhost:3000`. It does not run tests, sanitizers,
 qualification, package generation, or proof generation. The

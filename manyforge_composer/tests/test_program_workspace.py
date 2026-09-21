@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from manyforge_behavior.canonical_artifact import compute_content_identity
+from manyforge_behavior.executable_node_resolver import build_executable_node_resolver
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
 from manyforge_composer.backend import program_artifacts
@@ -149,6 +150,94 @@ def _motion_control_projection(*, sequence: int = 1) -> dict:
     }
 
 
+def _node_environment_projection() -> dict:
+    """Return the smallest build-qualified node-environment projection."""
+    environment = build_node_environment()
+    manifest = environment.manifest
+    dispositions = {
+        item.row: item
+        for item in build_executable_node_resolver(environment).dispositions
+    }
+    implementations = []
+    for row in manifest.executable_registry:
+        disposition = dispositions[row]
+        implementations.append(
+            {
+                "adapter_build_qualified": disposition.adapter_build_qualified,
+                "authoring_available": True,
+                "binding_available": False,
+                "engine_id": row.engine_id,
+                "executable_package_id": row.executable_package_id,
+                "execution_available": False,
+                "implementation_id": row.implementation_id,
+                "implementation_identity_resolved": True,
+                "node_id": row.node_id,
+                "owner_health_available": (
+                    disposition.adapter_build_qualified
+                    and disposition.owner_port_name is None
+                ),
+                "reason_codes": sorted(
+                    {
+                        "program_binding_unselected",
+                        *(
+                            [disposition.unavailable_reason_code]
+                            if disposition.unavailable_reason_code is not None
+                            else []
+                        ),
+                        *(
+                            ["program_runtime_owner_unavailable"]
+                            if disposition.owner_port_name is not None
+                            or not disposition.adapter_build_qualified
+                            else []
+                        ),
+                    }
+                ),
+                "restoration_gates": list(disposition.restoration_gates),
+            }
+        )
+    return {
+        "schema_version": "manyforge.node_environment_projection.v2",
+        "retained_bundle_id": "bundle-1",
+        "graph_revision": "graph-1",
+        "catalog_id": manifest.catalog_id,
+        "content_version": manifest.catalog_content_version,
+        "catalog_digest": manifest.catalog_digest,
+        "environment_digest": manifest.environment_digest,
+        "package_environment": {
+            "catalog_id": manifest.catalog_id,
+            "content_version": manifest.catalog_content_version,
+            "catalog_digest": manifest.catalog_digest,
+            "environment_digest": manifest.environment_digest,
+        },
+        "catalog": environment.catalog.raw_data,
+        "manifest": manifest.to_dict(),
+        "availability": {
+            "binding_context": "unselected",
+            "execution_available": False,
+            "implementations": implementations,
+            "manager_runtime_converged": True,
+            "portable_authoring_available": True,
+            "reason_codes": [
+                "program_binding_unselected",
+                "program_runtime_owner_unavailable",
+            ],
+            "restoration_gates": ["I6", "N"],
+        },
+        "source": {
+            "available": True,
+            "freshness": "fresh",
+            "known_gaps": [],
+            "projection_generation": 1,
+            "projection_owner_epoch": "headless.epoch.1",
+            "receiver_age_ns": 0,
+            "source_generation": 1,
+            "source_owner_epoch": "manager.epoch.1",
+            "source_owner_id": "component-manager.test",
+            "source_content_digest": "sha256:" + "a" * 64,
+        },
+    }
+
+
 def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
     tmp_path: Path,
 ) -> None:
@@ -158,6 +247,9 @@ def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
 
         def execution_targets(self) -> dict:
             return _motion_targets_projection()
+
+        def node_environment(self) -> dict:
+            return _node_environment_projection()
 
         def execution_control_state(self) -> dict:
             self.reads += 1
@@ -214,6 +306,9 @@ def test_observed_move_is_one_revision_fenced_draft_mutation(tmp_path: Path) -> 
     class Headless:
         def execution_targets(self) -> dict:
             return _motion_targets_projection()
+
+        def node_environment(self) -> dict:
+            return _node_environment_projection()
 
         def execution_control_state(self) -> dict:
             return _motion_control_projection()

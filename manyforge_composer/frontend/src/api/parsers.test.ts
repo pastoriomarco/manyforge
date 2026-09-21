@@ -6,6 +6,7 @@ import {
   parseCapabilityCommandPreviewResponse,
   parseCatalogResponse,
   parseCurrentScenarioResponse,
+  parseDeploymentCandidateOperationResponse,
   parseDeploymentWorkspaceResponse,
   parseExecutionControlStatus,
   parseExecutionIdentity,
@@ -1052,6 +1053,47 @@ describe('Program product projections', () => {
 });
 
 describe('Deployment workspace parser', () => {
+  it('retains bounded Apply phase timings and preparation identity', () => {
+    const digestA = `sha256:${'a'.repeat(64)}`;
+    const digestB = `sha256:${'b'.repeat(64)}`;
+    const digestC = `sha256:${'c'.repeat(64)}`;
+    const compilation = {
+      schema_version: 'manyforge.deployment_candidate_compilation.v1',
+      scenario_id: 'fixture',
+      scenario_catalog_revision: digestB,
+      deployment_artifact_id: 'deployment.fixture',
+      deployment_revision: digestA,
+      retained_bundle_id: digestB,
+      graph_revision: digestC,
+      program_id: 'fixture-program',
+      program_revision: digestB,
+      program_binding_id: digestA,
+    };
+    const parsed = parseDeploymentCandidateOperationResponse({
+      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
+      workspace: deploymentWorkspaceFixture(),
+      result: {
+        status: 'applied',
+        confirmation_token: null,
+        compilation,
+        candidate_preview: null,
+        manager_apply: null,
+        selection: Object.fromEntries(
+          Object.entries(compilation).filter(([key]) => key !== 'schema_version'),
+        ),
+        preparation: null,
+        phases_ms: { compile_ms: 2.5, manager_apply_ms: 8.25 },
+        apply_id: 'apply-1',
+      },
+    });
+
+    expect(parsed.result.phasesMs).toEqual({
+      compile_ms: 2.5,
+      manager_apply_ms: 8.25,
+    });
+    expect(parsed.result.applyId).toBe('apply-1');
+  });
+
   it('accepts the authored graph without embedding its compiler-issued revision', () => {
     const parsed = parseDeploymentWorkspaceResponse(deploymentWorkspaceFixture());
     expect(parsed.draft.document?.graph).not.toHaveProperty('graph_revision');

@@ -77,6 +77,20 @@ private:
           std::istreambuf_iterator<char>()};
 }
 
+void CopyDirectory(const std::filesystem::path &source,
+                   const std::filesystem::path &destination) {
+  std::error_code error;
+  std::filesystem::copy(
+      source, destination,
+      std::filesystem::copy_options::recursive |
+          std::filesystem::copy_options::copy_symlinks,
+      error);
+  if (error) {
+    throw std::runtime_error("route-fence owner fixture copy failed: " +
+                             error.message());
+  }
+}
+
 [[nodiscard]] const std::string &
 TextMember(const deployment::CanonicalValue &root,
            const std::string_view name) {
@@ -633,6 +647,57 @@ TEST(ManagedKernelRouteFenceOwner,
             query.expected_active_control_configuration);
 }
 
+TEST(ManagedKernelRouteFenceOwner,
+     ResolvesActivePredecessorFromCandidatePackageDuringManagedApply) {
+  OwnerFixture fixture;
+  ScopedTemporaryRoot package_roots;
+  const auto trusted_root = package_roots.path() / "trusted";
+  const auto candidate_root = package_roots.path() / "candidate";
+  CopyDirectory(fixture.retained_root, trusted_root);
+  CopyDirectory(fixture.retained_root, candidate_root);
+
+  // During a managed Apply the child is started from the candidate package
+  // before the durable active-publication pointer is advanced.  The trusted
+  // package therefore intentionally lacks the predecessor bundle; the
+  // candidate package still contains it and must be accepted as the bounded
+  // exact-identity fallback.
+  const auto predecessor_path =
+      trusted_root / "retained-bundles" / "sha256" /
+      (fixture.bundle->retained_bundle_id().value().substr(7U) + ".json");
+  ASSERT_TRUE(std::filesystem::remove(predecessor_path));
+  ASSERT_FALSE(std::filesystem::exists(predecessor_path));
+  ASSERT_TRUE(std::filesystem::exists(
+      candidate_root / "retained-bundles" / "sha256" /
+      (fixture.bundle->retained_bundle_id().value().substr(7U) + ".json")));
+
+  ManagedKernelAdmissionGate gate;
+  const auto scope = AffectedScope();
+  auto table = std::make_shared<core::ResourceSlotTable>(
+      scope.resources, std::vector<core::DomainActiveControlConfigurationDTO>{},
+      gate.shared_admission_mutex());
+  gate.BindResourceTable(table);
+  ASSERT_TRUE(table
+                  ->reconfigure_runtime_inventory(scope.resources,
+                                                  ActiveConfigurations(), {})
+                  .ok());
+
+  auto config = fixture.Config("candidate-fallback");
+  config.retained_package_root = trusted_root;
+  config.candidate_retained_package_root = candidate_root;
+  ManagedKernelApplyFenceOwner owner(config, gate);
+
+  auto query = RouteQuery(fixture);
+  query.expected_active_control_configuration = {
+      core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
+      std::nullopt, std::nullopt};
+  const auto observed = owner.ObserveRouteConfigurationFenceAdmission(query);
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  EXPECT_EQ(observed.value().query.expected_retained_bundle_id,
+            fixture.bundle->retained_bundle_id());
+  EXPECT_EQ(observed.value().query.expected_graph_revision,
+            fixture.bundle->value().cell_graph.graph_revision);
+}
+
 TEST(ManagedKernelRouteFenceRecordCodec,
      ExactIntentRoundTripsAndRejectsAnotherRecordKind) {
   const core::ExpectedActiveControlConfigurationDTO expected_active{
@@ -839,11 +904,17 @@ TEST(ManagedKernelDisableFenceOwner,
       fixture.state_root.path() / "operation-journal.sqlite3",
       fixture.bundle->value().cell_graph.cell_id, 32U);
   core::RuntimeParticipantExecutionRegistration registration{
-      binding,      std::nullopt,
-      {},           core::MotionInterruptNodeCategory::kGeneric,
-      &engine,      nullptr,
-      std::nullopt, nullptr,
-      std::nullopt, std::nullopt};
+      .binding = binding,
+      .stop_readiness = std::nullopt,
+      .retained_default_stop_limits = {},
+      .stop_node_category = core::MotionInterruptNodeCategory::kGeneric,
+      .engine = &engine,
+      .stop_execution_port = nullptr,
+      .runtime_policy = std::nullopt,
+      .prepared_motion_engine = nullptr,
+      .default_operator_stop_profile = std::nullopt,
+      .default_fault_stop_profile = std::nullopt,
+      .deployment_maximum_tcp_linear_speed_mps = std::nullopt};
   core::ResourceAddressedExecutionKernel kernel(
       {std::move(registration)}, clock, scheduler, journal,
       core::ResourceAddressedExecutionKernelConfig{

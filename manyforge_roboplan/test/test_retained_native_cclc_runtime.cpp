@@ -1043,7 +1043,7 @@ private:
         std::move(contact_policy),
         {authority.runtime_policy.value().source_artifact},
         request.speed_profile.max_tcp_linear_speed_mps,
-        *authority.deployment_maximum_tcp_linear_speed_mps,
+        authority.deployment_maximum_tcp_linear_speed_mps,
         std::move(scopes),
         request.timeouts.execution_timeout_s};
 
@@ -1207,16 +1207,17 @@ public:
     fault_profile.allow_natural_completion_on_short_path = false;
     fault_profile.recoverable_substitution_mode.reset();
     core::RuntimeParticipantExecutionRegistration registration{
-        participants.front().participant_binding,
-        participants.front().stop_readiness,
-        std::move(hard_limits),
-        core::MotionInterruptNodeCategory::kGeneric,
-        &engine_,
-        &engine_,
-        std::move(runtime_policy.value()),
-        &engine_,
-        std::move(operator_profile.value()),
-        std::move(fault_profile)};
+        .binding = participants.front().participant_binding,
+        .stop_readiness = participants.front().stop_readiness,
+        .retained_default_stop_limits = std::move(hard_limits),
+        .stop_node_category = core::MotionInterruptNodeCategory::kGeneric,
+        .engine = &engine_,
+        .stop_execution_port = &engine_,
+        .runtime_policy = std::move(runtime_policy.value()),
+        .prepared_motion_engine = &engine_,
+        .default_operator_stop_profile = std::move(operator_profile.value()),
+        .default_fault_stop_profile = std::move(fault_profile),
+        .deployment_maximum_tcp_linear_speed_mps = 0.15};
     if (kernel_ == nullptr) {
       journal_ = std::make_unique<core::SqliteOperationJournal>(journal_path_,
                                                                 cell_id_);

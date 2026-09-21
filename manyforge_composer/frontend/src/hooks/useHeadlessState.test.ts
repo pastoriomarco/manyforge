@@ -1177,19 +1177,40 @@ describe('HeadlessStateSource delivery scheduling', () => {
     if (recovery === 'disconnect') viewer.fail();
     else if (recovery === 'model rejection') {
       source.rejectExecutionObservation(source.getLatestExecutionObservation()!);
+      // A model transition discards the incompatible frame in place. It must
+      // not replace the socket and create reconnect churn while the structural
+      // model refreshes.
+      expect(source.getExecutionObservationTransportStatus()).toMatchObject({
+        phase: 'synchronizing',
+      });
+      expect(viewer.readyState).toBe(FakeWebSocket.OPEN);
+      expect(JSON.parse(viewer.sent.at(-1)!)).toMatchObject({
+        last_applied: { source_sequence: 3 },
+      });
+      source.markExecutionObservationApplied(source.getLatestExecutionObservation()!);
+      expect(source.getExecutionObservationTransportStatus()).toMatchObject({
+        phase: 'live',
+      });
     } else source.reconnect();
     expect(animationFrames.size).toBe(0);
-    expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(2);
+    expect(source.getLatestExecutionObservation()?.sourceSequence).toBe(
+      recovery === 'model rejection' ? 3 : 2,
+    );
 
-    vi.advanceTimersByTime(1_000);
-    const replacement = FakeWebSocket.instances.filter(
-      (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
-    ).at(-1)!;
-    replacement.open();
+    let replacement = viewer;
+    if (recovery !== 'model rejection') {
+      vi.advanceTimersByTime(1_000);
+      replacement = FakeWebSocket.instances.filter(
+        (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
+      ).at(-1)!;
+      replacement.open();
+    }
     replacement.sendFrame(wireObservation(4));
     // A repeated unrendered frame is not an applied acknowledgement.
     replacement.sendFrame(wireObservation(4));
-    expect(replacement.sent).toHaveLength(1);
+    expect(replacement.sent.length).toBeGreaterThanOrEqual(
+      recovery === 'model rejection' ? 2 : 1,
+    );
     expect(animationFrames.size).toBe(1);
     const [currentId, currentCallback] = [...animationFrames.entries()][0]!;
     animationFrames.delete(currentId);

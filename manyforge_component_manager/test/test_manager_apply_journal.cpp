@@ -2310,7 +2310,7 @@ TEST(ManagerApplySceneJournal,
 }
 
 TEST(ManagerApplySceneJournal,
-     FreezesLatestRuntimeEvidenceAndRejectsMismatchedStageResults) {
+     SceneStageIntentIsInsertOrExactReplayAndNeverReplaced) {
   TemporaryDirectory directory;
   SqliteManagerApplyJournal journal(directory.path() / "scene-stage.sqlite3",
                                     CellId("cell-1"));
@@ -2321,6 +2321,10 @@ TEST(ManagerApplySceneJournal,
                ManagerApplyJournalConflictError);
   const auto intent = journal.EnsureSceneStageIntent(
       SceneStageIntent(parents.staged_ready.staged_ready_digest));
+  const auto replay = journal.EnsureSceneStageIntent(
+      intent.record.scene_stage_intent);
+  EXPECT_FALSE(replay.inserted);
+  EXPECT_EQ(replay.record, intent.record);
 
   const auto runtime_intent = journal.ReadRuntimeConvergenceIntent(
       ApplyId("apply-1"), ApplyGeneration(1U));
@@ -2328,6 +2332,16 @@ TEST(ManagerApplySceneJournal,
   EXPECT_THROW(journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
                    runtime_intent->runtime_convergence_intent_digest, 2U)),
                ManagerApplyJournalConflictError);
+  EXPECT_EQ(journal.ReadSceneStageIntent(ApplyId("apply-1"),
+                                         ApplyGeneration(1U)),
+            std::optional<PersistedManagerApplySceneStageIntent>{intent.record});
+
+  auto conflicting_replay = intent.record.scene_stage_intent;
+  conflicting_replay.candidate_graph_revision =
+      GraphRevision("candidate-graph-other");
+  EXPECT_THROW(
+      static_cast<void>(journal.EnsureSceneStageIntent(conflicting_replay)),
+      ManagerApplyJournalConflictError);
 
   auto wrong_parent = SceneStaged(ContentDigest(std::string(kDigestTwo)));
   EXPECT_THROW(journal.EnsureSceneStaged(wrong_parent),
@@ -2354,12 +2368,13 @@ TEST(ManagerApplySceneJournal,
   EXPECT_THROW(journal.EnsureSceneStaged(wrong_candidate),
                ManagerApplyJournalConflictError);
 
-  auto missing_rows =
-      SceneStaged(intent.record.scene_stage_intent_digest, true);
+  auto missing_rows = SceneStaged(intent.record.scene_stage_intent_digest, true);
   EXPECT_TRUE(missing_rows.valid());
   EXPECT_THROW(journal.EnsureSceneStaged(missing_rows),
                ManagerApplyJournalConflictError);
-  EXPECT_EQ(journal.VerifyIntegrity().scene_staged_count, 0);
+  const auto report = journal.VerifyIntegrity();
+  EXPECT_EQ(report.scene_stage_intent_count, 1);
+  EXPECT_EQ(report.scene_staged_count, 0);
 }
 
 TEST(ManagerApplySceneJournal,

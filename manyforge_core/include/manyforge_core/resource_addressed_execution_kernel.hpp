@@ -58,8 +58,9 @@ struct RuntimeParticipantExecutionRegistration final {
 
   MotionInterruptNodeCategory stop_node_category{MotionInterruptNodeCategory::kGeneric};
 
-  /// Non-owning. The engine must remain alive and quiesce callbacks before
-  /// this addressed owner is destroyed.
+  /// Non-owning. The engine must remain alive through addressed-owner
+  /// destruction while the owner closes, unsubscribes and drains callback
+  /// ingress.
   IResolvedParticipantExecutionEngine* engine{};
 
   /// Exact prepared-stage realization boundary. This is deliberately
@@ -618,6 +619,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct StopProjectionJob;
   struct PartialDispatchStopScope;
   struct DisableRuntimeExpectation;
+  struct EngineEventIngress;
   class StopProjectionWorker;
   struct EngineSubscription;
   struct PreviewSession;
@@ -841,6 +843,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// Canonical bounded resident operation table. Unresolved operations are
   /// never evicted; resolved history rotates before new admission.
   std::map<OperationId, std::unique_ptr<ActiveOperation>> active_operations_;
+  // Shared with every engine callback snapshot. The ingress owns the only
+  // callback-visible Kernel pointer and drains entered callbacks before any
+  // Kernel state or asynchronous lane is retired.
+  std::shared_ptr<EngineEventIngress> engine_event_ingress_;
   std::vector<EngineSubscription> engine_subscriptions_;
   // Engaged exactly once during successful construction and replaced only by
   // a fully validated runtime reconfiguration.

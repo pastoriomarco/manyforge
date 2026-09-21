@@ -68,6 +68,16 @@ public:
             "Manager-liveness batch names a superseded active publication") {}
 };
 
+/// The Manager snapshot still names a predecessor process while convergence
+/// is replacing that process.  No heartbeat was sent, so callers can keep the
+/// cell closed and retry as soon as the converged snapshot advances.
+class ManagerLivenessRuntimeTransition final : public std::runtime_error {
+public:
+  ManagerLivenessRuntimeTransition()
+      : std::runtime_error(
+            "Manager-liveness snapshot is awaiting the current runtime epoch") {}
+};
+
 /// One exact Manager-to-runtime renewal transaction.  The required set and
 /// policy are repeated deliberately: the private child never consults ambient
 /// Manager state and can reject a changed bundle/set/policy before renewal.

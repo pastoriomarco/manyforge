@@ -455,16 +455,27 @@ export interface DeploymentCandidateCompilation {
   programBindingId: string;
 }
 
+export interface DeploymentCandidatePreparation {
+  requestOwnerEpoch: string;
+  requestId: string;
+}
+
 export interface DeploymentCandidateOperationResponse {
   schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1';
   workspace: DeploymentWorkspaceResponse;
   result: {
     status: 'previewed' | 'confirmation_required' | 'applied';
     confirmationToken: string | null;
+    /** Authoritative identity of the journalized preparation, echoed on
+     * confirmation_required so the confirmation can reference it. */
+    preparation: DeploymentCandidatePreparation | null;
     compilation: DeploymentCandidateCompilation;
     candidatePreview: ManagerDeploymentCandidatePreviewResponse | null;
     managerApply: ManagerApplyResponse | null;
     selection: Omit<DeploymentCandidateCompilation, 'schemaVersion'>;
+    /** Monotonic backend durations for the phases actually traversed. */
+    phasesMs: Record<string, number>;
+    applyId: string | null;
   };
 }
 

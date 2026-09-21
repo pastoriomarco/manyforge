@@ -12,8 +12,12 @@ documentation must remain self-contained here. Maintainers can also follow the
 
 `README.md` remains the project entrypoint. For LLM agents,
 [`../AGENTS.md`](../AGENTS.md) is the canonical landing page (covers the
-current outage, historical lane selection, boundary rules, and the
-branch/commit workflow).
+operator quickstart, runtime/development routing and authorization boundaries).
+For installation prerequisites, start/status/stop commands and diagnosis of the
+available simulated runtime, go directly to
+[the workbench runbook](operations/DEVELOPMENT_WORKBENCH.md). It requires no
+private documentation. A fresh cache does require the matching maintained
+scenario package; standalone packaged installation is not yet available.
 
 > **Current `dev` outage:** the composable-cell destructive migration has
 > removed the legacy node factory and runtime resolver. Catalog inspection is

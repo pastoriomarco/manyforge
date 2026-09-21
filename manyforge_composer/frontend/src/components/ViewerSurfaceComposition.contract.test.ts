@@ -89,7 +89,7 @@ describe('UI4 application and viewport composition', () => {
     expect(transport).toContain('Scale current and subsequent moves');
     expect(styles).toMatch(/\.viewer-transport \{[^}]*grid-template-columns:[^;]*var\(--viewer-transport-motion-panel-width\)[^;]*minmax\(0, 1fr\)[^;]*var\(--viewer-transport-column-width\);/s);
     expect(styles).toMatch(/\.transport-control-layout \{[^}]*display: contents;/s);
-    expect(styles).toMatch(/\.transport-guidance \{[^}]*grid-column: 2;[^}]*align-self: end;/s);
+    expect(styles).toMatch(/\.transport-guidance \{[^}]*position: absolute;[^}]*right: calc\(var\(--viewer-transport-column-width\) \+ 1\.25rem\);[^}]*bottom: 0;[^}]*left: calc\(var\(--viewer-transport-motion-panel-width\) \+ 1\.25rem\);/s);
     expect(styles).toMatch(/\.viewer-transport \{[^}]*padding: 0;[^}]*overflow: visible;/s);
     expect(styles).not.toMatch(/\.viewer-transport \{[^}]*(?:border|background):/s);
     expect(styles).toMatch(/\.transport-motion-panel \{[^}]*border: 1px solid #365463;[^}]*background: rgb\(8 23 32 \/ 94%\);/s);

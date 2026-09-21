@@ -108,8 +108,11 @@ function robotController(): RobotControlController {
     runtimeScaleDraft: 1,
     runtimeScalePending: false,
     fullStopError: null,
+    stopFaultRecoveryPending: false,
+    stopFaultRecoveryError: null,
     resume: vi.fn(),
     stop: vi.fn(),
+    recoverStopFault: vi.fn(),
     setRuntimeScale: vi.fn(),
     commitRuntimeScale: vi.fn(),
   } as unknown as RobotControlController;
@@ -679,11 +682,15 @@ describe('Program runtime projection', () => {
     expect(transport).toContain('overflow: visible;');
     expect(transport).toMatch(/\.viewer-transport \{[^}]*padding: 0;[^}]*overflow: visible;/s);
     expect(transport).not.toMatch(/\.viewer-transport \{[^}]*(?:border|background):/s);
+    expect(transport).toMatch(/\.viewer-transport \{[^}]*pointer-events: none;/s);
+    expect(css).toMatch(
+      /\.viewer-transport \.transport-motion-panel,[\s\S]*\.transport-unique-column,[\s\S]*\.transport-guidance \{[^}]*pointer-events: auto;/s,
+    );
     expect(transport).toMatch(
       /\.viewer-transport \{[^}]*grid-template-columns:[^;]*var\(--viewer-transport-motion-panel-width\)[^;]*minmax\(0, 1fr\)[^;]*var\(--viewer-transport-column-width\);[^}]*column-gap: 1\.25rem;/s,
     );
     expect(transport).toMatch(
-      /\.transport-guidance \{[^}]*grid-row: 1;[^}]*grid-column: 2;[^}]*align-self: end;/s,
+      /\.transport-guidance \{[^}]*position: absolute;[^}]*right: calc\(var\(--viewer-transport-column-width\) \+ 1\.25rem\);[^}]*bottom: 0;[^}]*left: calc\(var\(--viewer-transport-motion-panel-width\) \+ 1\.25rem\);/s,
     );
     expect(transport).toMatch(/\.transport-control-layout \{[^}]*display: contents;/s);
     expect(transport).toMatch(
@@ -830,6 +837,8 @@ describe('Program runtime projection', () => {
       enabled program={controller()} robot={robot} />);
     expect(render()).toContain('Cell recovery required.');
     expect(render()).toContain('waiting for observation');
+    expect(render()).toContain('>Retry recovery</button>');
+    expect(render()).not.toMatch(/class="runtime-detail-button"[^>]*disabled[^>]*>Retry recovery/);
     robot.state.status.cellStopAction.fault = { ...fault, state: 'cleared' };
     expect(render()).not.toContain('Cell recovery required.');
   });

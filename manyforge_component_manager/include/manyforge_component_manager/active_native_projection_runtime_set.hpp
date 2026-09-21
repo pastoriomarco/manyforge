@@ -7,10 +7,11 @@
 
 namespace manyforge::component_manager {
 
-/// Joins the active compiler-owned provider/runtime requirements with the
-/// exact converged process epochs directly observed by Component Manager.
-/// This binding-only form lets the steady-state loop compare process
-/// incarnations without reading the scene store.
+/// Joins the active compiler-owned provider/runtime requirements with exact
+/// present process epochs directly observed by Component Manager.  A present
+/// epoch is sufficient for the scene-owner recovery bootstrap; callers that
+/// need admission must still require the enclosing runtime observation to be
+/// converged.
 [[nodiscard]]
 std::vector<manyforge::core::ProjectionNativeRuntimeBindingDTO>
 DeriveActiveNativeProjectionRuntimeBindings(

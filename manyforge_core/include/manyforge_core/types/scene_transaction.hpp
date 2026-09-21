@@ -217,6 +217,16 @@ struct NativeProjectionRebuildDTO final {
            logical_scene->revision ==
                target_projection_revision.scene_revision;
   }
+
+  friend bool operator==(const NativeProjectionRebuildDTO& lhs,
+                         const NativeProjectionRebuildDTO& rhs) {
+    return lhs.expected_native_runtime_binding ==
+               rhs.expected_native_runtime_binding &&
+           lhs.target_projection_revision == rhs.target_projection_revision &&
+           lhs.planning_collision_model == rhs.planning_collision_model &&
+           lhs.logical_scene != nullptr && rhs.logical_scene != nullptr &&
+           *lhs.logical_scene == *rhs.logical_scene;
+  }
 };
 
 enum class SceneUpdateStatusDTO {
@@ -294,6 +304,7 @@ enum class SceneProjectionCommitStatusDTO {
 }
 
 enum class ProjectionCommitResultStateDTO {
+  kAccepted,
   kCommitted,
   kRejectedRollbackProven,
   kFailedProjectionUncertain,
@@ -343,6 +354,10 @@ inline bool ProjectionCommitResultDTO::presence_valid() const noexcept {
     return false;
   }
   switch (result) {
+    case ProjectionCommitResultStateDTO::kAccepted:
+      return !acknowledged_projection_revision.has_value() &&
+             !rollback_proven && !error.has_value() &&
+             resulting_health.state == ProjectionHealthState::kRebuilding;
     case ProjectionCommitResultStateDTO::kCommitted:
       return acknowledged_projection_revision.has_value() &&
              *acknowledged_projection_revision == proposed_projection_revision &&

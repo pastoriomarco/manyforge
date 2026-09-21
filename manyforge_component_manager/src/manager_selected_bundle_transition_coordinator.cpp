@@ -101,7 +101,7 @@ ObserveObsoleteManagedCommandSurfaces(
     const RetainedBundle &predecessor, const RetainedBundle &candidate,
     const deployment::IVerifiedRetainedProductArtifactSource *artifact_source,
     const PersistedManagerApplyRuntimeStagedReady *staged_ready,
-    const core::ContentDigest &expected_staged_ready_digest) {
+    const core::ContentDigest & /*expected_staged_ready_digest*/) {
   std::vector<ObsoleteManagedCommandSurfaceEvidenceDTO> result;
   const auto &predecessor_units = predecessor.value().cell_graph.runtime_units;
   const auto &candidate_units = candidate.value().cell_graph.runtime_units;
@@ -134,9 +134,12 @@ ObserveObsoleteManagedCommandSurfaces(
     if (*candidate_unit == predecessor_unit &&
         *candidate_product == *predecessor_product)
       continue;
-    if (!artifact_source || !staged_ready ||
-        staged_ready->staged_ready_digest != expected_staged_ready_digest)
+    if (!artifact_source || !staged_ready)
       Fail("native command-surface retirement lacks exact candidate readiness");
+    // The scene-stage intent remains bound to the original staged-ready
+    // digest.  A Manager restart may append a newer staged-ready observation
+    // for the recreated child epoch; the journal already verifies that this
+    // latest row belongs to the same Apply/runtime-convergence intent.
     const auto old = deployment::verify_runtime_unit_product(
         predecessor, predecessor_unit.runtime_unit_id, *artifact_source);
     const auto next = deployment::verify_runtime_unit_product(

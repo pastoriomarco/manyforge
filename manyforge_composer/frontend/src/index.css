@@ -1395,6 +1395,13 @@ code {
   font-size: 0.75rem;
 }
 
+.robot-control-owner-notice {
+  overflow-wrap: anywhere;
+  color: #91a7b2;
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
 .robot-control-actions {
   display: flex;
   width: fit-content;
@@ -1651,6 +1658,34 @@ code {
   font-size: 0.78rem;
 }
 
+.runtime-detail-button {
+  display: inline-flex;
+  min-width: 9.5rem;
+  min-height: 2.1rem;
+  align-items: center;
+  justify-content: center;
+  padding: 0.45rem 0.75rem;
+  border: 1px solid #315667;
+  border-radius: 0.45rem;
+  color: #b7d7df;
+  background: #122530;
+  font-size: 0.78rem;
+  line-height: 1.15;
+  text-align: center;
+}
+
+.runtime-detail-button:not(:disabled):hover {
+  border-color: #65c9df;
+  color: #e3f7fb;
+  background: #173342;
+}
+
+.runtime-detail-button:disabled {
+  border-color: #29414d;
+  color: #8196a0;
+  background: #101e27;
+}
+
 .viewer-stage {
   position: relative;
   height: clamp(27rem, 58vh, 45rem);
@@ -1794,10 +1829,10 @@ svg.viewer-camera-icon {
   text-align: left;
 }
 
-.viewer-observation-status {
+.viewer-target-status {
   position: absolute;
+  top: 0.65rem;
   left: 0.65rem;
-  bottom: 0.65rem;
   z-index: 4;
   display: flex;
   max-width: min(27rem, calc(100% - 1.3rem));
@@ -1812,7 +1847,7 @@ svg.viewer-camera-icon {
   pointer-events: none;
 }
 
-.viewer-observation-status strong {
+.viewer-target-status strong {
   color: #f2d9a7;
   white-space: nowrap;
 }
@@ -7034,12 +7069,26 @@ svg.viewer-camera-icon {
     var(--viewer-transport-motion-panel-width)
     minmax(0, 1fr)
     var(--viewer-transport-column-width);
+  grid-template-rows: auto auto;
   align-items: end;
   column-gap: 1.25rem;
+  row-gap: 0.35rem;
   padding: 0;
   overflow: visible;
   transform: translateX(50%);
   white-space: nowrap;
+  /* Only the actual control panels are hit targets. The flexible center gap
+     stays transparent so viewer drag gestures reach the 3D canvas. */
+  pointer-events: none;
+  /* Prevent accidental label selection while dragging inside a control. */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.viewer-transport .transport-motion-panel,
+.viewer-transport .transport-unique-column,
+.viewer-transport .transport-guidance {
+  pointer-events: auto;
 }
 
 .viewer-transport-feedback {
@@ -7061,9 +7110,14 @@ svg.viewer-camera-icon {
 }
 
 .transport-guidance {
-  grid-row: 1;
-  grid-column: 2;
-  align-self: end;
+  /* Keep status out of grid flow. A transient backend/observation message
+     must never resize or push either persistent control panel. On desktop the
+     center track is the only hit-target area available to the message. */
+  position: absolute;
+  right: calc(var(--viewer-transport-column-width) + 1.25rem);
+  bottom: 0;
+  left: calc(var(--viewer-transport-motion-panel-width) + 1.25rem);
+  width: auto;
   min-width: 0;
   max-height: min(30vh, 14rem);
   overflow: auto;
@@ -7086,6 +7140,13 @@ svg.viewer-camera-icon {
   border-color: #824d41;
   color: #efb7ac;
   background: #351d1b;
+}
+
+.transport-guidance.observation-synchronizing,
+.transport-guidance.observation-waiting {
+  border-color: #376477;
+  color: #b9dbe3;
+  background: #122a34;
 }
 
 .transport-guidance p {
@@ -8463,8 +8524,10 @@ svg.viewer-camera-icon {
   }
 
   .transport-guidance {
+    position: static;
     grid-row: 2;
     grid-column: 1;
+    width: 100%;
   }
 
   .transport-motion-panel {

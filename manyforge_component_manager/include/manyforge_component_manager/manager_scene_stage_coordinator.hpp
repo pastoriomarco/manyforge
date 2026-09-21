@@ -17,6 +17,12 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+/// The exact stage is owned and progressing; retry by identity.
+class ManagerSceneStagePending final : public ManagerSceneStageCoordinatorError {
+public:
+  using ManagerSceneStageCoordinatorError::ManagerSceneStageCoordinatorError;
+};
+
 /// Explicit recovery context when the scene owner may have observed Stage but
 /// the Manager cannot yet prove one exact durable result.
 class ManagerSceneStageEffectUncertainError final
@@ -74,7 +80,8 @@ public:
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
       manyforge::core::IManagerSceneProjectionHandoffPort &scene_owner,
       manyforge::core::IManagerSceneProjectionBootstrapPort
-          *bootstrap_scene_owner = nullptr);
+          *bootstrap_scene_owner = nullptr,
+      IRuntimeUnitProcessPort *runtime_process_port = nullptr);
 
   [[nodiscard]] ManagerSceneStageResult
   StageOrRecover(const manyforge::core::ApplyId &apply_id,
@@ -92,6 +99,7 @@ private:
   manyforge::core::IManagerSceneProjectionHandoffPort &scene_owner_;
   manyforge::core::IManagerSceneProjectionBootstrapPort
       *bootstrap_scene_owner_;
+  IRuntimeUnitProcessPort *runtime_process_port_;
   std::mutex operation_mutex_;
 };
 

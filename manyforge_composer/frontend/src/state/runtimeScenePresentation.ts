@@ -239,8 +239,8 @@ export function executionObservationRobotPresentation(
   frame: ExecutionObservationFrame | null,
   sourceModel: SourceModelProjection | null,
   manifest: SceneUrdfManifest | null,
-  descriptor: ManualControlMotionDescriptor | null,
-  observedAtNs: Nanoseconds | null,
+  descriptor: ManualControlMotionDescriptor | null = null,
+  observedAtNs: Nanoseconds | null = null,
 ): MeasuredRobotPresentation | null {
   if (
     frame === null
@@ -252,17 +252,26 @@ export function executionObservationRobotPresentation(
     || frame.retainedBundleId !== manifest.retained_bundle_id
     || frame.graphRevision !== sourceModel.graph_revision
     || frame.graphRevision !== manifest.graph_revision
-    || descriptor === null
   ) return null;
-  const motion = frame.targets.find((target) => (
-    target.controllableComponentId === descriptor.controllableComponentId
-    && target.commandTargetId === descriptor.commandTargetId
-  ));
-  if (motion === undefined || motion.sourceJointNames.length !== descriptor.joints.length
+  // Viewer pose admission must not depend on the optional Robot-control
+  // selection. After Apply (and whenever the inspector is closed) there may
+  // be no selected descriptor, while the execution owner still publishes the
+  // complete current state. Use any observed target as the presentation
+  // identity and validate a descriptor only when one is explicitly selected.
+  const motion = descriptor === null
+    ? frame.targets[0]
+    : frame.targets.find((target) => (
+        target.controllableComponentId === descriptor.controllableComponentId
+        && target.commandTargetId === descriptor.commandTargetId
+      ));
+  if (motion === undefined) return null;
+  if (descriptor !== null && (
+    motion.sourceJointNames.length !== descriptor.joints.length
     || descriptor.joints.some((joint, index) => (
       joint.sourceJointName !== motion.sourceJointNames[index]
       || joint.compiledJointName !== motion.compiledJointNames[index]
-    ))) return null;
+    ))
+  )) return null;
   const compiledPositions = new Map<string, number>();
   for (const observed of frame.targets) {
     const target = sourceModel.targets.find((candidate) => (
@@ -296,8 +305,8 @@ export function executionObservationRobotPresentation(
   }
   const linkTransforms = measuredLinkTransforms(manifest, compiledPositions);
   return linkTransforms === null ? null : {
-    objectId: descriptor.controllableComponentId,
-    sourceId: `execution:${descriptor.commandTargetId}`,
+    objectId: motion.controllableComponentId,
+    sourceId: `execution:${motion.commandTargetId}`,
     sourceEpoch: `${frame.ownerEpoch}:${frame.sourceEpoch}`,
     sourceSequence: frame.sourceSequence,
     observedAtNs,
@@ -334,9 +343,10 @@ export function createExecutionRobotPresentationReader(
         && sourceModel.cell_id === manifest.cell_id
         && sourceModel.retained_bundle_id === manifest.retained_bundle_id
         && sourceModel.graph_revision === manifest.graph_revision) {
-        // A frame for the prior model cannot be applied or honestly ACKed.
-        // Reuse current-only reconnect; otherwise its credit blocks the new
-        // model forever. Incomplete metadata is only a bootstrap wait.
+        // A frame for a model that is not currently projectable cannot move
+        // the retained links. The transport rejects it in place (with a
+        // credit) so a model refresh does not create a reconnect storm. An
+        // incomplete metadata join remains a bootstrap wait.
         reader.rejectExecutionObservation(frame);
       }
       return cachedPresentation;

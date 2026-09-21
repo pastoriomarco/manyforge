@@ -812,6 +812,24 @@ def test_client_preserves_stable_server_error() -> None:
         raw.close()
 
 
+def test_client_distinguishes_transport_timeout_from_other_unavailability() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("status observation timed out", request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        with pytest.raises(HeadlessClientError) as captured:
+            client.manager_apply_status("apply-1", 1, timeout_seconds=0.1)
+        assert captured.value.code == "headless_http_timeout"
+        assert captured.value.status_code is None
+    finally:
+        raw.close()
+
+
 def test_client_rejects_noncanonical_alarm_condition_path_before_http() -> None:
     transport = httpx.MockTransport(
         lambda request: pytest.fail(f"unexpected request: {request.url}")

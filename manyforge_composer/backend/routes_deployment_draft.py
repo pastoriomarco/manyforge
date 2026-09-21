@@ -5,15 +5,18 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any, Literal, NoReturn
 
 from fastapi import APIRouter, HTTPException
 from manyforge_headless_api.client import HeadlessClientError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .authoring_admission import (
     AuthoringMutationEnvelope,
+    PARTIAL_EFFECT_OBSERVATION_CODES,
+    PARTIAL_EFFECT_OBSERVATION_TIMEOUT_CODES,
     headless_client_http_exception,
 )
 from .authoring_transaction_journal import AuthoringJournalError
@@ -28,6 +31,7 @@ from .state import ComposerState
 
 
 _DTO = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)
+_LOGGER = logging.getLogger(__name__)
 
 
 class _Fence(BaseModel):
@@ -106,12 +110,56 @@ class ApplyDeploymentCandidateRequest(_Fence):
         max_length=71,
         pattern=r"^sha256:[0-9a-f]{64}$",
     )
+    preparation_request_owner_epoch: str | None = Field(
+        default=None,
+        alias="preparationRequestOwnerEpoch",
+        min_length=1,
+        max_length=256,
+    )
+    preparation_request_id: str | None = Field(
+        default=None,
+        alias="preparationRequestId",
+        min_length=1,
+        max_length=256,
+    )
+
+    @model_validator(mode="after")
+    def require_preparation_identity(self) -> "ApplyDeploymentCandidateRequest":
+        if self.confirmation_token is not None and (
+            self.preparation_request_owner_epoch is None
+            or self.preparation_request_id is None
+        ):
+            raise ValueError(
+                "confirmationToken requires both "
+                "preparationRequestOwnerEpoch and preparationRequestId"
+            )
+        return self
 
 
+# One bounded observation deadline can expire after its Manager effect was
+# already accepted.  Those typed partial timeouts name the accepted Apply, so
+# they are gateway/observation timeouts rather than generic server failures;
+# their code and message stay exactly as the state owner raised them.
 def _raise(error: Exception) -> NoReturn:
     if (
         isinstance(error, AuthoringJournalError)
         and error.code == "program_scene_preparation_unavailable"
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+    if (
+        isinstance(error, AuthoringJournalError)
+        and error.code in PARTIAL_EFFECT_OBSERVATION_TIMEOUT_CODES
+    ):
+        raise HTTPException(
+            status_code=504,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+    if (
+        isinstance(error, AuthoringJournalError)
+        and error.code in PARTIAL_EFFECT_OBSERVATION_CODES
     ):
         raise HTTPException(
             status_code=503,
@@ -151,10 +199,26 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
         unavailable.append("headless_unavailable")
     else:
         try:
-            current_projection = state.current_scenario()
-            current_value = current_projection.get("current_scenario")
+            # Manager publication is the identity used by authoring controls.
+            # It is intentionally independent from runtime convergence: an
+            # Apply may have a durable active projection while native children
+            # are still settling.  Keep the strict projection below for
+            # execution admission only.
+            current_projection = state.published_scenario()
+            current_value = current_projection.get("published_scenario")
             if isinstance(current_value, dict):
                 current = current_value
+            elif not current_projection.get("ready"):
+                # Keep the workspace tolerant of legacy/lightweight Headless
+                # doubles that expose only the strict current projection. In
+                # the real stack this fallback is equivalent whenever the
+                # published read is available; a genuinely pending runtime
+                # never yields a strict current Scenario and therefore cannot
+                # mask the publication read-model.
+                strict_projection = state.current_scenario()
+                strict_value = strict_projection.get("current_scenario")
+                if isinstance(strict_value, dict):
+                    current = strict_value
             catalog = state.headless_client.scenarios()
             scenario_catalog_revision = catalog.get("scenario_catalog_revision")
             rows = catalog.get("scenarios")
@@ -186,33 +250,72 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
     applied_revision = (
         current.get("deployment_revision") if current is not None else None
     )
+    # The workspace's Apply/Discard/Revert state is publication identity, not
+    # native runtime liveness.  Runtime controls independently remain gated by
+    # the strict current_scenario/component readiness projection.
     run_ready = draft_revision is None or draft_revision == applied_revision
-    candidates: dict[str, dict[str, Any] | None] = {}
+    candidates: dict[tuple[str, bool], dict[str, Any] | None] = {}
+    selections: dict[str, dict[str, Any] | None] = {}
 
-    def candidate(row: dict[str, Any]) -> dict[str, Any] | None:
+    def candidate(
+        row: dict[str, Any], *, allow_saved_baseline: bool = False
+    ) -> dict[str, Any] | None:
         # The catalog owns the pairing, not copied Program identity fields.
         # Resolve only matching Draft/Saved entries through the existing pure
         # selection read, once per workspace response (never on heartbeat).
         scenario_id = row["scenario_id"]
-        if scenario_id not in candidates:
-            candidates[scenario_id] = None
+        cache_key = (scenario_id, allow_saved_baseline)
+        if cache_key not in candidates:
+            candidates[cache_key] = None
             try:
-                selection = state.headless_client.scenario_load_selection(scenario_id)
-                if selection[
-                    "scenario_catalog_revision"
-                ] != scenario_catalog_revision or any(
-                    selection.get(key) != row.get(key)
-                    for key in (
-                        "scenario_id",
-                        "deployment_artifact_id",
-                        "deployment_revision",
-                        "retained_bundle_id",
-                        "program_binding_id",
+                if scenario_id not in selections:
+                    selections[scenario_id] = (
+                        state.headless_client.scenario_load_selection(scenario_id)
                     )
+                selection = selections[scenario_id]
+                if not isinstance(selection, dict):
+                    raise HeadlessClientError(
+                        "scenario_candidate_selection_unavailable",
+                        "Scenario selection was unavailable",
+                    )
+                selection_mismatch = (
+                    selection["scenario_catalog_revision"]
+                    != scenario_catalog_revision
+                    or any(
+                        selection.get(key) != row.get(key)
+                        for key in (
+                            "scenario_id",
+                            "deployment_artifact_id",
+                            "deployment_revision",
+                            "retained_bundle_id",
+                            "program_binding_id",
+                        )
+                    )
+                )
+                # After a Deployment Apply, the active selection can be a
+                # Manager-produced closure while the catalog row remains the
+                # maintained saved candidate.  That is valid for Revert: the
+                # saved artifact and catalog row still identify the exact
+                # candidate to restore, and the current Program identity is
+                # only informational here.
+                saved_baseline_retargeted = (
+                    selection["scenario_catalog_revision"]
+                    != scenario_catalog_revision
+                    or any(
+                        selection.get(key) != row.get(key)
+                        for key in (
+                            "deployment_artifact_id",
+                            "deployment_revision",
+                            "retained_bundle_id",
+                        )
+                    )
+                )
+                if selection_mismatch and not (
+                    allow_saved_baseline and saved_baseline_retargeted
                 ):
                     unavailable.append("scenario_candidate_selection_mismatch")
                 else:
-                    candidates[scenario_id] = {
+                    candidates[cache_key] = {
                         "scenarioId": scenario_id,
                         "scenarioCatalogRevision": scenario_catalog_revision,
                         "deploymentArtifactId": row["deployment_artifact_id"],
@@ -225,7 +328,7 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
                     }
             except HeadlessClientError as error:
                 unavailable.append(error.code)
-        return candidates[scenario_id]
+        return candidates[cache_key]
 
     matching_scenarios = [
         resolved
@@ -251,7 +354,7 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
         for row in scenarios
         if row.get("deployment_artifact_id") == saved_artifact_id
         and row.get("deployment_revision") == saved_revision
-        and (resolved := candidate(row)) is not None
+        and (resolved := candidate(row, allow_saved_baseline=True)) is not None
     ]
     workspace.update(
         {
@@ -549,14 +652,27 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             state.deployment_draft_session.require_current(
                 body.draft_id, body.expected_draft_revision
             )
-            current_projection = state.current_scenario()
+            # Discard only restores the local Draft from the authoritative
+            # Manager publication.  It must remain usable while the newly
+            # published runtime is still converging; requiring the strict
+            # execution-ready Scenario here made the cycle fail closed during
+            # the normal post-Apply settling window.  Keep a strict fallback
+            # for lightweight authoring doubles that expose no publication
+            # projection.
+            current_projection = state.published_scenario()
             current = current_projection.get("current_scenario")
+            if not isinstance(current, dict):
+                current = current_projection.get("published_scenario")
+            if not isinstance(current, dict):
+                strict_projection = state.current_scenario()
+                current = strict_projection.get("current_scenario")
+                current_projection = strict_projection
             if current_projection.get("ready") is not True or not isinstance(
                 current, dict
             ):
                 raise DeploymentDraftError(
                     "deployment_applied_unavailable",
-                    "Deployment Discard requires one exact currently Applied Scenario",
+                    "Deployment Discard requires one exact Manager Applied Scenario",
                     status_code=409,
                 )
             if state.headless_client is None:
@@ -619,9 +735,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     status_code=404,
                 )
             )
-        saved_compiled = state.deployment_draft_session.preview_source(
-            json.dumps(saved, ensure_ascii=False, allow_nan=False)
-        )
         workspace = _workspace(state)
         candidates = workspace["savedScenarioCandidates"]
         if not candidates:
@@ -633,6 +746,56 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 )
             )
         candidate = candidates[0]
+        # Revert changes the active Deployment, so it must also rebind the
+        # already Applied Program to the reopened Scenario closure.  Capture
+        # that exact Program and its compare-and-set digest before touching
+        # Manager; otherwise Manager can become active with an old Program
+        # record, leaving the cell in an execution-blocked mismatch.
+        try:
+            applied_program = state.headless_client.program_applied()
+        except HeadlessClientError as error:
+            _raise(
+                DeploymentDraftError(
+                    "deployment_applied_program_unavailable",
+                    "Deployment Revert requires the current Applied Program "
+                    f"to be active ({error.code})",
+                    status_code=409,
+                )
+            )
+        program = applied_program.get("program")
+        source = applied_program.get("source")
+        applied_record_digest = (
+            source.get("record_digest") if isinstance(source, dict) else None
+        )
+        if not isinstance(program, dict) or not isinstance(applied_record_digest, str):
+            _raise(
+                DeploymentDraftError(
+                    "deployment_applied_program_unavailable",
+                    "Deployment Revert requires the exact current Applied Program",
+                    status_code=409,
+                )
+            )
+        try:
+            target_selection = state.headless_client.scenario_load_selection(
+                candidate["scenarioId"]
+            )
+        except HeadlessClientError as error:
+            _raise(
+                DeploymentDraftError(
+                    "deployment_saved_candidate_unavailable",
+                    "Saved Deployment candidate could not be reopened "
+                    f"({error.code})",
+                    status_code=409,
+                )
+            )
+        if target_selection.get("program") != program:
+            _raise(
+                DeploymentDraftError(
+                    "deployment_saved_candidate_program_mismatch",
+                    "Saved Deployment candidate belongs to another Applied Program",
+                    status_code=409,
+                )
+            )
         manager_status = state.headless_client.manager_status()
         active = manager_status["status"]["active"]
         manager_epoch = manager_status["source"]["source_owner_epoch"]
@@ -657,38 +820,65 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     status_code=409,
                 )
             )
-        post_state = state.authoring_retained_state()
-        deployment_post = deepcopy(post_state["deployment"])
-        if deployment_post["document"] != saved:
-            deployment_post["draft_revision"] += 1
-        deployment_post["document"] = deepcopy(saved)
-        post_state["deployment"] = deployment_post
         manager_request_id = (
             "deployment-revert-"
             + hashlib.sha256(
                 f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
             ).hexdigest()[:32]
         )
+        manager_apply = {
+            "request_id": manager_request_id,
+            "request_owner_epoch": manager_epoch,
+            "source_label": "manyforge_composer_deployment_revert",
+            "correlation_id": body.request_id,
+            "deployment_artifact_id": candidate["deploymentArtifactId"],
+            "deployment_revision": candidate["deploymentRevision"],
+            "expected_current": receipt["expected_current"],
+            "reject_if_affected_busy": True,
+            "candidate_receipt": receipt,
+        }
+        # A Revert is also valid when the saved candidate is already active
+        # (for example after reopening an unchanged workspace).  Do not send
+        # a redundant Manager Apply: the strict owner treats that as an
+        # invalid staged transition.  Program rebind and authoring journaling
+        # still run below, while a genuinely different active candidate keeps
+        # the normal Manager transition.
+        if (
+            active.get("graph_revision") == receipt.get("candidate_graph_revision")
+            and active.get("retained_bundle_id")
+            == receipt.get("candidate_retained_bundle_id")
+        ):
+            manager_apply = None
+        post_state = state.authoring_retained_state()
+        deployment_post = deepcopy(post_state["deployment"])
+        if deployment_post["document"] != saved:
+            deployment_post["draft_revision"] += 1
+        deployment_post["document"] = deepcopy(saved)
+        post_state["deployment"] = deployment_post
         intent = {
             "schema_version": "manyforge.composer_authoring_effect.v1",
             "operation_kind": "revert_deployment",
             "effect_class": "external",
             "external_kind": "revert_deployment",
-            "manager_apply": {
-                "request_id": manager_request_id,
-                "request_owner_epoch": manager_epoch,
-                "source_label": "manyforge_composer_deployment_revert",
-                "correlation_id": body.request_id,
-                "deployment_artifact_id": candidate["deploymentArtifactId"],
-                "deployment_revision": candidate["deploymentRevision"],
-                "expected_current": receipt["expected_current"],
-                "reject_if_affected_busy": True,
-                "candidate_receipt": receipt,
-            },
+            "manager_apply": manager_apply,
+            "scenario_id": candidate["scenarioId"],
+            "expected_scenario_catalog_revision": candidate[
+                "scenarioCatalogRevision"
+            ],
+            "program": deepcopy(program),
+            "expected_applied_record_digest": applied_record_digest,
+            "deployment": deepcopy(saved),
+            "draft_id": body.draft_id,
+            "draft_revision": body.expected_draft_revision,
+            "manager_request_id": manager_request_id,
+            "correlation_id": body.request_id,
             "post_state": post_state,
         }
 
-        def validate(_claim: dict[str, Any]) -> None:
+        prepared_candidate: dict[str, Any] | None = None
+
+        def validate(_claim: dict[str, Any]) -> dict[str, Any]:
+            nonlocal prepared_candidate
             current = state.deployment_draft_session.retained_state()
             if current != retained:
                 raise DeploymentDraftError(
@@ -696,13 +886,43 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "Deployment Draft changed before Revert",
                     status_code=409,
                 )
+            compilation = {
+                "schema_version": "manyforge.deployment_candidate_compilation.v1",
+                "scenario_id": candidate["scenarioId"],
+                "scenario_catalog_revision": candidate[
+                    "scenarioCatalogRevision"
+                ],
+                "deployment_artifact_id": candidate["deploymentArtifactId"],
+                "deployment_revision": candidate["deploymentRevision"],
+                "retained_bundle_id": candidate["retainedBundleId"],
+                "graph_revision": receipt["candidate_graph_revision"],
+                "program_id": target_selection["program_id"],
+                "program_revision": target_selection["program_revision"],
+                "program_binding_id": candidate["programBindingId"],
+            }
+            prepared_candidate = {
+                "compilation": compilation,
+                "candidate_preview": preview,
+                "manager_apply": intent["manager_apply"],
+                "confirmation_required": False,
+                "confirmation_token": None,
+                "preparation": None,
+                "phases_ms": {},
+            }
+            return {"prepared_deployment_candidate": prepared_candidate}
 
         def effect(claim: dict[str, Any]) -> dict[str, Any]:
-            state.apply_manager_deployment_candidate(intent, claim)
-            state.deployment_draft_session.commit_compiled(
-                saved_compiled,
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
+            if prepared_candidate is None:
+                raise DeploymentDraftError(
+                    "deployment_revert_preparation_missing",
+                    "Deployment Revert was not prepared under its claim",
+                    status_code=409,
+                )
+            state.execute_authored_deployment_candidate(
+                intent,
+                claim,
+                apply=True,
+                prepared=prepared_candidate,
             )
             return _workspace(state)
 
@@ -719,6 +939,55 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         *,
         apply: bool,
     ) -> dict[str, Any]:
+        operation_kind = (
+            "apply_deployment_candidate"
+            if apply
+            else "preview_deployment_candidate"
+        )
+        coordinator = state.authoring_admission
+        if coordinator is not None:
+            try:
+                replayed, result = coordinator.replay_or_recover_exact(
+                    body.envelope(),
+                    operation_kind=operation_kind,
+                    draft_id=body.draft_id,
+                    draft_revision=body.expected_draft_revision,
+                    payload=body.model_dump(mode="json", by_alias=True),
+                )
+            except Exception as error:
+                _raise(error)
+            if replayed:
+                operation = result.get("result") if isinstance(result, dict) else None
+                if (
+                    apply
+                    and isinstance(operation, dict)
+                    and operation.get("status") == "applied"
+                ):
+                    try:
+                        state.prepare_current_applied_scene(
+                            request_owner_epoch=body.request_owner_epoch,
+                            request_id=body.request_id,
+                        )
+                    except (AuthoringJournalError, HeadlessClientError) as error:
+                        _LOGGER.warning(
+                            "authoring_post_release_followup_pending",
+                            extra={
+                                "operation_kind": operation_kind,
+                                "request_owner_epoch": body.request_owner_epoch,
+                                "request_id": body.request_id,
+                                "error_code": getattr(error, "code", None),
+                            },
+                        )
+                    except Exception:
+                        _LOGGER.exception(
+                            "authoring_post_release_followup_failed",
+                            extra={
+                                "operation_kind": operation_kind,
+                                "request_owner_epoch": body.request_owner_epoch,
+                                "request_id": body.request_id,
+                            },
+                        )
+                return result
         if state.headless_client is None:
             _raise(
                 DeploymentDraftError(
@@ -791,11 +1060,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         pre_state = state.authoring_retained_state()
         intent = {
             "schema_version": "manyforge.composer_authoring_effect.v1",
-            "operation_kind": (
-                "apply_deployment_candidate"
-                if apply
-                else "preview_deployment_candidate"
-            ),
+            "operation_kind": operation_kind,
             "effect_class": "external",
             "external_kind": (
                 "deployment_candidate_apply"
@@ -822,12 +1087,26 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 if isinstance(body, ApplyDeploymentCandidateRequest)
                 else None
             ),
+            "preparation_request_owner_epoch": (
+                body.preparation_request_owner_epoch
+                if isinstance(body, ApplyDeploymentCandidateRequest)
+                and body.confirmation_token is not None
+                else body.request_owner_epoch
+            ),
+            "preparation_request_id": (
+                body.preparation_request_id
+                if isinstance(body, ApplyDeploymentCandidateRequest)
+                and body.confirmation_token is not None
+                else body.request_id
+            ),
             "draft_id": body.draft_id,
             "draft_revision": body.expected_draft_revision,
             "post_state": pre_state,
         }
 
-        def validate(_claim: dict[str, Any]) -> None:
+        prepared: dict[str, Any] = {}
+
+        def validate(_claim: dict[str, Any]) -> dict[str, Any] | None:
             state.deployment_draft_session.require_current(
                 body.draft_id, body.expected_draft_revision
             )
@@ -858,14 +1137,80 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "changed before candidate compilation",
                     status_code=409,
                 )
+            # Compile or resolve the retained confirmation exactly once under
+            # this request's fresh claim. The complete, JSON-safe preparation
+            # is journaled as the effect intent before Manager mutation, so
+            # recovery reuses the same candidate and request rather than
+            # compiling or previewing again.
+            try:
+                prepared["candidate"] = (
+                    state.execute_authored_deployment_candidate(
+                        intent,
+                        _claim,
+                        apply=apply,
+                        prepare_only=True,
+                    )
+                )
+            except AuthoringJournalError as error:
+                if error.code not in {"confirmation_expired", "confirmation_stale"}:
+                    raise
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": error.code, "message": str(error)},
+                ) from error
+            except HeadlessClientError as error:
+                raise headless_client_http_exception(error) from error
+            return {"prepared_deployment_candidate": prepared["candidate"]}
 
         completed_apply = False
 
         def effect(claim: dict[str, Any]) -> dict[str, Any]:
             nonlocal completed_apply
-            result = state.execute_authored_deployment_candidate(
-                intent, claim, apply=apply
-            )
+            try:
+                result = state.execute_authored_deployment_candidate(
+                    intent,
+                    claim,
+                    apply=apply,
+                    prepared=prepared.get("candidate"),
+                )
+            except Exception as error:
+                candidate = prepared.get("candidate")
+                phases = (
+                    candidate.get("phases_ms")
+                    if isinstance(candidate, dict)
+                    else None
+                )
+                manager_request = (
+                    candidate.get("manager_apply")
+                    if isinstance(candidate, dict)
+                    else None
+                )
+                if not isinstance(phases, dict):
+                    failure_phase = "preparation"
+                elif (
+                    manager_request is not None
+                    and "manager_apply_ms" not in phases
+                ):
+                    failure_phase = "manager_apply"
+                elif "scenario_selection_ms" not in phases:
+                    failure_phase = "scenario_selection"
+                elif "program_rebind_ms" not in phases:
+                    failure_phase = "program_rebind"
+                else:
+                    failure_phase = "workspace_projection"
+                _LOGGER.exception(
+                    "deployment_candidate_activation_failed",
+                    extra={
+                        "request_owner_epoch": body.request_owner_epoch,
+                        "request_id": body.request_id,
+                        "draft_id": body.draft_id,
+                        "draft_revision": body.expected_draft_revision,
+                        "failure_phase": failure_phase,
+                        "error_code": getattr(error, "code", None),
+                        "phases_ms": phases,
+                    },
+                )
+                raise
             completed_apply = result.get("status") == "applied"
             return {
                 "schemaVersion": (

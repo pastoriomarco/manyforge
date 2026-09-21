@@ -212,6 +212,30 @@ export interface StopCertificateReference {
   stopGeneration: number;
 }
 
+/** The identity-fenced facts required to clear a cell stop-fault latch. */
+export interface StopFaultRecoveryOffer {
+  latchId: string;
+  latchGeneration: number;
+  recoveryAssessmentRevision: number;
+  recoveryStatus:
+    | 'waiting_for_observation'
+    | 'waiting_for_quiescence'
+    | 'waiting_for_configuration'
+    | 'waiting_for_external_reconciliation'
+    | 'waiting_for_durable_record'
+    | 'ready'
+    | 'recovery_pending';
+  cellId: string;
+  retainedBundleId: string;
+  graphRevision: string;
+  stopCertificate: StopCertificateReference | null;
+  configurationExpectations: Array<{
+    controlDomainId: string;
+    activeControlConfigurationId: string;
+    activeControlConfigurationGeneration: number;
+  }>;
+}
+
 export interface CellStopStageSummary {
   operationId: string;
   participantId: string;

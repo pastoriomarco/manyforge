@@ -1632,6 +1632,12 @@ class ControlledExecution : public IExecutionBackend {
     return cv_.wait_for(lock, timeout, [this]() { return resume_count > 0; });
   }
 
+  bool wait_until_resume_count(
+      int count, std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return cv_.wait_for(lock, timeout, [this, count]() { return resume_count >= count; });
+  }
+
   bool wait_until_stop_count(int count,
                              std::chrono::milliseconds timeout = std::chrono::milliseconds(2000)) {
     std::unique_lock<std::mutex> lock(mu_);
@@ -5889,6 +5895,110 @@ TEST_F(ExecutionKernelTest, CartesianResumeUsesFreshTcpAndCurrentCurveRemainingD
   controlled_execution.complete();
   EXPECT_TRUE(controlled_kernel.wait_for_completion(2'000'000'000LL));
   EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kCompleted);
+}
+
+TEST_F(ExecutionKernelTest, Resume_FromPaused_ProgramExecutionDeadlineRemainsCumulative) {
+  ThreadSafeFakeClock local_clock;
+  ThreadSafeManualScheduler local_scheduler;
+  class CumulativeDeadlineExecution final : public ControlledExecution {
+   public:
+    explicit CumulativeDeadlineExecution(ThreadSafeFakeClock& clock) : clock_(clock) {}
+
+    std::promise<void> initial_elapsed;
+    int initial_ticks{};
+    int resume_handles{};
+    int resumed_ticks{};
+
+    ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
+      auto handle = ControlledExecution::execute_trajectory(trajectory);
+      const auto wait = handle.wait_for_completion;
+      handle.wait_for_completion = [this, wait](int64_t timeout) {
+        if (initial_ticks >= 4) return wait(timeout);
+        clock_.advance(1'000'000'000);
+        const bool result = wait(1);
+        if (++initial_ticks == 4) initial_elapsed.set_value();
+        return result;
+      };
+      return handle;
+    }
+
+    ExecutionHandle resume(const TrajectoryDTO& trajectory) override {
+      auto handle = ControlledExecution::resume(trajectory);
+      ++resume_handles;
+      if (resume_handles == 1) return handle;
+      const auto wait = handle.wait_for_completion;
+      handle.wait_for_completion = [this, wait](int64_t) {
+        if (wait(1)) return true;
+        clock_.advance(1'000'000'000);
+        ++resumed_ticks;
+        return wait(1);
+      };
+      return handle;
+    }
+
+   private:
+    ThreadSafeFakeClock& clock_;
+  } controlled_execution{local_clock};
+  TrajectoryCache local_cache{CacheConfig{10}};
+  MockCollisionWorldPublisher local_collision_world;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{planner,     context,         controlled_execution,
+                                    local_clock, local_scheduler, local_cache};
+  configure_authoritative_collision_validation(controlled_kernel, local_collision_world,
+                                               local_collision_engine);
+
+  auto request = make_test_request();
+  ASSERT_FALSE(request.trajectory_relative_timeout);
+  request.timeouts.execution_timeout_s = 10.0;
+  const auto result = controlled_kernel.execute(request);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  ASSERT_EQ(controlled_execution.initial_elapsed.get_future().wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+
+  controlled_execution.set_progress(0.5, {0.5, 0.5});
+  ASSERT_TRUE(controlled_kernel.pause().accepted);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_execution.wait_until_paused());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
+
+  context.current_state_value.positions_rad = {0.25, 0.25};
+  PlanResultDTO resume_plan;
+  resume_plan.trajectory = make_test_trajectory_from({0.25, 0.25}, {1.0, 1.0});
+  resume_plan.trajectory->waypoints.back().time_from_start_s = 20.0;
+  planner.next_result = resume_plan;
+  planner.on_plan = [&](int plan_count) {
+    local_clock.advance(plan_count == 2 ? 2'000'000'000 : 3'000'000'000);
+  };
+
+  ASSERT_TRUE(controlled_kernel.resume().accepted);
+  ASSERT_TRUE(controlled_execution.wait_until_resume_count(1));
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+
+  controlled_execution.set_progress(0.75, {0.75, 0.75});
+  ASSERT_TRUE(controlled_kernel.pause().accepted);
+  local_scheduler.advance_to(local_clock.now());
+  ASSERT_TRUE(controlled_execution.wait_until_paused());
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kPaused));
+
+  context.current_state_value.positions_rad = {0.5, 0.5};
+  resume_plan.trajectory = make_test_trajectory_from({0.5, 0.5}, {1.0, 1.0});
+  resume_plan.trajectory->waypoints.back().time_from_start_s = 20.0;
+  planner.next_result = resume_plan;
+
+  ASSERT_TRUE(controlled_kernel.resume().accepted);
+  ASSERT_TRUE(controlled_execution.wait_until_resume_count(2));
+  EXPECT_EQ(controlled_execution.resume_count, 2);
+  ASSERT_TRUE(controlled_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(controlled_execution.resume_handles, 2);
+  EXPECT_GE(controlled_execution.resumed_ticks, 1);
+  EXPECT_LT(local_clock.now(), 20'000'000'000);
+  EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kFailed);
+  const auto snapshot = controlled_kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->code, kErrorExecutionTimeout);
+  EXPECT_GE(controlled_execution.stop_count_value(), 1);
 }
 
 TEST_F(ExecutionKernelTest, Resume_FromPaused_WhenBackendPauseTerminatesHandle_KeepsWorkerAlive) {

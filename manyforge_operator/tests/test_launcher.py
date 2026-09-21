@@ -75,6 +75,12 @@ def test_native_commands_retain_four_owner_entrypoints(tmp_path: Path):
     ] == "500"
     assert "--cell-id native" in commands[1]
     assert "--manager-timeout-s 60.0" in commands[1]
+    assert specs[1].argv[
+        specs[1].argv.index("--node-environment-manifest-path") + 1
+    ] == str(
+        config.source_root
+        / "manyforge_behavior/resources/node_environment_manifest.yaml"
+    )
     assert "--execution-run-root" in specs[1].argv
     assert specs[1].argv[specs[1].argv.index("--execution-run-root") + 1] == str(
         config.execution_run_root

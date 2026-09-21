@@ -27,6 +27,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <manyforge_component_manager/native_execution_runtime_unit_admission.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
@@ -57,6 +58,15 @@ using ProjectionBindingKey =
     std::pair<manyforge::core::CapabilityProviderBindingId,
               manyforge::core::CapabilityProviderBindingRevision>;
 
+[[nodiscard]] bool SameProjectionBindingIdentity(
+    const manyforge::core::ProjectionNativeRuntimeBindingDTO &lhs,
+    const manyforge::core::ProjectionNativeRuntimeBindingDTO &rhs) noexcept {
+  return lhs.provider_binding_id == rhs.provider_binding_id &&
+         lhs.provider_binding_revision == rhs.provider_binding_revision &&
+         lhs.runtime_unit_id == rhs.runtime_unit_id &&
+         lhs.runtime_epoch == rhs.runtime_epoch;
+}
+
 constexpr int kChildChannelFd = 3;
 constexpr int kChildLivenessChannelFd = 4;
 constexpr int kChildExecErrorFd = 5;
@@ -74,13 +84,22 @@ constexpr auto kExecTimeout = std::chrono::seconds(10);
 constexpr auto kReadyTimeout = std::chrono::seconds(10);
 constexpr auto kStatusTimeout = std::chrono::milliseconds(750);
 constexpr auto kManagerLivenessTimeout = std::chrono::milliseconds(750);
-// Cold projection preparation and the first candidate Stage may materialize
-// the complete immutable planning/collision product. Keep those effects
-// bounded independently from the short steady-state status, fence,
-// composition, and projection-query budget.
 constexpr auto kProjectionPreparationTimeout = std::chrono::seconds(10);
 constexpr auto kGracefulStopTimeout = std::chrono::seconds(2);
 constexpr auto kTermStopTimeout = std::chrono::seconds(1);
+
+[[nodiscard]] std::string_view ProjectionOperationName(
+    const detail::NativeProjectionRpcRequest &request) noexcept {
+  static constexpr std::array<std::string_view, 16U> names{
+      "prepare",          "health",       "transaction", "rebuild",
+      "bootstrap-rebuild", "bootstrap-status", "stage",       "activate",
+      "retire",           "retire-status", "discard",     "stage-status",
+      "retain",           "release",      "scene-frame", "effective-policy",
+  };
+  static_assert(names.size() ==
+                std::variant_size_v<detail::NativeProjectionRpcRequest>);
+  return names[request.index()];
+}
 
 [[noreturn]] void Fail(const std::string &detail) {
   throw RetainedNativeRuntimeUnitAdapterError(detail);
@@ -1037,16 +1056,11 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         held.fence_results.front().state !=
             manyforge::core::ApplyFenceReconcileState::kMatched)
       Fail("native replacement requires the current exact held Apply fence");
-    const manyforge::core::ConfigurationFenceAdmissionQueryDTO query{
-        replacement.persisted_scope, replacement.manager_runtime_epoch};
-    const auto idle = ExchangeKernelFence<
-        manyforge::core::ConfigurationFenceAdmissionSnapshotDTO>(child, query);
-    if (!idle.matches(query) ||
-        idle.execution_host_epoch.runtime_epoch != child.runtime_epoch ||
-        idle.affected_active_operation_count != 0U ||
-        idle.affected_queued_operation_count != 0U)
-      Fail("native replacement requires the current exact held idle Apply "
-           "fence");
+    // Rehydrate is the single replacement proof.  It restores the exact
+    // durable fence and verifies zero affected work against the bound Kernel
+    // table.  A second admission snapshot here races bootstrap: the
+    // predecessor's active configuration rows are deliberately absent until
+    // the restarted child reconstructs its composition.
   }
 
   [[nodiscard]] std::uint64_t NextObservationSequence() {
@@ -1075,6 +1089,16 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       return true;
     }
     if (result == child.pid) {
+      if (WIFEXITED(status)) {
+        std::cerr << "native runtime child exited: pid=" << child.pid
+                  << " status=" << WEXITSTATUS(status) << '\n';
+      } else if (WIFSIGNALED(status)) {
+        std::cerr << "native runtime child terminated: pid=" << child.pid
+                  << " signal=" << WTERMSIG(status) << '\n';
+      } else {
+        std::cerr << "native runtime child stopped unexpectedly: pid="
+                  << child.pid << '\n';
+      }
       child.channel.Reset();
       return false;
     }
@@ -1100,7 +1124,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       // normal convergence create a fresh epoch.
       child.channel.Reset();
       StopChildNoThrow(child);
-      Fail("native projection response timed out");
+      Fail("native projection " +
+           std::string(ProjectionOperationName(request)) +
+           " response timed out");
     }
     auto response = detail::DecodeNativeProjectionRpcResponse(*packet);
     return response;
@@ -1276,17 +1302,23 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     std::lock_guard lock(mutex);
     const auto found = children.find(request.runtime_unit_id.value());
-    if (found == children.end() ||
-        found->second.runtime_epoch != request.runtime_epoch) {
+    if (found == children.end()) {
       Fail("selected runtime composition no longer names the current child "
            "epoch");
     }
+    // The durable composition request can outlive the native child process.
+    // Keep its stable Apply identity and translate only the process-local
+    // runtime epoch to the current child incarnation.  The response is
+    // normalized back to the durable request below so journal comparisons
+    // remain deterministic across Manager restarts.
+    auto effective_request = request;
+    effective_request.runtime_epoch = found->second.runtime_epoch;
     if (!ChildIsLive(found->second)) {
       EraseChild(found);
       Fail("managed runtime child exited before its composition response");
     }
     const auto encoded =
-        detail::EncodeSelectedRuntimeCompositionRpcRequest(request);
+        detail::EncodeSelectedRuntimeCompositionRpcRequest(effective_request);
     // On first convergence the child may be completing the bounded retained
     // CCLC recovery before it can service the ordinary command channel.  This
     // is cold composition work, not a steady-state status exchange.
@@ -1312,10 +1344,17 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     }
     const auto *result =
         std::get_if<ManagerSelectedRuntimeCompositionResultDTO>(&response);
-    if (result == nullptr || !result->valid() || result->request != request) {
+    if (result == nullptr || !result->valid() ||
+        result->request != effective_request) {
       Fail("managed runtime child returned foreign composition evidence");
     }
-    return *result;
+    auto normalized = *result;
+    normalized.request = request;
+    if (!normalized.valid()) {
+      Fail("managed runtime child returned invalid composition evidence after "
+           "runtime-epoch rebinding");
+    }
+    return normalized;
   }
 
   [[nodiscard]] manyforge::core::ManagerLivenessObservationDTO
@@ -1340,8 +1379,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     const auto public_pointer_digest =
         requests.front().active_public_pointer_digest;
     std::set<std::string> requested_receivers;
-    std::vector<std::string> encoded;
-    encoded.reserve(requests.size());
     for (const auto &request : requests) {
       if (!manyforge::core::ValidateManagerLivenessRequiredSet(
                request.required_set)
@@ -1355,7 +1392,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                .second) {
         Fail("Manager-liveness batch is not one exact required-set renewal");
       }
-      encoded.push_back(detail::EncodeManagerLivenessRpcRequest(request));
     }
     // The required set may also contain same-host external receivers (for
     // example Program Runner) renewed by another strict transport in the same
@@ -1367,6 +1403,27 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("Manager-liveness request has an invalid required set");
     }
     std::lock_guard lock(liveness_mutex);
+
+    std::vector<std::string> encoded;
+    encoded.reserve(requests.size());
+    for (const auto &request : requests) {
+      const auto required = std::find_if(
+          required_set.required_receivers.begin(),
+          required_set.required_receivers.end(), [&](const auto &row) {
+            return row.runtime_unit_id == request.receiver_runtime_unit_id;
+          });
+      const auto endpoint =
+          liveness_endpoints.find(request.receiver_runtime_unit_id.value());
+      if (required == required_set.required_receivers.end() ||
+          endpoint == liveness_endpoints.end()) {
+        Fail("Manager-liveness request names an unavailable native receiver");
+      }
+      if (endpoint->second.runtime_epoch != required->runtime_epoch) {
+        throw ManagerLivenessRuntimeTransition();
+      }
+      encoded.push_back(detail::EncodeManagerLivenessRpcRequest(request));
+    }
+
     // The response budget starts only once this batch owns the dedicated
     // liveness channels. Ordinary control and Apply traffic cannot consume it.
     const detail::ManagerLivenessBatchDeadline deadline(
@@ -1386,8 +1443,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       if (expected == required_set.required_receivers.end() ||
           found == liveness_endpoints.end() ||
           found->second.runtime_epoch != expected->runtime_epoch) {
-        Fail(
-            "Manager-liveness request no longer names the current child epoch");
+        throw ManagerLivenessRuntimeTransition();
       }
       targets.push_back(&found->second);
       descriptors.push_back({found->second.channel.get(), 0, 0});
@@ -1440,6 +1496,40 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         std::rethrow_exception(first_other_failure);
       }
       Fail("Manager-liveness batch returned mixed renewal outcomes");
+    }
+    for (std::size_t index = 0U; index < responses.size(); ++index) {
+      auto &response = responses[index];
+      const auto &request = requests[index];
+      const auto receiver = std::find_if(
+          required_set.required_receivers.begin(),
+          required_set.required_receivers.end(), [&](const auto &row) {
+            return row.runtime_unit_id == request.receiver_runtime_unit_id;
+          });
+      if (receiver == required_set.required_receivers.end() ||
+          response.active_bundle_id != required_set.active_bundle_id ||
+          response.required_runtime_set_digest !=
+              required_set.required_runtime_set_digest ||
+          response.status.receiver_runtime_unit_id !=
+              request.receiver_runtime_unit_id ||
+          response.status.receiver_runtime_epoch !=
+              receiver->runtime_epoch ||
+          response.status.manager_runtime_unit_id !=
+              required_set.manager_runtime_unit_id ||
+          response.status.manager_runtime_epoch !=
+              required_set.manager_runtime_epoch ||
+          response.status.manager_owner_epoch !=
+              required_set.manager_owner_epoch ||
+          response.status.runtime_policy_id !=
+              receiver->runtime_policy_id ||
+          response.status.runtime_policy_revision !=
+              receiver->runtime_policy_revision ||
+          response.status.last_accepted_heartbeat_sequence !=
+              request.heartbeat.heartbeat_sequence ||
+          response.receiver_status_digest !=
+              manyforge::core::ComputeManagerLivenessStatusDigest(
+                  response.status)) {
+        Fail("native liveness receiver returned foreign evidence");
+      }
     }
     return responses;
   }
@@ -1567,6 +1657,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       child.channel.Reset();
       return;
     }
+    std::cerr << "native runtime child shutdown requested: pid=" << child.pid
+              << " epoch=" << child.runtime_epoch.value() << '\n';
     try {
       SendPacket(child.channel.get(), "shutdown",
                  std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1835,6 +1927,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                   found->second.configuration_identity),
               observer_instance_id,
               0U};
+          std::cerr << "replacing native runtime child: runtime_unit="
+                    << runtime_id << " predecessor_epoch="
+                    << found->second.runtime_epoch.value() << '\n';
           StopChild(found->second);
           withdrawal->process_observation_sequence = NextObservationSequence();
         }
@@ -1877,6 +1972,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                           found->second.runtime_contract_offer_digest)) {
       Fail("native runtime stop query differs from the tracked child");
     }
+    std::cerr << "stopping native runtime child: runtime_unit="
+              << query.plan.runtime_unit_id.value() << " epoch="
+              << found->second.runtime_epoch.value() << '\n';
     StopChild(found->second);
     EraseChild(found);
     return Presence(query, ProcessPresenceState::kAbsent);
@@ -1930,8 +2028,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     SendPacket(found->second.channel.get(), "status", kStatusTimeout);
     const auto packet =
         ReceivePacket(found->second.channel.get(),
-                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                          kProjectionPreparationTimeout));
+                      kStatusTimeout);
     if (!packet.has_value()) {
       found->second.channel.Reset();
       StopChildNoThrow(found->second);
@@ -2011,9 +2108,11 @@ public:
 
   manyforge::core::ProjectionCommitResultDTO ApplyTransaction(
       const manyforge::core::SceneTransactionDTO &transaction) override {
-    return adapter_->ProjectionCall<manyforge::core::ProjectionCommitResultDTO>(
-        binding_,
-        detail::NativeProjectionTransactionRequest{binding_, transaction});
+    auto result = adapter_->ProjectionCall<
+        manyforge::core::ProjectionCommitResultDTO>(
+        binding_, detail::NativeProjectionTransactionRequest{binding_, transaction});
+    RequireHealth(result.resulting_health);
+    return result;
   }
 
   manyforge::core::Result<manyforge::core::CollisionWorldLeaseInventory>
@@ -2050,76 +2149,128 @@ public:
   }
 
   manyforge::core::ProjectionHealthDTO ProjectionHealth() const override {
-    return adapter_->ProjectionCall<manyforge::core::ProjectionHealthDTO>(
+    auto health = adapter_->ProjectionCall<
+        manyforge::core::ProjectionHealthDTO>(
         binding_, detail::NativeProjectionHealthQuery{binding_});
+    RequireHealth(health);
+    return health;
   }
 
   manyforge::core::ProjectionCommitResultDTO RebuildProjection(
       const manyforge::core::NativeProjectionRebuildDTO &request) override {
-    return adapter_->ProjectionCall<manyforge::core::ProjectionCommitResultDTO>(
-        binding_, request);
+    RequireBinding(request.expected_native_runtime_binding,
+                   "rebuild request");
+    auto result = adapter_->ProjectionCall<
+        manyforge::core::ProjectionCommitResultDTO>(
+        binding_, request,
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            kProjectionPreparationTimeout));
+    RequireHealth(result.resulting_health);
+    return result;
   }
 
   manyforge::core::NativeProjectionBootstrapRebuildResultDTO
   RebuildBootstrapProjection(
       const manyforge::core::NativeProjectionBootstrapRebuildDTO &request)
       override {
-    return adapter_->ProjectionCall<
-        manyforge::core::NativeProjectionBootstrapRebuildResultDTO>(binding_,
-                                                                    request);
+    RequireBinding(request.native_runtime_binding,
+                   "bootstrap rebuild request");
+    auto result = adapter_->ProjectionCall<
+        manyforge::core::NativeProjectionBootstrapRebuildResultDTO>(
+        binding_, request,
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            kProjectionPreparationTimeout));
+    RequireBinding(result.native_runtime_binding,
+                   "bootstrap rebuild response");
+    RequireHealth(result.resulting_health);
+    return result;
   }
 
   manyforge::core::NativeProjectionBootstrapStatusDTO BootstrapProjectionStatus(
       const manyforge::core::NativeProjectionBootstrapStatusQueryDTO &request)
       const override {
-    return adapter_
+    RequireBinding(request.native_runtime_binding,
+                   "bootstrap status request");
+    auto result = adapter_
         ->ProjectionCall<manyforge::core::NativeProjectionBootstrapStatusDTO>(
             binding_, request);
+    RequireBinding(result.native_runtime_binding,
+                   "bootstrap status response");
+    RequireHealth(result.resulting_health);
+    return result;
   }
 
   manyforge::core::NativeProjectionStageResultDTO StageProjection(
       const manyforge::core::NativeProjectionStageDTO &request) override {
-    return adapter_
+    RequireTransitionRow(request.transition_row, "stage request");
+    auto result = adapter_
         ->ProjectionCall<manyforge::core::NativeProjectionStageResultDTO>(
-            binding_, request,
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                kProjectionPreparationTimeout));
+            binding_, request);
+    RequireTransitionRow(result.transition_row, "stage response");
+    RequireHealth(result.resulting_health);
+    return result;
   }
 
   manyforge::core::NativeProjectionActivationResultDTO ActivateStagedProjection(
       const manyforge::core::NativeProjectionActivationDTO &request) override {
-    return adapter_
+    RequireTransitionRow(request.transition_row, "activation request");
+    auto result = adapter_
         ->ProjectionCall<manyforge::core::NativeProjectionActivationResultDTO>(
             binding_, request);
+    RequireTransitionRow(result.request.transition_row,
+                         "activation response");
+    RequireHealth(result.resulting_health);
+    return result;
   }
 
   manyforge::core::NativeProjectionRetireResultDTO RetireProjection(
       const manyforge::core::NativeProjectionRetireDTO &request) override {
-    return adapter_
+    RequireTransitionRow(request.transition_row, "retirement request");
+    auto result = adapter_
         ->ProjectionCall<manyforge::core::NativeProjectionRetireResultDTO>(
             binding_, request);
+    RequireTransitionRow(result.request.transition_row,
+                         "retirement response");
+    RequireHealth(result.resulting_health);
+    return result;
   }
 
   manyforge::core::NativeProjectionRetireStatusDTO ProjectionRetireStatus(
       const manyforge::core::NativeProjectionRetireStatusQueryDTO &request)
       const override {
-    return adapter_
+    RequireTransitionRow(request.request.transition_row,
+                         "retirement status request");
+    auto result = adapter_
         ->ProjectionCall<manyforge::core::NativeProjectionRetireStatusDTO>(
             binding_, request);
+    RequireTransitionRow(result.request.transition_row,
+                         "retirement status response");
+    RequireHealth(result.resulting_health);
+    return result;
   }
 
   manyforge::core::NativeProjectionDiscardResultDTO DiscardStagedProjection(
       const manyforge::core::NativeProjectionDiscardDTO &request) override {
-    return adapter_
+    RequireTransitionRow(request.transition_row, "discard request");
+    auto result = adapter_
         ->ProjectionCall<manyforge::core::NativeProjectionDiscardResultDTO>(
             binding_, request);
+    RequireTransitionRow(result.request.transition_row, "discard response");
+    RequireHealth(result.resulting_health);
+    return result;
   }
 
   manyforge::core::NativeProjectionStatusDTO ProjectionStageStatus(
       const manyforge::core::NativeProjectionStatusQueryDTO &request)
       const override {
-    return adapter_->ProjectionCall<manyforge::core::NativeProjectionStatusDTO>(
-        binding_, request);
+    RequireTransitionRow(request.transition_row, "stage status request");
+    auto result =
+        adapter_->ProjectionCall<manyforge::core::NativeProjectionStatusDTO>(
+            binding_, request);
+    RequireTransitionRow(result.query.transition_row,
+                         "stage status response");
+    RequireHealth(result.resulting_health);
+    return result;
   }
 
   manyforge::core::Result<manyforge::core::SceneFrameResolutionReceiptDTO>
@@ -2143,6 +2294,26 @@ public:
   }
 
 private:
+  void RequireBinding(
+      const manyforge::core::ProjectionNativeRuntimeBindingDTO &binding,
+      const std::string_view surface) const {
+    if (!SameProjectionBindingIdentity(binding, binding_)) {
+      Fail("native projection " + std::string(surface) +
+           " names a different provider, runtime unit, or runtime epoch");
+    }
+  }
+
+  void RequireTransitionRow(
+      const manyforge::core::ProjectionTransitionRowDTO &row,
+      const std::string_view surface) const {
+    RequireBinding(row.native_runtime_binding, surface);
+  }
+
+  void RequireHealth(
+      const manyforge::core::ProjectionHealthDTO &health) const {
+    RequireBinding(health.native_runtime_binding, "health response");
+  }
+
   std::shared_ptr<Impl> adapter_;
   manyforge::core::ProjectionNativeRuntimeBindingDTO binding_;
 };
@@ -2163,13 +2334,15 @@ RetainedNativeRuntimeUnitAdapter::Impl::ResolveProjection(
   {
     std::lock_guard lock(mutex);
     const auto found = children.find(binding.runtime_unit_id.value());
-    if (found == children.end() ||
-        found->second.runtime_epoch != binding.runtime_epoch) {
-      return missing("no exact Manager child owns the native runtime epoch");
+    if (found == children.end()) {
+      return missing("no Manager child owns the native runtime unit");
     }
     if (!ChildIsLive(found->second)) {
       EraseChild(found);
-      return missing("the exact Manager child is no longer live");
+      return missing("the Manager child is no longer live");
+    }
+    if (found->second.runtime_epoch != binding.runtime_epoch) {
+      return missing("the Manager child has a different runtime epoch");
     }
     const ProjectionBindingKey key{binding.provider_binding_id,
                                    binding.provider_binding_revision};
@@ -2177,10 +2350,10 @@ RetainedNativeRuntimeUnitAdapter::Impl::ResolveProjection(
       return missing(
           "the verified child product does not own the projection binding");
     }
+    return manyforge::core::
+        Result<std::shared_ptr<manyforge::core::IPlannerSceneProjection>>::Ok(
+            std::make_shared<ProjectionClient>(shared_from_this(), binding));
   }
-  return manyforge::core::
-      Result<std::shared_ptr<manyforge::core::IPlannerSceneProjection>>::Ok(
-          std::make_shared<ProjectionClient>(shared_from_this(), binding));
 }
 
 RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(

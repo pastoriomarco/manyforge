@@ -261,11 +261,18 @@ _MAX_URDF_CACHE_ENTRIES = 8
 _MAX_GLB_CACHE_ENTRIES_PER_MODEL = 256
 
 
-def _viewer_model_key(retained_bundle_id: str, viewer_model_revision: str) -> str:
+def _viewer_model_key(_retained_bundle_id: str, viewer_model_revision: str) -> str:
+    """Return the stable browser/cache identity of the structural model.
+
+    The retained bundle is a runtime selection identity, not a geometry
+    identity. A TCP-limit-only Apply can replace that bundle while leaving the
+    robot model byte-for-byte unchanged; including the bundle here forces a
+    needless URDF parse and causes every mesh URL to change. The native
+    viewer-model revision is the content identity and remains immutable for
+    the model served by this route.
+    """
     digest = hashlib.sha256()
     digest.update(_VISUAL_ASSET_SCHEMA_VERSION.encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(retained_bundle_id.encode("ascii"))
     digest.update(b"\0")
     digest.update(viewer_model_revision.encode("ascii"))
     return digest.hexdigest()
@@ -278,6 +285,23 @@ def _load_urdf_entry(asset: Any) -> _UrdfCacheEntry | None:
     )
     cached = _urdf_cache.get(model_key)
     if cached is not None:
+        if (
+            cached.cell_id != asset.cell_id
+            or cached.viewer_model_revision != asset.viewer_model_revision
+            or cached.urdf_content_digest != asset.content_digest
+        ):
+            # A violated revision/content contract must not turn into stale
+            # geometry. Reparse under the same key and replace the entry.
+            _urdf_cache.pop(model_key, None)
+            cached = None
+    if cached is not None:
+        # Keep the parsed structural geometry, but retarget resource fetches
+        # to the currently active retained bundle. The revision is the
+        # geometry identity; the bundle is only where that immutable asset is
+        # currently addressed.
+        cached.cell_id = asset.cell_id
+        cached.graph_revision = asset.graph_revision
+        cached.retained_bundle_id = asset.retained_bundle_id
         return cached
 
     try:
@@ -1104,10 +1128,11 @@ def create_urdf_router(state: ComposerState) -> APIRouter:
                 detail="No URDF available for the active deployment",
             )
         # Drei's GLB cache is keyed by URL string, while industrial robot
-        # models often reuse link names across arms. The URL therefore carries
-        # the exact active retained viewer-product identity plus this
-        # converter's public protocol revision. A later Apply cannot reuse
-        # geometry produced for an earlier immutable model.
+        # models often reuse link names across arms. The URL carries the
+        # immutable viewer-model revision plus this converter's public
+        # protocol revision. A runtime-only Apply therefore keeps the same
+        # structural and mesh URLs while resource requests still use the
+        # active retained bundle internally.
         model_key = entry.model_key
         return {
             "cell_id": entry.cell_id,

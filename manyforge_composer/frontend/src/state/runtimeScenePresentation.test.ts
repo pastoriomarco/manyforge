@@ -444,6 +444,11 @@ describe('runtime scene presentation', () => {
       observedAtNs: 2_000_000,
     });
     expect(projected?.linkTransforms.tip.position_m[1]).toBeCloseTo(1);
+    // The viewer remains live even when Robot-control has no selected target
+    // (for example immediately after Apply or while the inspector is closed).
+    expect(executionObservationRobotPresentation(
+      frame, sourceModel(), manifest(), null, 2_000_000,
+    )).toMatchObject({ objectId: 'robot-1', sourceSequence: 5 });
 
     // Source-model units are retained-map enums, not URDF-manifest labels.
     const wrongUnits = sourceModel();

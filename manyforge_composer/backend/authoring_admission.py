@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import math
 from pathlib import Path
 from typing import Any, Callable, Mapping, TypeVar
@@ -25,6 +26,25 @@ from .authoring_transaction_journal import (
 )
 
 _T = TypeVar("_T")
+_LOGGER = logging.getLogger(__name__)
+
+# These failures occur after an external Apply may already be accepted. Keep
+# their owner-issued type through the authoring transaction so the HTTP
+# boundary can report an observation timeout without pretending no effect or
+# degrading it to generic service unavailability.
+PARTIAL_EFFECT_OBSERVATION_CODES = frozenset(
+    {
+        "manager_apply_observation_timeout",
+        "manager_apply_observation_interrupted",
+        "deployment_candidate_selection_timeout",
+    }
+)
+PARTIAL_EFFECT_OBSERVATION_TIMEOUT_CODES = frozenset(
+    {
+        "manager_apply_observation_timeout",
+        "deployment_candidate_selection_timeout",
+    }
+)
 
 
 def headless_client_http_exception(error: HeadlessClientError) -> HTTPException:
@@ -91,21 +111,15 @@ class AuthoringAdmissionCoordinator:
         """Resolve predecessor rows, then rotate the exact Kernel owner role."""
 
         try:
-            retained = self._journal.retained_workspace()
-            if retained is not None:
-                if self._restore_post_image is None:
-                    raise AuthoringJournalError(
-                        "composer_authoring_recovery_invalid",
-                        "retained Composer workspace has no restore owner",
-                    )
-                self._restore_post_image(retained)
             receipt: dict[str, Any] | None = None
+            restored_post_image: dict[str, Any] | None = None
             for transaction in self._journal.unresolved():
+                had_outcome = transaction.outcome is not None
                 response = self._client.recover_authoring_transaction(
                     {
                         "intent": transaction.claim_intent,
                         "expected_claim": transaction.claim,
-                        "expected_release": transaction.release_intent,
+                        "expected_release": self._kernel_release(transaction),
                     }
                 )
                 receipt = response.get("recovery_receipt")
@@ -115,6 +129,29 @@ class AuthoringAdmissionCoordinator:
                         "Headless omitted the exact Kernel recovery receipt",
                     )
                 self._recover_transaction(transaction, receipt)
+                recovered = self._journal.lookup(
+                    transaction.request_owner_epoch, transaction.request_id
+                )
+                if (
+                    not had_outcome
+                    and recovered is not None
+                    and recovered.post_image is not None
+                ):
+                    # _recover_transaction restored this newly produced image.
+                    restored_post_image = dict(recovered.post_image)
+
+            # An unresolved external effect owns the next post-image. Settle
+            # it from its immutable intent before restoring mutable workspace
+            # state; the predecessor image may legitimately name the runtime
+            # that the accepted Apply just replaced.
+            retained = self._journal.retained_workspace()
+            if retained is not None and retained != restored_post_image:
+                if self._restore_post_image is None:
+                    raise AuthoringJournalError(
+                        "composer_authoring_recovery_invalid",
+                        "retained Composer workspace has no restore owner",
+                    )
+                self._restore_post_image(retained)
 
             # Refresh the complete Kernel inventory after predecessor
             # settlement; a per-transaction receipt may predate its release.
@@ -223,7 +260,10 @@ class AuthoringAdmissionCoordinator:
             }
             self._client.reconcile_authoring_owner(reconciliation)
         except Exception as error:
-            self._blocked_reason = str(error)
+            detail = str(error)
+            if detail != self._blocked_reason:
+                _LOGGER.warning("Composer authoring recovery pending: %s", detail)
+            self._blocked_reason = detail
             self._ready = False
             return
         self._blocked_reason = None
@@ -399,6 +439,41 @@ class AuthoringAdmissionCoordinator:
         self._journal.record(transaction, "release_receipt_json", response)
 
     @staticmethod
+    def _kernel_release(
+        transaction: AuthoringTransaction,
+    ) -> dict[str, Any] | None:
+        """Rebuild the exact Kernel release from durable owner evidence."""
+
+        claim = transaction.claim
+        settlement = transaction.release_intent
+        intent = claim.get("intent") if isinstance(claim, dict) else None
+        if settlement is None:
+            return None
+        if not isinstance(intent, dict) or not isinstance(settlement, dict):
+            raise AuthoringJournalError(
+                "composer_authoring_release_invalid",
+                "durable authoring release lacks its exact claim evidence",
+            )
+        try:
+            return {
+                "owner_role": intent["owner_role"],
+                "owner_epoch": intent["owner_epoch"],
+                "owner_transaction_id": intent["owner_transaction_id"],
+                "request_id": intent["request_id"],
+                "request_payload_digest": intent["request_payload_digest"],
+                "acquired_admission_generation": claim[
+                    "acquired_admission_generation"
+                ],
+                "claim_generation": claim["claim_generation"],
+                "settlement": dict(settlement),
+            }
+        except KeyError as error:
+            raise AuthoringJournalError(
+                "composer_authoring_release_invalid",
+                "durable authoring release lacks its exact claim evidence",
+            ) from error
+
+    @staticmethod
     def _receipt_settles_exact(
         transaction: AuthoringTransaction, receipt: Mapping[str, Any]
     ) -> bool:
@@ -408,7 +483,9 @@ class AuthoringAdmissionCoordinator:
         if receipt.get("matched_claim") != transaction.claim:
             return False
         if status == "released_exact":
-            return receipt.get("matched_release") == transaction.release_intent
+            return receipt.get(
+                "matched_release"
+            ) == AuthoringAdmissionCoordinator._kernel_release(transaction)
         if status != "reconciled_exact":
             return False
         settlement = receipt.get("matched_reconcile_settlement")
@@ -476,6 +553,119 @@ class AuthoringAdmissionCoordinator:
             "composer_authoring_outcome_invalid",
             self._blocked_reason,
         )
+
+    def prepared_authoring_transaction(
+        self, request_owner_epoch: str, request_id: str
+    ) -> AuthoringTransaction | None:
+        """Return one durable preparation record for confirmation checks.
+
+        This is the only typed exposure of retained preparation evidence;
+        owners validate it themselves and no route reads the journal SQL.
+        """
+
+        return self._journal.lookup(request_owner_epoch, request_id)
+
+    def replay_or_recover_exact(
+        self,
+        envelope: AuthoringMutationEnvelope,
+        *,
+        operation_kind: str,
+        draft_id: str,
+        draft_revision: int,
+        payload: Mapping[str, Any],
+    ) -> tuple[bool, Any]:
+        """Settle one known request before consulting mutable current state.
+
+        This is the existing journal recovery path exposed at the HTTP entry
+        boundary. It never creates an operation: an unknown request returns
+        ``(False, None)`` and follows ordinary validation. A known request is
+        identity-checked, observed/reconciled exactly, and replayed.
+        """
+
+        transaction = self._journal.lookup(
+            envelope.request_owner_epoch, envelope.request_id
+        )
+        if transaction is None:
+            return False, None
+        payload_digest = canonical_digest(payload)
+        if (
+            transaction.payload_digest != payload_digest
+            or transaction.operation_kind != operation_kind
+            or transaction.draft_id != draft_id
+            or transaction.draft_revision != draft_revision
+            or transaction.admission_generation
+            != envelope.expected_admission_generation
+        ):
+            raise self._unavailable(
+                "composer_authoring_request_id_conflict",
+                "authoring request ID is bound to another operation",
+            )
+
+        if not transaction.complete:
+            response = self._client.recover_authoring_transaction(
+                {
+                    "intent": transaction.claim_intent,
+                    "expected_claim": transaction.claim,
+                    "expected_release": self._kernel_release(transaction),
+                }
+            )
+            receipt = response.get("recovery_receipt")
+            if not isinstance(receipt, dict):
+                raise AuthoringJournalError(
+                    "composer_authoring_recovery_invalid",
+                    "Headless omitted the exact Kernel recovery receipt",
+                )
+            self._recover_transaction(transaction, receipt)
+            transaction = self._journal.lookup(
+                envelope.request_owner_epoch, envelope.request_id
+            )
+            if transaction is None or not transaction.complete:
+                raise AuthoringJournalError(
+                    "composer_authoring_recovery_blocked",
+                    "the exact authoring request remains unresolved",
+                )
+            if not self._journal.unresolved():
+                self._blocked_reason = None
+                self._ready = True
+
+        self._validate_transaction_outcome(transaction)
+        assert transaction.outcome is not None
+        return True, self._replay(transaction.outcome)
+
+    @staticmethod
+    def _run_post_release_followup(
+        callback: Callable[[], None],
+        *,
+        operation_kind: str,
+        envelope: AuthoringMutationEnvelope,
+    ) -> None:
+        """Run a post-commit refresh without undoing a durable mutation."""
+
+        try:
+            callback()
+        except (AuthoringJournalError, HeadlessClientError) as error:
+            _LOGGER.warning(
+                "authoring_post_release_followup_pending",
+                extra={
+                    "operation_kind": operation_kind,
+                    "request_owner_epoch": envelope.request_owner_epoch,
+                    "request_id": envelope.request_id,
+                    "error_code": getattr(error, "code", None),
+                    "error": str(error),
+                },
+            )
+        except Exception:
+            # The owner commit and claim release are already durable.  Keep
+            # that truth visible even if a non-authoring follow-up has a
+            # programming error, while retaining the traceback for diagnosis.
+            _LOGGER.exception(
+                "authoring_post_release_followup_failed",
+                extra={
+                    "operation_kind": operation_kind,
+                    "request_owner_epoch": envelope.request_owner_epoch,
+                    "request_id": envelope.request_id,
+                },
+            )
 
     @staticmethod
     def _stored_result(result: Any) -> dict[str, Any]:
@@ -690,7 +880,11 @@ class AuthoringAdmissionCoordinator:
                     replay.outcome["settlement_kind"] == "owner_commit"
                     and after_release is not None
                 ):
-                    after_release()
+                    self._run_post_release_followup(
+                        after_release,
+                        operation_kind=operation_kind,
+                        envelope=envelope,
+                    )
                 return result
             raise self._unavailable(
                 "composer_authoring_recovery_blocked",
@@ -870,13 +1064,19 @@ class AuthoringAdmissionCoordinator:
                 "authoring effect outcome requires durable recovery"
             )
             raise
-        except (AuthoringJournalError, HeadlessClientError) as error:
+        except AuthoringJournalError as error:
             self._ready = False
             self._blocked_reason = str(error)
+            if error.code in PARTIAL_EFFECT_OBSERVATION_CODES:
+                raise
             raise self._unavailable(
-                getattr(error, "code", "composer_authoring_unavailable"),
+                error.code,
                 str(error),
             ) from error
+        except HeadlessClientError as error:
+            self._ready = False
+            self._blocked_reason = str(error)
+            raise self._unavailable(error.code, str(error)) from error
         except Exception:
             self._ready = False
             self._blocked_reason = (
@@ -884,15 +1084,22 @@ class AuthoringAdmissionCoordinator:
             )
             raise
         if after_release is not None:
-            # The owner commit and claim release are already durable. Keep this
-            # idempotent follow-up outside claim-outcome recovery so a transient
-            # preparation failure cannot be misclassified as an unknown claim.
-            after_release()
+            # This idempotent follow-up runs only after the owner commit and
+            # claim release are durable, so a transient preparation failure
+            # cannot be misclassified as an unknown claim or false Apply
+            # failure.  Replays use the same Applied identity and retry it.
+            self._run_post_release_followup(
+                after_release,
+                operation_kind=operation_kind,
+                envelope=envelope,
+            )
         return result
 
 
 __all__ = [
     "AuthoringAdmissionCoordinator",
     "AuthoringMutationEnvelope",
+    "PARTIAL_EFFECT_OBSERVATION_CODES",
+    "PARTIAL_EFFECT_OBSERVATION_TIMEOUT_CODES",
     "headless_client_http_exception",
 ]

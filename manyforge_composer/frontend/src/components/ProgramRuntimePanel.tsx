@@ -8,6 +8,7 @@ import type { RobotControlController } from '../hooks/useRobotControl';
 import type {
   JsonValue,
 } from '../types/api';
+import type { ExecutionObservationTransportStatus } from '../types/viewerObservation';
 import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
 import { appliedExecutionSelectionRows } from '../state/programExecutionGroups';
 import { OverlayPanel } from './OverlayPanel';
@@ -583,12 +584,14 @@ export function ProgramTransportControls({
   enabled,
   program,
   robot,
+  observationTransport,
   onOpenRuntimeHistory,
   onOpenRobotControls,
 }: {
   enabled: boolean;
   program: ProgramRuntimeController;
   robot: RobotControlController;
+  observationTransport?: ExecutionObservationTransportStatus;
   onOpenRuntimeHistory?: () => void;
   onOpenRobotControls?: () => void;
 }) {
@@ -723,8 +726,8 @@ export function ProgramTransportControls({
   const nativeStatus = robot.currentStatus;
   const manualRecovery = nativeStatus?.manualOperations
     .filter(manualOperationRequiresRecovery) ?? [];
-  const cellFault = nativeStatus?.cellStopAction.fault?.state !== 'cleared'
-    ? nativeStatus?.cellStopAction.fault : null;
+  const cellFault = fullCellStop?.fault?.state !== 'cleared'
+    ? fullCellStop?.fault : null;
   const recoveryOffer = state.controls?.recoveryOffer;
   const programRecoveryMessage = cycleFailureMessage(cycleFailure)
     ?? state.run?.message
@@ -758,6 +761,13 @@ export function ProgramTransportControls({
           : resetRequired ? 'Reset the Program before starting another run.'
             : nativeStatus == null
               ? 'Robot status unavailable. Last-known manual and cell recovery status is not current.' : null;
+  const observationReconnecting = observationTransport?.phase === 'reconnecting';
+  const observationSynchronizing = observationTransport?.phase === 'synchronizing';
+  const observationWaiting = observationTransport?.phase === 'waiting';
+  const showGuidance = blockedReason !== null
+    || observationReconnecting
+    || observationSynchronizing
+    || observationWaiting;
   // Keep the control panels at their established sizes. Only the center
   // guidance track is elastic; additional Motion groups widen the left panel
   // by exactly one control column plus its inter-column gap.
@@ -777,11 +787,32 @@ export function ProgramTransportControls({
           '--viewer-transport-motion-panel-width': `${motionPanelWidthRem}rem`,
         } as CSSProperties}
       >
-        {blockedReason !== null && (
+        {showGuidance && (
           <div
-            className={`transport-guidance${recoveryRequired && enabled ? ' recovery-required' : ''}`}
+            className={`transport-guidance${recoveryRequired && enabled ? ' recovery-required' : ''}${
+              observationSynchronizing ? ' observation-synchronizing' : ''
+            }${observationWaiting ? ' observation-waiting' : ''}`}
             role="status"
           >
+            {observationSynchronizing && <div className="transport-guidance-row">
+              <p>
+                <strong>Live robot view synchronizing.</strong>{' '}
+                {observationTransport?.message
+                  ?? 'The current robot state is being reloaded for the active model.'}
+              </p>
+            </div>}
+            {observationWaiting && <div className="transport-guidance-row">
+              <p>
+                <strong>Waiting for the live robot view.</strong>{' '}
+                The displayed pose is not yet confirmed by the current runtime.
+              </p>
+            </div>}
+            {observationReconnecting && <div className="transport-guidance-row">
+              <p>
+                <strong>Live robot view reconnecting.</strong>{' '}
+                {observationTransport?.message ?? 'The measured-state stream is reconnecting.'}
+              </p>
+            </div>}
             {!enabled ? <p>{blockedReason} Last-known recovery status is not current.</p> : <>
               {nativeStatus == null && <p>
                 Robot status unavailable. Last-known manual and cell recovery status is not current.
@@ -848,7 +879,16 @@ export function ProgramTransportControls({
               {cellFault != null && <div className="transport-guidance-row">
                 <p><strong>Cell recovery required.</strong> {cellFault.reasonCode.replaceAll('_', ' ')}
                   {' · '}{cellFault.recoveryStatus.replaceAll('_', ' ')}. Motion remains blocked.</p>
-                <button type="button" onClick={() => setDetailsOpen(true)}>Review cell status</button>
+                <button
+                  type="button"
+                  className="runtime-detail-button"
+                  disabled={robot.stopFaultRecoveryPending}
+                  onClick={() => { void robot.recoverStopFault(); }}
+                >
+                  {robot.stopFaultRecoveryPending
+                    ? 'Checking recovery'
+                    : cellFault.recoveryStatus === 'ready' ? 'Recover cell' : 'Retry recovery'}
+                </button>
               </div>}
               {programRecovery ? <div className="transport-guidance-row">
                 <p><strong>Program recovery required.</strong> {programRecoveryMessage}</p>
@@ -1174,7 +1214,7 @@ export function ProgramTransportControls({
           </p>
           <button
             type="button"
-            className="danger-button"
+            className="runtime-detail-button danger-button"
             disabled={!canProgramHalt || haltIntent !== null}
             onClick={() => { void requestProgramHalt(); }}
           >
@@ -1194,7 +1234,7 @@ export function ProgramTransportControls({
           )}
           <button
             type="button"
-            className="danger-button"
+            className="runtime-detail-button danger-button"
             disabled={
               !enabled
               || fullCellStop?.available !== true
@@ -1205,6 +1245,37 @@ export function ProgramTransportControls({
           >
             {robot.fullStopPending ? 'Sending Full Stop' : 'Cell Full Stop'}
           </button>
+          {fullCellStop?.fault && fullCellStop.fault.state !== 'cleared' && (
+            <>
+              <p className="panel-intro transport-unavailable-reason">
+                Stop-fault recovery: {fullCellStop.fault.recoveryStatus.replaceAll('_', ' ')}.
+                {fullCellStop.fault.recoveryStatus !== 'ready'
+                  ? ' The cell remains motion-blocked until the backend confirms configuration and quiescence.'
+                  : ' The backend has confirmed the cell can be recovered.'}
+              </p>
+              {robot.stopFaultRecoveryError && (
+                <p className="panel-intro">
+                  {robot.stopFaultRecoveryError}
+                </p>
+              )}
+              <button
+                type="button"
+                className="runtime-detail-button"
+                disabled={
+                  !enabled
+                  || robot.stopFaultRecoveryPending
+                }
+                title={fullCellStop.fault.recoveryStatus === 'ready'
+                  ? 'Clear the cell stop-fault latch using the current backend recovery offer.'
+                  : 'Ask the backend to refresh the recovery assessment. It will clear the latch only when all safety predicates are ready.'}
+                onClick={() => { void robot.recoverStopFault(); }}
+              >
+                {robot.stopFaultRecoveryPending
+                  ? 'Checking recovery'
+                  : fullCellStop.fault.recoveryStatus === 'ready' ? 'Recover cell' : 'Retry recovery'}
+              </button>
+            </>
+          )}
           {fullCellStop?.latestTerminal && (
             <p className="panel-intro">
               Latest certificate {fullCellStop.latestTerminal.certificate.stopCertificateId}
@@ -1232,6 +1303,7 @@ export function ProgramTransportControls({
           {onOpenRuntimeHistory && (
             <button
               type="button"
+              className="runtime-detail-button"
               onClick={() => {
                 setDetailsOpen(false);
                 onOpenRuntimeHistory();

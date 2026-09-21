@@ -522,10 +522,15 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   readonly markExecutionObservationApplied = (
     frame: ExecutionObservationFrame,
   ): void => {
-    if (
-      frame !== this.latestExecutionObservation
-      || frame === this.appliedExecutionObservation
-    ) return;
+    if (frame !== this.latestExecutionObservation) return;
+    if (frame === this.appliedExecutionObservation) {
+      // The frame may have been acknowledged as unrenderable while the
+      // structural model was refreshing. Once that same frame becomes
+      // renderable, clear the synchronization banner even though no second
+      // transport credit is needed.
+      this.publishObservationTransportStatus('live', null);
+      return;
+    }
     this.appliedExecutionObservation = frame;
     recordViewerObservationApplied({
       ownerEpoch: frame.ownerEpoch,
@@ -534,16 +539,26 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       receivedAtComposerMonotonicUs: frame.receivedAtMonotonicUs,
     });
     this.sendObservationCredit(frame);
+    this.publishObservationTransportStatus('live', null);
   };
   readonly getExecutionObservationTransportStatus = () =>
     this.observationTransportStatus;
   readonly rejectExecutionObservation = (frame: ExecutionObservationFrame): void => {
     if (frame !== this.latestExecutionObservation || this.observationSocket === null) return;
+    // A model/runtime Apply can leave one already-delivered frame fenced to a
+    // model the viewer cannot currently project. A credit is still required
+    // to release the bounded stream; closing and immediately reconnecting
+    // would turn an ordinary model refresh into a reconnect storm. Discard the
+    // frame at the transport boundary, keep the socket, and let the next
+    // render-compatible frame (or the same cached frame after the model
+    // refreshes) drive the measured viewer.
     this.publishObservationTransportStatus(
-      'reconnecting',
-      'The measured-state frame does not match the current model; requesting current state.',
+      'synchronizing',
+      'Updating the live robot view for the current model.',
     );
-    this.observationSocket.close(4002, 'execution observation/model changed');
+    this.cancelObservationFrame();
+    this.appliedExecutionObservation = frame;
+    this.sendObservationCredit(frame);
   };
   readonly subscribeExecutionObservationTransport = (listener: Listener) => {
     this.observationTransportListeners.add(listener);
@@ -1562,13 +1577,17 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         || !this.viewerDemand
         || this.disposed
       ) return;
-      this.discardUnappliedExecutionObservation();
       if (this.observationSocket === socket) {
         this.observationSocket = null;
         this.qualificationRecord.socketActive = false;
         publishHeadlessQualification();
       }
-      if (this.observationTransportStatus.phase !== 'reconnecting') {
+      // Clear the transport reference before notifying presentation readers.
+      // A discarded prior-model frame must not recursively try to close the
+      // socket that has already emitted this close event.
+      this.discardUnappliedExecutionObservation();
+      const synchronizing = this.observationTransportStatus.phase === 'synchronizing';
+      if (!synchronizing && this.observationTransportStatus.phase !== 'reconnecting') {
         this.publishObservationTransportStatus(
           'reconnecting',
           'The live measured-state viewer disconnected and is reconnecting.',
@@ -1579,7 +1598,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           serial === this.observationSerial
           && this.viewerDemand
         ) this.connectObservation();
-      }, RECONNECT_DELAY_MS);
+      }, synchronizing ? 0 : RECONNECT_DELAY_MS);
     };
   }
 

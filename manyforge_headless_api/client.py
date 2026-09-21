@@ -244,18 +244,30 @@ class HeadlessHttpClient:
         *,
         params: Sequence[tuple[str, str | int]] = (),
         body: Mapping[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[bytes, int, int]:
         """Read one bounded response without imposing projection semantics."""
 
         if not path.startswith("/api/") or ".." in path:
             raise ValueError("headless API path is invalid")
+        if timeout_seconds is not None and (
+            not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("per-request HTTP timeout must be positive")
         maximum_response_bytes = self._response_bound(method, path)
         try:
+            timeout_override = (
+                {"timeout": min(float(timeout_seconds), self._timeout_seconds)}
+                if timeout_seconds is not None
+                else {}
+            )
             with self._client.stream(
                 method,
                 path,
                 params=params,
                 json=dict(body) if body is not None else None,
+                **timeout_override,
             ) as response:
                 chunks: list[bytes] = []
                 size = 0
@@ -271,6 +283,11 @@ class HeadlessHttpClient:
                 status_code = response.status_code
         except HeadlessClientError:
             raise
+        except httpx.TimeoutException as exc:
+            raise HeadlessClientError(
+                "headless_http_timeout",
+                f"headless API request timed out: {exc}",
+            ) from exc
         except httpx.HTTPError as exc:
             raise HeadlessClientError(
                 "headless_http_unavailable",
@@ -313,12 +330,14 @@ class HeadlessHttpClient:
         *,
         params: Sequence[tuple[str, str | int]] = (),
         body: Mapping[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         payload, status_code, maximum = self._request_payload(
             method,
             path,
             params=params,
             body=body,
+            timeout_seconds=timeout_seconds,
         )
         value = self._decode_response(
             payload,
@@ -648,7 +667,9 @@ class HeadlessHttpClient:
             ) from error
         return projection
 
-    def scenario_load_selection(self, scenario_id: str) -> dict[str, Any]:
+    def scenario_load_selection(
+        self, scenario_id: str, *, timeout_seconds: float | None = None
+    ) -> dict[str, Any]:
         if (
             not isinstance(scenario_id, str)
             or not scenario_id
@@ -658,6 +679,7 @@ class HeadlessHttpClient:
         projection = self.request(
             "GET",
             f"/api/scenarios/{quote(scenario_id, safe='')}/load-selection",
+            timeout_seconds=timeout_seconds,
         )
         try:
             validate_scenario_load_selection(
@@ -949,7 +971,11 @@ class HeadlessHttpClient:
         return self.request("POST", "/api/manager/apply", body=body)
 
     def manager_apply_status(
-        self, apply_id: str, apply_generation: int
+        self,
+        apply_id: str,
+        apply_generation: int,
+        *,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         if (
             not isinstance(apply_id, str)
@@ -963,6 +989,7 @@ class HeadlessHttpClient:
             "GET",
             "/api/manager/apply/status",
             params=(("apply_id", apply_id), ("apply_generation", apply_generation)),
+            timeout_seconds=timeout_seconds,
         )
 
     def execution_diagnostics(self) -> dict[str, Any]:

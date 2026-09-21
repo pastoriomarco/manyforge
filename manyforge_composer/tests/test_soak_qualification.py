@@ -10,6 +10,7 @@ at their named gates.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Final
 
@@ -90,6 +91,17 @@ def _viewer_asset(index: int) -> ViewerModelAsset:
     )
 
 
+def test_structural_model_key_is_stable_across_runtime_bundle_replacement() -> None:
+    viewer_revision = "sha256:" + "a" * 64
+    assert routes_urdf._viewer_model_key(
+        "sha256:" + "b" * 64,
+        viewer_revision,
+    ) == routes_urdf._viewer_model_key(
+        "sha256:" + "c" * 64,
+        viewer_revision,
+    )
+
+
 def test_urdf_cache_remains_bounded_in_the_structural_shell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -110,6 +122,28 @@ def test_urdf_cache_remains_bounded_in_the_structural_shell(
             assert len(routes_urdf._urdf_cache) <= 3
 
         assert set(routes_urdf._urdf_cache) == set(expected_keys[-3:])
+    finally:
+        routes_urdf._urdf_cache.clear()
+
+
+def test_urdf_cache_rebinds_resources_after_runtime_bundle_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "yourdfpy", SimpleNamespace(URDF=_FakeUrdf))
+    routes_urdf._urdf_cache.clear()
+    try:
+        first_asset = _viewer_asset(1)
+        replacement = replace(
+            first_asset,
+            retained_bundle_id="sha256:" + "f" * 64,
+            graph_revision="graph-replacement",
+        )
+        first = routes_urdf._load_urdf_entry(first_asset)
+        current = routes_urdf._load_urdf_entry(replacement)
+        assert first is not None
+        assert current is first
+        assert current.retained_bundle_id == replacement.retained_bundle_id
+        assert current.graph_revision == replacement.graph_revision
     finally:
         routes_urdf._urdf_cache.clear()
 

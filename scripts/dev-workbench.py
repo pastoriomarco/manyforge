@@ -500,11 +500,13 @@ def _wait_until(
     predicate: Callable[[], Any],
     processes: Sequence[tuple[str, subprocess.Popen[bytes]]],
     *,
-    timeout_seconds: float = 20.0,
+    timeout_seconds: float | None = 20.0,
 ) -> Any:
-    deadline = time.monotonic() + timeout_seconds
+    deadline = (
+        None if timeout_seconds is None else time.monotonic() + timeout_seconds
+    )
     last_error: Exception | None = None
-    while time.monotonic() < deadline:
+    while deadline is None or time.monotonic() < deadline:
         for name, process in processes:
             if process.poll() is not None:
                 raise WorkbenchError(
@@ -847,7 +849,10 @@ def _converge_control_management(
         "execution control management",
         current_mode,
         processes,
-        timeout_seconds=30.0,
+        # Native product materialization is asynchronous and host-load
+        # dependent. The wait already fails immediately if an owning process
+        # exits, while repeated identity reads expose terminal progress.
+        timeout_seconds=None,
     )
     if mode == "direct":
         return mode
@@ -1132,30 +1137,26 @@ class Workbench:
             self.processes,
         )
 
-        def manager_ready() -> dict[str, Any] | None:
+        # Projection rebuild and composition materialization are asynchronous.
+        # Their total duration depends on the retained model and host load, so
+        # keep waiting while the managed processes remain alive; do not turn a
+        # slow but healthy operation into a startup failure.
+        while True:
+            for name, process in self.processes:
+                if process.poll() is not None:
+                    raise WorkbenchError(
+                        f"{name} exited with status {process.returncode} while "
+                        "waiting for fresh converged Manager baseline"
+                    )
             with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
                 status = client.manager_status()
                 diff = client.manager_diff()
-                if _manager_projection_ready(status, diff):
-                    return status
-            return None
-
-        _wait_until("fresh converged Manager baseline", manager_ready, self.processes)
-
-        def node_environment_ready() -> dict[str, Any] | None:
-            # Manager convergence and Program Runner availability are
-            # published independently. Composer startup consumes their exact
-            # joined environment, so wait for that existing Headless contract
-            # instead of relying on process timing or retrying a failed load.
-            with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
-                environment = client.node_environment()
-                return environment if environment.get("schema_version") else None
-
-        _wait_until(
-            "active Program node environment",
-            node_environment_ready,
-            self.processes,
-        )
+            if _manager_projection_ready(status, diff):
+                break
+            # Manager reconciliation itself runs at 500 ms. Polling faster
+            # only reserializes two large status documents and competes with
+            # the projection work without discovering completion sooner.
+            time.sleep(0.5)
 
         def contained_startup_cycle() -> str | None:
             with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
@@ -1173,6 +1174,7 @@ class Workbench:
             "contained Program-cycle startup reconciliation",
             contained_startup_cycle,
             self.processes,
+            timeout_seconds=None,
         )
 
         def authoring_ready() -> dict[str, Any] | None:
@@ -1227,7 +1229,28 @@ class Workbench:
             ) as client:
                 return bool(client.health())
 
-        _wait_until("Composer backend", composer_ready, self.processes)
+        _wait_until(
+            "Composer backend",
+            composer_ready,
+            self.processes,
+            timeout_seconds=None,
+        )
+
+        def node_environment_ready() -> dict[str, Any] | None:
+            # Composer owns recovery of durable authoring effects. Start that
+            # owner before waiting for the joined Program environment; an
+            # interrupted Apply/Revert may otherwise hold the exact admission
+            # claim whose recovery makes this environment current.
+            with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
+                environment = client.node_environment()
+                return environment if environment.get("schema_version") else None
+
+        _wait_until(
+            "active Program node environment",
+            node_environment_ready,
+            self.processes,
+            timeout_seconds=None,
+        )
 
         def exact_status() -> dict[str, Any] | None:
             result = query_status(
@@ -1236,7 +1259,12 @@ class Workbench:
             )
             return result if result["ready"] else None
 
-        _wait_until("exact current Scenario tuple", exact_status, self.processes)
+        _wait_until(
+            "exact current Scenario tuple",
+            exact_status,
+            self.processes,
+            timeout_seconds=None,
+        )
         if startup_cycle_state == "idle_after_reset":
             with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:
                 _converge_control_management(
@@ -1245,7 +1273,12 @@ class Workbench:
                     scenario_id=self.metadata["scenario_id"],
                     processes=self.processes,
                 )
-            _wait_until("idle authoring admission", authoring_ready, self.processes)
+            _wait_until(
+                "idle authoring admission",
+                authoring_ready,
+                self.processes,
+                timeout_seconds=None,
+            )
         vite_environment = os.environ.copy()
         vite_environment["MANYFORGE_COMPOSER_PROXY_TARGET"] = (
             f"http://127.0.0.1:{self.composer_port}"

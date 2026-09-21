@@ -65,13 +65,23 @@ def _pick_program() -> Program:
 def _lite6_program_with_literal_tcp_limit(limit_mps: float = 0.14) -> Program:
     catalog = build_node_environment().catalog
     document = Program(_LITE6_PROGRAM_PATH, catalog).to_dict()
+    document["parameters"] = [
+        row
+        for row in document["parameters"]
+        if row["parameter_id"] != "max_tcp_linear_speed_mps"
+    ]
+    pending = [document["tree"]]
+    while pending:
+        current = pending.pop()
+        current.get("value_sources", {}).pop("max_tcp_linear_speed_mps", None)
+        pending.extend(current.get("children", []))
     move = next(
         child
         for child in document["tree"]["children"]
         if child["instance_id"] == "move_to_rest"
     )
     move["parameters"]["max_tcp_linear_speed_mps"] = limit_mps
-    move["value_sources"].pop("max_tcp_linear_speed_mps")
+    move.setdefault("value_sources", {}).pop("max_tcp_linear_speed_mps", None)
     document["program_revision"] = compute_content_identity(
         document,
         own_field="program_revision",
@@ -935,7 +945,6 @@ def test_new_draft_is_fresh_empty_authoring_and_clears_saved_identity() -> None:
     } == {
         "acceleration_scale": 1.0,
         "max_blend_deviation_rad": 0.01,
-        "max_tcp_linear_speed_mps": 0.1,
         "translation_tol_m": 0.005,
         "velocity_scale": 1.0,
     }
@@ -1680,28 +1689,9 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
     bindings = {
         "velocity_scale": "velocity_scale",
         "acceleration_scale": "acceleration_scale",
-        "max_tcp_linear_speed_mps": "max_tcp_linear_speed_mps",
         "translation_tol_m": "translation_tol_m",
         "max_blend_deviation_rad": "max_blend_deviation_rad",
     }
-
-    with pytest.raises(DraftSessionError) as conflict:
-        _mutate(
-            session,
-            "program_draft_update_motion_defaults",
-            {
-                "mode": "update",
-                "velocity_scale": 0.35,
-                "acceleration_scale": 0.7,
-                "max_tcp_linear_speed_mps": 0.1,
-                "translation_tol_m": 0.004,
-                "max_blend_deviation_rad": 0.02,
-                "parameter_bindings": bindings,
-                "conflict_resolution": "reject",
-            },
-        )
-    assert conflict.value.code == "program_motion_limit_conflict"
-    assert session.revision == initial_revision
 
     updated = _mutate(
         session,
@@ -1710,20 +1700,19 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
             "mode": "update",
             "velocity_scale": 0.35,
             "acceleration_scale": 0.7,
-            "max_tcp_linear_speed_mps": 0.1,
             "translation_tol_m": 0.004,
             "max_blend_deviation_rad": 0.02,
             "parameter_bindings": bindings,
-            "conflict_resolution": "reduce",
+            "conflict_resolution": "reject",
         },
     )
+    assert updated.snapshot["draft_revision"] == initial_revision + 1
     authoring = updated.snapshot["authoring"]
     declarations = {
         row["parameter_id"]: row for row in authoring["parameters"]
     }
     assert declarations["velocity_scale"]["default"] == 0.35
     assert declarations["acceleration_scale"]["default"] == 0.7
-    assert declarations["max_tcp_linear_speed_mps"]["default"] == 0.1
     assert declarations["translation_tol_m"]["default"] == 0.004
     assert declarations["max_blend_deviation_rad"]["default"] == 0.02
     move = next(
@@ -1731,14 +1720,8 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
         for child in authoring["forest"][0]["children"]
         if child["instance_id"] == "move_to_rest"
     )
-    assert move["parameters"]["max_tcp_linear_speed_mps"] == 0.1
-    assert "max_tcp_linear_speed_mps" not in move.get("value_sources", {})
-    assert updated.details["reduced_node_fields"] == [{
-        "instance_id": "move_to_rest",
-        "field": "max_tcp_linear_speed_mps",
-        "current_value": 0.14,
-        "new_ceiling": 0.1,
-    }]
+    assert move["parameters"]["max_tcp_linear_speed_mps"] == 0.14
+    assert updated.details["reduced_node_fields"] == []
 
     restored = _mutate(
         session,
@@ -1760,7 +1743,6 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
         ("velocity_scale", 1.01),
         ("acceleration_scale", 0.0),
         ("acceleration_scale", 1.01),
-        ("max_tcp_linear_speed_mps", 0.0),
         ("translation_tol_m", 0.0),
         ("max_blend_deviation_rad", -0.001),
     ],
@@ -1775,13 +1757,11 @@ def test_program_motion_defaults_reject_invalid_values_without_mutation(
         "mode": "update",
         "velocity_scale": 0.4,
         "acceleration_scale": 1.0,
-        "max_tcp_linear_speed_mps": 0.15,
         "translation_tol_m": 0.005,
         "max_blend_deviation_rad": 0.01,
         "parameter_bindings": {
             "velocity_scale": "velocity_scale",
             "acceleration_scale": "acceleration_scale",
-            "max_tcp_linear_speed_mps": "max_tcp_linear_speed_mps",
             "translation_tol_m": "translation_tol_m",
             "max_blend_deviation_rad": "max_blend_deviation_rad",
         },
@@ -1806,7 +1786,6 @@ def test_new_motion_node_defaults_to_program_motion_references() -> None:
     for field, value in (
         ("velocity_scale", 0.9),
         ("acceleration_scale", 0.8),
-        ("max_tcp_linear_speed_mps", 0.14),
         ("translation_tol_m", 0.004),
     ):
         sources.pop(field, None)
@@ -1827,7 +1806,6 @@ def test_new_motion_node_defaults_to_program_motion_references() -> None:
     for field in (
         "velocity_scale",
         "acceleration_scale",
-        "max_tcp_linear_speed_mps",
         "translation_tol_m",
     ):
         assert field not in authored["parameters"]
@@ -1885,7 +1863,6 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
     aliases = {
         "velocity_scale": "cycle_velocity",
         "acceleration_scale": "cycle_acceleration",
-        "max_tcp_linear_speed_mps": "cycle_tcp_cap",
         "translation_tol_m": "cycle_path_tolerance",
     }
     for declaration in document["parameters"]:
@@ -1917,7 +1894,6 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
             "mode": "update",
             "velocity_scale": 0.3,
             "acceleration_scale": 0.6,
-            "max_tcp_linear_speed_mps": 0.12,
             "translation_tol_m": 0.004,
             "max_blend_deviation_rad": 0.02,
             "parameter_bindings": {
@@ -1933,7 +1909,6 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
     }
     assert declarations["cycle_velocity"] == 0.3
     assert declarations["cycle_acceleration"] == 0.6
-    assert declarations["cycle_tcp_cap"] == 0.12
     assert declarations["cycle_path_tolerance"] == 0.004
     assert declarations["max_blend_deviation_rad"] == 0.02
     assert not set(aliases).intersection(declarations)
@@ -1943,7 +1918,6 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
     node["parameters"].update({
         "velocity_scale": 0.9,
         "acceleration_scale": 0.8,
-        "max_tcp_linear_speed_mps": 0.14,
         "translation_tol_m": 0.003,
     })
     node.pop("value_sources", None)

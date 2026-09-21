@@ -10,6 +10,7 @@ import type {
   DraftMutationResponse,
   DeploymentCandidateCompilation,
   DeploymentCandidateOperationResponse,
+  DeploymentCandidatePreparation,
   DeploymentWorkspaceResponse,
   ProgramDraftProjection,
   ProgramDraftApplicability,
@@ -290,6 +291,7 @@ import type {
   OperationObservation,
   RuntimeScaleControlAccepted,
   RuntimeScaleControlStatus,
+  StopFaultRecoveryOffer,
   OperationStateName,
   ResourceSourceKind,
   SceneRevisionValue,
@@ -3021,10 +3023,10 @@ export function parseDeploymentCandidateOperationResponse(
   }
   const workspace = parseDeploymentWorkspaceResponse(record.workspace);
   const resultRecord = objectAt(record.result, `${path}.result`);
-  exactKeysAt(resultRecord, [
+  allowedKeysAt(resultRecord, [
     'status', 'confirmation_token', 'compilation', 'candidate_preview',
     'manager_apply', 'selection',
-  ], `${path}.result`);
+  ], ['preparation', 'phases_ms', 'apply_id'], `${path}.result`);
   const status = stringAt(resultRecord.status, `${path}.result.status`);
   if (
     status !== 'previewed'
@@ -3046,6 +3048,40 @@ export function parseDeploymentCandidateOperationResponse(
     return fail(
       `${path}.result.confirmation_token`,
       'a token exactly when confirmation is required',
+    );
+  }
+  if (status === 'confirmation_required'
+    && (resultRecord.preparation === undefined
+      || resultRecord.preparation === null)) {
+    return fail(
+      `${path}.result.preparation`,
+      'the prepared request identity for a required confirmation',
+    );
+  }
+  let preparation: DeploymentCandidatePreparation | null = null;
+  if (resultRecord.preparation !== undefined
+    && resultRecord.preparation !== null) {
+    const preparationRecord = objectAt(
+      resultRecord.preparation,
+      `${path}.result.preparation`,
+    );
+    exactKeysAt(preparationRecord, ['request_owner_epoch', 'request_id'],
+      `${path}.result.preparation`);
+    preparation = {
+      requestOwnerEpoch: stringAt(
+        preparationRecord.request_owner_epoch,
+        `${path}.result.preparation.request_owner_epoch`,
+      ),
+      requestId: stringAt(
+        preparationRecord.request_id,
+        `${path}.result.preparation.request_id`,
+      ),
+    };
+  }
+  if (status !== 'confirmation_required' && preparation !== null) {
+    return fail(
+      `${path}.result.preparation`,
+      'null unless confirmation is required',
     );
   }
   const compilation = parseDeploymentCandidateIdentity(
@@ -3083,6 +3119,26 @@ export function parseDeploymentCandidateOperationResponse(
   const managerApply = resultRecord.manager_apply === null
     ? null
     : parseManagerApplyResponse(resultRecord.manager_apply);
+  const phaseKeys = [
+    'compile_ms', 'preview_ms', 'confirmation_validation_ms',
+    'manager_apply_ms', 'scenario_selection_ms', 'program_rebind_ms',
+  ] as const;
+  const phasesRecord = resultRecord.phases_ms === undefined
+    ? {}
+    : objectAt(resultRecord.phases_ms, `${path}.result.phases_ms`);
+  allowedKeysAt(phasesRecord, [], phaseKeys, `${path}.result.phases_ms`);
+  const phasesMs: Record<string, number> = {};
+  for (const [phase, value] of Object.entries(phasesRecord)) {
+    const duration = numberAt(value, `${path}.result.phases_ms.${phase}`);
+    if (duration < 0) return fail(
+      `${path}.result.phases_ms.${phase}`,
+      'a non-negative finite duration',
+    );
+    phasesMs[phase] = duration;
+  }
+  const applyId = resultRecord.apply_id === undefined
+    ? null
+    : nullableStringAt(resultRecord.apply_id, `${path}.result.apply_id`);
   if (
     candidatePreview !== null
     && (
@@ -3125,10 +3181,13 @@ export function parseDeploymentCandidateOperationResponse(
     result: {
       status,
       confirmationToken,
+      preparation,
       compilation,
       candidatePreview,
       managerApply,
       selection: selectionWithoutSchema,
+      phasesMs,
+      applyId,
     },
   };
 }
@@ -6615,6 +6674,198 @@ export function parseComposerHeadlessState(
 
 export function parseObjectResponse(value: unknown): Record<string, unknown> {
   return objectAt(value, 'response');
+}
+
+/**
+ * Parse the complete stop-fault recovery offer used by the recovery command.
+ * The owner supplies these facts; the UI never invents or caches them.
+ */
+export function parseStopFaultRecoveryOffer(
+  value: unknown,
+): StopFaultRecoveryOffer | null {
+  const envelope = objectAt(value, 'stopFaultResponse');
+  exactKeysAt(
+    envelope,
+    ['api_version', 'command', 'ok', 'stop_fault'],
+    'stopFaultResponse',
+  );
+  if (
+    stringAt(envelope.api_version, 'stopFaultResponse.api_version')
+      !== 'manyforge.execution_command_response.v1'
+    || booleanAt(envelope.ok, 'stopFaultResponse.ok') !== true
+    || stringAt(envelope.command, 'stopFaultResponse.command') !== 'get_stop_fault'
+  ) {
+    return fail('stopFaultResponse', 'a successful stop-fault response');
+  }
+  if (envelope.stop_fault === null) return null;
+  const offer = objectAt(envelope.stop_fault, 'stopFaultResponse.stop_fault');
+  exactKeysAt(
+    offer,
+    ['configuration_expectations', 'latch'],
+    'stopFaultResponse.stop_fault',
+  );
+  const latch = objectAt(offer.latch, 'stopFaultResponse.stop_fault.latch');
+  allowedKeysAt(
+    latch,
+    [
+      'cell_id', 'graph_revision', 'latch_generation', 'latch_id',
+      'recovery_assessment_revision', 'recovery_status',
+      'retained_bundle_id', 'state', 'stop_certificate',
+    ],
+    [
+      'captured_operation_ids', 'captured_resources', 'clear_projection',
+      'evidence_refs', 'persistence_degraded', 'reason_code',
+      'stop_generation', 'stop_id', 'terminal_projection', 'trigger',
+    ],
+    'stopFaultResponse.stop_fault.latch',
+  );
+  const recoveryStatus = stringAt(
+    latch.recovery_status,
+    'stopFaultResponse.stop_fault.latch.recovery_status',
+  );
+  const supportedRecoveryStatuses = [
+    'waiting_for_observation', 'waiting_for_quiescence',
+    'waiting_for_configuration', 'waiting_for_external_reconciliation',
+    'waiting_for_durable_record', 'ready', 'recovery_pending',
+  ] as const;
+  if (!(supportedRecoveryStatuses as readonly string[]).includes(recoveryStatus)) {
+    return fail(
+      'stopFaultResponse.stop_fault.latch.recovery_status',
+      'a supported stop-fault recovery status',
+    );
+  }
+  const certificate = latch.stop_certificate === null
+    ? null
+    : (() => {
+      const record = objectAt(
+        latch.stop_certificate,
+        'stopFaultResponse.stop_fault.latch.stop_certificate',
+      );
+      exactKeysAt(record, [
+        'stop_certificate_id', 'stop_certificate_revision',
+        'stop_generation', 'stop_id',
+      ], 'stopFaultResponse.stop_fault.latch.stop_certificate');
+      return {
+        stopCertificateId: stringAt(
+          record.stop_certificate_id,
+          'stopFaultResponse.stop_fault.latch.stop_certificate.stop_certificate_id',
+        ),
+        stopCertificateRevision: positiveIntegerAt(
+          record.stop_certificate_revision,
+          'stopFaultResponse.stop_fault.latch.stop_certificate.stop_certificate_revision',
+        ),
+        stopGeneration: positiveIntegerAt(
+          record.stop_generation,
+          'stopFaultResponse.stop_fault.latch.stop_certificate.stop_generation',
+        ),
+        stopId: stringAt(
+          record.stop_id,
+          'stopFaultResponse.stop_fault.latch.stop_certificate.stop_id',
+        ),
+      };
+    })();
+  const expectations = arrayAt(
+    offer.configuration_expectations,
+    'stopFaultResponse.stop_fault.configuration_expectations',
+  ).map((value, index) => {
+    const path = `stopFaultResponse.stop_fault.configuration_expectations[${index}]`;
+    const row = objectAt(value, path);
+    exactKeysAt(row, [
+      'active_control_configuration_generation',
+      'active_control_configuration_id',
+      'control_domain_id',
+    ], path);
+    return {
+      controlDomainId: stringAt(row.control_domain_id, `${path}.control_domain_id`),
+      activeControlConfigurationId: stringAt(
+        row.active_control_configuration_id,
+        `${path}.active_control_configuration_id`,
+      ),
+      activeControlConfigurationGeneration: positiveIntegerAt(
+        row.active_control_configuration_generation,
+        `${path}.active_control_configuration_generation`,
+      ),
+    };
+  });
+  if (
+    (expectations.length === 0
+      && !(certificate === null && recoveryStatus === 'waiting_for_observation'))
+    || expectations.some((row, index) => (
+      index > 0
+      && expectations[index - 1].controlDomainId >= row.controlDomainId
+    ))
+  ) {
+    return fail(
+      'stopFaultResponse.stop_fault.configuration_expectations',
+      'valid configuration expectations sorted by control domain',
+    );
+  }
+  return {
+    latchId: stringAt(latch.latch_id, 'stopFaultResponse.stop_fault.latch.latch_id'),
+    latchGeneration: positiveIntegerAt(
+      latch.latch_generation,
+      'stopFaultResponse.stop_fault.latch.latch_generation',
+    ),
+    recoveryAssessmentRevision: positiveIntegerAt(
+      latch.recovery_assessment_revision,
+      'stopFaultResponse.stop_fault.latch.recovery_assessment_revision',
+    ),
+    recoveryStatus: recoveryStatus as StopFaultRecoveryOffer['recoveryStatus'],
+    cellId: stringAt(latch.cell_id, 'stopFaultResponse.stop_fault.latch.cell_id'),
+    retainedBundleId: stringAt(
+      latch.retained_bundle_id,
+      'stopFaultResponse.stop_fault.latch.retained_bundle_id',
+    ),
+    graphRevision: stringAt(
+      latch.graph_revision,
+      'stopFaultResponse.stop_fault.latch.graph_revision',
+    ),
+    stopCertificate: certificate,
+    configurationExpectations: expectations,
+  };
+}
+
+export function parseStopFaultRecoveryResult(
+  value: unknown,
+  expectedRequestId: string,
+): void {
+  const envelope = objectAt(value, 'stopFaultRecoveryResponse');
+  exactKeysAt(
+    envelope,
+    ['api_version', 'command', 'ok', 'result'],
+    'stopFaultRecoveryResponse',
+  );
+  if (
+    stringAt(envelope.api_version, 'stopFaultRecoveryResponse.api_version')
+      !== 'manyforge.execution_command_response.v1'
+    || booleanAt(envelope.ok, 'stopFaultRecoveryResponse.ok') !== true
+    || stringAt(envelope.command, 'stopFaultRecoveryResponse.command')
+      !== 'recover_stop_fault'
+  ) {
+    return fail(
+      'stopFaultRecoveryResponse',
+      'a successful stop-fault recovery response',
+    );
+  }
+  const result = objectAt(envelope.result, 'stopFaultRecoveryResponse.result');
+  allowedKeysAt(
+    result,
+    ['accepted', 'request_id'],
+    ['error', 'latch', 'replay_status'],
+    'stopFaultRecoveryResponse.result',
+  );
+  if (stringAt(result.request_id, 'stopFaultRecoveryResponse.result.request_id')
+      !== expectedRequestId) {
+    return fail(
+      'stopFaultRecoveryResponse.result.request_id',
+      `the request ID ${expectedRequestId}`,
+    );
+  }
+  if (!booleanAt(result.accepted, 'stopFaultRecoveryResponse.result.accepted')) {
+    const reason = typeof result.error === 'string' && result.error.length > 0
+      ? `: ${result.error}` : '';
+    throw new StructuralContractError(`Stop-fault recovery was rejected${reason}`);
+  }
 }
 
 function parseHistorianEvent(value: unknown, path: string): HistorianEvent {

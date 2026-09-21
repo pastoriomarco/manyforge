@@ -4213,6 +4213,36 @@ public:
     return RuntimeStagedReadyLocked(apply_id, apply_generation, generation);
   }
 
+  // Scene-stage intent records the exact staged-ready digest that justified
+  // the irreversible scene transition.  Runtime recovery may append a newer
+  // staged-ready observation (for example after the Manager recreates a
+  // native child with a new process epoch), so looking up the scene evidence
+  // by the high-water generation would incorrectly make the immutable stage
+  // intent appear corrupt.
+  std::optional<PersistedManagerApplyRuntimeStagedReady>
+  RuntimeStagedReadyByDigestLocked(const ApplyId &apply_id,
+                                   const std::int64_t apply_generation,
+                                   const ContentDigest &staged_ready_digest) const {
+    Statement rows(
+        database_,
+        "SELECT staged_ready_generation "
+        "FROM manager_apply_runtime_staged_ready_sets "
+        "WHERE apply_id=? AND apply_generation=? AND staged_ready_digest=? "
+        "ORDER BY staged_ready_generation");
+    rows.Bind(1, apply_id.value());
+    rows.Bind(2, apply_generation);
+    rows.Bind(3, staged_ready_digest.value());
+    if (!rows.Step()) {
+      return std::nullopt;
+    }
+    const auto generation = rows.Integer(0);
+    if (generation <= 0 || rows.Step()) {
+      throw ManagerApplyJournalIntegrityError(
+          "runtime staged-ready digest does not identify exactly one row");
+    }
+    return RuntimeStagedReadyLocked(apply_id, apply_generation, generation);
+  }
+
   std::optional<PersistedManagerApplySceneStageIntent>
   SceneStageIntentLocked(const ApplyId &apply_id,
                          const std::int64_t apply_generation) const {
@@ -4280,15 +4310,14 @@ public:
           DecodeTransitionRows(transition_rows),
       };
       const auto encoded = EncodeSceneStageIntent(intent);
-      const auto latest =
-          LatestRuntimeStagedReadyLocked(apply_id, apply_generation);
+      const auto staged = RuntimeStagedReadyByDigestLocked(
+          apply_id, apply_generation, intent.runtime_staged_ready_digest);
       const auto parent = IntentLocked(apply_id, apply_generation);
-      if (encoded.digest != stored_digest || !latest.has_value() ||
-          !WithdrawalsMatchRuntimeStage(intent, latest->staged_ready) ||
-          latest->staged_ready_digest != intent.runtime_staged_ready_digest ||
-          latest->staged_ready.predecessor_publication_generation !=
+      if (encoded.digest != stored_digest || !staged.has_value() ||
+          !WithdrawalsMatchRuntimeStage(intent, staged->staged_ready) ||
+          staged->staged_ready.predecessor_publication_generation !=
               intent.predecessor_publication_generation ||
-          latest->staged_ready.predecessor_public_pointer_digest !=
+          staged->staged_ready.predecessor_public_pointer_digest !=
               intent.predecessor_public_pointer_digest ||
           !parent.has_value() ||
           parent->intent.expected_active_projection_revision !=
@@ -4298,7 +4327,7 @@ public:
           parent->intent.candidate_graph_revision !=
               intent.candidate_graph_revision) {
         throw ManagerApplyJournalIntegrityError(
-            "stored scene-stage intent is not bound to its exact latest "
+            "stored scene-stage intent is not bound to its exact "
             "staged-ready/Apply records");
       }
       return PersistedManagerApplySceneStageIntent{
@@ -5538,10 +5567,11 @@ public:
       throw ManagerApplyJournalIntegrityError(
           "stored runtime convergence inventory count is inconsistent");
     }
-    Statement scene_stage_intents(database_,
-                                  "SELECT apply_id,apply_generation "
-                                  "FROM manager_apply_scene_stage_intents "
-                                  "ORDER BY apply_id,apply_generation LIMIT ?");
+    Statement scene_stage_intents(
+        database_,
+        "SELECT apply_id,apply_generation "
+        "FROM manager_apply_scene_stage_intents "
+        "ORDER BY apply_id,apply_generation LIMIT ?");
     scene_stage_intents.Bind(
         1,
         static_cast<std::int64_t>(kMaximumManagerApplySceneStageIntents + 1U));
@@ -6444,13 +6474,11 @@ SqliteManagerApplyJournal::EnsureRuntimeStagedReady(
     transaction.Commit();
     return {*existing, false};
   }
-  if (impl_
-          ->SceneStageIntentLocked(staged_ready.apply_id,
-                                   encoded.apply_generation)
-          .has_value()) {
-    throw ManagerApplyJournalConflictError(
-        "runtime staged-ready evidence is frozen after scene-stage intent");
-  }
+  // A scene-stage intent freezes the scene transition, not the Manager's
+  // observation of the runtime child.  If the Manager restarts after scene
+  // staging/activation, the native child can legitimately receive a new
+  // process epoch; append a fresh staged-ready row while retaining the
+  // original digest as the immutable scene-stage parent.
   const auto latest = impl_->LatestRuntimeStagedReadyLocked(
       staged_ready.apply_id, encoded.apply_generation);
   const auto expected_generation =
@@ -6523,17 +6551,31 @@ SqliteManagerApplyJournal::EnsureSceneStageIntent(
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
   static_cast<void>(impl_->VerifyIntegrityLocked());
-  const auto latest = impl_->LatestRuntimeStagedReadyLocked(
+  if (const auto existing = impl_->SceneStageIntentLocked(
+          scene_stage_intent.apply_id, encoded.apply_generation);
+      existing.has_value()) {
+    if (existing->scene_stage_intent != scene_stage_intent ||
+        existing->scene_stage_intent_digest.value() != encoded.digest) {
+      throw ManagerApplyJournalConflictError(
+          "Apply generation already has a different immutable scene-stage "
+          "intent");
+    }
+    transaction.Commit();
+    return {*existing, false};
+  }
+  const auto staged = impl_->RuntimeStagedReadyByDigestLocked(
+      scene_stage_intent.apply_id, encoded.apply_generation,
+      scene_stage_intent.runtime_staged_ready_digest);
+  const auto latest_staged = impl_->LatestRuntimeStagedReadyLocked(
       scene_stage_intent.apply_id, encoded.apply_generation);
   const auto parent = impl_->IntentLocked(scene_stage_intent.apply_id,
                                           encoded.apply_generation);
-  if (!latest.has_value() ||
-      !WithdrawalsMatchRuntimeStage(scene_stage_intent, latest->staged_ready) ||
-      latest->staged_ready_digest !=
-          scene_stage_intent.runtime_staged_ready_digest ||
-      latest->staged_ready.predecessor_publication_generation !=
+  if (!staged.has_value() ||
+      !latest_staged.has_value() || *latest_staged != *staged ||
+      !WithdrawalsMatchRuntimeStage(scene_stage_intent, staged->staged_ready) ||
+      staged->staged_ready.predecessor_publication_generation !=
           scene_stage_intent.predecessor_publication_generation ||
-      latest->staged_ready.predecessor_public_pointer_digest !=
+      staged->staged_ready.predecessor_public_pointer_digest !=
           scene_stage_intent.predecessor_public_pointer_digest ||
       !parent.has_value() ||
       parent->intent.expected_active_projection_revision !=
@@ -6545,17 +6587,6 @@ SqliteManagerApplyJournal::EnsureSceneStageIntent(
     throw ManagerApplyJournalConflictError(
         "scene-stage intent does not name its exact latest staged-ready/Apply "
         "records");
-  }
-  if (const auto existing = impl_->SceneStageIntentLocked(
-          scene_stage_intent.apply_id, encoded.apply_generation);
-      existing.has_value()) {
-    if (existing->scene_stage_intent != scene_stage_intent ||
-        existing->scene_stage_intent_digest.value() != encoded.digest) {
-      throw ManagerApplyJournalConflictError(
-          "Apply generation already has a different scene-stage intent");
-    }
-    transaction.Commit();
-    return {*existing, false};
   }
   const auto count =
       ScalarInteger(impl_->database_,
@@ -6593,8 +6624,8 @@ SqliteManagerApplyJournal::EnsureSceneStageIntent(
   insert.Bind(13, encoded.transition_rows);
   insert.Bind(14, encoded.digest);
   static_cast<void>(insert.Step());
-  const auto stored = impl_->SceneStageIntentLocked(scene_stage_intent.apply_id,
-                                                    encoded.apply_generation);
+  const auto stored = impl_->SceneStageIntentLocked(
+      scene_stage_intent.apply_id, encoded.apply_generation);
   if (!stored.has_value() || stored->scene_stage_intent != scene_stage_intent ||
       stored->scene_stage_intent_digest.value() != encoded.digest) {
     throw ManagerApplyJournalIntegrityError(

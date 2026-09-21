@@ -47,6 +47,7 @@ struct ActiveProjectionRuntimeSetDTO final {
 };
 
 enum class ActiveProjectionRuntimeRecoveryState {
+  kProgressing,
   kCurrent,
   kRecovered,
 };
@@ -64,6 +65,8 @@ struct ActiveProjectionRuntimeRecoveryResultDTO final {
       return false;
     }
     switch (state) {
+      case ActiveProjectionRuntimeRecoveryState::kProgressing:
+        return recovery_generation.has_value();
       case ActiveProjectionRuntimeRecoveryState::kCurrent:
         return true;
       case ActiveProjectionRuntimeRecoveryState::kRecovered:
@@ -147,6 +150,7 @@ struct NativeProjectionStageDTO final {
 };
 
 enum class NativeProjectionStageResultState {
+  kAccepted,
   kStaged,
   kRejected,
   kFailedProjectionUncertain,
@@ -182,6 +186,12 @@ struct NativeProjectionStageResultDTO final {
     const ProjectionStagedCandidateDTO staged{
         apply_id, apply_generation, projection_stage_generation, candidate_projection_revision};
     switch (state) {
+      case NativeProjectionStageResultState::kAccepted:
+        return !acknowledged_staged_candidate_revision.has_value() &&
+               (observed_local_active == transition_row.expected_local_active ||
+                resulting_health.state == ProjectionHealthState::kRebuilding) &&
+               !resulting_health.staged_candidate.has_value() &&
+               !resulting_health.error.has_value() && !error.has_value();
       case NativeProjectionStageResultState::kStaged:
         return acknowledged_staged_candidate_revision ==
                    std::optional<ProjectionRevisionDTO>{candidate_projection_revision} &&
@@ -220,6 +230,7 @@ struct NativeProjectionActivationDTO final {
 };
 
 enum class NativeProjectionActivationResultState {
+  kAccepted,
   kActivated,
   kStale,
   kFailedProjectionUncertain,
@@ -242,6 +253,12 @@ struct NativeProjectionActivationResultDTO final {
       return false;
     }
     switch (state) {
+      case NativeProjectionActivationResultState::kAccepted:
+        return !acknowledged_candidate_projection_revision.has_value() &&
+               (resulting_health.active_projection_revision ==
+                    request.transition_row.expected_local_active ||
+                resulting_health.state == ProjectionHealthState::kRebuilding) &&
+               !resulting_health.error.has_value() && !error.has_value();
       case NativeProjectionActivationResultState::kActivated:
         return acknowledged_candidate_projection_revision ==
                    std::optional<ProjectionRevisionDTO>{request.candidate_projection_revision} &&
@@ -426,6 +443,7 @@ struct NativeProjectionStatusQueryDTO final {
 
 enum class NativeProjectionStatusState {
   kAbsent,
+  kProgressing,
   kStaged,
   kActivated,
   kDiscarded,
@@ -451,6 +469,11 @@ struct NativeProjectionStatusDTO final {
     switch (state) {
       case NativeProjectionStatusState::kAbsent:
         return !staged_or_active_candidate_revision.has_value() && !error.has_value();
+      case NativeProjectionStatusState::kProgressing:
+        return staged_or_active_candidate_revision.has_value() &&
+               staged_or_active_candidate_revision->valid() &&
+               !resulting_health.staged_candidate.has_value() &&
+               !error.has_value();
       case NativeProjectionStatusState::kStaged:
         return staged_or_active_candidate_revision.has_value() &&
                resulting_health.staged_candidate.has_value() && !error.has_value();

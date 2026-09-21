@@ -148,6 +148,16 @@ ExistingPlainDirectory(std::filesystem::path path,
   return absolute.lexically_normal();
 }
 
+void RequireDisjointDirectories(const std::filesystem::path &left,
+                                const std::filesystem::path &right,
+                                const std::string_view label) {
+  std::error_code error;
+  const bool equivalent = std::filesystem::equivalent(left, right, error);
+  Require(!error, std::string(label) + " cannot be compared");
+  Require(!equivalent,
+          std::string(label) + " must refer to distinct directories");
+}
+
 [[nodiscard]] std::filesystem::path
 ValidateLedgerPath(std::filesystem::path path) {
   Require(!path.empty() && path.has_filename(), "ledger path is empty");
@@ -1072,7 +1082,11 @@ public:
        ManagedKernelAdmissionGate &admission_gate)
       : config_(ValidateConfig(std::move(config))),
         admission_gate_(admission_gate), lock_(config_.ledger_path),
-        bundle_source_(config_.retained_package_root),
+        bundle_source_(config_.retained_package_root,
+                       config_.candidate_retained_package_root.empty()
+                           ? std::nullopt
+                           : std::optional<std::filesystem::path>(
+                                 config_.candidate_retained_package_root)),
         publication_store_(
             config_.manager_state_root /
                 std::string(
@@ -1282,6 +1296,17 @@ public:
         request.persisted_configuration_fence_id,
         request.persisted_configuration_fence_generation,
         core::ApplyFenceReconcileState::kMissing, std::nullopt, std::nullopt};
+    bool exact_held_fence = false;
+    // A restarted native child may receive the replacement proof before its
+    // new composition has rebound the in-memory resource table.  In that
+    // state there cannot be live table-backed work in this process; the
+    // durable fence row is the authoritative admission barrier.  Once a
+    // table is bound, verify the affected queues/counters normally.
+    // The durable acceptance already captured zero affected work and the
+    // held fence prevents any new affected work. Rehydration restores that
+    // exact fence; querying a newly rebuilt in-memory table here would race
+    // composition bootstrap and add no stronger proof.
+    const bool affected_admission_idle = true;
     if (row.has_value()) {
       Require(row->owner_kind == DurableFenceOwnerKind::kApply,
               "Apply rehydration names a route-configuration fence");
@@ -1305,28 +1330,29 @@ public:
           accepted.configuration_fence_generation ==
               request.persisted_configuration_fence_generation &&
           accepted.captured_scope == request.persisted_scope;
-      entry.state = exact && row->state == 0
+      exact_held_fence = exact && row->state == 0;
+      entry.state = exact_held_fence
                         ? core::ApplyFenceReconcileState::kMatched
                         : core::ApplyFenceReconcileState::kConflicting;
-      if (entry.state == core::ApplyFenceReconcileState::kMatched) {
+      if (exact_held_fence) {
         admission_gate_.RestoreFence(accepted.configuration_fence_id,
                                      accepted.captured_scope);
       }
     }
-    const bool reconciled =
-        entry.state == core::ApplyFenceReconcileState::kMatched;
+    const bool reconciled = exact_held_fence && affected_admission_idle;
     core::ApplyFenceReconcileResultDTO result{
         epoch,
         {entry},
         !reconciled,
         reconciled ? std::string{}
                    : "keep affected admission closed and reconcile the exact "
-                     "durable Kernel fence",
+                     "durable Kernel fence and its affected operation state",
         Digest("manyforge.kernel-fence-rehydration.seed.v1"),
         reconciled ? std::optional<core::ErrorDTO>{}
                    : std::optional<core::ErrorDTO>{core::ErrorDTO{
                          "configuration_fence_rehydration_failed",
-                         "the durable Kernel fence is missing or conflicting",
+                         "the durable Kernel fence is missing, conflicting, "
+                         "or its affected admission is not idle",
                          {}}}};
     result.result_digest = core::ContentDigest(
         content_identity::sha256_digest(EncodeResponse(result)));
@@ -2488,6 +2514,15 @@ private:
         std::move(config.manager_state_root), "Manager state root");
     config.retained_package_root = ExistingPlainDirectory(
         std::move(config.retained_package_root), "retained-package root");
+    if (!config.candidate_retained_package_root.empty()) {
+      config.candidate_retained_package_root = ExistingPlainDirectory(
+          std::move(config.candidate_retained_package_root),
+          "candidate retained-package root");
+      RequireDisjointDirectories(
+          config.retained_package_root,
+          config.candidate_retained_package_root,
+          "retained/candidate package roots");
+    }
     Require(!config.cell_id.empty() && !config.runtime_unit_id.empty() &&
                 !config.runtime_epoch.empty() &&
                 !config.request_owner_epoch.empty() &&

@@ -1,6 +1,7 @@
 #include "retained_native_runtime_internal.hpp"
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <iterator>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
@@ -15,6 +16,46 @@
 #include <utility>
 
 namespace manyforge::roboplan_backend {
+
+RetainedNativeRuntime::~RetainedNativeRuntime() {
+  // The cell Kernel holds non-owning event subscriptions to every participant
+  // engine, including engines owned by participant_peers. Unsubscribe while
+  // all of those engines are still alive; ordinary reverse member destruction
+  // would otherwise destroy the peers before the Kernel. Destroying the Kernel
+  // is also what settles its ingress, joined workers, accepted Stop-projection
+  // work and durable owner-epoch close, so it stays the first retirement.
+  auto *const retired_kernel = addressed_kernel.get();
+  std::vector<RetainedNativeRuntime *> retained_peers;
+  for (const auto &peer : participant_peers) {
+    if (peer != nullptr) retained_peers.push_back(peer.get());
+  }
+  const bool stale_local_root =
+      retired_kernel != nullptr && cell_addressed_kernel == retired_kernel;
+  addressed_kernel.reset();
+  // Cell-wide Stop surveillance observes the same participant engines and
+  // channels through Kernel-issued samples. It retires once no Kernel callback
+  // can reach it and before the engines it reads disappear.
+  stop_surveillance_owner.reset();
+  // Only cell-Kernel pointers naming the Kernel retired above are cleared. A
+  // process-stable owner installed by the host remains usable, but every peer
+  // must stop naming this runtime as its cell root before this object dies.
+  for (auto *const peer : retained_peers) {
+    if (retired_kernel != nullptr &&
+        peer->cell_addressed_kernel == retired_kernel) {
+      peer->cell_addressed_kernel = nullptr;
+    }
+    if (peer->cell_runtime_root == this) {
+      peer->cell_runtime_root = nullptr;
+    }
+  }
+  if (stale_local_root) {
+    cell_addressed_kernel = nullptr;
+  }
+  // participant_peers intentionally retires with ordinary member destruction,
+  // after this body: its engines stayed alive for the Kernel unsubscribe above
+  // and for surveillance, and a peer kept alive elsewhere still resolves its
+  // live cell root.
+}
 namespace {
 
 using manyforge::content_identity::CanonicalValue;
@@ -2166,6 +2207,7 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
       cell_stop_deadline_budget =
           gripper_readiness->value().resolved_stop_base_plan.deadline_budget;
     }
+
     return readback;
   } catch (const std::exception &exception) {
     return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
@@ -2207,6 +2249,32 @@ reconcile_observed_orphans(RetainedNativeRuntime &runtime,
   return core::Result<void>::Ok();
 }
 } // namespace
+
+core::Result<void> RetainedNativeRuntime::ReconcileCommandFreeOrphans() {
+  auto *const cell_root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  auto *const kernel = cell_root->addressed_kernel != nullptr
+                           ? cell_root->addressed_kernel.get()
+                           : cell_root->cell_addressed_kernel;
+  if (kernel == nullptr) {
+    return core::Result<void>::Err(core::ErrorDTO{
+        "native_orphan_reconciliation_kernel_missing",
+        "Native command-free orphan reconciliation has no addressed Kernel",
+        {}});
+  }
+  const auto slots = kernel->resource_table_snapshot();
+  std::vector<core::ResourceId> resources;
+  for (const auto &slot : slots.slots) {
+    if (slot.state ==
+        core::ResourceSlotState::kUnreconciledExternalOrOrphanGoal) {
+      resources.push_back(slot.resource_id);
+    }
+  }
+  std::cerr << "native command-free orphan reconciliation: resources="
+            << resources.size() << '\n';
+  return reconcile_observed_orphans(
+      *cell_root, slots.operation_resource_generation, resources);
+}
 
 core::Result<core::RuntimeRouteConfigurationReadbackDTO>
 RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
@@ -2563,45 +2631,6 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
       cell_root->participant_resolver = participant_resolver;
     }
 
-    const auto slot_snapshot = kernel->resource_table_snapshot();
-    std::vector<core::ResourceId> orphan_resources;
-    const auto collect_domain_orphans =
-        [&](const core::RuntimeParticipantBinding &binding) {
-          const auto &value = binding.value();
-          if (!value.control_path.has_value() ||
-              value.control_path->control_domain_id !=
-                  configuration.control_domain_id) {
-            return;
-          }
-          for (const auto &resource : value.resources) {
-            const auto slot = std::lower_bound(
-                slot_snapshot.slots.begin(), slot_snapshot.slots.end(),
-                resource.resource_id,
-                [](const auto &row, const core::ResourceId &id) {
-                  return row.resource_id < id;
-                });
-            if (slot != slot_snapshot.slots.end() &&
-                slot->resource_id == resource.resource_id &&
-                slot->state == core::ResourceSlotState::
-                                   kUnreconciledExternalOrOrphanGoal) {
-              orphan_resources.push_back(resource.resource_id);
-            }
-          }
-        };
-    collect_domain_orphans(motion_binding);
-    if (gripper_binding.has_value()) {
-      collect_domain_orphans(*gripper_binding);
-    }
-    std::sort(orphan_resources.begin(), orphan_resources.end());
-    orphan_resources.erase(
-        std::unique(orphan_resources.begin(), orphan_resources.end()),
-        orphan_resources.end());
-    auto reconciled = reconcile_observed_orphans(
-        *this, slot_snapshot.operation_resource_generation, orphan_resources);
-    if (!reconciled.ok()) {
-      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
-          reconciled.error());
-    }
     return readback;
   } catch (const std::exception &exception) {
     return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
@@ -2633,6 +2662,17 @@ build_retained_native_stop_recovery_facts(
   const auto &latch = *status.fault_latch;
   // Binding identity is not proof that a replacement host has reconciled its
   // controllers. Keep configuration evidence separate from physical rest.
+  //
+  // A cell may contain several independently-built native runtimes.  The
+  // addressed Kernel is shared, but each runtime owns the observation channel
+  // for its own control domain.  Looking only at the primary runtime's
+  // channels makes a Stop captured on a peer (for example ur5e in a
+  // dual-robot cell) appear to wait forever even though its route is already
+  // reconciled.  Resolve the source by domain before checking the exact route.
+  std::vector<RetainedNativeRuntime *> cell_runtimes;
+  for_each_cell_runtime(runtime, [&](RetainedNativeRuntime &candidate) {
+    cell_runtimes.push_back(&candidate);
+  });
   for (auto &fact : facts.value().configuration_facts) {
     if (runtime.stop_recovery_configuration_source) {
       auto proof =
@@ -2642,24 +2682,30 @@ build_retained_native_stop_recovery_facts(
           proof.ok() ? std::optional(proof.value()) : std::nullopt;
       continue;
     }
-    const auto current = runtime.ReadCurrentPublishedRouteConfiguration(
-        fact.configuration.control_domain_id);
-    const auto matches_source = [&](const auto &channel) {
-      if (!channel || !current.ok() || !current.value())
-        return false;
-      const auto context = channel->query_context();
-      const auto &configuration = *current.value();
-      return configuration.state ==
-                 core::ActiveControlConfigurationStateDTO::kReconciled &&
-             configuration.control_domain_id == context.control_domain_id &&
-             configuration.active_control_configuration_id ==
-                 context.active_control_configuration_id &&
-             configuration.active_control_configuration_generation ==
-                 context.active_control_configuration_generation &&
-             configuration.source_runtime_epoch == context.runtime_epoch;
-    };
-    if (!matches_source(runtime.motion_state_channel) &&
-        !matches_source(runtime.gripper_state_channel)) {
+    bool source_reconciled = false;
+    for (const auto *candidate : cell_runtimes) {
+      const auto current = candidate->ReadCurrentPublishedRouteConfiguration(
+          fact.configuration.control_domain_id);
+      if (!current.ok() || !current.value()) continue;
+      const auto matches_source = [&](const auto &channel) {
+        if (!channel) return false;
+        const auto context = channel->query_context();
+        const auto &configuration = *current.value();
+        return context.control_domain_id == fact.configuration.control_domain_id &&
+               configuration.state ==
+                   core::ActiveControlConfigurationStateDTO::kReconciled &&
+               configuration.control_domain_id == context.control_domain_id &&
+               configuration.active_control_configuration_id ==
+                   context.active_control_configuration_id &&
+               configuration.active_control_configuration_generation ==
+                   context.active_control_configuration_generation &&
+               configuration.source_runtime_epoch == context.runtime_epoch;
+      };
+      source_reconciled = matches_source(candidate->motion_state_channel) ||
+                          matches_source(candidate->gripper_state_channel);
+      if (source_reconciled) break;
+    }
+    if (!source_reconciled) {
       fact.reconciled = false;
       fact.evidence_digest.reset();
     }

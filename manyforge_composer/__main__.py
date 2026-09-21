@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from typing import Any, Final, Sequence
 
 import uvicorn
 
 from manyforge_composer.backend.app import create_app
+from manyforge_composer.backend.draft_session import DraftSessionError
 from manyforge_composer.backend.logging_config import setup_logging
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import (
@@ -136,7 +138,17 @@ def main() -> None:
             assistant_client=assistant_client,
         )
         if args.startup_scenario is not None:
-            state.load_startup_scenario(args.startup_scenario)
+            try:
+                state.load_startup_scenario(args.startup_scenario)
+            except DraftSessionError as error:
+                if error.code != "composer_draft_discard_confirmation_required":
+                    raise
+                # The launcher scenario is only a bootstrap default. A
+                # recovered user Draft wins; explicit Load remains available
+                # in the running application with its normal confirmation.
+                logging.getLogger(__name__).info(
+                    "startup Scenario load skipped to preserve recovered Drafts"
+                )
         app = create_app(
             state,
             static_dir=args.static_dir,

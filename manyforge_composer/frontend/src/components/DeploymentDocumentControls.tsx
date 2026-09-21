@@ -18,6 +18,21 @@ export function DeploymentDocumentControls({
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmOverwrite, setConfirmOverwrite] = useState(false);
   const workspace = controller.workspace;
+  // Manager Applied is the publication identity.  Runtime convergence is a
+  // separate readiness concern and must not make the document controls
+  // oscillate while an accepted Apply is still settling.
+  const draftMatchesManager = workspace !== null
+    && workspace.draft.document !== null
+    && workspace.draft.deploymentRevision !== null
+    && workspace.draft.deploymentRevision
+      === workspace.managerApplied.deploymentRevision;
+  // Discard is a local Draft-to-Applied operation.  A Draft can remain
+  // different from its saved baseline after Apply (which is what makes
+  // Revert useful), but there is then nothing left for Discard to do.
+  const hasUnappliedChanges = workspace !== null
+    && workspace.draft.document !== null
+    && workspace.managerApplied.deploymentRevision !== null
+    && !draftMatchesManager;
   const pendingConfirmation = controller.pendingApplyConfirmation;
   const chooseArtifact = useCallback((
     _kind: ArtifactKind,
@@ -30,8 +45,11 @@ export function DeploymentDocumentControls({
     setConfirmOverwrite(false);
   };
   const complete = async (request: () => Promise<unknown>) => {
-    const result = await request();
-    if (result !== null) close();
+    // The confirmation is only the user's authorization boundary. Close it
+    // as soon as the request is dispatched; busy/error state belongs to the
+    // document controls and remains visible if the owner rejects the action.
+    close();
+    await request();
   };
   return (
     <>
@@ -47,8 +65,8 @@ export function DeploymentDocumentControls({
           <span className={`document-state state-${workspace?.draft.differsFromSaved ? 'different' : 'saved'}`}>
             {workspace?.draft.differsFromSaved ? 'different' : 'saved'}
           </span>
-          <span className={`document-state state-${workspace?.runAdmission.ready ? 'applied' : 'different'}`}>
-            {workspace?.runAdmission.ready ? 'applied' : 'different'}
+          <span className={`document-state state-${draftMatchesManager ? 'applied' : 'different'}`}>
+            {draftMatchesManager ? 'applied' : 'different'}
           </span>
           <span className="document-identity-divider document-settings-divider" aria-hidden="true" />
         </div>
@@ -70,7 +88,10 @@ export function DeploymentDocumentControls({
           >Save As</button>
           <button
             type="button"
-            disabled={!controller.mutationAvailable || controller.busy || !workspace?.draft.differsFromSaved}
+            disabled={!controller.mutationAvailable || controller.busy || !hasUnappliedChanges}
+            title={hasUnappliedChanges
+              ? 'Discard Draft changes and return to Manager Applied.'
+              : 'Draft already matches Manager Applied.'}
             onClick={() => setAction('discard')}
           >Discard</button>
           <button
@@ -92,13 +113,13 @@ export function DeploymentDocumentControls({
               !controller.mutationAvailable
               || controller.busy
               || !workspace?.draft.document
-              || workspace?.runAdmission.ready === true
+              || draftMatchesManager
             }
-            title={workspace?.runAdmission.ready === true
+            title={draftMatchesManager
               ? 'Draft already matches Manager Applied.'
               : 'Validate and apply this Deployment Draft to runtime.'}
             onClick={() => { void controller.applyDraft(); }}
-          >Apply</button>
+          >{controller.applying ? 'Applying Deployment' : 'Apply'}</button>
         </div>
       </div>
 
@@ -181,7 +202,7 @@ export function DeploymentDocumentControls({
               className="primary-action"
               disabled={!controller.mutationAvailable || controller.busy}
               onClick={() => { void controller.confirmApply(); }}
-            >Confirm Apply</button>
+            >{controller.applying ? 'Applying Deployment' : 'Confirm Apply'}</button>
           </div>
         </OverlayPanel>
       )}

@@ -210,6 +210,58 @@ TEST(RetainedStopSurveillanceOwnerTest,
 }
 
 TEST(RetainedStopSurveillanceOwnerTest,
+     BuildsCommandFreeOrphanFactsFromRetainedIdlePredictedState) {
+  const auto binding = make_binding();
+  auto channel = std::make_shared<StateChannel>(binding);
+  bool active_goal = false;
+  RetainedNoActiveGoalEvidenceSource goal_source =
+      [&](const std::int64_t) -> core::Result<core::ContentDigest> {
+    if (active_goal) {
+      return core::Result<core::ContentDigest>::Err(
+          core::ErrorDTO{"invalid_state_transition",
+                         "test goal is active",
+                         {{"reason", "test_goal_active"}}});
+    }
+    return core::Result<core::ContentDigest>::Ok(
+        core::ContentDigest("sha256:" + std::string(64U, 'd')));
+  };
+  RetainedStopSurveillanceOwner owner(
+      {RetainedStopSurveillanceSourceInput{binding, channel, {}, goal_source}});
+  ASSERT_TRUE(channel
+                  ->publish_state({std::array<double, 2U>{0.0, 0.0}},
+                                  {std::array<double, 2U>{0.0, 0.0}}, 100, 100)
+                  .applied());
+  std::vector<core::ResourceId> resources;
+  for (const auto &resource : binding.value().resources) {
+    resources.push_back(resource.resource_id);
+  }
+  std::sort(resources.begin(), resources.end());
+  constexpr std::int64_t assessed_at_ns =
+      100 + kRetainedNativeReconciliationFreshnessBudgetNs + 1;
+
+  const auto facts = owner.BuildOrphanResourceReconciliationFacts(
+      core::RequestOwnerEpoch("owner.2"), core::CellId("cell.test"), 7U,
+      resources, assessed_at_ns);
+  ASSERT_TRUE(facts.ok()) << facts.error().message;
+  ASSERT_EQ(facts.value().resources.size(), resources.size());
+  for (const auto &fact : facts.value().resources) {
+    ASSERT_TRUE(fact.settlement.source_age_ns.has_value());
+    ASSERT_TRUE(fact.settlement.freshness_budget_ns.has_value());
+    EXPECT_EQ(*fact.settlement.source_age_ns, assessed_at_ns - 100);
+    EXPECT_EQ(*fact.settlement.freshness_budget_ns,
+              assessed_at_ns - 100 +
+                  kRetainedNativeReconciliationFreshnessBudgetNs);
+  }
+
+  active_goal = true;
+  const auto rejected = owner.BuildOrphanResourceReconciliationFacts(
+      core::RequestOwnerEpoch("owner.2"), core::CellId("cell.test"), 7U,
+      resources, assessed_at_ns);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"), "test_goal_active");
+}
+
+TEST(RetainedStopSurveillanceOwnerTest,
      RejectsOrWaitsInsteadOfRelabelingAStaleEpochForOrphanFacts) {
   const auto binding = make_binding();
   auto channel = std::make_shared<StateChannel>(binding);

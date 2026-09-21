@@ -67,7 +67,6 @@ import type {
 } from '../types/api';
 import type { Pose3Value } from '../types/robotControl';
 import type { Nanoseconds } from '../types/nanoseconds';
-import type { ExecutionObservationTransportStatus } from '../types/viewerObservation';
 import type { SceneObjectMutationAvailability } from '../state/sceneAuthoring';
 import {
   classifyStructuralAssetFailure,
@@ -144,7 +143,6 @@ interface StructuralViewerProps {
   candidateRejected?: boolean;
   runtimePresentation?: RuntimeScenePresentation;
   executionObservationPresentation?: MeasuredRobotPresentationReader;
-  executionObservationTransport?: ExecutionObservationTransportStatus;
   sceneOwnerIdentity?: {
     ownerEpoch: string;
     generation: number;
@@ -2875,7 +2873,6 @@ function StructuralViewerContent({
   candidateRejected = false,
   runtimePresentation,
   executionObservationPresentation,
-  executionObservationTransport,
   sceneOwnerIdentity,
   viewerFrameIdentity,
   readViewerFrameIdentity,
@@ -3338,14 +3335,8 @@ function StructuralViewerContent({
       >
         {runtimeOverlay}
         {inspectorPanel === 'robot' && candidateTcpPose !== null && candidateTool === null && candidateRobot === null && (
-          <div className="viewer-observation-status" role="status">
+          <div className="viewer-target-status" role="status">
             <span>Target marker only — mapped tool geometry unavailable. Target is unvalidated.</span>
-          </div>
-        )}
-        {executionObservationTransport?.phase === 'reconnecting' && (
-          <div className="viewer-observation-status" role="status">
-            <strong>Live robot view reconnecting</strong>
-            <span>{executionObservationTransport.message}</span>
           </div>
         )}
         {viewerActive && (

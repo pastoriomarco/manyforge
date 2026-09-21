@@ -1,10 +1,20 @@
 #include <algorithm>
+#if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#endif
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/logical_scene_projection.hpp>
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <stdexcept>
+#include <string_view>
+#if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
+#include <thread>
+#endif
 #include <type_traits>
 #include <utility>
 
@@ -74,6 +84,87 @@ std::optional<core::ContentDigest> publisher_digest(
   return core::ContentDigest(
       manyforge::content_identity::sha256_digest(preimage));
 }
+
+#if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
+// Process-fixture synchronization at the actual serialized construction
+// boundary. This function and both call sites are absent from ordinary hosts.
+// The finite deadline fails closed rather than leaving a fixture child holding
+// the projection mutex when its test process cannot publish a release marker.
+bool projection_construction_test_operation_selected(
+    std::string_view selected_operations, const std::string_view operation) {
+  while (!selected_operations.empty()) {
+    const auto separator = selected_operations.find(',');
+    if (selected_operations.substr(0, separator) == operation) {
+      return true;
+    }
+    if (separator == std::string_view::npos) {
+      return false;
+    }
+    selected_operations.remove_prefix(separator + 1U);
+  }
+  return false;
+}
+
+void projection_construction_test_boundary(
+    const std::string_view operation,
+    const core::ProjectionNativeRuntimeBindingDTO &binding) {
+  const char *const root =
+      std::getenv("MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR");
+  if (root == nullptr || *root == '\0') {
+    return;
+  }
+  const auto control_root = std::filesystem::path(root);
+  {
+    static std::mutex trace_mutex;
+    std::lock_guard trace_lock(trace_mutex);
+    std::ofstream trace(control_root / "trace.log",
+                        std::ios::binary | std::ios::app);
+    if (!trace) {
+      throw std::runtime_error(
+          "native projection construction trace could not be opened");
+    }
+    trace << "execute " << operation << ' '
+          << binding.provider_binding_id.value() << '\n';
+    if (!trace) {
+      throw std::runtime_error(
+          "native projection construction trace could not be written");
+    }
+  }
+  const char *const held =
+      std::getenv("MANYFORGE_NATIVE_PROJECTION_TEST_HOLD");
+  if (held != nullptr && projection_construction_test_operation_selected(
+                             held, operation)) {
+    std::ofstream entered(
+        control_root / (std::string(operation) + ".entered"),
+        std::ios::binary | std::ios::trunc);
+    if (!entered) {
+      throw std::runtime_error(
+          "native projection construction barrier could not be entered");
+    }
+    entered << binding.provider_binding_id.value() << '\n';
+    entered.close();
+    constexpr auto kDiagnosticDeadline = std::chrono::seconds(30);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          kDiagnosticDeadline;
+    const auto release =
+        control_root / (std::string(operation) + ".release");
+    while (!std::filesystem::exists(release) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    if (!std::filesystem::exists(release)) {
+      throw std::runtime_error(
+          "native projection construction barrier exceeded its fixed "
+          "30-second diagnostic deadline");
+    }
+  }
+  const char *const failed =
+      std::getenv("MANYFORGE_NATIVE_PROJECTION_TEST_FAIL");
+  if (failed != nullptr && std::string_view(failed) == operation) {
+    throw std::runtime_error("injected native projection construction failure");
+  }
+}
+#endif
 
 } // namespace
 
@@ -310,6 +401,19 @@ bool RetainedPlannerSceneProjection::HealthyAt(
   return health_.healthy_for_target(revision) && logical_snapshot_ &&
          logical_snapshot_->revision == revision.scene_revision &&
          active_publisher_.load(std::memory_order_acquire) != nullptr;
+}
+
+bool RetainedPlannerSceneProjection::RetainedStageReplayable() const {
+  if (!stage_record_.has_value() || stage_record_->discarded) {
+    return false;
+  }
+  // An activated record stays replayable as staged even after its duplicate
+  // captures were released: staging did happen, and activation consumed it.
+  return stage_record_->activated ||
+         (stage_record_->candidate_publisher != nullptr &&
+          health_.staged_candidate ==
+              std::optional<core::ProjectionStagedCandidateDTO>{
+                  stage_record_->staged_candidate()});
 }
 
 core::ProjectionCommitResultDTO RetainedPlannerSceneProjection::RollbackProven(
@@ -639,12 +743,14 @@ core::ProjectionCommitResultDTO
 RetainedPlannerSceneProjection::RebuildProjection(
     const core::NativeProjectionRebuildDTO &request) {
   std::lock_guard lock(mutex_);
-  return RebuildProjectionLocked(request);
+  return RebuildProjectionLocked(request,
+                                 RebuildConstructionContext::kOrdinary);
 }
 
 core::ProjectionCommitResultDTO
 RetainedPlannerSceneProjection::RebuildProjectionLocked(
-    const core::NativeProjectionRebuildDTO &request) {
+    const core::NativeProjectionRebuildDTO &request,
+    [[maybe_unused]] const RebuildConstructionContext construction_context) {
   const auto invalid = [&](std::string message, std::string reason) {
     return RollbackProven(std::nullopt, request.target_projection_revision,
                           error(std::string(core::to_string(
@@ -695,7 +801,20 @@ RetainedPlannerSceneProjection::RebuildProjectionLocked(
   health_.staged_candidate = std::nullopt;
   health_.error = std::nullopt;
   active_publisher_.store(nullptr, std::memory_order_release);
+  if (stage_record_.has_value() && !stage_record_->activated &&
+      !stage_record_->discarded) {
+    // Recovery has invalidated this candidate before construction begins. It
+    // can no longer publish even if the rebuild itself ends uncertain.
+    stage_record_->ReleaseCaptures();
+  }
 
+#if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
+  projection_construction_test_boundary(
+      construction_context == RebuildConstructionContext::kBootstrap
+          ? "bootstrap_rebuild"
+          : "rebuild",
+      native_runtime_binding_);
+#endif
   auto rebuilt =
       BuildPublisher(projector_, *request.logical_scene,
                      core::CollisionWorldMutationSource::kDeploymentApply,
@@ -764,7 +883,8 @@ RetainedPlannerSceneProjection::RebuildBootstrapProjection(
       request.planning_collision_model,
       request.initialized_logical_scene.shared(),
   };
-  auto result = RebuildProjectionLocked(rebuild);
+  auto result = RebuildProjectionLocked(
+      rebuild, RebuildConstructionContext::kBootstrap);
   if (result.result == core::ProjectionCommitResultStateDTO::kCommitted &&
       result.acknowledged_projection_revision ==
           std::optional<core::ProjectionRevisionDTO>{
@@ -958,9 +1078,27 @@ RetainedPlannerSceneProjection::StageProjection(
   }
   if (stage_record_.has_value()) {
     if (stage_record_->request == request) {
-      return stage_record_->stage_result;
+      if (RetainedStageReplayable()) {
+        return stage_record_->stage_result;
+      }
+      // The candidate behind this record is gone - its captures were released
+      // by a confirmed discard or a recovery Rebuild replaced the staged
+      // candidate - so the stored Staged result is no longer a true statement.
+      // With the expected predecessor still active the honest answer is that
+      // this candidate can never be activated; otherwise the ordinary
+      // predecessor check below reports the mismatch instead.
+      if (health_.active_projection_revision ==
+          request.transition_row.expected_local_active) {
+        return rejected(stage_record_->discarded
+                            ? "native candidate stage was already discarded"
+                            : "native candidate stage is no longer staged",
+                        stage_record_->discarded
+                            ? "native_projection_stage_discarded"
+                            : "native_projection_stage_no_longer_staged");
+      }
     }
-    if (!stage_record_->activated && !stage_record_->discarded) {
+    if (!stage_record_->activated && !stage_record_->discarded &&
+        RetainedStageReplayable()) {
       return rejected("another exact native stage already owns this runtime",
                       "native_projection_stage_conflict");
     }
@@ -1014,6 +1152,9 @@ RetainedPlannerSceneProjection::StageProjection(
     candidate_product = &prepared_candidate_model_->planning_collision_model;
     candidate_frame_resolver = prepared_candidate_model_->frame_resolver;
   }
+#if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
+  projection_construction_test_boundary("stage", native_runtime_binding_);
+#endif
   auto candidate = BuildPublisher(
       *candidate_projector, *request.frozen_logical_scene.shared(),
       core::CollisionWorldMutationSource::kDeploymentApply,
@@ -1053,8 +1194,10 @@ RetainedPlannerSceneProjection::StageProjection(
     throw std::logic_error("native stage produced an invalid success result");
   }
   StageRecord record{request,
-                     *candidate_projector,
-                     *candidate_product,
+                     std::optional<RetainedCollisionWorldProjector>{
+                         *candidate_projector},
+                     std::optional<core::RetainedProductDTO>{
+                         *candidate_product},
                      std::move(candidate_frame_resolver),
                      std::move(candidate.value()),
                      result,
@@ -1127,7 +1270,9 @@ RetainedPlannerSceneProjection::ActivateStagedProjection(
           std::optional<core::ProjectionStagedCandidateDTO>{expected_stage} ||
       health_.active_projection_revision !=
           request.transition_row.expected_local_active ||
-      !stage_record_->candidate_publisher) {
+      !stage_record_->candidate_publisher ||
+      !stage_record_->candidate_projector.has_value() ||
+      !stage_record_->candidate_planning_collision_model.has_value()) {
     return stale("native staged state no longer matches activation",
                  "native_projection_activation_state_stale");
   }
@@ -1158,14 +1303,19 @@ RetainedPlannerSceneProjection::ActivateStagedProjection(
   next_health.error = std::nullopt;
   logical_snapshot_ = stage_record_->request.frozen_logical_scene.shared();
   transaction_records_.clear();
-  projector_ = stage_record_->candidate_projector;
-  planning_collision_model_ = stage_record_->candidate_planning_collision_model;
+  projector_ = *stage_record_->candidate_projector;
+  planning_collision_model_ =
+      *stage_record_->candidate_planning_collision_model;
   frame_resolver_ = stage_record_->candidate_frame_resolver;
   prepared_candidate_model_.reset();
   active_publisher_.store(stage_record_->candidate_publisher,
                           std::memory_order_release);
   health_ = std::move(next_health);
   stage_record_->activated = true;
+  // The staged candidate has become the active projection, so its duplicate
+  // captures are no longer needed. Only the exact identity and the one stored
+  // result remain, which is what an exact replay needs.
+  stage_record_->ReleaseCaptures();
   core::NativeProjectionActivationResultDTO result{
       request,
       core::NativeProjectionActivationResultState::kActivated,
@@ -1375,7 +1525,10 @@ RetainedPlannerSceneProjection::DiscardStagedProjection(
                   "native_projection_discard_conflict");
   }
   if (!stage_record_->discarded) {
-    stage_record_->candidate_publisher.reset();
+    // A confirmed discard releases every heavy capture. The worker that
+    // produced this candidate can no longer publish it, and a different Stage
+    // or Rebuild for this runtime becomes admissible again.
+    stage_record_->ReleaseCaptures();
     stage_record_->discarded = true;
     health_.staged_candidate = std::nullopt;
     if (health_.source_sequence != std::numeric_limits<std::uint64_t>::max()) {
@@ -1423,11 +1576,18 @@ RetainedPlannerSceneProjection::ProjectionStageStatus(
                            "native_projection_stage_status_conflict");
     } else if (stage_record_->discarded) {
       state = core::NativeProjectionStatusState::kDiscarded;
-    } else {
+    } else if (stage_record_->activated) {
       candidate = stage_record_->request.candidate_projection_revision;
-      state = stage_record_->activated
-                  ? core::NativeProjectionStatusState::kActivated
-                  : core::NativeProjectionStatusState::kStaged;
+      state = core::NativeProjectionStatusState::kActivated;
+    } else if (RetainedStageReplayable()) {
+      candidate = stage_record_->request.candidate_projection_revision;
+      state = core::NativeProjectionStatusState::kStaged;
+    } else {
+      // A confirmed discard released the captures, or a recovery Rebuild
+      // replaced this projection after the stage was recorded. Either way no
+      // candidate is staged any more, so report the honest absence instead of
+      // a staged row that the projection's own health row contradicts.
+      state = core::NativeProjectionStatusState::kAbsent;
     }
   }
   core::NativeProjectionStatusDTO result{

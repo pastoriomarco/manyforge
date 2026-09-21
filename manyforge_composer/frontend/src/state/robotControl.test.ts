@@ -779,7 +779,7 @@ describe('addressed Robot Control state', () => {
     expect(blocked.error).toContain('More than one');
   });
 
-  it('invalidates all local preview and operation state on owner restart', () => {
+  it('invalidates local preview state with an informational owner notice', () => {
     const ready = readyState();
     const restarted = robotControlReducer(ready, {
       type: 'status_refreshed',
@@ -789,7 +789,23 @@ describe('addressed Robot Control state', () => {
     expect(restarted.phase).toBe('idle');
     expect(restarted.preview).toBeNull();
     expect(restarted.ghost).toBeNull();
-    expect(restarted.error).toContain('restarted');
+    expect(restarted.error).toBeNull();
+    expect(restarted.ownerNotice).toContain('uncommitted manual work');
+  });
+
+  it('rebases an idle owner replacement silently', () => {
+    const idle = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved',
+      status: statusFixture(),
+    });
+    const restarted = robotControlReducer(idle, {
+      type: 'status_refreshed',
+      status: statusFixture('execution-owner-2'),
+    });
+
+    expect(restarted.phase).toBe('idle');
+    expect(restarted.error).toBeNull();
+    expect(restarted.ownerNotice).toBeNull();
   });
 
   it('discards a local preview at a Program lifecycle boundary', () => {

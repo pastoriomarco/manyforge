@@ -10,6 +10,7 @@ optional HTTP clients that own no runtime truth.
 from __future__ import annotations
 
 from copy import deepcopy
+import logging
 from pathlib import Path
 import os
 import time
@@ -94,10 +95,16 @@ _CURRENT_SCENARIO_FIELDS = (
 )
 _SCENARIO_LOAD_TIMEOUT_SECONDS = 20.0
 _SCENARIO_LOAD_POLL_SECONDS = 0.1
+_LOGGER = logging.getLogger(__name__)
 
 
 class ComposerState:
     """Authoring state and a replaceable client, never runtime authority."""
+
+    # Absolute monotonic budget for every post-Apply observation in one
+    # activation. One deadline is computed per activation and shared by all
+    # its phases; a test or caller may inject a shorter budget on the instance.
+    deployment_observation_timeout_seconds: float = _SCENARIO_LOAD_TIMEOUT_SECONDS
 
     def __init__(
         self,
@@ -333,6 +340,7 @@ class ComposerState:
                 "program_scene_preparation_unavailable",
                 "Applied Program scene preparation requires Headless",
             )
+        started = time.monotonic()
         applied = self.headless_client.program_applied()
         source = applied.get("source")
         record_digest = (
@@ -383,6 +391,45 @@ class ComposerState:
                 "program_scene_preparation_invalid",
                 "scene preparation returned another Applied Program identity",
             )
+        _LOGGER.info(
+            "deployment_scene_prepared",
+            extra={
+                "request_owner_epoch": request_owner_epoch,
+                "request_id": request_id,
+                "applied_record_digest": record_digest,
+                "scene_prep_ms": (time.monotonic() - started) * 1000.0,
+            },
+        )
+
+    @staticmethod
+    def _manager_published_matches_scenario(
+        status: dict[str, Any],
+        selection: dict[str, Any],
+    ) -> bool:
+        """Return whether Manager has published the selected projection.
+
+        Publication and runtime convergence are deliberately different
+        facts.  A terminal Manager Apply makes the candidate the authoritative
+        active projection before every runtime component has caught up.  The
+        authoring workspace needs that identity immediately so Apply,
+        Discard, and Revert buttons do not oscillate while the runtime settles.
+        Execution-facing callers continue to use ``_manager_matches_scenario``
+        below, which also requires convergence.
+        """
+
+        source = status.get("source")
+        payload = status.get("status")
+        active = payload.get("active") if isinstance(payload, dict) else None
+        return bool(
+            isinstance(source, dict)
+            and source.get("available") is True
+            and source.get("freshness") == "fresh"
+            and source.get("known_gaps") == []
+            and isinstance(active, dict)
+            and active.get("retained_bundle_id")
+            == selection.get("retained_bundle_id")
+            and active.get("graph_revision") == selection.get("graph_revision")
+        )
 
     @staticmethod
     def _manager_matches_scenario(
@@ -450,8 +497,15 @@ class ComposerState:
         self, *, allow_inactive: bool = False
     ) -> dict[str, Any] | None:
         assert self.headless_client is not None
+        # Lightweight authoring doubles may expose only the projections
+        # needed by a local Draft test.  Absence of the optional Applied
+        # Program read means there is no published Scenario identity; it is
+        # not an authoring exception.
+        reader = getattr(self.headless_client, "program_applied", None)
+        if not callable(reader):
+            return None
         try:
-            return self.headless_client.program_applied()
+            return reader()
         except HeadlessClientError as error:
             if error.code == "program_applied_selection_not_found":
                 return None
@@ -463,13 +517,60 @@ class ComposerState:
             raise
 
     def current_scenario(self) -> dict[str, Any]:
-        """Derive current Scenario from owner projections; retain no copy."""
+        """Derive the execution-ready Scenario from owner projections."""
 
+        published = self.published_scenario()
         if self.headless_client is None:
             return {
                 "schema_version": "manyforge.current_scenario.v1",
                 "ready": False,
                 "current_scenario": None,
+                "unavailable_reasons": ["headless_unavailable"],
+            }
+        current = published.get("published_scenario")
+        reasons = [
+            "deployment_not_active_and_converged"
+            if reason == "deployment_not_published"
+            else reason
+            for reason in published.get("unavailable_reasons", [])
+        ]
+        if current is not None:
+            try:
+                selection = self.headless_client.scenario_program_selection(
+                    current["scenario_id"]
+                )
+                if not self._manager_matches_scenario(
+                    self.headless_client.manager_status(),
+                    self.headless_client.manager_diff(),
+                    selection,
+                ):
+                    reasons.append("deployment_not_active_and_converged")
+            except HeadlessClientError:
+                reasons.append("scenario_selection_unavailable")
+        execution_current = current if current is not None and not reasons else None
+        return {
+            "schema_version": "manyforge.current_scenario.v1",
+            "ready": execution_current is not None,
+            "current_scenario": execution_current,
+            "unavailable_reasons": reasons,
+        }
+
+    def published_scenario(self) -> dict[str, Any]:
+        """Derive the authoritative Manager publication without convergence.
+
+        This is the read model used by Deployment authoring.  It is not an
+        execution admission signal: the native/runtime owners may still be
+        reconciling the newly published projection.  Keeping this identity
+        separate from ``current_scenario`` makes the Apply/Revert/Discard
+        cycle deterministic and leaves runtime readiness to the component
+        status/Program execution paths.
+        """
+
+        if self.headless_client is None:
+            return {
+                "schema_version": "manyforge.published_scenario.v1",
+                "ready": False,
+                "published_scenario": None,
                 "unavailable_reasons": ["headless_unavailable"],
             }
         reasons: list[str] = []
@@ -489,22 +590,19 @@ class ComposerState:
                     applied, selection
                 ):
                     reasons.append("applied_program_selection_mismatch")
-        if selection is not None:
-            if not self._manager_matches_scenario(
-                self.headless_client.manager_status(),
-                self.headless_client.manager_diff(),
-                selection,
-            ):
-                reasons.append("deployment_not_active_and_converged")
+        if selection is not None and applied is not None:
+            status = self.headless_client.manager_status()
+            if not self._manager_published_matches_scenario(status, selection):
+                reasons.append("deployment_not_published")
         current = None
         if selection is not None and applied is not None and not reasons:
             current = {field: selection[field] for field in _CURRENT_SCENARIO_FIELDS}
             for field in ("program_id", "program_revision", "program_binding_id"):
                 current[field] = applied[field]
         return {
-            "schema_version": "manyforge.current_scenario.v1",
+            "schema_version": "manyforge.published_scenario.v1",
             "ready": current is not None,
-            "current_scenario": current,
+            "published_scenario": current,
             "unavailable_reasons": reasons,
         }
 
@@ -573,9 +671,58 @@ class ComposerState:
         program_post_state = post_state
 
         deployment_document = deepcopy(selection["deployment"])
+        # Prefer the maintained Deployment artifact as the saved baseline.
+        # The active Scenario selection can point at a Manager-produced
+        # candidate after an Apply, while the artifact on disk remains the
+        # operator's reversible source.  If no matching artifact is present,
+        # the exact selected Scenario document is the baseline.
+        deployment_saved_baseline = deployment_document
+        deployment_saved_path: str | None = None
+        deployment_artifact_id = selection.get("deployment_artifact_id")
+        if isinstance(deployment_artifact_id, str) and deployment_artifact_id:
+            for root in sorted(
+                Path(path).resolve() for path in self.allowed_fs_roots
+            ):
+                for suffix in (".deployment.yaml", ".deployment.yml"):
+                    candidate = root / f"{deployment_artifact_id}{suffix}"
+                    if not candidate.is_file() or candidate.is_symlink():
+                        continue
+                    try:
+                        source, source_path = load_deployment_artifact(
+                            str(candidate), allowed_roots=self.allowed_fs_roots
+                        )
+                        compiled_baseline = (
+                            self.deployment_draft_session.preview_source(source)
+                        )
+                    except DeploymentDraftError:
+                        continue
+                    if (
+                        compiled_baseline.deployment_artifact_id
+                        == deployment_artifact_id
+                    ):
+                        deployment_saved_baseline = deepcopy(
+                            compiled_baseline.document
+                        )
+                        deployment_saved_path = source_path
+                        break
+                else:
+                    continue
+                break
         deployment_current = self.deployment_draft_session.retained_state()
         if deployment_current["document"] == deployment_document:
             deployment_post_state = deepcopy(deployment_current)
+            # A Scenario's Deployment is the durable baseline.  When the
+            # maintained artifact is available, retain its real path as part
+            # of the Saved identity so the client can offer Revert.
+            if deployment_post_state["saved_path"] is None and (
+                deployment_post_state["saved_document"]
+                != deployment_saved_baseline
+                or deployment_saved_path is not None
+            ):
+                deployment_post_state["saved_document"] = deepcopy(
+                    deployment_saved_baseline
+                )
+                deployment_post_state["saved_path"] = deployment_saved_path
         else:
             deployment_post_state = {
                 "schema_version": deployment_current["schema_version"],
@@ -592,8 +739,11 @@ class ComposerState:
                 ),
                 "draft_revision": 1,
                 "document": deployment_document,
-                "saved_path": None,
-                "saved_document": None,
+                "saved_path": deployment_saved_path,
+                # Scenario selection (or its maintained artifact) is the
+                # saved baseline for Deployment authoring.  Apply changes the
+                # runtime, while Revert returns to that exact baseline.
+                "saved_document": deepcopy(deployment_saved_baseline),
             }
         return {
             "schema_version": "manyforge.composer_authoring_workspace.v2",
@@ -775,26 +925,15 @@ class ComposerState:
                     "scenario_load_manager_state_changed",
                     "the target Deployment stopped matching after preflight",
                 )
-            manager_receipt = self.headless_client.manager_apply(
-                {**deepcopy(manager_request), "parent_authoring_claim": claim}
+            manager_receipt = self.apply_manager_deployment_candidate(
+                {"manager_apply": manager_request}, claim
             )
-            if manager_receipt.get("ok") is not True:
-                raise AuthoringJournalError(
-                    "scenario_load_manager_apply_rejected",
-                    "Manager rejected the target Deployment",
-                )
-        deadline = time.monotonic() + _SCENARIO_LOAD_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
+        while True:
             status = self.headless_client.manager_status()
             diff = self.headless_client.manager_diff()
             if self._manager_matches_scenario(status, diff, selection):
                 break
             time.sleep(_SCENARIO_LOAD_POLL_SECONDS)
-        else:
-            raise AuthoringJournalError(
-                "scenario_load_manager_convergence_timeout",
-                "Manager did not publish the target converged Deployment in time",
-            )
         applied = self._optional_applied(allow_inactive=True)
         program_result: dict[str, Any] | None = None
         if applied is None or not applied_program_matches_scenario_selection(
@@ -862,9 +1001,21 @@ class ComposerState:
         }
 
     def apply_manager_deployment_candidate(
-        self, intent: dict[str, Any], claim: dict[str, Any]
+        self,
+        intent: dict[str, Any],
+        claim: dict[str, Any],
+        *,
+        observation_deadline: float | None = None,
     ) -> dict[str, Any]:
-        """Apply one retained Manager candidate and prove its terminal head."""
+        """Apply one retained Manager candidate and prove its terminal head.
+
+        `observation_deadline` is the absolute monotonic instant that bounds
+        every post-acceptance observation in a caller's sequence. A caller
+        that owns one multi-phase activation passes its shared deadline so the
+        status wait cannot restart the full budget for each phase; callers with
+        no deadline keep the Manager's own terminal receipt as the only
+        completion proof.
+        """
 
         if self.headless_client is None:
             raise AuthoringJournalError(
@@ -886,17 +1037,55 @@ class ComposerState:
                 "Manager rejected the exact Deployment candidate",
             )
         acceptance = deepcopy(response)
-        deadline = time.monotonic() + _SCENARIO_LOAD_TIMEOUT_SECONDS
-        while response.get("state") != "succeeded":
-            if time.monotonic() >= deadline:
-                raise AuthoringJournalError(
-                    "manager_apply_convergence_timeout",
-                    "Manager did not finish Deployment Apply in time",
-                )
-            time.sleep(_SCENARIO_LOAD_POLL_SECONDS)
-            response = self.headless_client.manager_apply_status(
-                response["apply_id"], response["apply_generation"]
+
+        def observation_timeout() -> AuthoringJournalError:
+            return AuthoringJournalError(
+                "manager_apply_observation_timeout",
+                "Manager reported no terminal receipt for Apply "
+                f"{acceptance.get('apply_id')} before the shared "
+                "observation deadline",
             )
+
+        while response.get("state") != "succeeded":
+            remaining = (
+                None
+                if observation_deadline is None
+                else observation_deadline - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
+                raise observation_timeout()
+            time.sleep(
+                _SCENARIO_LOAD_POLL_SECONDS
+                if remaining is None
+                else min(_SCENARIO_LOAD_POLL_SECONDS, remaining)
+            )
+            remaining = (
+                None
+                if observation_deadline is None
+                else observation_deadline - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
+                raise observation_timeout()
+            try:
+                response = self.headless_client.manager_apply_status(
+                    response["apply_id"],
+                    response["apply_generation"],
+                    timeout_seconds=remaining,
+                )
+            except HeadlessClientError as error:
+                if error.code == "headless_http_timeout":
+                    raise observation_timeout() from error
+                raise AuthoringJournalError(
+                    "manager_apply_observation_interrupted",
+                    "Manager accepted Apply "
+                    f"{acceptance.get('apply_id')}, but its terminal outcome "
+                    "could not be observed; the effect remains unconfirmed",
+                ) from error
+            if (
+                observation_deadline is not None
+                and time.monotonic() >= observation_deadline
+            ):
+                raise observation_timeout()
             if response.get("ok") is not True:
                 raise AuthoringJournalError(
                     "manager_apply_status_rejected",
@@ -910,14 +1099,17 @@ class ComposerState:
                     "manager_apply_status_identity_mismatch",
                     "Manager status does not name the accepted Apply",
                 )
+        # The Manager's own terminal Apply receipt is the single completion
+        # proof of the published candidate; no second status or diff read may
+        # substitute for it (UI6-I-AP AP2).
         receipt = request.get("candidate_receipt")
-        status = self.headless_client.manager_status()
-        active = status.get("status", {}).get("active", {})
+        projection = response.get("candidate_projection_revision")
         if (
             not isinstance(receipt, dict)
-            or active.get("retained_bundle_id")
+            or not isinstance(projection, dict)
+            or projection.get("retained_bundle_id")
             != receipt.get("candidate_retained_bundle_id")
-            or active.get("graph_revision")
+            or projection.get("graph_revision")
             != receipt.get("candidate_graph_revision")
         ):
             raise AuthoringJournalError(
@@ -928,80 +1120,11 @@ class ComposerState:
         # acceptance/replay identity. Retain that receipt across polling.
         return {**acceptance, **response}
 
-    def execute_authored_deployment_candidate(
-        self,
-        intent: dict[str, Any],
-        claim: dict[str, Any],
-        *,
-        apply: bool,
-    ) -> dict[str, Any]:
-        """Compile one Draft, then preview or select its exact closure."""
-
-        if self.headless_client is None:
-            raise AuthoringJournalError(
-                "deployment_candidate_unavailable",
-                "Deployment candidate compilation requires Headless",
-            )
-        compiled_response = self.headless_client.compile_deployment_candidate(
-            {
-                "scenario_id": intent["scenario_id"],
-                "expected_scenario_catalog_revision": intent[
-                    "expected_scenario_catalog_revision"
-                ],
-                "deployment": deepcopy(intent["deployment"]),
-                "program": deepcopy(intent["program"]),
-                "authoring_claim": claim,
-            }
-        )
-        compilation = compiled_response.get("compilation")
-        if not isinstance(compilation, dict):
-            raise AuthoringJournalError(
-                "deployment_candidate_compiler_response_invalid",
-                "Deployment candidate compilation omitted its exact result",
-            )
-        status = self.headless_client.manager_status()
-        current_bundle, current_graph, manager_epoch = self._manager_current(
-            status
-        )
-        manager_receipt: dict[str, Any] | None = None
-        preview: dict[str, Any] | None = None
-        if not self._manager_matches_scenario(
-            status, self.headless_client.manager_diff(), compilation
-        ):
-            expected_current = intent["expected_manager_current"]
-            if expected_current != {
-                "retained_bundle_id": current_bundle,
-                "graph_revision": current_graph,
-            }:
-                raise AuthoringJournalError(
-                    "deployment_candidate_manager_state_changed",
-                    "Manager selection changed before Deployment candidate "
-                    "preview",
-                )
-            preview = self.headless_client.manager_deployment_candidate_preview(
-                {
-                    "deployment_artifact_id": compilation[
-                        "deployment_artifact_id"
-                    ],
-                    "deployment_revision": compilation["deployment_revision"],
-                    "expected_current": {
-                        "graph_revision": current_graph,
-                        "retained_bundle_id": current_bundle,
-                    },
-                    "expected_admission_generation": intent[
-                        "expected_admission_generation"
-                    ],
-                    "request_owner_epoch": manager_epoch,
-                }
-            )
-            receipt = preview.get("candidate_receipt")
-            if preview.get("ok") is not True or not isinstance(receipt, dict):
-                raise AuthoringJournalError(
-                    "deployment_candidate_rejected",
-                    "Manager rejected the compiled Deployment candidate",
-                )
-            diff = preview.get("diff")
-            disruptive = isinstance(diff, dict) and any(
+    @staticmethod
+    def _deployment_candidate_is_disruptive(diff: Any) -> bool:
+        return bool(
+            isinstance(diff, dict)
+            and any(
                 isinstance(record_diff, dict)
                 and any(
                     isinstance(record_diff.get(change), list)
@@ -1010,150 +1133,621 @@ class ComposerState:
                 )
                 for record_diff in diff.values()
             )
-            confirmation_token = canonical_digest(
+        )
+
+    @staticmethod
+    def _deployment_candidate_confirmation_token(
+        *,
+        draft_id: Any,
+        draft_revision: Any,
+        compilation: dict[str, Any],
+        preview: dict[str, Any],
+    ) -> str:
+        receipt = preview["candidate_receipt"]
+        return canonical_digest(
+            {
+                "schema_version": (
+                    "manyforge.deployment_apply_confirmation.v1"
+                ),
+                "draft_id": draft_id,
+                "draft_revision": draft_revision,
+                "candidate": {
+                    field: compilation[field]
+                    for field in _CURRENT_SCENARIO_FIELDS
+                },
+                "manager_current": receipt["expected_current"],
+                "candidate_retained_bundle_id": receipt[
+                    "candidate_retained_bundle_id"
+                ],
+                "candidate_graph_revision": receipt[
+                    "candidate_graph_revision"
+                ],
+                "diff": preview.get("diff"),
+            }
+        )
+
+    def validate_deployment_candidate_confirmation(
+        self, intent: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Check one retained preparation against this confirmation claim.
+
+        This runs under the confirmation's fresh authoring claim and performs
+        reads only: the durable preparation outcome, current Manager facts,
+        and one fresh candidate preview. It never compiles or mutates an
+        owner; the confirmation-time compile branch no longer exists.
+        """
+
+        started = time.monotonic()
+        if self.headless_client is None or self.authoring_admission is None:
+            raise AuthoringJournalError(
+                "confirmation_expired",
+                "Deployment confirmation requires retained authoring evidence",
+            )
+        confirmation_token = intent.get("confirmation_token")
+        preparation_owner_epoch = intent.get("preparation_request_owner_epoch")
+        preparation_request_id = intent.get("preparation_request_id")
+        if (
+            not isinstance(confirmation_token, str)
+            or not isinstance(preparation_owner_epoch, str)
+            or not isinstance(preparation_request_id, str)
+        ):
+            raise AuthoringJournalError(
+                "confirmation_expired",
+                "Deployment confirmation omitted its preparation identity",
+            )
+        transaction = self.authoring_admission.prepared_authoring_transaction(
+            preparation_owner_epoch, preparation_request_id
+        )
+        outcome = transaction.outcome if transaction is not None else None
+        preparation = (
+            transaction.effect_intent if transaction is not None else None
+        )
+        body = outcome.get("body") if isinstance(outcome, dict) else None
+        result = body.get("result") if isinstance(body, dict) else None
+        compilation = (
+            result.get("compilation") if isinstance(result, dict) else None
+        )
+        if (
+            transaction is None
+            or not transaction.complete
+            or not isinstance(outcome, dict)
+            or outcome.get("settlement_kind") != "owner_commit"
+            or transaction.operation_kind != intent.get("operation_kind")
+            or not isinstance(preparation, dict)
+            or not isinstance(result, dict)
+            or result.get("status") != "confirmation_required"
+            or not isinstance(compilation, dict)
+            or any(
+                field not in compilation for field in _CURRENT_SCENARIO_FIELDS
+            )
+            or not isinstance(result.get("candidate_preview"), dict)
+            or not isinstance(
+                result["candidate_preview"].get("candidate_receipt"), dict
+            )
+        ):
+            raise AuthoringJournalError(
+                "confirmation_expired",
+                "the confirmed Deployment preparation is absent or incomplete",
+            )
+        candidate_receipt = result["candidate_preview"]["candidate_receipt"]
+        # The compiler validates the source catalog revision supplied in
+        # ``expected_scenario_catalog_revision``.  A candidate may then
+        # publish a new catalog revision because the edited Deployment changes
+        # the retained Scenario closure, so that input revision must not be
+        # compared with the candidate's output revision here.  The receipt is
+        # the candidate-side identity check.
+        if (
+            compilation["scenario_id"] != preparation.get("scenario_id")
+            or candidate_receipt.get("scenario_catalog_revision")
+            != compilation["scenario_catalog_revision"]
+        ):
+            raise AuthoringJournalError(
+                "confirmation_expired",
+                "the confirmed preparation evidence is self-inconsistent",
+            )
+        changed = [
+            label
+            for label, retained, current in (
+                (
+                    "Deployment Draft identity",
+                    (transaction.draft_id, transaction.draft_revision),
+                    (intent["draft_id"], intent["draft_revision"]),
+                ),
+                (
+                    "Scenario",
+                    preparation.get("scenario_id"),
+                    intent["scenario_id"],
+                ),
+                (
+                    "Scenario catalog",
+                    preparation.get("expected_scenario_catalog_revision"),
+                    intent["expected_scenario_catalog_revision"],
+                ),
+                (
+                    "Applied Program",
+                    preparation.get("program"),
+                    intent["program"],
+                ),
+                (
+                    "Deployment Draft document",
+                    preparation.get("deployment"),
+                    intent["deployment"],
+                ),
+            )
+            if retained != current
+        ]
+        if changed:
+            raise AuthoringJournalError(
+                "confirmation_stale",
+                "the confirmed preparation's "
+                + " and ".join(changed)
+                + " changed; prepare and confirm again",
+            )
+        status = self.headless_client.manager_status()
+        current_bundle, current_graph, manager_epoch = self._manager_current(
+            status
+        )
+        confirmed_candidate = {
+            "retained_bundle_id": compilation["retained_bundle_id"],
+            "graph_revision": compilation["graph_revision"],
+        }
+        if self._manager_matches_scenario(
+            status, self.headless_client.manager_diff(), compilation
+        ):
+            # The confirmed candidate is already active; the pre-apply
+            # short-circuit observes it instead of restarting its runtime.
+            return {
+                "compilation": compilation,
+                "preview": None,
+                "receipt": None,
+                "manager_epoch": manager_epoch,
+                "validation_ms": (time.monotonic() - started) * 1000.0,
+            }
+        preview = self.headless_client.manager_deployment_candidate_preview(
+            {
+                "deployment_artifact_id": compilation[
+                    "deployment_artifact_id"
+                ],
+                "deployment_revision": compilation["deployment_revision"],
+                "expected_current": {
+                    "graph_revision": current_graph,
+                    "retained_bundle_id": current_bundle,
+                },
+                "expected_admission_generation": intent[
+                    "expected_admission_generation"
+                ],
+                "request_owner_epoch": manager_epoch,
+            }
+        )
+        receipt = preview.get("candidate_receipt")
+        if preview.get("ok") is not True or not isinstance(receipt, dict):
+            raise AuthoringJournalError(
+                "deployment_candidate_rejected",
+                "Manager rejected the retained Deployment candidate",
+            )
+        if (
+            receipt.get("candidate_retained_bundle_id")
+            != confirmed_candidate["retained_bundle_id"]
+            or receipt.get("candidate_graph_revision")
+            != confirmed_candidate["graph_revision"]
+        ):
+            raise AuthoringJournalError(
+                "confirmation_stale",
+                "the candidate identities changed since the confirmed "
+                "preparation; prepare and confirm again",
+            )
+        if (
+            self._deployment_candidate_confirmation_token(
+                draft_id=intent["draft_id"],
+                draft_revision=intent["draft_revision"],
+                compilation=compilation,
+                preview=preview,
+            )
+            != confirmation_token
+        ):
+            raise AuthoringJournalError(
+                "confirmation_stale",
+                "the candidate's semantic impact changed since the confirmed "
+                "preparation; prepare and confirm again",
+            )
+        return {
+            "compilation": compilation,
+            "preview": preview,
+            "receipt": receipt,
+            "manager_epoch": manager_epoch,
+            "validation_ms": (time.monotonic() - started) * 1000.0,
+        }
+
+    def _prepare_authored_deployment_candidate(
+        self,
+        intent: dict[str, Any],
+        claim: dict[str, Any],
+        *,
+        apply: bool,
+    ) -> dict[str, Any]:
+        """Resolve one immutable candidate and its exact next Manager request."""
+
+        assert self.headless_client is not None
+        phases: dict[str, float] = {}
+        confirmation = (
+            self.validate_deployment_candidate_confirmation(intent)
+            if intent.get("confirmation_token") is not None
+            else None
+        )
+        if confirmation is not None:
+            compilation = confirmation["compilation"]
+            preview = confirmation["preview"]
+            receipt = confirmation["receipt"]
+            manager_epoch = confirmation["manager_epoch"]
+            phases["confirmation_validation_ms"] = confirmation[
+                "validation_ms"
+            ]
+        else:
+            started = time.monotonic()
+            compiled_response = self.headless_client.compile_deployment_candidate(
                 {
-                    "schema_version": (
-                        "manyforge.deployment_apply_confirmation.v1"
-                    ),
-                    "draft_id": intent["draft_id"],
-                    "draft_revision": intent["draft_revision"],
-                    "candidate": {
-                        field: compilation[field]
-                        for field in _CURRENT_SCENARIO_FIELDS
-                    },
-                    "manager_current": receipt["expected_current"],
-                    "candidate_retained_bundle_id": receipt[
-                        "candidate_retained_bundle_id"
+                    "scenario_id": intent["scenario_id"],
+                    "expected_scenario_catalog_revision": intent[
+                        "expected_scenario_catalog_revision"
                     ],
-                    "candidate_graph_revision": receipt[
-                        "candidate_graph_revision"
-                    ],
-                    "diff": diff,
+                    "deployment": deepcopy(intent["deployment"]),
+                    "program": deepcopy(intent["program"]),
+                    "authoring_claim": claim,
                 }
             )
-            if (
-                apply
-                and disruptive
-                and intent.get("confirmation_token") != confirmation_token
-            ):
-                return {
-                    "status": "confirmation_required",
-                    "confirmation_token": confirmation_token,
-                    "compilation": compilation,
-                    "candidate_preview": preview,
-                    "manager_apply": None,
-                    "selection": {
-                        field: compilation[field]
-                        for field in _CURRENT_SCENARIO_FIELDS
-                    },
-                }
-            if apply:
-                manager_receipt = self.apply_manager_deployment_candidate(
-                    {
-                        "manager_apply": {
-                            "request_id": intent["manager_request_id"],
-                            "request_owner_epoch": manager_epoch,
-                            "source_label": (
-                                "manyforge_composer_deployment_apply"
-                            ),
-                            "correlation_id": intent["correlation_id"],
-                            "deployment_artifact_id": compilation[
-                                "deployment_artifact_id"
-                            ],
-                            "deployment_revision": compilation[
-                                "deployment_revision"
-                            ],
-                            "expected_current": receipt["expected_current"],
-                            "reject_if_affected_busy": True,
-                            "candidate_receipt": receipt,
-                        }
-                    },
-                    claim,
-                )
-
-        if apply:
-            deadline = time.monotonic() + _SCENARIO_LOAD_TIMEOUT_SECONDS
-            selection = None
-            while selection is None:
-                if self._manager_matches_scenario(
-                    self.headless_client.manager_status(),
-                    self.headless_client.manager_diff(),
-                    compilation,
-                ):
-                    try:
-                        selection = self.headless_client.scenario_load_selection(
-                            intent["scenario_id"]
-                        )
-                    except HeadlessClientError as error:
-                        if error.code != "scenario_program_selection_unavailable":
-                            raise
-                if selection is not None:
-                    break
-                if time.monotonic() >= deadline:
-                    raise AuthoringJournalError(
-                        "deployment_candidate_convergence_timeout",
-                        "Manager did not converge the authored Deployment",
-                    )
-                time.sleep(_SCENARIO_LOAD_POLL_SECONDS)
-            correspondences = {
-                "scenario_catalog_revision": "scenario_catalog_revision",
-                "deployment_artifact_id": "deployment_artifact_id",
-                "deployment_revision": "deployment_revision",
-                "retained_bundle_id": "retained_bundle_id",
-                "graph_revision": "graph_revision",
-                "program_id": "program_id",
-                "program_revision": "program_revision",
-                "program_binding_id": "program_binding_id",
-            }
-            if (
-                any(
-                    selection.get(selection_field) != compilation.get(compilation_field)
-                    for selection_field, compilation_field in correspondences.items()
-                )
-                or selection.get("program") != intent["program"]
-            ):
+            compilation = compiled_response.get("compilation")
+            if not isinstance(compilation, dict):
                 raise AuthoringJournalError(
-                    "deployment_candidate_selection_mismatch",
-                    "applied Deployment candidate did not reopen as one exact "
-                    "Scenario closure",
+                    "deployment_candidate_compiler_response_invalid",
+                    "Deployment candidate compilation omitted its exact result",
                 )
-            applied = self._optional_applied(allow_inactive=True)
-            if applied is None or not applied_program_matches_scenario_selection(
-                applied, selection
+            phases["compile_ms"] = (time.monotonic() - started) * 1000.0
+            started = time.monotonic()
+            status = self.headless_client.manager_status()
+            current_bundle, current_graph, manager_epoch = self._manager_current(
+                status
+            )
+            preview = None
+            receipt = None
+            if not self._manager_matches_scenario(
+                status, self.headless_client.manager_diff(), compilation
             ):
-                self.headless_client.program_apply(
+                expected_current = intent["expected_manager_current"]
+                if expected_current != {
+                    "retained_bundle_id": current_bundle,
+                    "graph_revision": current_graph,
+                }:
+                    raise AuthoringJournalError(
+                        "deployment_candidate_manager_state_changed",
+                        "Manager selection changed before Deployment candidate "
+                        "preview",
+                    )
+                preview = self.headless_client.manager_deployment_candidate_preview(
                     {
-                        "scenario_id": selection["scenario_id"],
-                        "scenario_catalog_revision": selection[
-                            "scenario_catalog_revision"
+                        "deployment_artifact_id": compilation[
+                            "deployment_artifact_id"
                         ],
-                        "program": deepcopy(intent["program"]),
-                        "expected_applied_record_digest": intent[
-                            "expected_applied_record_digest"
+                        "deployment_revision": compilation["deployment_revision"],
+                        "expected_current": {
+                            "graph_revision": current_graph,
+                            "retained_bundle_id": current_bundle,
+                        },
+                        "expected_admission_generation": intent[
+                            "expected_admission_generation"
                         ],
-                        "authoring_claim": claim,
+                        "request_owner_epoch": manager_epoch,
                     }
                 )
-            applied = self.headless_client.program_applied()
-            if not applied_program_matches_scenario_selection(
-                applied, selection
-            ):
-                raise AuthoringJournalError(
-                    "deployment_candidate_program_mismatch",
-                    "Program Apply did not bind the current Program to the "
-                    "authored Deployment",
-                )
-            self._restore_authoring_post_image(deepcopy(intent["post_state"]))
+                receipt = preview.get("candidate_receipt")
+                if preview.get("ok") is not True or not isinstance(receipt, dict):
+                    raise AuthoringJournalError(
+                        "deployment_candidate_rejected",
+                        "Manager rejected the compiled Deployment candidate",
+                    )
+                if (
+                    receipt.get("candidate_retained_bundle_id")
+                    != compilation["retained_bundle_id"]
+                    or receipt.get("candidate_graph_revision")
+                    != compilation["graph_revision"]
+                ):
+                    raise AuthoringJournalError(
+                        "deployment_candidate_preview_mismatch",
+                        "Manager preview returned another compiled candidate",
+                    )
+            phases["preview_ms"] = (time.monotonic() - started) * 1000.0
 
+        confirmation_required = bool(
+            apply
+            and intent.get("confirmation_token") is None
+            and preview is not None
+            and self._deployment_candidate_is_disruptive(preview.get("diff"))
+        )
+        confirmation_token = (
+            self._deployment_candidate_confirmation_token(
+                draft_id=intent["draft_id"],
+                draft_revision=intent["draft_revision"],
+                compilation=compilation,
+                preview=preview,
+            )
+            if confirmation_required and preview is not None
+            else None
+        )
+        manager_apply = None
+        if apply and not confirmation_required and receipt is not None:
+            manager_apply = {
+                "request_id": intent["manager_request_id"],
+                "request_owner_epoch": manager_epoch,
+                "source_label": "manyforge_composer_deployment_apply",
+                "correlation_id": intent["correlation_id"],
+                "deployment_artifact_id": compilation["deployment_artifact_id"],
+                "deployment_revision": compilation["deployment_revision"],
+                "expected_current": receipt["expected_current"],
+                "reject_if_affected_busy": True,
+                "candidate_receipt": receipt,
+            }
         return {
-            "status": "applied" if apply else "previewed",
+            "compilation": deepcopy(compilation),
+            "candidate_preview": deepcopy(preview),
+            "manager_apply": deepcopy(manager_apply),
+            "confirmation_required": confirmation_required,
+            "confirmation_token": confirmation_token,
+            "preparation": (
+                {
+                    "request_owner_epoch": intent.get(
+                        "preparation_request_owner_epoch"
+                    ),
+                    "request_id": intent.get("preparation_request_id"),
+                }
+                if confirmation_required
+                else None
+            ),
+            "phases_ms": phases,
+        }
+
+    def execute_authored_deployment_candidate(
+        self,
+        intent: dict[str, Any],
+        claim: dict[str, Any],
+        *,
+        apply: bool,
+        prepared: dict[str, Any] | None = None,
+        prepare_only: bool = False,
+    ) -> dict[str, Any]:
+        """Prepare or activate one authored Deployment candidate exactly once."""
+
+        if self.headless_client is None:
+            raise AuthoringJournalError(
+                "deployment_candidate_unavailable",
+                "Deployment candidate compilation requires Headless",
+            )
+        manager_receipt: dict[str, Any] | None = None
+        apply_id: str | None = None
+        apply_generation: int | None = None
+        if prepared is None:
+            retained = intent.get("prepared_deployment_candidate")
+            if isinstance(retained, dict):
+                prepared = deepcopy(retained)
+
+        if prepared is None:
+            prepared = self._prepare_authored_deployment_candidate(
+                intent, claim, apply=apply
+            )
+
+        compilation = prepared.get("compilation")
+        preview = prepared.get("candidate_preview")
+        manager_apply = prepared.get("manager_apply")
+        phases = prepared.get("phases_ms")
+        confirmation_required = prepared.get("confirmation_required")
+        confirmation_token = prepared.get("confirmation_token")
+        preparation = prepared.get("preparation")
+        if (
+            not isinstance(compilation, dict)
+            or any(field not in compilation for field in _CURRENT_SCENARIO_FIELDS)
+            or preview is not None and not isinstance(preview, dict)
+            or manager_apply is not None and not isinstance(manager_apply, dict)
+            or not isinstance(phases, dict)
+            or not isinstance(confirmation_required, bool)
+            or confirmation_required
+            and (
+                not isinstance(confirmation_token, str)
+                or not isinstance(preparation, dict)
+                or manager_apply is not None
+            )
+            or not confirmation_required
+            and (confirmation_token is not None or preparation is not None)
+        ):
+            raise AuthoringJournalError(
+                "deployment_candidate_preparation_invalid",
+                "retained Deployment candidate preparation is incomplete",
+            )
+        if prepare_only:
+            return deepcopy(prepared)
+        if confirmation_required:
+            return {
+                "status": "confirmation_required",
+                "confirmation_token": prepared.get("confirmation_token"),
+                "compilation": compilation,
+                "candidate_preview": preview,
+                "manager_apply": None,
+                "selection": {
+                    field: compilation[field]
+                    for field in _CURRENT_SCENARIO_FIELDS
+                },
+                "preparation": prepared.get("preparation"),
+                "phases_ms": phases,
+                "apply_id": None,
+            }
+        if not apply:
+            return {
+                "status": "previewed",
+                "confirmation_token": None,
+                "compilation": compilation,
+                "candidate_preview": preview,
+                "manager_apply": None,
+                "selection": {
+                    field: compilation[field]
+                    for field in _CURRENT_SCENARIO_FIELDS
+                },
+                "preparation": None,
+                "phases_ms": phases,
+                "apply_id": None,
+            }
+        # One absolute monotonic deadline bounds the whole post-acceptance
+        # observation sequence. Each later phase consumes the remaining budget
+        # instead of restarting a full timeout, and the Manager's terminal
+        # Apply receipt stays the only completion proof of the mutation.
+        observation_deadline = (
+            time.monotonic() + self.deployment_observation_timeout_seconds
+        )
+        if manager_apply is not None:
+            started = time.monotonic()
+            manager_receipt = self.apply_manager_deployment_candidate(
+                {"manager_apply": manager_apply},
+                claim,
+                observation_deadline=observation_deadline,
+            )
+            phases["manager_apply_ms"] = (
+                time.monotonic() - started
+            ) * 1000.0
+            observed_apply_id = manager_receipt.get("apply_id")
+            if isinstance(observed_apply_id, str):
+                apply_id = observed_apply_id
+            observed_generation = manager_receipt.get("apply_generation")
+            if type(observed_generation) is int:
+                apply_generation = observed_generation
+        started = time.monotonic()
+        selection = None
+
+        def selection_timeout() -> AuthoringJournalError:
+            _LOGGER.error(
+                "deployment_candidate_selection_timeout",
+                extra={
+                    "correlation_id": intent.get("correlation_id"),
+                    "apply_id": apply_id,
+                    "apply_generation": apply_generation,
+                    "failure_phase": "scenario_selection",
+                    "phases_ms": phases,
+                },
+            )
+            return AuthoringJournalError(
+                "deployment_candidate_selection_timeout",
+                "Manager applied; selection confirmation timed out"
+                + (
+                    f" for Apply {apply_id} generation {apply_generation}"
+                    if apply_id is not None
+                    else ""
+                ),
+            )
+
+        while selection is None:
+            remaining = observation_deadline - time.monotonic()
+            if remaining <= 0:
+                raise selection_timeout()
+            try:
+                selection = self.headless_client.scenario_load_selection(
+                    intent["scenario_id"], timeout_seconds=remaining
+                )
+            except HeadlessClientError as error:
+                if (
+                    error.code
+                    != "scenario_program_selection_unavailable"
+                ):
+                    raise
+            if time.monotonic() >= observation_deadline:
+                raise selection_timeout()
+            if selection is not None:
+                break
+            remaining = observation_deadline - time.monotonic()
+            if remaining <= 0:
+                raise selection_timeout()
+            time.sleep(min(_SCENARIO_LOAD_POLL_SECONDS, remaining))
+        correspondences = {
+            "scenario_catalog_revision": "scenario_catalog_revision",
+            "deployment_artifact_id": "deployment_artifact_id",
+            "deployment_revision": "deployment_revision",
+            "retained_bundle_id": "retained_bundle_id",
+            "program_id": "program_id",
+            "program_revision": "program_revision",
+        }
+        # Manager's terminal receipt is the authority for the activated graph.
+        # Program binding is a derivative of that exact graph and Program and
+        # is validated by Program Apply below; comparing either against a
+        # predecessor selection makes Revert depend on stale derived values.
+        expected_graph = compilation["graph_revision"]
+        if isinstance(manager_apply, dict):
+            candidate_receipt = manager_apply.get("candidate_receipt")
+            if isinstance(candidate_receipt, dict):
+                expected_graph = candidate_receipt.get(
+                    "candidate_graph_revision", expected_graph
+                )
+        if (
+            any(
+                selection.get(selection_field)
+                != compilation.get(compilation_field)
+                for selection_field, compilation_field in (
+                    correspondences.items()
+                )
+            )
+            or selection.get("graph_revision") != expected_graph
+            or selection.get("program") != intent["program"]
+        ):
+            raise AuthoringJournalError(
+                "deployment_candidate_selection_mismatch",
+                "applied Deployment candidate did not reopen as one exact "
+                "Scenario closure",
+            )
+        phases["scenario_selection_ms"] = (
+            time.monotonic() - started
+        ) * 1000.0
+        started = time.monotonic()
+        applied = self._optional_applied(allow_inactive=True)
+        if applied is None or not applied_program_matches_scenario_selection(
+            applied, selection
+        ):
+            self.headless_client.program_apply(
+                {
+                    "scenario_id": selection["scenario_id"],
+                    "scenario_catalog_revision": selection[
+                        "scenario_catalog_revision"
+                    ],
+                    "program": deepcopy(intent["program"]),
+                    "expected_applied_record_digest": intent[
+                        "expected_applied_record_digest"
+                    ],
+                    "authoring_claim": claim,
+                }
+            )
+        applied = self.headless_client.program_applied()
+        if not applied_program_matches_scenario_selection(applied, selection):
+            raise AuthoringJournalError(
+                "deployment_candidate_program_mismatch",
+                "Program Apply did not bind the current Program to the "
+                "authored Deployment",
+            )
+        phases["program_rebind_ms"] = (time.monotonic() - started) * 1000.0
+        self._restore_authoring_post_image(deepcopy(intent["post_state"]))
+        _LOGGER.info(
+            "deployment_candidate_applied",
+            extra={
+                "correlation_id": intent.get("correlation_id"),
+                "apply_id": apply_id,
+                "retained_bundle_id": selection.get("retained_bundle_id"),
+                "graph_revision": selection.get("graph_revision"),
+                "phases_ms": phases,
+            },
+        )
+        return {
+            "status": "applied",
             "confirmation_token": None,
             "compilation": compilation,
             "candidate_preview": preview,
             "manager_apply": manager_receipt,
             "selection": {
-                field: compilation[field] for field in _CURRENT_SCENARIO_FIELDS
+                field: selection[field] for field in _CURRENT_SCENARIO_FIELDS
             },
+            "preparation": None,
+            "phases_ms": phases,
+            "apply_id": apply_id,
         }
 
     def execute_scenario_document_load(
@@ -1254,17 +1848,22 @@ class ComposerState:
                 "startup Load Scenario requires Headless-backed authoring",
             )
         selection = self.headless_client.scenario_load_selection(scenario_id)
-        deadline = time.monotonic() + _SCENARIO_LOAD_TIMEOUT_SECONDS
         while True:
+            # Recovery is exact and idempotent. A replacement Manager may
+            # still be completing the durable external effect when Composer
+            # first starts, so retry that same recovery instead of polling a
+            # permanently stale unavailable flag or imposing a host-speed
+            # deadline.
+            if not self.authoring_admission.mutation_ready:
+                self.authoring_admission.recover()
             admission = self.headless_client.authoring_admission()
             generation = admission.get("admission_generation")
-            if admission.get("authoring_allowed") is True and type(generation) is int:
+            if (
+                self.authoring_admission.mutation_ready
+                and admission.get("authoring_allowed") is True
+                and type(generation) is int
+            ):
                 break
-            if time.monotonic() >= deadline:
-                raise AuthoringJournalError(
-                    "scenario_load_authoring_not_ready",
-                    "startup Load Scenario requires idle authoring admission",
-                )
             time.sleep(_SCENARIO_LOAD_POLL_SECONDS)
         request_id = "development-load-scenario-" + uuid.uuid4().hex
         return self.load_scenario(
@@ -1397,7 +1996,21 @@ class ComposerState:
             self._restore_authoring_post_image(post_state)
             return self.deployment_draft_session.snapshot(), post_state
         if kind == "revert_deployment":
-            result = self.apply_manager_deployment_candidate(intent, claim)
+            # Revert now uses the same Manager-apply/Scenario-reopen/Program-
+            # rebind transaction as a normal Deployment Apply.  Older journal
+            # entries predate that prepared candidate; retain their narrow
+            # Manager-only recovery fallback so startup can settle them
+            # without pretending the old transaction performed a rebind.
+            prepared = intent.get("prepared_deployment_candidate")
+            if isinstance(prepared, dict):
+                result = self.execute_authored_deployment_candidate(
+                    intent,
+                    claim,
+                    apply=True,
+                    prepared=prepared,
+                )
+            else:
+                result = self.apply_manager_deployment_candidate(intent, claim)
             self._restore_authoring_post_image(post_state)
             return result, post_state
         if kind == "scenario_document_load":

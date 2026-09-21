@@ -1690,16 +1690,6 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     readyManifest,
     motionDescriptor,
   ), [motionDescriptor, presentationFacts, readyManifest, sourceValue]);
-  const executionPresentation = useMemo(() => executionRobotPresentation(
-    robotControl.selectedStatus,
-    sourceValue,
-    readyManifest,
-  ), [readyManifest, robotControl.selectedStatus, sourceValue]);
-  const runtimePresentation = useMemo(() => (
-    executionPresentation !== null && sceneRuntimePresentation.measuredRobot === null
-      ? { ...sceneRuntimePresentation, measuredRobot: executionPresentation }
-      : sceneRuntimePresentation
-  ), [executionPresentation, sceneRuntimePresentation]);
   const executionObservationPresentation = useMemo(
     () => createExecutionRobotPresentationReader(
       source,
@@ -1709,6 +1699,47 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     ),
     [motionDescriptor, readyManifest, source, sourceValue],
   );
+  const executionPresentation = useMemo(() => executionRobotPresentation(
+    robotControl.selectedStatus,
+    sourceValue,
+    readyManifest,
+  ), [readyManifest, robotControl.selectedStatus, sourceValue]);
+  // The measured-model driver can only subscribe after it is mounted. Wake
+  // this parent only while it still needs a first valid observation, so a
+  // frame that arrives during neutral bootstrap can promote the model without
+  // rerendering the whole authoring surface for every steady-state sample.
+  const [observationBootstrapRevision, setObservationBootstrapRevision] = useState(0);
+  const lastBootstrapFrame = useRef(source.getLatestExecutionObservation());
+  const needsObservationBootstrap = executionPresentation === null
+    && sceneRuntimePresentation.measuredRobot === null;
+  useEffect(() => {
+    if (!needsObservationBootstrap) return undefined;
+    const wakeForObservation = () => {
+      const frame = source.getLatestExecutionObservation();
+      if (frame === null || frame === lastBootstrapFrame.current) return;
+      lastBootstrapFrame.current = frame;
+      setObservationBootstrapRevision((revision) => revision + 1);
+    };
+    wakeForObservation();
+    const unsubscribe = source.subscribeExecutionObservation(wakeForObservation);
+    // The source's legacy unsubscribe returns a boolean; React effects must
+    // expose a void cleanup function (the return value is not meaningful to
+    // the subscription owner).
+    return () => { void unsubscribe(); };
+  }, [needsObservationBootstrap, source]);
+  const liveExecutionPresentation = useMemo(
+    () => executionObservationPresentation.readMeasuredRobotPresentation(),
+    [executionObservationPresentation, observationBootstrapRevision],
+  );
+  const runtimePresentation = useMemo(() => (
+    (executionPresentation ?? liveExecutionPresentation) !== null
+      && sceneRuntimePresentation.measuredRobot === null
+      ? {
+          ...sceneRuntimePresentation,
+          measuredRobot: executionPresentation ?? liveExecutionPresentation,
+        }
+      : sceneRuntimePresentation
+  ), [executionPresentation, liveExecutionPresentation, sceneRuntimePresentation]);
   const candidates = useMemo(() => {
     if (readyManifest === null || motionDescriptor === null) return null;
     const observation = source.getLatestExecutionObservation();
@@ -2027,7 +2058,6 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       candidateRejected={robotControl.state.previewIssue !== null}
       runtimePresentation={runtimePresentation}
       executionObservationPresentation={executionObservationPresentation}
-      executionObservationTransport={observationTransport}
       sceneOwnerIdentity={sceneOwnerIdentity}
       viewerFrameIdentity={viewerFrameIdentity}
       readViewerFrameIdentity={source.getPresentedRuntimeFrame}
@@ -2061,6 +2091,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           enabled={runtimeEnabled}
           program={programRuntime}
           robot={robotControl}
+          observationTransport={observationTransport}
           onOpenRobotControls={openRobotControls}
           onOpenRuntimeHistory={onOpenRuntimeHistory}
         />

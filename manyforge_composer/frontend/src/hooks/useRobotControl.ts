@@ -222,6 +222,8 @@ export interface RobotControlController {
   runtimeScaleError: string | null;
   fullStopPending: boolean;
   fullStopError: string | null;
+  stopFaultRecoveryPending: boolean;
+  stopFaultRecoveryError: string | null;
   selectRobot: (componentId: string, motionTargetId: string) => void;
   selectTool: (gripperTargetId: string) => void;
   selectMode: (mode: RobotControlMode) => void;
@@ -240,6 +242,7 @@ export interface RobotControlController {
   revert: () => void;
   stop: () => Promise<void>;
   fullStop: () => Promise<void>;
+  recoverStopFault: () => Promise<void>;
   dismissFullStopError: () => void;
   dismissRuntimeScaleError: () => void;
   dismissError: () => void;
@@ -273,6 +276,9 @@ export function useRobotControl(
   const [fullStopPending, setFullStopPending] = useState(false);
   const [fullStopError, setFullStopError] = useState<string | null>(null);
   const fullStopRequest = useRef<{ ownerEpoch: string } | null>(null);
+  const [stopFaultRecoveryPending, setStopFaultRecoveryPending] = useState(false);
+  const [stopFaultRecoveryError, setStopFaultRecoveryError] = useState<string | null>(null);
+  const stopFaultRecoveryRequest = useRef<{ ownerEpoch: string } | null>(null);
   const approveInFlight = useRef<{ ownerEpoch: string; generation: number } | null>(null);
   const dragGeneration = useRef<number | null>(null);
   useLayoutEffect(() => {
@@ -562,6 +568,11 @@ export function useRobotControl(
       fullStopRequest.current = null;
       setFullStopPending(false);
       setFullStopError(null);
+    }
+    if (stopFaultRecoveryRequest.current?.ownerEpoch !== state.status?.ownerEpoch) {
+      stopFaultRecoveryRequest.current = null;
+      setStopFaultRecoveryPending(false);
+      setStopFaultRecoveryError(null);
     }
   }, [state.status?.ownerEpoch]);
 
@@ -946,6 +957,35 @@ export function useRobotControl(
     }
   }, [clearRuntimeScaleQueue, controlSource, enabled, state.status]);
 
+  const recoverStopFault = useCallback(async () => {
+    const status = state.status;
+    const fault = status?.cellStopAction.fault;
+    if (
+      !enabled
+      || status === null
+      || fault === null
+      || stopFaultRecoveryRequest.current !== null
+    ) return;
+    const pending = { ownerEpoch: status.ownerEpoch };
+    stopFaultRecoveryRequest.current = pending;
+    setStopFaultRecoveryPending(true);
+    setStopFaultRecoveryError(null);
+    try {
+      await api.execution.recoverStopFault(status.ownerEpoch, requestId());
+    } catch (error: unknown) {
+      if (stopFaultRecoveryRequest.current === pending) {
+        setStopFaultRecoveryError(
+          errorMessage(error, 'Cell stop-fault recovery was rejected.'),
+        );
+      }
+    } finally {
+      if (stopFaultRecoveryRequest.current === pending) {
+        stopFaultRecoveryRequest.current = null;
+        setStopFaultRecoveryPending(false);
+      }
+    }
+  }, [enabled, state.status]);
+
   const controlOperation = useCallback(async (control: 'pause' | 'resume') => {
     const operation = state.operation;
     if (pendingOperationControl.current !== null || state.status === null || operation === null
@@ -1008,6 +1048,8 @@ export function useRobotControl(
     runtimeScaleError,
     fullStopPending,
     fullStopError,
+    stopFaultRecoveryPending,
+    stopFaultRecoveryError,
     selectRobot,
     selectTool,
     selectMode,
@@ -1026,6 +1068,7 @@ export function useRobotControl(
     revert,
     stop,
     fullStop,
+    recoverStopFault,
     dismissFullStopError,
     dismissRuntimeScaleError,
     dismissError,
@@ -1052,6 +1095,8 @@ export function useRobotControl(
     runtimeScaleError,
     fullStopPending,
     fullStopError,
+    stopFaultRecoveryPending,
+    stopFaultRecoveryError,
     runtimeScalePending,
     runtimeScaleStatus,
     selectMode,
@@ -1071,6 +1116,7 @@ export function useRobotControl(
     manualControlUnavailableReason,
     stop,
     fullStop,
+    recoverStopFault,
     selectRobot,
     selectTool,
     dismissFullStopError,

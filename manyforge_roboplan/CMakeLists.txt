@@ -527,6 +527,53 @@ if(BUILD_TESTING)
       SQLite::SQLite3
       Threads::Threads)
 
+    # Test-only build of the native host at the real projection-construction
+    # boundary. The projection source is compiled directly into this one
+    # executable so its barrier/failure definition can never reach either
+    # installed host or the ordinary collision-projection library. Its product
+    # output name lives in a dedicated directory consumed only by the focused
+    # native adapter cases that request injection.
+    add_executable(manyforge_native_execution_host_projection_fixture
+      src/product_backed_runtime_participant_resolver.cpp
+      src/native_execution_host_main.cpp
+      src/retained_planner_scene_projection.cpp)
+    set_target_properties(
+      manyforge_native_execution_host_projection_fixture PROPERTIES
+      OUTPUT_NAME manyforge_native_execution_host
+      RUNTIME_OUTPUT_DIRECTORY
+        "${CMAKE_CURRENT_BINARY_DIR}/native_projection_host_fixture")
+    target_include_directories(
+      manyforge_native_execution_host_projection_fixture PRIVATE
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
+    target_compile_definitions(
+      manyforge_native_execution_host_projection_fixture PRIVATE
+      COAL_DISABLE_HPP_FCL_WARNINGS
+      MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY=1)
+    target_link_libraries(
+      manyforge_native_execution_host_projection_fixture PRIVATE
+      manyforge_roboplan_managed_kernel_apply_fence
+      manyforge_roboplan_cell_admission_command_codec
+      manyforge_roboplan_native_cclc_runtime
+      manyforge_roboplan_native_runtime
+      manyforge_roboplan_process_candidate_client
+      manyforge_roboplan_retained_consumer
+      manyforge_component_manager
+      manyforge::content_identity
+      manyforge::scene
+      manyforge::scene_value_codec
+      manyforge_deployment
+      manyforge::persistence
+      SQLite::SQLite3
+      Threads::Threads)
+    add_dependencies(manyforge_native_execution_host_projection_fixture
+      manyforge_roboplan_candidate_worker)
+    add_custom_command(
+      TARGET manyforge_native_execution_host_projection_fixture POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "$<TARGET_FILE:manyforge_roboplan_candidate_worker>"
+        "$<TARGET_FILE_DIR:manyforge_native_execution_host_projection_fixture>/$<TARGET_FILE_NAME:manyforge_roboplan_candidate_worker>"
+      VERBATIM)
+
     if(NOT TARGET manyforge_collision)
       message(FATAL_ERROR
         "I6 retained collision projection requires the authoritative "
@@ -1010,11 +1057,13 @@ if(BUILD_TESTING)
     add_dependencies(test_retained_native_runtime_unit_adapter
       generate_lite6_native_execution_fixture
       manyforge_native_execution_host
+      manyforge_native_execution_host_projection_fixture
       manyforge_roboplan_candidate_worker)
     target_compile_definitions(
       test_retained_native_runtime_unit_adapter PRIVATE
       MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
       MANYFORGE_NATIVE_PICK_PLACE_PLANNING_TARGET="$<TARGET_FILE:manyforge_native_execution_host_pick_place_planning_fixture>"
+      MANYFORGE_NATIVE_PROJECTION_TEST_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_native_execution_host_projection_fixture>"
       MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_native_execution_host>")
     target_link_libraries(test_retained_native_runtime_unit_adapter PRIVATE
       manyforge_component_manager

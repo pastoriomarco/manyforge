@@ -2179,17 +2179,16 @@ public:
     RequireCurrentPackageGeneration();
     // Native children are directly owned by this Manager process and therefore
     // never survive its restart. Recreate the runtime selected by the durable
-    // public pointer before replaying an incomplete Apply that must query its
-    // Kernel-held admission claim or fence.
+    // public pointer before the progression lane resumes an incomplete Apply.
+    // Constructor/bootstrap work never advances that Apply: the command socket
+    // must be available while its exact durable status is observed.
     static_cast<void>(ReconcileAndPublish());
-    if (TryAdvanceApplyBeforeReconcile()) {
-      static_cast<void>(ReconcileAndPublish());
-    }
   }
 
   int Run() {
     CommandSocket command_socket(config_.manager_run_root);
     StartNativeManagerLivenessLane();
+    StartApplyProgressLane();
     auto next_reconciliation =
         std::chrono::steady_clock::now() + config_.reconciliation_period;
     try {
@@ -2225,6 +2224,7 @@ public:
         }
         if ((descriptor.revents & POLLIN) != 0 &&
             HandleOneClient(command_socket)) {
+          StopApplyProgressLane();
           StopNativeManagerLivenessLane();
           return 0;
         }
@@ -2233,9 +2233,11 @@ public:
         }
       }
     } catch (...) {
+      StopApplyProgressLane();
       StopNativeManagerLivenessLane();
       throw;
     }
+    StopApplyProgressLane();
     StopNativeManagerLivenessLane();
     return 0;
   }
@@ -2489,8 +2491,16 @@ private:
     Require(active_bundle != nullptr,
             "active publication has no independently verified retained bundle");
     last_active_bundle_ = active_bundle;
+    const bool all_runtime_processes_present = std::all_of(
+        runtime.observations.observations().begin(),
+        runtime.observations.observations().end(), [](const auto &observation) {
+          return observation.process_presence() ==
+                     component_manager::ProcessPresenceState::kPresent &&
+                 !observation.runtime_epoch().empty();
+        });
     if (runtime.state ==
-        component_manager::ManagerActiveRuntimeConvergenceState::kConverged) {
+            component_manager::ManagerActiveRuntimeConvergenceState::kConverged ||
+        all_runtime_processes_present) {
       const auto current_bindings =
           component_manager::DeriveActiveNativeProjectionRuntimeBindings(
               active_bundle->value(), runtime.observations);
@@ -2499,7 +2509,9 @@ private:
         // Full native rebuild/recovery is a startup or process-incarnation
         // transition effect. Unchanged observations perform no scene-store
         // read and no native recovery work.
-        if (!current_bindings.empty()) {
+        if (current_bindings.empty()) {
+          last_reconciled_native_runtime_bindings_ = current_bindings;
+        } else {
           const auto scene_access = scene_owner_.ReadAccessStatus();
           Require(scene_access.active_projection.has_value(),
                   "active publication has no finalized logical-scene "
@@ -2513,8 +2525,11 @@ private:
           Require(
               recovery.valid() && recovery.runtime_set == runtime_set,
               "active native projection recovery returned foreign evidence");
+          if (recovery.state !=
+              core::ActiveProjectionRuntimeRecoveryState::kProgressing) {
+            last_reconciled_native_runtime_bindings_ = current_bindings;
+          }
         }
-        last_reconciled_native_runtime_bindings_ = current_bindings;
       }
     }
     const auto observed_at = static_cast<std::int64_t>(ElapsedNs());
@@ -2990,6 +3005,12 @@ private:
         SubmitCellAdmissionReadiness(readiness);
       }
       manager_liveness_retry_gate_.RecordSuccess();
+    } catch (const component_manager::ManagerLivenessRuntimeTransition &) {
+      // Runtime replacement is already fenced by Apply. No native heartbeat
+      // was sent, so this is ordinary convergence rather than an uncertain
+      // renewal. Keep readiness closed until the next exact snapshot arrives.
+      SubmitFailClosedReadiness(probed_cycle_status);
+      manager_liveness_retry_gate_.RecordSuccess();
     } catch (const component_manager::ManagerLivenessPublicationSuperseded &) {
       SubmitFailClosedReadiness(probed_cycle_status);
       {
@@ -3167,11 +3188,19 @@ private:
   void TryPeriodicReconcile() noexcept {
     try {
       RequireCurrentPackageGeneration();
-      if (TryAdvanceApplyBeforeReconcile()) {
-        static_cast<void>(ReconcileAndPublish());
-      } else {
+      // Apply progression has one dedicated owner so slow projection work
+      // cannot occupy the command/status strand. While it remains open, keep
+      // readiness closed and leave ordinary active reconciliation alone.
+      if (HasIncompleteApply()) {
         TrySubmitFailClosedReadiness();
+        RequestApplyProgress();
+        return;
       }
+      if (!ActiveProjectionRecoveryCurrent()) {
+        static_cast<void>(ReconcileAndPublish());
+        return;
+      }
+      static_cast<void>(ReconcileAndPublish());
     } catch (const ManagerPackageGenerationRestartRequired &error) {
       TrySubmitFailClosedReadiness();
       PublishPackageRestartRequired();
@@ -3188,25 +3217,108 @@ private:
     }
   }
 
-  bool TryAdvanceApplyBeforeReconcile() noexcept {
-    try {
-      const auto result = named_apply_.RecoverIncompleteApply();
-      // During replacement the public pointer can still name the withdrawn
-      // predecessor. Only Apply owns that transition; active reconciliation
-      // must not try to restore or assess the old product against the new
-      // child.
-      return !result ||
-             result->state ==
-                 component_manager::ManagerNamedApplyResultState::kSucceeded;
-    } catch (const std::exception &error) {
-      std::cerr << "Manager daemon incomplete Apply recovery remains "
-                   "fail-closed: "
-                << error.what() << '\n';
-    } catch (...) {
-      std::cerr << "Manager daemon incomplete Apply recovery remains "
-                   "fail-closed after an unknown failure\n";
+  [[nodiscard]] bool HasIncompleteApply() {
+    for (const auto &status : stores_.apply_journal().ReadStatusInventory()) {
+      if (!status.terminal_outcome.has_value()) {
+        return true;
+      }
     }
     return false;
+  }
+
+  void StartApplyProgressLane() {
+    Require(!apply_progress_lane_.joinable(),
+            "Manager Apply progression lane is already running");
+    {
+      std::lock_guard lock(apply_progress_lane_mutex_);
+      apply_progress_lane_stop_ = false;
+      apply_progress_requested_ = true;
+      apply_progress_faulted_ = false;
+    }
+    apply_progress_lane_ = std::thread([this] { RunApplyProgressLane(); });
+  }
+
+  void StopApplyProgressLane() noexcept {
+    if (!apply_progress_lane_.joinable()) {
+      return;
+    }
+    {
+      std::lock_guard lock(apply_progress_lane_mutex_);
+      apply_progress_lane_stop_ = true;
+    }
+    apply_progress_lane_condition_.notify_one();
+    apply_progress_lane_.join();
+  }
+
+  void RequestApplyProgress() noexcept {
+    {
+      std::lock_guard lock(apply_progress_lane_mutex_);
+      if (apply_progress_lane_stop_ || apply_progress_faulted_) {
+        return;
+      }
+      apply_progress_requested_ = true;
+    }
+    apply_progress_lane_condition_.notify_one();
+  }
+
+  void RunApplyProgressLane() noexcept {
+    std::unique_lock lock(apply_progress_lane_mutex_);
+    while (!apply_progress_lane_stop_) {
+      apply_progress_lane_condition_.wait(lock, [&] {
+        return apply_progress_lane_stop_ || apply_progress_requested_;
+      });
+      if (apply_progress_lane_stop_) {
+        break;
+      }
+      apply_progress_requested_ = false;
+      lock.unlock();
+
+      bool pending = false;
+      try {
+        const auto result = named_apply_.RecoverIncompleteApply();
+        pending = result.has_value() &&
+                  result->state ==
+                      component_manager::ManagerNamedApplyResultState::kPending;
+      } catch (const std::exception &error) {
+        std::cerr << "Manager daemon Apply progression stopped fail-closed: "
+                  << error.what() << '\n';
+        lock.lock();
+        apply_progress_faulted_ = true;
+        continue;
+      } catch (...) {
+        std::cerr << "Manager daemon Apply progression stopped fail-closed "
+                     "after an unknown failure\n";
+        lock.lock();
+        apply_progress_faulted_ = true;
+        continue;
+      }
+
+      lock.lock();
+      if (pending && !apply_progress_lane_stop_) {
+        apply_progress_lane_condition_.wait_for(
+            lock, config_.reconciliation_period,
+            [&] {
+              return apply_progress_lane_stop_ || apply_progress_requested_;
+            });
+        if (!apply_progress_lane_stop_) {
+          apply_progress_requested_ = true;
+        }
+      }
+    }
+  }
+
+  [[nodiscard]] bool ActiveProjectionRecoveryCurrent() const {
+    if (!last_runtime_.has_value() || last_active_bundle_ == nullptr ||
+        !last_reconciled_native_runtime_bindings_.has_value()) {
+      return false;
+    }
+    try {
+      return *last_reconciled_native_runtime_bindings_ ==
+             component_manager::DeriveActiveNativeProjectionRuntimeBindings(
+                 last_active_bundle_->value(), last_runtime_->observations);
+    } catch (...) {
+      return false;
+    }
   }
 
   void RequireCurrentPackageGeneration() {
@@ -3599,14 +3711,6 @@ private:
         return false;
       }
       case CommandKind::kApply: {
-        if (*command.request_owner_epoch != manager_owner_epoch_) {
-          TrySendResponse(
-              client.get(),
-              ApplyErrorResponse(
-                  command, "stale_request_owner_epoch",
-                  "Apply request targets a stale Manager owner epoch"));
-          return false;
-        }
         Require(command.deployment_artifact_id.has_value() &&
                     command.deployment_revision.has_value() &&
                     command.expected_current_retained_bundle_id.has_value() &&
@@ -3616,34 +3720,50 @@ private:
                     command.source_label.has_value() &&
                     command.deployment_candidate_receipt.has_value(),
                 "decoded Apply command lacks its exact selection");
-        const auto &candidate_receipt = *command.deployment_candidate_receipt;
-        const auto receipt_admission_generation =
-            command.expected_admission_generation.has_value()
-                ? *command.expected_admission_generation
-                : command.parent_authoring_claim->intent
-                      .expected_admission_generation;
-        if (candidate_receipt.manager_owner_epoch != manager_owner_epoch_ ||
-            candidate_receipt.deployment_artifact_id !=
-                *command.deployment_artifact_id ||
-            candidate_receipt.deployment_revision !=
-                *command.deployment_revision ||
-            candidate_receipt.expected_current_retained_bundle_id !=
-                *command.expected_current_retained_bundle_id ||
-            candidate_receipt.expected_current_graph_revision !=
-                *command.expected_current_graph_revision ||
-            candidate_receipt.expected_admission_generation !=
-                receipt_admission_generation) {
-          TrySendResponse(
-              client.get(),
-              ApplyErrorResponse(
-                  command, "deployment_candidate_receipt_mismatch",
-                  "Apply does not match its exact candidate preview"));
-          return false;
-        }
         try {
           const auto existing = stores_.apply_journal().ReadRequest(
               core::RequestOwnerEpoch(*command.request_owner_epoch),
               core::RequestId(*command.request_id));
+          // A Manager epoch is process-local, while an accepted Apply request
+          // and its terminal outcome are durable. Exact replay must reach the
+          // journal before current-epoch admission so Composer can recover an
+          // interrupted Apply/Revert after a Manager restart. Unknown stale
+          // requests remain rejected and cannot create a new effect.
+          if (!existing.has_value() &&
+              *command.request_owner_epoch != manager_owner_epoch_) {
+            TrySendResponse(
+                client.get(),
+                ApplyErrorResponse(
+                    command, "stale_request_owner_epoch",
+                    "Apply request targets a stale Manager owner epoch"));
+            return false;
+          }
+          const auto &candidate_receipt =
+              *command.deployment_candidate_receipt;
+          const auto receipt_admission_generation =
+              command.expected_admission_generation.has_value()
+                  ? *command.expected_admission_generation
+                  : command.parent_authoring_claim->intent
+                        .expected_admission_generation;
+          if (!existing.has_value() &&
+              (candidate_receipt.manager_owner_epoch != manager_owner_epoch_ ||
+               candidate_receipt.deployment_artifact_id !=
+                   *command.deployment_artifact_id ||
+               candidate_receipt.deployment_revision !=
+                   *command.deployment_revision ||
+               candidate_receipt.expected_current_retained_bundle_id !=
+                   *command.expected_current_retained_bundle_id ||
+               candidate_receipt.expected_current_graph_revision !=
+                   *command.expected_current_graph_revision ||
+               candidate_receipt.expected_admission_generation !=
+                   receipt_admission_generation)) {
+            TrySendResponse(
+                client.get(),
+                ApplyErrorResponse(
+                    command, "deployment_candidate_receipt_mismatch",
+                    "Apply does not match its exact candidate preview"));
+            return false;
+          }
           if (!existing.has_value()) {
             RequireCurrentPackageGeneration();
           }
@@ -3696,7 +3816,7 @@ private:
                         .ResolveExact({*command.deployment_artifact_id,
                                        *command.deployment_revision})
                         .retained_bundle_id;
-          const auto result = named_apply_.ApplyOrRecover({
+          const auto result = named_apply_.AcceptOrReplay({
               core::PublicRequestContextDTO{
                   core::RequestId(*command.request_id),
                   core::RequestOwnerEpoch(*command.request_owner_epoch),
@@ -3715,19 +3835,12 @@ private:
           if (result.state ==
               component_manager::ManagerNamedApplyResultState::kPending) {
             TrySubmitFailClosedReadiness();
+            RequestApplyProgress();
             return false;
           }
-          // Apply durability is authoritative. A source-publication failure is
-          // logged and retried by the periodic strand; it cannot turn a
-          // successful Apply into a second mutation on client retry.
-          try {
-            static_cast<void>(ReconcileAndPublish());
-          } catch (const std::exception &error) {
-            TrySubmitFailClosedReadiness();
-            std::cerr << "Manager daemon publication failed after durable "
-                         "Apply: "
-                      << error.what() << '\n';
-          }
+          // A terminal replay is a read. Ordinary periodic reconciliation
+          // publishes current runtime/source state without extending this
+          // command or repeating an Apply effect.
         } catch (const component_manager::ManagerNamedApplyBusyError &error) {
           TrySendResponse(
               client.get(),
@@ -4235,6 +4348,12 @@ private:
       manager_liveness_superseded_publication_;
   std::optional<core::CellAdmissionReadinessSnapshotDTO>
       last_submitted_readiness_;
+  std::mutex apply_progress_lane_mutex_;
+  std::condition_variable apply_progress_lane_condition_;
+  bool apply_progress_lane_stop_{};
+  bool apply_progress_requested_{};
+  bool apply_progress_faulted_{};
+  std::thread apply_progress_lane_;
   std::map<std::string, PoseObserverSession> pose_observer_sessions_;
   std::vector<DeploymentCandidateReceipt> deployment_candidate_receipts_;
   std::map<PoseObservationKey, PoseObservationReplay> pose_observation_replays_;
