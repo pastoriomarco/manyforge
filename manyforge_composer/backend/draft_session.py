@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-import logging
 import math
 from pathlib import Path
 import re
@@ -105,7 +104,6 @@ _ASSISTANT_PROPOSAL_MUTATIONS = frozenset(
 _PORTABLE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _PORTABLE_ID_MAX_BYTES = 128
 _T = TypeVar("_T")
-_LOGGER = logging.getLogger(__name__)
 
 
 def _is_portable_id(value: Any) -> bool:
@@ -290,6 +288,26 @@ class PreparedProgramReplacement:
                 else freeze_json(self.saved_document)
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedProgramSave:
+    """One Program Save/Save As prepared outside every owner lock.
+
+    ``program`` is the exact validated content a writer persists, and the Saved
+    baseline adopted afterwards is derived from that same value, so the file
+    written and the baseline adopted cannot describe two different Drafts. The
+    target path and the overwrite authority are resolved once, before any file
+    I/O, and the write itself happens outside every owner lock.
+    """
+
+    tool_id: str
+    draft_id: str
+    base_revision: int
+    target_path: str
+    resolved_target: str
+    overwrite: bool
+    program: Program
 
 
 def _error(
@@ -808,28 +826,6 @@ class ComposerDraftSession:
         self._saved_document = (
             program.to_dict() if resolved_source is not None else None
         )
-        self._identity_change_observer: Callable[[], None] | None = None
-
-    def set_identity_change_observer(
-        self, observer: Callable[[], None] | None
-    ) -> None:
-        """Install the one non-authoritative presentation wake callback."""
-
-        if observer is not None and not callable(observer):
-            raise TypeError("Draft identity observer must be callable")
-        with self._lock:
-            self._identity_change_observer = observer
-
-    def _notify_identity_change_locked(self) -> None:
-        observer = self._identity_change_observer
-        if observer is None:
-            return
-        try:
-            observer()
-        except Exception:
-            # A presentation wake cannot roll back or relabel an already
-            # committed authoring-owner mutation.
-            _LOGGER.exception("Composer Draft identity wake failed")
 
     @property
     def draft_id(self) -> str:
@@ -1303,7 +1299,6 @@ class ComposerDraftSession:
                         status_code=503,
                     )
                 successor_revision = self._revision + 1
-            prior_identity = (self._draft_id, self._revision)
             self._draft_id = successor_draft_id
             self._revision = successor_revision
             self._authoring = thaw_json(prepared.authoring)
@@ -1317,8 +1312,9 @@ class ComposerDraftSession:
                     if prepared.saved_document is None
                     else thaw_json(prepared.saved_document)
                 )
-            if prior_identity != (self._draft_id, self._revision):
-                self._notify_identity_change_locked()
+            # The composite workspace owner publishes the single presentation
+            # wake for this commit after it verifies the install contract; the
+            # Program session owns no presentation callback of its own.
             return True
 
     def prepare_open_replacement(
@@ -1439,15 +1435,22 @@ class ComposerDraftSession:
                 )
             return applier(self._program)
 
-    def save_program(
+    def prepare_save(
         self,
         *,
         draft_id: str,
         expected_revision: int,
         target_path: str | None,
-        writer: Callable[[Program, str], str],
-    ) -> dict[str, Any]:
-        """Serialize one exact Draft while blocking concurrent Draft replacement."""
+        confirm_overwrite: bool,
+    ) -> PreparedProgramSave:
+        """Capture the exact content and target for one Save/Save As.
+
+        Save names no target and keeps its existing authority; Save As resolves
+        its own target and only overwrites an existing file after an explicit
+        confirmation or when it names the current Saved path. The write happens
+        outside every owner lock; only the returned Saved baseline is committed
+        through the composite workspace fence.
+        """
 
         with self._lock:
             self._require_identity_locked(
@@ -1467,11 +1470,55 @@ class ComposerDraftSession:
                     "composer_saved_path_unavailable",
                     "Save requires an existing Program path; use Save As",
                 )
-            saved_path = writer(self._program, selected_path)
-            self._saved_path = str(Path(saved_path).resolve())
-            self._saved_program_revision = self._program.program_revision
-            self._saved_document = self._program.to_dict()
-            return self._workspace_snapshot_locked()
+            try:
+                resolved_target = str(Path(selected_path).resolve())
+            except (OSError, RuntimeError, ValueError):
+                resolved_target = selected_path
+            return PreparedProgramSave(
+                tool_id=(
+                    "save_draft_as" if target_path is not None else "save_draft"
+                ),
+                draft_id=self._draft_id,
+                base_revision=self._revision,
+                target_path=selected_path,
+                resolved_target=resolved_target,
+                overwrite=confirm_overwrite or resolved_target == self._saved_path,
+                program=self._program,
+            )
+
+    def install_prepared_save(
+        self, prepared: PreparedProgramSave, *, saved_path: str
+    ) -> bool:
+        """Adopt one already-written Program artifact as the Saved baseline.
+
+        Returns whether the Saved baseline changed. Save does not change the
+        Program Draft content, so no Draft revision advances; the composite
+        workspace revision still advances whenever the baseline changed, because
+        the Saved projection is part of the identity a client fences.
+        """
+
+        if not isinstance(prepared, PreparedProgramSave):
+            raise TypeError("prepared Program save has an invalid type")
+        try:
+            resolved = str(Path(saved_path).resolve())
+        except (OSError, RuntimeError, ValueError):
+            resolved = saved_path
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=prepared.draft_id,
+                expected_revision=prepared.base_revision,
+            )
+            document = prepared.program.to_dict()
+            if (
+                self._saved_path == resolved
+                and self._saved_program_revision == prepared.program.program_revision
+                and self._saved_document == document
+            ):
+                return False
+            self._saved_path = resolved
+            self._saved_program_revision = prepared.program.program_revision
+            self._saved_document = document
+            return True
 
     def new_draft(
         self,
@@ -1585,7 +1632,6 @@ class ComposerDraftSession:
                     self._program = validated_saved
                     self._diagnostics = []
                     self._revision += 1
-                    self._notify_identity_change_locked()
                 return None, self._workspace_snapshot_locked(
                     applied_program_revision=validated_saved.program_revision,
                 )
@@ -1610,7 +1656,6 @@ class ComposerDraftSession:
                 self._program = validated_saved
                 self._diagnostics = []
                 self._revision += 1
-                self._notify_identity_change_locked()
             return result, self._workspace_snapshot_locked(
                 applied_program_revision=validated_saved.program_revision,
             )
@@ -1702,7 +1747,6 @@ class ComposerDraftSession:
             self._program = prepared.program
             self._diagnostics = [thaw_json(row) for row in prepared.diagnostics]
             self._revision += 1
-            self._notify_identity_change_locked()
             return True
 
     def mutate(

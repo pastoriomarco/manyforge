@@ -963,12 +963,18 @@ class _ComposerTestClient(TestClient):
             and "expectedDraftRevision" in json
         ):
             self._authoring_sequence += 1
+            workspace = self._composer_state.authoring_workspace.identity()
             json = {
                 **json,
                 "expectedAdmissionGeneration": 7,
                 "requestOwnerEpoch": "test-browser.epoch.1",
                 "requestId": f"test-browser.request.{self._authoring_sequence}",
             }
+            if url not in {"/api/program/apply", "/api/program/revert"}:
+                json.setdefault("expectedWorkspaceEpoch", workspace.workspace_epoch)
+                json.setdefault(
+                    "expectedWorkspaceRevision", workspace.workspace_revision
+                )
         return super().post(url, json=json, **kwargs)
 
 

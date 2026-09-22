@@ -146,6 +146,15 @@ export interface ComponentOverviewProjection {
   };
 }
 
+export interface AuthoringWorkspaceIdentity {
+  workspaceEpoch: string;
+  workspaceRevision: number;
+  programDraftId: string;
+  programDraftRevision: number;
+  deploymentDraftId: string;
+  deploymentDraftRevision: number;
+}
+
 export interface ComposerHeadlessState {
   schemaVersion: 'manyforge.composer_headless_state.v2';
   complete: true;
@@ -158,7 +167,13 @@ export interface ComposerHeadlessState {
   };
   executionControlStatus: ExecutionOwnerStatus | null;
   programCycle: ProgramCycleStatus;
-  draftIdentity: { draftId: string; draftRevision: number };
+  /**
+   * The one composite authoring workspace identity: the workspace epoch and
+   * revision plus both Draft identities. It replaces the old Program-only
+   * `draftIdentity`, because an ordinary edit, Save, whole-project Load or
+   * Deployment edit all advance the same workspace revision.
+   */
+  authoringWorkspace: AuthoringWorkspaceIdentity;
   receiverEpoch: string;
   snapshotSequence: number;
 }

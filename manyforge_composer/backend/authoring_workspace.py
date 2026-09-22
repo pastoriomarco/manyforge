@@ -131,6 +131,59 @@ def _require_project_shape(value: Mapping[str, Any]) -> None:
         )
 
 
+def scenario_project_facts(
+    document: Mapping[str, Any] | None,
+    *,
+    document_path: str | None = None,
+    source_document_digest: str | None = None,
+    source_diagnostics: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Derive the closed Scenario project facts for one loaded document.
+
+    A pure derivation, so a caller that must prepare outside every lock — the
+    authoring-only document Load, which installs its project facts in the same
+    commit as the two Draft replacements — can pass the result to
+    :meth:`AuthoringWorkspace.replace` or :meth:`AuthoringWorkspace.remember_project`
+    without a second inconsistency window between those two owner calls.
+    """
+
+    if document is None:
+        # Forgetting the loaded document clears its identity, digests,
+        # assignment and overrides. The selected project path is a project
+        # selection rather than document content, so it is retained unless the
+        # caller supplies a replacement path.
+        return {
+            "document_path": document_path,
+            "document_id": None,
+            "document_name": None,
+            "document_description": None,
+            "source_diagnostics": [],
+            "source_document_digest": None,
+            "program_role_assignment": None,
+            "typed_parameter_overrides": {},
+            "source_program_digest": None,
+            "source_deployment_digest": None,
+        }
+    return {
+        "document_path": document_path,
+        "document_id": document.get("scenario_id"),
+        "document_name": document.get("name"),
+        "document_description": document.get("description"),
+        "source_diagnostics": deepcopy(source_diagnostics or []),
+        "source_document_digest": source_document_digest,
+        "program_role_assignment": deepcopy(document.get("program_role_assignment")),
+        "typed_parameter_overrides": deepcopy(
+            document.get("typed_parameter_overrides", {})
+        ),
+        "source_program_digest": canonical_digest(
+            {"value": document.get("program_draft")}
+        ),
+        "source_deployment_digest": canonical_digest(
+            {"value": document.get("deployment_draft")}
+        ),
+    }
+
+
 class AuthoringWorkspaceError(RuntimeError):
     """One composite workspace operation failed or was contained."""
 
@@ -365,24 +418,75 @@ class AuthoringWorkspace:
         """
 
         with self._lock:
-            self._require_usable_locked()
-            self._require_capacity_locked()
-            if expected_identity is not None:
-                self._require_identity_locked(expected_identity)
-            before = self._project_facts_locked()
-            self._remember_project_locked(
+            captured, advanced = self._commit_project_locked(
+                expected_identity=expected_identity,
                 document=document,
                 document_path=document_path,
                 source_document_digest=source_document_digest,
                 source_diagnostics=source_diagnostics,
+                explicit=None,
             )
-            advanced = self._finish_commit_locked(
-                self._project_facts_locked() != before
-            )
-            captured = self._snapshot_locked()
         if advanced and notify:
             self._notify_once()
         return captured
+
+    def commit_project(
+        self,
+        *,
+        expected_identity: AuthoringWorkspaceIdentity | None = None,
+        facts: Mapping[str, Any],
+        notify: bool = True,
+    ) -> AuthoringWorkspaceSnapshot:
+        """Commit one already-prepared Scenario project-facts replacement.
+
+        The project counterpart of :meth:`commit_program` and
+        :meth:`commit_deployment`: no Program or Deployment Draft identity
+        changes, so the authoring-only Scenario Save adopts its written Saved
+        baseline through this single composite commit.
+        """
+
+        _require_project_shape(facts)
+        with self._lock:
+            captured, advanced = self._commit_project_locked(
+                expected_identity=expected_identity,
+                document=None,
+                document_path=None,
+                source_document_digest=None,
+                source_diagnostics=None,
+                explicit=facts,
+            )
+        if advanced and notify:
+            self._notify_once()
+        return captured
+
+    def _commit_project_locked(
+        self,
+        *,
+        expected_identity: AuthoringWorkspaceIdentity | None,
+        document: Mapping[str, Any] | None,
+        document_path: str | None,
+        source_document_digest: str | None,
+        source_diagnostics: list[dict[str, str]] | None,
+        explicit: Mapping[str, Any] | None,
+    ) -> tuple[AuthoringWorkspaceSnapshot, bool]:
+        """Install project facts and report whether the composite advanced."""
+
+        self._require_usable_locked()
+        self._require_capacity_locked()
+        if expected_identity is not None:
+            self._require_identity_locked(expected_identity)
+        before = self._project_facts_locked()
+        self._remember_project_locked(
+            document=document,
+            document_path=document_path,
+            source_document_digest=source_document_digest,
+            source_diagnostics=source_diagnostics,
+            explicit=explicit,
+        )
+        changed = self._finish_commit_locked(
+            self._project_facts_locked() != before
+        )
+        return self._snapshot_locked(), changed
 
     def publish_commit_wake(self) -> None:
         """Publish the one latest-only wake for an already committed change.
@@ -765,47 +869,21 @@ class AuthoringWorkspace:
             _require_project_shape(explicit)
             facts = explicit
         elif document is None:
-            # Forgetting the loaded document clears its identity, digests,
-            # assignment and overrides. The selected project path is a project
-            # selection rather than document content, so it is retained unless
-            # the caller supplies a replacement path.
-            facts = {
-                "document_path": (
+            facts = scenario_project_facts(
+                None,
+                document_path=(
                     document_path
                     if document_path is not None
                     else self._document_path
                 ),
-                "document_id": None,
-                "document_name": None,
-                "document_description": None,
-                "source_diagnostics": [],
-                "source_document_digest": None,
-                "program_role_assignment": None,
-                "typed_parameter_overrides": {},
-                "source_program_digest": None,
-                "source_deployment_digest": None,
-            }
+            )
         else:
-            facts = {
-                "document_path": document_path,
-                "document_id": document.get("scenario_id"),
-                "document_name": document.get("name"),
-                "document_description": document.get("description"),
-                "source_diagnostics": deepcopy(source_diagnostics or []),
-                "source_document_digest": source_document_digest,
-                "program_role_assignment": deepcopy(
-                    document.get("program_role_assignment")
-                ),
-                "typed_parameter_overrides": deepcopy(
-                    document.get("typed_parameter_overrides", {})
-                ),
-                "source_program_digest": canonical_digest(
-                    {"value": document.get("program_draft")}
-                ),
-                "source_deployment_digest": canonical_digest(
-                    {"value": document.get("deployment_draft")}
-                ),
-            }
+            facts = scenario_project_facts(
+                document,
+                document_path=document_path,
+                source_document_digest=source_document_digest,
+                source_diagnostics=source_diagnostics,
+            )
         self._document_path = facts["document_path"]
         self._document_id = facts["document_id"]
         self._document_name = facts["document_name"]
@@ -891,4 +969,5 @@ __all__ = [
     "AuthoringWorkspaceError",
     "AuthoringWorkspaceIdentity",
     "AuthoringWorkspaceSnapshot",
+    "scenario_project_facts",
 ]

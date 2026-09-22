@@ -23,7 +23,7 @@ from websockets.asyncio.client import connect as connect_websocket
 from websockets.exceptions import ConnectionClosed
 
 from .authoring_admission import AuthoringAdmissionCoordinator
-from .draft_session import ComposerDraftSession
+from .authoring_workspace import AuthoringWorkspace
 
 
 _SEND_TIMEOUT_SECONDS = 0.25
@@ -47,19 +47,21 @@ class HeadlessStateSource:
         client: HeadlessHttpClient,
         *,
         admission: AuthoringAdmissionCoordinator,
-        draft_session: ComposerDraftSession,
+        workspace: AuthoringWorkspace,
     ) -> None:
         self._client = client
         self._admission = admission
-        self._draft_session = draft_session
+        self._workspace = workspace
         self._lock = threading.Lock()
         self._closed = False
         self._local_revision = 0
         self._enrich_lock = threading.Lock()
         self._local_subscriptions: set[_LocalStateSubscription] = set()
-        self._draft_session.set_identity_change_observer(
-            self.notify_local_state_change
-        )
+        # Subscribe to the composite workspace owner. It is the only writer of
+        # the two Draft sessions, so one ordinary edit, Save, whole-project Load
+        # or Deployment edit all reach this single wake instead of only the
+        # Program Draft that the old Program-only subscription covered.
+        self._workspace.set_observer(self.notify_local_state_change)
 
     @property
     def control_websocket_url(self) -> str:
@@ -85,10 +87,15 @@ class HeadlessStateSource:
     async def close(self) -> None:
         with self._lock:
             self._closed = True
-        self._draft_session.set_identity_change_observer(None)
+        self._workspace.set_observer(None)
 
     def notify_local_state_change(self) -> None:
-        """Wake each browser once when Composer's Draft identity advances."""
+        """Wake each browser once when the composite workspace advances.
+
+        Each subscription holds one ``asyncio.Event``, so concurrent commits
+        coalesce into a single pending wake, and the newest identity is read
+        when that wake is served rather than when it was raised.
+        """
 
         with self._lock:
             if self._closed:
@@ -98,13 +105,17 @@ class HeadlessStateSource:
             subscription.loop.call_soon_threadsafe(subscription.wake.set)
 
     def _local_shell(self, *, complete: bool) -> dict[str, Any]:
-        draft = self._draft_session.snapshot()
+        identity = self._workspace.identity()
         self._local_revision += 1
         return {
             "complete": complete,
-            "draft_identity": {
-                "draft_id": draft["draft_id"],
-                "draft_revision": draft["draft_revision"],
+            "authoring_workspace": {
+                "workspace_epoch": identity.workspace_epoch,
+                "workspace_revision": identity.workspace_revision,
+                "program_draft_id": identity.program_draft_id,
+                "program_draft_revision": identity.program_draft_revision,
+                "deployment_draft_id": identity.deployment_draft_id,
+                "deployment_draft_revision": identity.deployment_draft_revision,
             },
             "receiver_epoch": self._admission.receiver_epoch,
             "schema_version": "manyforge.composer_headless_state.v2",
@@ -142,7 +153,7 @@ class HeadlessStateSource:
         return encoded
 
     def local_delta(self, template: str) -> str:
-        """Build one tiny latest-only Draft identity delta."""
+        """Build one tiny latest-only composite workspace identity delta."""
 
         value = json.loads(template)
         if not isinstance(value, dict):

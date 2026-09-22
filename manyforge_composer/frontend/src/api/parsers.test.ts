@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
 import {
   StructuralContractError,
+  parseAuthoringWorkspaceSnapshot,
   parseAppliedProgramSelection,
   parseCapabilityCommandPreviewResponse,
   parseCatalogResponse,
@@ -45,6 +46,63 @@ import {
   parseSceneUrdfManifest,
   parseSourceModelProjection,
 } from './parsers';
+
+function authoringWorkspaceFixture(): Record<string, unknown> {
+  const program = workspaceFixture();
+  const deployment = deploymentWorkspaceFixture();
+  const programDraft = program.draft as Record<string, unknown>;
+  const programSaved = program.saved as Record<string, unknown>;
+  const deploymentDraft = deployment.draft as Record<string, unknown>;
+  return {
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v1',
+    workspaceEpoch: 'workspace.epoch.1',
+    workspaceRevision: 7,
+    program: { ...programDraft, saved: programSaved },
+    deployment: {
+      draftId: deploymentDraft.id,
+      draftRevision: deploymentDraft.revision,
+      document: deploymentDraft.document,
+      savedPath: '/workspace/deployment.fixture.json',
+      savedDocument: deploymentDraft.document,
+      differsFromSaved: false,
+    },
+    project: {
+      document_path: '/workspace/cell',
+      document_id: 'cell',
+      document_name: 'Cell',
+      document_description: '',
+      source_diagnostics: [],
+      source_document_digest: null,
+      program_role_assignment: null,
+      typed_parameter_overrides: {},
+      source_program_digest: null,
+      source_deployment_digest: null,
+    },
+  };
+}
+
+describe('shared authoring workspace transport', () => {
+  it('parses both Drafts and project facts as one closed publication', () => {
+    const parsed = parseAuthoringWorkspaceSnapshot(authoringWorkspaceFixture());
+    expect(parsed.workspaceRevision).toBe(7);
+    expect(parsed.program.draft.draftRevision).toBe(2);
+    expect(parsed.deployment.draftRevision).toBe(4);
+    expect(parsed.project.documentPath).toBe('/workspace/cell');
+  });
+
+  it('rejects added fields and an untruthful saved comparison', () => {
+    const added = authoringWorkspaceFixture();
+    Object.assign(added, { applied: {} });
+    expect(() => parseAuthoringWorkspaceSnapshot(added)).toThrow(/exactly/);
+
+    const untruthful = authoringWorkspaceFixture();
+    const deployment = untruthful.deployment as Record<string, unknown>;
+    deployment.savedDocument = { deployment_revision: 'different' };
+    expect(() => parseAuthoringWorkspaceSnapshot(untruthful)).toThrow(
+      /truthful Draft\/Saved comparison/,
+    );
+  });
+});
 
 describe('editable Scenario document transport', () => {
   it('parses ordinary saved documents with explicit advisory state', () => {

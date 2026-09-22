@@ -10,10 +10,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from manyforge_composer.backend import routes_scenario_documents
 from manyforge_composer.backend.routes_scenario_documents import (
     _document_content_digest,
     create_scenario_document_router,
 )
+from manyforge_composer.backend.authoring_admission import LocalAuthoringCommit
 from manyforge_composer.backend.scenario_artifacts import (
     ScenarioArtifactError,
     build_scenario_document,
@@ -103,6 +105,45 @@ class _PassThroughAdmission:
             validate_under_claim({})
         return effect({})
 
+    def execute_local_mutation(
+        self,
+        _envelope,
+        *,
+        session="program",
+        draft_id=None,
+        workspace,
+        install=None,
+        expected_identity=None,
+        project=None,
+        **_kwargs,
+    ):
+        """Commit through the real composite owner; only the Kernel is stubbed."""
+
+        if session == "whole-workspace":
+            snapshot = workspace.replace(
+                expected_identity=expected_identity,
+                install=install,
+                project=project,
+            )
+        elif session == "project":
+            snapshot = workspace.commit_project(
+                expected_identity=expected_identity,
+                facts=project,
+            )
+        elif session == "deployment":
+            snapshot = workspace.commit_deployment(
+                draft_id=draft_id,
+                expected_identity=expected_identity,
+                install=install,
+            )
+        else:
+            snapshot = workspace.commit_program(
+                draft_id=draft_id,
+                expected_identity=expected_identity,
+                install=install,
+            )
+        return LocalAuthoringCommit(snapshot=snapshot, admission_generation=2)
+
 
 def _scenario_client(state: ComposerState) -> TestClient:
     app = FastAPI()
@@ -113,6 +154,7 @@ def _scenario_client(state: ComposerState) -> TestClient:
 def _fence(state: ComposerState) -> dict:
     program = state.draft_session.retained_state()
     deployment = state.deployment_draft_session.retained_state()
+    identity = state.authoring_workspace.identity()
     return {
         "draftId": program["draft_id"],
         "expectedDraftRevision": program["draft_revision"],
@@ -121,6 +163,8 @@ def _fence(state: ComposerState) -> dict:
         "expectedAdmissionGeneration": 1,
         "requestOwnerEpoch": "browser-test-epoch",
         "requestId": "scenario-test-request",
+        "expectedWorkspaceEpoch": identity.workspace_epoch,
+        "expectedWorkspaceRevision": identity.workspace_revision,
     }
 
 
@@ -334,6 +378,59 @@ def test_routes_save_incomplete_setup_and_reopen_it_without_runtime_effect(
     assert opened.json()["status"] == "opened"
     assert opened.json()["activation"] is None
     assert opened.json()["workspace"]["draft"]["programLoaded"] is False
+
+
+def test_save_keeps_written_file_but_refuses_a_stale_saved_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
+    client = _scenario_client(state)
+    target = tmp_path / "raced-save"
+    fence = _fence(state)
+    original_save = routes_scenario_documents.save_scenario_artifact
+
+    def write_then_commit_concurrent_edit(*args, **kwargs) -> str:
+        saved_path = original_save(*args, **kwargs)
+        snapshot = state.authoring_workspace.snapshot()
+        project = snapshot.as_dict()["project"]
+        project["document_description"] = "concurrent edit"
+        state.authoring_workspace.commit_project(
+            expected_identity=snapshot.identity,
+            facts=project,
+        )
+        return saved_path
+
+    monkeypatch.setattr(
+        routes_scenario_documents,
+        "save_scenario_artifact",
+        write_then_commit_concurrent_edit,
+    )
+    response = client.post(
+        "/api/scenario-documents/save",
+        json={
+            **fence,
+            "path": str(target),
+            "scenarioId": "raced_cell",
+            "name": "Raced cell",
+            "description": "captured before the race",
+            "confirmOverwrite": False,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == (
+        "scenario_saved_baseline_not_adopted"
+    )
+    written, _source = load_scenario_artifact(
+        str(target), allowed_roots=[str(tmp_path)]
+    )
+    assert written["description"] == "captured before the race"
+    current = state.authoring_workspace.snapshot().as_dict()
+    assert current["project"]["document_description"] == "concurrent edit"
+    assert current["program"]["saved"]["available"] is False
+    assert current["deployment"]["savedPath"] is None
 
 
 def test_capture_reads_one_source_identity(tmp_path: Path) -> None:

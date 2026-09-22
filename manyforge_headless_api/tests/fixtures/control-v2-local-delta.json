@@ -11,7 +11,14 @@
       "complete": false,
       "receiver_epoch": "receiver.epoch.1",
       "snapshot_sequence": 3,
-      "draft_identity": { "draft_id": "draft-1", "draft_revision": 2 }
+      "authoring_workspace": {
+        "workspace_epoch": "workspace.epoch.1",
+        "workspace_revision": 7,
+        "program_draft_id": "draft-1",
+        "program_draft_revision": 2,
+        "deployment_draft_id": "deployment-draft-1",
+        "deployment_draft_revision": 4
+      }
     }
   },
   "invalid_overlays": [

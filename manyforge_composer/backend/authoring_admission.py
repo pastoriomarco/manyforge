@@ -34,7 +34,9 @@ if TYPE_CHECKING:
     )
 
 
-_LOCAL_MUTATION_SESSIONS = frozenset({"program", "deployment", "whole-workspace"})
+_LOCAL_MUTATION_SESSIONS = frozenset(
+    {"program", "deployment", "project", "whole-workspace"}
+)
 
 _T = TypeVar("_T")
 _LOGGER = logging.getLogger(__name__)
@@ -84,6 +86,20 @@ class AuthoringMutationEnvelope:
     expected_admission_generation: int
     request_owner_epoch: str
     request_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class LocalAuthoringCommit:
+    """One committed local workspace mutation and its settled admission.
+
+    ``admission_generation`` is read from the exact Kernel settlement response,
+    so a caller that must report the next expected generation (the assistant
+    callback) never has to guess or reread the durable journal, which a local
+    mutation deliberately does not write.
+    """
+
+    snapshot: "AuthoringWorkspaceSnapshot"
+    admission_generation: int
 
 
 @dataclass(slots=True)
@@ -1177,11 +1193,12 @@ class AuthoringAdmissionCoordinator:
         draft_revision: int,
         payload: Mapping[str, Any],
         workspace: "AuthoringWorkspace",
-        install: Callable[[], bool],
+        install: Callable[[], bool] | None = None,
+        validate_under_claim: Callable[[], None] | None = None,
         session: str = "program",
         expected_identity: "AuthoringWorkspaceIdentity | None" = None,
         project: Mapping[str, Any] | None = None,
-    ) -> "AuthoringWorkspaceSnapshot":
+    ) -> "LocalAuthoringCommit":
         """Commit one ordinary workspace mutation under the exact Kernel claim.
 
         The caller has already prepared its immutable value; this method owns the
@@ -1191,8 +1208,9 @@ class AuthoringAdmissionCoordinator:
         one wake. Nothing is journaled and nothing is persisted.
 
         ``session`` selects the fenced commit: ``program`` and ``deployment`` are
-        ordinary Draft commits and ``whole-workspace`` is the replacement that
-        may rotate a Draft identity.
+        ordinary Draft commits, ``project`` adopts already-prepared Scenario
+        project facts without installing a Draft, and ``whole-workspace`` is the
+        replacement that may rotate a Draft identity.
 
         A refusal that installed nothing settles as ``proven_no_effect`` and
         preserves the caller's typed error. An uncertain install or settlement
@@ -1204,7 +1222,12 @@ class AuthoringAdmissionCoordinator:
 
         if session not in _LOCAL_MUTATION_SESSIONS:
             raise ValueError("local mutation session is not supported")
-        if not callable(install):
+        if session == "project":
+            if not isinstance(project, Mapping):
+                raise TypeError(
+                    "a project commit requires prepared Scenario project facts"
+                )
+        elif not callable(install):
             raise TypeError("local mutation install must be callable")
         with self._local_mutation_lock:
             return self._execute_local_mutation_locked(
@@ -1215,6 +1238,7 @@ class AuthoringAdmissionCoordinator:
                 payload=payload,
                 workspace=workspace,
                 install=install,
+                validate_under_claim=validate_under_claim,
                 session=session,
                 expected_identity=expected_identity,
                 project=project,
@@ -1229,11 +1253,12 @@ class AuthoringAdmissionCoordinator:
         draft_revision: int,
         payload: Mapping[str, Any],
         workspace: "AuthoringWorkspace",
-        install: Callable[[], bool],
+        install: Callable[[], bool] | None,
+        validate_under_claim: Callable[[], None] | None,
         session: str,
         expected_identity: "AuthoringWorkspaceIdentity | None",
         project: Mapping[str, Any] | None,
-    ) -> "AuthoringWorkspaceSnapshot":
+    ) -> "LocalAuthoringCommit":
         """Run the fixed local sequence with the single pending slot owned."""
 
         if workspace.failed_closed is not None:
@@ -1284,13 +1309,21 @@ class AuthoringAdmissionCoordinator:
         )
         # The browser is presentation only. Recheck backend-owned readiness
         # after acquiring the exact claim, as the durable path does.
-        self._require_mutation_ready()
+        try:
+            self._require_mutation_ready()
+            if validate_under_claim is not None:
+                validate_under_claim()
+        except Exception:
+            self._settle_pending_local_claim("proven_no_effect")
+            raise
         installed: list[bool] = []
 
         def tracked_install() -> bool:
             changed = install()
             installed.append(changed)
             return changed
+
+        tracked = tracked_install if install is not None else None
 
         # Once installation begins, a failure is not proof of no effect. A
         # refusal before the installer runs changes this back to
@@ -1304,7 +1337,7 @@ class AuthoringAdmissionCoordinator:
                 workspace=workspace,
                 draft_id=draft_id,
                 expected_identity=expected_identity,
-                install=tracked_install,
+                install=tracked,
                 project=project,
             )
         except Exception as error:
@@ -1328,8 +1361,43 @@ class AuthoringAdmissionCoordinator:
                 self._pending_local_claim.publish_wake = (
                     workspace.publish_commit_wake
                 )
-        self._settle_pending_local_claim()
-        return snapshot
+        settled = self._settle_pending_local_claim()
+        return LocalAuthoringCommit(
+            snapshot=snapshot,
+            admission_generation=self._settled_local_generation(settled),
+        )
+
+    def _settled_local_generation(
+        self, settlement: Mapping[str, Any] | None
+    ) -> int:
+        """Read the exact post-settlement admission generation once.
+
+        A settlement response that omits it contains authoring, exactly as the
+        durable path does when a completed transaction omits its generation:
+        the next request would otherwise fence a generation nobody can prove.
+        """
+
+        admission = (
+            settlement.get("admission")
+            if isinstance(settlement, Mapping)
+            else None
+        )
+        generation = (
+            admission.get("admission_generation")
+            if isinstance(admission, Mapping)
+            else settlement.get("admission_generation")
+            if isinstance(settlement, Mapping)
+            else None
+        )
+        if type(generation) is int and 1 <= generation <= 9_007_199_254_740_991:
+            return generation
+        self._block(
+            "settled local authoring claim omitted its admission generation"
+        )
+        raise self._unavailable(
+            "composer_authoring_outcome_invalid",
+            "the settled local authoring claim omitted its admission generation",
+        )
 
     @staticmethod
     def _commit_local(
@@ -1338,25 +1406,36 @@ class AuthoringAdmissionCoordinator:
         workspace: "AuthoringWorkspace",
         draft_id: str,
         expected_identity: "AuthoringWorkspaceIdentity | None",
-        install: Callable[[], bool],
+        install: Callable[[], bool] | None,
         project: Mapping[str, Any] | None,
     ) -> "AuthoringWorkspaceSnapshot":
         """Commit one prepared value with the workspace wake deferred."""
 
         if session == "whole-workspace":
+            assert install is not None
             return workspace.replace(
                 expected_identity=expected_identity,
                 install=install,
                 project=project,
                 notify=False,
             )
+        if session == "project":
+            # The project facts are the whole commit; no Draft install runs.
+            assert project is not None
+            return workspace.commit_project(
+                expected_identity=expected_identity,
+                facts=project,
+                notify=False,
+            )
         if session == "deployment":
+            assert install is not None
             return workspace.commit_deployment(
                 draft_id=draft_id,
                 expected_identity=expected_identity,
                 install=install,
                 notify=False,
             )
+        assert install is not None
         return workspace.commit_program(
             draft_id=draft_id,
             expected_identity=expected_identity,

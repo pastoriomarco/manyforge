@@ -44,7 +44,14 @@ function snapshot(): ComposerHeadlessState {
       state: 'idle_after_reset',
       runtimeControlRevision: null,
     },
-    draftIdentity: { draftId: 'draft.1', draftRevision: 1 },
+    authoringWorkspace: {
+      workspaceEpoch: 'workspace.epoch.1',
+      workspaceRevision: 1,
+      programDraftId: 'draft.1',
+      programDraftRevision: 1,
+      deploymentDraftId: 'deployment-draft.1',
+      deploymentDraftRevision: 1,
+    },
   } as unknown as ComposerHeadlessState;
 }
 
@@ -60,7 +67,7 @@ describe('nodeEnvironmentRefreshKey', () => {
     next.programCycle.cycleGeneration = 7;
     next.programCycle.state = 'running';
     next.programCycle.runtimeControlRevision = 4;
-    next.draftIdentity.draftRevision = 5;
+    next.authoringWorkspace.programDraftRevision = 5;
     expect(nodeEnvironmentRefreshKey(next)).toBe(nodeEnvironmentRefreshKey(current));
   });
 

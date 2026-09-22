@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-17 18:47:19 UTC
+  Last regenerated: 2026-09-22 12:58:43 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -22,6 +22,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/assistant/bridge/tools/{tool_id}` | assistant-draft-callback | Invoke Draft Tool |
 | `GET` | `/api/assistant/modes` | headless-runtime-client | Assistant Modes |
 | `GET` | `/api/assistant/modes/{mode_id}` | headless-runtime-client | Assistant Mode |
+| `GET` | `/api/authoring/workspace` | composer-authoring-workspace | Read Authoring Workspace |
 | `GET` | `/api/catalog` | catalog | Get Catalog |
 | `GET` | `/api/catalog/{entry_id}` | catalog | Get Catalog Entry |
 | `GET` | `/api/cclc/components/{component_id}` | headless-runtime-client | Cclc Component |
@@ -128,6 +129,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/program/workspace` | composer-draft | Read Workspace |
 | `GET` | `/api/runtime` | headless-runtime-client | Runtime |
 | `GET` | `/api/scenario-documents` | composer-scenario-documents | List Documents |
+| `POST` | `/api/scenario-documents/convert-legacy` | composer-scenario-documents | Convert Legacy Document |
+| `POST` | `/api/scenario-documents/export` | composer-scenario-documents | Export Document |
 | `POST` | `/api/scenario-documents/load` | composer-scenario-documents | Load Document |
 | `POST` | `/api/scenario-documents/save` | composer-scenario-documents | Save Document |
 | `GET` | `/api/scenarios` | headless-runtime-client | Scenarios |

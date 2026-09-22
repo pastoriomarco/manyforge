@@ -219,6 +219,7 @@ def _run_local(
     headless: _Headless,
     *,
     install=None,
+    validate_under_claim=None,
     session: str = "program",
     expected_identity: AuthoringWorkspaceIdentity | None = None,
     envelope: AuthoringMutationEnvelope | None = None,
@@ -239,6 +240,7 @@ def _run_local(
         payload={"mutation": "tree_draft_rename_node", "arguments": {}},
         workspace=workspace,
         install=tracked_install,
+        validate_under_claim=validate_under_claim,
         session=session,
         expected_identity=expected_identity,
     )
@@ -247,7 +249,7 @@ def _run_local(
 def test_local_mutation_acquires_commits_settles_then_wakes_once(tmp_path) -> None:
     workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
 
-    snapshot = _run_local(coordinator, workspace, program, headless)
+    commit = _run_local(coordinator, workspace, program, headless)
 
     assert headless.events == [
         "acquire",
@@ -255,7 +257,8 @@ def test_local_mutation_acquires_commits_settles_then_wakes_once(tmp_path) -> No
         "settle:owner_commit",
         "wake",
     ]
-    assert snapshot.workspace_revision == 2
+    assert commit.snapshot.workspace_revision == 2
+    assert commit.admission_generation == 8
     assert workspace.revision == 2
     assert len(headless.claims) == 1
     assert headless.settlements[0]["settlement_kind"] == "owner_commit"
@@ -268,7 +271,7 @@ def test_local_mutation_acquires_commits_settles_then_wakes_once(tmp_path) -> No
 def test_validated_no_op_does_not_advance_or_wake(tmp_path) -> None:
     workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
 
-    snapshot = _run_local(
+    commit = _run_local(
         coordinator,
         workspace,
         program,
@@ -277,7 +280,8 @@ def test_validated_no_op_does_not_advance_or_wake(tmp_path) -> None:
     )
 
     assert headless.events == ["acquire", "install", "settle:owner_commit"]
-    assert snapshot.workspace_revision == 1
+    assert commit.snapshot.workspace_revision == 1
+    assert commit.admission_generation == 8
     assert workspace.revision == 1
     assert coordinator.local_claim_pending is False
 
@@ -301,6 +305,33 @@ def test_refusal_settles_proven_no_effect_and_keeps_the_typed_error(
     assert raised.value.code == "composer_workspace_stale"
     assert headless.events == ["acquire", "settle:proven_no_effect"]
     assert headless.settlements[0]["settlement_kind"] == "proven_no_effect"
+    assert workspace.revision == 1
+    assert program.revision == 0
+    assert coordinator.local_claim_pending is False
+    assert coordinator.mutation_ready is True
+
+
+def test_under_claim_validation_refusal_settles_without_install(tmp_path) -> None:
+    workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+
+    def reject_changed_source() -> None:
+        headless.events.append("validate")
+        raise AuthoringWorkspaceError(
+            "external_source_changed",
+            "the prepared external source changed",
+        )
+
+    with pytest.raises(AuthoringWorkspaceError) as raised:
+        _run_local(
+            coordinator,
+            workspace,
+            program,
+            headless,
+            validate_under_claim=reject_changed_source,
+        )
+
+    assert raised.value.code == "external_source_changed"
+    assert headless.events == ["acquire", "validate", "settle:proven_no_effect"]
     assert workspace.revision == 1
     assert program.revision == 0
     assert coordinator.local_claim_pending is False
@@ -438,7 +469,7 @@ def test_stale_admission_generation_takes_no_claim(tmp_path) -> None:
 def test_whole_workspace_session_uses_the_replacement_commit(tmp_path) -> None:
     workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
 
-    snapshot = _run_local(
+    commit = _run_local(
         coordinator,
         workspace,
         program,
@@ -453,8 +484,8 @@ def test_whole_workspace_session_uses_the_replacement_commit(tmp_path) -> None:
         "settle:owner_commit",
         "wake",
     ]
-    assert snapshot.identity.program_draft_id == "program-draft-2"
-    assert snapshot.workspace_revision == 2
+    assert commit.snapshot.identity.program_draft_id == "program-draft-2"
+    assert commit.snapshot.workspace_revision == 2
     assert coordinator.mutation_ready is True
     assert coordinator.local_claim_pending is False
 

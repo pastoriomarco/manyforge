@@ -1,15 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, ApiError } from '../api/client';
+import { api, isStaleWorkspaceError } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
+import {
+  programLocalFence,
+  publicationSupersedesDeployment,
+  withSharedDeploymentAuthoring,
+} from '../state/authoringWorkspace';
 import type {
   DeploymentWorkspaceResponse,
   DeploymentCandidateOperationResponse,
   DeploymentControlledStopUpdate,
-  DraftFenceRequest,
   JsonValue,
+  LocalWorkspaceFenceRequest,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
+import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
 import { browserStableIdentity } from './useHeadlessState';
 
 function requestId(): string {
@@ -17,22 +23,10 @@ function requestId(): string {
     ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
 }
 
-function isStaleDraftError(error: unknown): boolean {
-  if (!(error instanceof ApiError) || error.status !== 409) return false;
-  const payload = error.payload;
-  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
-    return false;
-  }
-  const detail = (payload as Record<string, unknown>).detail;
-  return detail !== null
-    && typeof detail === 'object'
-    && !Array.isArray(detail)
-    && (detail as Record<string, unknown>).code === 'deployment_draft_stale';
-}
-
 export function useDeploymentWorkspace(
   enabled: boolean,
   snapshot: ComposerHeadlessState | null,
+  authoring: AuthoringWorkspaceController,
 ) {
   const [workspace, setWorkspace] = useState<DeploymentWorkspaceResponse | null>(null);
   const [loading, setLoading] = useState(enabled);
@@ -96,31 +90,53 @@ export function useDeploymentWorkspace(
     ? 'Deployment authoring requires the configured headless product.'
     : snapshot === null
       ? 'Backend status is disconnected or has not arrived.'
-      : snapshot.programCycle.state !== 'idle_after_reset'
-        ? `Program execution is ${snapshot.programCycle.state.replaceAll('_', ' ')}; Deployment authoring requires Idle.`
-        : completedAdmission?.receiverEpoch === snapshot.receiverEpoch
+      : completedAdmission?.receiverEpoch === snapshot.receiverEpoch
           && snapshot.authoringAdmission.admissionGeneration <= completedAdmission.generation
           ? 'Waiting for updated backend authoring permissions.'
-        : !snapshot.authoringAdmission.authoringAllowed
-          ? 'The backend has not admitted authoring; execution must be Idle and required components healthy.'
-          : workspace === null
-            ? 'Deployment workspace is not loaded.'
-            : null;
+          : authoring.unavailableReason
+            ?? (workspace === null
+              ? 'Deployment workspace is not loaded.'
+              : null);
   const mutationAvailable = mutationUnavailableReason === null;
+  const published = authoring.published;
 
-  const fence = useCallback((): DraftFenceRequest | null => {
-    if (!mutationAvailable || workspace === null || snapshot === null) return null;
-    return {
-      draftId: workspace.draft.id,
-      expectedDraftRevision: workspace.draft.revision,
-      expectedAdmissionGeneration: snapshot.authoringAdmission.admissionGeneration,
-      requestOwnerEpoch: ownerEpoch.current,
-      requestId: requestId(),
-    };
-  }, [mutationAvailable, snapshot, workspace]);
+  useEffect(() => {
+    if (workspace === null || published === null) return;
+    // A mutation response can beat the control delta; never revert it.
+    if (!publicationSupersedesDeployment(published, workspace)) return;
+    // Deployment Draft and Saved are authoring truth and come from the one
+    // shared publication; the Manager/Applied projection stays with this owner
+    // read.
+    const merged = withSharedDeploymentAuthoring(workspace, published.snapshot);
+    if (
+      merged.draft.id === workspace.draft.id
+      && merged.draft.revision === workspace.draft.revision
+      && merged.draft.document === workspace.draft.document
+      && merged.saved.path === workspace.saved.path
+      && merged.saved.deploymentRevision === workspace.saved.deploymentRevision
+    ) {
+      return;
+    }
+    setWorkspace(merged);
+  }, [published, workspace]);
+
+  const fence = useCallback((): LocalWorkspaceFenceRequest | null => {
+    if (
+      !mutationAvailable
+      || snapshot === null
+      || published === null
+      || workspace === null
+    ) return null;
+    return programLocalFence(
+      published,
+      snapshot,
+      ownerEpoch.current,
+      requestId(),
+    );
+  }, [mutationAvailable, published, snapshot, workspace]);
 
   const run = useCallback(async (
-    operation: (requestFence: DraftFenceRequest) => Promise<DeploymentWorkspaceResponse>,
+    operation: (requestFence: LocalWorkspaceFenceRequest) => Promise<DeploymentWorkspaceResponse>,
     message: string,
   ) => {
     const requestFence = fence();
@@ -147,7 +163,7 @@ export function useDeploymentWorkspace(
       return next;
     } catch (reason: unknown) {
       const message = errorMessage(reason, 'Deployment authoring request failed.');
-      if (isStaleDraftError(reason)) {
+      if (isStaleWorkspaceError(reason)) {
         const latest = await refresh();
         if (mounted.current && latest !== null) setError(message);
       } else if (mounted.current) {
@@ -162,7 +178,7 @@ export function useDeploymentWorkspace(
 
   const runApply = useCallback(async (
     operation: (
-      requestFence: DraftFenceRequest,
+      requestFence: LocalWorkspaceFenceRequest,
     ) => Promise<DeploymentCandidateOperationResponse>,
     message: string,
   ) => {
@@ -200,7 +216,7 @@ export function useDeploymentWorkspace(
       // A terminal request failure must return the UI to the ordinary Apply
       // action instead of leaving a disabled confirmation overlay behind.
       if (mounted.current) setPendingApplyConfirmation(null);
-      if (isStaleDraftError(reason)) {
+      if (isStaleWorkspaceError(reason)) {
         const latest = await refresh();
         if (mounted.current && latest !== null) setError(message);
       } else if (mounted.current) {

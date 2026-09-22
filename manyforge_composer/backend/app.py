@@ -218,7 +218,7 @@ def create_app(
         headless_state_source = HeadlessStateSource(
             state.headless_client,
             admission=state.authoring_admission,
-            draft_session=state.draft_session,
+            workspace=state.authoring_workspace,
         )
 
     @asynccontextmanager

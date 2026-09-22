@@ -318,8 +318,9 @@ export function buildProgramStartRequest(
     || snapshot === null || !snapshot.authoringAdmission.authoringAllowed
     || snapshot.programCycle.state !== 'idle_after_reset'
     || workspace === null
-    || workspace.draft.draftId !== snapshot.draftIdentity.draftId
-    || workspace.draft.draftRevision !== snapshot.draftIdentity.draftRevision
+    || workspace.draft.draftId !== snapshot.authoringWorkspace.programDraftId
+    || workspace.draft.draftRevision
+      !== snapshot.authoringWorkspace.programDraftRevision
     || !workspace.draft.programLoaded
     || workspace.draft.programRevision !== applied.programRevision
   ) return null;
@@ -1672,8 +1673,9 @@ export function useProgramRuntime(
       || state.controlPending !== null
       || proposal.expectedDraftId !== workspace.draft.draftId
       || proposal.expectedDraftRevision !== workspace.draft.draftRevision
-      || snapshot.draftIdentity.draftId !== workspace.draft.draftId
-      || snapshot.draftIdentity.draftRevision !== workspace.draft.draftRevision
+      || snapshot.authoringWorkspace.programDraftId !== workspace.draft.draftId
+      || snapshot.authoringWorkspace.programDraftRevision
+        !== workspace.draft.draftRevision
       || snapshot.programCycle.state !== 'idle_after_reset'
       || !snapshot.authoringAdmission.authoringAllowed
     ) return;
@@ -1688,6 +1690,9 @@ export function useProgramRuntime(
         {
           draftId: workspace.draft.draftId,
           expectedDraftRevision: workspace.draft.draftRevision,
+          expectedWorkspaceEpoch: snapshot.authoringWorkspace.workspaceEpoch,
+          expectedWorkspaceRevision:
+            snapshot.authoringWorkspace.workspaceRevision,
           expectedAdmissionGeneration: snapshot.authoringAdmission.admissionGeneration,
           requestOwnerEpoch: callerEpoch.current,
           requestId,
@@ -1724,8 +1729,9 @@ export function useProgramRuntime(
       || proposal.expectedDraftRevision !== workspace.draft.draftRevision
     ) return 'The Draft changed after this promotion was requested.';
     if (
-      snapshot.draftIdentity.draftId !== workspace.draft.draftId
-      || snapshot.draftIdentity.draftRevision !== workspace.draft.draftRevision
+      snapshot.authoringWorkspace.programDraftId !== workspace.draft.draftId
+      || snapshot.authoringWorkspace.programDraftRevision
+        !== workspace.draft.draftRevision
     ) return 'The displayed Draft is still synchronizing.';
     if (
       snapshot.programCycle.state !== 'idle_after_reset'

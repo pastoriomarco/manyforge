@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
 import {
+  parseAuthoringWorkspaceIdentity,
   parseComposerHeadlessState,
   parseComponentOverviewProjection,
   parseExecutionControlStatus,
@@ -8,7 +9,10 @@ import {
   parseOperatorAlarmSnapshot,
   parseProgramCycleStatus,
 } from '../api/parsers';
-import type { ComposerHeadlessState } from '../types/headless';
+import type {
+  AuthoringWorkspaceIdentity,
+  ComposerHeadlessState,
+} from '../types/headless';
 import type {
   ExecutionObservationFrame,
   ExecutionObservationTarget,
@@ -299,6 +303,18 @@ export interface RuntimeFrameIdentity {
   generation: number;
 }
 
+export function sameAuthoringWorkspaceIdentity(
+  left: AuthoringWorkspaceIdentity,
+  right: AuthoringWorkspaceIdentity,
+): boolean {
+  return left.workspaceEpoch === right.workspaceEpoch
+    && left.workspaceRevision === right.workspaceRevision
+    && left.programDraftId === right.programDraftId
+    && left.programDraftRevision === right.programDraftRevision
+    && left.deploymentDraftId === right.deploymentDraftId
+    && left.deploymentDraftRevision === right.deploymentDraftRevision;
+}
+
 export function admitHeadlessState(
   current: ComposerHeadlessState | null,
   candidate: ComposerHeadlessState,
@@ -309,12 +325,13 @@ export function admitHeadlessState(
       return { accepted: false, reason: 'Headless snapshot sequence regressed.' };
     }
     if (candidate.snapshotSequence === current.snapshotSequence
-      && (candidate.draftIdentity.draftId !== current.draftIdentity.draftId
-        || candidate.draftIdentity.draftRevision
-          !== current.draftIdentity.draftRevision)) {
+      && !sameAuthoringWorkspaceIdentity(
+        candidate.authoringWorkspace,
+        current.authoringWorkspace,
+      )) {
       return {
         accepted: false,
-        reason: 'Headless Draft identity changed without a local sequence advance.',
+        reason: 'Headless authoring workspace identity changed without a local sequence advance.',
       };
     }
   }
@@ -1246,7 +1263,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           throw new Error('Partial control delta claimed to be complete.');
         }
         const localIdentityFields = [
-          'schema_version', 'draft_identity', 'receiver_epoch', 'snapshot_sequence',
+          'schema_version', 'authoring_workspace', 'receiver_epoch',
+          'snapshot_sequence',
         ];
         const localIdentityCount = localIdentityFields.filter(
           (name) => name in shellRecord,
@@ -1256,34 +1274,28 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           throw new Error('Control delta contains a partial Composer identity.');
         }
         const hasLocalIdentity = localIdentityCount === localIdentityFields.length;
-        let draftIdentity = this.latest.draftIdentity;
+        let authoringWorkspace = this.latest.authoringWorkspace;
         let receiverEpoch = this.latest.receiverEpoch;
         let snapshotSequence = this.latest.snapshotSequence;
         if (hasLocalIdentity) {
-          const draft = shellRecord.draft_identity;
-          if (draft === null || typeof draft !== 'object' || Array.isArray(draft)) {
-            throw new Error('Control delta Draft identity is invalid.');
-          }
-          const draftRecord = draft as Record<string, unknown>;
-          if (typeof draftRecord.draft_id !== 'string'
-            || !Number.isSafeInteger(draftRecord.draft_revision)
-            || typeof shellRecord.receiver_epoch !== 'string'
+          const workspace = parseAuthoringWorkspaceIdentity(
+            shellRecord.authoring_workspace,
+            'controlDelta.authoring_workspace',
+          );
+          if (typeof shellRecord.receiver_epoch !== 'string'
             || !Number.isSafeInteger(shellRecord.snapshot_sequence)
             || shellRecord.schema_version
               !== 'manyforge.composer_headless_state.v2') {
             throw new Error('Control delta shell identity is invalid.');
           }
-          draftIdentity = {
-            draftId: draftRecord.draft_id,
-            draftRevision: draftRecord.draft_revision as number,
-          };
+          authoringWorkspace = workspace;
           receiverEpoch = shellRecord.receiver_epoch;
           snapshotSequence = shellRecord.snapshot_sequence as number;
         }
         const permitted = new Set([
           'schema_version', 'complete', 'runtime', 'alarms',
           'component_overview', 'authoring_admission', 'execution_targets',
-          'execution_control_state', 'program_cycle', 'draft_identity',
+          'execution_control_state', 'program_cycle', 'authoring_workspace',
           'receiver_epoch', 'snapshot_sequence',
         ]);
         if (Object.keys(shellRecord).some((name) => !permitted.has(name))) {
@@ -1349,7 +1361,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             : {}),
           authoringAdmission,
           executionControlStatus,
-          draftIdentity,
+          authoringWorkspace,
           receiverEpoch,
           snapshotSequence,
         };

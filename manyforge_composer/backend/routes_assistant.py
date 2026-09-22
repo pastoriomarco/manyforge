@@ -169,6 +169,10 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             raise _error(error) from error
 
         draft = state.draft_session.snapshot()
+        # The assistant callback carries the composite workspace fence, so the
+        # submitted context must name the same workspace identity the browser
+        # holds; it is captured once here and rechecked by the callback commit.
+        workspace_identity = state.authoring_workspace.identity()
         admission_generation = _current_admission_generation(state)
         mode = assistant_mode.payload
         payload = {
@@ -187,6 +191,10 @@ def create_assistant_router(state: ComposerState) -> APIRouter:
             "composerDraft": {
                 "draftId": draft["draft_id"],
                 "expectedDraftRevision": draft["draft_revision"],
+                "expectedWorkspaceEpoch": workspace_identity.workspace_epoch,
+                "expectedWorkspaceRevision": (
+                    workspace_identity.workspace_revision
+                ),
                 "expectedAdmissionGeneration": admission_generation,
                 "programLoaded": draft["program_loaded"],
                 "authoring": draft["authoring"],

@@ -30,6 +30,15 @@ from .node_environment_client import (
 from .source_model_client import ActiveSourceModelProjectionError
 from .state import ComposerState
 from .authoring_admission import AuthoringMutationEnvelope
+from .authoring_identity import thaw_json
+from .authoring_workspace import (
+    AuthoringWorkspaceError,
+    AuthoringWorkspaceIdentity,
+)
+from .authoring_workspace_fence import (
+    commit_local_authoring,
+    require_captured_workspace_identity,
+)
 
 
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
@@ -86,6 +95,13 @@ class AssistantDraftCallbackRequest(BaseModel):
         int,
         Field(alias="expectedDraftRevision", ge=0, le=_MAXIMUM_SAFE_INTEGER),
     ]
+    expected_workspace_epoch: str = Field(
+        alias="expectedWorkspaceEpoch", min_length=1, max_length=256
+    )
+    expected_workspace_revision: Annotated[
+        int,
+        Field(alias="expectedWorkspaceRevision", ge=1, le=_MAXIMUM_SAFE_INTEGER),
+    ]
     request_id: str = Field(alias="requestId", min_length=1, max_length=256)
     request_owner_epoch: str = Field(
         alias="requestOwnerEpoch", min_length=1, max_length=256
@@ -106,6 +122,24 @@ class AssistantDraftCallbackRequest(BaseModel):
     )
     arguments: dict[str, Any]
 
+    def admission_envelope(self) -> AuthoringMutationEnvelope:
+        return AuthoringMutationEnvelope(
+            expected_admission_generation=self.expected_admission_generation,
+            request_owner_epoch=self.request_owner_epoch,
+            request_id=self.request_id,
+        )
+
+    def require_workspace_fence(
+        self, identity: AuthoringWorkspaceIdentity
+    ) -> None:
+        """Require the composite workspace the callback was issued against."""
+
+        require_captured_workspace_identity(
+            self.expected_workspace_epoch,
+            self.expected_workspace_revision,
+            identity,
+        )
+
     @field_validator(
         "assistant_mode",
         "retained_bundle_id",
@@ -113,6 +147,7 @@ class AssistantDraftCallbackRequest(BaseModel):
         "draft_id",
         "request_id",
         "request_owner_epoch",
+        "expected_workspace_epoch",
         "source_label",
         "correlation_id",
     )
@@ -153,6 +188,7 @@ def _validation_result(
             "sourceLabel": body.source_label,
             "correlationId": body.correlation_id,
             "nextAdmissionGeneration": body.expected_admission_generation,
+            "nextWorkspaceRevision": body.expected_workspace_revision,
             "result": {
                 "kind": "validation_error",
                 "httpStatus": status_code,
@@ -389,6 +425,7 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
         mutation: str | None,
         details: dict[str, Any],
         next_admission_generation: int,
+        next_workspace_revision: int,
     ) -> JSONResponse:
         mutated = mutation is not None
         return JSONResponse(
@@ -402,6 +439,7 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                 "sourceLabel": body.source_label,
                 "correlationId": body.correlation_id,
                 "nextAdmissionGeneration": next_admission_generation,
+                "nextWorkspaceRevision": next_workspace_revision,
                 "result": {
                     "kind": (
                         "composer_draft_mutation"
@@ -428,22 +466,11 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
         body: AssistantDraftCallbackRequest,
     ) -> JSONResponse:
         if tool_id in SUPPORTED_DRAFT_MUTATIONS:
-            coordinator = state.authoring_admission
-            if coordinator is None:
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "code": "authoring_not_ready",
-                        "message": "authoritative authoring admission is unavailable",
-                    },
-                )
-            validated_catalog = None
+            # Reject a lost-response retry at the cheapest authoritative fence
+            # before rereading and validating the larger active projections.
+            body.require_workspace_fence(state.authoring_workspace.identity())
 
-            def validate_mutation_context(
-                *,
-                validation_as_result: bool,
-                include_preview: bool,
-            ):
+            def validate_mutation_context(*, validation_as_result: bool):
                 node_environment, effect, _snapshot = active_context(
                     tool_id,
                     body,
@@ -457,87 +484,52 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                             "message": "callback is not a Composer Draft mutation",
                         },
                     )
-                if include_preview:
-                    try:
-                        state.draft_session.preview_mutation(
-                            tool_id=tool_id,
-                            arguments=body.arguments,
-                            expected_revision=body.expected_draft_revision,
-                            catalog=node_environment.catalog,
-                            draft_id=body.draft_id,
-                        )
-                    except DraftSessionError as error:
-                        draft_error(
-                            body,
-                            error,
-                            validation_as_result=validation_as_result,
-                        )
                 return node_environment.catalog
 
-            def prepare_effect() -> dict[str, Any]:
-                validate_mutation_context(
-                    validation_as_result=True,
-                    include_preview=True,
-                )
-                return {
-                    "schema_version": "manyforge.composer_authoring_effect.v1",
-                    "operation_kind": f"assistant_{tool_id}",
-                    "effect_class": "local",
-                    "pre_state": state.draft_session.retained_state(),
-                }
-
-            def validate_under_claim(_claim: dict[str, Any]) -> None:
-                nonlocal validated_catalog
+            try:
                 validated_catalog = validate_mutation_context(
-                    validation_as_result=False,
-                    include_preview=False,
+                    validation_as_result=True
                 )
-
-            def mutate_draft(_claim: dict[str, Any]) -> dict[str, Any]:
-                if validated_catalog is None:
-                    raise RuntimeError("assistant mutation validation was not retained")
-                changed = state.draft_session.mutate(
+                # Prepare the edit and its derivation outside every owner lock;
+                # the commit rechecks the composite and Draft fences atomically.
+                prepared = state.draft_session.prepare_mutation(
                     tool_id=tool_id,
                     arguments=body.arguments,
                     expected_revision=body.expected_draft_revision,
                     catalog=validated_catalog,
                     draft_id=body.draft_id,
                 )
-                return {
-                    "mutation": changed.mutation,
-                    "details": changed.details,
-                    "snapshot": changed.snapshot,
-                }
-
-            envelope = AuthoringMutationEnvelope(
-                expected_admission_generation=body.expected_admission_generation,
-                request_owner_epoch=body.request_owner_epoch,
-                request_id=body.request_id,
-            )
-            try:
-                result = coordinator.execute(
-                    envelope,
+                commit = commit_local_authoring(
+                    state,
+                    body,
                     operation_kind=f"assistant_{tool_id}",
-                    draft_id=body.draft_id,
-                    draft_revision=body.expected_draft_revision,
-                    payload=body.model_dump(mode="json", by_alias=True),
-                    effect=mutate_draft,
-                    post_image=state.authoring_retained_state,
-                    prepare_effect=prepare_effect,
-                    validate_under_claim=validate_under_claim,
+                    validate_under_claim=lambda: validate_mutation_context(
+                        validation_as_result=False
+                    ),
+                    install=lambda: state.draft_session.install_prepared_mutation(
+                        prepared
+                    ),
                 )
             except _CallbackValidationResult as result_error:
                 return result_error.response
             except DraftSessionError as error:
+                draft_error(body, error, validation_as_result=True)
+            except AuthoringWorkspaceError as error:
                 raise _http_error(error) from error
+            program = commit.snapshot.as_dict()["program"]
             return callback_response(
                 body,
-                next_snapshot=result["snapshot"],
-                mutation=result["mutation"],
-                details=result["details"],
-                next_admission_generation=(
-                    coordinator.completed_admission_generation(envelope)
-                ),
+                next_snapshot={
+                    "draft_id": program["draftId"],
+                    "draft_revision": program["draftRevision"],
+                    "candidate_available": program["candidateAvailable"],
+                    "program_revision": program["programRevision"],
+                    "diagnostics": program["diagnostics"],
+                },
+                mutation=prepared.tool_id,
+                details=thaw_json(prepared.details),
+                next_admission_generation=commit.admission_generation,
+                next_workspace_revision=commit.snapshot.workspace_revision,
             )
 
         try:
@@ -582,6 +574,7 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
             mutation=None,
             details=details,
             next_admission_generation=body.expected_admission_generation,
+            next_workspace_revision=state.authoring_workspace.revision,
         )
 
     return router

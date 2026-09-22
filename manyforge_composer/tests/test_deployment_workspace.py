@@ -27,6 +27,8 @@ from manyforge_composer.backend.routes_deployment_draft import (
 from manyforge_composer.backend.authoring_transaction_journal import (
     AuthoringJournalError,
 )
+from manyforge_composer.backend.authoring_admission import LocalAuthoringCommit
+from manyforge_composer.backend.authoring_workspace import AuthoringWorkspace
 from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_composer.backend.state import ComposerState
 
@@ -258,7 +260,7 @@ def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
     client, state = _client(tmp_path)
     # Keep the existing lightweight admission double, but use the real source
     # compiler and actual workspace mutation/save/open routes.
-    state.deployment_draft_session = DeploymentDraftSession()
+    _replace_deployment_session(state, DeploymentDraftSession())
     original = tmp_path / "original.deployment.yaml"
     original.write_text(json.dumps(source))
     workspace = client.get("/api/deployment/workspace").json()
@@ -739,6 +741,46 @@ class _Coordinator:
             after_release()
         return result
 
+    def execute_local_mutation(
+        self,
+        _envelope,
+        *,
+        session="program",
+        draft_id=None,
+        workspace,
+        install=None,
+        validate_under_claim=None,
+        expected_identity=None,
+        project=None,
+        **_kwargs,
+    ):
+        if validate_under_claim is not None:
+            validate_under_claim()
+        if session == "whole-workspace":
+            snapshot = workspace.replace(
+                expected_identity=expected_identity,
+                install=install,
+                project=project,
+            )
+        elif session == "project":
+            snapshot = workspace.commit_project(
+                expected_identity=expected_identity,
+                facts=project,
+            )
+        elif session == "deployment":
+            snapshot = workspace.commit_deployment(
+                draft_id=draft_id,
+                expected_identity=expected_identity,
+                install=install,
+            )
+        else:
+            snapshot = workspace.commit_program(
+                draft_id=draft_id,
+                expected_identity=expected_identity,
+                install=install,
+            )
+        return LocalAuthoringCommit(snapshot=snapshot, admission_generation=2)
+
 
 class _Headless:
     applied_deployment: dict[str, Any] | None = None
@@ -757,7 +799,9 @@ class _Headless:
 
 
 def _request(workspace: dict[str, Any], **extra: Any) -> dict[str, Any]:
-    return {
+    local = extra.pop("local", True)
+    identity = workspace["authoringWorkspace"]
+    request = {
         "draftId": workspace["draft"]["id"],
         "expectedDraftRevision": workspace["draft"]["revision"],
         "expectedAdmissionGeneration": 1,
@@ -766,13 +810,32 @@ def _request(workspace: dict[str, Any], **extra: Any) -> dict[str, Any]:
         + str(workspace["draft"]["revision"])
         + "-"
         + extra.pop("kind", "edit"),
+        "expectedWorkspaceEpoch": identity["workspaceEpoch"],
+        "expectedWorkspaceRevision": identity["workspaceRevision"],
         **extra,
     }
+    if not local:
+        request.pop("expectedWorkspaceEpoch")
+        request.pop("expectedWorkspaceRevision")
+    return request
+
+
+def _replace_deployment_session(
+    state: ComposerState, session: DeploymentDraftSession
+) -> None:
+    state.deployment_draft_session = session
+    state.authoring_workspace = AuthoringWorkspace(
+        program_session=state.draft_session,
+        deployment_session=session,
+    )
 
 
 def _client(tmp_path: Path) -> tuple[TestClient, ComposerState]:
     state = ComposerState()
-    state.deployment_draft_session = DeploymentDraftSession(compiler=_compile)
+    _replace_deployment_session(
+        state,
+        DeploymentDraftSession(compiler=_compile),
+    )
     state.authoring_admission = _Coordinator()  # type: ignore[assignment]
     state.headless_client = _Headless()  # type: ignore[assignment]
     state.allowed_fs_roots = [str(tmp_path)]
@@ -912,8 +975,8 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     )
     source = project / "deployment.yaml"
     state.allowed_fs_roots.append(str(project.parents[1]))
+    _replace_deployment_session(state, DeploymentDraftSession())
     state.scenario_document_path = str(project)
-    state.deployment_draft_session = DeploymentDraftSession()
     compiled = state.deployment_draft_session.preview_source(
         source.read_text(encoding="utf-8")
     )
@@ -1067,7 +1130,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
 
     confirmation = client.post(
         "/api/deployment/draft/apply",
-        json=_request(edited, kind="apply"),
+        json=_request(edited, kind="apply", local=False),
     )
     assert confirmation.status_code == 200, confirmation.text
     assert confirmation.json()["result"]["status"] == "confirmation_required"
@@ -1094,6 +1157,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
             preparationRequestId=confirmation.json()["result"]["preparation"][
                 "request_id"
             ],
+            local=False,
         ),
     )
     assert applied.status_code == 200, applied.text
@@ -1142,7 +1206,7 @@ def test_exact_candidate_replay_precedes_fresh_runtime_prerequisites(
         "/api/deployment/open-draft",
         json=_request(workspace, path=str(source), confirmDiscard=False, kind="open"),
     ).json()
-    request = _request(opened, kind="apply-replay")
+    request = _request(opened, kind="apply-replay", local=False)
     expected = {
         "schemaVersion": "manyforge.composer_deployment_candidate_operation.v1",
         "workspace": opened,
@@ -1508,7 +1572,10 @@ def test_named_scenario_candidates_project_the_complete_exact_pairing(
 
 def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():
     state = ComposerState()
-    state.deployment_draft_session = DeploymentDraftSession(compiler=_compile)
+    _replace_deployment_session(
+        state,
+        DeploymentDraftSession(compiler=_compile),
+    )
     compiled = _compile(json.dumps(_document()))
     retained = state.deployment_draft_session.retained_state()
     state.deployment_draft_session.commit_open(
@@ -1553,7 +1620,10 @@ def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():
 
 def test_run_uses_the_existing_transport_when_deployment_draft_matches_applied():
     state = ComposerState()
-    state.deployment_draft_session = DeploymentDraftSession(compiler=_compile)
+    _replace_deployment_session(
+        state,
+        DeploymentDraftSession(compiler=_compile),
+    )
     compiled = _compile(json.dumps(_document()))
     retained = state.deployment_draft_session.retained_state()
     state.deployment_draft_session.commit_open(

@@ -183,8 +183,8 @@ export function sceneMutationFenceFromSnapshot(
     return { available: false, reason: 'The current Program Draft identity is unavailable.' };
   }
   if (
-    snapshot.draftIdentity.draftId !== draftId
-    || snapshot.draftIdentity.draftRevision !== draftRevision
+    snapshot.authoringWorkspace.programDraftId !== draftId
+    || snapshot.authoringWorkspace.programDraftRevision !== draftRevision
   ) {
     return {
       available: false,

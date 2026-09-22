@@ -37,7 +37,6 @@ from .draft_session import (
 from .deployment_draft import (
     DeploymentDraftError,
     DeploymentDraftSession,
-    compile_deployment_document,
 )
 from .authoring_admission import (
     AuthoringAdmissionCoordinator,
@@ -54,16 +53,9 @@ from .node_environment_client import read_active_node_environment
 from .program_artifacts import (
     ProgramArtifactError,
     load_program_artifact,
-    save_program_artifact,
 )
 from .deployment_artifacts import (
     load_deployment_artifact,
-    save_deployment_artifact,
-)
-from .scenario_artifacts import (
-    ScenarioArtifactError,
-    load_scenario_artifact,
-    save_scenario_artifact,
 )
 from .execution_observation_stream import ExecutionObservationSource
 
@@ -384,6 +376,20 @@ class ComposerState:
         *,
         catalog: Any | None = None,
     ) -> None:
+        """Restore one durable post-image owned by an external operation.
+
+        After UA2D.5 this has exactly one responsibility: the retained external
+        authoring operations (Program Apply/Revert, `/api/scenarios/load`
+        including startup activation, and Deployment candidate Preview/Apply/
+        Revert) still publish a Composer post-image through the durable journal.
+        Ordinary edits, saves, Open/New/Discard and the authoring-only Scenario
+        document Load no longer restore a post-image here: they commit through
+        the composite workspace owner, which is the only writer of the two Draft
+        sessions. The two accepted shapes are the external workspace post-image
+        (Program plus Deployment) and the Program-only one written when no
+        Deployment Draft is loaded.
+        """
+
         authoring_catalog = (
             self._active_authoring_catalog() if catalog is None else catalog
         )
@@ -1873,93 +1879,6 @@ class ComposerState:
             )
         kind = intent.get("external_kind")
         post_state = deepcopy(intent["post_state"])
-        if kind == "save_scenario_document":
-            exact_already_present = False
-            try:
-                present, present_path = load_scenario_artifact(
-                    intent["target_path"],
-                    allowed_roots=self.allowed_fs_roots,
-                )
-                exact_already_present = (
-                    present == intent["scenario_document"]
-                    and present_path
-                    == str(Path(intent["target_path"]).expanduser().resolve())
-                )
-            except ScenarioArtifactError as error:
-                if (
-                    error.code != "scenario_artifact_path_invalid"
-                    and not intent["overwrite"]
-                ):
-                    raise AuthoringJournalError(
-                        "composer_authoring_scenario_save_recovery_conflict",
-                        "Scenario Save target cannot be proven exact without overwrite authority",
-                    ) from error
-            if not exact_already_present:
-                saved_path = save_scenario_artifact(
-                    intent["scenario_document"],
-                    intent["target_path"],
-                    allowed_roots=self.allowed_fs_roots,
-                    overwrite=bool(intent["overwrite"]),
-                )
-            else:
-                saved_path = str(Path(intent["target_path"]).expanduser().resolve())
-            self.scenario_document_path = saved_path
-            self.remember_scenario_document(intent["scenario_document"])
-            self._restore_authoring_post_image(post_state)
-            return {
-                "status": "saved",
-                "path": saved_path,
-                "scenario_id": intent["scenario_document"]["scenario_id"],
-                "last_known_status": intent["scenario_document"]["saved_status"][
-                    "last_known_status"
-                ],
-                "workspace": self.draft_session.workspace_snapshot(
-                    applied_program_revision=None,
-                    applied_unavailable_reason={
-                        "code": "applied_state_refresh_required",
-                        "message": "Applied Program status is refreshed after recovery.",
-                    },
-                ),
-            }, post_state
-        if kind == "save_deployment":
-            exact_already_present = False
-            try:
-                source, present_path = load_deployment_artifact(
-                    intent["target_path"],
-                    allowed_roots=(
-                        self.allowed_deployment_write_roots
-                        if self.allowed_deployment_write_roots is not None
-                        else self.allowed_fs_roots
-                    ),
-                )
-                exact_already_present = (
-                    compile_deployment_document(source).canonical_json
-                    == intent["canonical_json"]
-                    and present_path
-                    == post_state["deployment"]["saved_path"]
-                )
-            except DeploymentDraftError as error:
-                if (
-                    error.code != "deployment_artifact_not_found"
-                    and not intent["overwrite"]
-                ):
-                    raise AuthoringJournalError(
-                        "composer_authoring_save_recovery_conflict",
-                        "Deployment Save target cannot be proven exact without overwrite authority",
-                    ) from error
-            if not exact_already_present:
-                save_deployment_artifact(
-                    intent["canonical_json"],
-                    intent["target_path"],
-                    allowed_roots=(
-                        self.allowed_deployment_write_roots
-                        if self.allowed_deployment_write_roots is not None
-                        else self.allowed_fs_roots
-                    ),
-                    overwrite=bool(intent["overwrite"]),
-                )
-            self._restore_authoring_post_image(post_state)
-            return self.deployment_draft_session.snapshot(), post_state
         if kind == "revert_deployment":
             prepared = intent.get("prepared_deployment_candidate")
             if not isinstance(prepared, dict):
@@ -1986,70 +1905,6 @@ class ComposerState:
             if applied:
                 self._restore_authoring_post_image(post_state)
             return result, post_state
-        if kind == "save_program":
-            try:
-                program = Program.from_dict(
-                    deepcopy(intent["program_document"]),
-                    self._active_authoring_catalog(),
-                    path="<composer-save-recovery>",
-                )
-            except ProgramValidationError as error:
-                raise AuthoringJournalError(
-                    "composer_authoring_recovery_invalid",
-                    f"retained Save Program is invalid: {error}",
-                ) from error
-            exact_already_present = False
-            try:
-                present, present_path = load_program_artifact(
-                    intent["target_path"],
-                    allowed_roots=(
-                        self.allowed_program_write_roots
-                        if self.allowed_program_write_roots is not None
-                        else self.allowed_fs_roots
-                    ),
-                    catalog=self._active_authoring_catalog(),
-                )
-                exact_already_present = (
-                    present.to_dict() == program.to_dict()
-                    and present_path == post_state["saved_path"]
-                )
-            except ProgramArtifactError as error:
-                if (
-                    error.code != "program_artifact_not_found"
-                    and not intent["overwrite"]
-                ):
-                    raise AuthoringJournalError(
-                        "composer_authoring_save_recovery_conflict",
-                        "Save target cannot be proven exact without overwrite authority",
-                    ) from error
-            if not exact_already_present:
-                save_program_artifact(
-                    program,
-                    intent["target_path"],
-                    allowed_roots=(
-                        self.allowed_program_write_roots
-                        if self.allowed_program_write_roots is not None
-                        else self.allowed_fs_roots
-                    ),
-                    overwrite=bool(intent["overwrite"]),
-                )
-            self._restore_authoring_post_image(post_state)
-            applied = intent.get("applied_context", {})
-            return (
-                self._recovery_workspace(
-                    applied_program_revision=(
-                        applied.get("program_revision")
-                        if applied.get("available") is True
-                        else None
-                    ),
-                    applied_unavailable_reason=(
-                        applied.get("reason")
-                        if applied.get("available") is not True
-                        else None
-                    ),
-                ),
-                post_state,
-            )
         if kind in {"program_apply", "revert_program"}:
             result = self._recover_program_apply(intent, claim)
             applied = result.get("applied")

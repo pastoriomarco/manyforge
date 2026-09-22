@@ -645,11 +645,13 @@ def _composer_fence(
     *,
     request_id: str,
 ) -> dict:
-    draft_identity = snapshot["draft_identity"]
+    workspace = snapshot["authoring_workspace"]
     admission = snapshot["authoring_admission"]
     return {
-        "draftId": draft_identity["draft_id"],
-        "expectedDraftRevision": draft_identity["draft_revision"],
+        "draftId": workspace["program_draft_id"],
+        "expectedDraftRevision": workspace["program_draft_revision"],
+        "expectedWorkspaceEpoch": workspace["workspace_epoch"],
+        "expectedWorkspaceRevision": workspace["workspace_revision"],
         "expectedAdmissionGeneration": admission["admission_generation"],
         "requestOwnerEpoch": "composer.process.epoch.1",
         "requestId": request_id,
@@ -659,10 +661,11 @@ def _composer_fence(
 def _matching_composer_snapshot(next_snapshot: Callable[[], dict], draft: dict) -> dict:
     for _ in range(32):
         snapshot = next_snapshot()
-        if snapshot.get("draft_identity") == {
-            "draft_id": draft["draft_id"],
-            "draft_revision": draft["draft_revision"],
-        }:
+        workspace = snapshot.get("authoring_workspace")
+        if isinstance(workspace, dict) and (
+            workspace.get("program_draft_id") == draft["draft_id"]
+            and workspace.get("program_draft_revision") == draft["draft_revision"]
+        ):
             return snapshot
     raise RuntimeError("Composer did not publish the exact current Draft snapshot")
 

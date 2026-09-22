@@ -327,6 +327,62 @@ def test_simultaneous_program_and_deployment_commits_each_advance_once() -> None
     assert captured.deployment["document"] == {"deployment_revision": "dep-1"}
 
 
+def test_simultaneous_edits_from_one_identity_accept_exactly_one() -> None:
+    workspace, program, deployment = _workspace()
+    baseline = workspace.identity()
+    start = threading.Barrier(2)
+
+    def commit_program() -> str:
+        start.wait(timeout=5)
+        workspace.commit_program(
+            draft_id=program.draft_id,
+            expected_identity=baseline,
+            install=lambda: program.install_program("rev-1"),
+        )
+        return "program"
+
+    def commit_deployment() -> str:
+        start.wait(timeout=5)
+        workspace.commit_deployment(
+            draft_id=deployment.draft_id,
+            expected_identity=baseline,
+            install=lambda: deployment.install_document("dep-1"),
+        )
+        return "deployment"
+
+    accepted: list[str] = []
+    rejected: list[str] = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(commit_program), pool.submit(commit_deployment)]
+        for future in futures:
+            try:
+                accepted.append(future.result(timeout=10))
+            except AuthoringWorkspaceError as error:
+                rejected.append(error.code)
+
+    assert len(accepted) == 1
+    assert rejected == ["composer_workspace_stale"]
+    assert workspace.revision == baseline.workspace_revision + 1
+
+
+def test_new_backend_workspace_does_not_restore_unsaved_edits() -> None:
+    workspace, program, _deployment = _workspace()
+    workspace.commit_program(
+        draft_id=program.draft_id,
+        install=lambda: program.install_program("unsaved"),
+    )
+    assert workspace.snapshot().program["programRevision"] == "unsaved"
+
+    # A clean backend restart creates a new in-memory owner. Saved project
+    # files may be opened explicitly, but an unsaved predecessor post-image is
+    # deliberately not replayed.
+    successor, _successor_program, _successor_deployment = _workspace()
+    captured = successor.snapshot()
+    assert captured.program["programLoaded"] is False
+    assert captured.program["programRevision"] is None
+    assert captured.workspace_epoch != workspace.epoch
+
+
 def test_whole_workspace_replacement_rotates_both_identities_in_one_advance() -> None:
     workspace, program, deployment = _workspace()
     program.install_program("rev-1")

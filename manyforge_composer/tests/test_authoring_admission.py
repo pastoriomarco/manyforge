@@ -612,13 +612,9 @@ def test_exact_recovery_settles_before_mutable_current_state_is_consulted(
     assert coordinator.mutation_ready
 
 
-def test_startup_recovers_external_effect_before_restoring_workspace(tmp_path) -> None:
+def test_startup_recovers_external_effect_before_admitting_mutation(tmp_path) -> None:
     headless = _RecoveryHeadless({})
     order: list[str] = []
-
-    def restore(post_image: dict[str, Any]) -> None:
-        assert post_image == {"workspace": "successor"}
-        order.append("restore")
 
     def recover_effect(transaction, claim):
         assert claim == transaction.claim
@@ -628,7 +624,7 @@ def test_startup_recovers_external_effect_before_restoring_workspace(tmp_path) -
     coordinator = AuthoringAdmissionCoordinator(
         headless,
         tmp_path,
-        restore_post_image=restore,
+        restore_post_image=lambda _post_image: None,
         recover_effect=recover_effect,  # type: ignore[arg-type]
     )
     transaction = coordinator._journal.record_intent(
@@ -675,8 +671,7 @@ def test_startup_recovers_external_effect_before_restoring_workspace(tmp_path) -
     coordinator.recover()
 
     assert coordinator.mutation_ready
-    assert order[0] == "effect"
-    assert order[1:] == ["restore"]
+    assert order == ["effect"]
 
 
 def test_owner_proven_external_rejection_settles_and_replays_exactly(
@@ -829,51 +824,6 @@ def test_successor_rejects_mismatched_acquire_claim(tmp_path) -> None:
     )
     coordinator.recover()
     assert not coordinator.mutation_ready
-
-
-def test_successor_restores_completed_local_post_image_before_opening(tmp_path) -> None:
-    transaction, claim = _durable_transaction(tmp_path, effect_class="local")
-    journal = ComposerAuthoringTransactionJournal(tmp_path)
-    journal.record_effect_outcome(
-        transaction,
-        post_image={"draft_id": "draft.2", "revision": 4},
-        outcome={
-            "kind": "mapping",
-            "settlement_kind": "owner_commit",
-            "body": {"ok": True},
-        },
-    )
-    journal.record(
-        transaction, "release_intent_json", _owner_commit_settlement()
-    )
-    transaction = journal.lookup(
-        transaction.request_owner_epoch, transaction.request_id
-    )
-    assert transaction is not None
-    expected_release = AuthoringAdmissionCoordinator._kernel_release(transaction)
-    restored: list[dict[str, Any]] = []
-    receipt = _startup_receipt(
-        status="released_exact",
-        claim=claim,
-        matched_release=expected_release,
-    )
-    headless = _RecoveryHeadless(receipt)
-    coordinator = AuthoringAdmissionCoordinator(
-        headless, tmp_path, restore_post_image=restored.append
-    )
-    coordinator.recover()
-    assert coordinator.mutation_ready
-    assert restored == [{"draft_id": "draft.2", "revision": 4}]
-    assert headless.recoveries[0]["expected_release"] == expected_release
-
-
-def test_successor_proves_local_interrupted_effect_had_no_effect(tmp_path) -> None:
-    _transaction, claim = _durable_transaction(tmp_path, effect_class="local")
-    headless = _RecoveryHeadless(_startup_receipt(status="held_exact", claim=claim))
-    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)
-    coordinator.recover()
-    assert coordinator.mutation_ready
-    assert headless.settlements[0]["settlement_kind"] == "proven_no_effect"
 
 
 def test_successor_replays_external_recovery_callback_exactly(tmp_path) -> None:

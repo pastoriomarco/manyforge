@@ -58,7 +58,14 @@ function admissionFixtures() {
       failure: null, resetPhase: null, allowedCommands: [],
       run: null, runtimeControls: null,
     },
-    draftIdentity: { draftId: 'draft-1', draftRevision: 5 },
+    authoringWorkspace: {
+      workspaceEpoch: 'workspace.epoch.1',
+      workspaceRevision: 1,
+      programDraftId: 'draft-1',
+      programDraftRevision: 5,
+      deploymentDraftId: 'deployment-draft-1',
+      deploymentDraftRevision: 1,
+    },
   } as unknown as ComposerHeadlessState;
   return { applied, workspace, snapshot };
 }
@@ -118,7 +125,14 @@ describe('Program runtime idle selection', () => {
         runtimeControlRevision: null,
         recoveryOffer: null,
       },
-      draftIdentity: { draftId: 'draft-1', draftRevision: 5 },
+      authoringWorkspace: {
+        workspaceEpoch: 'workspace.epoch.1',
+        workspaceRevision: 1,
+        programDraftId: 'draft-1',
+        programDraftRevision: 5,
+        deploymentDraftId: 'deployment-draft-1',
+        deploymentDraftRevision: 1,
+      },
     } as ComposerHeadlessState;
     expect(programRuntimeWakeKey(snapshot)).toContain(
       'manager.1:no-retained-bundle:no-graph-revision:applied.1:3',
@@ -144,7 +158,10 @@ describe('Program runtime idle selection', () => {
     expect(source).not.toContain('api.programs.read(activeRunId');
     expect(programRuntimeWakeKey({
       ...snapshot,
-      draftIdentity: { draftId: 'draft-1', draftRevision: 6 },
+      authoringWorkspace: {
+        ...snapshot.authoringWorkspace,
+        programDraftRevision: 6,
+      },
     })).toBe(programRuntimeWakeKey(snapshot));
     expect(programRuntimeWakeKey({
       ...snapshot,

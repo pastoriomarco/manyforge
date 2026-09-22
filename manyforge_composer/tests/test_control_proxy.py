@@ -32,7 +32,7 @@ def _source() -> HeadlessStateSource:
     return HeadlessStateSource(
         _Client(),  # type: ignore[arg-type]
         admission=_Admission(),  # type: ignore[arg-type]
-        draft_session=ComposerState().draft_session,
+        workspace=ComposerState().authoring_workspace,
     )
 
 
@@ -64,7 +64,8 @@ def test_source_only_enriches_owner_frames_and_performs_no_http_reads() -> None:
     )
     assert first["shell"]["receiver_epoch"] == "composer.epoch.1"
     assert first["shell"]["snapshot_sequence"] == 1
-    assert first["shell"]["draft_identity"]["draft_revision"] == 0
+    assert first["shell"]["authoring_workspace"]["program_draft_revision"] == 0
+    assert first["shell"]["authoring_workspace"]["workspace_revision"] == 1
     assert first["shell"]["complete"] is True
     assert source.enrich(second_payload) == second_payload
 
@@ -241,6 +242,7 @@ def test_local_draft_wake_emits_one_resequenced_latest_shell(
         source.notify_local_state_change()
         await asyncio.wait_for(task, 0.5)
 
+        identity = source._workspace.identity()  # noqa: SLF001
         assert [frame["server_sequence"] for frame in browser.sent] == ["1", "2"]
         assert browser.sent[1]["message_kind"] == "delta"
         assert browser.sent[1]["event_class"] == "cold"
@@ -249,14 +251,99 @@ def test_local_draft_wake_emits_one_resequenced_latest_shell(
         assert browser.sent[1]["shell"]["snapshot_sequence"] == 2
         assert browser.sent[1]["shell"] == {
             "complete": False,
-            "draft_identity": {
-                "draft_id": source._draft_session.snapshot()["draft_id"],  # noqa: SLF001
-                "draft_revision": 0,
+            "authoring_workspace": {
+                "workspace_epoch": identity.workspace_epoch,
+                "workspace_revision": identity.workspace_revision,
+                "program_draft_id": identity.program_draft_id,
+                "program_draft_revision": identity.program_draft_revision,
+                "deployment_draft_id": identity.deployment_draft_id,
+                "deployment_draft_revision": identity.deployment_draft_revision,
             },
             "receiver_epoch": "composer.epoch.1",
             "schema_version": "manyforge.composer_headless_state.v2",
             "snapshot_sequence": 2,
         }
+        assert not source._local_subscriptions  # noqa: SLF001
+
+    asyncio.run(exercise())
+
+
+def test_two_browsers_coalesce_wakes_and_publish_the_newest_identity(
+    monkeypatch,
+) -> None:
+    """Two clients share one owner: each wake collapses and carries the newest identity."""
+
+    class _StopAfterDeltas(_Browser):
+        def __init__(self) -> None:
+            super().__init__('{"message_kind":"client_hello"}')
+            self.deltas = 0
+            self.ready = asyncio.Event()
+            self.first_delta = asyncio.Event()
+
+        async def send_text(self, message: str) -> None:
+            self.sent.append(json.loads(message))
+            self.ready.set()
+            if json.loads(message).get("message_kind") == "delta":
+                self.deltas += 1
+                if self.deltas == 1:
+                    self.first_delta.set()
+                if self.deltas == 2:
+                    raise WebSocketDisconnect()
+
+    async def exercise() -> None:
+        def _connect(*_args, **_kwargs) -> _Upstream:
+            # Each browser owns its own owner-side session; one shared upstream
+            # would deliver the snapshot to only one of them.
+            return _Upstream(wait_for_browser=False)
+
+        monkeypatch.setattr(headless_ws, "connect_websocket", _connect)
+        source = _source()
+        first = _StopAfterDeltas()
+        second = _StopAfterDeltas()
+        tasks = [
+            asyncio.create_task(serve_headless_state(first, source)),  # type: ignore[arg-type]
+            asyncio.create_task(serve_headless_state(second, source)),  # type: ignore[arg-type]
+        ]
+
+        await asyncio.wait_for(
+            asyncio.gather(first.ready.wait(), second.ready.wait()),
+            0.5,
+        )
+
+        # Three commits raise three wakes before either browser is served. Each
+        # subscription holds one pending event, so one delta is published per
+        # browser per wake round instead of three.
+        source.notify_local_state_change()
+        source.notify_local_state_change()
+        source.notify_local_state_change()
+        await asyncio.wait_for(
+            asyncio.gather(first.first_delta.wait(), second.first_delta.wait()),
+            0.5,
+        )
+        source.notify_local_state_change()
+        source.notify_local_state_change()
+        source.notify_local_state_change()
+
+        await asyncio.wait_for(asyncio.gather(*tasks), 0.5)
+
+        deltas = [
+            frame
+            for frame in first.sent + second.sent
+            if frame.get("message_kind") == "delta"
+        ]
+        assert len(deltas) == 4
+        identities = [
+            (
+                frame["shell"]["authoring_workspace"]["workspace_epoch"],
+                frame["shell"]["authoring_workspace"]["workspace_revision"],
+            )
+            for frame in deltas
+        ]
+        # Every delta names the shared workspace epoch, and no later frame
+        # regresses the revision.
+        assert all(epoch == identities[0][0] for epoch, _revision in identities)
+        revisions = [revision for _epoch, revision in identities]
+        assert revisions == sorted(revisions)
         assert not source._local_subscriptions  # noqa: SLF001
 
     asyncio.run(exercise())

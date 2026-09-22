@@ -66,7 +66,11 @@ export type ProgramWorkspaceStateAction =
       generation: number;
       error: string;
     }
-  | { type: 'clear_feedback' };
+  | { type: 'clear_feedback' }
+  | {
+      type: 'authoring_synced';
+      workspace: ProgramWorkspaceResponse;
+    };
 
 export const INITIAL_PROGRAM_WORKSPACE_STATE: ProgramWorkspaceState = {
   status: 'loading',
@@ -113,6 +117,14 @@ export function programWorkspaceReducer(
       };
     }
     return state;
+  }
+  if (action.type === 'authoring_synced') {
+    // Publishing the shared authoring half is not a user request, so it must
+    // not be fenced by a request generation: it replaces only the authoring
+    // truth and leaves the Applied projection, message and pending action
+    // exactly as they are.
+    if (state.workspace === null) return state;
+    return { ...state, workspace: action.workspace };
   }
   if (action.generation !== state.requestGeneration) return state;
   if (action.type === 'request_succeeded') {

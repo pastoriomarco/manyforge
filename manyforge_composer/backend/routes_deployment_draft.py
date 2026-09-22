@@ -33,9 +33,17 @@ from .deployment_artifacts import (
     normalize_deployment_save_path,
     save_deployment_artifact,
 )
-from .deployment_draft import CompiledDeploymentDocument, DeploymentDraftError
+from .deployment_draft import DeploymentDraftError
 from .draft_session import DraftSessionError
 from .state import ComposerState
+from .authoring_workspace import (
+    AuthoringWorkspaceError,
+    AuthoringWorkspaceIdentity,
+)
+from .authoring_workspace_fence import (
+    commit_local_authoring,
+    require_captured_workspace_identity,
+)
 
 
 _DTO = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)
@@ -79,7 +87,7 @@ class _Fence(BaseModel):
     )
     request_id: str = Field(alias="requestId", min_length=1, max_length=256)
 
-    def envelope(self) -> AuthoringMutationEnvelope:
+    def admission_envelope(self) -> AuthoringMutationEnvelope:
         return AuthoringMutationEnvelope(
             expected_admission_generation=self.expected_admission_generation,
             request_owner_epoch=self.request_owner_epoch,
@@ -87,40 +95,64 @@ class _Fence(BaseModel):
         )
 
 
-class OpenDeploymentRequest(_Fence):
+class _LocalFence(_Fence):
+    """Migrated ordinary-edit fence: the Deployment Draft plus the workspace.
+
+    Deployment candidate Preview/Apply/Revert stay on the external-operation
+    path and keep the plain :class:`_Fence` shape.
+    """
+
+    expected_workspace_epoch: str = Field(
+        alias="expectedWorkspaceEpoch", min_length=1, max_length=256
+    )
+    expected_workspace_revision: int = Field(
+        alias="expectedWorkspaceRevision", ge=1, le=9_007_199_254_740_991
+    )
+
+    def require_workspace_fence(
+        self, identity: "AuthoringWorkspaceIdentity"
+    ) -> None:
+        require_captured_workspace_identity(
+            self.expected_workspace_epoch,
+            self.expected_workspace_revision,
+            identity,
+        )
+
+
+class OpenDeploymentRequest(_LocalFence):
     path: str = Field(min_length=1, max_length=4096)
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
 
 
-class UpdateDeploymentRequest(_Fence):
+class UpdateDeploymentRequest(_LocalFence):
     path: list[str | int] = Field(min_length=1, max_length=32)
     operation: Literal["set", "append", "remove"] = "set"
     value: Any = None
 
 
-class UpdateControlledStopRequest(_Fence):
+class UpdateControlledStopRequest(_LocalFence):
     controllable_component_id: str = Field(min_length=1, max_length=256)
     command_target_id: str = Field(min_length=1, max_length=256)
     profile: dict[str, Any] | None
     timing: dict[str, Any] | None
 
 
-class UpdateMotionTargetLimitRequest(_Fence):
+class UpdateMotionTargetLimitRequest(_LocalFence):
     controllable_component_id: str = Field(min_length=1, max_length=256)
     command_target_id: str = Field(min_length=1, max_length=256)
     maximum_tcp_linear_speed_mps: float = Field(gt=0.0, le=1000.0)
 
 
-class SaveDeploymentRequest(_Fence):
+class SaveDeploymentRequest(_LocalFence):
     pass
 
 
-class SaveDeploymentAsRequest(_Fence):
+class SaveDeploymentAsRequest(_LocalFence):
     path: str = Field(min_length=1, max_length=4096)
     confirm_overwrite: bool = Field(default=False, alias="confirmOverwrite")
 
 
-class DiscardDeploymentRequest(_Fence):
+class DiscardDeploymentRequest(_LocalFence):
     pass
 
 
@@ -171,6 +203,11 @@ class ApplyDeploymentCandidateRequest(_Fence):
 # they are gateway/observation timeouts rather than generic server failures;
 # their code and message stay exactly as the state owner raised them.
 def _raise(error: Exception) -> NoReturn:
+    if isinstance(error, AuthoringWorkspaceError):
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
     if (
         isinstance(error, AuthoringJournalError)
         and error.code == "program_scene_preparation_unavailable"
@@ -216,8 +253,64 @@ def _write_roots(state: ComposerState) -> list[str]:
     return state.allowed_fs_roots
 
 
+def _published_deployment_canonical(
+    state: ComposerState, target: str
+) -> str | None:
+    """Return the content identity already published at one exact target.
+
+    Save resolves a lost response by rereading the exact target and comparing
+    this identity with the canonical content captured for that request. A
+    missing or unreadable target returns ``None``, so the ordinary overwrite
+    rules still apply.
+    """
+
+    try:
+        source, _path = load_deployment_artifact(
+            target, allowed_roots=_write_roots(state)
+        )
+        return state.deployment_draft_session.preview_source(source).canonical_json
+    except (DeploymentDraftError, OSError, ValueError):
+        return None
+
+
 def _workspace(state: ComposerState) -> dict[str, Any]:
-    workspace = state.deployment_draft_session.snapshot()
+    authoring = state.authoring_workspace.snapshot()
+    deployment = authoring.as_dict()["deployment"]
+    document = deployment["document"]
+    saved_document = deployment["savedDocument"]
+    workspace = {
+        "schemaVersion": "manyforge.composer_deployment_workspace.v1",
+        "draft": {
+            "id": deployment["draftId"],
+            "revision": deployment["draftRevision"],
+            "document": document,
+            "deploymentArtifactId": (
+                document.get("deployment_artifact_id")
+                if isinstance(document, dict)
+                else None
+            ),
+            "deploymentRevision": (
+                document.get("deployment_revision")
+                if isinstance(document, dict)
+                else None
+            ),
+            "graphRevision": (
+                document.get("graph_revision")
+                if isinstance(document, dict)
+                else None
+            ),
+            "differsFromSaved": deployment["differsFromSaved"],
+        },
+        "saved": {
+            "path": deployment["savedPath"],
+            "deploymentRevision": (
+                saved_document.get("deployment_revision")
+                if isinstance(saved_document, dict)
+                else None
+            ),
+        },
+    }
+    workspace["authoringWorkspace"] = authoring.identity.as_dict()
     draft = workspace["draft"]
     current_projection: dict[str, Any] | None = None
     current: dict[str, Any] | None = None
@@ -434,7 +527,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             )
         try:
             return coordinator.execute(
-                body.envelope(),
+                body.admission_envelope(),
                 operation_kind=operation_kind,
                 draft_id=body.draft_id,
                 draft_revision=body.expected_draft_revision,
@@ -454,74 +547,71 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/deployment/open-draft")
     def open_draft(body: OpenDeploymentRequest) -> dict[str, Any]:
-        prepared: dict[str, Any] = {}
-
-        def validate(_claim: dict[str, Any]) -> dict[str, Any]:
+        try:
             state.deployment_draft_session.require_open_allowed(
                 body.draft_id,
                 body.expected_draft_revision,
                 confirm_discard=body.confirm_discard,
             )
+            # The artifact read and its compilation happen outside every owner
+            # lock; the commit installs the compiled value atomically and
+            # rechecks the discard decision under the composite fence.
             source, source_path = load_deployment_artifact(
                 body.path, allowed_roots=state.allowed_fs_roots
             )
-            prepared["compiled"] = state.deployment_draft_session.preview_source(source)
-            prepared["source_path"] = source_path
-            return {"source_path": source_path}
-
-        def effect(_claim: dict[str, Any]) -> dict[str, Any]:
-            state.deployment_draft_session.commit_open(
-                prepared["compiled"],
-                prepared["source_path"],
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                confirm_discard=body.confirm_discard,
+            compiled = state.deployment_draft_session.preview_source(source)
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="open_deployment_draft",
+                session="deployment",
+                install=lambda: state.deployment_draft_session.commit_open(
+                    compiled,
+                    source_path,
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                    confirm_discard=body.confirm_discard,
+                ),
             )
-            return _workspace(state)
-
-        return execute(
-            body,
-            "open_deployment_draft",
-            prepare=lambda: {"effect_class": "local"},
-            validate=validate,
-            effect=effect,
-        )
+            return {
+                **_workspace(state),
+                "authoringWorkspace": commit.snapshot.as_dict(),
+            }
+        except Exception as error:
+            _raise(error)
 
     @router.post("/api/deployment/draft/mutations")
     def mutate_draft(body: UpdateDeploymentRequest) -> dict[str, Any]:
-        prepared: dict[str, CompiledDeploymentDocument] = {}
-
-        def validate(_claim: dict[str, Any]) -> None:
-            prepared["compiled"] = state.deployment_draft_session.preview_update(
+        try:
+            compiled = state.deployment_draft_session.preview_update(
                 body.path,
                 body.value,
                 body.operation,
                 draft_id=body.draft_id,
                 expected_revision=body.expected_draft_revision,
             )
-
-        def effect(_claim: dict[str, Any]) -> dict[str, Any]:
-            state.deployment_draft_session.commit_compiled(
-                prepared["compiled"],
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="mutate_deployment_draft",
+                session="deployment",
+                install=lambda: state.deployment_draft_session.commit_compiled(
+                    compiled,
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                ),
             )
-            return _workspace(state)
-
-        return execute(
-            body,
-            "mutate_deployment_draft",
-            prepare=lambda: {"effect_class": "local"},
-            validate=validate,
-            effect=effect,
-        )
+            return {
+                **_workspace(state),
+                "authoringWorkspace": commit.snapshot.as_dict(),
+            }
+        except Exception as error:
+            _raise(error)
 
     @router.post("/api/deployment/draft/controlled-stop")
     def update_controlled_stop(body: UpdateControlledStopRequest) -> dict[str, Any]:
-        prepared: dict[str, CompiledDeploymentDocument] = {}
-
-        def validate(_claim: dict[str, Any]) -> None:
-            prepared["compiled"] = (
+        try:
+            compiled = (
                 state.deployment_draft_session.preview_controlled_stop_update(
                     body.profile,
                     controllable_component_id=body.controllable_component_id,
@@ -531,31 +621,30 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     expected_revision=body.expected_draft_revision,
                 )
             )
-
-        def effect(_claim: dict[str, Any]) -> dict[str, Any]:
-            state.deployment_draft_session.commit_compiled(
-                prepared["compiled"],
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="mutate_deployment_controlled_stop",
+                session="deployment",
+                install=lambda: state.deployment_draft_session.commit_compiled(
+                    compiled,
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                ),
             )
-            return _workspace(state)
-
-        return execute(
-            body,
-            "mutate_deployment_controlled_stop",
-            prepare=lambda: {"effect_class": "local"},
-            validate=validate,
-            effect=effect,
-        )
+            return {
+                **_workspace(state),
+                "authoringWorkspace": commit.snapshot.as_dict(),
+            }
+        except Exception as error:
+            _raise(error)
 
     @router.post("/api/deployment/draft/motion-target-limit")
     def update_motion_target_limit(
         body: UpdateMotionTargetLimitRequest,
     ) -> dict[str, Any]:
-        prepared: dict[str, CompiledDeploymentDocument] = {}
-
-        def validate(_claim: dict[str, Any]) -> None:
-            prepared["compiled"] = (
+        try:
+            compiled = (
                 state.deployment_draft_session.preview_motion_target_limit_update(
                     controllable_component_id=body.controllable_component_id,
                     command_target_id=body.command_target_id,
@@ -564,107 +653,92 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     expected_revision=body.expected_draft_revision,
                 )
             )
-
-        def effect(_claim: dict[str, Any]) -> dict[str, Any]:
-            state.deployment_draft_session.commit_compiled(
-                prepared["compiled"],
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="mutate_deployment_motion_target_limit",
+                session="deployment",
+                install=lambda: state.deployment_draft_session.commit_compiled(
+                    compiled,
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                ),
             )
-            return _workspace(state)
-
-        return execute(
-            body,
-            "mutate_deployment_motion_target_limit",
-            prepare=lambda: {"effect_class": "local"},
-            validate=validate,
-            effect=effect,
-        )
+            return {
+                **_workspace(state),
+                "authoringWorkspace": commit.snapshot.as_dict(),
+            }
+        except Exception as error:
+            _raise(error)
 
     def save(body: SaveDeploymentRequest | SaveDeploymentAsRequest) -> dict[str, Any]:
-        state.deployment_draft_session.require_current(
-            body.draft_id, body.expected_draft_revision
-        )
-        snapshot = state.deployment_draft_session.snapshot()
-        current_path = snapshot["saved"]["path"]
-        if isinstance(body, SaveDeploymentAsRequest):
-            target = normalize_deployment_save_path(body.path)
-            resolved = str(
-                Path(target).expanduser().parent.resolve() / Path(target).name
-            )
-            overwrite = body.confirm_overwrite or resolved == current_path
-        else:
-            if current_path is None:
-                _raise(
-                    DeploymentDraftError(
-                        "deployment_saved_path_unavailable",
-                        "Save requires an existing path; use Save As",
-                        status_code=409,
-                    )
-                )
-            target = current_path
-            overwrite = True
-        canonical = state.deployment_draft_session.canonical_json(
-            draft_id=body.draft_id,
-            expected_revision=body.expected_draft_revision,
-        )
-        target_resolved = str(
-            Path(target).expanduser().parent.resolve() / Path(target).name
-        )
-        deployment_post = state.deployment_draft_session.retained_state()
-        deployment_post["saved_path"] = target_resolved
-        deployment_post["saved_document"] = deepcopy(snapshot["draft"]["document"])
-        post_state = {
-            "schema_version": "manyforge.composer_authoring_workspace.v2",
-            "program": state.draft_session.retained_state(),
-            "deployment": deployment_post,
-        }
+        """Persist one exact Deployment Draft and adopt it as the Saved baseline.
 
-        def validate(_claim: dict[str, Any]) -> None:
-            state.deployment_draft_session.require_current(
-                body.draft_id, body.expected_draft_revision
-            )
-            current_canonical = state.deployment_draft_session.canonical_json(
+        The capture, the write and the baseline adoption are three separate
+        steps: the write happens outside every owner lock and the adoption is one
+        composite commit fenced by the captured workspace identity.
+        """
+
+        target = body.path if isinstance(body, SaveDeploymentAsRequest) else None
+        try:
+            prepared = state.deployment_draft_session.prepare_save(
                 draft_id=body.draft_id,
                 expected_revision=body.expected_draft_revision,
+                target_path=(
+                    normalize_deployment_save_path(target)
+                    if target is not None
+                    else None
+                ),
+                confirm_overwrite=(
+                    body.confirm_overwrite
+                    if isinstance(body, SaveDeploymentAsRequest)
+                    else True
+                ),
             )
-            if current_canonical != canonical:
-                raise DeploymentDraftError(
-                    "deployment_draft_stale",
-                    "Deployment Draft changed; refresh before saving",
+            if _published_deployment_canonical(state, prepared.target_path) == (
+                prepared.canonical_json
+            ):
+                # This exact content is already published at the target, so a
+                # lost response is resolved without repeating the write.
+                saved_path = prepared.resolved_target
+            else:
+                saved_path = save_deployment_artifact(
+                    prepared.canonical_json,
+                    prepared.target_path,
+                    allowed_roots=_write_roots(state),
+                    overwrite=prepared.overwrite,
+                )
+            try:
+                commit = commit_local_authoring(
+                    state,
+                    body,
+                    operation_kind=prepared.tool_id,
+                    session="deployment",
+                    install=lambda: state.deployment_draft_session.install_prepared_save(
+                        prepared, saved_path=saved_path
+                    ),
+                )
+            except AuthoringWorkspaceError as error:
+                if error.code != "composer_workspace_stale":
+                    raise
+                raise HTTPException(
                     status_code=409,
-                )
-
-        def effect(_claim: dict[str, Any]) -> dict[str, Any]:
-            saved_path = save_deployment_artifact(
-                canonical,
-                target,
-                allowed_roots=_write_roots(state),
-                overwrite=overwrite,
-            )
-            state.deployment_draft_session.mark_saved(
-                saved_path,
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-            )
-            return _workspace(state)
-
-        return execute(
-            body,
-            "save_deployment_draft",
-            prepare=lambda: {
-                "schema_version": "manyforge.composer_authoring_effect.v1",
-                "operation_kind": "save_deployment_draft",
-                "effect_class": "external",
-                "external_kind": "save_deployment",
-                "target_path": target,
-                "overwrite": overwrite,
-                "canonical_json": canonical,
-                "post_state": post_state,
-            },
-            validate=validate,
-            effect=effect,
-        )
+                    detail={
+                        "code": "deployment_saved_baseline_not_adopted",
+                        "message": (
+                            "the Deployment artifact was written but a newer "
+                            "workspace revision was not adopted as Saved"
+                        ),
+                        "path": saved_path,
+                        "currentWorkspace": error.detail.get("workspace"),
+                    },
+                ) from error
+            return {
+                **_workspace(state),
+                "authoringWorkspace": commit.snapshot.as_dict(),
+            }
+        except Exception as error:
+            _raise(error)
 
     @router.post("/api/deployment/save")
     def save_draft(body: SaveDeploymentRequest) -> dict[str, Any]:
@@ -676,12 +750,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/deployment/discard")
     def discard(body: DiscardDeploymentRequest) -> dict[str, Any]:
-        prepared: dict[str, CompiledDeploymentDocument] = {}
-
-        def validate(_claim: dict[str, Any]) -> None:
-            state.deployment_draft_session.require_current(
-                body.draft_id, body.expected_draft_revision
-            )
+        try:
             # Discard only restores the local Draft from the authoritative
             # Manager publication.  It must remain usable while the newly
             # published runtime is still converging; requiring the strict
@@ -689,61 +758,89 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             # the normal post-Apply settling window.  Keep a strict fallback
             # for lightweight authoring doubles that expose no publication
             # projection.
-            current_projection = state.published_scenario()
-            current = current_projection.get("current_scenario")
-            if not isinstance(current, dict):
-                current = current_projection.get("published_scenario")
-            if not isinstance(current, dict):
-                strict_projection = state.current_scenario()
-                current = strict_projection.get("current_scenario")
-                current_projection = strict_projection
-            if current_projection.get("ready") is not True or not isinstance(
-                current, dict
-            ):
-                raise DeploymentDraftError(
-                    "deployment_applied_unavailable",
-                    "Deployment Discard requires one exact Manager Applied Scenario",
-                    status_code=409,
+            def read_applied() -> tuple[dict[str, Any], str]:
+                current_projection = state.published_scenario()
+                current = current_projection.get("current_scenario")
+                if not isinstance(current, dict):
+                    current = current_projection.get("published_scenario")
+                if not isinstance(current, dict):
+                    strict_projection = state.current_scenario()
+                    current = strict_projection.get("current_scenario")
+                    current_projection = strict_projection
+                if current_projection.get("ready") is not True or not isinstance(
+                    current, dict
+                ):
+                    raise DeploymentDraftError(
+                        "deployment_applied_unavailable",
+                        "Deployment Discard requires one exact Manager Applied Scenario",
+                        status_code=409,
+                    )
+                if state.headless_client is None:
+                    raise DeploymentDraftError(
+                        "deployment_applied_unavailable",
+                        "Deployment Discard requires the configured Manager",
+                        status_code=503,
+                    )
+                selection = state.headless_client.scenario_load_selection(
+                    current["scenario_id"]
                 )
-            if state.headless_client is None:
-                raise DeploymentDraftError(
-                    "deployment_applied_unavailable",
-                    "Deployment Discard requires the configured Manager",
-                    status_code=503,
+                applied = selection.get("deployment")
+                if (
+                    not isinstance(applied, dict)
+                    or applied.get("deployment_revision")
+                    != current.get("deployment_revision")
+                ):
+                    raise DeploymentDraftError(
+                        "deployment_applied_projection_mismatch",
+                        "Applied Scenario did not return its exact Deployment document",
+                        status_code=409,
+                    )
+                identity = raw_sha256_digest(
+                    canonical_json_bytes(
+                        {
+                            "scenario_id": current["scenario_id"],
+                            "deployment": applied,
+                        }
+                    )
                 )
-            selection = state.headless_client.scenario_load_selection(
-                current["scenario_id"]
-            )
-            applied = selection.get("deployment")
-            if (
-                not isinstance(applied, dict)
-                or applied.get("deployment_revision")
-                != current.get("deployment_revision")
-            ):
-                raise DeploymentDraftError(
-                    "deployment_applied_projection_mismatch",
-                    "Applied Scenario did not return its exact Deployment document",
-                    status_code=409,
-                )
-            prepared["compiled"] = state.deployment_draft_session.preview_source(
+                return applied, identity
+
+            applied, applied_identity = read_applied()
+            # The publication read and compilation stay outside owner locks.
+            # Once admission is claimed, re-read its exact identity before the
+            # local install; Manager publication is external to the workspace
+            # revision and therefore needs this explicit validation.
+            compiled = state.deployment_draft_session.preview_source(
                 json.dumps(applied, ensure_ascii=False, allow_nan=False)
             )
 
-        def effect(_claim: dict[str, Any]) -> dict[str, Any]:
-            state.deployment_draft_session.commit_compiled(
-                prepared["compiled"],
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-            )
-            return _workspace(state)
+            def validate_applied_under_claim() -> None:
+                _current, current_identity = read_applied()
+                if current_identity != applied_identity:
+                    raise DeploymentDraftError(
+                        "deployment_applied_changed",
+                        "Manager Applied Deployment changed before Discard committed",
+                        status_code=409,
+                    )
 
-        return execute(
-            body,
-            "discard_deployment_draft",
-            prepare=lambda: {"effect_class": "local"},
-            validate=validate,
-            effect=effect,
-        )
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="discard_deployment_draft",
+                session="deployment",
+                validate_under_claim=validate_applied_under_claim,
+                install=lambda: state.deployment_draft_session.commit_compiled(
+                    compiled,
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                ),
+            )
+            return {
+                **_workspace(state),
+                "authoringWorkspace": commit.snapshot.as_dict(),
+            }
+        except Exception as error:
+            _raise(error)
 
     @router.post("/api/deployment/revert")
     def revert(body: RevertDeploymentRequest) -> dict[str, Any]:
@@ -892,7 +989,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         if coordinator is not None:
             try:
                 replayed, result = coordinator.replay_or_recover_exact(
-                    body.envelope(),
+                    body.admission_envelope(),
                     operation_kind=operation_kind,
                     draft_id=body.draft_id,
                     draft_revision=body.expected_draft_revision,

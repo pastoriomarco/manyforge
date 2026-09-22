@@ -23,6 +23,7 @@ import {
   useHeadlessStateSource,
   useShellHeadlessState,
 } from './hooks/useHeadlessState';
+import { useAuthoringWorkspace } from './hooks/useAuthoringWorkspace';
 import { useDeploymentWorkspace } from './hooks/useDeploymentWorkspace';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
@@ -152,9 +153,14 @@ export default function App() {
   const headlessStateSource = useHeadlessStateSource(headlessEnabled);
   const headlessState = useShellHeadlessState(headlessStateSource);
   const headlessSnapshot = headlessState.snapshot;
+  // One shared authoring publication for the whole workbench: Program,
+  // Deployment and Scenario authoring all read this single snapshot, so no
+  // consumer establishes an independent authoring identity.
+  const authoringWorkspace = useAuthoringWorkspace(headlessSnapshot);
   const deploymentController = useDeploymentWorkspace(
     headlessEnabled,
     headlessSnapshot,
+    authoringWorkspace,
   );
   useEffect(() => {
     if (!headlessEnabled) {
@@ -171,7 +177,10 @@ export default function App() {
     nodeEnvironmentWakeKey.current = key;
     retryNodeEnvironment();
   }, [headlessEnabled, headlessSnapshot, retryNodeEnvironment]);
-  const programController = useProgramWorkspace(headlessSnapshot);
+  const programController = useProgramWorkspace(
+    headlessSnapshot,
+    authoringWorkspace,
+  );
   const programRuntime = useProgramRuntime(
     headlessEnabled,
     headlessSnapshot,

@@ -160,10 +160,12 @@ The Viewer uses its separate applied-frame-credit WebSocket. No control client
 means no control-source subscription, reduction, serialization, heartbeat, or
 diagnostic timer.
 
-At the public Composer endpoint, a committed edit to Composer's local Draft
-adds one tiny latest-only `delta` containing the new `draft_identity`; it does
-not resend the runtime shell or wait for a runtime update. Its shell is marked
-`complete: false`, so it cannot be consumed as a complete runtime snapshot.
+At the public Composer endpoint, a committed edit to the shared Program,
+Deployment, or Scenario authoring workspace adds one tiny latest-only `delta`
+containing `authoring_workspace`: the composite workspace epoch/revision and
+both Draft identities. It does not resend the runtime shell or wait for a
+runtime update. Its shell is marked `complete: false`, so it cannot be consumed
+as a complete runtime snapshot.
 Composer assigns the public downstream `server_sequence` across both proxied
 Headless messages and this local delta. The opaque Headless freshness context
 is forwarded unchanged and remains the only context accepted by Headless for

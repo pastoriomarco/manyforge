@@ -26,6 +26,7 @@ from manyforge_composer.backend.program_artifacts import (
     save_program_artifact,
 )
 from manyforge_composer.backend import routes_draft
+from manyforge_composer.backend.authoring_admission import LocalAuthoringCommit
 from manyforge_composer.backend.routes_draft import (
     _apply_program,
     _assistant_proposal_operations,
@@ -60,9 +61,59 @@ class _AuthoringPassThrough:
             validate_under_claim({})
         return effect({})
 
+    def execute_local_mutation(
+        self,
+        _envelope,
+        *,
+        session="program",
+        draft_id=None,
+        workspace,
+        install=None,
+        expected_identity=None,
+        project=None,
+        **_kwargs,
+    ):
+        """Commit through the real composite owner; only the Kernel is stubbed.
+
+        Every migrated route commits through the workspace owner, so the fence,
+        the revision and the response projection come from production code. The
+        admission protocol itself is covered by
+        ``test_authoring_admission.py`` and ``test_authoring_local_mutation.py``.
+        """
+
+        if session == "whole-workspace":
+            snapshot = workspace.replace(
+                expected_identity=expected_identity,
+                install=install,
+                project=project,
+            )
+        elif session == "project":
+            snapshot = workspace.commit_project(
+                expected_identity=expected_identity,
+                facts=project,
+            )
+        elif session == "deployment":
+            snapshot = workspace.commit_deployment(
+                draft_id=draft_id,
+                expected_identity=expected_identity,
+                install=install,
+            )
+        else:
+            snapshot = workspace.commit_program(
+                draft_id=draft_id,
+                expected_identity=expected_identity,
+                install=install,
+            )
+        return LocalAuthoringCommit(snapshot=snapshot, admission_generation=2)
+
+
+_FENCED_STATE: ComposerState | None = None
+
 
 def _enable_authoring(state: ComposerState) -> ComposerState:
+    global _FENCED_STATE
     state.authoring_admission = _AuthoringPassThrough()  # type: ignore[assignment]
+    _FENCED_STATE = state
     return state
 
 
@@ -91,12 +142,20 @@ def _client(
 
 
 def _fence(workspace: dict) -> dict:
+    """Build the Program Draft fence plus the required workspace fence."""
+
+    identity = workspace.get("authoringWorkspace")
+    if identity is None:
+        assert _FENCED_STATE is not None
+        identity = _FENCED_STATE.authoring_workspace.identity().as_dict()
     return {
         "draftId": workspace["draft"]["draftId"],
         "expectedDraftRevision": workspace["draft"]["draftRevision"],
         "expectedAdmissionGeneration": 1,
         "requestOwnerEpoch": "test-browser.epoch.1",
         "requestId": "test-browser.request.1",
+        "expectedWorkspaceEpoch": identity["workspaceEpoch"],
+        "expectedWorkspaceRevision": identity["workspaceRevision"],
     }
 
 
@@ -620,7 +679,12 @@ def test_node_policy_mutation_is_closed_draft_only_and_revision_fenced(
     )
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"mutation", "details", "workspace"}
+    assert set(body) == {
+        "mutation",
+        "details",
+        "workspace",
+        "authoringWorkspace",
+    }
     assert body["mutation"] == "program_draft_update_node_policies"
     assert body["details"] == {"updated_instance_id": "move_to_pick"}
     draft = body["workspace"]["draft"]
@@ -850,7 +914,12 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"mutation", "details", "workspace"}
+    assert set(body) == {
+        "mutation",
+        "details",
+        "workspace",
+        "authoringWorkspace",
+    }
     assert body["workspace"]["draft"]["program"]["tree"]["children"][0][
         "recovery_policy"
     ]["allowed_skills"] == ["legacy.inspect"]
@@ -859,7 +928,9 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
     blocked_apply = client.post(
         "/api/program/apply",
         json={
-            **_fence(body["workspace"]),
+            key: value
+            for key, value in _fence(body["workspace"]).items()
+            if key not in {"expectedWorkspaceEpoch", "expectedWorkspaceRevision"}
         },
     )
     assert blocked_apply.status_code == 409

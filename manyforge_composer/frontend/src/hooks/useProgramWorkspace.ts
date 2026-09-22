@@ -4,11 +4,16 @@ import {
   useMemo,
   useReducer,
   useRef,
-  useState,
 } from 'react';
 
-import { api } from '../api/client';
+import { api, isStaleWorkspaceError } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
+import {
+  programLocalFence,
+  publicationSupersedesProgram,
+  scenarioLocalFence,
+  withSharedProgramAuthoring,
+} from '../state/authoringWorkspace';
 import {
   INITIAL_PROGRAM_WORKSPACE_STATE,
   programWorkspaceReducer,
@@ -17,6 +22,7 @@ import {
 import type {
   DraftMutationResponse,
   JsonValue,
+  LocalWorkspaceFenceRequest,
   ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
@@ -25,37 +31,15 @@ import type {
   ProgramWorkspaceTransitionResponse,
   ProgramWorkspaceTransitionStatus,
   ScenarioDocumentFenceRequest,
-  ScenarioDocumentLoadResponse,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
+import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
 import { browserStableIdentity } from './useHeadlessState';
 
 function identity(prefix: string): string {
   const random = globalThis.crypto?.randomUUID?.()
     ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   return `${prefix}.${random}`;
-}
-
-function fence(
-  workspace: ProgramWorkspaceResponse | null,
-  snapshot: ComposerHeadlessState | null,
-  requestOwnerEpoch: string,
-) {
-  if (
-    workspace === null
-    || snapshot === null
-    || snapshot.draftIdentity.draftId !== workspace.draft.draftId
-    || snapshot.draftIdentity.draftRevision !== workspace.draft.draftRevision
-    || !snapshot.authoringAdmission.authoringAllowed
-    || snapshot.programCycle.state !== 'idle_after_reset'
-  ) return null;
-  return {
-    draftId: workspace.draft.draftId,
-    expectedDraftRevision: workspace.draft.draftRevision,
-    expectedAdmissionGeneration: snapshot.authoringAdmission.admissionGeneration,
-    requestOwnerEpoch,
-    requestId: identity('composer-authoring'),
-  };
 }
 
 interface ProgramWorkspaceRunResult {
@@ -101,42 +85,34 @@ export function programWorkspaceTransitionResult(
   throw new Error(`Unexpected ${response.status} status for ${action}.`);
 }
 
-export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = null) {
+export function useProgramWorkspace(
+  snapshot: ComposerHeadlessState | null,
+  authoring: AuthoringWorkspaceController,
+) {
   const [state, dispatch] = useReducer(
     programWorkspaceReducer,
     INITIAL_PROGRAM_WORKSPACE_STATE,
   );
-  const [scenarioDocumentPath, setScenarioDocumentPath] = useState<string | null>(null);
-  const [scenarioSourceDiagnostics, setScenarioSourceDiagnostics] = useState<ScenarioDocumentLoadResponse['sourceDiagnostics']>([]);
   const generation = useRef(0);
   const mounted = useRef(true);
   const workspaceRead = useRef<Promise<ProgramWorkspaceResponse> | null>(null);
   const workspaceReadGeneration = useRef<number | null>(null);
-  const initialReadStarted = useRef(false);
-  const requestedSnapshotIdentity = useRef<string | null>(null);
+  const projectionIdentityRead = useRef<string | null>(null);
   const requestOwnerEpoch = useRef(browserStableIdentity(
     'manyforge.composer.request_owner_epoch',
     'composer-authoring-owner',
   ));
-  const mutationAvailable = state.workspace !== null
-    && snapshot !== null
-    && snapshot.draftIdentity.draftId === state.workspace.draft.draftId
-    && snapshot.draftIdentity.draftRevision === state.workspace.draft.draftRevision
-    && snapshot.authoringAdmission.authoringAllowed
-    && snapshot.programCycle.state === 'idle_after_reset';
+  // Authoring identity, both Draft projections' fences and the admission gate
+  // come from the one shared publication. This hook contributes the
+  // Applied/applicability projection it reads from the Program workspace route,
+  // which owns runtime truth.
   const mutationUnavailableReason = state.workspace === null
     ? 'Program workspace is not loaded.'
-    : snapshot === null
-      ? 'Backend status is disconnected or has not arrived.'
-      : snapshot.draftIdentity.draftId !== state.workspace.draft.draftId
-        || snapshot.draftIdentity.draftRevision !== state.workspace.draft.draftRevision
-        ? 'The displayed Draft is still synchronizing with the backend.'
-        : snapshot.programCycle.state !== 'idle_after_reset'
-          ? `Program execution is ${snapshot.programCycle.state.replaceAll('_', ' ')}; authoring requires Idle.`
-          : !snapshot.authoringAdmission.authoringAllowed
-            ? 'The backend has not admitted authoring; execution must be Idle and required components healthy.'
-            : null;
+    : authoring.unavailableReason;
+  const mutationAvailable = mutationUnavailableReason === null;
   const admissionObserved = snapshot !== null;
+  const published = authoring.published;
+  const project = authoring.project;
 
   const readWorkspace = useCallback((requestGeneration: number) => {
     if (
@@ -192,65 +168,126 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
           error: errorMessage(error, 'Program workspace request failed.'),
         });
       }
+      // Another client's accepted edit moved the workspace ahead of this
+      // request. Refresh both owners' truth once and never repeat the edit.
+      if (isStaleWorkspaceError(error)) {
+        void readWorkspace(current).then(
+          (workspace) => {
+            if (mounted.current) {
+              dispatch({
+                type: 'request_succeeded',
+                generation: current,
+                workspace,
+                message: null,
+                transitionStatus: null,
+              });
+            }
+          },
+          () => undefined,
+        );
+        void authoring.refresh();
+      }
       return null;
     }
-  }, []);
+  }, [authoring]);
 
-  const refresh = useCallback(() => run(
-    'refresh',
-    () => readWorkspace(generation.current).then((workspace) =>
-      workspaceResult(workspace, null)),
-  ), [readWorkspace, run]);
+  const refresh = useCallback(() => {
+    const result = run(
+      'refresh',
+      () => readWorkspace(generation.current).then((workspace) =>
+        workspaceResult(workspace, null)),
+    );
+    // The shared publication is the authoring half of this projection, so an
+    // operator refresh reads both owners' truth instead of only the Applied
+    // projection.
+    void authoring.refresh();
+    return result;
+  }, [authoring, readWorkspace, run]);
 
   useEffect(() => {
     mounted.current = true;
-    if (!initialReadStarted.current) {
-      initialReadStarted.current = true;
-      void refresh();
-    }
     return () => {
       mounted.current = false;
     };
-  }, [refresh]);
+  }, []);
 
   useEffect(() => {
-    if (snapshot === null || state.workspace === null) return;
-    const displayed = state.workspace.draft;
-    const observed = snapshot.draftIdentity;
-    const backendHasNewerDraft = displayed.draftId !== observed.draftId
-      || observed.draftRevision > displayed.draftRevision;
-    if (!backendHasNewerDraft) {
-      requestedSnapshotIdentity.current = null;
+    if (!authoring.current || published === null) return;
+    const identityKey = `${published.identity.workspaceEpoch}:${published.identity.workspaceRevision}`;
+    if (projectionIdentityRead.current === identityKey) return;
+    projectionIdentityRead.current = identityKey;
+    const requestGeneration = generation.current + 1;
+    void run(
+      'refresh',
+      () => readWorkspace(requestGeneration).then((workspace) =>
+        workspaceResult(workspace, null)),
+    );
+  }, [authoring.current, published, readWorkspace, run]);
+
+  useEffect(() => {
+    if (state.workspace === null || published === null) return;
+    // Never let a lagging publication revert a just-committed post-image.
+    if (!publicationSupersedesProgram(published, state.workspace)) return;
+    // Publish the shared authoring half into the projection this hook displays.
+    // The publication is the only authoring writer, so this can never resurrect
+    // an older Draft over a newer one.
+    const merged = withSharedProgramAuthoring(
+      state.workspace,
+      published.snapshot,
+    );
+    if (
+      merged.draft === state.workspace.draft
+      && merged.saved === state.workspace.saved
+      && merged.hasUnsavedChanges === state.workspace.hasUnsavedChanges
+    ) {
       return;
     }
-    const identityKey = `${observed.draftId}:${observed.draftRevision}`;
-    if (requestedSnapshotIdentity.current === identityKey) return;
-    requestedSnapshotIdentity.current = identityKey;
-    void refresh();
-  }, [refresh, snapshot, state.workspace]);
+    dispatch({ type: 'authoring_synced', workspace: merged });
+  }, [published, state.workspace]);
 
   const requireWorkspace = useCallback((): ProgramWorkspaceResponse | null =>
     state.workspace, [state.workspace]);
 
-  const scenarioFence = useCallback(async (
-    workspace: ProgramWorkspaceResponse,
-  ): Promise<ScenarioDocumentFenceRequest | null> => {
-    const programFence = fence(workspace, snapshot, requestOwnerEpoch.current);
-    if (programFence === null) return null;
-    const deployment = await api.deploymentWorkspace.get();
-    return {
-      ...programFence,
-      deploymentDraftId: deployment.draft.id,
-      expectedDeploymentDraftRevision: deployment.draft.revision,
-    };
-  }, [snapshot]);
+  /** The one local Program fence, or ``null`` while authoring is gated. */
+  const localFence = useCallback((): LocalWorkspaceFenceRequest | null => {
+    if (
+      mutationUnavailableReason !== null
+      || published === null
+      || snapshot === null
+    ) return null;
+    return programLocalFence(
+      published,
+      snapshot,
+      requestOwnerEpoch.current,
+      identity('composer-authoring'),
+    );
+  }, [mutationUnavailableReason, published, snapshot]);
+
+  /**
+   * The one Scenario document fence.
+   *
+   * Both Draft halves come from the same installed publication the backend
+   * rechecks, so this needs no second workspace read.
+   */
+  const scenarioFence = useCallback((): ScenarioDocumentFenceRequest | null => {
+    if (
+      mutationUnavailableReason !== null
+      || published === null
+      || snapshot === null
+    ) return null;
+    return scenarioLocalFence(
+      published,
+      snapshot,
+      requestOwnerEpoch.current,
+      identity('composer-document'),
+    );
+  }, [mutationUnavailableReason, published, snapshot]);
 
   const mutate = useCallback(async (
     mutation: string,
     args: Record<string, JsonValue>,
   ): Promise<DraftMutationResponse | null> => {
-    const workspace = requireWorkspace();
-    const requestFence = fence(workspace, snapshot, requestOwnerEpoch.current);
+    const requestFence = localFence();
     if (!requestFence) return null;
     let response: DraftMutationResponse | null = null;
     const result = await run(
@@ -261,12 +298,10 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
       },
     );
     return result === null ? null : response;
-  }, [requireWorkspace, run, snapshot]);
+  }, [localFence, run]);
 
   const openDraft = useCallback((path: string, confirmDiscard: boolean) => {
-    const workspace = requireWorkspace();
-    const requestFence = workspace
-      ? fence(workspace, snapshot, requestOwnerEpoch.current) : null;
+    const requestFence = localFence();
     if (!requestFence) return;
     void run(
       'open_draft',
@@ -279,12 +314,10 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
         'Program opened as Draft; runtime Applied state was not changed.',
       )),
     );
-  }, [requireWorkspace, run, snapshot]);
+  }, [localFence, run]);
 
   const newDraft = useCallback((confirmDiscard: boolean) => {
-    const workspace = requireWorkspace();
-    const requestFence = workspace
-      ? fence(workspace, snapshot, requestOwnerEpoch.current) : null;
+    const requestFence = localFence();
     if (!requestFence) return;
     void run(
       'new',
@@ -296,12 +329,10 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
         'New unsaved Program Draft created; Saved, disk, and runtime were not changed.',
       )),
     );
-  }, [requireWorkspace, run, snapshot]);
+  }, [localFence, run]);
 
   const save = useCallback(() => {
-    const workspace = requireWorkspace();
-    const requestFence = workspace
-      ? fence(workspace, snapshot, requestOwnerEpoch.current) : null;
+    const requestFence = localFence();
     if (!requestFence) return;
     void run(
       'save',
@@ -311,12 +342,10 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
           'Draft saved; runtime Applied state was not changed.',
         )),
     );
-  }, [requireWorkspace, run, snapshot]);
+  }, [localFence, run]);
 
   const saveAs = useCallback((path: string, confirmOverwrite: boolean) => {
-    const workspace = requireWorkspace();
-    const requestFence = workspace
-      ? fence(workspace, snapshot, requestOwnerEpoch.current) : null;
+    const requestFence = localFence();
     if (!requestFence) return;
     void run(
       'save_as',
@@ -329,24 +358,20 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
         'Draft saved to the selected path; runtime Applied state was not changed.',
       )),
     );
-  }, [requireWorkspace, run, snapshot]);
+  }, [localFence, run]);
 
   const apply = useCallback(() => {
-    const workspace = requireWorkspace();
-    const requestFence = workspace
-      ? fence(workspace, snapshot, requestOwnerEpoch.current) : null;
+    const requestFence = localFence();
     if (!requestFence) return;
     void run(
       'apply',
       () => api.programWorkspace.apply(requestFence)
         .then((response) => programWorkspaceTransitionResult('apply', response)),
     );
-  }, [requireWorkspace, run, snapshot]);
+  }, [localFence, run]);
 
   const discard = useCallback(() => {
-    const workspace = requireWorkspace();
-    const requestFence = workspace
-      ? fence(workspace, snapshot, requestOwnerEpoch.current) : null;
+    const requestFence = localFence();
     if (!requestFence) return;
     void run(
       'discard',
@@ -356,19 +381,17 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
           'Draft discarded to the owner-issued Applied Program; Saved was unchanged.',
         )),
     );
-  }, [requireWorkspace, run, snapshot]);
+  }, [localFence, run]);
 
   const revert = useCallback(() => {
-    const workspace = requireWorkspace();
-    const requestFence = workspace
-      ? fence(workspace, snapshot, requestOwnerEpoch.current) : null;
+    const requestFence = localFence();
     if (!requestFence) return;
     void run(
       'revert',
       () => api.programWorkspace.revert(requestFence)
         .then((response) => programWorkspaceTransitionResult('revert', response)),
     );
-  }, [requireWorkspace, run, snapshot]);
+  }, [localFence, run]);
 
   const saveScenarioDocument = useCallback((input: {
     path: string;
@@ -377,32 +400,27 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     description: string;
     confirmOverwrite: boolean;
   }) => {
-    const workspace = requireWorkspace();
-    if (workspace === null) return;
     void run('save_scenario_document', async () => {
-      const requestFence = await scenarioFence(workspace);
+      const requestFence = scenarioFence();
       if (requestFence === null) throw new Error('Scenario Save is not admitted.');
       const response = await api.scenarioDocuments.save(requestFence, input);
-      setScenarioDocumentPath(response.path);
-      setScenarioSourceDiagnostics([]);
       return workspaceResult(
         response.workspace,
         `Scenario saved (${response.lastKnownStatus}); runtime state was not changed.`,
       );
     });
-  }, [requireWorkspace, run, scenarioFence]);
+  }, [run, scenarioFence]);
 
   const exportScenarioDocument = useCallback((destinationPath: string) => {
-    const workspace = requireWorkspace();
-    if (workspace === null) return;
+    const requestFence = scenarioFence();
+    const current = requireWorkspace();
+    if (requestFence === null || current === null) return;
     void run('export_scenario_document', async () => {
-      const requestFence = await scenarioFence(workspace);
-      if (requestFence === null) throw new Error('Scenario Export is not admitted.');
       const response = await api.scenarioDocuments.export(
         requestFence, destinationPath,
       );
       return workspaceResult(
-        workspace,
+        current,
         `Portable Scenario exported to ${response.path}.`,
       );
     });
@@ -412,17 +430,14 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     path: string,
     confirmDiscard: boolean,
   ) => {
-    const workspace = requireWorkspace();
-    if (workspace === null) return;
     void run('load_scenario_document', async () => {
-      const requestFence = await scenarioFence(workspace);
+      const requestFence = scenarioFence();
       if (requestFence === null) throw new Error('Scenario Load is not admitted.');
       const response = await api.scenarioDocuments.load(
         requestFence,
         path,
         confirmDiscard,
       );
-      setScenarioDocumentPath(response.path);
       return workspaceResult(
         response.workspace,
         response.incomplete
@@ -430,24 +445,23 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
           : 'Scenario opened for editing; runtime state was not changed.',
       );
     });
-  }, [requireWorkspace, run, scenarioFence]);
+  }, [run, scenarioFence]);
 
   const convertLegacyScenarioDocument = useCallback((input: {
     sourcePath: string;
     destinationPath: string;
     confirmOverwrite: boolean;
   }) => {
-    const workspace = requireWorkspace();
-    if (workspace === null) return;
+    const current = requireWorkspace();
+    if (current === null) return;
     void run('convert_legacy_scenario_document', async () => {
-      const response = await api.scenarioDocuments.convertLegacy(
+      await api.scenarioDocuments.convertLegacy(
         input.sourcePath,
         input.destinationPath,
         input.confirmOverwrite,
       );
-      setScenarioDocumentPath(response.path);
       return workspaceResult(
-        workspace,
+        current,
         'Legacy Scenario converted to a project; the source file and runtime state were unchanged.',
       );
     });
@@ -490,8 +504,10 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     loadScenarioDocument,
     convertLegacyScenarioDocument,
     exportScenarioDocument,
-    scenarioDocumentPath,
-    scenarioSourceDiagnostics,
+    // The selected project path and its source diagnostics are shared project
+    // facts of the one publication, not per-hook state.
+    scenarioDocumentPath: project === null ? null : project.documentPath,
+    scenarioSourceDiagnostics: project === null ? [] : project.sourceDiagnostics,
     updateNodePolicies,
     clearFeedback,
   }), [
@@ -507,13 +523,12 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     mutationUnavailableReason,
     newDraft,
     openDraft,
+    project,
     refresh,
     revert,
     save,
     saveAs,
     saveScenarioDocument,
-    scenarioDocumentPath,
-    scenarioSourceDiagnostics,
     state,
     updateNodePolicies,
   ]);

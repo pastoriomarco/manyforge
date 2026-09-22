@@ -7,13 +7,28 @@ import {
   historianListPath,
   resolveStructuralAssetUrl,
 } from './client';
-import type { DraftFenceRequest, ManagerApplyRequest } from '../types/api';
+import type {
+  DraftFenceRequest,
+  LocalWorkspaceFenceRequest,
+  ManagerApplyRequest,
+} from '../types/api';
 import type { OperatorAlarmRecord } from '../types/headless';
 import type { RuntimeScaleControlSelector } from '../types/robotControl';
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+it('reads the shared authoring workspace through its single endpoint', async () => {
+  const fetchMock = vi.fn().mockResolvedValue(response({}));
+  vi.stubGlobal('fetch', fetchMock);
+
+  await expect(api.authoringWorkspace.get()).rejects.toThrow(
+    /authoringWorkspace/,
+  );
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/authoring/workspace');
 });
 
 it('downloads filtered diagnostics directly without fetching or parsing into UI state', () => {
@@ -275,6 +290,18 @@ function draftFence(revision = 1): DraftFenceRequest {
     expectedAdmissionGeneration: 4,
     requestOwnerEpoch: 'composer-authoring-owner.fixture',
     requestId: 'composer-authoring.fixture',
+  };
+}
+
+/**
+ * The migrated ordinary routes also require the composite workspace fence;
+ * Apply, Revert and Deployment candidate requests keep the plain fence.
+ */
+function localFence(revision = 1): LocalWorkspaceFenceRequest {
+  return {
+    ...draftFence(revision),
+    expectedWorkspaceEpoch: 'workspace.epoch.1',
+    expectedWorkspaceRevision: 3,
   };
 }
 
@@ -621,7 +648,7 @@ describe('structural API client', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const result = await api.programWorkspace.mutate(
-      draftFence(),
+      localFence(),
       'tree_draft_update_node_params',
       {
         instance_id: 'wait',
@@ -633,7 +660,7 @@ describe('structural API client', () => {
     const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('/api/program/draft/mutations');
     expect(JSON.parse(String(options.body))).toEqual({
-      ...draftFence(),
+      ...localFence(),
       mutation: 'tree_draft_update_node_params',
       arguments: {
         instance_id: 'wait',
@@ -697,11 +724,12 @@ describe('structural API client', () => {
         workspace: workspaceFixture(),
       }));
     vi.stubGlobal('fetch', fetchMock);
-    const currentFence = draftFence(7);
+    const currentFence = localFence(7);
+    const revertFence = draftFence(7);
 
     await api.programWorkspace.newDraft(currentFence, true);
     await api.programWorkspace.discard(currentFence);
-    await api.programWorkspace.revert(currentFence);
+    await api.programWorkspace.revert(revertFence);
 
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       '/api/program/new-draft',
@@ -716,7 +744,7 @@ describe('structural API client', () => {
     ))).toEqual(currentFence);
     expect(JSON.parse(String(
       (fetchMock.mock.calls[2]?.[1] as RequestInit).body,
-    ))).toEqual(currentFence);
+    ))).toEqual(revertFence);
   });
 
   it('lists, saves, and loads editable Scenario documents with both Draft fences', async () => {
@@ -755,7 +783,7 @@ describe('structural API client', () => {
       }));
     vi.stubGlobal('fetch', fetchMock);
     const scenarioFence = {
-      ...draftFence(),
+      ...localFence(),
       deploymentDraftId: 'deployment-draft-1',
       expectedDeploymentDraftRevision: 3,
     };

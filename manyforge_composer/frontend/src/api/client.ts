@@ -1,4 +1,5 @@
 import {
+  parseAuthoringWorkspaceSnapshot,
   parseCatalogResponse,
   parseAppliedProgramSelection,
   parseCapabilityCommandPreviewResponse,
@@ -53,11 +54,13 @@ import {
 import type {
   ArtifactKind,
   AppliedProgramSelection,
+  AuthoringWorkspaceSnapshot,
   CatalogResponse,
   ManagerApplyRequest,
   ManagerDeploymentCandidatePreviewRequest,
   ManagerDeploymentCandidatePreviewResponse,
   DraftFenceRequest,
+  LocalWorkspaceFenceRequest,
   DraftMutationResponse,
   DeploymentControlledStopUpdate,
   DeploymentCandidateOperationResponse,
@@ -294,6 +297,39 @@ export class ApiError extends Error {
   }
 }
 
+const STALE_WORKSPACE_CODES = new Set([
+  // The composite workspace or a Draft identity moved under this request.
+  'composer_workspace_stale',
+  'composer_draft_id_stale',
+  'composer_draft_revision_stale',
+  'scenario_workspace_stale',
+  // The artifact was written, but a newer workspace revision refused to be
+  // labelled Saved; the client must adopt the newer identity, not retry.
+  'program_saved_baseline_not_adopted',
+  'deployment_saved_baseline_not_adopted',
+]);
+
+/**
+ * Recognize one typed stale rejection.
+ *
+ * A stale fence means another client's accepted edit moved the workspace, so the
+ * only correct response is to refresh the observed identity. It is never a blind
+ * retry of the same request.
+ */
+export function isStaleWorkspaceError(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.status !== 409) return false;
+  const payload = error.payload;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    return false;
+  }
+  const detail = (payload as Record<string, unknown>).detail;
+  if (detail === null || typeof detail !== 'object' || Array.isArray(detail)) {
+    return false;
+  }
+  const code = (detail as Record<string, unknown>).code;
+  return typeof code === 'string' && STALE_WORKSPACE_CODES.has(code);
+}
+
 async function requestJson<T>(
   path: string,
   parser: (value: unknown) => T,
@@ -460,6 +496,21 @@ export const api = {
       signal,
     ),
   },
+  authoringWorkspace: {
+    /**
+     * Read the one atomic composite authoring snapshot.
+     *
+     * Every authoring consumer takes its identity, both Draft projections and
+     * the Scenario project facts from this single read, so no consumer
+     * establishes an independent authoring identity.
+     */
+    get: (signal?: AbortSignal): Promise<AuthoringWorkspaceSnapshot> =>
+      requestJson(
+        '/api/authoring/workspace',
+        parseAuthoringWorkspaceSnapshot,
+        signal,
+      ),
+  },
   programWorkspace: {
     get: (signal?: AbortSignal): Promise<ProgramWorkspaceResponse> =>
       requestJson(
@@ -468,7 +519,7 @@ export const api = {
         signal,
       ),
     mutate: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       mutation: string,
       args: Record<string, JsonValue>,
       signal?: AbortSignal,
@@ -482,7 +533,7 @@ export const api = {
       },
     ),
     openDraft: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       path: string,
       confirmDiscard: boolean,
       signal?: AbortSignal,
@@ -496,7 +547,7 @@ export const api = {
       },
     ),
     save: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       signal?: AbortSignal,
     ): Promise<ProgramWorkspaceResponse> => requestJson(
       '/api/program/save',
@@ -505,7 +556,7 @@ export const api = {
       { method: 'POST', body: JSON.stringify(fence) },
     ),
     saveAs: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       path: string,
       confirmOverwrite: boolean,
       signal?: AbortSignal,
@@ -531,7 +582,7 @@ export const api = {
       },
     ),
     discard: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       signal?: AbortSignal,
     ): Promise<ProgramWorkspaceResponse> => requestJson(
       '/api/program/discard',
@@ -540,7 +591,7 @@ export const api = {
       { method: 'POST', body: JSON.stringify(fence) },
     ),
     newDraft: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       confirmDiscard: boolean,
       signal?: AbortSignal,
     ): Promise<ProgramWorkspaceResponse> => requestJson(
@@ -565,7 +616,7 @@ export const api = {
       },
     ),
     materializeRuntimeOverride: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       programRunId: string,
       proposalId: string,
       signal?: AbortSignal,
@@ -665,7 +716,7 @@ export const api = {
         signal,
       ),
     openDraft: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       path: string,
       confirmDiscard: boolean,
       signal?: AbortSignal,
@@ -679,7 +730,7 @@ export const api = {
       },
     ),
     mutate: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       path: Array<string | number>,
       operation: 'set' | 'append' | 'remove',
       value: JsonValue | undefined,
@@ -694,7 +745,7 @@ export const api = {
       },
     ),
     updateControlledStop: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       update: DeploymentControlledStopUpdate,
       signal?: AbortSignal,
     ): Promise<DeploymentWorkspaceResponse> => requestJson(
@@ -707,7 +758,7 @@ export const api = {
       },
     ),
     updateMotionTargetLimit: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       controllableComponentId: string,
       commandTargetId: string,
       maximumTcpLinearSpeedMps: number,
@@ -727,7 +778,7 @@ export const api = {
       },
     ),
     save: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       signal?: AbortSignal,
     ): Promise<DeploymentWorkspaceResponse> => requestJson(
       '/api/deployment/save',
@@ -736,7 +787,7 @@ export const api = {
       { method: 'POST', body: JSON.stringify(fence) },
     ),
     saveAs: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       path: string,
       confirmOverwrite: boolean,
       signal?: AbortSignal,
@@ -750,7 +801,7 @@ export const api = {
       },
     ),
     discard: (
-      fence: DraftFenceRequest,
+      fence: LocalWorkspaceFenceRequest,
       signal?: AbortSignal,
     ): Promise<DeploymentWorkspaceResponse> => requestJson(
       '/api/deployment/discard',

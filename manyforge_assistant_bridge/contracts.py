@@ -40,6 +40,13 @@ class ComposerDraftContext(_ClosedModel):
         int,
         Field(alias="expectedDraftRevision", ge=0, le=_MAXIMUM_SAFE_INTEGER),
     ]
+    expected_workspace_epoch: str = Field(
+        alias="expectedWorkspaceEpoch", min_length=1, max_length=256
+    )
+    expected_workspace_revision: Annotated[
+        int,
+        Field(alias="expectedWorkspaceRevision", ge=1, le=_MAXIMUM_SAFE_INTEGER),
+    ]
     expected_admission_generation: Annotated[
         int,
         Field(alias="expectedAdmissionGeneration", ge=1, le=_MAXIMUM_SAFE_INTEGER),

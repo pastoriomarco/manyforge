@@ -22,6 +22,11 @@ from .authoring_transaction_journal import AuthoringJournalError
 from .authoring_workspace import (
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
+    scenario_project_facts,
+)
+from .authoring_workspace_fence import (
+    commit_local_authoring,
+    require_captured_workspace_identity,
 )
 from .deployment_draft import DeploymentDraftError
 from .draft_session import DraftSessionError
@@ -55,6 +60,12 @@ class _ScenarioFence(BaseModel):
     expected_deployment_draft_revision: int = Field(
         alias="expectedDeploymentDraftRevision", ge=0, le=9_007_199_254_740_991
     )
+    expected_workspace_epoch: str = Field(
+        alias="expectedWorkspaceEpoch", min_length=1, max_length=256
+    )
+    expected_workspace_revision: int = Field(
+        alias="expectedWorkspaceRevision", ge=1, le=9_007_199_254_740_991
+    )
     expected_admission_generation: int = Field(
         alias="expectedAdmissionGeneration", ge=1, le=9_007_199_254_740_991
     )
@@ -63,11 +74,20 @@ class _ScenarioFence(BaseModel):
     )
     request_id: str = Field(alias="requestId", min_length=1, max_length=256)
 
-    def envelope(self) -> AuthoringMutationEnvelope:
+    def admission_envelope(self) -> AuthoringMutationEnvelope:
         return AuthoringMutationEnvelope(
             expected_admission_generation=self.expected_admission_generation,
             request_owner_epoch=self.request_owner_epoch,
             request_id=self.request_id,
+        )
+
+    def require_workspace_fence(
+        self, identity: AuthoringWorkspaceIdentity
+    ) -> None:
+        require_captured_workspace_identity(
+            self.expected_workspace_epoch,
+            self.expected_workspace_revision,
+            identity,
         )
 
 
@@ -232,6 +252,11 @@ def _require_captured_workspace_fence(
     saved baseline adopted always come from the revision the client fenced.
     """
 
+    require_captured_workspace_identity(
+        body.expected_workspace_epoch,
+        body.expected_workspace_revision,
+        identity,
+    )
     if (
         identity.program_draft_id != body.draft_id
         or identity.program_draft_revision != body.expected_draft_revision
@@ -293,7 +318,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             # identity is rechecked atomically when that baseline is adopted.
             snapshot = state.authoring_workspace.snapshot()
             _require_captured_workspace_fence(body, snapshot.identity)
-            workspace_identity = snapshot.identity
             # ``as_dict`` is the detached plain-JSON projection; the snapshot's
             # own members are recursively read-only.
             captured_workspace = snapshot.as_dict()
@@ -341,30 +365,22 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             captured, _, source_digest = capture_scenario_artifact(
                 saved_path, allowed_roots=state.allowed_fs_roots
             )
-            try:
-                state.authoring_workspace.remember_project(
-                    expected_identity=workspace_identity,
-                    document=captured,
+            # One composite commit adopts the written project path, Saved
+            # baseline and Scenario facts together, fenced by the identity the
+            # bytes were captured at. A concurrent edit keeps the correctly
+            # written file and refuses only the baseline.
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="save_scenario_document",
+                captured_identity=snapshot.identity,
+                session="project",
+                project=scenario_project_facts(
+                    captured,
                     document_path=saved_path,
                     source_document_digest=source_digest,
-                )
-            except AuthoringWorkspaceError as error:
-                if error.code != "composer_workspace_stale":
-                    raise
-                # The project is correctly written; only the Saved baseline is
-                # refused, so newer in-memory content is never labelled Saved.
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "scenario_saved_baseline_not_adopted",
-                        "message": (
-                            "the Scenario project was written but a newer "
-                            "workspace revision was not adopted as Saved"
-                        ),
-                        "path": saved_path,
-                        "currentWorkspace": error.detail.get("workspace"),
-                    },
-                ) from error
+                ),
+            )
             return {
                 "status": "saved",
                 "path": saved_path,
@@ -373,7 +389,24 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 "workspace": state.draft_session.workspace_snapshot(
                     applied_program_revision=None
                 ),
+                "authoringWorkspace": commit.snapshot.as_dict(),
             }
+        except AuthoringWorkspaceError as error:
+            if error.code != "composer_workspace_stale":
+                _raise(error)
+            # The project is correctly written; only the Saved baseline is
+            # refused, so newer in-memory content is never labelled Saved.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "scenario_saved_baseline_not_adopted",
+                    "message": (
+                        "the Scenario project was written but a newer "
+                        "workspace revision was not adopted as Saved"
+                    ),
+                    "currentWorkspace": error.detail.get("workspace"),
+                },
+            ) from error
         except Exception as error:
             _raise(error)
 
@@ -433,12 +466,42 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     "Loading would replace unsaved Program or Deployment Draft changes",
                     status_code=409,
                 )
-            state._restore_authoring_post_image(post_state, catalog=authoring_catalog)
-            state.scenario_document_path = source_path
-            state.remember_scenario_document(
-                scenario_document,
-                source_document_digest=source_digest,
-                source_diagnostics=source_diagnostics,
+            # Both retained Draft replacements are validated outside every
+            # owner lock, and the whole load commits as one workspace
+            # replacement: the successor Program and Deployment identities and
+            # the Scenario project facts land in a single fenced commit.
+            program_replacement = state.draft_session.prepare_load_replacement(
+                post_state["program"], authoring_catalog
+            )
+            deployment_replacement = (
+                state.deployment_draft_session.prepare_load_replacement(
+                    post_state["deployment"]
+                )
+            )
+
+            def install_load() -> bool:
+                program_changed = state.draft_session.install_prepared_replacement(
+                    program_replacement
+                )
+                deployment_changed = (
+                    state.deployment_draft_session.install_prepared_replacement(
+                        deployment_replacement
+                    )
+                )
+                return program_changed or deployment_changed
+
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="load_scenario_document",
+                session="whole-workspace",
+                project=scenario_project_facts(
+                    scenario_document,
+                    document_path=source_path,
+                    source_document_digest=source_digest,
+                    source_diagnostics=source_diagnostics,
+                ),
+                install=install_load,
             )
             return {
                 "status": "opened",
@@ -451,6 +514,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 "workspace": state.draft_session.workspace_snapshot(
                     applied_program_revision=None
                 ),
+                "authoringWorkspace": commit.snapshot.as_dict(),
             }
         except Exception as error:
             _raise(error)

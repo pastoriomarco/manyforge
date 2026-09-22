@@ -377,11 +377,6 @@ export interface ScenarioDocumentIndexResponse {
   entries: ScenarioDocumentEntry[];
 }
 
-export interface ScenarioDocumentFenceRequest extends DraftFenceRequest {
-  deploymentDraftId: string;
-  expectedDeploymentDraftRevision: number;
-}
-
 export interface ScenarioDocumentSaveResponse {
   status: 'saved';
   path: string;
@@ -399,6 +394,65 @@ export interface ScenarioDocumentLoadResponse {
   diagnostics: ProgramAuthoringDiagnostic[];
   sourceDiagnostics: ScenarioSourceDiagnostic[];
   workspace: ProgramWorkspaceResponse;
+}
+
+/**
+ * The retained Scenario project facts of the one shared authoring workspace.
+ *
+ * These are the facts an operator cannot re-derive from a Draft alone: the
+ * selected project path, the Saved baseline identity, the source diagnostics and
+ * the Program role assignment/typed overrides that were captured from the
+ * document. They are read once per observed workspace identity, together with
+ * both Draft projections, so no consumer has to combine two reads.
+ */
+export interface AuthoringWorkspaceProjectFacts {
+  documentPath: string | null;
+  documentId: string | null;
+  documentName: string | null;
+  documentDescription: string | null;
+  sourceDiagnostics: ScenarioSourceDiagnostic[];
+  sourceDocumentDigest: string | null;
+  programRoleAssignment: Record<string, JsonValue> | null;
+  typedParameterOverrides: Record<string, JsonValue>;
+  sourceProgramDigest: string | null;
+  sourceDeploymentDigest: string | null;
+}
+
+export interface AuthoringWorkspaceProgramSaved {
+  available: boolean;
+  matchesDraft: boolean;
+  path: string | null;
+  programRevision: string | null;
+}
+
+export interface AuthoringWorkspaceDeploymentDraft {
+  draftId: string;
+  draftRevision: number;
+  document: Record<string, JsonValue> | null;
+  savedPath: string | null;
+  savedDocument: Record<string, JsonValue> | null;
+  differsFromSaved: boolean;
+}
+
+/**
+ * One atomic composite authoring snapshot.
+ *
+ * The closed response of `GET /api/authoring/workspace`: the workspace identity,
+ * the Program Draft and Saved projection, the Deployment Draft and Saved
+ * projection, and the Scenario project facts, all captured at one revision.
+ * Runtime, Applied and Manager truth is deliberately absent; those remain in
+ * their existing owner projections.
+ */
+export interface AuthoringWorkspaceSnapshot {
+  schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v1';
+  workspaceEpoch: string;
+  workspaceRevision: number;
+  program: {
+    draft: ProgramDraftProjection;
+    saved: AuthoringWorkspaceProgramSaved;
+  };
+  deployment: AuthoringWorkspaceDeploymentDraft;
+  project: AuthoringWorkspaceProjectFacts;
 }
 
 export interface ScenarioSourceDiagnostic {
@@ -1322,6 +1376,26 @@ export interface DraftFenceRequest {
   expectedAdmissionGeneration: number;
   requestOwnerEpoch: string;
   requestId: string;
+}
+
+/**
+ * The fence every migrated ordinary authoring request sends.
+ *
+ * The composite workspace epoch/revision is mandatory, not optional: the
+ * backend rechecks it atomically with the Draft fence, so a request that
+ * omitted it would either be rejected or would leave a stale edit unguarded.
+ * Apply, Revert, runtime Scenario activation and Deployment candidate
+ * Preview/Apply/Revert stay on the external path and keep the plain
+ * `DraftFenceRequest` shape.
+ */
+export interface LocalWorkspaceFenceRequest extends DraftFenceRequest {
+  expectedWorkspaceEpoch: string;
+  expectedWorkspaceRevision: number;
+}
+
+export interface ScenarioDocumentFenceRequest extends LocalWorkspaceFenceRequest {
+  deploymentDraftId: string;
+  expectedDeploymentDraftRevision: number;
 }
 
 export interface ManagerDeploymentCandidateReceipt {

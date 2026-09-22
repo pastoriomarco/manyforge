@@ -299,6 +299,7 @@ def _body(
     assistant_mode: VerifiedActiveAssistantMode,
 ) -> dict:
     snapshot = state.draft_session.snapshot()
+    workspace = state.authoring_workspace.identity()
     mode = assistant_mode.payload
     return {
         "assistantMode": "composer-assistant",
@@ -317,6 +318,8 @@ def _body(
         "inputSchemaHash": mode["tools"][0]["input_schema_hash"],
         "draftId": snapshot["draft_id"],
         "expectedDraftRevision": snapshot["draft_revision"],
+        "expectedWorkspaceEpoch": workspace.workspace_epoch,
+        "expectedWorkspaceRevision": workspace.workspace_revision,
         "requestId": "assistant.request.1",
         "requestOwnerEpoch": "assistant.epoch.1",
         "expectedAdmissionGeneration": 7,
@@ -376,15 +379,15 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
     assert state.draft_session.snapshot()["saved"] is False
     assert state.authoring_admission is not None
     assert not hasattr(state.authoring_admission, "_snapshots")
-    assert (
-        state.authoring_admission._journal.retained_workspace()
-        == state.draft_session.retained_state()
-    )
+    assert state.authoring_admission._journal.retained_workspace() is None
 
     second_body = deepcopy(body)
     second_body["expectedDraftRevision"] = 2
     second_body["expectedAdmissionGeneration"] = result[
         "nextAdmissionGeneration"
+    ]
+    second_body["expectedWorkspaceRevision"] = result[
+        "nextWorkspaceRevision"
     ]
     second_body["requestId"] = "assistant.request.2"
     second_body["arguments"]["scene_resource"][
@@ -398,18 +401,15 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
     assert second.json()["result"]["draftRevision"] == 3
     assert second.json()["nextAdmissionGeneration"] == 11
 
-    def unexpected_projection_read(_state):
-        raise AssertionError("exact callback replay consulted mutable projections")
-
-    monkeypatch.setattr(
-        route, "read_active_assistant_context", unexpected_projection_read
-    )
+    # Ordinary in-memory edits have no durable replay ledger. A lost-response
+    # retry carries the old workspace fence and is rejected as stale instead
+    # of repeating the edit.
     replay = client.post(
         "/api/assistant/bridge/tools/scene_draft_add_object",
         json=body,
     )
-    assert replay.status_code == 200
-    assert replay.json() == result
+    assert replay.status_code == 409
+    assert replay.json()["detail"]["code"] == "composer_workspace_stale"
     assert len(state.headless_client.claims) == 2
     assert len(state.headless_client.settlements) == 2
 
@@ -419,10 +419,8 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
         "/api/assistant/bridge/tools/scene_draft_add_object",
         json=conflicting,
     )
-    assert conflict.status_code == 503
-    assert conflict.json()["detail"]["code"] == (
-        "composer_authoring_request_id_conflict"
-    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "composer_workspace_stale"
 
 
 def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(

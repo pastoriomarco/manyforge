@@ -96,6 +96,24 @@ class PreparedDeploymentReplacement:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedDeploymentSave:
+    """One Deployment Save/Save As prepared outside every owner lock.
+
+    ``canonical_json`` is the exact bytes a writer persists and the Saved
+    baseline adopted afterwards is the same document, so the file and the
+    baseline cannot describe two different Drafts.
+    """
+
+    tool_id: str
+    draft_id: str
+    base_revision: int
+    target_path: str
+    resolved_target: str
+    overwrite: bool
+    canonical_json: str
+
+
 def validate_deployment_draft_document(source: str) -> CompiledDeploymentDocument:
     """Validate one authored intent or an unmigrated compiled artifact.
 
@@ -1232,19 +1250,23 @@ class DeploymentDraftSession:
                     status_code=409,
                 )
 
-    def mark_saved(self, path: str, *, draft_id: str, expected_revision: int) -> None:
-        with self._lock:
-            self._require_current(draft_id, expected_revision)
-            if self._compiled is None:
-                _fail(
-                    "deployment_draft_unavailable",
-                    "open a Deployment artifact before saving",
-                    status_code=404,
-                )
-            self._saved_path = str(Path(path).resolve())
-            self._saved_document = deepcopy(self._compiled.document)
+    def prepare_save(
+        self,
+        *,
+        draft_id: str,
+        expected_revision: int,
+        target_path: str | None,
+        confirm_overwrite: bool,
+    ) -> PreparedDeploymentSave:
+        """Capture the exact content and target for one Save/Save As.
 
-    def canonical_json(self, *, draft_id: str, expected_revision: int) -> str:
+        Save names no target and keeps its existing authority; Save As resolves
+        its own target and only overwrites an existing file after an explicit
+        confirmation or when it names the current Saved path. The write happens
+        outside every owner lock; only the returned Saved baseline is committed
+        through the composite workspace fence.
+        """
+
         with self._lock:
             self._require_current(draft_id, expected_revision)
             if self._compiled is None:
@@ -1253,7 +1275,61 @@ class DeploymentDraftSession:
                     "open a Deployment artifact before saving",
                     status_code=404,
                 )
-            return self._compiled.canonical_json
+            selected_path = target_path or self._saved_path
+            if selected_path is None:
+                _fail(
+                    "deployment_saved_path_unavailable",
+                    "Save requires an existing path; use Save As",
+                    status_code=409,
+                )
+            try:
+                resolved_target = str(Path(selected_path).resolve())
+            except (OSError, RuntimeError, ValueError):
+                resolved_target = selected_path
+            return PreparedDeploymentSave(
+                tool_id=(
+                    "save_deployment_as"
+                    if target_path is not None
+                    else "save_deployment"
+                ),
+                draft_id=self._draft_id,
+                base_revision=self._revision,
+                target_path=selected_path,
+                resolved_target=resolved_target,
+                overwrite=confirm_overwrite or resolved_target == self._saved_path,
+                canonical_json=self._compiled.canonical_json,
+            )
+
+    def install_prepared_save(
+        self, prepared: PreparedDeploymentSave, *, saved_path: str
+    ) -> bool:
+        """Adopt one already-written Deployment artifact as the Saved baseline.
+
+        Returns whether the Saved baseline changed. No Draft revision advances,
+        because the Draft content is unchanged; the composite workspace revision
+        still advances whenever the baseline changed.
+        """
+
+        if not isinstance(prepared, PreparedDeploymentSave):
+            raise TypeError("prepared Deployment save has an invalid type")
+        try:
+            resolved = str(Path(saved_path).resolve())
+        except (OSError, RuntimeError, ValueError):
+            resolved = saved_path
+        with self._lock:
+            self._require_current(prepared.draft_id, prepared.base_revision)
+            if self._compiled is None:
+                _fail(
+                    "deployment_draft_unavailable",
+                    "open a Deployment artifact before saving",
+                    status_code=404,
+                )
+            document = deepcopy(self._compiled.document)
+            if self._saved_path == resolved and self._saved_document == document:
+                return False
+            self._saved_path = resolved
+            self._saved_document = document
+            return True
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:

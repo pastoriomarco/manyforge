@@ -698,22 +698,25 @@ def test_save_updates_saved_identity_only_after_writer_success(tmp_path: Path) -
     def fail_writer(_program: Program, _path: str) -> str:
         raise RuntimeError("disk failed")
 
+    prepared = session.prepare_save(
+        draft_id=before["draft"]["draftId"],
+        expected_revision=before["draft"]["draftRevision"],
+        target_path=str(tmp_path / "saved.program.yaml"),
+        confirm_overwrite=False,
+    )
     with pytest.raises(RuntimeError, match="disk failed"):
-        session.save_program(
-            draft_id=before["draft"]["draftId"],
-            expected_revision=before["draft"]["draftRevision"],
-            target_path=str(tmp_path / "saved.program.yaml"),
-            writer=fail_writer,
-        )
+        fail_writer(prepared.program, prepared.target_path)
     assert session.workspace_snapshot() == before
 
     target = tmp_path / "saved.program.yaml"
-    saved = session.save_program(
+    prepared = session.prepare_save(
         draft_id=before["draft"]["draftId"],
         expected_revision=before["draft"]["draftRevision"],
         target_path=str(target),
-        writer=lambda _program, path: path,
+        confirm_overwrite=False,
     )
+    assert session.install_prepared_save(prepared, saved_path=str(target)) is True
+    saved = session.workspace_snapshot()
     assert saved["saved"]["path"] == str(target.resolve())
     assert saved["saved"]["matchesDraft"] is True
     assert type(session._saved_document) is dict
@@ -759,11 +762,15 @@ def test_saved_document_lifecycle_never_deepcopies_program_graph(
         expected_revision=session.revision,
         discard_changes=True,
     )
-    session.save_program(
+    prepared_save = session.prepare_save(
         draft_id=session.draft_id,
         expected_revision=session.revision,
         target_path=str(tmp_path / "saved.program.yaml"),
-        writer=lambda _program, path: path,
+        confirm_overwrite=False,
+    )
+    session.install_prepared_save(
+        prepared_save,
+        saved_path=str(tmp_path / "saved.program.yaml"),
     )
     retained_saved = deepcopy(session._saved_document)
 
@@ -1992,11 +1999,11 @@ def test_authoring_forest_retains_incomplete_topology_until_it_derives_a_program
     assert restored.snapshot() == session.snapshot()
 
     with pytest.raises(DraftSessionError) as incomplete_save:
-        session.save_program(
+        session.prepare_save(
             draft_id=session.draft_id,
             expected_revision=session.revision,
             target_path=None,
-            writer=lambda _program, path: path,
+            confirm_overwrite=False,
         )
     assert incomplete_save.value.code == "composer_authoring_draft_incomplete"
 

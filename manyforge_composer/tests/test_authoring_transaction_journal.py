@@ -37,7 +37,7 @@ def _record(journal: ComposerAuthoringTransactionJournal, payload: str = "1"):
     return journal.record_intent(
         request_owner_epoch="browser.1",
         request_id="request.1",
-        operation_kind="save_draft",
+        operation_kind="apply_deployment_candidate",
         payload_digest="sha256:" + payload * 64,
         draft_id="draft.1",
         draft_revision=3,
@@ -84,12 +84,26 @@ def test_capacity_is_bounded_before_new_intent(tmp_path) -> None:
         (
             ("acquire_attempted", True),
             ("claim_json", {"claim": 1}),
-            ("effect_intent_json", {"operation_kind": "save_draft"}),
+            (
+                "effect_intent_json",
+                {
+                    "effect_class": "external",
+                    "external_kind": "deployment_candidate_apply",
+                    "operation_kind": "apply_deployment_candidate",
+                },
+            ),
         ),
         (
             ("acquire_attempted", True),
             ("claim_json", {"claim": 1}),
-            ("effect_intent_json", {"operation_kind": "save_draft"}),
+            (
+                "effect_intent_json",
+                {
+                    "effect_class": "external",
+                    "external_kind": "deployment_candidate_apply",
+                    "operation_kind": "apply_deployment_candidate",
+                },
+            ),
             (
                 "outcome_json",
                 {
@@ -103,7 +117,14 @@ def test_capacity_is_bounded_before_new_intent(tmp_path) -> None:
         (
             ("acquire_attempted", True),
             ("claim_json", {"claim": 1}),
-            ("effect_intent_json", {"operation_kind": "save_draft"}),
+            (
+                "effect_intent_json",
+                {
+                    "effect_class": "external",
+                    "external_kind": "deployment_candidate_apply",
+                    "operation_kind": "apply_deployment_candidate",
+                },
+            ),
             (
                 "outcome_json",
                 {
@@ -199,7 +220,7 @@ def test_pruning_reuses_completed_capacity_but_never_unresolved(tmp_path) -> Non
     third = journal.record_intent(
         request_owner_epoch="browser.3",
         request_id="request.3",
-        operation_kind="save_draft",
+        operation_kind="apply_deployment_candidate",
         payload_digest="sha256:" + "3" * 64,
         draft_id="draft.1",
         draft_revision=3,
@@ -213,7 +234,7 @@ def test_pruning_reuses_completed_capacity_but_never_unresolved(tmp_path) -> Non
         journal.record_intent(
             request_owner_epoch="browser.4",
             request_id="request.4",
-            operation_kind="save_draft",
+            operation_kind="apply_deployment_candidate",
             payload_digest="sha256:" + "4" * 64,
             draft_id="draft.1",
             draft_revision=3,
@@ -241,7 +262,7 @@ def test_concurrent_requests_serialize_shared_sqlite_connection(tmp_path) -> Non
         transaction = journal.record_intent(
             request_owner_epoch=request_owner_epoch,
             request_id=request_id,
-            operation_kind="save_draft",
+            operation_kind="apply_deployment_candidate",
             payload_digest=f"sha256:{index:064x}",
             draft_id="draft.1",
             draft_revision=3,

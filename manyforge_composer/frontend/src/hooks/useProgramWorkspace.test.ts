@@ -1,9 +1,8 @@
-import { act, createElement, useEffect, type ReactNode } from 'react';
+import { act, createElement, useEffect, useMemo, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   DraftMutationResponse,
-  DeploymentWorkspaceResponse,
   ProgramNodeModificationPolicy,
   ProgramNodeRecoveryPolicy,
   ProgramOperatorStopPolicy,
@@ -16,9 +15,6 @@ const apiMock = vi.hoisted(() => ({
     get: vi.fn(),
     mutate: vi.fn(),
   },
-  deploymentWorkspace: {
-    get: vi.fn(),
-  },
   scenarioDocuments: {
     save: vi.fn(),
     load: vi.fn(),
@@ -26,9 +22,80 @@ const apiMock = vi.hoisted(() => ({
   },
 }));
 
-vi.mock('../api/client', () => ({ api: apiMock }));
+vi.mock('../api/client', () => ({
+  api: apiMock,
+  // The hook reads the shared publication through the controller, not through an
+  // independent identity read, so the only client surface it needs is the
+  // Program workspace projection that still owns Applied truth.
+  isStaleWorkspaceError: (error: unknown) =>
+    error !== null
+    && typeof error === 'object'
+    && (error as { status?: number }).status === 409,
+}));
 
+import {
+  authoringUnavailableReason,
+  authoringWorkspaceIdentity,
+  projectFacts,
+  publicationIsCurrent,
+  type PublishedAuthoringWorkspace,
+} from '../state/authoringWorkspace';
+import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
 import { useProgramWorkspace } from './useProgramWorkspace';
+
+/**
+ * A real shared-publication controller for this hook's tests.
+ *
+ * It uses the same pure gate and fence helpers the production controller uses, so
+ * the hook is exercised against the real contract rather than a behavioural
+ * stub; only the read loop itself belongs to `useAuthoringWorkspace`'s own test.
+ */
+function testAuthoringController(
+  published: PublishedAuthoringWorkspace | null,
+  snapshot: ComposerHeadlessState | null,
+): AuthoringWorkspaceController {
+  return {
+    published,
+    current: publicationIsCurrent(published, snapshot),
+    unavailableReason: authoringUnavailableReason(published, snapshot),
+    project: projectFacts(published),
+    reading: false,
+    error: null,
+    refresh: async () => undefined,
+  };
+}
+
+function testPublication(
+  workspace: ProgramWorkspaceResponse,
+): PublishedAuthoringWorkspace {
+  const snapshot = {
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v1' as const,
+    workspaceEpoch: 'workspace.epoch.1',
+    workspaceRevision: 1,
+    program: { draft: workspace.draft, saved: workspace.saved },
+    deployment: {
+      draftId: 'deployment-draft-1',
+      draftRevision: 4,
+      document: null,
+      savedPath: null,
+      savedDocument: null,
+      differsFromSaved: false,
+    },
+    project: {
+      documentPath: '/workspace/cell',
+      documentId: null,
+      documentName: null,
+      documentDescription: null,
+      sourceDiagnostics: [],
+      sourceDocumentDigest: null,
+      programRoleAssignment: null,
+      typedParameterOverrides: {},
+      sourceProgramDigest: null,
+      sourceDeploymentDigest: null,
+    },
+  };
+  return { identity: authoringWorkspaceIdentity(snapshot), snapshot };
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -127,28 +194,6 @@ const recoveryPolicy: ProgramNodeRecoveryPolicy = {
 };
 const operatorStopPolicy: ProgramOperatorStopPolicy = 'hold';
 
-function deploymentWorkspace(): DeploymentWorkspaceResponse {
-  return {
-    schemaVersion: 'manyforge.composer_deployment_workspace.v1',
-    draft: {
-      id: 'deployment-draft-1',
-      revision: 4,
-      document: null,
-      deploymentArtifactId: null,
-      deploymentRevision: null,
-      graphRevision: null,
-      differsFromSaved: false,
-    },
-    saved: { path: null, deploymentRevision: null },
-    managerApplied: { deploymentRevision: null, scenarioId: null },
-    runAdmission: { ready: false, reason: 'No Deployment' },
-    binding: null,
-    scenarioCandidates: [],
-    savedScenarioCandidates: [],
-    unavailableReasons: ['deployment_draft_unavailable'],
-  };
-}
-
 type FakeNode = {
   nodeType: number;
   nodeName: string;
@@ -181,6 +226,7 @@ let latest: ReturnType<typeof useProgramWorkspace> | null = null;
 async function mountHarness(
   initial: Deferred<ProgramWorkspaceResponse>,
   snapshot: ComposerHeadlessState | null = null,
+  published: PublishedAuthoringWorkspace | null = null,
 ) {
   const document = {
     nodeType: 9,
@@ -222,7 +268,32 @@ async function mountHarness(
   const { createRoot } = await import('react-dom/client');
   root = createRoot(makeNode('div') as unknown as Element);
   function Harness({ currentSnapshot }: { currentSnapshot: ComposerHeadlessState | null }) {
-    const controller = useProgramWorkspace(currentSnapshot);
+    const currentPublication = useMemo(() => {
+      if (published === null || currentSnapshot === null) return published;
+      const current = workspace(
+        currentSnapshot.authoringWorkspace.programDraftRevision,
+      );
+      const nextSnapshot = {
+        ...published.snapshot,
+        workspaceEpoch: currentSnapshot.authoringWorkspace.workspaceEpoch,
+        workspaceRevision: currentSnapshot.authoringWorkspace.workspaceRevision,
+        program: { draft: current.draft, saved: current.saved },
+        deployment: {
+          ...published.snapshot.deployment,
+          draftId: currentSnapshot.authoringWorkspace.deploymentDraftId,
+          draftRevision: currentSnapshot.authoringWorkspace.deploymentDraftRevision,
+        },
+      };
+      return {
+        identity: authoringWorkspaceIdentity(nextSnapshot),
+        snapshot: nextSnapshot,
+      };
+    }, [currentSnapshot, published]);
+    const authoring = useMemo(
+      () => testAuthoringController(currentPublication, currentSnapshot),
+      [currentPublication, currentSnapshot],
+    );
+    const controller = useProgramWorkspace(currentSnapshot, authoring);
     useEffect(() => {
       latest = controller;
       return () => {
@@ -302,9 +373,13 @@ function authoringSnapshot(
       run: null,
       runtimeControls: null,
     },
-    draftIdentity: {
-      draftId: current.draft.draftId,
-      draftRevision: current.draft.draftRevision,
+    authoringWorkspace: {
+      workspaceEpoch: 'workspace.epoch.1',
+      workspaceRevision: current.draft.draftRevision,
+      programDraftId: current.draft.draftId,
+      programDraftRevision: current.draft.draftRevision,
+      deploymentDraftId: 'deployment-draft-1',
+      deploymentDraftRevision: 4,
     },
     receiverEpoch: 'headless-receiver.epoch.1',
     snapshotSequence: 11,
@@ -371,7 +446,11 @@ describe('useProgramWorkspace Draft policy interaction', () => {
 
   it('coalesces one workspace read for a newer backend Draft identity', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
-    const rerender = await mountHarness(initial, authoringSnapshot(workspace(1)));
+    const rerender = await mountHarness(
+      initial,
+      authoringSnapshot(workspace(1)),
+      testPublication(workspace(1)),
+    );
     await act(async () => initial.resolve(workspace(1)));
     const resynchronized = deferred<ProgramWorkspaceResponse>();
     apiMock.programWorkspace.get.mockReturnValueOnce(resynchronized.promise);
@@ -387,7 +466,11 @@ describe('useProgramWorkspace Draft policy interaction', () => {
 
   it('uses the ordinary Draft mutation path for node policies', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
-    await mountHarness(initial, authoringSnapshot(workspace(1)));
+    await mountHarness(
+      initial,
+      authoringSnapshot(workspace(1)),
+      testPublication(workspace(1)),
+    );
     await act(async () => initial.resolve(workspace(1)));
     const mutation = deferred<DraftMutationResponse>();
     apiMock.programWorkspace.mutate.mockReturnValueOnce(mutation.promise);
@@ -429,9 +512,12 @@ describe('useProgramWorkspace Draft policy interaction', () => {
 
   it('fences Scenario Save and Load with both current authored documents', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
-    await mountHarness(initial, authoringSnapshot(workspace(1)));
+    await mountHarness(
+      initial,
+      authoringSnapshot(workspace(1)),
+      testPublication(workspace(1)),
+    );
     await act(async () => initial.resolve(workspace(1)));
-    apiMock.deploymentWorkspace.get.mockResolvedValue(deploymentWorkspace());
     apiMock.scenarioDocuments.save.mockResolvedValue({
       status: 'saved',
       path: '/workspace/cell',

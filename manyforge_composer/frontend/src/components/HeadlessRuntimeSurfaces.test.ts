@@ -232,7 +232,14 @@ describe('headless Composer presentation adapters', () => {
         run: null,
         runtimeControls: null,
       },
-      draftIdentity: { draftId: 'draft-1', draftRevision: 1 },
+      authoringWorkspace: {
+        workspaceEpoch: 'workspace.epoch.1',
+        workspaceRevision: 1,
+        programDraftId: 'draft-1',
+        programDraftRevision: 1,
+        deploymentDraftId: 'deployment-draft-1',
+        deploymentDraftRevision: 1,
+      },
       receiverEpoch: 'receiver.epoch.1',
       snapshotSequence: 1,
       runtime: {

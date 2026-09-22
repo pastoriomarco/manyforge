@@ -1,5 +1,8 @@
 import { parseNanoseconds, type Nanoseconds } from '../types/nanoseconds';
 import type {
+  AuthoringWorkspaceProgramSaved,
+  AuthoringWorkspaceProjectFacts,
+  AuthoringWorkspaceSnapshot,
   RetainedNeutralProjection,
   CatalogBlackboardBinding,
   CatalogCapabilityRequirement,
@@ -264,6 +267,7 @@ import type {
   AlarmMembership,
   AlarmPriority,
   AlarmSubject,
+  AuthoringWorkspaceIdentity,
   ComponentOverviewProjection,
   ComposerHeadlessState,
   HeadlessRuntimeSnapshot,
@@ -509,6 +513,23 @@ function jsonRecordAt(value: unknown, path: string): Record<string, JsonValue> {
     return fail(path, 'a JSON object');
   }
   return parsed;
+}
+
+function equalJson(left: JsonValue, right: JsonValue): boolean {
+  if (left === right) return true;
+  if (left === null || right === null || typeof left !== typeof right) return false;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => equalJson(value, right[index]!));
+  }
+  if (typeof left !== 'object' || typeof right !== 'object') return false;
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key, index) =>
+      key === rightKeys[index] && equalJson(left[key]!, right[key]!));
 }
 
 function programLiteralAt(value: unknown, path: string): JsonValue {
@@ -2357,6 +2378,47 @@ function parseProgramAuthoringDiagnostic(
   };
 }
 
+/**
+ * Parse the Program Saved projection shared by the Program workspace response
+ * and the composite authoring snapshot.
+ *
+ * Both responses must report the same truthful Draft/Saved comparison, so the
+ * invariant checks live here once instead of being duplicated per response.
+ */
+function parseProgramSavedProjection(
+  value: unknown,
+  path: string,
+  draft: ProgramDraftProjection,
+): AuthoringWorkspaceProgramSaved {
+  const saved = objectAt(value, path);
+  exactKeysAt(saved, ['available', 'matchesDraft', 'path', 'programRevision'], path);
+  const available = booleanAt(saved.available, `${path}.available`);
+  const savedPath = nullableStringAt(saved.path, `${path}.path`);
+  const savedRevision = nullableStringAt(
+    saved.programRevision,
+    `${path}.programRevision`,
+  );
+  const matchesDraft = booleanAt(saved.matchesDraft, `${path}.matchesDraft`);
+  if (available !== (savedPath !== null && savedRevision !== null)) {
+    return fail(path, 'internally consistent Saved identity');
+  }
+  if (
+    matchesDraft !== (
+      draft.programRevision !== null
+      && savedRevision !== null
+      && draft.programRevision === savedRevision
+    )
+  ) {
+    return fail(path, 'a truthful Draft/Saved comparison');
+  }
+  return {
+    available,
+    matchesDraft,
+    path: savedPath,
+    programRevision: savedRevision,
+  };
+}
+
 function parseProgramDraftProjection(
   value: unknown,
   path: string,
@@ -2482,34 +2544,11 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
     record.applicability,
     'programWorkspace.applicability',
   );
-  const saved = objectAt(record.saved, 'programWorkspace.saved');
-  exactKeysAt(
-    saved,
-    ['available', 'matchesDraft', 'path', 'programRevision'],
+  const saved = parseProgramSavedProjection(
+    record.saved,
     'programWorkspace.saved',
+    draft,
   );
-  const savedAvailable = booleanAt(saved.available, 'programWorkspace.saved.available');
-  const savedPath = nullableStringAt(saved.path, 'programWorkspace.saved.path');
-  const savedRevision = nullableStringAt(
-    saved.programRevision,
-    'programWorkspace.saved.programRevision',
-  );
-  const savedMatchesDraft = booleanAt(
-    saved.matchesDraft,
-    'programWorkspace.saved.matchesDraft',
-  );
-  if (savedAvailable !== (savedPath !== null && savedRevision !== null)) {
-    return fail('programWorkspace.saved', 'internally consistent Saved identity');
-  }
-  if (
-    savedMatchesDraft !== (
-      draft.programRevision !== null
-      && savedRevision !== null
-      && draft.programRevision === savedRevision
-    )
-  ) {
-    return fail('programWorkspace.saved', 'a truthful Draft/Saved comparison');
-  }
   const applied = objectAt(record.applied, 'programWorkspace.applied');
   exactKeysAt(
     applied,
@@ -2552,7 +2591,7 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
     record.hasUnsavedChanges,
     'programWorkspace.hasUnsavedChanges',
   );
-  if (hasUnsavedChanges !== (draft.programLoaded && !savedMatchesDraft)) {
+  if (hasUnsavedChanges !== (draft.programLoaded && !saved.matchesDraft)) {
     return fail(
       'programWorkspace.hasUnsavedChanges',
       'the exact Draft/Saved comparison',
@@ -2562,12 +2601,7 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
     schemaVersion,
     draft,
     applicability,
-    saved: {
-      available: savedAvailable,
-      matchesDraft: savedMatchesDraft,
-      path: savedPath,
-      programRevision: savedRevision,
-    },
+    saved,
     applied: {
       available: appliedAvailable,
       matchesDraft: appliedMatchesDraft,
@@ -2587,6 +2621,172 @@ const SCENARIO_DOCUMENT_STATUSES = [
   'version_changed',
   'unsupported',
 ] as const;
+
+function parseAuthoringWorkspaceProjectFacts(
+  value: unknown,
+  path: string,
+): AuthoringWorkspaceProjectFacts {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'document_path', 'document_id', 'document_name', 'document_description',
+    'source_diagnostics', 'source_document_digest', 'program_role_assignment',
+    'typed_parameter_overrides', 'source_program_digest',
+    'source_deployment_digest',
+  ], path);
+  const roleAssignment = record.program_role_assignment === null
+    ? null
+    : jsonRecordAt(
+        record.program_role_assignment,
+        `${path}.program_role_assignment`,
+      );
+  return {
+    documentPath: nullableStringAt(record.document_path, `${path}.document_path`),
+    documentId: nullableStringAt(record.document_id, `${path}.document_id`),
+    documentName: nullableStringAt(record.document_name, `${path}.document_name`),
+    documentDescription: nullableStringAt(
+      record.document_description,
+      `${path}.document_description`,
+    ),
+    sourceDiagnostics: boundedArrayAt(
+      record.source_diagnostics,
+      `${path}.source_diagnostics`,
+      4_096,
+    ).map((diagnostic, index) => {
+      const diagnosticPath = `${path}.source_diagnostics[${index}]`;
+      const selected = objectAt(diagnostic, diagnosticPath);
+      exactKeysAt(selected, ['code', 'message', 'source_id'], diagnosticPath);
+      const code = stringAt(selected.code, `${diagnosticPath}.code`);
+      if (code !== 'scenario_source_changed') {
+        return fail(`${diagnosticPath}.code`, 'scenario_source_changed');
+      }
+      return {
+        code,
+        sourceId: stringAt(selected.source_id, `${diagnosticPath}.source_id`),
+        message: stringAt(selected.message, `${diagnosticPath}.message`),
+      };
+    }),
+    sourceDocumentDigest: nullableStringAt(
+      record.source_document_digest,
+      `${path}.source_document_digest`,
+    ),
+    programRoleAssignment: roleAssignment,
+    typedParameterOverrides: jsonRecordAt(
+      record.typed_parameter_overrides,
+      `${path}.typed_parameter_overrides`,
+    ),
+    sourceProgramDigest: nullableStringAt(
+      record.source_program_digest,
+      `${path}.source_program_digest`,
+    ),
+    sourceDeploymentDigest: nullableStringAt(
+      record.source_deployment_digest,
+      `${path}.source_deployment_digest`,
+    ),
+  };
+}
+
+/**
+ * Parse the one atomic composite authoring snapshot.
+ *
+ * The composite read is the single owner of authoring identity, both Draft
+ * projections and the Scenario project facts, so its shape is closed on both
+ * sides: the Program slice must carry exactly the Program Draft projection plus
+ * its Saved projection, and the Deployment slice exactly its Draft and Saved
+ * projection. Applied, Manager and runtime truth are absent by contract and stay
+ * in their existing owner projections.
+ */
+export function parseAuthoringWorkspaceSnapshot(
+  value: unknown,
+): AuthoringWorkspaceSnapshot {
+  const path = 'authoringWorkspace';
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['schemaVersion', 'workspaceEpoch', 'workspaceRevision', 'program', 'deployment', 'project'],
+    path,
+  );
+  const schemaVersion = stringAt(record.schemaVersion, `${path}.schemaVersion`);
+  if (schemaVersion !== 'manyforge.composer_authoring_workspace_snapshot.v1') {
+    return fail(
+      `${path}.schemaVersion`,
+      'manyforge.composer_authoring_workspace_snapshot.v1',
+    );
+  }
+  const workspaceEpoch = stringAt(record.workspaceEpoch, `${path}.workspaceEpoch`);
+  if (!workspaceEpoch) {
+    return fail(`${path}.workspaceEpoch`, 'a non-empty workspace epoch');
+  }
+  const programRecord = objectAt(record.program, `${path}.program`);
+  exactKeysAt(programRecord, [
+    'draftId', 'draftRevision', 'programLoaded', 'authoring', 'candidateAvailable',
+    'programRevision', 'program', 'diagnostics', 'saved',
+  ], `${path}.program`);
+  const { saved: savedRecord, ...draftFields } = programRecord;
+  const programDraft = parseProgramDraftProjection(
+    draftFields,
+    `${path}.program`,
+  );
+  const programSaved = parseProgramSavedProjection(
+    savedRecord,
+    `${path}.program.saved`,
+    programDraft,
+  );
+  const deploymentRecord = objectAt(record.deployment, `${path}.deployment`);
+  exactKeysAt(deploymentRecord, [
+    'draftId', 'draftRevision', 'document', 'savedPath', 'savedDocument',
+    'differsFromSaved',
+  ], `${path}.deployment`);
+  const deploymentDraftId = stringAt(
+    deploymentRecord.draftId,
+    `${path}.deployment.draftId`,
+  );
+  if (!deploymentDraftId) {
+    return fail(`${path}.deployment.draftId`, 'a non-empty Draft identity');
+  }
+  const document = deploymentRecord.document === null
+    ? null
+    : jsonRecordAt(deploymentRecord.document, `${path}.deployment.document`);
+  const savedDocument = deploymentRecord.savedDocument === null
+    ? null
+    : jsonRecordAt(
+        deploymentRecord.savedDocument,
+        `${path}.deployment.savedDocument`,
+      );
+  const differsFromSaved = booleanAt(
+    deploymentRecord.differsFromSaved,
+    `${path}.deployment.differsFromSaved`,
+  );
+  if (
+    differsFromSaved
+      !== (document !== null && (savedDocument === null || !equalJson(document, savedDocument)))
+  ) {
+    return fail(`${path}.deployment`, 'a truthful Draft/Saved comparison');
+  }
+  return {
+    schemaVersion,
+    workspaceEpoch,
+    workspaceRevision: positiveIntegerAt(
+      record.workspaceRevision,
+      `${path}.workspaceRevision`,
+    ),
+    program: { draft: programDraft, saved: programSaved },
+    deployment: {
+      draftId: deploymentDraftId,
+      draftRevision: integerAt(
+        deploymentRecord.draftRevision,
+        `${path}.deployment.draftRevision`,
+      ),
+      document,
+      savedPath: nullableStringAt(
+        deploymentRecord.savedPath,
+        `${path}.deployment.savedPath`,
+      ),
+      savedDocument,
+      differsFromSaved,
+    },
+    project: parseAuthoringWorkspaceProjectFacts(record.project, `${path}.project`),
+  };
+}
 
 export function parseScenarioDocumentIndexResponse(
   value: unknown,
@@ -6636,6 +6836,37 @@ export function parseComponentOverviewProjection(
   };
 }
 
+export function parseAuthoringWorkspaceIdentity(
+  value: unknown,
+  path = 'authoringWorkspace',
+): AuthoringWorkspaceIdentity {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'workspace_epoch', 'workspace_revision', 'program_draft_id',
+    'program_draft_revision', 'deployment_draft_id', 'deployment_draft_revision',
+  ], path);
+  return {
+    workspaceEpoch: stringAt(record.workspace_epoch, `${path}.workspace_epoch`),
+    workspaceRevision: positiveIntegerAt(
+      record.workspace_revision,
+      `${path}.workspace_revision`,
+    ),
+    programDraftId: stringAt(record.program_draft_id, `${path}.program_draft_id`),
+    programDraftRevision: integerAt(
+      record.program_draft_revision,
+      `${path}.program_draft_revision`,
+    ),
+    deploymentDraftId: stringAt(
+      record.deployment_draft_id,
+      `${path}.deployment_draft_id`,
+    ),
+    deploymentDraftRevision: integerAt(
+      record.deployment_draft_revision,
+      `${path}.deployment_draft_revision`,
+    ),
+  };
+}
+
 export function parseComposerHeadlessState(
   value: unknown,
 ): ComposerHeadlessState {
@@ -6643,7 +6874,7 @@ export function parseComposerHeadlessState(
   exactKeysAt(record, [
     'schema_version', 'runtime', 'alarms', 'component_overview', 'authoring_admission',
     'execution_targets', 'execution_control_state', 'program_cycle',
-    'draft_identity', 'receiver_epoch',
+    'authoring_workspace', 'receiver_epoch',
     'snapshot_sequence', 'complete',
   ], 'headlessState');
   const schemaVersion = stringAt(
@@ -6658,8 +6889,6 @@ export function parseComposerHeadlessState(
   }
   const admission = objectAt(record.authoring_admission, 'headlessState.authoring_admission');
   exactKeysAt(admission, ['admission_generation', 'authoring_allowed'], 'headlessState.authoring_admission');
-  const draft = objectAt(record.draft_identity, 'headlessState.draft_identity');
-  exactKeysAt(draft, ['draft_id', 'draft_revision'], 'headlessState.draft_identity');
   const complete = booleanAt(record.complete, 'headlessState.complete');
   if (!complete) return fail('headlessState.complete', 'true');
   return {
@@ -6683,10 +6912,10 @@ export function parseComposerHeadlessState(
           record.execution_control_state,
         ),
     programCycle: parseProgramCycleStatus(record.program_cycle),
-    draftIdentity: {
-      draftId: stringAt(draft.draft_id, 'headlessState.draft_identity.draft_id'),
-      draftRevision: integerAt(draft.draft_revision, 'headlessState.draft_identity.draft_revision'),
-    },
+    authoringWorkspace: parseAuthoringWorkspaceIdentity(
+      record.authoring_workspace,
+      'headlessState.authoring_workspace',
+    ),
     receiverEpoch: stringAt(record.receiver_epoch, 'headlessState.receiver_epoch'),
     snapshotSequence: positiveIntegerAt(record.snapshot_sequence, 'headlessState.snapshot_sequence'),
   };

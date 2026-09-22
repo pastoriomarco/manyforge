@@ -46,18 +46,26 @@ closed request contains:
   `requestedTools`, and narrowing-only `fieldPolicy`;
 - forwarded proof input: the complete `modeProjection` and exact
   `resolvedCatalog` (`catalogHash`, `grantPolicy`, `nodes`, `skills`, `tools`);
-- Composer context: `composerDraft` with Draft identity/revision, the current
-  Kernel `expectedAdmissionGeneration`, optional Program snapshot, and the
-  node-environment/source-model projection digests.
+- Composer context: `composerDraft` with Draft identity/revision, the
+  composite `expectedWorkspaceEpoch`/`expectedWorkspaceRevision` of the shared
+  authoring workspace, the current Kernel `expectedAdmissionGeneration`,
+  optional Program snapshot, and the node-environment/source-model projection
+  digests.
 
-Composer captures that backend admission generation when it accepts the
-assistant request. Every mutating callback rechecks it through the normal
-authoring transaction owner. Browser snapshot fields are deliberately absent:
-the GUI is a disposable presentation client, so its disconnect or snapshot
-expiry cannot become assistant authority or interrupt accepted backend work.
-Each Composer callback returns its exact durable `nextAdmissionGeneration`.
-The bridge chains that backend-issued value for a later mutation in the same
-assistant request; read-only or rejected callbacks leave it unchanged.
+Composer captures that backend admission generation and that composite
+workspace identity when it accepts the assistant request. Every callback
+rechecks them through the normal authoring owner, and a mutating callback
+commits under the same composite fence an ordinary edit uses. Browser snapshot
+fields are deliberately absent: the GUI is a disposable presentation client,
+so its disconnect or snapshot expiry cannot become assistant authority or
+interrupt accepted backend work.
+Each Composer callback returns its exact settled `nextAdmissionGeneration` and
+its exact `nextWorkspaceRevision`. The bridge chains both backend-issued values
+for a later callback in the same assistant request; read-only or rejected
+callbacks leave the generation unchanged and never decrease the workspace
+revision. A committed edit advances the workspace revision, a validated no-op
+callback does not, so the bridge requires the exact next revision rather than
+accepting a gap or a backwards value.
 
 Forwarded projection/catalog content is not trusted by itself. Before every
 model turn, the bridge independently reads the active mode and node environment

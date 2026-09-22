@@ -8,7 +8,6 @@ from contextvars import ContextVar
 from functools import wraps
 import hashlib
 import math
-from pathlib import Path
 from typing import Any, NoReturn
 
 from fastapi import APIRouter, HTTPException
@@ -32,6 +31,7 @@ from .draft_session import (
     draft_applicability,
 )
 from .authoring_forest import AuthoringForestError, derive_candidate, from_program
+from .authoring_identity import thaw_json
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
     read_active_node_environment,
@@ -47,6 +47,14 @@ from .state import ComposerState
 from .authoring_admission import (
     AuthoringMutationEnvelope,
     headless_client_http_exception,
+)
+from .authoring_workspace import (
+    AuthoringWorkspaceError,
+    AuthoringWorkspaceIdentity,
+)
+from .authoring_workspace_fence import (
+    commit_local_authoring,
+    require_captured_workspace_identity,
 )
 from .assistant_mode_client import (
     ActiveAssistantModeProjectionError,
@@ -125,12 +133,36 @@ class _DraftFence(BaseModel):
         )
 
 
-class DraftMutationRequest(_DraftFence):
+class _LocalDraftFence(_DraftFence):
+    """Migrated ordinary-edit fence: the Program Draft plus the workspace.
+
+    Program Apply, Revert and Scenario Load stay on the external-operation path
+    and keep the plain :class:`_DraftFence` shape.
+    """
+
+    expected_workspace_epoch: str = Field(
+        alias="expectedWorkspaceEpoch", min_length=1, max_length=256
+    )
+    expected_workspace_revision: int = Field(
+        alias="expectedWorkspaceRevision", ge=1, le=9_007_199_254_740_991
+    )
+
+    def require_workspace_fence(
+        self, identity: "AuthoringWorkspaceIdentity"
+    ) -> None:
+        require_captured_workspace_identity(
+            self.expected_workspace_epoch,
+            self.expected_workspace_revision,
+            identity,
+        )
+
+
+class DraftMutationRequest(_LocalDraftFence):
     mutation: str = Field(min_length=1, max_length=128)
     arguments: dict[str, Any]
 
 
-class RuntimeOverrideMaterializationRequest(_DraftFence):
+class RuntimeOverrideMaterializationRequest(_LocalDraftFence):
     program_run_id: str = Field(
         alias="programRunId", min_length=1, max_length=256
     )
@@ -139,12 +171,12 @@ class RuntimeOverrideMaterializationRequest(_DraftFence):
     )
 
 
-class OpenDraftRequest(_DraftFence):
+class OpenDraftRequest(_LocalDraftFence):
     path: str = Field(min_length=1, max_length=4096)
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
 
 
-class NewDraftRequest(_DraftFence):
+class NewDraftRequest(_LocalDraftFence):
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
 
 
@@ -153,11 +185,11 @@ class ValidateProgramSourceRequest(BaseModel):
     authoring: dict[str, Any]
 
 
-class SaveDraftRequest(_DraftFence):
+class SaveDraftRequest(_LocalDraftFence):
     pass
 
 
-class SaveDraftAsRequest(_DraftFence):
+class SaveDraftAsRequest(_LocalDraftFence):
     path: str = Field(min_length=1, max_length=4096)
     confirm_overwrite: bool = Field(default=False, alias="confirmOverwrite")
 
@@ -166,7 +198,7 @@ class ApplyDraftRequest(_DraftFence):
     pass
 
 
-class DiscardDraftRequest(_DraftFence):
+class DiscardDraftRequest(_LocalDraftFence):
     pass
 
 
@@ -206,6 +238,11 @@ def _raise_workspace_error(error: Exception) -> NoReturn:
             "message": str(error),
         }
         if isinstance(error, DraftSessionError) and error.detail != str(error):
+            detail["context"] = error.detail
+        raise HTTPException(status_code=error.status_code, detail=detail) from error
+    if isinstance(error, AuthoringWorkspaceError):
+        detail = {"code": error.code, "message": str(error)}
+        if error.detail != str(error):
             detail["context"] = error.detail
         raise HTTPException(status_code=error.status_code, detail=detail) from error
     if isinstance(error, ActiveNodeEnvironmentProjectionError):
@@ -297,11 +334,23 @@ def _applied_context(
 
 def _workspace(state: ComposerState) -> dict[str, Any]:
     context, reason = _applied_context(state)
-    return state.draft_session.workspace_snapshot(
-        applied_program_revision=(
-            context.program_revision if context is not None else None
-        ),
-        applied_unavailable_reason=reason,
+    for _attempt in range(3):
+        identity = state.authoring_workspace.identity()
+        workspace = state.draft_session.workspace_snapshot(
+            applied_program_revision=(
+                context.program_revision if context is not None else None
+            ),
+            applied_unavailable_reason=reason,
+        )
+        if state.authoring_workspace.identity() == identity:
+            workspace["authoringWorkspace"] = identity.as_dict()
+            return workspace
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": "composer_workspace_snapshot_busy",
+            "message": "the authoring workspace changed while it was being read",
+        },
     )
 
 
@@ -311,6 +360,31 @@ def _program_write_roots(state: ComposerState) -> list[str]:
     if state.allowed_program_write_roots is not None:
         return state.allowed_program_write_roots
     return state.allowed_fs_roots
+
+
+def _published_program_revision(state: ComposerState, target: str) -> str | None:
+    """Return the content identity already published at one exact target.
+
+    Save resolves a lost response by rereading the exact target and comparing
+    this identity with the content captured for that request. A missing,
+    unreadable or divergent target returns ``None``, so the ordinary overwrite
+    rules still apply.
+    """
+
+    try:
+        program, _path = load_program_artifact(
+            target,
+            allowed_roots=_program_write_roots(state),
+            catalog=_active_catalog(state),
+        )
+    except (
+        ProgramArtifactError,
+        ActiveNodeEnvironmentProjectionError,
+        HeadlessClientError,
+        OSError,
+    ):
+        return None
+    return program.program_revision
 
 
 def _draft_node(document: dict[str, Any], instance_id: str) -> dict[str, Any]:
@@ -1019,151 +1093,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             "effect_class": "local",
             "pre_state": pre_state,
         }
-        if operation_kind == "mutate_draft":
-            assert isinstance(body, DraftMutationRequest)
-            if body.mutation not in _AUTHORING_MUTATIONS:
-                raise HTTPException(
-                    status_code=404,
-                    detail={
-                        "code": "composer_authoring_mutation_unsupported",
-                        "message": (
-                            "unsupported Program authoring mutation: "
-                            f"{body.mutation}"
-                        ),
-                    },
-                )
-            if body.mutation not in _SOURCE_RESOLVED_MUTATIONS:
-                state.draft_session.preview_mutation(
-                    tool_id=body.mutation,
-                    arguments=body.arguments,
-                    expected_revision=body.expected_draft_revision,
-                    catalog=state.node_catalog,
-                    draft_id=body.draft_id,
-                )
-        elif operation_kind == "materialize_runtime_override":
-            assert isinstance(body, RuntimeOverrideMaterializationRequest)
-            if state.headless_client is None:
-                raise DraftSessionError(
-                    "program_runtime_promotion_unavailable",
-                    "runtime promotion requires the current Program Runner",
-                    status_code=503,
-                )
-            try:
-                projection = state.headless_client.program_runtime_controls(
-                    body.program_run_id
-                )
-            except HeadlessClientError as error:
-                raise headless_client_http_exception(error) from error
-            controls = projection.get("runtime_controls")
-            proposals = (
-                controls.get("promotion_proposals")
-                if isinstance(controls, dict)
-                else None
-            )
-            proposal = next(
-                (
-                    row
-                    for row in proposals
-                    if isinstance(row, dict)
-                    and row.get("proposal_id") == body.proposal_id
-                ),
-                None,
-            ) if isinstance(proposals, list) else None
-            if (
-                projection.get("program_run_id") != body.program_run_id
-                or not isinstance(proposal, dict)
-                or proposal.get("status") != "ready"
-                or proposal.get("program_run_id") != body.program_run_id
-                or proposal.get("expected_draft_id") != body.draft_id
-                or proposal.get("expected_draft_revision")
-                != body.expected_draft_revision
-                or not isinstance(proposal.get("node_instance_id"), str)
-                or not isinstance(proposal.get("node_id"), str)
-                or not isinstance(proposal.get("parameter_id"), str)
-                or "value" not in proposal
-            ):
-                raise DraftSessionError(
-                    "program_runtime_promotion_stale",
-                    "runtime promotion no longer names this exact idle Draft",
-                    status_code=409,
-                )
-            arguments = {
-                "instance_id": proposal["node_instance_id"],
-                "expected_node_id": proposal["node_id"],
-                "parameters": {
-                    proposal["parameter_id"]: deepcopy(proposal["value"])
-                },
-                "merge": True,
-            }
-            state.draft_session.preview_mutation(
-                tool_id="tree_draft_update_node_params",
-                arguments=arguments,
-                expected_revision=body.expected_draft_revision,
-                catalog=state.node_catalog,
-                draft_id=body.draft_id,
-            )
-            prepared.update(
-                {
-                    "runtime_promotion": deepcopy(proposal),
-                    "runtime_promotion_arguments": arguments,
-                }
-            )
-        elif operation_kind in {"new_draft", "open_draft"}:
-            state.draft_session.require_replace_allowed(
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                discard_changes=body.confirm_discard,  # type: ignore[attr-defined]
-            )
-        elif operation_kind in {"save_draft", "save_draft_as"}:
-            target_path: str | None = None
-            overwrite = True
-            if isinstance(body, SaveDraftAsRequest):
-                target_path = normalize_program_save_path(body.path)
-            document = pre_state["program"]
-            if document is None:
-                raise DraftSessionError(
-                    "composer_authoring_draft_incomplete",
-                    "Composer Draft has no strict Program candidate",
-                    status_code=409,
-                    detail={"diagnostics": pre_state["diagnostics"]},
-                )
-            if isinstance(body, SaveDraftAsRequest):
-                assert target_path is not None
-                try:
-                    candidate = Path(target_path).expanduser()
-                    resolved_candidate = str(
-                        candidate.parent.resolve() / candidate.name
-                    )
-                except (OSError, RuntimeError, ValueError):
-                    resolved_candidate = target_path
-                overwrite = (
-                    body.confirm_overwrite
-                    or resolved_candidate == pre_state["saved_path"]
-                )
-            else:
-                target_path = pre_state["saved_path"]
-                overwrite = True
-                if target_path is None:
-                    raise DraftSessionError(
-                        "composer_saved_path_unavailable",
-                        "Save requires an existing Program path; use Save As",
-                    )
-            post_state = deepcopy(pre_state)
-            post_state["saved_path"] = str(Path(target_path).resolve())
-            post_state["saved_program_revision"] = document["program_revision"]
-            post_state["saved_document"] = deepcopy(document)
-            prepared.update(
-                {
-                    "effect_class": "external",
-                    "external_kind": "save_program",
-                    "target_path": target_path,
-                    "overwrite": overwrite,
-                    "program_document": deepcopy(document),
-                    "post_state": post_state,
-                    "applied_context": retained_applied_context(),
-                }
-            )
-        elif operation_kind == "apply_draft":
+        if operation_kind == "apply_draft":
             document = pre_state["program"]
             if document is None:
                 raise DraftSessionError(
@@ -1291,6 +1221,14 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         operation_kind: str,
         effect,
     ):
+        """Run one external authoring effect through the durable owner.
+
+        Only the retained external callers use this: Program Apply and Revert.
+        Ordinary edits and saves commit through :func:`commit_local_authoring`
+        instead, and every local branch of :func:`prepare_authoring_effect` was
+        deleted when its last caller moved.
+        """
+
         coordinator = state.authoring_admission
         if coordinator is None:
             raise HTTPException(
@@ -1315,35 +1253,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 _ACTIVE_AUTHORING_EFFECT.reset(effect_token)
                 _ACTIVE_AUTHORING_CLAIM.reset(claim_token)
 
-        def validate_source_under_claim(
-            _claim: dict[str, Any],
-        ) -> dict[str, Any] | None:
-            if (
-                not isinstance(body, DraftMutationRequest)
-                or body.mutation not in _SOURCE_RESOLVED_MUTATIONS
-            ):
-                return None
-            try:
-                resolved = _source_resolved_mutation(
-                    state, body.mutation, body.arguments
-                )
-                if resolved is None:
-                    raise RuntimeError("source-resolved mutation has no resolver")
-                mutation_arguments, source_identity = resolved
-                state.draft_session.preview_mutation(
-                    tool_id=body.mutation,
-                    arguments=mutation_arguments,
-                    expected_revision=body.expected_draft_revision,
-                    catalog=state.node_catalog,
-                    draft_id=body.draft_id,
-                )
-            except DraftSessionError as error:
-                _raise_workspace_error(error)
-            prepared["resolved_mutation_arguments"] = deepcopy(
-                mutation_arguments
-            )
-            return {"source_identity": deepcopy(source_identity)}
-
         try:
             return coordinator.execute(
                 body.admission_envelope(),
@@ -1354,7 +1263,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 effect=execute_effect,
                 post_image=state.authoring_retained_state,
                 prepare_effect=prepare,
-                validate_under_claim=validate_source_under_claim,
                 after_release=(
                     lambda: state.prepare_current_applied_scene(
                         request_owner_epoch=body.request_owner_epoch,
@@ -1414,7 +1322,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         return _workspace(state)
 
     @router.post("/api/program/draft/mutations")
-    @authoring_gate
     def mutate_draft(body: DraftMutationRequest) -> dict[str, Any]:
         if body.mutation not in _AUTHORING_MUTATIONS:
             raise HTTPException(
@@ -1427,12 +1334,18 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 },
             )
         try:
-            prepared = active_authoring_effect()
-            result = state.draft_session.mutate(
+            arguments = body.arguments
+            if body.mutation in _SOURCE_RESOLVED_MUTATIONS:
+                resolved = _source_resolved_mutation(
+                    state, body.mutation, body.arguments
+                )
+                if resolved is None:
+                    raise RuntimeError("source-resolved mutation has no resolver")
+                arguments, _source_identity = resolved
+            # Prepare the edit and its derivation outside every owner lock.
+            prepared = state.draft_session.prepare_mutation(
                 tool_id=body.mutation,
-                arguments=deepcopy(
-                    prepared.get("resolved_mutation_arguments", body.arguments)
-                ),
+                arguments=deepcopy(arguments),
                 expected_revision=body.expected_draft_revision,
                 # Draft validation uses the immutable build-qualified catalog.
                 # Owner truth is rechecked only at consequential Save/Apply
@@ -1440,40 +1353,108 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 catalog=state.node_catalog,
                 draft_id=body.draft_id,
             )
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="mutate_draft",
+                install=lambda: state.draft_session.install_prepared_mutation(
+                    prepared
+                ),
+            )
         except Exception as error:
             _raise_workspace_error(error)
         return {
-            "mutation": result.mutation,
-            "details": result.details,
+            "mutation": prepared.tool_id,
+            "details": thaw_json(prepared.details),
             "workspace": _workspace(state),
+            "authoringWorkspace": commit.snapshot.as_dict(),
         }
 
     @router.post("/api/program/draft/runtime-override-promotions")
-    @authoring_gate
     def materialize_runtime_override(
         body: RuntimeOverrideMaterializationRequest,
     ) -> dict[str, Any]:
-        prepared = active_authoring_effect()
-        proposal = prepared["runtime_promotion"]
         try:
-            result = state.draft_session.mutate(
+            if state.headless_client is None:
+                raise DraftSessionError(
+                    "program_runtime_promotion_unavailable",
+                    "runtime promotion requires the current Program Runner",
+                    status_code=503,
+                )
+            try:
+                projection = state.headless_client.program_runtime_controls(
+                    body.program_run_id
+                )
+            except HeadlessClientError as error:
+                raise headless_client_http_exception(error) from error
+            controls = projection.get("runtime_controls")
+            proposals = (
+                controls.get("promotion_proposals")
+                if isinstance(controls, dict)
+                else None
+            )
+            proposal = next(
+                (
+                    row
+                    for row in proposals
+                    if isinstance(row, dict)
+                    and row.get("proposal_id") == body.proposal_id
+                ),
+                None,
+            ) if isinstance(proposals, list) else None
+            if (
+                projection.get("program_run_id") != body.program_run_id
+                or not isinstance(proposal, dict)
+                or proposal.get("status") != "ready"
+                or proposal.get("program_run_id") != body.program_run_id
+                or proposal.get("expected_draft_id") != body.draft_id
+                or proposal.get("expected_draft_revision")
+                != body.expected_draft_revision
+                or not isinstance(proposal.get("node_instance_id"), str)
+                or not isinstance(proposal.get("node_id"), str)
+                or not isinstance(proposal.get("parameter_id"), str)
+                or "value" not in proposal
+            ):
+                raise DraftSessionError(
+                    "program_runtime_promotion_stale",
+                    "runtime promotion no longer names this exact idle Draft",
+                    status_code=409,
+                )
+            arguments = {
+                "instance_id": proposal["node_instance_id"],
+                "expected_node_id": proposal["node_id"],
+                "parameters": {
+                    proposal["parameter_id"]: deepcopy(proposal["value"])
+                },
+                "merge": True,
+            }
+            # Prepare the promoted parameter edit outside every owner lock.
+            prepared = state.draft_session.prepare_mutation(
                 tool_id="tree_draft_update_node_params",
-                arguments=prepared["runtime_promotion_arguments"],
+                arguments=arguments,
                 expected_revision=body.expected_draft_revision,
                 catalog=state.node_catalog,
                 draft_id=body.draft_id,
+            )
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="materialize_runtime_override",
+                install=lambda: state.draft_session.install_prepared_mutation(
+                    prepared
+                ),
             )
         except Exception as error:
             _raise_workspace_error(error)
         return {
             "proposalId": proposal["proposal_id"],
-            "mutation": result.mutation,
-            "details": result.details,
+            "mutation": prepared.tool_id,
+            "details": thaw_json(prepared.details),
             "workspace": _workspace(state),
+            "authoringWorkspace": commit.snapshot.as_dict(),
         }
 
     @router.post("/api/program/open-draft")
-    @authoring_gate
     def open_draft(body: OpenDraftRequest) -> dict[str, Any]:
         try:
             state.draft_session.require_replace_allowed(
@@ -1486,79 +1467,160 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 allowed_roots=state.allowed_fs_roots,
                 catalog=_active_catalog(state),
             )
-            state.draft_session.replace_program(
-                program,
-                source_path=source_path,
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                discard_changes=body.confirm_discard,
+            prepared = state.draft_session.prepare_open_replacement(
+                program, source_path=source_path
             )
-            return _workspace(state)
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="open_draft",
+                session="whole-workspace",
+                install=lambda: state.draft_session.install_prepared_replacement(
+                    prepared,
+                    expected_draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                ),
+            )
+            return {
+                **_workspace(state),
+                "authoringWorkspace": commit.snapshot.as_dict(),
+            }
         except Exception as error:
             _raise_workspace_error(error)
 
     @router.post("/api/program/new-draft")
-    @authoring_gate
     def new_draft(body: NewDraftRequest) -> dict[str, Any]:
         try:
             def applied_revision() -> str | None:
                 context, _reason = _applied_context(state)
                 return context.program_revision if context is not None else None
 
-            state.draft_session.new_draft(
+            state.draft_session.require_replace_allowed(
                 draft_id=body.draft_id,
                 expected_revision=body.expected_draft_revision,
-                confirm_discard=body.confirm_discard,
-                applied_revision_reader=applied_revision,
-                catalog_reader=lambda: _active_catalog(state),
+                discard_changes=body.confirm_discard,
             )
-            return _workspace(state)
+            current = state.draft_session.snapshot()
+            if (
+                current["program_loaded"]
+                and not body.confirm_discard
+                and (applied := applied_revision()) is not None
+                and (
+                    current["program_revision"] is None
+                    or current["program_revision"] != applied
+                )
+            ):
+                raise DraftSessionError(
+                    "composer_draft_discard_confirmation_required",
+                    "creating a new Program would discard unapplied Draft changes",
+                    status_code=409,
+                )
+            prepared = state.draft_session.prepare_new_replacement(
+                _active_catalog(state)
+            )
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="new_draft",
+                session="whole-workspace",
+                install=lambda: state.draft_session.install_prepared_replacement(
+                    prepared,
+                    expected_draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                ),
+            )
+            return {
+                **_workspace(state),
+                "authoringWorkspace": commit.snapshot.as_dict(),
+            }
         except Exception as error:
             _raise_workspace_error(error)
 
-    @router.post("/api/program/save")
-    @authoring_gate
-    def save_draft(body: SaveDraftRequest) -> dict[str, Any]:
+    def program_save(
+        body: SaveDraftRequest | SaveDraftAsRequest,
+        *,
+        target_path: str | None,
+        confirm_overwrite: bool,
+    ) -> dict[str, Any]:
+        """Persist one exact Program Draft and adopt it as the Saved baseline.
+
+        The capture, the write and the baseline adoption are three separate
+        steps: the write happens outside every owner lock and the adoption is one
+        composite commit fenced by the captured workspace identity. A stale
+        adoption keeps the correctly written file and never labels newer
+        in-memory content Saved.
+        """
+
+        prepared = state.draft_session.prepare_save(
+            draft_id=body.draft_id,
+            expected_revision=body.expected_draft_revision,
+            target_path=target_path,
+            confirm_overwrite=confirm_overwrite,
+        )
+        if _published_program_revision(state, prepared.target_path) == (
+            prepared.program.program_revision
+        ):
+            # This exact content is already published at the target, so a lost
+            # response is resolved without repeating the write.
+            saved_path = prepared.resolved_target
+        else:
+            saved_path = save_program_artifact(
+                prepared.program,
+                prepared.target_path,
+                allowed_roots=_program_write_roots(state),
+                overwrite=prepared.overwrite,
+            )
         try:
-            state.draft_session.save_program(
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                target_path=None,
-                writer=lambda program, path: save_program_artifact(
-                    program,
-                    path,
-                    allowed_roots=_program_write_roots(state),
-                    overwrite=True,
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind=prepared.tool_id,
+                install=lambda: state.draft_session.install_prepared_save(
+                    prepared, saved_path=saved_path
                 ),
             )
-            return _workspace(state)
+        except AuthoringWorkspaceError as error:
+            if error.code != "composer_workspace_stale":
+                raise
+            # The Program artifact is correctly written; only the Saved
+            # baseline is refused, so newer in-memory content is never labelled
+            # Saved and the client refreshes instead of retrying blindly.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "program_saved_baseline_not_adopted",
+                    "message": (
+                        "the Program artifact was written but a newer "
+                        "workspace revision was not adopted as Saved"
+                    ),
+                    "path": saved_path,
+                    "currentWorkspace": error.detail.get("workspace"),
+                },
+            ) from error
+        return {
+            **_workspace(state),
+            "authoringWorkspace": commit.snapshot.as_dict(),
+        }
+
+    @router.post("/api/program/save")
+    def save_draft(body: SaveDraftRequest) -> dict[str, Any]:
+        try:
+            return program_save(
+                body,
+                target_path=None,
+                confirm_overwrite=True,
+            )
         except Exception as error:
             _raise_workspace_error(error)
 
     @router.post("/api/program/save-as")
-    @authoring_gate
     def save_draft_as(body: SaveDraftAsRequest) -> dict[str, Any]:
         try:
-            normalized = normalize_program_save_path(body.path)
-            try:
-                candidate = Path(normalized).expanduser()
-                resolved_candidate = str(candidate.parent.resolve() / candidate.name)
-            except (OSError, RuntimeError, ValueError):
-                resolved_candidate = normalized
-            current_path = state.draft_session.workspace_snapshot()["saved"]["path"]
-            overwrite = body.confirm_overwrite or resolved_candidate == current_path
-            state.draft_session.save_program(
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                target_path=normalized,
-                writer=lambda program, path: save_program_artifact(
-                    program,
-                    path,
-                    allowed_roots=_program_write_roots(state),
-                    overwrite=overwrite,
-                ),
+            return program_save(
+                body,
+                target_path=normalize_program_save_path(body.path),
+                confirm_overwrite=body.confirm_overwrite,
             )
-            return _workspace(state)
         except Exception as error:
             _raise_workspace_error(error)
 
@@ -1626,7 +1688,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         )
 
     @router.post("/api/program/discard")
-    @authoring_gate
     def discard_draft(body: DiscardDraftRequest) -> dict[str, Any]:
         try:
             def read_applied() -> Program:
@@ -1672,11 +1733,23 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     )
                 return candidate
 
-            return state.draft_session.discard_to_applied(
-                draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                reader=read_applied,
+            prepared = state.draft_session.prepare_discard_replacement(
+                read_applied()
             )
+            commit = commit_local_authoring(
+                state,
+                body,
+                operation_kind="discard_draft",
+                install=lambda: state.draft_session.install_prepared_replacement(
+                    prepared,
+                    expected_draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                ),
+            )
+            return {
+                **_workspace(state),
+                "authoringWorkspace": commit.snapshot.as_dict(),
+            }
         except Exception as error:
             _raise_workspace_error(error)
 

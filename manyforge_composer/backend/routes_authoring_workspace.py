@@ -34,7 +34,7 @@ def create_authoring_workspace_router(state: ComposerState) -> APIRouter:
         except AuthoringWorkspaceError as error:
             raise HTTPException(
                 status_code=error.status_code,
-                detail={"code": error.code, "detail": error.detail},
+                detail={"code": error.code, "message": str(error)},
             ) from error
 
     return router

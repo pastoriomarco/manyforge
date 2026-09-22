@@ -83,7 +83,14 @@ function state(
       run: null,
       runtimeControls: null,
     },
-    draftIdentity: { draftId: 'draft-1', draftRevision: 1 },
+    authoringWorkspace: {
+      workspaceEpoch: 'workspace.epoch.1',
+      workspaceRevision: 1,
+      programDraftId: 'draft-1',
+      programDraftRevision: 1,
+      deploymentDraftId: 'deployment-draft-1',
+      deploymentDraftRevision: 1,
+    },
     receiverEpoch: runtimeEpoch,
     snapshotSequence: Math.max(1, runtimeGeneration),
     runtime: {
@@ -221,9 +228,10 @@ describe('Headless owner-frame admission', () => {
       expect(admitHeadlessState(current, state('runtime.epoch.1', 1)).accepted)
         .toBe(false);
       const changedWithoutSequence = state('runtime.epoch.1', 2);
-      changedWithoutSequence.draftIdentity = {
-        ...changedWithoutSequence.draftIdentity,
-        draftRevision: changedWithoutSequence.draftIdentity.draftRevision + 1,
+      changedWithoutSequence.authoringWorkspace = {
+        ...changedWithoutSequence.authoringWorkspace,
+        programDraftRevision:
+          changedWithoutSequence.authoringWorkspace.programDraftRevision + 1,
       };
       expect(admitHeadlessState(current, changedWithoutSequence).accepted)
         .toBe(false);
@@ -300,7 +308,14 @@ function wireState(generation: number): Record<string, unknown> {
       run: null,
       runtime_controls: null,
     },
-    draft_identity: { draft_id: 'draft-1', draft_revision: 1 },
+    authoring_workspace: {
+      workspace_epoch: 'workspace.epoch.1',
+      workspace_revision: 1,
+      program_draft_id: 'draft-1',
+      program_draft_revision: 1,
+      deployment_draft_id: 'deployment-draft-1',
+      deployment_draft_revision: 1,
+    },
     receiver_epoch: 'receiver.epoch.1',
     snapshot_sequence: Math.max(1, generation + 1),
     complete: true,
@@ -764,10 +779,17 @@ describe('HeadlessStateSource delivery scheduling', () => {
       return;
     }
     expect(source.getShellSnapshot().error).toBeNull();
-    expect(source.getShellSnapshot().snapshot?.draftIdentity).toEqual({
-      draftId: 'draft-1', draftRevision: 2,
+    expect(source.getShellSnapshot().snapshot?.authoringWorkspace).toEqual({
+      workspaceEpoch: 'workspace.epoch.1',
+      workspaceRevision: 7,
+      programDraftId: 'draft-1',
+      programDraftRevision: 2,
+      deploymentDraftId: 'deployment-draft-1',
+      deploymentDraftRevision: 4,
     });
-    expect(source.getViewerSnapshot().snapshot?.draftIdentity.draftRevision).toBe(1);
+    expect(
+      source.getViewerSnapshot().snapshot?.authoringWorkspace.programDraftRevision,
+    ).toBe(1);
     source.dispose();
   });
 
@@ -830,8 +852,13 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(merged.authoringAdmission).toEqual({
       admissionGeneration: 2, authoringAllowed: false,
     });
-    expect(merged.draftIdentity).toEqual({
-      draftId: 'draft-1', draftRevision: 1,
+    expect(merged.authoringWorkspace).toEqual({
+      workspaceEpoch: 'workspace.epoch.1',
+      workspaceRevision: 1,
+      programDraftId: 'draft-1',
+      programDraftRevision: 1,
+      deploymentDraftId: 'deployment-draft-1',
+      deploymentDraftRevision: 1,
     });
     expect(merged.snapshotSequence).toBe(initial.snapshot_sequence);
     expect(merged.runtime).toBe(source.getViewerSnapshot().snapshot?.runtime);
@@ -1717,13 +1744,20 @@ describe('HeadlessStateSource delivery scheduling', () => {
           complete: false,
           receiver_epoch: 'receiver.epoch.1',
           snapshot_sequence: draftRevision + 1,
-          draft_identity: {
-            draft_id: 'draft-1', draft_revision: draftRevision,
+          authoring_workspace: {
+            workspace_epoch: 'workspace.epoch.1',
+            workspace_revision: draftRevision,
+            program_draft_id: 'draft-1',
+            program_draft_revision: draftRevision,
+            deployment_draft_id: 'deployment-draft-1',
+            deployment_draft_revision: 1,
           },
         },
       });
     }
-    expect(source.getShellSnapshot().snapshot?.draftIdentity.draftRevision).toBe(1);
+    expect(
+      source.getShellSnapshot().snapshot?.authoringWorkspace.programDraftRevision,
+    ).toBe(1);
     receiveControl(FakeWebSocket.shell, {
       schema_version: 'manyforge.execution_control.v2',
       message_kind: 'command_receipt',
@@ -1758,7 +1792,9 @@ describe('HeadlessStateSource delivery scheduling', () => {
     await Promise.resolve();
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
     expect(source.getShellSnapshot().snapshot?.programCycle.state).toBe(before);
-    expect(source.getShellSnapshot().snapshot?.draftIdentity.draftRevision).toBe(3);
+    expect(
+      source.getShellSnapshot().snapshot?.authoringWorkspace.programDraftRevision,
+    ).toBe(3);
     source.dispose();
     expect(vi.getTimerCount()).toBe(0);
   });

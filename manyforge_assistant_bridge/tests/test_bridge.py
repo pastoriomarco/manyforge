@@ -204,6 +204,8 @@ def _request(projection: dict[str, Any]) -> dict[str, Any]:
         "composerDraft": {
             "draftId": "draft.1",
             "expectedDraftRevision": 1,
+            "expectedWorkspaceEpoch": "workspace.1",
+            "expectedWorkspaceRevision": 3,
             "expectedAdmissionGeneration": 7,
             "programLoaded": True,
             "authoring": {"schema_version": "manyforge.composer_authoring_forest.v1"},
@@ -328,6 +330,9 @@ def test_bridge_verifies_projection_and_runs_only_draft_callback(tmp_path: Path)
                 "nextAdmissionGeneration": callback_body[
                     "expectedAdmissionGeneration"
                 ],
+                "nextWorkspaceRevision": callback_body[
+                    "expectedWorkspaceRevision"
+                ],
                 "result": {"kind": "composer_draft_read", "draftRevision": 1},
             },
             request=request,
@@ -427,6 +432,7 @@ def test_bridge_assigns_one_composer_idempotency_key_per_mutating_tool_call(
                 "nextAdmissionGeneration": (
                     body["expectedAdmissionGeneration"] + 2
                 ),
+                "nextWorkspaceRevision": body["expectedWorkspaceRevision"] + 1,
                 "result": {
                     "kind": "composer_draft_mutation",
                     "draftRevision": next_revision,
@@ -454,6 +460,12 @@ def test_bridge_assigns_one_composer_idempotency_key_per_mutating_tool_call(
     assert [
         body["expectedAdmissionGeneration"] for body in callback_bodies
     ] == [7, 9]
+    assert {
+        body["expectedWorkspaceEpoch"] for body in callback_bodies
+    } == {"workspace.1"}
+    assert [
+        body["expectedWorkspaceRevision"] for body in callback_bodies
+    ] == [3, 4]
     callback_ids = [body["requestId"] for body in callback_bodies]
     expected_ids = [
         "assistant.callback."
@@ -850,6 +862,7 @@ def test_bridge_bounds_repeated_tool_failures_as_clarification(tmp_path: Path) -
                 "nextAdmissionGeneration": body[
                     "expectedAdmissionGeneration"
                 ],
+                "nextWorkspaceRevision": body["expectedWorkspaceRevision"],
                 "result": {
                     "kind": "validation_error",
                     "message": "Draft is unavailable",

@@ -660,6 +660,10 @@ class BridgeService:
         admission_generation = (
             request.composer_draft.expected_admission_generation
         )
+        # The composite workspace fence advances on every committed edit, so the
+        # loop tracks it exactly like the Draft revision and admission
+        # generation instead of reusing the first turn's identity.
+        workspace_revision = request.composer_draft.expected_workspace_revision
         failure_counts: dict[str, int] = {}
 
         for turn in range(1, self.config.maximum_turns + 1):
@@ -804,6 +808,7 @@ class BridgeService:
                         verified=verified,
                         call=call,
                         expected_draft_revision=draft_revision,
+                        expected_workspace_revision=workspace_revision,
                         expected_admission_generation=admission_generation,
                         turn=turn,
                     )
@@ -812,6 +817,12 @@ class BridgeService:
                 )
                 if type(next_admission_generation) is int:
                     admission_generation = next_admission_generation
+                next_workspace_revision = result.get("nextWorkspaceRevision")
+                if (
+                    type(next_workspace_revision) is int
+                    and next_workspace_revision >= workspace_revision
+                ):
+                    workspace_revision = next_workspace_revision
                 mutated = result.get("draftMutated") is True
                 draft_mutated = draft_mutated or mutated
                 result_payload = result.get("result")
@@ -1114,6 +1125,7 @@ class BridgeService:
         verified: _VerifiedRequest,
         call: _ToolCall,
         expected_draft_revision: int,
+        expected_workspace_revision: int,
         expected_admission_generation: int,
         turn: int,
     ) -> dict[str, Any]:
@@ -1146,6 +1158,8 @@ class BridgeService:
             "fieldPolicy": deepcopy(request.field_policy),
             "draftId": context.draft_id,
             "expectedDraftRevision": expected_draft_revision,
+            "expectedWorkspaceEpoch": context.expected_workspace_epoch,
+            "expectedWorkspaceRevision": expected_workspace_revision,
             "expectedAdmissionGeneration": expected_admission_generation,
             "requestId": callback_request_id,
             "requestOwnerEpoch": request.request_owner_epoch,
@@ -1203,6 +1217,7 @@ class BridgeService:
             "sourceLabel",
             "correlationId",
             "nextAdmissionGeneration",
+            "nextWorkspaceRevision",
             "result",
         }
         if set(result) != expected_fields or any(
@@ -1257,6 +1272,21 @@ class BridgeService:
             raise BridgeRunError(
                 "assistant_callback_invalid",
                 "Composer callback mutation flags disagree",
+            )
+        # A committed edit advances the composite workspace exactly once; a
+        # validated no-op callback and a read leave it unchanged.
+        next_workspace_revision = result["nextWorkspaceRevision"]
+        expected_next_workspace_revision = expected_workspace_revision + (
+            1 if result["mutated"] else 0
+        )
+        if (
+            type(next_workspace_revision) is not int
+            or not 1 <= next_workspace_revision <= MAXIMUM_SAFE_INTEGER
+            or next_workspace_revision != expected_next_workspace_revision
+        ):
+            raise BridgeRunError(
+                "assistant_callback_invalid",
+                "Composer callback returned an invalid workspace revision",
             )
         return result
 

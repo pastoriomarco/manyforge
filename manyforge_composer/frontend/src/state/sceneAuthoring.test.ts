@@ -123,7 +123,14 @@ describe('scene authoring intents', () => {
   it('forms an authored fence only from one current admitted Draft snapshot', () => {
     const snapshot = {
       authoringAdmission: { authoringAllowed: true, admissionGeneration: 7 },
-      draftIdentity: { draftId: 'draft-1', draftRevision: 4 },
+      authoringWorkspace: {
+        workspaceEpoch: 'workspace.epoch.1',
+        workspaceRevision: 9,
+        programDraftId: 'draft-1',
+        programDraftRevision: 4,
+        deploymentDraftId: 'deployment-draft-1',
+        deploymentDraftRevision: 1,
+      },
     } as ComposerHeadlessState;
     expect(sceneMutationFenceFromSnapshot(snapshot, 'draft-1', 4)).toEqual({
       available: true,
