@@ -4,12 +4,14 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 import pytest
 
+from manyforge_behavior.program import Program
 from manyforge_composer.backend.deployment_draft import (
     CompiledDeploymentDocument,
     DeploymentDraftError,
@@ -17,6 +19,7 @@ from manyforge_composer.backend.deployment_draft import (
     _edit_controlled_stop_profile,
     compile_deployment_document,
 )
+from manyforge_composer.backend.draft_session import ComposerDraftSession
 from manyforge_composer.backend.routes_deployment_draft import (
     _raise,
     create_deployment_draft_router,
@@ -497,8 +500,8 @@ def test_jerk_draft_choice_preserves_units_inactive_values_and_substitution(enab
         ],
     }
     selection = {
-        "control_binding_id": "arm_binding",
-        "control_binding_revision": _DIGEST,
+        "controllable_component_id": "robot",
+        "command_target_id": "arm",
         "timing": None,
     }
     result = _edit_controlled_stop_profile(source, profile, **selection)
@@ -519,7 +522,7 @@ def test_jerk_draft_choice_preserves_units_inactive_values_and_substitution(enab
         _edit_controlled_stop_profile(source, profile, **selection)
 
 
-def test_stop_timing_edit_preserves_other_binding_and_explicit_null_removes_only_selection():
+def test_stop_timing_edit_converges_all_bindings_for_one_authored_target():
     source = _focused_document()
     other_binding = deepcopy(source["graph"]["control_bindings"][0])
     other_binding["control_binding_id"] = "other_binding"
@@ -539,10 +542,7 @@ def test_stop_timing_edit_preserves_other_binding_and_explicit_null_removes_only
     }
     source["policies"]["stop_timing_parameters"] = [deepcopy(other)]
     saved_source = deepcopy(source)
-    selection = {
-        "control_binding_id": "arm_binding",
-        "control_binding_revision": _DIGEST,
-    }
+    selection = {"controllable_component_id": "robot", "command_target_id": "arm"}
     # A timing-only edit does not require a fictitious motion profile.
     result = _edit_controlled_stop_profile(source, None, **selection, timing=timing)
     assert source == saved_source
@@ -551,17 +551,21 @@ def test_stop_timing_edit_preserves_other_binding_and_explicit_null_removes_only
         == source["policies"]["stop_stage_parameters"]
     )
     assert result["policies"]["stop_timing_parameters"] == [
+        {
+            "control_binding_id": "arm_binding",
+            "control_binding_revision": _DIGEST,
+            "timing": timing,
+        },
         other,
-        {**selection, "timing": timing},
     ]
     restored = _edit_controlled_stop_profile(result, None, **selection, timing=None)
-    assert restored == source
+    assert "stop_timing_parameters" not in restored["policies"]
     with pytest.raises(DeploymentDraftError, match="no longer matches"):
         _edit_controlled_stop_profile(
             source,
             None,
-            control_binding_id="arm_binding",
-            control_binding_revision="sha256:" + "2" * 64,
+            controllable_component_id="other",
+            command_target_id="arm",
             timing=timing,
         )
     with pytest.raises(DeploymentDraftError, match="integer nanosecond"):
@@ -882,49 +886,76 @@ def test_invalid_or_stale_deployment_mutation_never_changes_the_draft(
     )
 
 
-def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_program(
-    tmp_path: Path,
+def test_authored_deployment_apply_carries_one_prepared_identity_through_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from manyforge_composer.backend import routes_deployment_draft
+
     client, state = _client(tmp_path)
-    source = tmp_path / "cell_a.deployment.yaml"
-    source.write_text(json.dumps(_document()), encoding="utf-8")
-    initial = client.get("/api/deployment/workspace").json()
-    opened = client.post(
-        "/api/deployment/open-draft",
-        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
-    ).json()
-    base_revision = opened["draft"]["deploymentRevision"]
+    project = (
+        Path(__file__).resolve().parents[2]
+        / "examples/lite6_pick_and_place.scenario"
+    )
+    source = project / "deployment.yaml"
+    state.allowed_fs_roots.append(str(project.parents[1]))
+    state.scenario_document_path = str(project)
+    state.deployment_draft_session = DeploymentDraftSession()
+    compiled = state.deployment_draft_session.preview_source(
+        source.read_text(encoding="utf-8")
+    )
+    retained = state.deployment_draft_session.retained_state()
+    retained.update(
+        {
+            "draft_revision": 1,
+            "document": compiled.document,
+            "saved_path": str(source),
+            "saved_document": compiled.document,
+        }
+    )
+    state.deployment_draft_session.restore_retained_state(retained)
+    opened = client.get("/api/deployment/workspace").json()
+    base_revision = "sha256:" + "1" * 64
     edited = client.post(
         "/api/deployment/draft/mutations",
         json=_request(opened, path=["name"], value="Authored", kind="edit"),
     ).json()
-    candidate_revision = edited["draft"]["deploymentRevision"]
+    candidate_revision = "sha256:" + "8" * 64
     assert candidate_revision != base_revision
-    program = {
-        "api_version": "manyforge.program.v2",
-        "program_id": "program_a",
-        "program_revision": "sha256:" + "7" * 64,
-    }
+    program_model = Program(
+        str(
+            Path(__file__).resolve().parents[2]
+            / "examples/lite6_lite_gripper_pick_and_place.program.yaml"
+        ),
+        state.node_environment.catalog,
+    )
+    program = program_model.to_dict()
+    state.draft_session = ComposerDraftSession(program_model)
+    state.scenario_program_role_assignment = json.loads(
+        (project / "assignment.yaml").read_text(encoding="utf-8")
+    )
+    state.scenario_source_document_digest = "sha256:" + "6" * 64
+    state.scenario_typed_parameter_overrides = {}
+    capture_calls = 0
+    refuse_additional_capture = False
+    capture_sources = routes_deployment_draft._capture_model_sources
+
+    def counted_capture(*args, **kwargs):
+        nonlocal capture_calls, refuse_additional_capture
+        if refuse_additional_capture:
+            raise AssertionError("confirmation must not recapture model sources")
+        capture_calls += 1
+        return capture_sources(*args, **kwargs)
+
+    monkeypatch.setattr(
+        routes_deployment_draft, "_capture_model_sources", counted_capture
+    )
     current = {
-        "scenario_id": "cell_a",
-        "scenario_catalog_revision": "sha256:" + "6" * 64,
-        "deployment_artifact_id": "cell_a",
         "deployment_revision": base_revision,
         "retained_bundle_id": "sha256:" + "2" * 64,
         "graph_revision": "sha256:" + "3" * 64,
-        "program_id": "program_a",
-        "program_revision": program["program_revision"],
-        "program_binding_id": "sha256:" + "5" * 64,
     }
 
     class CandidateHeadless(_Headless):
-        def program_applied(self):
-            return {
-                **current,
-                "program": deepcopy(program),
-                "source": {"record_digest": "sha256:" + "8" * 64},
-            }
-
         def manager_status(self):
             return {
                 "source": {
@@ -943,11 +974,6 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
             }
 
     state.headless_client = CandidateHeadless()  # type: ignore[assignment]
-    state.current_scenario = lambda: {  # type: ignore[method-assign]
-        "ready": True,
-        "current_scenario": deepcopy(current),
-        "unavailable_reasons": [],
-    }
     effects: list[tuple[dict[str, Any], bool]] = []
 
     confirmation_token = "sha256:" + "c" * 64
@@ -960,17 +986,21 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
         prepared=None,
         prepare_only=False,
     ):
-        compilation = {
-            "schema_version": "manyforge.deployment_candidate_compilation.v1",
-            "scenario_id": current["scenario_id"],
-            "scenario_catalog_revision": "sha256:" + "9" * 64,
-            "deployment_artifact_id": "cell_a",
+        prepared_activation = {
+            "schema_version": "manyforge.prepared_activation_input.v2",
+            "prepared_activation_id": "sha256:" + "9" * 64,
+            "source_document_digest": intent["source_document_digest"],
+            "captured_input_digest": intent["captured_input_digest"],
+            "deployment_artifact_id": edited["draft"]["deploymentArtifactId"],
             "deployment_revision": candidate_revision,
             "retained_bundle_id": "sha256:" + "a" * 64,
-            "graph_revision": edited["draft"]["graphRevision"],
-            "program_id": "program_a",
+            "graph_revision": "sha256:" + "7" * 64,
+            "program_id": program["program_id"],
             "program_revision": program["program_revision"],
             "program_binding_id": "sha256:" + "b" * 64,
+            "node_environment_digest": "sha256:" + "d" * 64,
+            "assistant_mode": "forbidden",
+            "typed_parameter_overrides": {},
         }
         if prepared is None:
             confirmation_required = (
@@ -985,18 +1015,14 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
                 "confirmation_token": (
                     confirmation_token if confirmation_required else None
                 ),
-                "compilation": compilation,
+                "prepared_activation": prepared_activation,
                 "candidate_preview": (
                     {"diff": {"runtime_units": {"changed": ["runtime"]}}}
                     if confirmation_required
                     else None
                 ),
                 "manager_apply": None,
-                "selection": {
-                    key: value
-                    for key, value in compilation.items()
-                    if key != "schema_version"
-                },
+                "selection": None,
                 "preparation": (
                     {
                         "request_owner_epoch": intent[
@@ -1007,7 +1033,7 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
                     if confirmation_required
                     else None
                 ),
-                "phases_ms": {"compile_ms": 1.0},
+                "phases_ms": {"preparation_ms": 1.0},
                 "apply_id": None,
             }
             prepared = {"result": result}
@@ -1017,14 +1043,6 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
         result = deepcopy(prepared["result"])
         if result["status"] == "confirmation_required":
             return result
-        if apply:
-            current.update(
-                {
-                    key: value
-                    for key, value in compilation.items()
-                    if key != "schema_version"
-                }
-            )
         return result
 
     state.execute_authored_deployment_candidate = execute_candidate  # type: ignore[method-assign]
@@ -1044,6 +1062,11 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
     assert effects[-1][0]["program"] == program
     assert effects[-1][0]["deployment"] == edited["draft"]["document"]
     assert prepared == []
+    capture_calls_after_preparation = capture_calls
+    refuse_additional_capture = True
+    state.retained_deployment_candidate_input = (  # type: ignore[method-assign]
+        lambda _owner, _request: deepcopy(effects[-1][0])
+    )
 
     applied = client.post(
         "/api/deployment/draft/apply",
@@ -1061,132 +1084,37 @@ def test_authored_deployment_apply_confirms_disruption_then_preserves_exact_prog
     )
     assert applied.status_code == 200, applied.text
     assert applied.json()["result"]["status"] == "applied"
-    assert applied.json()["workspace"]["runAdmission"]["ready"] is True
-    assert current["program_revision"] == program["program_revision"]
+    # This UA2A regression proves preparation reuse only. The test double does
+    # not publish the candidate bundle as Manager current; UA3 owns that live
+    # transition, so assert the Manager-facing observation stayed unchanged.
+    assert current["deployment_revision"] == base_revision
+    assert capture_calls == capture_calls_after_preparation
+    assert applied.json()["result"]["prepared_activation"] == (
+        confirmation.json()["result"]["prepared_activation"]
+    )
     assert prepared == [("browser-test", "request-2-apply-confirmed")]
 
 
-def test_candidate_apply_partial_timeout_returns_one_typed_gateway_error(
-    tmp_path: Path,
-) -> None:
-    """One post-Apply observation timeout is a typed 504, never a silent 500."""
-
-    client, state = _client(tmp_path)
-    source = tmp_path / "cell_a.deployment.yaml"
-    source.write_text(json.dumps(_document()), encoding="utf-8")
-    initial = client.get("/api/deployment/workspace").json()
-    opened = client.post(
-        "/api/deployment/open-draft",
-        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
-    ).json()
-    program = {
-        "api_version": "manyforge.program.v2",
-        "program_id": "program_a",
-        "program_revision": "sha256:" + "7" * 64,
+def test_retained_confirmation_input_is_an_immutable_journal_copy() -> None:
+    state = ComposerState()
+    retained = {
+        "operation_kind": "apply_deployment_candidate",
+        "captured_input_digest": "sha256:" + "1" * 64,
+        "model_source_closure": {"sources": [{"source_id": "robot"}]},
     }
-    current = {
-        "scenario_id": "cell_a",
-        "scenario_catalog_revision": "sha256:" + "6" * 64,
-        "deployment_artifact_id": "cell_a",
-        "deployment_revision": opened["draft"]["deploymentRevision"],
-        "retained_bundle_id": "sha256:" + "2" * 64,
-        "graph_revision": "sha256:" + "3" * 64,
-        "program_id": "program_a",
-        "program_revision": program["program_revision"],
-        "program_binding_id": "sha256:" + "5" * 64,
-    }
-
-    class TimeoutHeadless(_Headless):
-        def program_applied(self):
-            return {
-                **current,
-                "program": deepcopy(program),
-                "source": {"record_digest": "sha256:" + "8" * 64},
-            }
-
-        def manager_status(self):
-            return {
-                "source": {
-                    "available": True,
-                    "freshness": "fresh",
-                    "known_gaps": [],
-                    "source_owner_epoch": "manager.epoch.1",
-                },
-                "status": {
-                    "manager_ready": True,
-                    "active": {
-                        "retained_bundle_id": current["retained_bundle_id"],
-                        "graph_revision": current["graph_revision"],
-                    },
-                },
-            }
-
-    state.headless_client = TimeoutHeadless()  # type: ignore[assignment]
-    state.current_scenario = lambda: {  # type: ignore[method-assign]
-        "ready": True,
-        "current_scenario": deepcopy(current),
-        "unavailable_reasons": [],
-    }
-    scene_preparations: list[tuple[str, str]] = []
-    state.prepare_current_applied_scene = lambda **kwargs: scene_preparations.append(  # type: ignore[method-assign]
-        (kwargs["request_owner_epoch"], kwargs["request_id"])
+    transaction = SimpleNamespace(
+        complete=True,
+        effect_intent=retained,
     )
-    activations: list[bool] = []
-
-    def timeout_candidate(
-        intent,
-        _claim,
-        *,
-        apply,
-        prepared=None,
-        prepare_only=False,
-    ):
-        if prepare_only:
-            return {
-                "compilation": {
-                    **{field: current[field] for field in current},
-                    "schema_version": (
-                        "manyforge.deployment_candidate_compilation.v1"
-                    ),
-                    "program": deepcopy(program),
-                },
-                "candidate_preview": None,
-                "manager_apply": {"request_id": intent["manager_request_id"]},
-                "confirmation_required": False,
-                "confirmation_token": None,
-                "preparation": None,
-                "phases_ms": {"compile_ms": 1.0, "manager_apply_ms": 1.0},
-            }
-        activations.append(apply)
-        raise AuthoringJournalError(
-            "deployment_candidate_selection_timeout",
-            "Manager applied; selection confirmation timed out"
-            " for Apply apply-1 generation 1",
-        )
-
-    state.execute_authored_deployment_candidate = timeout_candidate  # type: ignore[method-assign]
-
-    response = client.post(
-        "/api/deployment/draft/apply",
-        json=_request(opened, kind="apply"),
+    state.authoring_admission = SimpleNamespace(
+        prepared_authoring_transaction=lambda _owner, _request: transaction
     )
 
-    assert response.status_code == 504, response.text
-    assert response.json()["detail"] == {
-        "code": "deployment_candidate_selection_timeout",
-        "message": (
-            "Manager applied; selection confirmation timed out for Apply "
-            "apply-1 generation 1"
-        ),
-    }
-    # The response names the accepted Apply's partial timeout.  It claims no
-    # rollback: the activation ran once, no post-Apply scene preparation was
-    # attempted, and the Draft was left intact.
-    assert activations == [True]
-    assert scene_preparations == []
-    untouched = state.deployment_draft_session.snapshot()["draft"]
-    assert untouched["revision"] == opened["draft"]["revision"]
-    assert untouched["document"] == opened["draft"]["document"]
+    first = state.retained_deployment_candidate_input("owner", "request")
+    first["model_source_closure"]["sources"][0]["source_id"] = "changed"
+
+    second = state.retained_deployment_candidate_input("owner", "request")
+    assert second == retained
 
 
 def test_exact_candidate_replay_precedes_fresh_runtime_prerequisites(
@@ -1332,8 +1260,8 @@ def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
             opened,
             profile=profile,
             kind="controlled-stop",
-            control_binding_id="arm_binding",
-            control_binding_revision=_DIGEST,
+            controllable_component_id="robot",
+            command_target_id="arm",
             timing={
                 "command_latency_allowance_ns": 250_000_000,
                 "settling_allowance_ns": 750_000_000,
@@ -1347,9 +1275,8 @@ def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
         row
         for row in rows
         if row["stop_escalation_stage_id"] == "motion_controlled_stop"
-        and row["control_binding_id"] == "arm_binding"
     ]
-    assert len(controlled) == 2
+    assert len(controlled) == 3
     assert all(
         row["default_contract_parameters"]
         == {
@@ -1374,7 +1301,7 @@ def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
         for row in controlled
     )
     assert rows[2]["default_contract_parameters"] == {}
-    assert rows[3] == other_stage
+    assert rows[3]["control_binding_id"] == "other_binding"
     workspace = updated.json()
     saved = client.post(
         "/api/deployment/save-as",

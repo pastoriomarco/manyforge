@@ -11,11 +11,23 @@ import threading
 from typing import Any, Callable, NoReturn, Sequence
 import uuid
 
+from manyforge_behavior.canonical_artifact import (
+    StrictArtifactError,
+    canonical_json_bytes,
+    load_strict_json_yaml_bytes,
+)
+
+from .deployment_intent import (
+    DEPLOYMENT_INTENT_API_VERSION,
+    DeploymentIntentError,
+    validate_deployment_intent,
+)
+
 
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 _MAX_PATH_DEPTH = 32
 _MAX_COLLECTION_INDEX = 100_000
-_RETAINED_SCHEMA = "manyforge.composer_deployment_draft_state.v1"
+_RETAINED_SCHEMA = "manyforge.composer_deployment_draft_state.v2"
 
 
 class DeploymentDraftError(RuntimeError):
@@ -34,11 +46,49 @@ class CompiledDeploymentDocument:
     document: dict[str, Any]
     canonical_json: str
     deployment_artifact_id: str
-    deployment_revision: str
-    graph_revision: str
+    deployment_revision: str | None
+    graph_revision: str | None
 
 
 DeploymentCompiler = Callable[[str], CompiledDeploymentDocument]
+
+
+def validate_deployment_draft_document(source: str) -> CompiledDeploymentDocument:
+    """Validate one authored intent or an unmigrated compiled artifact.
+
+    Source-referenced intent is the authoritative UA2A authoring document.  The
+    compiled branch is a temporary adapter for standalone Deployment consumers
+    that have not yet moved to Scenario projects; it is not used as a fallback
+    if intent validation fails.
+    """
+
+    encoded = source.encode("utf-8")
+    if not encoded or len(encoded) > _MAX_DOCUMENT_BYTES:
+        _fail(
+            "deployment_draft_oversized",
+            "Deployment Draft exceeds the artifact byte bound",
+            status_code=413,
+        )
+    try:
+        value = load_strict_json_yaml_bytes(encoded, source="<Deployment Draft>")
+    except StrictArtifactError as error:
+        _fail("deployment_draft_invalid", str(error))
+    if type(value) is dict and value.get("api_version") == DEPLOYMENT_INTENT_API_VERSION:
+        try:
+            document = validate_deployment_intent(
+                value, source="<Deployment Draft>"
+            )
+            canonical = canonical_json_bytes(document).decode("utf-8")
+        except (DeploymentIntentError, StrictArtifactError) as error:
+            _fail("deployment_draft_invalid", str(error))
+        return CompiledDeploymentDocument(
+            document=document,
+            canonical_json=canonical,
+            deployment_artifact_id=document["deployment_artifact_id"],
+            deployment_revision=None,
+            graph_revision=None,
+        )
+    return compile_deployment_document(source)
 
 
 def compile_deployment_document(source: str) -> CompiledDeploymentDocument:
@@ -214,7 +264,7 @@ def _edit_at_path(
     return candidate
 
 
-def _edit_controlled_stop_profile(
+def _edit_compiled_controlled_stop_profile(
     document: dict[str, Any],
     profile: dict[str, Any] | None,
     *,
@@ -489,6 +539,150 @@ def _edit_controlled_stop_profile(
     )
 
 
+def _edit_controlled_stop_profile(
+    document: dict[str, Any],
+    profile: dict[str, Any] | None,
+    *,
+    controllable_component_id: str,
+    command_target_id: str,
+    timing: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Edit one authored target and let preparation expand its route copies."""
+
+    if document.get("api_version") == DEPLOYMENT_INTENT_API_VERSION:
+        candidate = deepcopy(document)
+        matches: list[dict[str, Any]] = []
+        for component in candidate.get("components", []):
+            if (
+                isinstance(component, dict)
+                and component.get("component_id") == controllable_component_id
+                and isinstance(component.get("target_settings"), dict)
+                and isinstance(
+                    component["target_settings"].get(command_target_id), dict
+                )
+            ):
+                matches.append(component["target_settings"][command_target_id])
+        if len(matches) != 1 or not isinstance(matches[0].get("controlled_stop"), dict):
+            _fail(
+                "deployment_controlled_stop_scope_mismatch",
+                "Controlled Stop target no longer matches this Deployment Draft",
+                status_code=409,
+            )
+        current = matches[0]["controlled_stop"]
+        if profile is not None:
+            expected = {
+                "allow_natural_completion_on_short_path",
+                "jerk_limits_enabled",
+                "deceleration_time_s",
+                "per_resource_limits",
+                "stop_mode",
+            }
+            if not isinstance(profile, dict) or set(profile) != expected:
+                _fail(
+                    "deployment_controlled_stop_invalid",
+                    "Controlled Stop profile has an invalid shape",
+                )
+            limits = profile["per_resource_limits"]
+            if not isinstance(limits, list):
+                _fail(
+                    "deployment_controlled_stop_invalid",
+                    "Controlled Stop resource limits are malformed",
+                )
+            authored_limits: list[dict[str, Any]] = []
+            for row in limits:
+                if not isinstance(row, dict):
+                    _fail(
+                        "deployment_controlled_stop_invalid",
+                        "Controlled Stop resource limit is malformed",
+                    )
+                maximum = row.get("max_deceleration")
+                threshold = row.get("settle_velocity_threshold")
+                jerk = row.get("max_jerk")
+                if (
+                    not isinstance(row.get("resource_id"), str)
+                    or not isinstance(maximum, dict)
+                    or maximum.get("coordinate_kind") != "angular_rad_s2"
+                    or not isinstance(threshold, dict)
+                    or threshold.get("coordinate_kind") != "angular_rad_s"
+                    or (jerk is not None and (
+                        not isinstance(jerk, dict)
+                        or jerk.get("coordinate_kind") != "angular_rad_s3"
+                    ))
+                ):
+                    _fail(
+                        "deployment_controlled_stop_invalid",
+                        "Authored Stop limits must use source-joint angular units",
+                    )
+                authored = {
+                    "source_joint_name": row["resource_id"],
+                    "max_deceleration_rad_s2": maximum.get("value"),
+                    "settle_velocity_threshold_rad_s": threshold.get("value"),
+                }
+                if jerk is not None:
+                    authored["max_jerk_rad_s3"] = jerk.get("value")
+                authored_limits.append(authored)
+            current = {
+                "stop_mode": profile["stop_mode"],
+                "allow_natural_completion_on_short_path": profile[
+                    "allow_natural_completion_on_short_path"
+                ],
+                "jerk_limits_enabled": profile["jerk_limits_enabled"],
+                "deceleration_time_s": profile["deceleration_time_s"],
+                "per_joint_limits": authored_limits,
+            }
+        else:
+            current = deepcopy(current)
+            current.pop("timing", None)
+        if timing is not None:
+            current["timing"] = deepcopy(timing)
+        matches[0]["controlled_stop"] = current
+        try:
+            return validate_deployment_intent(
+                candidate, source="<Deployment Draft mutation>"
+            )
+        except DeploymentIntentError as error:
+            _fail("deployment_controlled_stop_invalid", str(error))
+
+    graph = document.get("graph")
+    bindings = graph.get("control_bindings") if isinstance(graph, dict) else None
+    if not isinstance(bindings, list):
+        _fail(
+            "deployment_controlled_stop_unavailable",
+            "Deployment has no editable Controlled Stop bindings",
+            status_code=409,
+        )
+    selected = [
+        row
+        for row in bindings
+        if isinstance(row, dict)
+        and row.get("controllable_component_id") == controllable_component_id
+        and row.get("command_target_id") == command_target_id
+    ]
+    if not selected:
+        _fail(
+            "deployment_controlled_stop_scope_mismatch",
+            "Controlled Stop target no longer matches this Deployment Draft",
+            status_code=409,
+        )
+    candidate = document
+    for binding in selected:
+        binding_id = binding.get("control_binding_id")
+        binding_revision = binding.get("control_binding_revision")
+        if not isinstance(binding_id, str) or not isinstance(binding_revision, str):
+            _fail(
+                "deployment_controlled_stop_invalid",
+                "Controlled Stop binding identity is malformed",
+            )
+        candidate = _edit_compiled_controlled_stop_profile(
+            candidate,
+            profile,
+            control_binding_id=binding_id,
+            control_binding_revision=binding_revision,
+            timing=timing,
+        )
+    return candidate
+
+
 def _with_stop_timing(
     document: dict[str, Any],
     control_binding_id: str,
@@ -558,6 +752,41 @@ def _edit_motion_target_limit(
             "Target motion limit identity or value is invalid",
         )
     candidate = deepcopy(document)
+    if candidate.get("api_version") == DEPLOYMENT_INTENT_API_VERSION:
+        components = candidate.get("components")
+        if not isinstance(components, list):
+            _fail(
+                "deployment_motion_target_limit_unavailable",
+                "Deployment intent has no component inventory",
+                status_code=409,
+            )
+        matches: list[dict[str, Any]] = []
+        for component in components:
+            if (
+                not isinstance(component, dict)
+                or component.get("component_id") != controllable_component_id
+            ):
+                continue
+            settings = component.get("target_settings")
+            if isinstance(settings, dict):
+                target = settings.get(command_target_id)
+                if isinstance(target, dict):
+                    matches.append(target)
+        if len(matches) != 1:
+            _fail(
+                "deployment_motion_target_limit_scope_mismatch",
+                "Deployment intent must contain exactly one addressed motion target",
+                status_code=409,
+            )
+        matches[0]["maximum_tcp_linear_speed_mps"] = float(
+            maximum_tcp_linear_speed_mps
+        )
+        try:
+            return validate_deployment_intent(
+                candidate, source="<Deployment Draft mutation>"
+            )
+        except DeploymentIntentError as error:
+            _fail("deployment_draft_invalid", str(error))
     graph = candidate.get("graph")
     runtime_units = graph.get("runtime_units") if isinstance(graph, dict) else None
     if not isinstance(runtime_units, list):
@@ -601,7 +830,7 @@ class DeploymentDraftSession:
     """Own one optional exact Deployment Draft and Saved baseline."""
 
     def __init__(
-        self, *, compiler: DeploymentCompiler = compile_deployment_document
+        self, *, compiler: DeploymentCompiler = validate_deployment_draft_document
     ) -> None:
         self._lock = threading.RLock()
         self._compiler = compiler
@@ -676,8 +905,8 @@ class DeploymentDraftSession:
         self,
         profile: dict[str, Any] | None,
         *,
-        control_binding_id: str,
-        control_binding_revision: str,
+        controllable_component_id: str,
+        command_target_id: str,
         timing: dict[str, Any] | None,
         draft_id: str,
         expected_revision: int,
@@ -693,8 +922,8 @@ class DeploymentDraftSession:
             candidate = _edit_controlled_stop_profile(
                 self._compiled.document,
                 profile,
-                control_binding_id=control_binding_id,
-                control_binding_revision=control_binding_revision,
+                controllable_component_id=controllable_component_id,
+                command_target_id=command_target_id,
                 timing=timing,
             )
         return self._compiler(_source(candidate))

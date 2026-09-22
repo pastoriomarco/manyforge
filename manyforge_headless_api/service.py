@@ -34,7 +34,7 @@ from .history_query import HistorianQueryRequest
 from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
-    DeploymentCandidateCompilationRequest,
+    ActivationPreparationRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
     ManagerDeploymentCandidatePreviewRequest,
@@ -205,7 +205,7 @@ class HeadlessService:
         program_runner: ProgramRunnerPort | None = None,
         cell_admission: Any | None = None,
         cclc: Any | None = None,
-        deployment_compiler: Any | None = None,
+        activation_preparer: Any | None = None,
     ) -> None:
         self.core = core
         self.manager = manager
@@ -213,7 +213,7 @@ class HeadlessService:
         self.program_runner = program_runner
         self.cell_admission = cell_admission
         self.cclc = cclc
-        self.deployment_compiler = deployment_compiler
+        self.activation_preparer = activation_preparer
 
     def _cell_admission(self) -> Any:
         if self.cell_admission is None:
@@ -2385,13 +2385,13 @@ class HeadlessService:
     ) -> dict[str, Any]:
         return self.manager.preview_deployment_candidate(request)
 
-    def compile_deployment_candidate(
-        self, request: DeploymentCandidateCompilationRequest
+    def prepare_activation(
+        self, request: ActivationPreparationRequest
     ) -> dict[str, Any]:
-        if self.deployment_compiler is None:
+        if self.activation_preparer is None:
             raise HeadlessApiError(
-                "deployment_candidate_compiler_unavailable",
-                "Deployment candidate compilation is not configured",
+                "activation_preparer_unavailable",
+                "Activation preparation is not configured",
             )
         claim = request.authoring_claim
         intent = claim.get("intent") if isinstance(claim, dict) else None
@@ -2402,7 +2402,7 @@ class HeadlessService:
         ):
             raise HeadlessApiError(
                 "authoring_not_ready",
-                "Deployment candidate compilation requires an exact held "
+                "Activation preparation requires an exact held "
                 "authoring claim",
             )
         try:
@@ -2415,13 +2415,14 @@ class HeadlessService:
                 "Deployment candidate authoring claim is no longer exact",
             )
         return {
-            "compilation": self.deployment_compiler.compile(
-                scenario_id=request.scenario_id,
-                expected_scenario_catalog_revision=(
-                    request.expected_scenario_catalog_revision
-                ),
+            "prepared_activation": self.activation_preparer.prepare(
+                source_document_digest=request.source_document_digest,
+                captured_input_digest=request.captured_input_digest,
                 deployment=request.deployment,
+                model_source_closure=request.model_source_closure,
                 program=request.program,
+                program_role_assignment=request.program_role_assignment,
+                typed_parameter_overrides=request.typed_parameter_overrides,
             )
         }
 

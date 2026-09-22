@@ -1,0 +1,1182 @@
+{
+  "api_version": "manyforge.program.v2",
+  "blackboard": {
+    "keys": [
+      {
+        "access": "read_write",
+        "fields": [
+          {
+            "field": "confidence",
+            "type": "float64"
+          },
+          {
+            "field": "pick_left_bin",
+            "type": "bool"
+          },
+          {
+            "field": "reason",
+            "type": "string"
+          },
+          {
+            "field": "selected_object_id",
+            "type": "scene_resource"
+          }
+        ],
+        "key": "perception.pick_target",
+        "persistence": "run",
+        "type": "model_response"
+      },
+      {
+        "access": "read_write",
+        "fields": [
+          {
+            "field": "approach_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "descend_path",
+            "type": "cartesian_path"
+          },
+          {
+            "field": "pick_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "retreat_path",
+            "type": "cartesian_path"
+          },
+          {
+            "field": "retreat_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "selected_object_id",
+            "type": "scene_resource"
+          },
+          {
+            "field": "tool_position",
+            "type": "coordinate_position"
+          }
+        ],
+        "key": "pick_place.pick_left_part",
+        "persistence": "run",
+        "type": "pick_planning_result"
+      },
+      {
+        "access": "read_write",
+        "fields": [
+          {
+            "field": "approach_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "descend_path",
+            "type": "cartesian_path"
+          },
+          {
+            "field": "pick_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "retreat_path",
+            "type": "cartesian_path"
+          },
+          {
+            "field": "retreat_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "selected_object_id",
+            "type": "scene_resource"
+          },
+          {
+            "field": "tool_position",
+            "type": "coordinate_position"
+          }
+        ],
+        "key": "pick_place.pick_right_part",
+        "persistence": "run",
+        "type": "pick_planning_result"
+      },
+      {
+        "access": "read_write",
+        "fields": [
+          {
+            "field": "approach_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "descend_path",
+            "type": "cartesian_path"
+          },
+          {
+            "field": "pick_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "retreat_path",
+            "type": "cartesian_path"
+          },
+          {
+            "field": "retreat_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "selected_object_id",
+            "type": "scene_resource"
+          },
+          {
+            "field": "tool_position",
+            "type": "coordinate_position"
+          }
+        ],
+        "key": "pick_place.place_left_part",
+        "persistence": "run",
+        "type": "pick_planning_result"
+      },
+      {
+        "access": "read_write",
+        "fields": [
+          {
+            "field": "approach_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "descend_path",
+            "type": "cartesian_path"
+          },
+          {
+            "field": "pick_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "retreat_path",
+            "type": "cartesian_path"
+          },
+          {
+            "field": "retreat_pose",
+            "type": "stored_pose"
+          },
+          {
+            "field": "selected_object_id",
+            "type": "scene_resource"
+          },
+          {
+            "field": "tool_position",
+            "type": "coordinate_position"
+          }
+        ],
+        "key": "pick_place.place_right_part",
+        "persistence": "run",
+        "type": "pick_planning_result"
+      },
+      {
+        "access": "read_write",
+        "description": "Operation-scoped selected-object binding for contact policy resolution.",
+        "key": "selected_object",
+        "persistence": "run",
+        "type": "scene_resource"
+      }
+    ],
+    "namespaces": [
+      {
+        "namespace_id": "perception",
+        "owner": "program"
+      },
+      {
+        "namespace_id": "pick_place",
+        "owner": "program"
+      }
+    ]
+  },
+  "catalog": {
+    "api_version": "manyforge.node_catalog.v2",
+    "content_version": "2.3.0"
+  },
+  "compatibility": {
+    "assistant": "required",
+    "lanes": [
+      "manyforge-only"
+    ],
+    "requires": [
+      "vision_pose_inference"
+    ],
+    "tags": [
+      "bin-pick",
+      "ur5",
+      "vision-pick"
+    ]
+  },
+  "component_roles": {
+    "robot": {
+      "required_component_type_tags": [
+        "articulated-arm"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ]
+    },
+    "tool": {
+      "required_component_type_tags": [
+        "gripper"
+      ]
+    }
+  },
+  "contact_policies": [
+    {
+      "api_version": "manyforge.contact_policy.v1",
+      "default_unmatched_response": "hard_stop",
+      "mode": "contact_grasp",
+      "policy_id": "selected_object_grasp",
+      "sensing_mode": "geometry_only",
+      "version": "sha256:13cce018403acdc3768ed8f1e86656fa482cf40aa3a1eb7984cd6c93e9acc47c",
+      "zones": [
+        {
+          "body_pairs": [
+            {
+              "body_a": {
+                "collision_body_role_id": "gripper_collision",
+                "component_role_id": "tool",
+                "kind": "component_model_body"
+              },
+              "body_b": {
+                "kind": "runtime_object",
+                "runtime_object_id": "selected_object"
+              }
+            }
+          ],
+          "max_penetration_m": 0.002,
+          "terminal_window_start_fraction": 0.8,
+          "violation_response": "hard_stop",
+          "zone_id": "tool_contact"
+        }
+      ]
+    }
+  ],
+  "description": "Vision-guided pick-and-place Program. A bounded model request selects one of two declared scene resources, an ordered fallback chooses the matching branch, and visible ordinary Pick/Place subtrees plan and execute the selected operation through the same motion, gripper, and Scene nodes used elsewhere.",
+  "forest": [
+    {
+      "children": [
+        {
+          "children": [],
+          "instance_id": "choose_pick_target",
+          "node_id": "assistant.query_model",
+          "parameters": {
+            "min_confidence": 0.7,
+            "model_endpoint_alias": "vision_model",
+            "output_key": "perception.pick_target",
+            "prompt_template_id": "choose_bin_target_v1",
+            "scene_attachment": "snapshot_image",
+            "scene_snapshot_format": "jpeg",
+            "scene_snapshot_height": 480,
+            "scene_snapshot_width": 640,
+            "timeout_s": 5
+          }
+        },
+        {
+          "children": [
+            {
+              "children": [
+                {
+                  "children": [],
+                  "instance_id": "left_was_selected",
+                  "node_id": "logic.check_bool",
+                  "parameters": {
+                    "expected_value": true
+                  },
+                  "value_sources": {
+                    "actual_value": {
+                      "field": "pick_left_bin",
+                      "kind": "blackboard_field",
+                      "reference": "perception.pick_target"
+                    }
+                  }
+                },
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "instance_id": "pick_left_part.plan",
+                      "node_id": "planning.plan_pick_sequence",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "carrier_frame_role": "tcp",
+                        "contact_policy_id": "selected_object_grasp",
+                        "motion_options": {
+                          "approach_velocity_scale": 0.4,
+                          "descend_velocity_scale": 0.4,
+                          "retreat_velocity_scale": 0.4
+                        },
+                        "output_key": "pick_place.pick_left_part",
+                        "planning_profile": "first_feasible",
+                        "selected_object_id": "left_part",
+                        "synthesis": {
+                          "approach_offset_envelope": {
+                            "orientation_rpy_max_deg": [
+                              0,
+                              0,
+                              0
+                            ],
+                            "orientation_rpy_min_deg": [
+                              0,
+                              0,
+                              0
+                            ],
+                            "position_max_m": [
+                              0,
+                              0,
+                              0.08
+                            ],
+                            "position_min_m": [
+                              0,
+                              0,
+                              0.08
+                            ]
+                          },
+                          "base_tool_orientation_rpy_deg": [
+                            180,
+                            0,
+                            -90
+                          ],
+                          "maximum_candidate_count": 1,
+                          "pick_offset_envelope": {
+                            "orientation_rpy_max_deg": [
+                              0,
+                              0,
+                              0
+                            ],
+                            "orientation_rpy_min_deg": [
+                              0,
+                              0,
+                              0
+                            ],
+                            "position_max_m": [
+                              0,
+                              0,
+                              0
+                            ],
+                            "position_min_m": [
+                              0,
+                              0,
+                              0
+                            ]
+                          },
+                          "search_strategy": "first_feasible"
+                        },
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "tool_position": {
+                          "kind": "linear_m",
+                          "value_m": 0
+                        },
+                        "tool_target_role": "gripper"
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "pick_left_part.approach",
+                      "node_id": "motion.move_to_pose",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "goal": {
+                          "field": "approach_pose",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_left_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "pick_left_part.descend",
+                      "node_id": "motion.follow_cartesian_path",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "contact_policy_id": "selected_object_grasp",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "contact_scene_resource_id": {
+                          "field": "selected_object_id",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_left_part"
+                        },
+                        "path": {
+                          "field": "descend_path",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_left_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "pick_left_part.close",
+                      "node_id": "gripper.command_position",
+                      "parameters": {
+                        "target_role": "gripper"
+                      },
+                      "value_sources": {
+                        "position": {
+                          "field": "tool_position",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_left_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "pick_left_part.attach",
+                      "node_id": "scene.attach_carried_object",
+                      "parameters": {
+                        "carrier_frame_role": "tcp",
+                        "target_role": "gripper",
+                        "touch_body_roles": [
+                          "gripper_collision"
+                        ]
+                      },
+                      "value_sources": {
+                        "scene_resource_id": {
+                          "field": "selected_object_id",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_left_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "pick_left_part.retreat",
+                      "node_id": "motion.follow_cartesian_path",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "path": {
+                          "field": "retreat_path",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_left_part"
+                        }
+                      }
+                    }
+                  ],
+                  "instance_id": "pick_left_part",
+                  "node_id": "sequence",
+                  "parameters": {}
+                },
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "instance_id": "place_left_part.plan",
+                      "node_id": "planning.plan_place_sequence",
+                      "parameters": {
+                        "approach_offset_m": [
+                          0,
+                          0,
+                          0.08
+                        ],
+                        "base_frame_role": "base",
+                        "carrier_frame_role": "tcp",
+                        "motion_options": {
+                          "approach_velocity_scale": 0.4,
+                          "descend_velocity_scale": 0.4,
+                          "retreat_velocity_scale": 0.4
+                        },
+                        "output_key": "pick_place.place_left_part",
+                        "place_pose": {
+                          "frame_ref": {
+                            "frame_role": "base",
+                            "kind": "target_frame",
+                            "target_role": "arm"
+                          },
+                          "orientation": {
+                            "rpy_deg": [
+                              180,
+                              0,
+                              -90
+                            ]
+                          },
+                          "position_m": [
+                            0.22,
+                            0.26,
+                            0.28
+                          ]
+                        },
+                        "planning_profile": "first_feasible",
+                        "selected_object_id": "left_part",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "tool_position": {
+                          "kind": "linear_m",
+                          "value_m": 0.01
+                        },
+                        "tool_target_role": "gripper"
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "place_left_part.approach",
+                      "node_id": "motion.move_to_pose",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "goal": {
+                          "field": "approach_pose",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.place_left_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "place_left_part.descend",
+                      "node_id": "motion.follow_cartesian_path",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "path": {
+                          "field": "descend_path",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.place_left_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "place_left_part.open",
+                      "node_id": "gripper.command_position",
+                      "parameters": {
+                        "target_role": "gripper"
+                      },
+                      "value_sources": {
+                        "position": {
+                          "field": "tool_position",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.place_left_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "place_left_part.detach",
+                      "node_id": "scene.detach_carried_object",
+                      "parameters": {
+                        "target_role": "gripper"
+                      },
+                      "value_sources": {
+                        "scene_resource_id": {
+                          "field": "selected_object_id",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.place_left_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "place_left_part.retreat",
+                      "node_id": "motion.follow_cartesian_path",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "path": {
+                          "field": "retreat_path",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.place_left_part"
+                        }
+                      }
+                    }
+                  ],
+                  "instance_id": "place_left_part",
+                  "node_id": "sequence",
+                  "parameters": {}
+                }
+              ],
+              "instance_id": "pick_left_branch",
+              "node_id": "sequence",
+              "parameters": {}
+            },
+            {
+              "children": [
+                {
+                  "children": [],
+                  "instance_id": "right_was_selected",
+                  "node_id": "logic.check_bool",
+                  "parameters": {
+                    "expected_value": false
+                  },
+                  "value_sources": {
+                    "actual_value": {
+                      "field": "pick_left_bin",
+                      "kind": "blackboard_field",
+                      "reference": "perception.pick_target"
+                    }
+                  }
+                },
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "instance_id": "pick_right_part.plan",
+                      "node_id": "planning.plan_pick_sequence",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "carrier_frame_role": "tcp",
+                        "contact_policy_id": "selected_object_grasp",
+                        "motion_options": {
+                          "approach_velocity_scale": 0.4,
+                          "descend_velocity_scale": 0.4,
+                          "retreat_velocity_scale": 0.4
+                        },
+                        "output_key": "pick_place.pick_right_part",
+                        "planning_profile": "first_feasible",
+                        "selected_object_id": "right_part",
+                        "synthesis": {
+                          "approach_offset_envelope": {
+                            "orientation_rpy_max_deg": [
+                              0,
+                              0,
+                              0
+                            ],
+                            "orientation_rpy_min_deg": [
+                              0,
+                              0,
+                              0
+                            ],
+                            "position_max_m": [
+                              0,
+                              0,
+                              0.08
+                            ],
+                            "position_min_m": [
+                              0,
+                              0,
+                              0.08
+                            ]
+                          },
+                          "base_tool_orientation_rpy_deg": [
+                            180,
+                            0,
+                            -90
+                          ],
+                          "maximum_candidate_count": 1,
+                          "pick_offset_envelope": {
+                            "orientation_rpy_max_deg": [
+                              0,
+                              0,
+                              0
+                            ],
+                            "orientation_rpy_min_deg": [
+                              0,
+                              0,
+                              0
+                            ],
+                            "position_max_m": [
+                              0,
+                              0,
+                              0
+                            ],
+                            "position_min_m": [
+                              0,
+                              0,
+                              0
+                            ]
+                          },
+                          "search_strategy": "first_feasible"
+                        },
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "tool_position": {
+                          "kind": "linear_m",
+                          "value_m": 0
+                        },
+                        "tool_target_role": "gripper"
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "pick_right_part.approach",
+                      "node_id": "motion.move_to_pose",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "goal": {
+                          "field": "approach_pose",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_right_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "pick_right_part.descend",
+                      "node_id": "motion.follow_cartesian_path",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "contact_policy_id": "selected_object_grasp",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "contact_scene_resource_id": {
+                          "field": "selected_object_id",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_right_part"
+                        },
+                        "path": {
+                          "field": "descend_path",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_right_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "pick_right_part.close",
+                      "node_id": "gripper.command_position",
+                      "parameters": {
+                        "target_role": "gripper"
+                      },
+                      "value_sources": {
+                        "position": {
+                          "field": "tool_position",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_right_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "pick_right_part.attach",
+                      "node_id": "scene.attach_carried_object",
+                      "parameters": {
+                        "carrier_frame_role": "tcp",
+                        "target_role": "gripper",
+                        "touch_body_roles": [
+                          "gripper_collision"
+                        ]
+                      },
+                      "value_sources": {
+                        "scene_resource_id": {
+                          "field": "selected_object_id",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_right_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "pick_right_part.retreat",
+                      "node_id": "motion.follow_cartesian_path",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "path": {
+                          "field": "retreat_path",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.pick_right_part"
+                        }
+                      }
+                    }
+                  ],
+                  "instance_id": "pick_right_part",
+                  "node_id": "sequence",
+                  "parameters": {}
+                },
+                {
+                  "children": [
+                    {
+                      "children": [],
+                      "instance_id": "place_right_part.plan",
+                      "node_id": "planning.plan_place_sequence",
+                      "parameters": {
+                        "approach_offset_m": [
+                          0,
+                          0,
+                          0.08
+                        ],
+                        "base_frame_role": "base",
+                        "carrier_frame_role": "tcp",
+                        "motion_options": {
+                          "approach_velocity_scale": 0.4,
+                          "descend_velocity_scale": 0.4,
+                          "retreat_velocity_scale": 0.4
+                        },
+                        "output_key": "pick_place.place_right_part",
+                        "place_pose": {
+                          "frame_ref": {
+                            "frame_role": "base",
+                            "kind": "target_frame",
+                            "target_role": "arm"
+                          },
+                          "orientation": {
+                            "rpy_deg": [
+                              180,
+                              0,
+                              -90
+                            ]
+                          },
+                          "position_m": [
+                            0.22,
+                            -0.26,
+                            0.28
+                          ]
+                        },
+                        "planning_profile": "first_feasible",
+                        "selected_object_id": "right_part",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "tool_position": {
+                          "kind": "linear_m",
+                          "value_m": 0.01
+                        },
+                        "tool_target_role": "gripper"
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "place_right_part.approach",
+                      "node_id": "motion.move_to_pose",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "goal": {
+                          "field": "approach_pose",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.place_right_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "place_right_part.descend",
+                      "node_id": "motion.follow_cartesian_path",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "path": {
+                          "field": "descend_path",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.place_right_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "place_right_part.open",
+                      "node_id": "gripper.command_position",
+                      "parameters": {
+                        "target_role": "gripper"
+                      },
+                      "value_sources": {
+                        "position": {
+                          "field": "tool_position",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.place_right_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "place_right_part.detach",
+                      "node_id": "scene.detach_carried_object",
+                      "parameters": {
+                        "target_role": "gripper"
+                      },
+                      "value_sources": {
+                        "scene_resource_id": {
+                          "field": "selected_object_id",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.place_right_part"
+                        }
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "place_right_part.retreat",
+                      "node_id": "motion.follow_cartesian_path",
+                      "parameters": {
+                        "base_frame_role": "base",
+                        "planning_profile": "first_feasible",
+                        "target_role": "arm",
+                        "tcp_frame_role": "tcp",
+                        "velocity_scale": 0.4
+                      },
+                      "value_sources": {
+                        "path": {
+                          "field": "retreat_path",
+                          "kind": "blackboard_field",
+                          "reference": "pick_place.place_right_part"
+                        }
+                      }
+                    }
+                  ],
+                  "instance_id": "place_right_part",
+                  "node_id": "sequence",
+                  "parameters": {}
+                }
+              ],
+              "instance_id": "pick_right_branch",
+              "node_id": "sequence",
+              "parameters": {}
+            }
+          ],
+          "instance_id": "execute_selected_pick",
+          "node_id": "fallback",
+          "parameters": {}
+        }
+      ],
+      "instance_id": "vision_guided_pick_cycle",
+      "node_id": "sequence",
+      "parameters": {}
+    }
+  ],
+  "name": "vision_guided_bin_pick",
+  "positions": {},
+  "program_id": "vision_guided_bin_pick",
+  "program_profile": "composable-cell-v1",
+  "scene": [
+    {
+      "pose": {
+        "frame_ref": {
+          "component_role": "robot",
+          "frame_role": "base",
+          "kind": "component_frame",
+          "model_role": "arm_model"
+        },
+        "orientation": {
+          "rpy_deg": [
+            0,
+            0,
+            0
+          ]
+        },
+        "position_m": [
+          0.4,
+          -0.14,
+          0.009
+        ]
+      },
+      "resource_roles": [
+        "pick_candidate"
+      ],
+      "scene_resource_id": "left_part",
+      "shape": {
+        "box_dimensions_m": [
+          0.02,
+          0.02,
+          0.02
+        ],
+        "type": "box"
+      }
+    },
+    {
+      "pose": {
+        "frame_ref": {
+          "component_role": "robot",
+          "frame_role": "base",
+          "kind": "component_frame",
+          "model_role": "arm_model"
+        },
+        "orientation": {
+          "rpy_deg": [
+            0,
+            0,
+            0
+          ]
+        },
+        "position_m": [
+          0.4,
+          0.14,
+          0.009
+        ]
+      },
+      "resource_roles": [
+        "pick_candidate"
+      ],
+      "scene_resource_id": "right_part",
+      "shape": {
+        "box_dimensions_m": [
+          0.02,
+          0.02,
+          0.02
+        ],
+        "type": "box"
+      }
+    },
+    {
+      "pose": {
+        "frame_ref": {
+          "component_role": "robot",
+          "frame_role": "base",
+          "kind": "component_frame",
+          "model_role": "arm_model"
+        },
+        "orientation": {
+          "xyzw": [
+            0,
+            0,
+            0,
+            1
+          ]
+        },
+        "position_m": [
+          0.45,
+          0,
+          -0.021
+        ]
+      },
+      "scene_resource_id": "table",
+      "shape": {
+        "box_dimensions_m": [
+          0.8,
+          0.6,
+          0.04
+        ],
+        "type": "box"
+      }
+    }
+  ],
+  "schema_version": "manyforge.composer_authoring_forest.v1",
+  "target_roles": {
+    "arm": {
+      "component_role": "robot",
+      "required_capabilities": [
+        {
+          "capability_id": "execution.feedback.phase_events",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "execution.trajectory.execute",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "model.kinematics.fk",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.cartesian_path",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.pose_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.profile.first_feasible",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.trajectory.time_parameterized",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "state.observed.current",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "validation.trajectory.non_collision",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [
+        "arm_collision"
+      ],
+      "required_frame_roles": [
+        "base",
+        "tcp"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ],
+      "required_resource_roles": [
+        "arm_joints"
+      ]
+    },
+    "gripper": {
+      "component_role": "tool",
+      "required_capabilities": [
+        {
+          "capability_id": "model.kinematics.fk",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "tool.gripper.command",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "tool.gripper.feedback",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [
+        "gripper_collision"
+      ],
+      "required_frame_roles": [
+        "tcp"
+      ],
+      "required_resource_roles": [
+        "fingers"
+      ]
+    }
+  }
+}

@@ -57,7 +57,7 @@ from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     ComponentLifecycleRequest,
-    DeploymentCandidateCompilationRequest,
+    ActivationPreparationRequest,
     FullStopIntentRequest,
     HistorianReconcileRequest,
     ManagerApplyRequest,
@@ -105,7 +105,7 @@ from .native import (
     HeadlessApiConfig,
     HeadlessApiError,
     MAX_PROGRAM_APPLY_REQUEST_BYTES,
-    MAX_DEPLOYMENT_CANDIDATE_REQUEST_BYTES,
+    MAX_ACTIVATION_PREPARATION_REQUEST_BYTES,
     MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
     NativeHeadlessCore,
     ViewerModelAsset,
@@ -114,7 +114,7 @@ from .native import (
 from .service import HeadlessService, TrustedAttribution
 from .program_runner_client import ProgramRunnerHttpClient
 from .cell_admission import CellAdmissionClient
-from .deployment_compiler import DeploymentCandidateCompiler
+from .activation_preparer import ActivationPreparer
 
 
 _REQUEST_ID_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
@@ -443,16 +443,13 @@ def create_app(
                 config.program_runner_url,
                 timeout_seconds=config.program_runner_timeout_seconds,
             )
-        deployment_compiler = None
-        if config.deployment_compiler_path is not None:
-            assert config.deployment_compiler_workspace_root is not None
-            deployment_compiler = DeploymentCandidateCompiler(
-                executable=config.deployment_compiler_path,
-                workspace_root=config.deployment_compiler_workspace_root,
-                installed_package_root=config.install_root,
-                candidate_package_root=config.artifact_root,
-                prepared_roots=config.deployment_compiler_prepared_roots,
-                timeout_seconds=config.deployment_compiler_timeout_seconds,
+        activation_preparer = None
+        if config.activation_preparer_path is not None:
+            assert config.activation_preparer_capability_root is not None
+            activation_preparer = ActivationPreparer(
+                executable=config.activation_preparer_path,
+                capability_root=config.activation_preparer_capability_root,
+                timeout_seconds=config.activation_preparer_timeout_seconds,
             )
         service = HeadlessService(
             core,
@@ -464,7 +461,7 @@ def create_app(
                 timeout_seconds=config.execution_timeout_seconds,
             ),
             cclc=cclc,
-            deployment_compiler=deployment_compiler,
+            activation_preparer=activation_preparer,
         )
         event_execution = ExecutionCommandClient(
             config.execution_run_root,
@@ -653,8 +650,8 @@ def create_app(
         maximum_bytes=maximum_body,
         path_maximum_bytes={
             "/api/program/apply": MAX_PROGRAM_APPLY_REQUEST_BYTES,
-            "/api/manager/deployment-candidates/compile": (
-                MAX_DEPLOYMENT_CANDIDATE_REQUEST_BYTES
+            "/api/activation-preparations": (
+                MAX_ACTIVATION_PREPARATION_REQUEST_BYTES
             ),
             "/api/program/model-attempts": MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
             "/api/program/diagnostics": 64 * 1024,
@@ -1378,11 +1375,11 @@ def create_app(
             )
         return JSONResponse(status_code=_error_status(code), content=response)
 
-    @app.post("/api/manager/deployment-candidates/compile")
-    def compile_deployment_candidate(
-        request: DeploymentCandidateCompilationRequest,
+    @app.post("/api/activation-preparations")
+    def prepare_activation(
+        request: ActivationPreparationRequest,
     ) -> dict[str, Any]:
-        return service.compile_deployment_candidate(request)
+        return service.prepare_activation(request)
 
     @app.post("/api/manager/apply")
     def manager_apply(request: ManagerApplyRequest) -> JSONResponse:

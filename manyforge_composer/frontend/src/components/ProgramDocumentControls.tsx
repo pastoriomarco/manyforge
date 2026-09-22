@@ -63,7 +63,6 @@ function scenarioEntryKey(entry: ScenarioDocumentEntry): string {
 }
 
 function scenarioStatusLabel(entry: ScenarioDocumentEntry): string {
-  if (entry.sourceKind === 'qualified') return 'installed';
   return entry.displayStatus.replaceAll('_', ' ');
 }
 
@@ -88,7 +87,10 @@ export function ProgramDocumentControls({
     revert,
     saveScenarioDocument,
     loadScenarioDocument,
+    convertLegacyScenarioDocument,
+    exportScenarioDocument,
     scenarioDocumentPath,
+    scenarioSourceDiagnostics = [],
   } = controller;
   const [action, setAction] = useState<ProgramAction | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -97,17 +99,20 @@ export function ProgramDocumentControls({
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmOverwrite, setConfirmOverwrite] = useState(false);
   const [saveAsPath, setSaveAsPath] = useState('');
-  const [scenarioMode, setScenarioMode] = useState<'load' | 'save'>('load');
+  const [scenarioMode, setScenarioMode] = useState<'load' | 'save' | 'export' | 'convert'>('load');
   const [scenarioIndex, setScenarioIndex] = useState<ScenarioDocumentIndexResponse | null>(null);
   const [scenarioIndexError, setScenarioIndexError] = useState<string | null>(null);
   const [scenarioIndexLoading, setScenarioIndexLoading] = useState(false);
   const [scenarioDirectory, setScenarioDirectory] = useState('');
   const [selectedScenarioKey, setSelectedScenarioKey] = useState('');
-  const [alternateDeploymentPath, setAlternateDeploymentPath] = useState('');
   const [scenarioSavePath, setScenarioSavePath] = useState('');
   const [scenarioId, setScenarioId] = useState('scenario');
   const [scenarioName, setScenarioName] = useState('Scenario');
   const [scenarioDescription, setScenarioDescription] = useState('');
+  const [legacyScenarioPath, setLegacyScenarioPath] = useState('');
+  const [legacyDestinationPath, setLegacyDestinationPath] = useState('');
+  const [exportDestinationPath, setExportDestinationPath] = useState('');
+  const [confirmLegacyOverwrite, setConfirmLegacyOverwrite] = useState(false);
   const scenarioDirectoryRef = useRef('');
   const returnFocus = useRef<HTMLElement | null>(null);
   const settingsButton = useRef<HTMLButtonElement>(null);
@@ -140,12 +145,7 @@ export function ProgramDocumentControls({
   ) ?? null;
   const selectedScenarioLoadable = selectedScenarioDocument !== null
     && selectedScenarioDocument.displayStatus !== 'unsupported'
-    && (
-      selectedScenarioDocument.sourceKind === 'saved'
-        ? selectedScenarioDocument.path !== null
-        : selectedScenarioDocument.scenarioId !== null
-          && scenarioIndex?.catalogRevision !== null
-    );
+    && selectedScenarioDocument.path !== null;
   const scenarioIdValid = /^[a-z][a-z0-9._-]{0,127}$/.test(scenarioId.trim());
   const hasAppliedUnsavedChanges = workspace?.saved.available === true
     && workspace.applied.available
@@ -184,7 +184,7 @@ export function ProgramDocumentControls({
           : ''
       ));
       setScenarioSavePath((current) => current || (
-        `${index.directory}/${authoring?.program_id ?? 'scenario'}.scenario.yaml`
+        `${index.directory}/${authoring?.program_id ?? 'scenario'}`
       ));
     } catch (error: unknown) {
       setScenarioIndexError(
@@ -226,7 +226,6 @@ export function ProgramDocumentControls({
     setSelectedProgramPath(null);
     setConfirmDiscard(false);
     setConfirmOverwrite(false);
-    setAlternateDeploymentPath('');
   }, []);
   const beginAction = (
     next: ProgramAction,
@@ -337,6 +336,18 @@ export function ProgramDocumentControls({
           </button>
         </div>
       </div>
+
+      {scenarioSourceDiagnostics.length > 0 && (
+        <div className="program-document-source-notice" role="status">
+          <strong>Referenced sources changed since the last Save.</strong>
+          <ul>
+            {scenarioSourceDiagnostics.map((diagnostic) => (
+              <li key={diagnostic.sourceId}>{diagnostic.sourceId}: {diagnostic.message}</li>
+            ))}
+          </ul>
+          <span>Apply will capture and validate the current source contents.</span>
+        </div>
+      )}
 
       <OverlayPanel
         open={settingsOpen}
@@ -468,6 +479,8 @@ export function ProgramDocumentControls({
             <div className="scenario-document-tabs" role="tablist" aria-label="Scenario operation">
               <button type="button" className={scenarioMode === 'load' ? 'active' : ''} onClick={() => setScenarioMode('load')}>Load</button>
               <button type="button" className={scenarioMode === 'save' ? 'active' : ''} onClick={() => setScenarioMode('save')}>Save current</button>
+              <button type="button" className={scenarioMode === 'export' ? 'active' : ''} onClick={() => setScenarioMode('export')}>Export portable</button>
+              <button type="button" className={scenarioMode === 'convert' ? 'active' : ''} onClick={() => setScenarioMode('convert')}>Convert legacy</button>
             </div>
 
             {scenarioMode === 'load' ? (
@@ -514,37 +527,8 @@ export function ProgramDocumentControls({
                     )}
                   </div>
                 )}
-                <label className="program-save-as-path">
-                  Deployment override (optional)
-                  <input
-                    value={alternateDeploymentPath}
-                    onChange={(event) => setAlternateDeploymentPath(event.target.value)}
-                    list="scenario-deployment-overrides"
-                    placeholder="Another .scenario.yaml or Deployment file"
-                  />
-                  <datalist id="scenario-deployment-overrides">
-                    {scenarioIndex?.entries
-                      .filter((entry) => entry.sourceKind === 'saved' && entry.path)
-                      .map((entry) => (
-                        <option key={scenarioEntryKey(entry)} value={entry.path ?? ''}>
-                          {entry.name}
-                        </option>
-                      ))}
-                  </datalist>
-                </label>
-                <details className="scenario-deployment-browser">
-                  <summary>Browse for a standalone Deployment</summary>
-                  <ArtifactBrowser
-                    lockedKind="deployment"
-                    onSelectionChange={(kind, entry) => {
-                      if (kind === 'deployment') {
-                        setAlternateDeploymentPath(entry?.path ?? '');
-                      }
-                    }}
-                  />
-                </details>
                 <p>
-                  Loading a saved Scenario parses and validates its current file contents. A complete setup is activated atomically; an incomplete setup opens only for editing.
+                  Loading a saved Scenario project opens its current authored files for editing. Runtime state is not changed.
                 </p>
                 {replaceNeedsConfirmation && (
                   <label className="program-confirmation">
@@ -563,23 +547,10 @@ export function ProgramDocumentControls({
                   onClick={() => {
                     const selected = selectedScenarioDocument;
                     if (!selected || !selectedScenarioLoadable) return;
-                    if (selected.sourceKind === 'qualified') {
-                      const selectedScenarioId = selected.scenarioId;
-                      if (!selectedScenarioId) return;
-                      complete(() => loadScenarioDocument(
-                        null,
-                        selectedScenarioId,
-                        alternateDeploymentPath.trim() || null,
-                        confirmDiscard,
-                      ));
-                      return;
-                    }
                     const selectedPath = selected.path;
                     if (!selectedPath) return;
                     complete(() => loadScenarioDocument(
                       selectedPath,
-                      null,
-                      alternateDeploymentPath.trim() || null,
                       confirmDiscard,
                     ));
                   }}
@@ -587,13 +558,13 @@ export function ProgramDocumentControls({
                   Load Scenario
                 </button>
               </div>
-            ) : (
+            ) : scenarioMode === 'save' ? (
               <div className="program-dialog-copy">
                 <p>
-                  Save the editable Program, Scene, and Deployment in one lightweight file. Referenced robot meshes and other assets are not copied.
+                  Save the editable Program, Scene, Deployment, assignment, and overrides in one structured project folder. Referenced robot meshes and other source assets are not copied.
                 </p>
                 <label className="program-save-as-path">
-                  Scenario path
+                  Scenario project folder
                   <input value={scenarioSavePath} onChange={(event) => setScenarioSavePath(event.target.value)} />
                 </label>
                 <div className="scenario-metadata-grid">
@@ -619,7 +590,7 @@ export function ProgramDocumentControls({
                 </label>
                 <label className="program-confirmation">
                   <input type="checkbox" checked={confirmOverwrite} onChange={(event) => setConfirmOverwrite(event.target.checked)} />
-                  Allow replacing an existing Scenario file
+                  Allow replacing an existing Scenario project
                 </label>
                 <button
                   type="button"
@@ -639,6 +610,54 @@ export function ProgramDocumentControls({
                   }))}
                 >
                   Save Scenario
+                </button>
+              </div>
+            ) : scenarioMode === 'export' ? (
+              <div className="program-dialog-copy">
+                <p>
+                  Export a portable copy with the complete currently supported robot-source and Scene-asset closure. The open project is not changed.
+                </p>
+                <label className="program-save-as-path">
+                  New destination project folder
+                  <input value={exportDestinationPath} onChange={(event) => setExportDestinationPath(event.target.value)} />
+                </label>
+                <button
+                  type="button"
+                  className="primary-action"
+                  disabled={busy || !scenarioDocumentPath || !exportDestinationPath.trim()}
+                  onClick={() => complete(() => exportScenarioDocument(exportDestinationPath.trim()))}
+                >
+                  Export Scenario
+                </button>
+              </div>
+            ) : (
+              <div className="program-dialog-copy">
+                <p>
+                  Convert one legacy <code>.scenario.yaml</code> file into the structured project format. The source file and runtime state are not changed.
+                </p>
+                <label className="program-save-as-path">
+                  Legacy Scenario file
+                  <input value={legacyScenarioPath} onChange={(event) => setLegacyScenarioPath(event.target.value)} />
+                </label>
+                <label className="program-save-as-path">
+                  Destination project folder
+                  <input value={legacyDestinationPath} onChange={(event) => setLegacyDestinationPath(event.target.value)} />
+                </label>
+                <label className="program-confirmation">
+                  <input type="checkbox" checked={confirmLegacyOverwrite} onChange={(event) => setConfirmLegacyOverwrite(event.target.checked)} />
+                  Allow replacing an existing Scenario project
+                </label>
+                <button
+                  type="button"
+                  className="primary-action"
+                  disabled={busy || !legacyScenarioPath.trim() || !legacyDestinationPath.trim()}
+                  onClick={() => complete(() => convertLegacyScenarioDocument({
+                    sourcePath: legacyScenarioPath.trim(),
+                    destinationPath: legacyDestinationPath.trim(),
+                    confirmOverwrite: confirmLegacyOverwrite,
+                  }))}
+                >
+                  Convert Scenario
                 </button>
               </div>
             )}

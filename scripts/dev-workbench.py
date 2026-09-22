@@ -51,8 +51,8 @@ SCENARIO_ROOT = Path(
 PACKAGE_ROOT = SCENARIO_ROOT / "retained-package"
 NATIVE_EXECUTION_HOST = ROBOPLAN_BUILD / "manyforge_native_execution_host"
 NATIVE_CANDIDATE_WORKER = ROBOPLAN_BUILD / "manyforge_roboplan_candidate_worker"
-DEPLOYMENT_COMPILER = (
-    DEPLOYMENT_AUTHORING_BUILD / "manyforge_maintained_deployment_occurrences"
+ACTIVATION_PREPARER = (
+    DEPLOYMENT_AUTHORING_BUILD / "manyforge_prepare_activation"
 )
 MANAGER_BINARY = HEADLESS_BUILD / "manyforge_manager_daemon"
 NODE_CATALOG = WORKSPACE / "manyforge_behavior/resources/node_catalog.yaml"
@@ -223,8 +223,8 @@ def _ensure_current_native_backend() -> tuple[Path, Path]:
     return NATIVE_EXECUTION_HOST, NATIVE_CANDIDATE_WORKER
 
 
-def _ensure_deployment_compiler() -> tuple[Path, tuple[tuple[str, Path], ...]]:
-    """Build the maintained compiler and its exact normalized model inputs."""
+def _ensure_activation_preparer() -> tuple[Path, tuple[tuple[str, Path], ...]]:
+    """Build the exact activation preparer and normalized model inputs."""
 
     if not (DEPLOYMENT_AUTHORING_BUILD / "CMakeCache.txt").is_file():
         _run(
@@ -248,13 +248,13 @@ def _ensure_deployment_compiler() -> tuple[Path, tuple[tuple[str, Path], ...]]:
             "--parallel",
             _build_jobs(),
             "--target",
-            "manyforge_maintained_deployment_occurrences",
+            "manyforge_prepare_activation",
             "--",
             "-k",
             "0",
         )
     )
-    _regular_file(DEPLOYMENT_COMPILER, "Deployment compiler", executable=True)
+    _regular_file(ACTIVATION_PREPARER, "activation preparer", executable=True)
     prepared = tuple(
         (
             family_id,
@@ -273,7 +273,7 @@ def _ensure_deployment_compiler() -> tuple[Path, tuple[tuple[str, Path], ...]]:
             raise WorkbenchError(
                 f"prepared Deployment model is unavailable for {family_id}: {root}"
             )
-    return DEPLOYMENT_COMPILER, prepared
+    return ACTIVATION_PREPARER, prepared
 
 
 def _regular_file(path: Path, label: str, *, executable: bool = False) -> None:
@@ -970,7 +970,7 @@ class Workbench:
         self.metadata = _load_scenario(self.scenario_id)
         current_headless_extension = _ensure_current_backend()
         current_native_targets = _ensure_current_native_backend()
-        deployment_compiler, prepared_models = _ensure_deployment_compiler()
+        activation_preparer, prepared_models = _ensure_activation_preparer()
         _regular_file(
             MANAGER_BINARY,
             "current Manager executable",
@@ -1071,18 +1071,10 @@ class Workbench:
                 "15",
                 "--program-runner-url",
                 f"http://127.0.0.1:{self.runner_port}",
-                "--deployment-compiler",
-                str(deployment_compiler),
-                "--deployment-compiler-workspace-root",
+                "--activation-preparer",
+                str(activation_preparer),
+                "--activation-preparer-capability-root",
                 str(WORKSPACE),
-                *(
-                    argument
-                    for family_id, prepared_root in prepared_models
-                    for argument in (
-                        "--deployment-compiler-prepared",
-                        f"{family_id}={prepared_root}",
-                    )
-                ),
             ),
         )
         base_url = f"http://127.0.0.1:{self.headless_port}"

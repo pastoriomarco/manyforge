@@ -29,7 +29,9 @@ MAX_VIEWER_MODEL_RESOURCE_BYTES = 256 * 1024 * 1024
 MAX_VIEWER_MODEL_RESOURCE_URI_BYTES = 4096
 MAX_STANDARD_REQUEST_BODY_BYTES = 1024 * 1024
 MAX_PROGRAM_APPLY_REQUEST_BYTES = 17 * 1024 * 1024
-MAX_DEPLOYMENT_CANDIDATE_REQUEST_BYTES = 34 * 1024 * 1024
+# Must match manyforge_deployment/activation_preparation_request.hpp. This is
+# an operation-transport limit, not the generic stored-artifact limit.
+MAX_ACTIVATION_PREPARATION_REQUEST_BYTES = 34 * 1024 * 1024
 MAX_PROGRAM_MODEL_ATTEMPT_BYTES = 256 * 1024
 DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS = 5.0
 MAX_MANAGER_COMMAND_TIMEOUT_SECONDS = 60.0
@@ -83,10 +85,9 @@ class HeadlessApiConfig:
     maximum_request_body_bytes: int = MAX_STANDARD_REQUEST_BODY_BYTES
     program_runner_url: str | None = None
     program_runner_timeout_seconds: float = 30.0
-    deployment_compiler_path: Path | None = None
-    deployment_compiler_workspace_root: Path | None = None
-    deployment_compiler_prepared_roots: tuple[tuple[str, Path], ...] = ()
-    deployment_compiler_timeout_seconds: float = 120.0
+    activation_preparer_path: Path | None = None
+    activation_preparer_capability_root: Path | None = None
+    activation_preparer_timeout_seconds: float = 120.0
 
     def __post_init__(self) -> None:
         path_values = (
@@ -175,34 +176,26 @@ class HeadlessApiConfig:
                 )
         if not 0 < self.program_runner_timeout_seconds <= 60:
             raise ValueError("program_runner_timeout_seconds must be in (0, 60]")
-        compiler_parts = (
-            self.deployment_compiler_path is not None,
-            self.deployment_compiler_workspace_root is not None,
-            bool(self.deployment_compiler_prepared_roots),
+        preparer_parts = (
+            self.activation_preparer_path is not None,
+            self.activation_preparer_capability_root is not None,
         )
-        compiler_configured = all(compiler_parts)
-        if any(compiler_parts) and not compiler_configured:
+        preparer_configured = all(preparer_parts)
+        if any(preparer_parts) and not preparer_configured:
             raise ValueError(
-                "Deployment compiler requires an executable, workspace, and "
-                "at least one prepared model root"
+                "Activation preparer requires an executable and capability root"
             )
-        if compiler_configured:
-            assert self.deployment_compiler_path is not None
-            assert self.deployment_compiler_workspace_root is not None
-            compiler_paths = (
-                self.deployment_compiler_path,
-                self.deployment_compiler_workspace_root,
-                *(path for _, path in self.deployment_compiler_prepared_roots),
+        if preparer_configured:
+            assert self.activation_preparer_path is not None
+            assert self.activation_preparer_capability_root is not None
+            preparer_paths = (
+                self.activation_preparer_path,
+                self.activation_preparer_capability_root,
             )
-            if any(not path.is_absolute() for path in compiler_paths):
-                raise ValueError("Deployment compiler capabilities must be absolute")
-            family_ids = tuple(
-                family_id for family_id, _ in self.deployment_compiler_prepared_roots
-            )
-            if family_ids != tuple(sorted(set(family_ids))):
-                raise ValueError("Deployment compiler prepared families must be sorted and unique")
-        if not 0 < self.deployment_compiler_timeout_seconds <= 300:
-            raise ValueError("deployment_compiler_timeout_seconds must be in (0, 300]")
+            if any(not path.is_absolute() for path in preparer_paths):
+                raise ValueError("Activation preparer capabilities must be absolute")
+        if not 0 < self.activation_preparer_timeout_seconds <= 300:
+            raise ValueError("activation_preparer_timeout_seconds must be in (0, 300]")
         if not 1_024 <= self.maximum_request_body_bytes <= 1024 * 1024:
             raise ValueError("maximum_request_body_bytes must be between 1024 and 1048576")
 

@@ -434,20 +434,28 @@ class ManagerDeploymentCandidatePreviewRequest(StrictRequest):
         )
 
 
-class DeploymentCandidateCompilationRequest(StrictRequest):
-    scenario_id: Annotated[
-        str,
-        Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
-    ]
-    expected_scenario_catalog_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+class ActivationPreparationRequest(StrictRequest):
+    source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     deployment: dict[str, Any]
+    model_source_closure: dict[str, Any]
     program: dict[str, Any]
+    program_role_assignment: dict[str, Any]
+    typed_parameter_overrides: dict[str, Any]
     authoring_claim: dict[str, Any]
 
     @model_validator(mode="after")
-    def require_deployment_object(self) -> "DeploymentCandidateCompilationRequest":
-        if not self.deployment or not self.program:
-            raise ValueError("deployment and program must be non-empty objects")
+    def require_complete_input(self) -> "ActivationPreparationRequest":
+        if (
+            not self.deployment
+            or not self.model_source_closure
+            or not self.program
+            or not self.program_role_assignment
+        ):
+            raise ValueError(
+                "deployment, model_source_closure, program, and "
+                "program_role_assignment must be non-empty objects"
+            )
         return self
 
 

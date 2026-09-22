@@ -8,11 +8,8 @@
 #include <iostream>
 #include <iterator>
 #include <manyforge_deployment/artifact_codec.hpp>
-#include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/content_identity.hpp>
-#include <manyforge_deployment/model_asset_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
-#include <manyforge_deployment/structural_model_preparation.hpp>
 #include <map>
 #include <optional>
 #include <set>
@@ -24,15 +21,13 @@
 #include <variant>
 #include <vector>
 
-#include "content_identity_internal.hpp"
+#include "activation_prepared_model_internal.hpp"
 
 namespace {
 
 namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
 
-constexpr std::string_view kZeroDigest =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr std::size_t kMaxMaintainedSourceArtifacts = 4096U;
 
 enum class Mode { kCheck, kPrint, kUpdate };
@@ -43,13 +38,6 @@ struct Options final {
   std::filesystem::path workspace_root;
   std::map<std::string, std::filesystem::path, std::less<>> prepared_roots;
   std::optional<std::string> selected_family;
-};
-
-struct SourceArtifact final {
-  std::string logical_uri;
-  std::string media_type;
-  core::ContentDigest content_digest;
-  std::string bytes;
 };
 
 struct FamilySource final {
@@ -69,10 +57,7 @@ struct FamilySource final {
 
 struct GeneratedFamily final {
   FamilySource source;
-  std::string catalog_bytes;
-  core::ModelAssetCatalogRecordRefDTO catalog_reference;
-  deployment::SourceVerifiedModelAsset verified_asset;
-  deployment::BuildQualifiedStructuralModelPreparation preparation;
+  deployment::detail::ActivationPreparedModel model;
 };
 
 [[noreturn]] void fail(std::string message) {
@@ -183,75 +168,6 @@ void require_shape(const deployment::CanonicalValue &value,
   }
 }
 
-[[nodiscard]] std::string pretty_json(std::string_view canonical) {
-  std::string result;
-  result.reserve(canonical.size() + canonical.size() / 4U);
-  std::size_t indentation = 0U;
-  bool in_string = false;
-  bool escaped = false;
-  const auto newline = [&result, &indentation] {
-    result.push_back('\n');
-    result.append(indentation * 2U, ' ');
-  };
-
-  for (std::size_t index = 0U; index < canonical.size(); ++index) {
-    const char byte = canonical[index];
-    if (in_string) {
-      result.push_back(byte);
-      if (escaped) {
-        escaped = false;
-      } else if (byte == '\\') {
-        escaped = true;
-      } else if (byte == '"') {
-        in_string = false;
-      }
-      continue;
-    }
-    if (byte == '"') {
-      in_string = true;
-      result.push_back(byte);
-      continue;
-    }
-    switch (byte) {
-    case '{':
-    case '[': {
-      result.push_back(byte);
-      const char close = byte == '{' ? '}' : ']';
-      if (index + 1U < canonical.size() && canonical[index + 1U] != close) {
-        ++indentation;
-        newline();
-      }
-      break;
-    }
-    case '}':
-    case ']': {
-      const char open = byte == '}' ? '{' : '[';
-      if (index > 0U && canonical[index - 1U] != open) {
-        --indentation;
-        newline();
-      }
-      result.push_back(byte);
-      break;
-    }
-    case ',':
-      result.push_back(byte);
-      newline();
-      break;
-    case ':':
-      result.append(": ");
-      break;
-    default:
-      result.push_back(byte);
-      break;
-    }
-  }
-  if (in_string || escaped || indentation != 0U) {
-    throw std::logic_error("catalog formatter lost structural state");
-  }
-  result.push_back('\n');
-  return result;
-}
-
 void replace_file_atomically(const std::filesystem::path &path,
                              std::string_view bytes) {
   std::filesystem::create_directories(path.parent_path());
@@ -358,9 +274,8 @@ void replace_file_atomically(const std::filesystem::path &path,
       "model_families",
       "runtime_restoration_profiles"};
   require_shape(parsed.root(), kDescriptionFields, "description");
-  if (require_text(
-          require_member(parsed.root(), "api_version", "description"),
-          "description.api_version") !=
+  if (require_text(require_member(parsed.root(), "api_version", "description"),
+                   "description.api_version") !=
       "manyforge.maintained_deployment_sources.v1") {
     fail("maintained source description has an unsupported API version");
   }
@@ -578,14 +493,7 @@ void verify_urdf_projection(const FamilySource &family,
   fail(family.family_id + " selects an unknown URDF projection kind");
 }
 
-[[nodiscard]] std::string store_key_for_digest(std::string_view digest) {
-  if (!deployment::is_sha256_digest(digest)) {
-    fail("model source artifact does not carry an exact SHA-256");
-  }
-  return "sha256/" + std::string(digest.substr(7U));
-}
-
-[[nodiscard]] std::vector<SourceArtifact>
+[[nodiscard]] std::vector<deployment::detail::PreparedModelSourceArtifact>
 load_source_artifacts(const FamilySource &family,
                       const std::filesystem::path &prepared_root,
                       const deployment::CanonicalValue &manifest) {
@@ -628,7 +536,7 @@ load_source_artifacts(const FamilySource &family,
       declarations.size() > kMaxMaintainedSourceArtifacts) {
     fail("prepared source artifact count is outside the maintained bound");
   }
-  std::vector<SourceArtifact> artifacts;
+  std::vector<deployment::detail::PreparedModelSourceArtifact> artifacts;
   artifacts.reserve(declarations.size());
   std::uint64_t aggregate_bytes = 0U;
   for (const auto &declaration : declarations) {
@@ -662,83 +570,17 @@ load_source_artifacts(const FamilySource &family,
       fail("prepared artifact bytes differ from the preparation receipt: " +
            logical_uri);
     }
-    artifacts.push_back(SourceArtifact{
+    artifacts.push_back(deployment::detail::PreparedModelSourceArtifact{
         logical_uri, media_type, core::ContentDigest(expected_digest), bytes});
   }
   if (artifacts.size() != paths.size()) {
     fail("preparation receipt path/declaration sets are not exact");
   }
   std::sort(artifacts.begin(), artifacts.end(),
-            [](const SourceArtifact &left, const SourceArtifact &right) {
+            [](const auto &left, const auto &right) {
               return left.logical_uri < right.logical_uri;
             });
   return artifacts;
-}
-
-[[nodiscard]] deployment::CanonicalValue
-artifact_rows(std::span<const SourceArtifact> artifacts) {
-  deployment::CanonicalValue::Array rows;
-  rows.reserve(artifacts.size());
-  for (const auto &artifact : artifacts) {
-    rows.emplace_back(deployment::CanonicalValue::Object{
-        {"logical_uri", deployment::CanonicalValue(artifact.logical_uri)},
-        {"media_type", deployment::CanonicalValue(artifact.media_type)},
-        {"byte_size", deployment::CanonicalValue(
-                          static_cast<double>(artifact.bytes.size()))},
-        {"content_digest",
-         deployment::CanonicalValue(artifact.content_digest.value())},
-    });
-  }
-  return deployment::CanonicalValue(std::move(rows));
-}
-
-[[nodiscard]] deployment::CanonicalValue
-normalized_model_asset_candidate(const FamilySource &family,
-                                 std::span<const SourceArtifact> artifacts) {
-  const auto &semantics = family.semantics;
-  const std::string urdf_uri =
-      "asset://" + family.model_asset_id + "/model.urdf";
-  const std::string srdf_uri =
-      "asset://" + family.model_asset_id + "/model.srdf";
-  deployment::CanonicalValue candidate(deployment::CanonicalValue::Object{
-      {"api_version",
-       deployment::CanonicalValue(std::string(core::kModelAssetApiVersion))},
-      {"model_asset_id", deployment::CanonicalValue(family.model_asset_id)},
-      {"model_revision", deployment::CanonicalValue(std::string(kZeroDigest))},
-      {"instance_cardinality",
-       require_member(semantics, "instance_cardinality", "semantics")},
-      {"expanded_source",
-       deployment::CanonicalValue(deployment::CanonicalValue::Object{
-           {"urdf_logical_uri", deployment::CanonicalValue(urdf_uri)},
-           {"srdf_logical_uri", deployment::CanonicalValue(srdf_uri)},
-           {"artifacts", artifact_rows(artifacts)},
-       })},
-      {"root_frame_role_id",
-       require_member(semantics, "root_frame_role_id", "semantics")},
-      {"frame_role_bindings",
-       require_member(semantics, "frame_role_bindings", "semantics")},
-      {"model_group_role_bindings",
-       require_member(semantics, "model_group_role_bindings", "semantics")},
-      {"resource_role_bindings",
-       require_member(semantics, "resource_role_bindings", "semantics")},
-      {"collision_body_role_bindings",
-       require_member(semantics, "collision_body_role_bindings", "semantics")},
-  });
-
-  const auto *schema =
-      deployment::build_qualified_closed_schema_registry()
-          .find_catalog_schema_family(core::CatalogRecordKind::kModelAsset);
-  if (schema == nullptr ||
-      schema->qualification() !=
-          deployment::CatalogSchemaQualification::kQualified ||
-      schema->compiled_schema() == nullptr) {
-    throw std::logic_error("model-asset schema is not build-qualified");
-  }
-  return deployment::validate_and_normalize_unqualified_artifact_candidate(
-             *schema->compiled_schema(),
-             deployment::parse_strict_json_model_yaml(
-                 deployment::canonical_json(candidate)))
-      .normalized_root();
 }
 
 [[nodiscard]] GeneratedFamily
@@ -752,14 +594,6 @@ generate_family(const FamilySource &family,
   if (deployment::canonical_json(manifest) != manifest_bytes) {
     fail("preparation manifest is not canonical JSON");
   }
-  const std::string &prepared_prefix = require_text(
-      require_member(manifest, "accepted_package_uri_prefix",
-                     "preparation manifest"),
-      "preparation manifest.accepted_package_uri_prefix");
-  if (prepared_prefix != family.accepted_package_uri_prefix) {
-    fail(family.family_id +
-         " preparation receipt uses a different package URI prefix");
-  }
   const std::string selected_srdf = read_plain_file(
       family.srdf_source, deployment::kMaxModelSourceXmlEntrypointBytes,
       "selected SRDF source");
@@ -769,63 +603,11 @@ generate_family(const FamilySource &family,
       "selected URDF source");
   verify_urdf_projection(family, selected_urdf);
   auto artifacts = load_source_artifacts(family, prepared_root, manifest);
-
-  auto normalized = normalized_model_asset_candidate(family, artifacts);
-  const deployment::detail::ContentIdentitySpec identity_spec{
-      deployment::detail::catalog_record_identity_domain("model_asset"),
-      std::string(core::kModelAssetApiVersion), "model_revision"};
-  const std::string revision =
-      deployment::detail::compute_content_identity(normalized, identity_spec);
-  auto root = normalized.as_object();
-  auto own_field =
-      std::find_if(root.begin(), root.end(), [](const auto &member) {
-        return member.first == "model_revision";
-      });
-  if (own_field == root.end()) {
-    throw std::logic_error("normalized ModelAsset lost model_revision");
-  }
-  own_field->second = deployment::CanonicalValue(revision);
-  const std::string catalog_bytes = pretty_json(
-      deployment::canonical_json(deployment::CanonicalValue(std::move(root))));
-
-  const auto *schema =
-      deployment::build_qualified_closed_schema_registry()
-          .find_catalog_schema_family(core::CatalogRecordKind::kModelAsset);
-  if (schema == nullptr || schema->compiled_schema() == nullptr) {
-    throw std::logic_error("model-asset schema disappeared during generation");
-  }
-  const core::ContentDigest catalog_digest(
-      deployment::sha256_digest(catalog_bytes));
-  const core::ContentAddressedStoreKey catalog_key("catalog/model-assets/" +
-                                                   family.model_asset_id + "/" +
-                                                   revision.substr(7U));
-  const core::ModelAssetCatalogRecordRefDTO reference{
-      core::ModelAssetId(family.model_asset_id),
-      core::ModelRevision(revision),
-      core::SchemaId(std::string(core::kModelAssetApiVersion)),
-      schema->compiled_schema()->schema_revision(),
-      catalog_digest,
-      catalog_key};
-  const auto qualified = deployment::resolve_and_qualify_model_asset(
-      reference, catalog_key, catalog_bytes);
-
-  std::vector<deployment::ResolvedModelSourceArtifactCandidate> candidates;
-  candidates.reserve(artifacts.size());
-  for (const auto &artifact : artifacts) {
-    candidates.push_back({
-        artifact.logical_uri,
-        core::ContentAddressedStoreKey(
-            store_key_for_digest(artifact.content_digest.value())),
-        artifact.bytes,
-    });
-  }
-  auto verified =
-      deployment::verify_model_source_closure(qualified, std::move(candidates));
-  auto preparation =
-      deployment::verify_build_qualified_structural_model_preparation(
-          manifest_bytes, selected_urdf, selected_srdf, verified);
-  return GeneratedFamily{family, catalog_bytes, reference, std::move(verified),
-                         std::move(preparation)};
+  auto model = deployment::detail::qualify_activation_prepared_model(
+      family.model_asset_id, family.semantics,
+      family.accepted_package_uri_prefix, manifest_bytes, selected_urdf,
+      selected_srdf, std::move(artifacts));
+  return GeneratedFamily{family, std::move(model)};
 }
 
 void run(const Options &raw_options) {
@@ -866,18 +648,18 @@ void run(const Options &raw_options) {
   // therefore never leave an earlier catalog refreshed in isolation.
   for (const auto &generated : generated_families) {
     if (options.mode == Mode::kPrint) {
-      std::cout << generated.catalog_bytes;
+      std::cout << generated.model.catalog_bytes;
       continue;
     }
     if (options.mode == Mode::kUpdate) {
       replace_file_atomically(generated.source.catalog_source,
-                              generated.catalog_bytes);
+                              generated.model.catalog_bytes);
       continue;
     }
     const std::string checked_in = read_plain_file(
         generated.source.catalog_source, deployment::kMaxArtifactEncodedBytes,
         "maintained ModelAsset catalog source");
-    if (checked_in != generated.catalog_bytes) {
+    if (checked_in != generated.model.catalog_bytes) {
       fail(generated.source.family_id +
            " maintained ModelAsset catalog source is stale; run "
            "manyforge_maintained_model_catalog --update");

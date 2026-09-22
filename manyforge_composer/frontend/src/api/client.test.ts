@@ -723,25 +723,35 @@ describe('structural API client', () => {
     const index = {
       api_version: 'manyforge.scenario_document_index.v1',
       directory: '/workspace/examples',
-      catalog_revision: null,
       entries: [],
     };
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(index))
       .mockResolvedValueOnce(response({
         status: 'saved',
-        path: '/workspace/examples/cell.scenario.yaml',
+        path: '/workspace/examples/cell',
         scenario_id: 'cell',
         last_known_status: 'unknown',
         workspace: workspaceFixture(),
       }))
       .mockResolvedValueOnce(response({
         status: 'opened',
-        path: '/workspace/examples/cell.scenario.yaml',
+        path: '/workspace/examples/cell',
         scenario_id: 'cell',
+        incomplete: false,
         activation: null,
         diagnostics: [],
+        source_diagnostics: [],
         workspace: workspaceFixture(),
+      }))
+      .mockResolvedValueOnce(response({
+        status: 'converted',
+        source_path: '/workspace/examples/legacy.scenario.yaml',
+        path: '/workspace/examples/cell',
+      }))
+      .mockResolvedValueOnce(response({
+        status: 'exported',
+        path: '/workspace/exports/cell',
       }));
     vi.stubGlobal('fetch', fetchMock);
     const scenarioFence = {
@@ -752,7 +762,7 @@ describe('structural API client', () => {
 
     await api.scenarioDocuments.list('/workspace/examples');
     await api.scenarioDocuments.save(scenarioFence, {
-      path: '/workspace/examples/cell.scenario.yaml',
+      path: '/workspace/examples/cell',
       scenarioId: 'cell',
       name: 'Cell',
       description: '',
@@ -760,10 +770,17 @@ describe('structural API client', () => {
     });
     await api.scenarioDocuments.load(
       scenarioFence,
-      '/workspace/examples/cell.scenario.yaml',
-      null,
-      '/workspace/examples/other.deployment.yaml',
+      '/workspace/examples/cell',
       true,
+    );
+    await api.scenarioDocuments.convertLegacy(
+      '/workspace/examples/legacy.scenario.yaml',
+      '/workspace/examples/cell',
+      true,
+    );
+    await api.scenarioDocuments.export(
+      scenarioFence,
+      '/workspace/exports/cell',
     );
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
@@ -773,7 +790,7 @@ describe('structural API client', () => {
       (fetchMock.mock.calls[1]?.[1] as RequestInit).body,
     ))).toEqual({
       ...scenarioFence,
-      path: '/workspace/examples/cell.scenario.yaml',
+      path: '/workspace/examples/cell',
       scenarioId: 'cell',
       name: 'Cell',
       description: '',
@@ -783,10 +800,24 @@ describe('structural API client', () => {
       (fetchMock.mock.calls[2]?.[1] as RequestInit).body,
     ))).toEqual({
       ...scenarioFence,
-      path: '/workspace/examples/cell.scenario.yaml',
-      qualifiedScenarioId: null,
-      alternateDeploymentPath: '/workspace/examples/other.deployment.yaml',
+      path: '/workspace/examples/cell',
       confirmDiscard: true,
+    });
+    expect(JSON.parse(String(
+      (fetchMock.mock.calls[3]?.[1] as RequestInit).body,
+    ))).toEqual({
+      sourcePath: '/workspace/examples/legacy.scenario.yaml',
+      destinationPath: '/workspace/examples/cell',
+      confirmOverwrite: true,
+    });
+    expect(fetchMock.mock.calls[4]?.[0]).toBe(
+      '/api/scenario-documents/export',
+    );
+    expect(JSON.parse(String(
+      (fetchMock.mock.calls[4]?.[1] as RequestInit).body,
+    ))).toEqual({
+      ...scenarioFence,
+      destinationPath: '/workspace/exports/cell',
     });
   });
 });

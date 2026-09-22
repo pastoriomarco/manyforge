@@ -124,8 +124,8 @@ runpy.run_module({module!r}, run_name='__main__')
             workbench.HEADLESS_BUILD.glob("manyforge_headless_py*.so")
         )
         workbench._ensure_current_native_backend = lambda: (host, worker)
-        workbench._ensure_deployment_compiler = lambda: (
-            args.build_root / "deployment/manyforge_maintained_deployment_occurrences",
+        workbench._ensure_activation_preparer = lambda: (
+            args.build_root / "deployment/manyforge_prepare_activation",
             tuple(
                 (family, args.build_root / "deployment/generated" / directory)
                 for family, directory in (

@@ -1,0 +1,770 @@
+{
+  "api_version": "manyforge.program.v2",
+  "catalog": {
+    "api_version": "manyforge.node_catalog.v2",
+    "content_version": "2.3.0"
+  },
+  "compatibility": {
+    "assistant": "forbidden",
+    "lanes": [
+      "manyforge-only"
+    ],
+    "requires": [
+      "lite_gripper"
+    ],
+    "tags": [
+      "lite6",
+      "pick-and-place"
+    ]
+  },
+  "component_roles": {
+    "robot": {
+      "required_component_type_tags": [
+        "articulated-arm"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ]
+    },
+    "tool": {
+      "required_component_type_tags": [
+        "gripper"
+      ]
+    }
+  },
+  "description": "Basic ManyForge pick-and-place Program for UFACTORY Lite6 with its lite pneumatic gripper. It preserves the ManyMove-derived rest pose, source-local Lite6 joints and frames, primitive scene, relative pick motions, physical gripper commands, and carried-object attach/detach sequence.",
+  "forest": [
+    {
+      "children": [
+        {
+          "children": [],
+          "instance_id": "open_gripper_start",
+          "node_id": "gripper.command_position",
+          "parameters": {
+            "command_duration_s": 0.8,
+            "max_effort": {
+              "kind": "linear_newton",
+              "value_n": 10.0
+            },
+            "position": {
+              "kind": "linear_m",
+              "value_m": 0.0081
+            },
+            "target_role": "gripper"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_rest",
+          "node_id": "motion.move_to_joint_target",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": [
+              {
+                "joint_name": "joint1",
+                "position_rad": 0.0
+              },
+              {
+                "joint_name": "joint2",
+                "position_rad": -0.785
+              },
+              {
+                "joint_name": "joint3",
+                "position_rad": 0.785
+              },
+              {
+                "joint_name": "joint4",
+                "position_rad": 0.0
+              },
+              {
+                "joint_name": "joint5",
+                "position_rad": 1.57
+              },
+              {
+                "joint_name": "joint6",
+                "position_rad": 0.0
+              }
+            ],
+            "planning_timeout_s": 10.0,
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
+            },
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_pick_approach",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                0.1
+              ]
+            },
+            "offset_reference": {
+              "frame_role_id": "base",
+              "type": "frame_role"
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "scene_resource_id": "graspable",
+              "type": "scene_resource"
+            },
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
+            },
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_pick",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                -0.0075
+              ]
+            },
+            "offset_reference": {
+              "frame_role_id": "base",
+              "type": "frame_role"
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "scene_resource_id": "graspable",
+              "type": "scene_resource"
+            },
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
+            },
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "close_gripper",
+          "node_id": "gripper.command_position",
+          "parameters": {
+            "command_duration_s": 0.8,
+            "max_effort": {
+              "kind": "linear_newton",
+              "value_n": 10.0
+            },
+            "position": {
+              "kind": "linear_m",
+              "value_m": 0.0
+            },
+            "target_role": "gripper"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "attach_graspable",
+          "node_id": "scene.attach_carried_object",
+          "parameters": {
+            "carrier_frame_role": "tcp",
+            "scene_resource_id": "graspable",
+            "target_role": "gripper",
+            "touch_body_roles": [
+              "gripper_collision"
+            ]
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "pick_retreat",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                -0.08
+              ]
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "frame_role_id": "tcp",
+              "type": "frame_role"
+            },
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
+            },
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_drop_approach",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "frame_ref": {
+                "frame_role": "base",
+                "kind": "target_frame",
+                "target_role": "arm"
+              },
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "position_m": [
+                0.16,
+                0.08,
+                0.2
+              ]
+            },
+            "planning_timeout_s": 10.0,
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
+            },
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_drop",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "frame_ref": {
+                "frame_role": "base",
+                "kind": "target_frame",
+                "target_role": "arm"
+              },
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "position_m": [
+                0.16,
+                0.08,
+                0.17
+              ]
+            },
+            "planning_timeout_s": 10.0,
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
+            },
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "open_gripper_release",
+          "node_id": "gripper.command_position",
+          "parameters": {
+            "command_duration_s": 0.8,
+            "max_effort": {
+              "kind": "linear_newton",
+              "value_n": 10.0
+            },
+            "position": {
+              "kind": "linear_m",
+              "value_m": 0.0081
+            },
+            "target_role": "gripper"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "detach_graspable",
+          "node_id": "scene.detach_carried_object",
+          "parameters": {
+            "scene_resource_id": "graspable",
+            "target_role": "gripper"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "drop_retreat",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "frame_ref": {
+                "frame_role": "base",
+                "kind": "target_frame",
+                "target_role": "arm"
+              },
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "position_m": [
+                0.16,
+                0.08,
+                0.22
+              ]
+            },
+            "planning_timeout_s": 10.0,
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
+            },
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "return_rest",
+          "node_id": "motion.move_to_joint_target",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": [
+              {
+                "joint_name": "joint1",
+                "position_rad": 0.0
+              },
+              {
+                "joint_name": "joint2",
+                "position_rad": -0.785
+              },
+              {
+                "joint_name": "joint3",
+                "position_rad": 0.785
+              },
+              {
+                "joint_name": "joint4",
+                "position_rad": 0.0
+              },
+              {
+                "joint_name": "joint5",
+                "position_rad": 1.57
+              },
+              {
+                "joint_name": "joint6",
+                "position_rad": 0.0
+              }
+            ],
+            "planning_timeout_s": 10.0,
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
+            },
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        }
+      ],
+      "instance_id": "lite6_pick_and_place",
+      "node_id": "sequence",
+      "parameters": {}
+    }
+  ],
+  "name": "lite6_lite_gripper_pick_and_place",
+  "parameters": [
+    {
+      "constraints": {
+        "max_inclusive": 1.0,
+        "min_exclusive": 0.0
+      },
+      "default": 1.0,
+      "description": "Acceleration scale for all Lite6 pick-and-place moves.",
+      "parameter_id": "acceleration_scale",
+      "runtime_mutability": "before_run",
+      "type": "float64"
+    },
+    {
+      "constraints": {
+        "min_inclusive": 0.0
+      },
+      "default": 0.01,
+      "description": "Default maximum Cartesian blend deviation.",
+      "parameter_id": "max_blend_deviation_rad",
+      "runtime_mutability": "before_run",
+      "type": "float64"
+    },
+    {
+      "constraints": {
+        "min_exclusive": 0.0
+      },
+      "default": 0.15,
+      "description": "Maximum TCP linear speed for all Lite6 pick-and-place moves.",
+      "parameter_id": "max_tcp_linear_speed_mps",
+      "runtime_mutability": "before_run",
+      "type": "float64"
+    },
+    {
+      "constraints": {
+        "min_exclusive": 0.0
+      },
+      "default": 0.005,
+      "description": "Default Cartesian translation tolerance for motion nodes.",
+      "parameter_id": "translation_tol_m",
+      "runtime_mutability": "before_run",
+      "type": "float64"
+    },
+    {
+      "constraints": {
+        "max_inclusive": 1.0,
+        "min_exclusive": 0.0
+      },
+      "default": 0.4,
+      "description": "Velocity scale for all Lite6 pick-and-place moves.",
+      "parameter_id": "velocity_scale",
+      "runtime_mutability": "before_run",
+      "type": "float64"
+    }
+  ],
+  "positions": {},
+  "program_id": "lite6_lite_gripper_pick_and_place",
+  "program_profile": "composable-cell-v1",
+  "scene": [
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "xyzw": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        },
+        "position_m": [
+          0.18,
+          -0.25,
+          0.08
+        ]
+      },
+      "resource_roles": [
+        "pick_object"
+      ],
+      "scene_resource_id": "graspable",
+      "shape": {
+        "box_dimensions_m": [
+          0.06,
+          0.015,
+          0.015
+        ],
+        "type": "box"
+      }
+    },
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "position_m": [
+          0.0,
+          0.0,
+          -0.051
+        ]
+      },
+      "scene_resource_id": "ground",
+      "shape": {
+        "box_dimensions_m": [
+          1.0,
+          1.0,
+          0.1
+        ],
+        "type": "box"
+      }
+    },
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "position_m": [
+          0.0,
+          -0.15,
+          0.1
+        ]
+      },
+      "scene_resource_id": "wall",
+      "shape": {
+        "box_dimensions_m": [
+          1.0,
+          0.02,
+          0.2
+        ],
+        "type": "box"
+      }
+    }
+  ],
+  "schema_version": "manyforge.composer_authoring_forest.v1",
+  "target_roles": {
+    "arm": {
+      "component_role": "robot",
+      "required_capabilities": [
+        {
+          "capability_id": "execution.feedback.phase_events",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "execution.trajectory.execute",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.joint_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.pose_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.profile.balanced",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.trajectory.time_parameterized",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "state.observed.current",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "validation.trajectory.non_collision",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [
+        "arm_collision"
+      ],
+      "required_frame_roles": [
+        "base",
+        "tcp"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ],
+      "required_resource_roles": [
+        "arm_joints"
+      ]
+    },
+    "gripper": {
+      "component_role": "tool",
+      "required_capabilities": [
+        {
+          "capability_id": "model.kinematics.fk",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "tool.gripper.command",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "tool.gripper.feedback",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [
+        "gripper_collision"
+      ],
+      "required_frame_roles": [
+        "tcp"
+      ],
+      "required_resource_roles": [
+        "fingers"
+      ]
+    }
+  }
+}

@@ -8,7 +8,7 @@ import type {
   CatalogResponse,
   CurrentScenarioResponse,
   DraftMutationResponse,
-  DeploymentCandidateCompilation,
+  PreparedActivationInput,
   DeploymentCandidateOperationResponse,
   DeploymentCandidatePreparation,
   DeploymentWorkspaceResponse,
@@ -71,6 +71,8 @@ import type {
   ProgramWorkspaceResponse,
   ProgramWorkspaceTransitionResponse,
   ScenarioDocumentDisplayStatus,
+  ScenarioDocumentExportResponse,
+  ScenarioDocumentConversionResponse,
   ScenarioDocumentIndexResponse,
   ScenarioDocumentLoadResponse,
   ScenarioDocumentSaveResponse,
@@ -2593,7 +2595,7 @@ export function parseScenarioDocumentIndexResponse(
   const record = objectAt(value, path);
   exactKeysAt(
     record,
-    ['api_version', 'catalog_revision', 'directory', 'entries'],
+    ['api_version', 'directory', 'entries'],
     path,
   );
   const apiVersion = stringAt(record.api_version, `${path}.api_version`);
@@ -2603,15 +2605,11 @@ export function parseScenarioDocumentIndexResponse(
   return {
     apiVersion,
     directory: stringAt(record.directory, `${path}.directory`),
-    catalogRevision: record.catalog_revision === null
-      ? null
-      : digestAt(record.catalog_revision, `${path}.catalog_revision`),
     entries: boundedArrayAt(record.entries, `${path}.entries`, 10_000).map(
       (entry, index) => {
         const entryPath = `${path}.entries[${index}]`;
         const row = objectAt(entry, entryPath);
         exactKeysAt(row, [
-          'base_scenario_id',
           'description',
           'display_status',
           'name',
@@ -2622,8 +2620,8 @@ export function parseScenarioDocumentIndexResponse(
           'status_detail',
         ], entryPath);
         const sourceKind = stringAt(row.source_kind, `${entryPath}.source_kind`);
-        if (sourceKind !== 'saved' && sourceKind !== 'qualified') {
-          return fail(`${entryPath}.source_kind`, 'saved or qualified');
+        if (sourceKind !== 'saved') {
+          return fail(`${entryPath}.source_kind`, 'saved');
         }
         const displayStatus = stringAt(
           row.display_status,
@@ -2636,17 +2634,13 @@ export function parseScenarioDocumentIndexResponse(
         }
         return {
           sourceKind,
-          path: nullableStringAt(row.path, `${entryPath}.path`),
+          path: stringAt(row.path, `${entryPath}.path`),
           scenarioId: nullableStringAt(
             row.scenario_id,
             `${entryPath}.scenario_id`,
           ),
           name: stringAt(row.name, `${entryPath}.name`),
           description: stringAt(row.description, `${entryPath}.description`),
-          baseScenarioId: nullableStringAt(
-            row.base_scenario_id,
-            `${entryPath}.base_scenario_id`,
-          ),
           savedManyforgeVersion: nullableStringAt(
             row.saved_manyforge_version,
             `${entryPath}.saved_manyforge_version`,
@@ -2697,31 +2691,74 @@ export function parseScenarioDocumentLoadResponse(
   const record = objectAt(value, path);
   exactKeysAt(
     record,
-    ['activation', 'diagnostics', 'path', 'scenario_id', 'status', 'workspace'],
+    ['activation', 'diagnostics', 'incomplete', 'path', 'scenario_id', 'source_diagnostics', 'status', 'workspace'],
     path,
   );
   const status = stringAt(record.status, `${path}.status`);
-  if (status !== 'loaded' && status !== 'opened') {
-    return fail(`${path}.status`, 'loaded or opened');
+  if (status !== 'opened') {
+    return fail(`${path}.status`, 'opened');
   }
   const activation = record.activation === null
     ? null
     : jsonRecordAt(record.activation, `${path}.activation`);
-  if ((status === 'loaded') !== (activation !== null)) {
-    return fail(`${path}.activation`, 'an activation only for loaded status');
+  if (activation !== null) {
+    return fail(`${path}.activation`, 'null');
   }
   return {
     status,
-    path: nullableStringAt(record.path, `${path}.path`),
+    path: stringAt(record.path, `${path}.path`),
     scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
     activation,
+    incomplete: booleanAt(record.incomplete, `${path}.incomplete`),
     diagnostics: arrayAt(record.diagnostics, `${path}.diagnostics`).map(
       (diagnostic, index) => parseProgramAuthoringDiagnostic(
         diagnostic,
         `${path}.diagnostics[${index}]`,
       ),
     ),
+    sourceDiagnostics: arrayAt(record.source_diagnostics, `${path}.source_diagnostics`).map(
+      (diagnostic, index) => {
+        const diagnosticPath = `${path}.source_diagnostics[${index}]`;
+        const selected = objectAt(diagnostic, diagnosticPath);
+        exactKeysAt(selected, ['code', 'message', 'source_id'], diagnosticPath);
+        const code = stringAt(selected.code, `${diagnosticPath}.code`);
+        if (code !== 'scenario_source_changed') {
+          return fail(`${diagnosticPath}.code`, 'scenario_source_changed');
+        }
+        return {
+          code,
+          sourceId: stringAt(selected.source_id, `${diagnosticPath}.source_id`),
+          message: stringAt(selected.message, `${diagnosticPath}.message`),
+        };
+      },
+    ),
     workspace: parseProgramWorkspaceResponse(record.workspace),
+  };
+}
+
+export function parseScenarioDocumentExportResponse(
+  value: unknown,
+): ScenarioDocumentExportResponse {
+  const path = 'scenarioDocumentExport';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['path', 'status'], path);
+  const status = stringAt(record.status, `${path}.status`);
+  if (status !== 'exported') return fail(`${path}.status`, 'exported');
+  return { status, path: stringAt(record.path, `${path}.path`) };
+}
+
+export function parseScenarioDocumentConversionResponse(
+  value: unknown,
+): ScenarioDocumentConversionResponse {
+  const path = 'scenarioDocumentConversion';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['path', 'source_path', 'status'], path);
+  const status = stringAt(record.status, `${path}.status`);
+  if (status !== 'converted') return fail(`${path}.status`, 'converted');
+  return {
+    status,
+    sourcePath: stringAt(record.source_path, `${path}.source_path`),
+    path: stringAt(record.path, `${path}.path`),
   };
 }
 
@@ -2957,32 +2994,33 @@ export function parseDeploymentWorkspaceResponse(
   };
 }
 
-function parseDeploymentCandidateIdentity(
+function parsePreparedActivationInput(
   value: unknown,
   path: string,
-  withSchema: boolean,
-): DeploymentCandidateCompilation {
+): PreparedActivationInput {
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    ...(withSchema ? ['schema_version'] : []),
-    'scenario_id', 'scenario_catalog_revision', 'deployment_artifact_id',
+    'schema_version', 'prepared_activation_id', 'source_document_digest',
+    'captured_input_digest', 'deployment_artifact_id',
     'deployment_revision', 'retained_bundle_id', 'graph_revision',
     'program_id', 'program_revision', 'program_binding_id',
+    'node_environment_digest', 'assistant_mode', 'typed_parameter_overrides',
   ], path);
-  if (withSchema && stringAt(record.schema_version, `${path}.schema_version`)
-    !== 'manyforge.deployment_candidate_compilation.v1') {
+  if (stringAt(record.schema_version, `${path}.schema_version`)
+    !== 'manyforge.prepared_activation_input.v2') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.deployment_candidate_compilation.v1',
+      'manyforge.prepared_activation_input.v2',
     );
   }
   return {
-    schemaVersion: 'manyforge.deployment_candidate_compilation.v1',
-    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
-    scenarioCatalogRevision: digestAt(
-      record.scenario_catalog_revision,
-      `${path}.scenario_catalog_revision`,
-    ),
+    schemaVersion: 'manyforge.prepared_activation_input.v2',
+    preparedActivationId: digestAt(record.prepared_activation_id,
+      `${path}.prepared_activation_id`),
+    sourceDocumentDigest: digestAt(record.source_document_digest,
+      `${path}.source_document_digest`),
+    capturedInputDigest: digestAt(record.captured_input_digest,
+      `${path}.captured_input_digest`),
     deploymentArtifactId: stringAt(
       record.deployment_artifact_id,
       `${path}.deployment_artifact_id`,
@@ -3005,6 +3043,17 @@ function parseDeploymentCandidateIdentity(
       record.program_binding_id,
       `${path}.program_binding_id`,
     ),
+    nodeEnvironmentDigest: digestAt(record.node_environment_digest,
+      `${path}.node_environment_digest`),
+    assistantMode: (() => {
+      const mode = stringAt(record.assistant_mode, `${path}.assistant_mode`);
+      if (mode !== 'required' && mode !== 'optional' && mode !== 'forbidden') {
+        return fail(`${path}.assistant_mode`, 'required, optional, or forbidden');
+      }
+      return mode;
+    })(),
+    typedParameterOverrides: jsonRecordAt(record.typed_parameter_overrides,
+      `${path}.typed_parameter_overrides`),
   };
 }
 
@@ -3024,7 +3073,7 @@ export function parseDeploymentCandidateOperationResponse(
   const workspace = parseDeploymentWorkspaceResponse(record.workspace);
   const resultRecord = objectAt(record.result, `${path}.result`);
   allowedKeysAt(resultRecord, [
-    'status', 'confirmation_token', 'compilation', 'candidate_preview',
+    'status', 'confirmation_token', 'prepared_activation', 'candidate_preview',
     'manager_apply', 'selection',
   ], ['preparation', 'phases_ms', 'apply_id'], `${path}.result`);
   const status = stringAt(resultRecord.status, `${path}.result.status`);
@@ -3084,30 +3133,16 @@ export function parseDeploymentCandidateOperationResponse(
       'null unless confirmation is required',
     );
   }
-  const compilation = parseDeploymentCandidateIdentity(
-    resultRecord.compilation,
-    `${path}.result.compilation`,
-    true,
+  const preparedActivation = parsePreparedActivationInput(
+    resultRecord.prepared_activation,
+    `${path}.result.prepared_activation`,
   );
-  const selection = parseDeploymentCandidateIdentity(
-    resultRecord.selection,
-    `${path}.result.selection`,
-    false,
-  );
-  const identityFields: Array<keyof Omit<
-    DeploymentCandidateCompilation,
-    'schemaVersion'
-  >> = [
-    'scenarioId', 'scenarioCatalogRevision', 'deploymentArtifactId',
-    'deploymentRevision', 'retainedBundleId', 'graphRevision', 'programId',
-    'programRevision', 'programBindingId',
-  ];
-  if (identityFields.some((field) => selection[field] !== compilation[field])) {
-    return fail(`${path}.result.selection`, 'the exact compiled candidate identity');
+  if (resultRecord.selection !== null) {
+    return fail(`${path}.result.selection`, 'null before the UA3 transition');
   }
   if (
-    workspace.draft.deploymentArtifactId !== compilation.deploymentArtifactId
-    || workspace.draft.deploymentRevision !== compilation.deploymentRevision
+    workspace.draft.deploymentArtifactId !== preparedActivation.deploymentArtifactId
+    || workspace.draft.deploymentRevision !== preparedActivation.deploymentRevision
   ) {
     return fail(`${path}.workspace`, 'the exact compiled Deployment Draft');
   }
@@ -3120,8 +3155,7 @@ export function parseDeploymentCandidateOperationResponse(
     ? null
     : parseManagerApplyResponse(resultRecord.manager_apply);
   const phaseKeys = [
-    'compile_ms', 'preview_ms', 'confirmation_validation_ms',
-    'manager_apply_ms', 'scenario_selection_ms', 'program_rebind_ms',
+    'preparation_ms', 'preview_ms', 'confirmation_validation_ms',
   ] as const;
   const phasesRecord = resultRecord.phases_ms === undefined
     ? {}
@@ -3143,13 +3177,13 @@ export function parseDeploymentCandidateOperationResponse(
     candidatePreview !== null
     && (
       candidatePreview.candidateReceipt.deployment_artifact_id
-        !== compilation.deploymentArtifactId
+        !== preparedActivation.deploymentArtifactId
       || candidatePreview.candidateReceipt.deployment_revision
-        !== compilation.deploymentRevision
+        !== preparedActivation.deploymentRevision
       || candidatePreview.candidateReceipt.candidate_retained_bundle_id
-        !== compilation.retainedBundleId
+        !== preparedActivation.retainedBundleId
       || candidatePreview.candidateReceipt.candidate_graph_revision
-        !== compilation.graphRevision
+        !== preparedActivation.graphRevision
     )
   ) {
     return fail(`${path}.result.candidate_preview`, 'the compiled candidate');
@@ -3157,24 +3191,10 @@ export function parseDeploymentCandidateOperationResponse(
   if (
     status === 'applied'
     && workspace.managerApplied.deploymentRevision
-      !== compilation.deploymentRevision
+      !== preparedActivation.deploymentRevision
   ) {
     return fail(`${path}.workspace.managerApplied`, 'the applied candidate');
   }
-  const selectionWithoutSchema: Omit<
-    DeploymentCandidateCompilation,
-    'schemaVersion'
-  > = {
-    scenarioId: selection.scenarioId,
-    scenarioCatalogRevision: selection.scenarioCatalogRevision,
-    deploymentArtifactId: selection.deploymentArtifactId,
-    deploymentRevision: selection.deploymentRevision,
-    retainedBundleId: selection.retainedBundleId,
-    graphRevision: selection.graphRevision,
-    programId: selection.programId,
-    programRevision: selection.programRevision,
-    programBindingId: selection.programBindingId,
-  };
   return {
     schemaVersion,
     workspace,
@@ -3182,10 +3202,10 @@ export function parseDeploymentCandidateOperationResponse(
       status,
       confirmationToken,
       preparation,
-      compilation,
+      preparedActivation,
       candidatePreview,
       managerApply,
-      selection: selectionWithoutSchema,
+      selection: null,
       phasesMs,
       applyId,
     },

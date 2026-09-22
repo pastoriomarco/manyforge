@@ -15,11 +15,10 @@ PROGRAMS = {
     "grouped": ROOT / "examples/ur5e_lite6_wall_grouped.program.yaml",
     "isolation": ROOT / "examples/ur5e_lite6_wall_isolation.program.yaml",
 }
-ROLE_ASSIGNMENTS = (
-    ROOT
-    / "manyforge_deployment/resources/maintained/"
-    "maintained_program_role_assignments.v1.json"
-)
+SCENARIOS = {
+    variant: ROOT / f"examples/ur5e_lite6_wall_{variant}.scenario"
+    for variant in PROGRAMS
+}
 
 
 def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> None:
@@ -167,36 +166,28 @@ def test_program_variants_keep_one_noninteracting_wall_scenario() -> None:
 
 
 def test_both_variants_are_registered_as_qualified_scenarios() -> None:
-    assignments = load_strict_json_yaml(ROLE_ASSIGNMENTS)["assignments"]
-    selected = {
-        row["scenario_id"]: row
-        for row in assignments
-        if row["scenario_id"].startswith("ur5e_lite6_wall_")
-    }
-    assert set(selected) == {
-        "ur5e_lite6_wall_grouped",
-        "ur5e_lite6_wall_isolation",
-    }
-    for scenario_id, row in selected.items():
-        program = load_strict_json_yaml(PROGRAMS[scenario_id.rsplit("_", 1)[1]])
-        assert row["deployment_source"] == (
-            "examples/ur5e_lite6_wall.deployment.yaml"
-        )
-        assert row["program_source"] == (
-            f"examples/{scenario_id}.program.yaml"
-        )
-        assert row["program_revision"] == program["program_revision"]
-        assert row["component_roles"] == {
-            "lite6_robot": "lite6_robot",
-            "ur5e_robot": "ur5e_robot",
+    for variant, path in SCENARIOS.items():
+        manifest = load_strict_json_yaml(path / "scenario.yaml")
+        assert manifest["scenario_id"] == f"ur5e_lite6_wall_{variant}"
+        deployment = load_strict_json_yaml(path / "deployment.yaml")
+        assert deployment["api_version"] == "manyforge.deployment_intent.v1"
+        assert deployment["deployment_artifact_id"] == "ur5e_lite6_wall"
+        assert {row["component_id"] for row in deployment["components"]} == {
+            "lite6_robot",
+            "ur5e_robot",
         }
-        assert row["target_roles"] == {
-            "lite6_arm": {
-                "component_role": "lite6_robot",
-                "command_target_id": "arm",
+        assignment = load_strict_json_yaml(path / "assignment.yaml")
+        assert assignment["component_roles"] == [
+            {
+                "component_role_id": "lite6_robot",
+                "controllable_component_id": "lite6_robot",
             },
-            "ur5e_arm": {
-                "component_role": "ur5e_robot",
-                "command_target_id": "arm",
+            {
+                "component_role_id": "ur5e_robot",
+                "controllable_component_id": "ur5e_robot",
             },
-        }
+        ]
+        assert assignment["target_roles"] == [
+            {"target_role_id": "lite6_arm", "command_target_id": "arm"},
+            {"target_role_id": "ur5e_arm", "command_target_id": "arm"},
+        ]

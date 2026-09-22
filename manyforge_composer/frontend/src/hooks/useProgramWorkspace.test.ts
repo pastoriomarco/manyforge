@@ -22,6 +22,7 @@ const apiMock = vi.hoisted(() => ({
   scenarioDocuments: {
     save: vi.fn(),
     load: vi.fn(),
+    convertLegacy: vi.fn(),
   },
 }));
 
@@ -433,23 +434,25 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     apiMock.deploymentWorkspace.get.mockResolvedValue(deploymentWorkspace());
     apiMock.scenarioDocuments.save.mockResolvedValue({
       status: 'saved',
-      path: '/workspace/cell.scenario.yaml',
+      path: '/workspace/cell',
       scenarioId: 'cell',
       lastKnownStatus: 'unknown',
       workspace: workspace(1),
     });
     apiMock.scenarioDocuments.load.mockResolvedValue({
       status: 'opened',
-      path: '/workspace/cell.scenario.yaml',
+      path: '/workspace/cell',
       scenarioId: 'cell',
       activation: null,
       diagnostics: [],
+      sourceDiagnostics: [],
+      incomplete: false,
       workspace: workspace(1),
     });
 
     await act(async () => {
       latest?.saveScenarioDocument({
-        path: '/workspace/cell.scenario.yaml',
+        path: '/workspace/cell',
         scenarioId: 'cell',
         name: 'Cell',
         description: '',
@@ -467,13 +470,11 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       }),
       expect.objectContaining({ scenarioId: 'cell' }),
     );
-    expect(latest?.scenarioDocumentPath).toBe('/workspace/cell.scenario.yaml');
+    expect(latest?.scenarioDocumentPath).toBe('/workspace/cell');
 
     await act(async () => {
       latest?.loadScenarioDocument(
-        '/workspace/cell.scenario.yaml',
-        null,
-        '/workspace/other.deployment.yaml',
+        '/workspace/cell',
         true,
       );
       await Promise.resolve();
@@ -484,9 +485,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
         deploymentDraftId: 'deployment-draft-1',
         expectedDeploymentDraftRevision: 4,
       }),
-      '/workspace/cell.scenario.yaml',
-      null,
-      '/workspace/other.deployment.yaml',
+      '/workspace/cell',
       true,
     );
   });

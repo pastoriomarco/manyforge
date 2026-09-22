@@ -10,6 +10,14 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn
 
 from fastapi import APIRouter, HTTPException
+from manyforge_behavior.canonical_artifact import (
+    canonical_json_bytes,
+    raw_sha256_digest,
+)
+from manyforge_behavior.model_source_capture import (
+    ModelSourceCaptureError,
+    capture_deployment_model_sources,
+)
 from manyforge_headless_api.client import HeadlessClientError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -32,6 +40,28 @@ from .state import ComposerState
 
 _DTO = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)
 _LOGGER = logging.getLogger(__name__)
+
+
+def _capture_model_sources(
+    state: ComposerState, deployment: dict[str, Any]
+) -> dict[str, Any]:
+    project = state.scenario_document_path
+    if not isinstance(project, str):
+        raise DeploymentDraftError(
+            "activation_source_project_unavailable",
+            "Activation preparation requires an open Scenario project",
+            status_code=409,
+        )
+    try:
+        return capture_deployment_model_sources(
+            deployment, project_root=Path(project)
+        )
+    except ModelSourceCaptureError as error:
+        raise DeploymentDraftError(
+            "activation_model_source_invalid",
+            str(error),
+            status_code=409,
+        ) from error
 
 
 class _Fence(BaseModel):
@@ -69,8 +99,8 @@ class UpdateDeploymentRequest(_Fence):
 
 
 class UpdateControlledStopRequest(_Fence):
-    control_binding_id: str = Field(min_length=1, max_length=256)
-    control_binding_revision: str = Field(min_length=1, max_length=256)
+    controllable_component_id: str = Field(min_length=1, max_length=256)
+    command_target_id: str = Field(min_length=1, max_length=256)
     profile: dict[str, Any] | None
     timing: dict[str, Any] | None
 
@@ -494,8 +524,8 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             prepared["compiled"] = (
                 state.deployment_draft_session.preview_controlled_stop_update(
                     body.profile,
-                    control_binding_id=body.control_binding_id,
-                    control_binding_revision=body.control_binding_revision,
+                    controllable_component_id=body.controllable_component_id,
+                    command_target_id=body.command_target_id,
                     timing=body.timing,
                     draft_id=body.draft_id,
                     expected_revision=body.expected_draft_revision,
@@ -735,120 +765,44 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     status_code=404,
                 )
             )
-        workspace = _workspace(state)
-        candidates = workspace["savedScenarioCandidates"]
-        if not candidates:
+        program = state.draft_session.retained_state().get("program")
+        assignment = deepcopy(state.scenario_program_role_assignment)
+        source_document_digest = state.scenario_source_document_digest
+        overrides = deepcopy(state.scenario_typed_parameter_overrides)
+        if (
+            not isinstance(program, dict)
+            or not isinstance(assignment, dict)
+            or not isinstance(source_document_digest, str)
+        ):
             _raise(
                 DeploymentDraftError(
-                    "deployment_saved_candidate_unavailable",
-                    "Saved Deployment has no current curated Apply candidate",
+                    "activation_input_incomplete",
+                    "Deployment Revert requires a complete saved Scenario input",
                     status_code=409,
                 )
             )
-        candidate = candidates[0]
-        # Revert changes the active Deployment, so it must also rebind the
-        # already Applied Program to the reopened Scenario closure.  Capture
-        # that exact Program and its compare-and-set digest before touching
-        # Manager; otherwise Manager can become active with an old Program
-        # record, leaving the cell in an execution-blocked mismatch.
-        try:
-            applied_program = state.headless_client.program_applied()
-        except HeadlessClientError as error:
-            _raise(
-                DeploymentDraftError(
-                    "deployment_applied_program_unavailable",
-                    "Deployment Revert requires the current Applied Program "
-                    f"to be active ({error.code})",
-                    status_code=409,
-                )
+        source_closure = _capture_model_sources(state, saved)
+        captured_input_digest = raw_sha256_digest(
+            canonical_json_bytes(
+                {
+                    "source_document_digest": source_document_digest,
+                    "deployment": saved,
+                    "model_source_closure": source_closure,
+                    "program": program,
+                    "program_role_assignment": assignment,
+                    "typed_parameter_overrides": overrides,
+                }
             )
-        program = applied_program.get("program")
-        source = applied_program.get("source")
-        applied_record_digest = (
-            source.get("record_digest") if isinstance(source, dict) else None
         )
-        if not isinstance(program, dict) or not isinstance(applied_record_digest, str):
-            _raise(
-                DeploymentDraftError(
-                    "deployment_applied_program_unavailable",
-                    "Deployment Revert requires the exact current Applied Program",
-                    status_code=409,
-                )
-            )
-        try:
-            target_selection = state.headless_client.scenario_load_selection(
-                candidate["scenarioId"]
-            )
-        except HeadlessClientError as error:
-            _raise(
-                DeploymentDraftError(
-                    "deployment_saved_candidate_unavailable",
-                    "Saved Deployment candidate could not be reopened "
-                    f"({error.code})",
-                    status_code=409,
-                )
-            )
-        if target_selection.get("program") != program:
-            _raise(
-                DeploymentDraftError(
-                    "deployment_saved_candidate_program_mismatch",
-                    "Saved Deployment candidate belongs to another Applied Program",
-                    status_code=409,
-                )
-            )
-        manager_status = state.headless_client.manager_status()
-        active = manager_status["status"]["active"]
-        manager_epoch = manager_status["source"]["source_owner_epoch"]
-        preview = state.headless_client.manager_deployment_candidate_preview(
-            {
-                "deployment_artifact_id": candidate["deploymentArtifactId"],
-                "deployment_revision": candidate["deploymentRevision"],
-                "expected_current": {
-                    "graph_revision": active["graph_revision"],
-                    "retained_bundle_id": active["retained_bundle_id"],
-                },
-                "expected_admission_generation": (body.expected_admission_generation),
-                "request_owner_epoch": manager_epoch,
-            }
+        current_bundle, current_graph, _ = state._manager_current(
+            state.headless_client.manager_status()
         )
-        receipt = preview.get("candidate_receipt")
-        if preview.get("ok") is not True or not isinstance(receipt, dict):
-            _raise(
-                DeploymentDraftError(
-                    "deployment_saved_candidate_rejected",
-                    "Manager rejected the Saved Deployment candidate",
-                    status_code=409,
-                )
-            )
         manager_request_id = (
             "deployment-revert-"
             + hashlib.sha256(
                 f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
             ).hexdigest()[:32]
         )
-        manager_apply = {
-            "request_id": manager_request_id,
-            "request_owner_epoch": manager_epoch,
-            "source_label": "manyforge_composer_deployment_revert",
-            "correlation_id": body.request_id,
-            "deployment_artifact_id": candidate["deploymentArtifactId"],
-            "deployment_revision": candidate["deploymentRevision"],
-            "expected_current": receipt["expected_current"],
-            "reject_if_affected_busy": True,
-            "candidate_receipt": receipt,
-        }
-        # A Revert is also valid when the saved candidate is already active
-        # (for example after reopening an unchanged workspace).  Do not send
-        # a redundant Manager Apply: the strict owner treats that as an
-        # invalid staged transition.  Program rebind and authoring journaling
-        # still run below, while a genuinely different active candidate keeps
-        # the normal Manager transition.
-        if (
-            active.get("graph_revision") == receipt.get("candidate_graph_revision")
-            and active.get("retained_bundle_id")
-            == receipt.get("candidate_retained_bundle_id")
-        ):
-            manager_apply = None
         post_state = state.authoring_retained_state()
         deployment_post = deepcopy(post_state["deployment"])
         if deployment_post["document"] != saved:
@@ -860,14 +814,18 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             "operation_kind": "revert_deployment",
             "effect_class": "external",
             "external_kind": "revert_deployment",
-            "manager_apply": manager_apply,
-            "scenario_id": candidate["scenarioId"],
-            "expected_scenario_catalog_revision": candidate[
-                "scenarioCatalogRevision"
-            ],
+            "source_document_digest": source_document_digest,
+            "captured_input_digest": captured_input_digest,
+            "model_source_closure": source_closure,
             "program": deepcopy(program),
-            "expected_applied_record_digest": applied_record_digest,
+            "program_role_assignment": assignment,
+            "typed_parameter_overrides": overrides,
             "deployment": deepcopy(saved),
+            "expected_manager_current": {
+                "retained_bundle_id": current_bundle,
+                "graph_revision": current_graph,
+            },
+            "expected_admission_generation": body.expected_admission_generation,
             "draft_id": body.draft_id,
             "draft_revision": body.expected_draft_revision,
             "manager_request_id": manager_request_id,
@@ -886,29 +844,15 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "Deployment Draft changed before Revert",
                     status_code=409,
                 )
-            compilation = {
-                "schema_version": "manyforge.deployment_candidate_compilation.v1",
-                "scenario_id": candidate["scenarioId"],
-                "scenario_catalog_revision": candidate[
-                    "scenarioCatalogRevision"
-                ],
-                "deployment_artifact_id": candidate["deploymentArtifactId"],
-                "deployment_revision": candidate["deploymentRevision"],
-                "retained_bundle_id": candidate["retainedBundleId"],
-                "graph_revision": receipt["candidate_graph_revision"],
-                "program_id": target_selection["program_id"],
-                "program_revision": target_selection["program_revision"],
-                "program_binding_id": candidate["programBindingId"],
-            }
-            prepared_candidate = {
-                "compilation": compilation,
-                "candidate_preview": preview,
-                "manager_apply": intent["manager_apply"],
-                "confirmation_required": False,
-                "confirmation_token": None,
-                "preparation": None,
-                "phases_ms": {},
-            }
+            if _capture_model_sources(state, saved) != source_closure:
+                raise DeploymentDraftError(
+                    "activation_model_source_changed",
+                    "A model source changed during activation capture",
+                    status_code=409,
+                )
+            prepared_candidate = state.execute_authored_deployment_candidate(
+                intent, _claim, apply=True, prepare_only=True
+            )
             return {"prepared_deployment_candidate": prepared_candidate}
 
         def effect(claim: dict[str, Any]) -> dict[str, Any]:
@@ -1021,39 +965,62 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     status_code=404,
                 )
             )
-        current_projection = state.current_scenario()
-        current = current_projection.get("current_scenario")
-        if current_projection.get("ready") is not True or not isinstance(current, dict):
-            _raise(
-                DeploymentDraftError(
-                    "deployment_current_scenario_unavailable",
-                    "Deployment preview requires one exact current Scenario",
-                    status_code=409,
-                )
-            )
-        if deployment_state["document"].get("deployment_artifact_id") != current.get(
-            "deployment_artifact_id"
+        program = state.draft_session.retained_state().get("program")
+        assignment = deepcopy(state.scenario_program_role_assignment)
+        source_document_digest = state.scenario_source_document_digest
+        overrides = deepcopy(state.scenario_typed_parameter_overrides)
+        if (
+            not isinstance(program, dict)
+            or not isinstance(assignment, dict)
+            or not isinstance(source_document_digest, str)
         ):
             _raise(
                 DeploymentDraftError(
-                    "deployment_candidate_artifact_mismatch",
-                    "The Deployment Draft addresses another artifact; load its "
-                    "Scenario before previewing it",
+                    "activation_input_incomplete",
+                    "Save or load one complete Scenario document with Program, "
+                    "Deployment, and explicit role assignment before preparation",
                     status_code=409,
                 )
             )
-        applied = state.headless_client.program_applied()
-        program = applied.get("program")
-        source = applied.get("source")
-        record_digest = (
-            source.get("record_digest") if isinstance(source, dict) else None
-        )
-        if not isinstance(program, dict) or not isinstance(record_digest, str):
-            _raise(
-                DeploymentDraftError(
-                    "deployment_applied_program_unavailable",
-                    "Deployment preview requires the exact current Applied Program",
+        retained_confirmation_input: dict[str, Any] | None = None
+        if (
+            isinstance(body, ApplyDeploymentCandidateRequest)
+            and body.confirmation_token is not None
+        ):
+            preparation_owner_epoch = body.preparation_request_owner_epoch
+            preparation_request_id = body.preparation_request_id
+            assert isinstance(preparation_owner_epoch, str)
+            assert isinstance(preparation_request_id, str)
+            try:
+                retained_confirmation_input = (
+                    state.retained_deployment_candidate_input(
+                        preparation_owner_epoch,
+                        preparation_request_id,
+                    )
+                )
+            except AuthoringJournalError as error:
+                raise HTTPException(
                     status_code=409,
+                    detail={"code": error.code, "message": str(error)},
+                ) from error
+            source_closure = deepcopy(
+                retained_confirmation_input["model_source_closure"]
+            )
+            captured_input_digest = retained_confirmation_input[
+                "captured_input_digest"
+            ]
+        else:
+            source_closure = _capture_model_sources(state, deployment)
+            captured_input_digest = raw_sha256_digest(
+                canonical_json_bytes(
+                    {
+                        "source_document_digest": source_document_digest,
+                        "deployment": deployment,
+                        "model_source_closure": source_closure,
+                        "program": program,
+                        "program_role_assignment": assignment,
+                        "typed_parameter_overrides": overrides,
+                    }
                 )
             )
         current_bundle, current_graph = manager_current()
@@ -1067,11 +1034,13 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 if apply
                 else "deployment_candidate_preview"
             ),
-            "scenario_id": current["scenario_id"],
-            "expected_scenario_catalog_revision": current["scenario_catalog_revision"],
+            "source_document_digest": source_document_digest,
+            "captured_input_digest": captured_input_digest,
+            "model_source_closure": source_closure,
             "deployment": deepcopy(deployment),
             "program": deepcopy(program),
-            "expected_applied_record_digest": record_digest,
+            "program_role_assignment": assignment,
+            "typed_parameter_overrides": overrides,
             "expected_manager_current": {
                 "retained_bundle_id": current_bundle,
                 "graph_revision": current_graph,
@@ -1116,25 +1085,22 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "Deployment Draft changed before candidate compilation",
                     status_code=409,
                 )
-            latest_current = state.current_scenario().get("current_scenario")
-            latest_applied = state.headless_client.program_applied()
-            latest_source = latest_applied.get("source")
-            latest_digest = (
-                latest_source.get("record_digest")
-                if isinstance(latest_source, dict)
-                else None
-            )
             latest_bundle, latest_graph = manager_current()
             if (
-                latest_current != current
-                or latest_applied.get("program") != program
-                or latest_digest != record_digest
+                state.draft_session.retained_state().get("program") != program
+                or state.scenario_program_role_assignment != assignment
+                or state.scenario_source_document_digest != source_document_digest
+                or state.scenario_typed_parameter_overrides != overrides
+                or (
+                    retained_confirmation_input is None
+                    and _capture_model_sources(state, deployment) != source_closure
+                )
                 or (latest_bundle, latest_graph) != (current_bundle, current_graph)
             ):
                 raise DeploymentDraftError(
                     "deployment_candidate_source_changed",
-                    "Current Scenario, Applied Program, or Manager selection "
-                    "changed before candidate compilation",
+                    "Captured authoring input or Manager selection changed "
+                    "before activation preparation",
                     status_code=409,
                 )
             # Compile or resolve the retained confirmation exactly once under

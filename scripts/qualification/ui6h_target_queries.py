@@ -28,6 +28,7 @@ from manyforge_behavior.canonical_artifact import (
     canonical_json_bytes,
     compute_content_identity,
     load_strict_json_yaml,
+    raw_sha256_digest,
 )
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
@@ -1374,24 +1375,57 @@ def main() -> None:
                     json.dumps(required_candidate)
                 ).canonical_json
         deployment_path.write_text(compiled)
+    scenario_document_path = (
+        workspace / "examples" / f"{scenario['scenario_id']}.scenario"
+    )
+    member_digests = {
+        name: raw_sha256_digest((scenario_document_path / name).read_bytes())
+        for name in (
+            "assignment.yaml",
+            "deployment.yaml",
+            "overrides.yaml",
+            "program.yaml",
+        )
+    }
+    source_document_digest = raw_sha256_digest(
+        canonical_json_bytes(
+            {
+                "manifest": raw_sha256_digest(
+                    (scenario_document_path / "scenario.yaml").read_bytes()
+                ),
+                "members": member_digests,
+            }
+        )
+    )
+    deployment = load_strict_json_yaml(deployment_path)
+    program = load_strict_json_yaml(program_path)
+    capture = {
+        "source_document_digest": source_document_digest,
+        "deployment": deployment,
+        "program": program,
+        "program_role_assignment": load_strict_json_yaml(
+            scenario_document_path / "assignment.yaml"
+        ),
+        "typed_parameter_overrides": load_strict_json_yaml(
+            scenario_document_path / "overrides.yaml"
+        ),
+    }
+    preparation_request = {
+        "schema_version": "manyforge.activation_preparation_request.v1",
+        **capture,
+        "captured_input_digest": raw_sha256_digest(canonical_json_bytes(capture)),
+    }
+    preparation_path = state / "activation-preparation.json"
+    preparation_path.write_bytes(canonical_json_bytes(preparation_request))
     subprocess.run(
         [
             str(compiler),
-            "--compile-candidate",
-            "--workspace-root",
+            "--input",
+            str(preparation_path),
+            "--capability-root",
             str(workspace),
-            "--base-package-root",
-            str(args.package_root),
-            "--candidate-package-root",
+            "--candidate-root",
             str(package),
-            "--candidate-deployment",
-            str(deployment_path),
-            "--candidate-program",
-            str(program_path),
-            "--scenario-id",
-            scenario["scenario_id"],
-            "--expected-scenario-catalog-revision",
-            catalog["scenario_catalog_revision"],
             *(
                 arg
                 for name, path in prepared
@@ -1421,7 +1455,7 @@ def main() -> None:
     # These only locate already qualified build/package inputs. Normal owner
     # construction, exact tuple checks, lifecycle convergence and teardown run.
     workbench._import_package = lambda: None
-    workbench._ensure_deployment_compiler = lambda: (compiler, prepared)
+    workbench._ensure_activation_preparer = lambda: (compiler, prepared)
     if args.ordinary_jerk or stop_profile_edit:
         # Verify the private, compiler-produced Deployment with the same
         # revision check as the ordinary workspace source. Do not bypass it.

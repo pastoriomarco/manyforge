@@ -1,0 +1,140 @@
+{
+  "api_version": "manyforge.deployment_intent.v1",
+  "assistant_profile_id": "vision_bin_selection",
+  "attachments": [],
+  "cell_id": "ur5_vision_bin_pick_cell",
+  "compatibility": {
+    "lane": "manyforge-only",
+    "provides": [
+      "vision_pose_inference"
+    ],
+    "tags": [
+      "bin-pick",
+      "ur5",
+      "vision-pick"
+    ]
+  },
+  "components": [
+    {
+      "component_id": "ur5_robot",
+      "component_profile_id": "ur5_native_simulated_v0",
+      "configuration": {
+        "default_fault_stop_profile": {
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "elbow_joint": 10.0,
+            "shoulder_lift_joint": 10.0,
+            "shoulder_pan_joint": 10.0,
+            "wrist_1_joint": 10.0,
+            "wrist_2_joint": 10.0,
+            "wrist_3_joint": 10.0
+          },
+          "profile_id": "default_fault_spring_back",
+          "stop_mode": "spring_back_hold"
+        },
+        "native_lifecycle_management": true,
+        "runtime_configuration": {
+          "collision_monitor_period_ms": 50.0,
+          "direct_control_joint_limits": [],
+          "execution_tick_hz": 100,
+          "initial_joint_positions_rad": [
+            0.0,
+            -1.57,
+            1.57,
+            -1.57,
+            -1.57,
+            0.0
+          ],
+          "mode": "simulated",
+          "planner_rng_seed": 12345
+        },
+        "runtime_kind": "native"
+      },
+      "model_source": {
+        "package_roots": {
+          "roboplan_example_models": {
+            "project_path": "../../.docker/roboplan/roboplan_example_models"
+          }
+        },
+        "srdf": {
+          "project_path": "../../manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/ur5_gripper.structural.srdf"
+        },
+        "urdf": {
+          "project_path": "../../manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/ur5_gripper.structural.urdf"
+        }
+      },
+      "root_pose_in_cell": {
+        "orientation_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "position_m": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "target_settings": {
+        "arm": {
+          "controlled_stop": {
+            "allow_natural_completion_on_short_path": true,
+            "deceleration_time_s": 1.0,
+            "jerk_limits_enabled": true,
+            "per_joint_limits": [
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "shoulder_pan_joint"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "shoulder_lift_joint"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "elbow_joint"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "wrist_1_joint"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "wrist_2_joint"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "wrist_3_joint"
+              }
+            ],
+            "stop_mode": "soft_on_path",
+            "timing": {
+              "command_latency_allowance_ns": 250000000,
+              "operational_timeout_ns": 3000000000,
+              "settling_allowance_ns": 750000000
+            }
+          },
+          "maximum_tcp_linear_speed_mps": 0.25
+        }
+      }
+    }
+  ],
+  "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pick",
+  "description": "Local deployment for the vision-guided bin-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
+  "name": "ur5_roboplan_local_vision_guided_pick",
+  "policies": {
+    "interrupt_config": {
+      "cancel_validation_timeout_ns": 1000,
+      "motion_scope_arm_timeout_ns": 1000,
+      "queue_depth": 8,
+      "supervisory_poll_rate_hz": 10
+    }
+  }
+}

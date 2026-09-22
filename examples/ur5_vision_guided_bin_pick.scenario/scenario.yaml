@@ -1,0 +1,91 @@
+{
+  "api_version": "manyforge.scenario.project.v1",
+  "content": {
+    "assignment_present": true,
+    "deployment_present": true,
+    "program_present": true
+  },
+  "description": "Local deployment for the vision-guided bin-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
+  "members": {
+    "assignment.yaml": "sha256:97a61aed742ff302a7ccf3c68eedb6b9c5e80516ef145a131db5f27b51538a60",
+    "deployment.yaml": "sha256:36df096cd6e5ed4fc7b0ebbfd9d7d82ec8a88813db8a809398a9581657d5c5df",
+    "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+    "program.yaml": "sha256:749333803441f6c2455f5914526143992efc7beae8a4307108bd9adb1ed43b25"
+  },
+  "name": "ur5_roboplan_local_vision_guided_pick",
+  "saved_status": {
+    "checked_content_digest": "sha256:921fc47a9f9e7690a50c9e3676cc27dba42e0c01f2921f8f784ca2404d1ef8fc",
+    "last_known_status": "ready",
+    "manyforge_version": "0.1.0"
+  },
+  "scenario_id": "ur5_vision_guided_bin_pick",
+  "source_snapshot": {
+    "entries": [
+      {
+        "content_digest": "sha256:c7af57d109de6a73f57943613bb000346518df06bb5ae119a2e80cf00bcbebde",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/collision/base.stl"
+      },
+      {
+        "content_digest": "sha256:8e79aa80a532494ba5320c30b40363ff63d228e3d59e2904703dca341dcba2ac",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/collision/forearm.stl"
+      },
+      {
+        "content_digest": "sha256:1d62e23a8c3ff9e6334fb157c805e6202037bcfca65bc6a36c5c9ae866751b3b",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/collision/shoulder.stl"
+      },
+      {
+        "content_digest": "sha256:55c11ac0ad1e144f230849b2033532e8b140b2e818ea497296d08dfb88757440",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/collision/upperarm.stl"
+      },
+      {
+        "content_digest": "sha256:0a1fd12150140efdee91650dcb4c2d0443065551a9207a2d2dbde58ff1fb4eb7",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/collision/wrist1.stl"
+      },
+      {
+        "content_digest": "sha256:c1d9f7843366068cb331f3f5c43fa716d3eceeb8c80216eccbbc878905dab123",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/collision/wrist2.stl"
+      },
+      {
+        "content_digest": "sha256:cf7220397b56f1d3047be9465eea1181d471b40fc82728052e31c97588585b4b",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/collision/wrist3.stl"
+      },
+      {
+        "content_digest": "sha256:2059aec60ceea5793181d52ecd07a25bac2a88f90182b96c4cf66f07cfb78de7",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/visual/base.dae"
+      },
+      {
+        "content_digest": "sha256:d7b40d794f81ba1658a442be9e7f193d445053564444a29f952b6bf7028706a2",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/visual/forearm.dae"
+      },
+      {
+        "content_digest": "sha256:2bfa801f928dd92ec8a83826f84aa30ad511d53f4760f5f83c7385a1bc924aa1",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/visual/shoulder.dae"
+      },
+      {
+        "content_digest": "sha256:0577221909b0b76445c4dd21c02aca97f04b5185fef7b33f5a484db679e3de34",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/visual/upperarm.dae"
+      },
+      {
+        "content_digest": "sha256:1cc29d29a40f2eefc89a280236dac1317babcb583538e7b31fdbc621f6a284a0",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/visual/wrist1.dae"
+      },
+      {
+        "content_digest": "sha256:d8cc770127fc7cc3c587594660971811b52092df75b6178895828f74df37ea0f",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/visual/wrist2.dae"
+      },
+      {
+        "content_digest": "sha256:8ee319c507ad0e0db4d77594cc03192f1660a3d0db03bae6f827518876d027af",
+        "source_id": "component:ur5_robot:resource:package://roboplan_example_models/models/ur_robot_model/meshes/visual/wrist3.dae"
+      },
+      {
+        "content_digest": "sha256:d01263052a0d97dce67239fc157d9c330f54ef96a48028a39fcf2ae47aced8cc",
+        "source_id": "component:ur5_robot:srdf"
+      },
+      {
+        "content_digest": "sha256:87bb2c74af4be8f5efa2429339abd0a73d8408981c3efa369e7e3cebf4a1b1e7",
+        "source_id": "component:ur5_robot:urdf"
+      }
+    ],
+    "schema_version": "manyforge.scenario.source_snapshot.v1"
+  }
+}

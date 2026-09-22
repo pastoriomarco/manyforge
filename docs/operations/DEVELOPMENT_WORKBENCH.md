@@ -88,6 +88,23 @@ activates configuration; Save persists an artifact. Motion requires a separate
 authorized command. Browser closure does not Stop the runtime, and an unconfirmed
 viewer pose must not be treated as current measured state.
 
+The ordinary authoring artifact is a Scenario project directory with fixed
+members: `scenario.yaml`, `deployment.yaml`, `program.yaml`, `assignment.yaml`
+and `overrides.yaml`, plus optional `sources/` and `assets/`. Open the project
+directory to load those parts together. Save updates authored intent and source
+references; Save As creates another project without copying referenced external
+sources. Missing/invalid sources block preparation, while changed compatible
+sources are reported for review rather than silently pinned to an old vendor
+copy. Use Export when a portable project is required: it copies the admitted
+source/asset closure and rewrites only the exported references. Do not use Save
+As as an asset-collection operation.
+
+UA2A qualifies this project and preparation workflow, not the new live
+activation lifecycle. Until UA3–UA7 replace and qualify the current Manager/
+Scene consumers, treat Apply/Revert behavior as development work in progress and
+follow Runtime/history rather than assuming that successful preparation means a
+completed live transition. Discard remains draft-only.
+
 Inspect before restarting:
 
 ```bash

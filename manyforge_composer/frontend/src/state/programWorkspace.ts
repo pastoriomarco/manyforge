@@ -13,6 +13,8 @@ export type ProgramWorkspaceActionName =
   | 'revert'
   | 'load'
   | 'load_scenario_document'
+  | 'convert_legacy_scenario_document'
+  | 'export_scenario_document'
   | 'save'
   | 'save_as'
   | 'save_scenario_document';

@@ -24,6 +24,8 @@ interface RuntimeConfiguration {
   index: number;
   runtimeUnitId: string;
   configuration: Record<string, JsonValue>;
+  configurationPath: Array<string | number>;
+  intentTargetSettings: Record<string, JsonValue> | null;
 }
 
 interface MotionTargetLimit {
@@ -32,6 +34,7 @@ interface MotionTargetLimit {
   componentId: string;
   targetId: string;
   value: number;
+  settingsPath: Array<string | number>;
 }
 
 interface DirectControlJointLimitDraft {
@@ -73,6 +76,34 @@ function numberValue(value: JsonValue | undefined): number | null {
 function runtimeConfigurations(
   document: Record<string, JsonValue> | null,
 ): RuntimeConfiguration[] {
+  if (document?.api_version === 'manyforge.deployment_intent.v1') {
+    const components = document.components;
+    if (!Array.isArray(components)) return [];
+    return components.flatMap((value, index) => {
+      const component = objectValue(value);
+      const configuration = objectValue(component?.configuration);
+      const targetSettings = objectValue(component?.target_settings);
+      const componentId = component?.component_id;
+      if (configuration === null || targetSettings === null || typeof componentId !== 'string') {
+        return [];
+      }
+      const limits = Object.entries(targetSettings).flatMap(([targetId, setting]) => {
+        const row = objectValue(setting);
+        return row === null ? [] : [{
+          ...row,
+          controllable_component_id: componentId,
+          command_target_id: targetId,
+        }];
+      });
+      return [{
+        index,
+        runtimeUnitId: componentId,
+        configuration: { ...configuration, motion_target_limits: limits },
+        configurationPath: ['components', index, 'configuration'],
+        intentTargetSettings: targetSettings,
+      }];
+    });
+  }
   const graph = objectValue(document?.graph);
   const runtimeUnits = graph?.runtime_units;
   if (!Array.isArray(runtimeUnits)) return [];
@@ -81,7 +112,13 @@ function runtimeConfigurations(
     const configuration = objectValue(runtime?.configuration);
     const runtimeUnitId = runtime?.runtime_unit_id;
     return configuration !== null && typeof runtimeUnitId === 'string'
-      ? [{ index, runtimeUnitId, configuration }]
+      ? [{
+        index,
+        runtimeUnitId,
+        configuration,
+        configurationPath: ['graph', 'runtime_units', index, 'configuration'],
+        intentTargetSettings: null,
+      }]
       : [];
   });
 }
@@ -98,7 +135,16 @@ function motionTargetLimits(runtimes: RuntimeConfiguration[]): MotionTargetLimit
       return typeof componentId === 'string'
         && typeof targetId === 'string'
         && limit !== null
-        ? [{ runtimeIndex: runtime.index, rowIndex, componentId, targetId, value: limit }]
+        ? [{
+          runtimeIndex: runtime.index,
+          rowIndex,
+          componentId,
+          targetId,
+          value: limit,
+          settingsPath: runtime.intentTargetSettings === null
+            ? [...runtime.configurationPath, 'motion_target_limits', rowIndex]
+            : ['components', runtime.index, 'target_settings', targetId],
+        }]
         : [];
     });
   });
@@ -206,14 +252,79 @@ function gripperConfigurationValue(
 }
 
 interface ControlledStopTarget {
-  bindingId: string;
-  bindingRevision: string;
+  key: string;
+  componentId: string;
+  targetId: string;
   label: string;
-  rows: JsonValue[];
+  profile: DeploymentControlledStopProfile | null;
+  derivedRows: number;
   timing: DeploymentStopTiming | null;
 }
 
 function controlledStopTargets(document: Record<string, JsonValue> | null): ControlledStopTarget[] {
+  if (document?.api_version === 'manyforge.deployment_intent.v1') {
+    return (Array.isArray(document.components) ? document.components : []).flatMap((componentValue) => {
+      const component = objectValue(componentValue);
+      const componentId = component?.component_id;
+      const settings = objectValue(component?.target_settings);
+      if (typeof componentId !== 'string' || settings === null) return [];
+      return Object.entries(settings).flatMap(([targetId, settingValue]) => {
+        const stop = objectValue(objectValue(settingValue)?.controlled_stop);
+        const mode = stop?.stop_mode;
+        const deceleration = numberValue(stop?.deceleration_time_s);
+        const natural = stop?.allow_natural_completion_on_short_path;
+        const jerkEnabled = stop?.jerk_limits_enabled;
+        const limits = stop?.per_joint_limits;
+        if ((mode !== 'soft_on_path' && mode !== 'spring_back_hold')
+          || deceleration === null || typeof natural !== 'boolean'
+          || typeof jerkEnabled !== 'boolean' || !Array.isArray(limits)) return [];
+        const normalizedLimits = limits.flatMap((limitValue) => {
+          const limit = objectValue(limitValue);
+          const sourceJoint = limit?.source_joint_name;
+          const maximum = numberValue(limit?.max_deceleration_rad_s2);
+          const threshold = numberValue(limit?.settle_velocity_threshold_rad_s);
+          const jerk = limit?.max_jerk_rad_s3 === undefined
+            ? null : numberValue(limit.max_jerk_rad_s3);
+          if (typeof sourceJoint !== 'string' || maximum === null || threshold === null
+            || (limit?.max_jerk_rad_s3 !== undefined && jerk === null)) return [];
+          return [{
+            resource_id: sourceJoint,
+            max_deceleration: { coordinate_kind: 'angular_rad_s2', value: maximum },
+            settle_velocity_threshold: { coordinate_kind: 'angular_rad_s', value: threshold },
+            ...(jerk === null ? {} : {
+              max_jerk: { coordinate_kind: 'angular_rad_s3', value: jerk },
+            }),
+          }];
+        });
+        if (normalizedLimits.length !== limits.length || normalizedLimits.length === 0) return [];
+        const timingValue = stop?.timing === undefined ? null : objectValue(stop.timing);
+        const timing = timingValue !== null
+          && typeof timingValue.command_latency_allowance_ns === 'number'
+          && typeof timingValue.settling_allowance_ns === 'number'
+          && typeof timingValue.operational_timeout_ns === 'number'
+          ? {
+              command_latency_allowance_ns: timingValue.command_latency_allowance_ns,
+              settling_allowance_ns: timingValue.settling_allowance_ns,
+              operational_timeout_ns: timingValue.operational_timeout_ns,
+            } : null;
+        return [{
+          key: JSON.stringify([componentId, targetId]),
+          componentId,
+          targetId,
+          label: `${componentId} · ${targetId}`,
+          profile: {
+            stop_mode: mode,
+            deceleration_time_s: deceleration,
+            allow_natural_completion_on_short_path: natural,
+            jerk_limits_enabled: jerkEnabled,
+            per_resource_limits: normalizedLimits,
+          },
+          derivedRows: 1,
+          timing,
+        } satisfies ControlledStopTarget];
+      });
+    });
+  }
   const policies = objectValue(document?.policies);
   const rows = policies?.stop_stage_parameters;
   const graph = objectValue(document?.graph);
@@ -231,26 +342,59 @@ function controlledStopTargets(document: Record<string, JsonValue> | null): Cont
     const row = objectValue(value);
     if (typeof row?.control_binding_id === 'string') timings.set(row.control_binding_id, row);
   }
-  return graph.control_bindings.flatMap((value) => {
+  const grouped = new Map<string, {
+    componentId: string;
+    targetId: string;
+    rows: JsonValue[];
+    timings: Array<DeploymentStopTiming | null>;
+  }>();
+  for (const value of graph.control_bindings) {
     const binding = objectValue(value);
     const id = binding?.control_binding_id;
     const revision = binding?.control_binding_revision;
     const targetRows = typeof id === 'string' ? byBinding.get(id) : undefined;
-    if (!binding || typeof id !== 'string' || typeof revision !== 'string' || !targetRows?.length) return [];
+    const componentId = binding?.controllable_component_id;
+    const targetId = binding?.command_target_id;
+    if (!binding || typeof id !== 'string' || typeof revision !== 'string'
+      || typeof componentId !== 'string' || typeof targetId !== 'string'
+      || !targetRows?.length) continue;
     const selected = timings.get(id);
     const timing = selected?.control_binding_revision === revision ? objectValue(selected.timing) : null;
     if (selected && (!timing
       || typeof timing.command_latency_allowance_ns !== 'number'
       || typeof timing.settling_allowance_ns !== 'number'
-      || typeof timing.operational_timeout_ns !== 'number')) return [];
-    return [{ bindingId: id, bindingRevision: revision,
-      label: `${binding.controllable_component_id} · ${binding.command_target_id} · ${binding.capability_id ?? id}`,
-      rows: targetRows,
-      timing: timing ? {
+      || typeof timing.operational_timeout_ns !== 'number')) continue;
+    const key = JSON.stringify([componentId, targetId]);
+    const group = grouped.get(key) ?? {
+      componentId, targetId, rows: [], timings: [],
+    };
+    group.rows.push(...targetRows.filter((rowValue) => {
+      const row = objectValue(rowValue);
+      return row?.stop_escalation_stage_id === 'motion_controlled_stop'
+        && objectValue(row.provider_contract_ref)?.provider_contract_role_id === 'stop_contract';
+    }));
+    group.timings.push(timing ? {
         command_latency_allowance_ns: timing.command_latency_allowance_ns as number,
         settling_allowance_ns: timing.settling_allowance_ns as number,
         operational_timeout_ns: timing.operational_timeout_ns as number,
-      } : null }];
+      } : null);
+    grouped.set(key, group);
+  }
+  return [...grouped.entries()].flatMap(([key, group]) => {
+    const normalized = normalizedStopProfile(group.rows);
+    if (group.rows.length === 0) return [];
+    const serializedTimings = group.timings.map((value) => JSON.stringify(value));
+    const timing = serializedTimings.every((value) => value === serializedTimings[0])
+      ? group.timings[0] : null;
+    return [{
+      key,
+      componentId: group.componentId,
+      targetId: group.targetId,
+      label: `${group.componentId} · ${group.targetId}`,
+      profile: normalized?.profile ?? null,
+      derivedRows: normalized?.derivedRows ?? group.rows.length,
+      timing,
+    }];
   });
 }
 
@@ -555,7 +699,7 @@ function DirectControlJointLimitsEditor({
     value: number | null,
   ) => controller.mutate(
     [
-      'graph', 'runtime_units', runtime.index, 'configuration',
+      ...runtime.configurationPath,
       'direct_control_joint_limits',
     ],
     'set',
@@ -658,7 +802,7 @@ function OrdinaryMotionJerkEditor({ controller, runtime, limit, descriptor }: {
     && row.maxJerkRadS3 !== null
   ));
   const commit = (changes: Record<string, JsonValue>) => controller.mutate(
-    ['graph', 'runtime_units', runtime.index, 'configuration', 'motion_target_limits', limit.rowIndex, 'ordinary_motion_jerk'],
+    [...limit.settingsPath, 'ordinary_motion_jerk'],
     'set', { ...settings, ...changes },
   );
   const override = (sourceJointName: string, value: number | null) => {
@@ -863,9 +1007,7 @@ function NativeRuntimeSection({
       <div className="deployment-focused-body">
         {runtimes.length === 0 && <p className="muted">No native runtime configuration is declared.</p>}
         {runtimes.map((runtime) => {
-          const prefix: Array<string | number> = [
-            'graph', 'runtime_units', runtime.index, 'configuration',
-          ];
+          const prefix = runtime.configurationPath;
           const positions = runtime.configuration.initial_joint_positions_rad;
           return (
             <section className="deployment-runtime-unit" key={runtime.runtimeUnitId}>
@@ -943,7 +1085,7 @@ function ControlledStopSection({
   targets: ControlledStopTarget[];
 }) {
   const [selectedId, setSelectedId] = useState('');
-  const target = targets.find((row) => row.bindingId === selectedId) ?? targets[0];
+  const target = targets.find((row) => row.key === selectedId) ?? targets[0];
   return (
     <details className="deployment-focused-section">
       <summary>Stop settings</summary>
@@ -951,12 +1093,12 @@ function ControlledStopSection({
         {target ? <>
           <label className="deployment-focused-field">
             <span>Target</span>
-            <select aria-label="Controlled Stop target" value={target.bindingId}
+            <select aria-label="Controlled Stop target" value={target.key}
               disabled={controller.busy} onChange={(event) => setSelectedId(event.target.value)}>
-              {targets.map((row) => <option key={row.bindingId} value={row.bindingId}>{row.label}</option>)}
+              {targets.map((row) => <option key={row.key} value={row.key}>{row.label}</option>)}
             </select>
           </label>
-          <ControlledStopEditor key={`${target.bindingId}:${target.bindingRevision}`}
+          <ControlledStopEditor key={target.key}
             controller={controller} target={target} />
         </> : <p className="muted">No editable Stop contract is declared.</p>}
       </div>
@@ -968,25 +1110,19 @@ function ControlledStopEditor({ controller, target }: {
   controller: DeploymentWorkspaceController;
   target: ControlledStopTarget;
 }) {
-  const controlledRows = useMemo(() => target.rows.filter((value) => {
-    const row = objectValue(value);
-    return row?.stop_escalation_stage_id === 'motion_controlled_stop'
-      && objectValue(row.provider_contract_ref)?.provider_contract_role_id === 'stop_contract';
-  }), [target.rows]);
-  const normalized = useMemo(() => normalizedStopProfile(controlledRows), [controlledRows]);
   const [draft, setDraft] = useState<DeploymentControlledStopProfile | null>(
-    normalized?.profile ?? null,
+    target.profile,
   );
   const [timing, setTiming] = useState<DeploymentStopTiming | null>(target.timing);
   useEffect(() => {
-    setDraft(normalized?.profile ?? null);
+    setDraft(target.profile);
     setTiming(target.timing);
-  }, [normalized, target.timing]);
+  }, [target.profile, target.timing]);
   const disabled = !controller.mutationAvailable || controller.busy
-    || (controlledRows.length > 0 && normalized?.profile.jerk_limits_enabled == null);
-  const changed = (normalized !== null && JSON.stringify(draft) !== JSON.stringify(normalized.profile))
+    || target.profile?.jerk_limits_enabled == null;
+  const changed = (target.profile !== null && JSON.stringify(draft) !== JSON.stringify(target.profile))
     || JSON.stringify(timing) !== JSON.stringify(target.timing);
-  const requiresMigration = controlledRows.length > 0 && normalized?.profile.jerk_limits_enabled == null;
+  const requiresMigration = target.profile?.jerk_limits_enabled == null;
   const updateLimit = (
     index: number,
     field: 'max_deceleration' | 'settle_velocity_threshold',
@@ -1142,17 +1278,18 @@ function ControlledStopEditor({ controller, target }: {
             className="primary-action"
             disabled={disabled || !changed || requiresMigration}
             onClick={() => { void controller.updateControlledStop({
-              control_binding_id: target.bindingId, control_binding_revision: target.bindingRevision,
+              controllable_component_id: target.componentId,
+              command_target_id: target.targetId,
               profile: draft, timing,
             }); }}
           >Update Controlled Stop Draft</button>
           <button
             type="button"
             disabled={disabled || !changed}
-            onClick={() => { setDraft(normalized?.profile ?? null); setTiming(target.timing); }}
+            onClick={() => { setDraft(target.profile); setTiming(target.timing); }}
           >Discard Stop edits</button>
         </div>
-        <p className="field-help" title={`Updates ${normalized?.derivedRows ?? 0} route rows for this target only. The timeout must cover the complete profile plus latency and settling. Expiry or nominal failure faults and requests strongest authorized containment.`}>
+        <p className="field-help" title={`Preparation expands this target profile to ${target.derivedRows} current route row(s). The timeout must cover the complete profile plus latency and settling. Expiry or nominal failure faults and requests strongest authorized containment.`}>
           Save records these choices; Apply activates them.
         </p>
     </>
@@ -1238,7 +1375,8 @@ function GripperSection({
     }
     const result = await controller.mutate(
       [
-        'graph', 'runtime_units', normalizedDraft.runtimeIndex, 'configuration',
+        ...runtimes.find((runtime) => runtime.index === normalizedDraft.runtimeIndex)!
+          .configurationPath,
         'gripper_target_configurations', normalizedDraft.rowIndex,
       ],
       'set',

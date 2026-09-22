@@ -361,12 +361,11 @@ export type ScenarioDocumentDisplayStatus =
   | 'unsupported';
 
 export interface ScenarioDocumentEntry {
-  sourceKind: 'saved' | 'qualified';
-  path: string | null;
+  sourceKind: 'saved';
+  path: string;
   scenarioId: string | null;
   name: string;
   description: string;
-  baseScenarioId: string | null;
   savedManyforgeVersion: string | null;
   displayStatus: ScenarioDocumentDisplayStatus;
   statusDetail: string;
@@ -375,7 +374,6 @@ export interface ScenarioDocumentEntry {
 export interface ScenarioDocumentIndexResponse {
   apiVersion: 'manyforge.scenario_document_index.v1';
   directory: string;
-  catalogRevision: string | null;
   entries: ScenarioDocumentEntry[];
 }
 
@@ -393,12 +391,31 @@ export interface ScenarioDocumentSaveResponse {
 }
 
 export interface ScenarioDocumentLoadResponse {
-  status: 'loaded' | 'opened';
-  path: string | null;
+  status: 'opened';
+  path: string;
   scenarioId: string;
-  activation: Record<string, JsonValue> | null;
+  activation: null;
+  incomplete: boolean;
   diagnostics: ProgramAuthoringDiagnostic[];
+  sourceDiagnostics: ScenarioSourceDiagnostic[];
   workspace: ProgramWorkspaceResponse;
+}
+
+export interface ScenarioSourceDiagnostic {
+  code: 'scenario_source_changed';
+  sourceId: string;
+  message: string;
+}
+
+export interface ScenarioDocumentExportResponse {
+  status: 'exported';
+  path: string;
+}
+
+export interface ScenarioDocumentConversionResponse {
+  status: 'converted';
+  sourcePath: string;
+  path: string;
 }
 
 export interface DeploymentScenarioCandidate {
@@ -442,10 +459,11 @@ export interface DeploymentWorkspaceResponse {
   unavailableReasons: string[];
 }
 
-export interface DeploymentCandidateCompilation {
-  schemaVersion: 'manyforge.deployment_candidate_compilation.v1';
-  scenarioId: string;
-  scenarioCatalogRevision: string;
+export interface PreparedActivationInput {
+  schemaVersion: 'manyforge.prepared_activation_input.v2';
+  preparedActivationId: string;
+  sourceDocumentDigest: string;
+  capturedInputDigest: string;
   deploymentArtifactId: string;
   deploymentRevision: string;
   retainedBundleId: string;
@@ -453,6 +471,9 @@ export interface DeploymentCandidateCompilation {
   programId: string;
   programRevision: string;
   programBindingId: string;
+  nodeEnvironmentDigest: string;
+  assistantMode: 'required' | 'optional' | 'forbidden';
+  typedParameterOverrides: Record<string, JsonValue>;
 }
 
 export interface DeploymentCandidatePreparation {
@@ -469,10 +490,10 @@ export interface DeploymentCandidateOperationResponse {
     /** Authoritative identity of the journalized preparation, echoed on
      * confirmation_required so the confirmation can reference it. */
     preparation: DeploymentCandidatePreparation | null;
-    compilation: DeploymentCandidateCompilation;
+    preparedActivation: PreparedActivationInput;
     candidatePreview: ManagerDeploymentCandidatePreviewResponse | null;
     managerApply: ManagerApplyResponse | null;
-    selection: Omit<DeploymentCandidateCompilation, 'schemaVersion'>;
+    selection: null;
     /** Monotonic backend durations for the phases actually traversed. */
     phasesMs: Record<string, number>;
     applyId: string | null;
@@ -506,8 +527,8 @@ export interface DeploymentStopTiming {
 }
 
 export interface DeploymentControlledStopUpdate {
-  control_binding_id: string;
-  control_binding_revision: string;
+  controllable_component_id: string;
+  command_target_id: string;
   /** null keeps the selected target's profile unchanged (including non-motion targets). */
   profile: DeploymentControlledStopProfile | null;
   timing: DeploymentStopTiming | null;

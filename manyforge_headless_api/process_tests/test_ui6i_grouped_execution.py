@@ -78,8 +78,9 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
         _composer_snapshot_stream(stack, client_id=f"ui6i-{scenario_id}") as snapshots,
         HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
     ):
-        scenarios = composer.scenarios()
-        ids = {row["scenario_id"] for row in scenarios["scenarios"]}
+        scenarios = composer.request("GET", "/api/scenario-documents")
+        rows = {row["scenario_id"]: row for row in scenarios["entries"]}
+        ids = set(rows)
         assert {GROUPED_SCENARIO, ISOLATION_SCENARIO} <= ids
         draft = composer.request("GET", "/api/program/draft")
         for attempt in range(8):
@@ -98,7 +99,7 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
                         "expectedDeploymentDraftRevision": deployment["draft"][
                             "revision"
                         ],
-                        "qualifiedScenarioId": scenario_id,
+                        "path": rows[scenario_id]["path"],
                         "confirmDiscard": False,
                     },
                 )
@@ -111,8 +112,8 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
                 ):
                     raise
                 draft = composer.request("GET", "/api/program/draft")
-        assert loaded["status"] == "loaded"
-        assert loaded["path"] is None
+        assert loaded["status"] == "opened"
+        assert loaded["path"] == rows[scenario_id]["path"]
         deployment = composer.request("GET", "/api/deployment/workspace")
         assert deployment["draft"]["document"]["deployment_artifact_id"] == (
             "ur5e_lite6_wall"
@@ -127,7 +128,7 @@ def _save_and_reopen_current_scenario(
 ) -> None:
     directory = stack.root / "saved-scenarios"
     directory.mkdir()
-    target = directory / f"{scenario_id}.scenario.yaml"
+    target = directory / f"{scenario_id}.scenario"
     with (
         _composer_snapshot_stream(stack, client_id=f"ui6i-save-{scenario_id}") as snapshots,
         HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,

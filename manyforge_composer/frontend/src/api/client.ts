@@ -29,6 +29,8 @@ import {
   parseRuntimeScaleControlStatus,
   parseScenarioCatalogResponse,
   parseScenarioDocumentIndexResponse,
+  parseScenarioDocumentExportResponse,
+  parseScenarioDocumentConversionResponse,
   parseScenarioDocumentLoadResponse,
   parseScenarioDocumentSaveResponse,
   parseSceneTransactionResponse,
@@ -75,6 +77,8 @@ import type {
   RuntimeOverrideMaterializationResponse,
   ScenarioCatalogResponse,
   ScenarioDocumentFenceRequest,
+  ScenarioDocumentExportResponse,
+  ScenarioDocumentConversionResponse,
   ScenarioDocumentIndexResponse,
   ScenarioDocumentLoadResponse,
   ScenarioDocumentSaveResponse,
@@ -609,9 +613,7 @@ export const api = {
     ),
     load: (
       fence: ScenarioDocumentFenceRequest,
-      path: string | null,
-      qualifiedScenarioId: string | null,
-      alternateDeploymentPath: string | null,
+      path: string,
       confirmDiscard: boolean,
       signal?: AbortSignal,
     ): Promise<ScenarioDocumentLoadResponse> => requestJson(
@@ -623,10 +625,35 @@ export const api = {
         body: JSON.stringify({
           ...fence,
           path,
-          qualifiedScenarioId,
-          alternateDeploymentPath,
           confirmDiscard,
         }),
+      },
+    ),
+    convertLegacy: (
+      sourcePath: string,
+      destinationPath: string,
+      confirmOverwrite: boolean,
+      signal?: AbortSignal,
+    ): Promise<ScenarioDocumentConversionResponse> => requestJson(
+      '/api/scenario-documents/convert-legacy',
+      parseScenarioDocumentConversionResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ sourcePath, destinationPath, confirmOverwrite }),
+      },
+    ),
+    export: (
+      fence: ScenarioDocumentFenceRequest,
+      destinationPath: string,
+      signal?: AbortSignal,
+    ): Promise<ScenarioDocumentExportResponse> => requestJson(
+      '/api/scenario-documents/export',
+      parseScenarioDocumentExportResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, destinationPath }),
       },
     ),
   },

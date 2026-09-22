@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-import json
 import re
 from copy import deepcopy
 from dataclasses import replace
@@ -59,12 +58,6 @@ _ROOT = Path(__file__).resolve().parents[2]
 _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
 _DIGEST_C = "sha256:" + "c" * 64
-_MAINTAINED_PROGRAM_INDEX = (
-    _ROOT / "manyforge_deployment/resources/maintained/"
-    "maintained_program_role_assignments.v1.json"
-)
-
-
 def _catalog() -> NodeCatalog:
     return NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
 
@@ -1036,8 +1029,13 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner(
         "Timer",
         lambda name, duration: py_trees.behaviours.Success(name=name),
     )
-    index = json.loads(_MAINTAINED_PROGRAM_INDEX.read_text(encoding="utf-8"))
-    sources = tuple(sorted({assignment["program_source"] for assignment in index["assignments"]}))
+    sources = tuple(
+        sorted(
+            path.relative_to(_ROOT).as_posix()
+            for path in (_ROOT / "examples").glob("*.program.yaml")
+            if not path.name.startswith("ur5e_lite6_wall_")
+        )
+    )
     assert len(sources) == 13
     environment = build_node_environment()
     exercised: set[str] = set()

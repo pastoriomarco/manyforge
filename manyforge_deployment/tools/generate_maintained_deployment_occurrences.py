@@ -20,6 +20,13 @@ from pathlib import Path
 from typing import Any, Final
 
 import yaml
+from manyforge_behavior.canonical_artifact import (
+    canonical_json_bytes,
+    raw_sha256_digest,
+)
+from manyforge_behavior.model_source_capture import (
+    capture_deployment_model_sources,
+)
 
 from check_maintained_deployment_sources import (
     SourceDescriptionError,
@@ -30,18 +37,9 @@ from check_maintained_deployment_sources import (
 ZERO_DIGEST: Final = "sha256:" + "0" * 64
 DESCRIPTION_API: Final = "manyforge.maintained_deployment_sources.v1"
 ASSISTANT_API: Final = "manyforge.maintained_assistant_profiles.v1"
-ROLE_ASSIGNMENTS_API: Final = "manyforge.maintained_program_role_assignments.v1"
-UI6I_DUAL_DEPLOYMENT_SOURCE: Final = "examples/ur5e_lite6_wall.deployment.yaml"
-UI6I_DUAL_PROGRAM_ASSIGNMENTS: Final = (
-    (
-        "ur5e_lite6_wall_grouped",
-        "examples/ur5e_lite6_wall_grouped.program.yaml",
-    ),
-    (
-        "ur5e_lite6_wall_isolation",
-        "examples/ur5e_lite6_wall_isolation.program.yaml",
-    ),
-)
+SCENARIO_PROJECT_API: Final = "manyforge.scenario.project.v1"
+DEPLOYMENT_INTENT_API: Final = "manyforge.deployment_intent.v1"
+SCENARIO_SOURCE_SNAPSHOT_API: Final = "manyforge.scenario.source_snapshot.v1"
 CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1\0"
 NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.native_execution.v1"
@@ -488,6 +486,18 @@ def require_or_update(path: Path, expected: bytes, update: bool, label: str) -> 
         return
     if path.is_symlink() or not path.is_file() or path.read_bytes() != expected:
         raise GenerationError(f"{label} is absent or stale: {path}")
+
+
+def require_obsolete_output_absent(path: Path, *, update: bool) -> None:
+    """Remove only a named repository-owned output replaced by this generator."""
+
+    if not path.exists():
+        return
+    if path.is_symlink() or not path.is_file():
+        raise GenerationError(f"obsolete generated output is not a plain file: {path}")
+    if not update:
+        raise GenerationError(f"obsolete generated output remains: {path}")
+    path.unlink()
 
 
 def schema_revisions(root: Path) -> dict[str, str]:
@@ -2902,68 +2912,350 @@ def sealed_deployment_bytes(
     return source.read_bytes()
 
 
-def role_assignments(
+def _program_draft(program: dict[str, Any]) -> dict[str, Any]:
+    result = copy.deepcopy(program)
+    tree = result.pop("tree")
+    result.pop("program_revision")
+    return {
+        "schema_version": "manyforge.composer_authoring_forest.v1",
+        **result,
+        "forest": [tree],
+        "positions": {},
+    }
+
+
+def _role_assignment(assignment: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "component_roles": [
+            {
+                "component_role_id": role,
+                "controllable_component_id": component,
+            }
+            for role, component in sorted(assignment["component_roles"].items())
+        ],
+        "target_roles": [
+            {
+                "target_role_id": role,
+                "command_target_id": target["command_target_id"],
+            }
+            for role, target in sorted(assignment["target_roles"].items())
+        ],
+    }
+
+
+def _project_reference(
+    root: Path, project_root: Path, relative_source: str
+) -> dict[str, str]:
+    target = (root / relative_source).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as error:
+        raise GenerationError(
+            f"maintained source escapes the workspace: {relative_source}"
+        ) from error
+    return {"project_path": os.path.relpath(target, project_root).replace(os.sep, "/")}
+
+
+def _deployment_intent(
+    *,
+    root: Path,
+    project_root: Path,
+    deployment: dict[str, Any],
+    family: dict[str, Any],
+    runtime_profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Project the maintained source description into editable intent.
+
+    The generated Deployment graph remains an offline qualification product.
+    Scenario projects retain only source references and the settings a user can
+    meaningfully author; preparation derives graph/provider/binding identities.
+    """
+
+    source = family["source"]
+    accepted_prefix = source["accepted_package_uri_prefix"]
+    if not accepted_prefix.startswith("package://"):
+        raise GenerationError("maintained model source has no package URI prefix")
+    package_reference = accepted_prefix[len("package://") :]
+    package_name, _separator, package_suffix = package_reference.partition("/")
+    if not package_name:
+        raise GenerationError("maintained model source has an empty package name")
+    resource_root = (root / source["resource_root"]).resolve()
+    try:
+        resource_root.relative_to(root)
+    except ValueError as error:
+        raise GenerationError(
+            "maintained model resource root escapes the workspace"
+        ) from error
+    suffix_parts = tuple(part for part in package_suffix.split("/") if part)
+    if suffix_parts and resource_root.parts[-len(suffix_parts) :] != suffix_parts:
+        raise GenerationError(
+            "maintained model resource root does not match its package URI prefix"
+        )
+    package_root = resource_root
+    for _unused in suffix_parts:
+        package_root = package_root.parent
+    if package_root.name != package_name:
+        raise GenerationError(
+            "maintained model resource root does not identify its declared package"
+        )
+    if not package_root.is_dir():
+        raise GenerationError(
+            f"maintained package root is unavailable: {package_root}"
+        )
+
+    runtime_kind = (
+        "ros2_control" if "ros2_control_runtime" in runtime_profile else "native"
+    )
+    runtime_key = f"{runtime_kind}_runtime"
+    runtime_configuration = copy.deepcopy(runtime_profile[runtime_key])
+    motion_limits = runtime_configuration.pop("motion_target_limits", [])
+    target_settings: dict[str, dict[str, Any]] = {}
+    for limit in motion_limits:
+        target = limit["command_target_id"]
+        selected = target_settings.setdefault(target, {})
+        selected["maximum_tcp_linear_speed_mps"] = limit[
+            "maximum_tcp_linear_speed_mps"
+        ]
+        if "ordinary_motion_jerk" in limit:
+            selected["ordinary_motion_jerk"] = copy.deepcopy(
+                limit["ordinary_motion_jerk"]
+            )
+
+    operator_stop = runtime_profile["stop_profiles"]["operator_stop_profile"]
+    source_joints = source_joint_names(family, "arm_joints")
+    decelerations = operator_stop["per_joint_max_deceleration_rad_s2"]
+    if not source_joints or not set(source_joints).issubset(decelerations):
+        raise GenerationError(
+            "maintained operator Stop limits do not cover the model arm joints"
+        )
+    target_settings.setdefault("arm", {})["controlled_stop"] = {
+        "stop_mode": operator_stop["stop_mode"],
+        "allow_natural_completion_on_short_path": operator_stop[
+            "allow_natural_completion_on_short_path"
+        ],
+        "jerk_limits_enabled": True,
+        "deceleration_time_s": operator_stop["deceleration_time_s"],
+        "per_joint_limits": [
+            {
+                "source_joint_name": joint,
+                "max_deceleration_rad_s2": decelerations[joint],
+                "settle_velocity_threshold_rad_s": 0.01,
+            }
+            for joint in source_joints
+        ],
+        "timing": {
+            "command_latency_allowance_ns": 250_000_000,
+            "settling_allowance_ns": (
+                1_500_000_000 if runtime_kind == "ros2_control" else 750_000_000
+            ),
+            "operational_timeout_ns": 3_000_000_000,
+        },
+    }
+
+    model_source: dict[str, Any] = {
+        "urdf": _project_reference(root, project_root, source["urdf_path"]),
+        "package_roots": {
+            package_name: {
+                "project_path": os.path.relpath(package_root, project_root).replace(
+                    os.sep, "/"
+                )
+            }
+        },
+    }
+    if source.get("srdf_path"):
+        model_source["srdf"] = _project_reference(
+            root, project_root, source["srdf_path"]
+        )
+
+    root_pose = deployment.get("root_pose_in_cell")
+    if root_pose is None:
+        root_pose = {
+            "position_m": [0.0, 0.0, 0.0],
+            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        }
+    result: dict[str, Any] = {
+        "api_version": DEPLOYMENT_INTENT_API,
+        "deployment_artifact_id": deployment["deployment_artifact_id"],
+        "cell_id": deployment["cell_id"],
+        "name": deployment["name"],
+        "description": deployment["description"],
+        "components": [
+            {
+                "component_id": deployment["component_occurrence_id"],
+                "component_profile_id": deployment[
+                    "runtime_restoration_profile_id"
+                ],
+                "model_source": model_source,
+                "root_pose_in_cell": copy.deepcopy(root_pose),
+                "target_settings": target_settings,
+                "configuration": {
+                    "runtime_kind": runtime_kind,
+                    "runtime_configuration": runtime_configuration,
+                    "default_fault_stop_profile": copy.deepcopy(
+                        runtime_profile["stop_profiles"][
+                            "default_fault_stop_profile"
+                        ]
+                    ),
+                    "native_lifecycle_management": deployment.get(
+                        "native_lifecycle_management", True
+                    ),
+                },
+            }
+        ],
+        "attachments": [],
+        "policies": {
+            "interrupt_config": {
+                "queue_depth": 8,
+                "supervisory_poll_rate_hz": 10,
+                "cancel_validation_timeout_ns": 1_000,
+                "motion_scope_arm_timeout_ns": 1_000,
+            }
+        },
+        "assistant_profile_id": deployment["assistant_profile_id"],
+        "compatibility": copy.deepcopy(deployment["compatibility"]),
+    }
+    return result
+
+
+def _scenario_project_outputs(
+    *,
+    project_root: Path,
+    scenario_id: str,
+    name: str,
+    description: str,
+    program: dict[str, Any],
+    deployment_intent: dict[str, Any],
+    assignment: dict[str, Any],
+    manyforge_version: str,
+) -> list[tuple[Path, bytes, str]]:
+    program_draft = _program_draft(program)
+    role_assignment = _role_assignment(assignment)
+    overrides: dict[str, Any] = {}
+    content = {
+        "program_draft": program_draft,
+        "deployment_draft": deployment_intent,
+        "program_role_assignment": role_assignment,
+        "typed_parameter_overrides": overrides,
+    }
+    saved_status = {
+        "manyforge_version": manyforge_version,
+        "last_known_status": "ready",
+        "checked_content_digest": raw_sha256_digest(canonical_json_bytes(content)),
+    }
+    members = {
+        "deployment.yaml": pretty_bytes(deployment_intent),
+        "program.yaml": pretty_bytes(program_draft),
+        "assignment.yaml": pretty_bytes(role_assignment),
+        "overrides.yaml": pretty_bytes(overrides),
+    }
+    source_entries: list[dict[str, str]] = []
+    source_closure = capture_deployment_model_sources(
+        deployment_intent, project_root=project_root
+    )
+    for component in source_closure["components"]:
+        component_id = component["component_id"]
+        for entrypoint, artifact in sorted(component["entrypoints"].items()):
+            source_entries.append(
+                {
+                    "source_id": f"component:{component_id}:{entrypoint}",
+                    "content_digest": artifact["content_digest"],
+                }
+            )
+        for artifact in component["resources"]:
+            source_entries.append(
+                {
+                    "source_id": (
+                        f"component:{component_id}:resource:"
+                        f"{artifact['logical_uri']}"
+                    ),
+                    "content_digest": artifact["content_digest"],
+                }
+            )
+    source_entries.sort(key=lambda row: row["source_id"])
+    manifest = {
+        "api_version": SCENARIO_PROJECT_API,
+        "scenario_id": scenario_id,
+        "name": name,
+        "description": description,
+        "content": {
+            "deployment_present": True,
+            "program_present": True,
+            "assignment_present": True,
+        },
+        "members": {
+            filename: raw_sha256_digest(payload)
+            for filename, payload in sorted(members.items())
+        },
+        "source_snapshot": {
+            "schema_version": SCENARIO_SOURCE_SNAPSHOT_API,
+            "entries": source_entries,
+        },
+        "saved_status": saved_status,
+    }
+    outputs = [
+        (
+            project_root / filename,
+            payload,
+            f"maintained Scenario {scenario_id} member {filename}",
+        )
+        for filename, payload in sorted(members.items())
+    ]
+    outputs.append(
+        (
+            project_root / "scenario.yaml",
+            pretty_bytes(manifest),
+            f"maintained Scenario {scenario_id} manifest",
+        )
+    )
+    return outputs
+
+
+def scenario_documents(
     root: Path,
     description: dict[str, Any],
     sealed: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
+) -> list[tuple[Path, bytes, str]]:
+    version = (root / "VERSION").read_text(encoding="utf-8").strip()
+    outputs: list[tuple[Path, bytes, str]] = []
+    families = {
+        row["model_family_id"]: row for row in description["model_families"]
+    }
+    runtime_profiles = {
+        row["runtime_restoration_profile_id"]: row
+        for row in description["runtime_restoration_profiles"]
+    }
     for deployment in description["deployments"]:
-        deployment_source = deployment["deployment_source"]
-        deployment_value = sealed[deployment_source]
+        # Keep the compiled Deployment output for offline qualification only.
+        # The Scenario project intentionally stores the editable source intent.
+        if deployment["deployment_source"] not in sealed:
+            raise GenerationError("maintained Deployment was not sealed")
         for assignment in deployment["program_role_assignments"]:
             program = read_yaml(
                 root / assignment["program_source"], "maintained Program"
             )
-            rows.append(
-                {
-                    "scenario_id": assignment["scenario_id"],
-                    "scenario_aliases": copy.deepcopy(assignment["scenario_aliases"]),
-                    "deployment_artifact_id": deployment["deployment_artifact_id"],
-                    "deployment_revision": deployment_value["deployment_revision"],
-                    "deployment_source": deployment_source,
-                    "program_id": program["program_id"],
-                    "program_revision": program["program_revision"],
-                    "program_source": assignment["program_source"],
-                    "component_roles": copy.deepcopy(assignment["component_roles"]),
-                    "target_roles": copy.deepcopy(assignment["target_roles"]),
-                }
-            )
-    dual_deployment = read_yaml(
-        root / UI6I_DUAL_DEPLOYMENT_SOURCE, "UI6-I dual Deployment"
-    )
-    for scenario_id, program_source in UI6I_DUAL_PROGRAM_ASSIGNMENTS:
-        program = read_yaml(root / program_source, "UI6-I dual Program")
-        rows.append(
-            {
-                "scenario_id": scenario_id,
-                "scenario_aliases": [],
-                "deployment_artifact_id": dual_deployment[
-                    "deployment_artifact_id"
+            project_root = root / "examples" / f"{assignment['scenario_id']}.scenario"
+            intent = _deployment_intent(
+                root=root,
+                project_root=project_root,
+                deployment=deployment,
+                family=families[deployment["model_family_id"]],
+                runtime_profile=runtime_profiles[
+                    deployment["runtime_restoration_profile_id"]
                 ],
-                "deployment_revision": dual_deployment["deployment_revision"],
-                "deployment_source": UI6I_DUAL_DEPLOYMENT_SOURCE,
-                "program_id": program["program_id"],
-                "program_revision": program["program_revision"],
-                "program_source": program_source,
-                "component_roles": {
-                    "lite6_robot": "lite6_robot",
-                    "ur5e_robot": "ur5e_robot",
-                },
-                "target_roles": {
-                    "lite6_arm": {
-                        "component_role": "lite6_robot",
-                        "command_target_id": "arm",
-                    },
-                    "ur5e_arm": {
-                        "component_role": "ur5e_robot",
-                        "command_target_id": "arm",
-                    },
-                },
-            }
-        )
-    rows.sort(key=lambda row: (row["deployment_source"], row["program_source"]))
-    return {"api_version": ROLE_ASSIGNMENTS_API, "assignments": rows}
+            )
+            outputs.extend(
+                _scenario_project_outputs(
+                    project_root=project_root,
+                    scenario_id=assignment["scenario_id"],
+                    name=deployment["name"],
+                    description=deployment["description"],
+                    program=program,
+                    deployment_intent=intent,
+                    assignment=assignment,
+                    manyforge_version=version,
+                )
+            )
+    return outputs
 
 
 def historical_capability_closure() -> dict[str, Any]:
@@ -3090,18 +3382,7 @@ def generate(args: argparse.Namespace) -> None:
             outputs.append((target, expected, "direct deployment source"))
             sealed_values[deployment["deployment_source"]] = json.loads(expected)
 
-    assignment_value = role_assignments(root, description, sealed_values)
-    assignment_path = (
-        root
-        / "manyforge_deployment/resources/maintained/maintained_program_role_assignments.v1.json"
-    )
-    outputs.append(
-        (
-            assignment_path,
-            pretty_bytes(assignment_value),
-            "maintained Program role assignments",
-        )
-    )
+    outputs.extend(scenario_documents(root, description, sealed_values))
     capability_closure_path = (
         root
         / "manyforge_deployment/resources/maintained/maintained_historical_capability_closure.v1.json"
@@ -3115,6 +3396,12 @@ def generate(args: argparse.Namespace) -> None:
     )
     for path, payload, label in outputs:
         require_or_update(path, payload, args.update, label)
+    for deployment in description["deployments"]:
+        for assignment in deployment["program_role_assignments"]:
+            require_obsolete_output_absent(
+                root / "examples" / f"{assignment['scenario_id']}.scenario.yaml",
+                update=args.update,
+            )
 
 
 def main() -> int:

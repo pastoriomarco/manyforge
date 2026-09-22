@@ -22,6 +22,7 @@ namespace manyforge::deployment {
 
 namespace detail {
 class RetainedBundleConstructionAuthority;
+class RetainedModelMapVerificationAuthority;
 class VerifiedRetainedPlanningConstructionAuthority;
 }
 
@@ -555,6 +556,7 @@ class VerifiedRetainedModelMap final {
   std::vector<CompositionTargetResolution> targets_;
 
   friend class FilesystemVerifiedRetainedModelMapSource;
+  friend class detail::RetainedModelMapVerificationAuthority;
 };
 
 class IVerifiedRetainedModelMapSource {

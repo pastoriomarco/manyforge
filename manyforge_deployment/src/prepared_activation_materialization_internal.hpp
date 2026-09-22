@@ -1,0 +1,46 @@
+#pragma once
+
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <manyforge_core/types/program_contract.hpp>
+#include <manyforge_deployment/scenario_catalog.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
+
+#include "activation_prepared_model_internal.hpp"
+#include "activation_deployment_intent_internal.hpp"
+#include "activation_component_profile_internal.hpp"
+
+namespace manyforge::deployment {
+class RetainedBundle;
+
+namespace detail {
+
+struct PreparedActivationArtifact final {
+  core::ContentAddressedStoreKey content_addressed_store_key;
+  core::ContentDigest content_digest;
+  std::string bytes;
+};
+
+struct PreparedActivationMaterialization final {
+  core::DeploymentArtifactId deployment_artifact_id;
+  core::DeploymentRevision deployment_revision;
+  ScenarioDeploymentCompatibilityDTO deployment_compatibility;
+  std::shared_ptr<const RetainedBundle> bundle;
+  VerifiedRetainedModelMap model_map;
+  std::vector<PreparedActivationArtifact> raw_artifacts;
+  std::vector<PreparedActivationArtifact> catalog_artifacts;
+};
+
+[[nodiscard]] PreparedActivationMaterialization materialize_prepared_activation(
+    const std::filesystem::path &capability_root,
+    std::vector<ActivationPreparedModel> prepared_models,
+    const ActivationDeploymentIntent &intent,
+    const std::vector<ActivationComponentProfile> &component_profiles);
+
+int run_maintained_example_qualification(int argc, char **argv);
+
+} // namespace detail
+} // namespace manyforge::deployment

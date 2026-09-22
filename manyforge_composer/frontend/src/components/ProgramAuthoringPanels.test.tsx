@@ -735,8 +735,11 @@ describe('Program authoring panels', () => {
       discard: vi.fn(),
       revert: vi.fn(),
       saveScenarioDocument: vi.fn(),
+      exportScenarioDocument: vi.fn(),
       loadScenarioDocument: vi.fn(),
+      convertLegacyScenarioDocument: vi.fn(),
       scenarioDocumentPath: null,
+      scenarioSourceDiagnostics: [],
       updateNodePolicies: vi.fn(),
       clearFeedback: vi.fn(),
     } satisfies ProgramWorkspaceController;
@@ -917,8 +920,11 @@ describe('Program authoring panels', () => {
       discard: vi.fn(),
       revert: vi.fn(),
       saveScenarioDocument: vi.fn(),
+      exportScenarioDocument: vi.fn(),
       loadScenarioDocument: vi.fn(),
+      convertLegacyScenarioDocument: vi.fn(),
       scenarioDocumentPath: null,
+      scenarioSourceDiagnostics: [],
       updateNodePolicies: vi.fn(),
       clearFeedback: vi.fn(),
     } satisfies ProgramWorkspaceController;

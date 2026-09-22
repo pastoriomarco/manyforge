@@ -411,23 +411,18 @@ def _load_exact_json_mapping(text: str, label: str) -> dict[str, Any] | None:
     return value
 
 
-def load_strict_json_yaml(path: str | Path) -> dict[str, Any]:
-    """Load one bounded UTF-8 mapping with no YAML-only semantics."""
+def load_strict_json_yaml_bytes(raw: bytes, *, source: str) -> dict[str, Any]:
+    """Parse one already-captured bounded UTF-8 mapping."""
 
-    artifact_path = Path(path)
-    try:
-        raw = artifact_path.read_bytes()
-    except OSError as exc:
-        raise StrictArtifactError(f"cannot read {artifact_path}: {exc}") from exc
     if len(raw) > MAX_DOCUMENT_BYTES:
         raise StrictArtifactError(
-            f"{artifact_path}: document exceeds {MAX_DOCUMENT_BYTES} bytes"
+            f"{source}: document exceeds {MAX_DOCUMENT_BYTES} bytes"
         )
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise StrictArtifactError(f"{artifact_path}: document is not UTF-8") from exc
-    exact_json = _load_exact_json_mapping(text, str(artifact_path))
+        raise StrictArtifactError(f"{source}: document is not UTF-8") from exc
+    exact_json = _load_exact_json_mapping(text, source)
     if exact_json is not None:
         return exact_json
     try:
@@ -442,11 +437,22 @@ def load_strict_json_yaml(path: str | Path) -> dict[str, Any]:
     except StrictArtifactError:
         raise
     except yaml.YAMLError as exc:
-        raise StrictArtifactError(f"{artifact_path}: invalid strict YAML: {exc}") from exc
+        raise StrictArtifactError(f"{source}: invalid strict YAML: {exc}") from exc
     if not isinstance(value, dict):
-        raise StrictArtifactError(f"{artifact_path}: root must be a mapping")
-    _validate_json_model(value, str(artifact_path))
+        raise StrictArtifactError(f"{source}: root must be a mapping")
+    _validate_json_model(value, source)
     return value
+
+
+def load_strict_json_yaml(path: str | Path) -> dict[str, Any]:
+    """Load one bounded UTF-8 mapping with no YAML-only semantics."""
+
+    artifact_path = Path(path)
+    try:
+        raw = artifact_path.read_bytes()
+    except OSError as exc:
+        raise StrictArtifactError(f"cannot read {artifact_path}: {exc}") from exc
+    return load_strict_json_yaml_bytes(raw, source=str(artifact_path))
 
 
 def canonical_json_bytes(value: Any) -> bytes:

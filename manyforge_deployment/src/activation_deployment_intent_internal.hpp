@@ -1,0 +1,44 @@
+#pragma once
+
+#include <optional>
+#include <string>
+#include <vector>
+
+#include <manyforge_deployment/canonical_value.hpp>
+
+#include "activation_model_source_closure_internal.hpp"
+
+namespace manyforge::deployment::detail {
+
+struct ActivationDeploymentComponent final {
+  std::string component_id;
+  std::string component_profile_id;
+  CanonicalValue root_pose_in_cell;
+  CanonicalValue target_settings;
+  CanonicalValue configuration;
+  CapturedComponentModelSource model_source;
+};
+
+struct ActivationDeploymentIntent final {
+  std::string deployment_artifact_id;
+  std::string cell_id;
+  std::string name;
+  std::optional<std::string> description;
+  std::optional<std::string> assistant_profile_id;
+  CanonicalValue attachments;
+  CanonicalValue policies;
+  std::optional<CanonicalValue> compatibility;
+  std::vector<ActivationDeploymentComponent> components;
+  CanonicalValue normalized_root;
+};
+
+/// Parse one normalized authored Deployment intent and join it exactly to the
+/// source bytes captured for the same components.
+///
+/// The caller has no path-based fallback: every authored component must have
+/// exactly one captured source row and every captured row must be consumed.
+[[nodiscard]] ActivationDeploymentIntent parse_activation_deployment_intent(
+    const CanonicalValue &value,
+    std::vector<CapturedComponentModelSource> captured_sources);
+
+} // namespace manyforge::deployment::detail

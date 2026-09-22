@@ -1,0 +1,410 @@
+{
+  "api_version": "manyforge.program.v2",
+  "catalog": {
+    "api_version": "manyforge.node_catalog.v2",
+    "content_version": "2.3.0"
+  },
+  "compatibility": {
+    "assistant": "forbidden",
+    "lanes": [
+      "manyforge-only"
+    ],
+    "requires": [],
+    "tags": [
+      "dual-robot",
+      "lite6",
+      "ur5e"
+    ]
+  },
+  "component_roles": {
+    "lite6_robot": {
+      "required_component_type_tags": [
+        "articulated-arm"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ]
+    },
+    "ur5e_robot": {
+      "required_component_type_tags": [
+        "articulated-arm"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ]
+    }
+  },
+  "description": "Two independent joint trajectories in the UR5e + Lite6 wall cell, in separate control groups for the isolation case.",
+  "execution_groups": {
+    "lite6_arm": {
+      "execution_policy": "independent"
+    },
+    "ur5e_arm": {
+      "execution_policy": "independent"
+    }
+  },
+  "forest": [
+    {
+      "children": [
+        {
+          "children": [],
+          "execution_groups": [
+            "lite6_arm"
+          ],
+          "instance_id": "lite6_joint_motion",
+          "node_id": "motion.move_to_joint_target",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": [
+              {
+                "joint_name": "joint1",
+                "position_rad": 0.3
+              },
+              {
+                "joint_name": "joint2",
+                "position_rad": -0.55
+              },
+              {
+                "joint_name": "joint3",
+                "position_rad": 1.05
+              },
+              {
+                "joint_name": "joint4",
+                "position_rad": 0.0
+              },
+              {
+                "joint_name": "joint5",
+                "position_rad": 1.35
+              },
+              {
+                "joint_name": "joint6",
+                "position_rad": 0.0
+              }
+            ],
+            "planning_timeout_s": 10.0,
+            "target_role": "lite6_arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
+            },
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "execution_groups": [
+            "ur5e_arm"
+          ],
+          "instance_id": "ur5e_joint_motion",
+          "node_id": "motion.move_to_joint_target",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": [
+              {
+                "joint_name": "shoulder_pan_joint",
+                "position_rad": -0.45
+              },
+              {
+                "joint_name": "shoulder_lift_joint",
+                "position_rad": -1.35
+              },
+              {
+                "joint_name": "elbow_joint",
+                "position_rad": 1.2
+              },
+              {
+                "joint_name": "wrist_1_joint",
+                "position_rad": -1.4
+              },
+              {
+                "joint_name": "wrist_2_joint",
+                "position_rad": -1.57
+              },
+              {
+                "joint_name": "wrist_3_joint",
+                "position_rad": 0.25
+              }
+            ],
+            "planning_timeout_s": 10.0,
+            "target_role": "ur5e_arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "acceleration_scale": {
+              "kind": "program_parameter",
+              "reference": "acceleration_scale"
+            },
+            "max_tcp_linear_speed_mps": {
+              "kind": "program_parameter",
+              "reference": "max_tcp_linear_speed_mps"
+            },
+            "translation_tol_m": {
+              "kind": "program_parameter",
+              "reference": "translation_tol_m"
+            },
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        }
+      ],
+      "instance_id": "paired_joint_motion",
+      "node_id": "parallel",
+      "parameters": {
+        "success_policy": "all"
+      }
+    }
+  ],
+  "name": "ur5e_lite6_wall_isolation",
+  "parameters": [
+    {
+      "constraints": {
+        "max_inclusive": 1.0,
+        "min_exclusive": 0.0
+      },
+      "default": 0.5,
+      "description": "Acceleration scale shared by the two planned motions.",
+      "parameter_id": "acceleration_scale",
+      "runtime_mutability": "before_run",
+      "type": "float64"
+    },
+    {
+      "constraints": {
+        "min_inclusive": 0.0
+      },
+      "default": 0.01,
+      "description": "Default maximum Cartesian blend deviation.",
+      "parameter_id": "max_blend_deviation_rad",
+      "runtime_mutability": "before_run",
+      "type": "float64"
+    },
+    {
+      "constraints": {
+        "min_exclusive": 0.0
+      },
+      "default": 0.15,
+      "description": "Maximum TCP linear speed shared by the two robots.",
+      "parameter_id": "max_tcp_linear_speed_mps",
+      "runtime_mutability": "before_run",
+      "type": "float64"
+    },
+    {
+      "constraints": {
+        "min_exclusive": 0.0
+      },
+      "default": 0.005,
+      "description": "Default Cartesian translation tolerance.",
+      "parameter_id": "translation_tol_m",
+      "runtime_mutability": "before_run",
+      "type": "float64"
+    },
+    {
+      "constraints": {
+        "max_inclusive": 1.0,
+        "min_exclusive": 0.0
+      },
+      "default": 0.35,
+      "description": "Velocity scale shared by the two planned motions.",
+      "parameter_id": "velocity_scale",
+      "runtime_mutability": "before_run",
+      "type": "float64"
+    }
+  ],
+  "positions": {},
+  "program_id": "ur5e_lite6_wall_isolation",
+  "program_profile": "composable-cell-v1",
+  "scene": [
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "position_m": [
+          0.0,
+          0.5,
+          -0.051
+        ]
+      },
+      "scene_resource_id": "ground",
+      "shape": {
+        "box_dimensions_m": [
+          0.8,
+          2.0,
+          0.1
+        ],
+        "type": "box"
+      }
+    },
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "position_m": [
+          0.0,
+          0.5,
+          0.4
+        ]
+      },
+      "scene_resource_id": "separation_wall",
+      "shape": {
+        "box_dimensions_m": [
+          0.8,
+          0.02,
+          0.8
+        ],
+        "type": "box"
+      }
+    }
+  ],
+  "schema_version": "manyforge.composer_authoring_forest.v1",
+  "target_roles": {
+    "lite6_arm": {
+      "component_role": "lite6_robot",
+      "required_capabilities": [
+        {
+          "capability_id": "execution.feedback.phase_events",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "execution.trajectory.execute",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.joint_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.pose_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.profile.balanced",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.trajectory.time_parameterized",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "state.observed.current",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "validation.trajectory.non_collision",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [
+        "arm_collision"
+      ],
+      "required_frame_roles": [
+        "base",
+        "tcp"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ],
+      "required_resource_roles": [
+        "arm_joints"
+      ]
+    },
+    "ur5e_arm": {
+      "component_role": "ur5e_robot",
+      "required_capabilities": [
+        {
+          "capability_id": "execution.feedback.phase_events",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "execution.trajectory.execute",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.joint_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.pose_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.profile.balanced",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.trajectory.time_parameterized",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "state.observed.current",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "validation.trajectory.non_collision",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [
+        "arm_collision"
+      ],
+      "required_frame_roles": [
+        "base",
+        "tcp"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ],
+      "required_resource_roles": [
+        "arm_joints"
+      ]
+    }
+  }
+}

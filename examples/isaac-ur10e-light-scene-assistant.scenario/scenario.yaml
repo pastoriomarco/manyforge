@@ -1,0 +1,127 @@
+{
+  "api_version": "manyforge.scenario.project.v1",
+  "content": {
+    "assignment_present": true,
+    "deployment_present": true,
+    "program_present": true
+  },
+  "description": "Retained Isaac UR10e light-scene deployment with the ROS 2 control execution product and the finite assistant scene-authoring overlay; simulator mutation remains operator-approved.",
+  "members": {
+    "assignment.yaml": "sha256:0609b83a2c63f70215b846bae55b156fc1e15046d49c48f2c7b579f7b4be09a0",
+    "deployment.yaml": "sha256:065d2c6298e16991ce7a40d2519c0e8102a7b6a448f254611ca17e6b5ea8c849",
+    "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+    "program.yaml": "sha256:381f2c0fc5b1eadb3dac574756676eb9d840a73a2592cc6f274a25e2bea0bfc7"
+  },
+  "name": "isaac_manipulator_scene_light_assistant",
+  "saved_status": {
+    "checked_content_digest": "sha256:9f49f7bce7c4b65356044100abcca9bdc67abe640b6ae0d496d3356d5ee28c8a",
+    "last_known_status": "ready",
+    "manyforge_version": "0.1.0"
+  },
+  "scenario_id": "isaac-ur10e-light-scene-assistant",
+  "source_snapshot": {
+    "entries": [
+      {
+        "content_digest": "sha256:111e37f13a664989dd54226f80f521b32ea0b71c975282a16696b14be7cc9249",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_base_link.stl"
+      },
+      {
+        "content_digest": "sha256:043901d9c22b38d09b30d11326108ab3ef1445b4bd655ef313f94199f25f57ed",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_finger.stl"
+      },
+      {
+        "content_digest": "sha256:d341d986aa8aca7262565c039c04fb6b4c0f2f5c93443519eb7ca9bfc67ba17c",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_inner_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:bd7da1b31b73f1aa1d61b26a582cea10f16f17396d54b8937890fa51547d26b0",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_finger.stl"
+      },
+      {
+        "content_digest": "sha256:37c1779f71fb5504a5898048a36f9f4bfce0f5e7039ff1dce53808b95c229777",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/collision/robotiq_2f_140_outer_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:be21c5e18c901d4747cbc8fa1a2af15dad7173ff701482a8517e33278432bb21",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_finger.stl"
+      },
+      {
+        "content_digest": "sha256:d61e9c5304d8015333856e4a26d99e32b695b6ada993253986b1afe8e396ab11",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_inner_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:666a92ee075f6f320ffb13b39995a5b374657cee90ded4c52c23ede20a812f34",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_finger.stl"
+      },
+      {
+        "content_digest": "sha256:f042edc44ede9773e7cad00f7d7354d0b7c1c6a6353fe897b2ca2e6ac71107fc",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/robotiq_2f_140/visual/robotiq_2f_140_outer_knuckle.stl"
+      },
+      {
+        "content_digest": "sha256:8a214f3f650e703fa081bd4bd8b1caeb0667598bec22d8b0e572efb97d06e957",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/base.stl"
+      },
+      {
+        "content_digest": "sha256:7005ed835336ec03ce6a299a356c774bfe2ba989051e37b2a66406173dcb3c96",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/forearm.stl"
+      },
+      {
+        "content_digest": "sha256:3f7c5f7ee742cf2d57130829be9f20b25625b3513d676ac5e20ca46ae84fd528",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/shoulder.stl"
+      },
+      {
+        "content_digest": "sha256:663a935951c802b1c16ad7478e7ce754b2d48efb828bbe5d3915fb6bb51cd7db",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/upperarm.stl"
+      },
+      {
+        "content_digest": "sha256:1408c3a0a29385fefe30ed44fceca56d2254f51ea93c75c404976816992324cc",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/wrist1.stl"
+      },
+      {
+        "content_digest": "sha256:4b9e74eab991af3dc9d38c3dfaad2c5bc69591fadc855f7966627ba4d0956579",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/wrist2.stl"
+      },
+      {
+        "content_digest": "sha256:7038904dd03dfea56212191ac61d26746b379dbddfd517b905e13c01e1c12e6a",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/collision/wrist3.stl"
+      },
+      {
+        "content_digest": "sha256:28226d95af8c1579a49fe69b62a00d9133a2a05258dad550bb9b583c80dc938f",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/base.dae"
+      },
+      {
+        "content_digest": "sha256:24d909834c380cceb0490181dae40bcdfcfa4a7fb0c6807d6e58794cdfadcf6e",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/forearm.dae"
+      },
+      {
+        "content_digest": "sha256:1c38a6afedfb8f064117da87b60c2dcb9ccd107f957e4c5e0a198f4c2bb63d36",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/shoulder.dae"
+      },
+      {
+        "content_digest": "sha256:f9d2380d14127440f4a50ed79ab4e7562f86289cd6131016c3d49a3e7483e6ed",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/upperarm.dae"
+      },
+      {
+        "content_digest": "sha256:643717d042920313dd9daa81511bd9afa66a877625967e6dd8d359ec851b4237",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/wrist1.dae"
+      },
+      {
+        "content_digest": "sha256:b820e8c8a4488563c7a21fe73bf2fa4038ec9f882dcf9db12e2d1df928253793",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/wrist2.dae"
+      },
+      {
+        "content_digest": "sha256:52ace7588f131dc43b49ba88d1c83c1f871e6d00659ea84b1f437e2a7f1ab7fe",
+        "source_id": "component:isaac_ur10e_assistant_robot:resource:package://manyforge_example_models/models/ur10e_robotiq_2f_140/meshes/ur10e/visual/wrist3.dae"
+      },
+      {
+        "content_digest": "sha256:6443713ddfa8a8e64803e9d27e4adeb06823c2c9ec5542bd94dad6e48b8cfbbc",
+        "source_id": "component:isaac_ur10e_assistant_robot:srdf"
+      },
+      {
+        "content_digest": "sha256:6a7fcb71888fc49de4faba4e3bad7ba4b2796f91bc71ab8aab9fe7fd8a83f666",
+        "source_id": "component:isaac_ur10e_assistant_robot:urdf"
+      }
+    ],
+    "schema_version": "manyforge.scenario.source_snapshot.v1"
+  }
+}

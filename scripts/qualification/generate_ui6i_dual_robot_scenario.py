@@ -27,6 +27,8 @@ CELL_ID: Final = "ui6i_ur5e_lite6_wall_cell"
 DEPLOYMENT_SOURCE: Final = "examples/ur5e_lite6_wall.deployment.yaml"
 GROUPED_PROGRAM_SOURCE: Final = "examples/ur5e_lite6_wall_grouped.program.yaml"
 ISOLATION_PROGRAM_SOURCE: Final = "examples/ur5e_lite6_wall_isolation.program.yaml"
+GROUPED_SCENARIO_SOURCE: Final = "examples/ur5e_lite6_wall_grouped.scenario"
+ISOLATION_SCENARIO_SOURCE: Final = "examples/ur5e_lite6_wall_isolation.scenario"
 RUNTIME_POLICY_SOURCE: Final = (
     "manyforge_deployment/resources/maintained/catalog/runtime_policy/"
     "manyforge.runtime_motion.ur5e_lite6_wall.json"
@@ -654,6 +656,18 @@ def require_or_update(path: Path, expected: bytes, *, update: bool) -> None:
         raise GenerationError(f"generated source is stale: {path}")
 
 
+def require_obsolete_output_absent(path: Path, *, update: bool) -> None:
+    """Remove only a named repository-owned output replaced by this generator."""
+
+    if not path.exists():
+        return
+    if path.is_symlink() or not path.is_file():
+        raise GenerationError(f"obsolete generated output is not a plain file: {path}")
+    if not update:
+        raise GenerationError(f"obsolete generated output remains: {path}")
+    path.unlink()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
@@ -690,8 +704,144 @@ def main() -> int:
                 temporary=temporary,
             ),
         }
+        generator_dir = root / "manyforge_deployment/tools"
+        sys.path.insert(0, str(generator_dir))
+        # pylint: disable-next=import-outside-toplevel
+        from generate_maintained_deployment_occurrences import (
+            _deployment_intent,
+            _scenario_project_outputs,
+            pretty_bytes,
+        )
+
+        description = read_json(
+            root
+            / "manyforge_deployment/resources/maintained/"
+            "maintained_deployment_sources.v1.json"
+        )
+        families = {
+            row["model_family_id"]: row for row in description["model_families"]
+        }
+        runtime_profiles = {
+            row["runtime_restoration_profile_id"]: row
+            for row in description["runtime_restoration_profiles"]
+        }
+        assignment = {
+            "component_roles": {
+                "lite6_robot": "lite6_robot",
+                "ur5e_robot": "ur5e_robot",
+            },
+            "target_roles": {
+                "lite6_arm": {
+                    "component_role": "lite6_robot",
+                    "command_target_id": "arm",
+                },
+                "ur5e_arm": {
+                    "component_role": "ur5e_robot",
+                    "command_target_id": "arm",
+                },
+            },
+        }
+        version = (root / "VERSION").read_text(encoding="utf-8").strip()
+        for program_source, scenario_source in (
+            (GROUPED_PROGRAM_SOURCE, GROUPED_SCENARIO_SOURCE),
+            (ISOLATION_PROGRAM_SOURCE, ISOLATION_SCENARIO_SOURCE),
+        ):
+            program = yaml.safe_load(outputs[root / program_source])
+            project_root = root / scenario_source
+            component_inputs = (
+                (
+                    {
+                        "deployment_artifact_id": "ur5e_lite6_wall",
+                        "cell_id": CELL_ID,
+                        "name": "ur5e_lite6_wall",
+                        "description": (
+                            "UI6-I dual-robot wall qualification occurrence"
+                        ),
+                        "component_occurrence_id": "lite6_robot",
+                        "runtime_restoration_profile_id": (
+                            "lite6_native_simulated_v0"
+                        ),
+                        "native_lifecycle_management": False,
+                        "assistant_profile_id": None,
+                        "root_pose_in_cell": {
+                            "position_m": [0.0, 0.0, 0.0],
+                            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                        },
+                        "compatibility": {
+                            "lane": "manyforge-only",
+                            "provides": [],
+                            "tags": ["dual-robot"],
+                        },
+                    },
+                    "lite6_lite_gripper",
+                    "lite6_native_simulated_v0",
+                ),
+                (
+                    {
+                        "deployment_artifact_id": "ur5e_lite6_wall",
+                        "cell_id": CELL_ID,
+                        "name": "ur5e_lite6_wall",
+                        "description": (
+                            "UI6-I dual-robot wall qualification occurrence"
+                        ),
+                        "component_occurrence_id": "ur5e_robot",
+                        "runtime_restoration_profile_id": (
+                            "ur5e_robotiq_native_simulated_v0"
+                        ),
+                        "native_lifecycle_management": False,
+                        "assistant_profile_id": None,
+                        "root_pose_in_cell": {
+                            "position_m": [0.0, 1.0, 0.0],
+                            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                        },
+                        "compatibility": {
+                            "lane": "manyforge-only",
+                            "provides": [],
+                            "tags": ["dual-robot"],
+                        },
+                    },
+                    "ur5e_robotiq_2f_85",
+                    "ur5e_robotiq_native_simulated_v0",
+                ),
+            )
+            intents = [
+                _deployment_intent(
+                    root=root,
+                    project_root=project_root,
+                    deployment=component,
+                    family=families[family_id],
+                    runtime_profile=runtime_profiles[runtime_profile_id],
+                )
+                for component, family_id, runtime_profile_id in component_inputs
+            ]
+            intent = copy.deepcopy(intents[0])
+            intent["components"] = sorted(
+                [row for value in intents for row in value["components"]],
+                key=lambda row: row["component_id"],
+            )
+            intent["compatibility"] = {
+                "lane": "manyforge-only",
+                "provides": [],
+                "tags": ["dual-robot"],
+            }
+            for path, payload, _label in _scenario_project_outputs(
+                project_root=project_root,
+                scenario_id=program["program_id"],
+                name=program["name"],
+                description=program["description"],
+                program=program,
+                deployment_intent=intent,
+                assignment=assignment,
+                manyforge_version=version,
+            ):
+                outputs[path] = payload
     for path, expected in outputs.items():
         require_or_update(path, expected, update=args.update)
+    for obsolete in (
+        root / "examples/ur5e_lite6_wall_grouped.scenario.yaml",
+        root / "examples/ur5e_lite6_wall_isolation.scenario.yaml",
+    ):
+        require_obsolete_output_absent(obsolete, update=args.update)
     print(
         "generate_ui6i_dual_robot_scenario: "
         + ("updated" if args.update else "current")

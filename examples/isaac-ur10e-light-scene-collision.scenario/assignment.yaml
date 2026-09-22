@@ -1,0 +1,22 @@
+{
+  "component_roles": [
+    {
+      "component_role_id": "robot",
+      "controllable_component_id": "isaac_ur10e_collision_robot"
+    },
+    {
+      "component_role_id": "tool",
+      "controllable_component_id": "isaac_ur10e_collision_robot"
+    }
+  ],
+  "target_roles": [
+    {
+      "command_target_id": "arm",
+      "target_role_id": "arm"
+    },
+    {
+      "command_target_id": "gripper",
+      "target_role_id": "gripper"
+    }
+  ]
+}

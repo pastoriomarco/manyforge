@@ -193,9 +193,9 @@ export function DeploymentDocumentControls({
               components. Running operations remain protected by Manager admission.
             </p>
             <p>
-              <strong>{pendingConfirmation.result.compilation.deploymentArtifactId}</strong>
+              <strong>{pendingConfirmation.result.preparedActivation.deploymentArtifactId}</strong>
               {' · '}
-              <code>{pendingConfirmation.result.compilation.deploymentRevision}</code>
+              <code>{pendingConfirmation.result.preparedActivation.deploymentRevision}</code>
             </p>
             <button
               type="button"

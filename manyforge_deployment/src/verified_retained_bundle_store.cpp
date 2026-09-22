@@ -2055,6 +2055,56 @@ read_verified_planning_resources(
 
 } // namespace
 
+std::optional<VerifiedRetainedModelMap>
+detail::RetainedModelMapVerificationAuthority::verify(
+    const RetainedBundle &bundle, const RetainedModelMapQuery &query,
+    std::string_view artifact_bytes) {
+  if (bundle.retained_bundle_id() != query.retained_bundle_id) {
+    return std::nullopt;
+  }
+  const RetainedProductArtifactQuery exact_product_query{
+      query.retained_bundle_id, query.product_id,
+      core::RetainedProductKind::kSymbolRoleMap,
+      core::ArtifactRoleId(
+          std::string(detail::kComposedModelSymbolRoleMapArtifactRole))};
+  const core::RetainedProductDTO *product =
+      find_exact_product(bundle.value(), exact_product_query);
+  if (product == nullptr) return std::nullopt;
+  const core::RetainedArtifactRefDTO *selected = nullptr;
+  for (const auto &artifact : product->artifact_refs) {
+    if (artifact.artifact_role_id != exact_product_query.artifact_role_id) {
+      continue;
+    }
+    if (selected != nullptr) {
+      detail::fail_retained_bundle(
+          "retained model-map product repeats its required artifact role");
+    }
+    selected = &artifact;
+  }
+  if (selected == nullptr) return std::nullopt;
+  if (selected->media_type != detail::kComposedModelSymbolRoleMapMediaType ||
+      selected->byte_size != artifact_bytes.size() ||
+      sha256_digest(artifact_bytes) != selected->content_digest.value()) {
+    detail::fail_retained_bundle(
+        "retained model-map artifact differs from its exact product reference");
+  }
+  const CanonicalValue parsed =
+      detail::parse_and_verify_composed_model_symbol_role_map(artifact_bytes);
+  require_symbol_role_map_matches_retained_graph(parsed,
+                                                  bundle.value().cell_graph);
+  DecodedRetainedModelMap decoded = decode_retained_model_map(parsed);
+  std::vector<core::KinematicFramePathDTO> kinematic_frame_paths =
+      build_runtime_kinematic_paths(decoded, bundle.value().cell_graph);
+  return VerifiedRetainedModelMap(
+      query, product->product_contract_id, product->product_contract_revision,
+      std::move(decoded.cell_frame), std::move(decoded.model_occurrences),
+      std::move(decoded.model_collision_bodies), std::move(decoded.symbols),
+      std::move(decoded.references), std::move(decoded.coordinates),
+      std::move(decoded.control_bindings), std::move(decoded.fixed_connections),
+      std::move(decoded.frame_paths), std::move(kinematic_frame_paths),
+      std::move(decoded.targets));
+}
+
 const CompositionTargetResolution *VerifiedRetainedModelMap::find_target(
     const core::ControllableComponentId &component_id,
     const core::CommandTargetId &command_target_id) const noexcept {

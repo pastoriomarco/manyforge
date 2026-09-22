@@ -11,6 +11,17 @@
 
 namespace manyforge::deployment::detail {
 
+/// Reconstruct one sealed model map directly from the exact retained bundle
+/// and artifact bytes already held by an activation preparation operation.
+/// This is the in-memory counterpart of the filesystem reader; it performs
+/// the same product-coordinate, digest, media-type, graph and namespace checks.
+class RetainedModelMapVerificationAuthority final {
+ public:
+  [[nodiscard]] static std::optional<VerifiedRetainedModelMap> verify(
+      const RetainedBundle &bundle, const RetainedModelMapQuery &query,
+      std::string_view artifact_bytes);
+};
+
 struct QualifiedRetainedProductArtifactRole final {
   std::string_view artifact_role_id;
   std::string_view media_type;

@@ -16,6 +16,7 @@ add_compile_options(-Wall -Wextra -Werror -pedantic)
 
 find_package(OpenSSL REQUIRED)
 find_package(EXPAT REQUIRED)
+find_package(ZLIB REQUIRED)
 find_package(double-conversion CONFIG REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(PkgConfig REQUIRED)
@@ -32,6 +33,9 @@ set(
   "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior/scripts/generate_node_environment_manifest.py")
 set(
   MANYFORGE_STRUCTURAL_PREPARATION_TOOL
+  "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior/manyforge_behavior/model_source_preparation.py")
+set(
+  MANYFORGE_STRUCTURAL_PREPARATION_CLIENT
   "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_structural_model.py")
 set(
   MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_CHECK
@@ -60,6 +64,7 @@ set(
 if(NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}" OR
    NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_CHECK}" OR
    NOT EXISTS "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}" OR
+   NOT EXISTS "${MANYFORGE_STRUCTURAL_PREPARATION_CLIENT}" OR
    NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_CHECK}" OR
    NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}" OR
    NOT EXISTS "${MANYFORGE_MAINTAINED_ASSISTANT_PROFILES}" OR
@@ -659,6 +664,7 @@ add_library(manyforge_deployment_verification_core
   src/ros2_control_execution_runtime_unit_internal.cpp
   src/planning_resource_map_internal.cpp
   src/posix_read_only_internal.cpp
+  src/prepared_activation_input.cpp
   src/program_contract.cpp
   src/program_binding.cpp
   src/provider_manifest_codec.cpp
@@ -840,6 +846,12 @@ endif()
 # defined separately below; producer manifests remain content-addressed
 # provenance and are not interpreted as current-reader compatibility profiles.
 add_library(manyforge_deployment
+  src/activation_component_profile_internal.cpp
+  src/activation_deployment_compiler_internal.cpp
+  src/activation_deployment_intent_internal.cpp
+  src/activation_model_source_closure_internal.cpp
+  src/activation_prepared_model_closure_internal.cpp
+  src/activation_prepared_model_internal.cpp
   src/build_manifest.cpp
   src/build_manifest_repository.cpp
   src/capability_definition_codec.cpp
@@ -873,6 +885,7 @@ target_include_directories(manyforge_deployment PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(manyforge_deployment PUBLIC
   manyforge_deployment_verification_core)
+target_link_libraries(manyforge_deployment PRIVATE ZLIB::ZLIB)
 set_target_properties(
   manyforge_deployment PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -908,7 +921,7 @@ target_link_libraries(
 
 add_executable(
   manyforge_maintained_deployment_occurrences
-  tools/maintained_deployment_occurrences.cpp)
+  tools/maintained_deployment_occurrences_main.cpp)
 target_include_directories(
   manyforge_maintained_deployment_occurrences PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -941,9 +954,23 @@ target_link_libraries(
   manyforge_deployment_canonical_package_generator PRIVATE
   manyforge::deployment
   manyforge::deployment_admission)
-target_link_libraries(
-  manyforge_maintained_deployment_occurrences PRIVATE
+add_library(manyforge_preparation_support STATIC
+  src/activation_materialization_internal.cpp)
+target_include_directories(manyforge_preparation_support PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(manyforge_preparation_support PRIVATE
+  manyforge::deployment
   manyforge_deployment_canonical_package_generator)
+target_link_libraries(manyforge_maintained_deployment_occurrences PRIVATE
+  manyforge_preparation_support)
+
+add_executable(manyforge_prepare_activation
+  tools/prepare_activation.cpp)
+target_include_directories(manyforge_prepare_activation PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(manyforge_prepare_activation PRIVATE
+  manyforge_preparation_support
+  manyforge::deployment)
 set_target_properties(
   manyforge_deployment_canonical_package_generator
   PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -1027,6 +1054,8 @@ if(BUILD_TESTING)
   add_test(
     NAME MaintainedDeploymentOccurrenceSources
     COMMAND
+      "${CMAKE_COMMAND}" -E env
+      "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT}"
       "${Python3_EXECUTABLE}"
       "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}"
       --check
@@ -1041,6 +1070,8 @@ if(BUILD_TESTING)
   add_test(
     NAME Ui6iDualRobotScenarioSources
     COMMAND
+      "${CMAKE_COMMAND}" -E env
+      "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT}"
       "${Python3_EXECUTABLE}"
       "${MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR}"
       --check
@@ -1412,7 +1443,7 @@ if(BUILD_TESTING)
     execute_process(
       COMMAND
         "${Python3_EXECUTABLE}"
-        "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
+        "${MANYFORGE_STRUCTURAL_PREPARATION_CLIENT}"
         --urdf "${urdf_path}"
         --srdf "${srdf_path}"
         --model-asset-id "${family_id}"
@@ -1429,6 +1460,7 @@ if(BUILD_TESTING)
     endif()
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
       "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
+      "${MANYFORGE_STRUCTURAL_PREPARATION_CLIENT}"
       "${urdf_path}"
       "${srdf_path}"
       ${resource_inputs}
@@ -1502,6 +1534,7 @@ if(BUILD_TESTING)
   file(GLOB_RECURSE MANYFORGE_UI6I_DUAL_SCENARIO_INPUTS
     CONFIGURE_DEPENDS LIST_DIRECTORIES false
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/*"
+    "${_MANYFORGE_WORKSPACE_ROOT}/examples/*.scenario/*"
     "${_MANYFORGE_WORKSPACE_ROOT}/examples/*.deployment.yaml"
     "${_MANYFORGE_WORKSPACE_ROOT}/examples/*.program.yaml")
   add_custom_command(
@@ -1579,6 +1612,39 @@ if(BUILD_TESTING)
       --prepared
       "ur5e_robotiq_2f_85=${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}")
 
+  function(manyforge_add_prepare_activation_test test_name scenario)
+    add_test(
+      NAME "${test_name}"
+      COMMAND "${CMAKE_COMMAND}" -E env
+        "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT}"
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/test/prepare_activation_tool.py"
+        --tool "$<TARGET_FILE:manyforge_prepare_activation>"
+        --workspace "${_MANYFORGE_WORKSPACE_ROOT}"
+        --scenario "${scenario}"
+        ${ARGN})
+    set_tests_properties("${test_name}" PROPERTIES TIMEOUT 180)
+  endfunction()
+
+  manyforge_add_prepare_activation_test(
+    PrepareActivationSingleDocument
+    "examples/lite6_pick_and_place.scenario")
+  manyforge_add_prepare_activation_test(
+    PrepareActivationDualDocument
+    "examples/ur5e_lite6_wall_grouped.scenario")
+  manyforge_add_prepare_activation_test(
+    PrepareActivationAssignmentRejections
+    "examples/ur5e_lite6_wall_grouped.scenario"
+    --negative-matrix)
+  manyforge_add_prepare_activation_test(
+    PrepareActivationSourceClosureRejections
+    "examples/ur5e_lite6_wall_grouped.scenario"
+    --source-closure-rejections)
+  manyforge_add_prepare_activation_test(
+    PrepareActivationIntentRejections
+    "examples/ur5e_lite6_wall_grouped.scenario"
+    --intent-rejections)
+
   add_executable(test_model_source
     test/test_model_source.cpp)
   target_compile_definitions(test_model_source PRIVATE
@@ -1600,7 +1666,7 @@ if(BUILD_TESTING)
   execute_process(
     COMMAND
       "${Python3_EXECUTABLE}"
-      "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}"
+      "${MANYFORGE_STRUCTURAL_PREPARATION_CLIENT}"
       --urdf
       "${MANYFORGE_STRUCTURAL_PREPARATION_TEST_SOURCE_ROOT}/source.urdf"
       --srdf

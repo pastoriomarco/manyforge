@@ -962,10 +962,8 @@ class HeadlessHttpClient:
             "POST", "/api/manager/deployment-candidates/preview", body=body
         )
 
-    def compile_deployment_candidate(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request(
-            "POST", "/api/manager/deployment-candidates/compile", body=body
-        )
+    def prepare_activation(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/activation-preparations", body=body)
 
     def manager_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/manager/apply", body=body)

@@ -119,6 +119,73 @@ function controller(): DeploymentWorkspaceController {
 }
 
 describe('DeploymentFocusedEditor', () => {
+  it('renders authored intent without requiring a compiled graph projection', () => {
+    const value = controller();
+    value.workspace!.draft.document = {
+      api_version: 'manyforge.deployment_intent.v1',
+      deployment_artifact_id: 'cell-a',
+      cell_id: 'cell-a',
+      name: 'Cell A',
+      components: [{
+        component_id: 'robot',
+        component_profile_id: 'robot_native_v1',
+        model_source: {
+          urdf: { project_path: 'sources/robot.urdf' },
+          package_roots: {},
+        },
+        root_pose_in_cell: {
+          position_m: [0, 0, 0],
+          orientation_xyzw: [0, 0, 0, 1],
+        },
+        target_settings: {
+          arm: {
+            maximum_tcp_linear_speed_mps: 0.2,
+            controlled_stop: {
+              stop_mode: 'soft_on_path',
+              allow_natural_completion_on_short_path: true,
+              jerk_limits_enabled: true,
+              deceleration_time_s: 1,
+              per_joint_limits: [{
+                source_joint_name: 'joint1',
+                max_deceleration_rad_s2: 4,
+                settle_velocity_threshold_rad_s: 0.01,
+              }],
+            },
+          },
+        },
+        configuration: {
+          mode: 'simulated',
+          execution_tick_hz: 100,
+          collision_monitor_period_ms: 50,
+          planner_rng_seed: 12345,
+          initial_joint_positions_rad: [0, 1.57],
+          direct_control_joint_limits: [],
+          gripper_target_configurations: [],
+        },
+      }],
+      attachments: [],
+      policies: {},
+    };
+    value.workspace!.draft.deploymentRevision = null;
+    value.workspace!.draft.graphRevision = null;
+    const descriptor = statusFixture().directControl.targetDescriptor;
+    descriptor.controllableComponentId = 'robot';
+    descriptor.commandTargetId = 'arm';
+    descriptor.operationalLimit = { maximumTcpLinearSpeedMps: 0.15 };
+
+    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[descriptor]}
+      gripperDescriptors={[]} />);
+
+    expect(markup).toContain('Maximum TCP linear speed');
+    expect(markup).toContain('value="0.2"');
+    expect(markup).toContain('robot · arm');
+    expect(markup).toContain('joint1 maximum deceleration');
+    expect(markup).toContain('Native runtime configuration');
+    expect(markup).toContain('Execution cadence');
+    expect(markup).toContain('Controlled Stop jerk limits');
+  });
+
   it.each([
     { enabled: false, override: null, imported: null, maximum: '0' },
     { enabled: true, override: 10, imported: 12, maximum: '10' },
@@ -231,7 +298,7 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toContain('value="0.15"');
   });
 
-  it('distinguishes capability bindings and shows saved timing without inventing values for absent settings', () => {
+  it('collapses derived capability bindings into one authored target Stop profile', () => {
     const value = controller();
     const document = value.workspace!.draft!.document as unknown as {
       graph: { control_bindings: Array<Record<string, unknown>> };
@@ -243,13 +310,16 @@ describe('DeploymentFocusedEditor', () => {
     const render = () => renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
       sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
     let markup = render();
-    expect(markup).toContain('robot · arm · execution.trajectory.execute');
-    expect(markup).toContain('robot · arm · execution.contact.geometric');
+    expect(markup).toContain('robot · arm');
+    expect(markup.match(/>robot · arm<\/option>/g)).toHaveLength(1);
     expect(markup).toContain('Using qualified policy timings.');
     expect(markup).not.toContain('value="0.25"');
-    document.policies.stop_timing_parameters = [{ control_binding_id: 'arm_binding',
-      control_binding_revision: digest, timing: { command_latency_allowance_ns: 250_000_000,
-        settling_allowance_ns: 750_000_000, operational_timeout_ns: 3_000_000_000 } }];
+    const timing = { command_latency_allowance_ns: 250_000_000,
+      settling_allowance_ns: 750_000_000, operational_timeout_ns: 3_000_000_000 };
+    document.policies.stop_timing_parameters = [
+      { control_binding_id: 'arm_binding', control_binding_revision: digest, timing },
+      { control_binding_id: 'arm_contact', control_binding_revision: digest, timing },
+    ];
     markup = render();
     expect(markup).toContain('Command latency');
     expect(markup).toContain('Settling allowance');

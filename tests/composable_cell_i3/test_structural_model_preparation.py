@@ -444,6 +444,71 @@ def test_qualified_receipt_binds_exact_configuration_inputs_and_closure(
     )
 
 
+def test_captured_resource_qualification_matches_offline_wrapper(
+    tmp_path: Path,
+) -> None:
+    logical_uri = f"{PACKAGE_PREFIX}meshes/tool.stl"
+    urdf = _minimal_urdf(
+        '<link name="base"><visual><geometry>'
+        f'<mesh filename="{logical_uri}"/>'
+        "</geometry></visual></link>"
+    )
+    resource_root = tmp_path / "source"
+    (resource_root / "meshes").mkdir(parents=True)
+    mesh_bytes = b"solid captured\nendsolid captured\n"
+    (resource_root / "meshes" / "tool.stl").write_bytes(mesh_bytes)
+    prepared = _prepare(urdf)
+
+    captured = subject.qualify_captured_structural_model_preparation(
+        prepared,
+        original_urdf_bytes=urdf,
+        original_srdf_bytes=None,
+        captured_resources={logical_uri: mesh_bytes},
+    )
+    offline = subject.qualify_structural_model_preparation(
+        prepared,
+        original_urdf_bytes=urdf,
+        original_srdf_bytes=None,
+        resource_root=resource_root,
+    )
+
+    assert captured == offline
+    assert captured.manifest_bytes() == offline.manifest_bytes()
+
+
+@pytest.mark.parametrize(
+    ("captured_resources", "message"),
+    [
+        ({}, "missing resource"),
+        (
+            {
+                f"{PACKAGE_PREFIX}meshes/tool.stl": b"solid exact\nendsolid exact\n",
+                f"{PACKAGE_PREFIX}meshes/unused.stl": b"unused",
+            },
+            "unused resource",
+        ),
+        ({f"{PACKAGE_PREFIX}meshes/tool.stl": b""}, "size is outside"),
+    ],
+)
+def test_captured_resource_qualification_requires_one_exact_closed_set(
+    captured_resources: dict[str, bytes], message: str
+) -> None:
+    urdf = _minimal_urdf(
+        '<link name="base"><visual><geometry>'
+        f'<mesh filename="{PACKAGE_PREFIX}meshes/tool.stl"/>'
+        "</geometry></visual></link>"
+    )
+    prepared = _prepare(urdf)
+
+    with pytest.raises(subject.StructuralModelPreparationError, match=message):
+        subject.qualify_captured_structural_model_preparation(
+            prepared,
+            original_urdf_bytes=urdf,
+            original_srdf_bytes=None,
+            captured_resources=captured_resources,
+        )
+
+
 def test_qualified_receipt_rejects_missing_or_symlinked_resources(
     tmp_path: Path,
 ) -> None:

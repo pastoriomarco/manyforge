@@ -34,6 +34,8 @@ import {
   parseProgramRuntimeControlProjection,
   parseScenarioCatalogResponse,
   parseScenarioDocumentIndexResponse,
+  parseScenarioDocumentConversionResponse,
+  parseScenarioDocumentExportResponse,
   parseScenarioDocumentLoadResponse,
   parseScenarioDocumentSaveResponse,
   parseSceneRuntimeProjection,
@@ -45,70 +47,81 @@ import {
 } from './parsers';
 
 describe('editable Scenario document transport', () => {
-  it('parses dynamic saved and qualified entries with explicit advisory state', () => {
+  it('parses ordinary saved documents with explicit advisory state', () => {
     const parsed = parseScenarioDocumentIndexResponse({
       api_version: 'manyforge.scenario_document_index.v1',
       directory: '/workspace/examples',
-      catalog_revision: `sha256:${'c'.repeat(64)}`,
       entries: [{
         source_kind: 'saved',
-        path: '/workspace/examples/cell.scenario.yaml',
+        path: '/workspace/examples/cell',
         scenario_id: 'cell',
         name: 'Cell',
         description: 'Editable cell',
-        base_scenario_id: 'maintained_cell',
         saved_manyforge_version: '1.0.0',
         display_status: 'changed',
         status_detail: 'Content changed since the recorded status.',
-      }, {
-        source_kind: 'qualified',
-        path: null,
-        scenario_id: 'installed_cell',
-        name: 'installed_cell',
-        description: '',
-        base_scenario_id: 'installed_cell',
-        saved_manyforge_version: null,
-        display_status: 'ready',
-        status_detail: 'Qualified by the installed Scenario catalog.',
       }],
     });
 
     expect(parsed.directory).toBe('/workspace/examples');
-    expect(parsed.entries.map((entry) => entry.sourceKind)).toEqual([
-      'saved',
-      'qualified',
-    ]);
+    expect(parsed.entries.map((entry) => entry.sourceKind)).toEqual(['saved']);
     expect(parsed.entries[0]?.displayStatus).toBe('changed');
   });
 
   it('parses Save and editor-only Load outcomes without inventing activation', () => {
     const saved = parseScenarioDocumentSaveResponse({
       status: 'saved',
-      path: '/workspace/cell.scenario.yaml',
+      path: '/workspace/cell',
       scenario_id: 'cell',
       last_known_status: 'unknown',
       workspace: workspaceFixture(),
     });
     const opened = parseScenarioDocumentLoadResponse({
       status: 'opened',
-      path: null,
+      path: '/workspace/cell',
       scenario_id: 'cell',
       activation: null,
+      incomplete: false,
       diagnostics: [],
+      source_diagnostics: [],
       workspace: workspaceFixture(),
     });
 
     expect(saved.lastKnownStatus).toBe('unknown');
-    expect(opened.path).toBeNull();
+    expect(opened.path).toBe('/workspace/cell');
     expect(opened.activation).toBeNull();
     expect(() => parseScenarioDocumentLoadResponse({
       status: 'loaded',
-      path: '/workspace/cell.scenario.yaml',
+      path: '/workspace/cell',
       scenario_id: 'cell',
       activation: null,
+      incomplete: false,
       diagnostics: [],
+      source_diagnostics: [],
       workspace: workspaceFixture(),
-    })).toThrow('activation');
+    })).toThrow('status');
+  });
+
+  it('parses explicit legacy conversion without treating it as a Load', () => {
+    expect(parseScenarioDocumentConversionResponse({
+      status: 'converted',
+      source_path: '/workspace/legacy.scenario.yaml',
+      path: '/workspace/cell',
+    })).toEqual({
+      status: 'converted',
+      sourcePath: '/workspace/legacy.scenario.yaml',
+      path: '/workspace/cell',
+    });
+  });
+
+  it('parses an explicit portable project export', () => {
+    expect(parseScenarioDocumentExportResponse({
+      status: 'exported',
+      path: '/workspace/exports/cell',
+    })).toEqual({
+      status: 'exported',
+      path: '/workspace/exports/cell',
+    });
   });
 });
 
@@ -1057,10 +1070,11 @@ describe('Deployment workspace parser', () => {
     const digestA = `sha256:${'a'.repeat(64)}`;
     const digestB = `sha256:${'b'.repeat(64)}`;
     const digestC = `sha256:${'c'.repeat(64)}`;
-    const compilation = {
-      schema_version: 'manyforge.deployment_candidate_compilation.v1',
-      scenario_id: 'fixture',
-      scenario_catalog_revision: digestB,
+    const preparedActivation = {
+      schema_version: 'manyforge.prepared_activation_input.v2',
+      prepared_activation_id: digestC,
+      source_document_digest: digestA,
+      captured_input_digest: digestB,
       deployment_artifact_id: 'deployment.fixture',
       deployment_revision: digestA,
       retained_bundle_id: digestB,
@@ -1068,6 +1082,9 @@ describe('Deployment workspace parser', () => {
       program_id: 'fixture-program',
       program_revision: digestB,
       program_binding_id: digestA,
+      node_environment_digest: digestC,
+      assistant_mode: 'forbidden',
+      typed_parameter_overrides: {},
     };
     const parsed = parseDeploymentCandidateOperationResponse({
       schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
@@ -1075,21 +1092,19 @@ describe('Deployment workspace parser', () => {
       result: {
         status: 'applied',
         confirmation_token: null,
-        compilation,
+        prepared_activation: preparedActivation,
         candidate_preview: null,
         manager_apply: null,
-        selection: Object.fromEntries(
-          Object.entries(compilation).filter(([key]) => key !== 'schema_version'),
-        ),
+        selection: null,
         preparation: null,
-        phases_ms: { compile_ms: 2.5, manager_apply_ms: 8.25 },
+        phases_ms: { preparation_ms: 2.5, preview_ms: 8.25 },
         apply_id: 'apply-1',
       },
     });
 
     expect(parsed.result.phasesMs).toEqual({
-      compile_ms: 2.5,
-      manager_apply_ms: 8.25,
+      preparation_ms: 2.5,
+      preview_ms: 8.25,
     });
     expect(parsed.result.applyId).toBe('apply-1');
   });

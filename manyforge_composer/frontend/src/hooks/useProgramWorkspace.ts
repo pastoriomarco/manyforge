@@ -25,6 +25,7 @@ import type {
   ProgramWorkspaceTransitionResponse,
   ProgramWorkspaceTransitionStatus,
   ScenarioDocumentFenceRequest,
+  ScenarioDocumentLoadResponse,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import { browserStableIdentity } from './useHeadlessState';
@@ -106,6 +107,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     INITIAL_PROGRAM_WORKSPACE_STATE,
   );
   const [scenarioDocumentPath, setScenarioDocumentPath] = useState<string | null>(null);
+  const [scenarioSourceDiagnostics, setScenarioSourceDiagnostics] = useState<ScenarioDocumentLoadResponse['sourceDiagnostics']>([]);
   const generation = useRef(0);
   const mounted = useRef(true);
   const workspaceRead = useRef<Promise<ProgramWorkspaceResponse> | null>(null);
@@ -382,6 +384,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
       if (requestFence === null) throw new Error('Scenario Save is not admitted.');
       const response = await api.scenarioDocuments.save(requestFence, input);
       setScenarioDocumentPath(response.path);
+      setScenarioSourceDiagnostics([]);
       return workspaceResult(
         response.workspace,
         `Scenario saved (${response.lastKnownStatus}); runtime state was not changed.`,
@@ -389,10 +392,24 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     });
   }, [requireWorkspace, run, scenarioFence]);
 
+  const exportScenarioDocument = useCallback((destinationPath: string) => {
+    const workspace = requireWorkspace();
+    if (workspace === null) return;
+    void run('export_scenario_document', async () => {
+      const requestFence = await scenarioFence(workspace);
+      if (requestFence === null) throw new Error('Scenario Export is not admitted.');
+      const response = await api.scenarioDocuments.export(
+        requestFence, destinationPath,
+      );
+      return workspaceResult(
+        workspace,
+        `Portable Scenario exported to ${response.path}.`,
+      );
+    });
+  }, [requireWorkspace, run, scenarioFence]);
+
   const loadScenarioDocument = useCallback((
-    path: string | null,
-    qualifiedScenarioId: string | null,
-    alternateDeploymentPath: string | null,
+    path: string,
     confirmDiscard: boolean,
   ) => {
     const workspace = requireWorkspace();
@@ -403,19 +420,38 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
       const response = await api.scenarioDocuments.load(
         requestFence,
         path,
-        qualifiedScenarioId,
-        alternateDeploymentPath,
         confirmDiscard,
       );
       setScenarioDocumentPath(response.path);
       return workspaceResult(
         response.workspace,
-        response.status === 'loaded'
-          ? 'Scenario loaded; its Deployment converged and its Program was Applied.'
-          : 'Incomplete Scenario opened for editing; runtime state was not changed.',
+        response.incomplete
+          ? 'Incomplete Scenario opened for editing; runtime state was not changed.'
+          : 'Scenario opened for editing; runtime state was not changed.',
       );
     });
   }, [requireWorkspace, run, scenarioFence]);
+
+  const convertLegacyScenarioDocument = useCallback((input: {
+    sourcePath: string;
+    destinationPath: string;
+    confirmOverwrite: boolean;
+  }) => {
+    const workspace = requireWorkspace();
+    if (workspace === null) return;
+    void run('convert_legacy_scenario_document', async () => {
+      const response = await api.scenarioDocuments.convertLegacy(
+        input.sourcePath,
+        input.destinationPath,
+        input.confirmOverwrite,
+      );
+      setScenarioDocumentPath(response.path);
+      return workspaceResult(
+        workspace,
+        'Legacy Scenario converted to a project; the source file and runtime state were unchanged.',
+      );
+    });
+  }, [requireWorkspace, run]);
 
   const updateNodePolicies = useCallback((
     instanceId: string,
@@ -452,7 +488,10 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     revert,
     saveScenarioDocument,
     loadScenarioDocument,
+    convertLegacyScenarioDocument,
+    exportScenarioDocument,
     scenarioDocumentPath,
+    scenarioSourceDiagnostics,
     updateNodePolicies,
     clearFeedback,
   }), [
@@ -461,6 +500,8 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     clearFeedback,
     discard,
     loadScenarioDocument,
+    convertLegacyScenarioDocument,
+    exportScenarioDocument,
     mutate,
     mutationAvailable,
     mutationUnavailableReason,
@@ -472,6 +513,7 @@ export function useProgramWorkspace(snapshot: ComposerHeadlessState | null = nul
     saveAs,
     saveScenarioDocument,
     scenarioDocumentPath,
+    scenarioSourceDiagnostics,
     state,
     updateNodePolicies,
   ]);

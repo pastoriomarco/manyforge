@@ -1,0 +1,774 @@
+{
+  "api_version": "manyforge.program.v2",
+  "catalog": {
+    "api_version": "manyforge.node_catalog.v2",
+    "content_version": "2.3.0"
+  },
+  "compatibility": {
+    "assistant": "optional",
+    "lanes": [
+      "isaac-sim"
+    ],
+    "requires": [
+      "robotiq_2f_140_gripper",
+      "ros2_control"
+    ],
+    "tags": [
+      "isaac-sim",
+      "pick-and-place",
+      "robotiq",
+      "ur10e"
+    ]
+  },
+  "component_roles": {
+    "robot": {
+      "required_component_type_tags": [
+        "articulated-arm"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ]
+    },
+    "tool": {
+      "required_component_type_tags": [
+        "gripper"
+      ]
+    }
+  },
+  "description": "Retained Isaac Sim light-scene pick-and-place Program for the UR10e and Robotiq 2F-140. It preserves the exact authored meshes and poses, typed simulator play/reset/pause lifecycle, observed-scene planning, physical gripper commands, carried-object transitions, and retained-world rest pose.",
+  "forest": [
+    {
+      "children": [
+        {
+          "children": [],
+          "instance_id": "set_cheese_initial_pose",
+          "node_id": "simulation.set_entity_pose",
+          "parameters": {
+            "pose": {
+              "frame_ref": {
+                "kind": "cell_frame"
+              },
+              "orientation": {
+                "rpy_deg": [
+                  92.340746,
+                  -1.76826,
+                  -90.093258
+                ]
+              },
+              "position_m": [
+                -0.455038,
+                0.076595,
+                0.087827
+              ]
+            },
+            "scene_resource_id": "isaac_cheese_box"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "play_simulation",
+          "node_id": "simulation.set_state",
+          "parameters": {
+            "state": "play"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "wait_for_simulation",
+          "node_id": "timer",
+          "parameters": {
+            "duration_s": 1.0
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "open_gripper_start",
+          "node_id": "gripper.command_position",
+          "parameters": {
+            "command_duration_s": 1.0,
+            "max_effort": {
+              "kind": "angular_newton_meter",
+              "value_nm": 40.0
+            },
+            "position": {
+              "kind": "angular_rad",
+              "value_rad": 0.0
+            },
+            "target_role": "gripper"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_pick_approach",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  -180.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                0.2
+              ]
+            },
+            "offset_reference": {
+              "frame_role_id": "base",
+              "type": "frame_role"
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "scene_resource_id": "isaac_cheese_box",
+              "type": "scene_resource"
+            },
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_pick",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  -180.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                0.08
+              ]
+            },
+            "offset_reference": {
+              "frame_role_id": "base",
+              "type": "frame_role"
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "scene_resource_id": "isaac_cheese_box",
+              "type": "scene_resource"
+            },
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [
+            {
+              "children": [],
+              "instance_id": "close_gripper",
+              "node_id": "gripper.command_position",
+              "parameters": {
+                "command_duration_s": 1.0,
+                "max_effort": {
+                  "kind": "angular_newton_meter",
+                  "value_nm": 40.0
+                },
+                "position": {
+                  "kind": "angular_rad",
+                  "value_rad": 0.55
+                },
+                "target_role": "gripper"
+              }
+            },
+            {
+              "children": [],
+              "instance_id": "wait_before_attach",
+              "node_id": "timer",
+              "parameters": {
+                "duration_s": 0.5
+              }
+            },
+            {
+              "children": [],
+              "instance_id": "attach_cheese_box",
+              "node_id": "scene.attach_carried_object",
+              "parameters": {
+                "carrier_frame_role": "tcp",
+                "scene_resource_id": "isaac_cheese_box",
+                "target_role": "gripper",
+                "touch_body_roles": [
+                  "gripper_collision"
+                ]
+              }
+            }
+          ],
+          "instance_id": "close_and_attach",
+          "node_id": "sequence",
+          "parameters": {}
+        },
+        {
+          "children": [],
+          "instance_id": "pick_retreat",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                -0.2
+              ]
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "frame_role_id": "tcp",
+              "type": "frame_role"
+            },
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_drop_approach",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  -180.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                0.4
+              ]
+            },
+            "offset_reference": {
+              "frame_role_id": "base",
+              "type": "frame_role"
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "scene_resource_id": "isaac_small_klt",
+              "type": "scene_resource"
+            },
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_drop",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  -180.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                0.35
+              ]
+            },
+            "joint_position_tol_rad": 0.05,
+            "offset_reference": {
+              "frame_role_id": "base",
+              "type": "frame_role"
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "scene_resource_id": "isaac_small_klt",
+              "type": "scene_resource"
+            },
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [
+            {
+              "children": [],
+              "instance_id": "detach_cheese_box",
+              "node_id": "scene.detach_carried_object",
+              "parameters": {
+                "scene_resource_id": "isaac_cheese_box",
+                "target_role": "gripper"
+              }
+            },
+            {
+              "children": [],
+              "instance_id": "wait_after_detach",
+              "node_id": "timer",
+              "parameters": {
+                "duration_s": 1.0
+              }
+            },
+            {
+              "children": [],
+              "instance_id": "open_gripper_release",
+              "node_id": "gripper.command_position",
+              "parameters": {
+                "command_duration_s": 1.0,
+                "max_effort": {
+                  "kind": "angular_newton_meter",
+                  "value_nm": 40.0
+                },
+                "position": {
+                  "kind": "angular_rad",
+                  "value_rad": 0.0
+                },
+                "target_role": "gripper"
+              }
+            }
+          ],
+          "instance_id": "detach_and_open",
+          "node_id": "sequence",
+          "parameters": {}
+        },
+        {
+          "children": [],
+          "instance_id": "drop_retreat",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  -180.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                0.4
+              ]
+            },
+            "offset_reference": {
+              "frame_role_id": "base",
+              "type": "frame_role"
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "scene_resource_id": "isaac_small_klt",
+              "type": "scene_resource"
+            },
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "return_rest",
+          "node_id": "motion.move_to_joint_target",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": [
+              {
+                "joint_name": "shoulder_pan_joint",
+                "position_rad": 2.63422544
+              },
+              {
+                "joint_name": "shoulder_lift_joint",
+                "position_rad": -0.875980752
+              },
+              {
+                "joint_name": "elbow_joint",
+                "position_rad": 1.551074106
+              },
+              {
+                "joint_name": "wrist_1_joint",
+                "position_rad": -2.29231544
+              },
+              {
+                "joint_name": "wrist_2_joint",
+                "position_rad": -1.560498884
+              },
+              {
+                "joint_name": "wrist_3_joint",
+                "position_rad": -2.038544566
+              }
+            ],
+            "planning_timeout_s": 10.0,
+            "target_role": "arm",
+            "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "reset_simulation",
+          "node_id": "simulation.reset",
+          "parameters": {}
+        },
+        {
+          "children": [],
+          "instance_id": "wait_after_reset",
+          "node_id": "timer",
+          "parameters": {
+            "duration_s": 3.0
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "pause_simulation",
+          "node_id": "simulation.set_state",
+          "parameters": {
+            "state": "pause"
+          }
+        }
+      ],
+      "instance_id": "isaac_light_cycle",
+      "node_id": "sequence",
+      "parameters": {}
+    }
+  ],
+  "name": "isaac_manipulator_scene_light",
+  "parameters": [
+    {
+      "constraints": {
+        "max_inclusive": 1.0,
+        "min_exclusive": 0.0
+      },
+      "default": 0.2,
+      "description": "Velocity scale for all retained-world moves.",
+      "parameter_id": "velocity_scale",
+      "runtime_mutability": "before_run",
+      "type": "float64"
+    }
+  ],
+  "positions": {},
+  "program_id": "isaac_manipulator_scene_light",
+  "program_profile": "composable-cell-v1",
+  "scene": [
+    {
+      "metadata": {
+        "support_contacts": [
+          {
+            "allow_recontact": false,
+            "enforce_max_start_penetration": false,
+            "max_start_penetration_m": 0.0,
+            "min_release_progress_m": 0.0,
+            "mode": "contact_release",
+            "release_evidence_mode": "binary_contact",
+            "release_tolerance_m": 0.0,
+            "require_separation_by_end": true,
+            "require_strictly_decreasing_penetration": false,
+            "support_object_id": "isaac_table_low_327"
+          }
+        ]
+      },
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            92.340746,
+            -1.76826,
+            -90.093258
+          ]
+        },
+        "position_m": [
+          -0.455038,
+          0.076595,
+          0.087827
+        ]
+      },
+      "resource_roles": [
+        "pick_object"
+      ],
+      "scene_resource_id": "isaac_cheese_box",
+      "shape": {
+        "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj",
+        "mesh_scale": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "type": "mesh"
+      }
+    },
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            -7.6e-05,
+            0.162992,
+            0.006698
+          ]
+        },
+        "position_m": [
+          -0.561839,
+          -0.367252,
+          0.073459
+        ]
+      },
+      "scene_resource_id": "isaac_small_klt",
+      "shape": {
+        "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/World__small_KLT_collider_primitives.obj",
+        "mesh_scale": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "type": "mesh"
+      }
+    },
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            -2.1e-05,
+            -0.104678,
+            -4e-05
+          ]
+        },
+        "position_m": [
+          0.27161648869514465,
+          -0.35853588581085205,
+          0.07468909025192261
+        ]
+      },
+      "scene_resource_id": "isaac_small_klt_01",
+      "shape": {
+        "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/World__small_KLT_01_collider_primitives.obj",
+        "mesh_scale": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "type": "mesh"
+      }
+    },
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            89.988004,
+            0.106372,
+            173.509839
+          ]
+        },
+        "position_m": [
+          0.085370734333992,
+          -0.004780956543982029,
+          0.05248536914587021
+        ]
+      },
+      "scene_resource_id": "isaac_soup_can",
+      "shape": {
+        "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj",
+        "mesh_scale": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "type": "mesh"
+      }
+    },
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "position_m": [
+          0.0,
+          0.0,
+          -0.7695999827980996
+        ]
+      },
+      "scene_resource_id": "isaac_table_low_327",
+      "shape": {
+        "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj",
+        "mesh_scale": [
+          1.0,
+          1.5,
+          1.149999976
+        ],
+        "type": "mesh"
+      }
+    }
+  ],
+  "schema_version": "manyforge.composer_authoring_forest.v1",
+  "target_roles": {
+    "arm": {
+      "component_role": "robot",
+      "required_capabilities": [
+        {
+          "capability_id": "execution.feedback.phase_events",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "execution.trajectory.execute",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.joint_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.pose_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.profile.balanced",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.trajectory.time_parameterized",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "state.observed.current",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "validation.trajectory.non_collision",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [
+        "arm_collision"
+      ],
+      "required_frame_roles": [
+        "base",
+        "tcp"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ],
+      "required_resource_roles": [
+        "arm_joints"
+      ]
+    },
+    "gripper": {
+      "component_role": "tool",
+      "required_capabilities": [
+        {
+          "capability_id": "model.kinematics.fk",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "tool.gripper.command",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "tool.gripper.feedback",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [
+        "gripper_collision"
+      ],
+      "required_frame_roles": [
+        "tcp"
+      ],
+      "required_resource_roles": [
+        "fingers"
+      ]
+    }
+  }
+}

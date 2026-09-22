@@ -1607,7 +1607,7 @@ def _service(
     execution: object | None = None,
     program_runner: object | None = None,
     cclc: object | None = None,
-    deployment_compiler: object | None = None,
+    activation_preparer: object | None = None,
 ) -> HeadlessService:
     return HeadlessService(
         core,
@@ -1616,7 +1616,7 @@ def _service(
         program_runner=program_runner,  # type: ignore[arg-type]
         cell_admission=FakeCellAdmission(),
         cclc=cclc,
-        deployment_compiler=deployment_compiler,  # type: ignore[arg-type]
+        activation_preparer=activation_preparer,  # type: ignore[arg-type]
     )
 
 
@@ -1630,16 +1630,17 @@ def _client(*, trusted: bool = False) -> tuple[TestClient, FakeCore, FakeManager
     return TestClient(app), core, manager
 
 
-class FakeDeploymentCompiler:
+class FakeActivationPreparer:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    def compile(self, **kwargs: Any) -> dict[str, Any]:
+    def prepare(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(copy.deepcopy(kwargs))
         return {
-            "schema_version": "manyforge.deployment_candidate_compilation.v1",
-            "scenario_id": kwargs["scenario_id"],
-            "scenario_catalog_revision": kwargs["expected_scenario_catalog_revision"],
+            "schema_version": "manyforge.prepared_activation_input.v2",
+            "source_document_digest": kwargs["source_document_digest"],
+            "captured_input_digest": kwargs["captured_input_digest"],
+            "prepared_activation_id": "sha256:" + "6" * 64,
             "deployment_artifact_id": "cell_a",
             "deployment_revision": "sha256:" + "1" * 64,
             "retained_bundle_id": "sha256:" + "2" * 64,
@@ -1647,39 +1648,54 @@ class FakeDeploymentCompiler:
             "program_id": "program_a",
             "program_revision": "sha256:" + "4" * 64,
             "program_binding_id": "sha256:" + "5" * 64,
+            "node_environment_digest": "sha256:" + "7" * 64,
+            "assistant_mode": "forbidden",
+            "typed_parameter_overrides": kwargs["typed_parameter_overrides"],
         }
 
 
-def test_deployment_candidate_compilation_requires_and_replays_exact_claim() -> None:
+def test_activation_preparation_requires_and_replays_exact_claim() -> None:
     core = FakeCore()
     manager = FakeManager()
-    compiler = FakeDeploymentCompiler()
+    preparer = FakeActivationPreparer()
     client = TestClient(
-        create_app(service=_service(core, manager, deployment_compiler=compiler))
+        create_app(service=_service(core, manager, activation_preparer=preparer))
     )
     body = {
-        "scenario_id": "cell_a",
-        "expected_scenario_catalog_revision": "sha256:" + "6" * 64,
+        "source_document_digest": "sha256:" + "6" * 64,
+        "captured_input_digest": "sha256:" + "8" * 64,
         "deployment": {"api_version": "manyforge.deployment.v1"},
+        "model_source_closure": {
+            "schema_version": "manyforge.activation_model_source_closure.v1",
+            "components": [],
+        },
         "program": {"api_version": "manyforge.program.v2"},
+        "program_role_assignment": {"component_roles": [], "target_roles": []},
+        "typed_parameter_overrides": {},
         "authoring_claim": _authoring_claim(),
     }
 
-    response = client.post("/api/manager/deployment-candidates/compile", json=body)
+    response = client.post("/api/activation-preparations", json=body)
 
     assert response.status_code == 200, response.text
-    assert response.json()["compilation"]["scenario_id"] == "cell_a"
-    assert compiler.calls == [
+    assert response.json()["prepared_activation"]["prepared_activation_id"]
+    assert preparer.calls == [
         {
-            "scenario_id": "cell_a",
-            "expected_scenario_catalog_revision": "sha256:" + "6" * 64,
+            "source_document_digest": "sha256:" + "6" * 64,
+            "captured_input_digest": "sha256:" + "8" * 64,
             "deployment": {"api_version": "manyforge.deployment.v1"},
+            "model_source_closure": {
+                "schema_version": "manyforge.activation_model_source_closure.v1",
+                "components": [],
+            },
             "program": {"api_version": "manyforge.program.v2"},
+            "program_role_assignment": {"component_roles": [], "target_roles": []},
+            "typed_parameter_overrides": {},
         }
     ]
 
     body["authoring_claim"] = {"intent": {"claim_kind": "not-authoring"}}
-    rejected = client.post("/api/manager/deployment-candidates/compile", json=body)
+    rejected = client.post("/api/activation-preparations", json=body)
     assert rejected.status_code == 409
     assert rejected.json()["detail"]["code"] == "authoring_not_ready"
 
