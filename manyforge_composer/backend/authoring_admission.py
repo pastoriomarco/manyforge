@@ -7,7 +7,8 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Any, Callable, Mapping, TypeVar
+import threading
+from typing import TYPE_CHECKING, Any, Callable, Mapping, TypeVar
 import uuid
 
 from fastapi import HTTPException
@@ -24,6 +25,16 @@ from .authoring_transaction_journal import (
     canonical_digest,
     owner_transaction_id,
 )
+
+if TYPE_CHECKING:
+    from .authoring_workspace import (
+        AuthoringWorkspace,
+        AuthoringWorkspaceIdentity,
+        AuthoringWorkspaceSnapshot,
+    )
+
+
+_LOCAL_MUTATION_SESSIONS = frozenset({"program", "deployment", "whole-workspace"})
 
 _T = TypeVar("_T")
 _LOGGER = logging.getLogger(__name__)
@@ -75,6 +86,19 @@ class AuthoringMutationEnvelope:
     request_id: str
 
 
+@dataclass(slots=True)
+class _PendingLocalClaim:
+    """One bounded in-memory local claim, including an uncertain Acquire."""
+
+    acquire_request: dict[str, Any]
+    owner_transaction_id: str
+    operation_kind: str
+    payload_digest: str
+    claim: dict[str, Any] | None = None
+    settlement_kind: str = "proven_no_effect"
+    publish_wake: Callable[[], None] | None = None
+
+
 class AuthoringAdmissionCoordinator:
     """Composer owner integration; Kernel remains admission authority."""
 
@@ -98,10 +122,31 @@ class AuthoringAdmissionCoordinator:
         self.receiver_epoch = f"composer-snapshot-{uuid.uuid4().hex}"
         self._ready = False
         self._blocked_reason: str | None = "authoring recovery has not run"
+        # At most one unresolved local claim is retained, in memory only. The
+        # composite workspace revision makes a lost-response retry reject stale,
+        # so no local request ledger is needed. One lock serializes the local
+        # sequence so a single pending slot can never be overwritten; its order
+        # is always local-mutation lock, then workspace lock, then session lock.
+        self._local_claim_lock = threading.Lock()
+        self._local_mutation_lock = threading.Lock()
+        self._pending_local_claim: _PendingLocalClaim | None = None
 
     @property
     def mutation_ready(self) -> bool:
         return self._ready
+
+    @property
+    def local_claim_pending(self) -> bool:
+        """Report whether one unresolved local claim is still retained."""
+
+        with self._local_claim_lock:
+            return self._pending_local_claim is not None
+
+    def _block(self, reason: str) -> None:
+        """Contain authoring after an unknown local-mutation outcome."""
+
+        self._ready = False
+        self._blocked_reason = reason
 
     @staticmethod
     def _unavailable(code: str, message: str) -> HTTPException:
@@ -110,7 +155,33 @@ class AuthoringAdmissionCoordinator:
     def recover(self) -> None:
         """Resolve predecessor rows, then rotate the exact Kernel owner role."""
 
+        # Recovery and local mutation both operate on the single bounded local
+        # claim slot. Serialize the complete recovery pass with local edits so
+        # neither can settle or replace evidence owned by the other.
+        with self._local_mutation_lock:
+            self._recover_locked()
+
+    def _recover_locked(self) -> None:
+        """Run recovery while the local-mutation serialization lock is held."""
+
         try:
+            # Settle one retained local claim before the durable predecessor
+            # sweep: an unreleased claim of our own epoch is not proof that
+            # authoring is available, and that sweep cannot see an unjournaled
+            # local claim.
+            try:
+                self._settle_pending_local_claim()
+            except HTTPException as error:
+                detail = error.detail
+                raise AuthoringJournalError(
+                    "composer_authoring_release_uncertain",
+                    (
+                        detail.get("message")
+                        if isinstance(detail, dict)
+                        else "the retained local authoring claim is unsettled"
+                    ),
+                ) from error
+
             receipt: dict[str, Any] | None = None
             restored_post_image: dict[str, Any] | None = None
             for transaction in self._journal.unresolved():
@@ -1094,6 +1165,334 @@ class AuthoringAdmissionCoordinator:
                 envelope=envelope,
             )
         return result
+
+    # -- local workspace mutations (UA2D.4) -------------------------------
+
+    def execute_local_mutation(
+        self,
+        envelope: AuthoringMutationEnvelope,
+        *,
+        operation_kind: str,
+        draft_id: str,
+        draft_revision: int,
+        payload: Mapping[str, Any],
+        workspace: "AuthoringWorkspace",
+        install: Callable[[], bool],
+        session: str = "program",
+        expected_identity: "AuthoringWorkspaceIdentity | None" = None,
+        project: Mapping[str, Any] | None = None,
+    ) -> "AuthoringWorkspaceSnapshot":
+        """Commit one ordinary workspace mutation under the exact Kernel claim.
+
+        The caller has already prepared its immutable value; this method owns the
+        whole protocol so no caller emulates it. The sequence is fixed:
+        admission, acquire the exact Kernel authoring claim, one fenced
+        workspace commit with the wake deferred, settle that claim, then at most
+        one wake. Nothing is journaled and nothing is persisted.
+
+        ``session`` selects the fenced commit: ``program`` and ``deployment`` are
+        ordinary Draft commits and ``whole-workspace`` is the replacement that
+        may rotate a Draft identity.
+
+        A refusal that installed nothing settles as ``proven_no_effect`` and
+        preserves the caller's typed error. An uncertain install or settlement
+        retains the exact claim evidence in memory, contains authoring and stays
+        closed until :meth:`recover` settles that one claim. One lock serializes
+        local mutations so the single retained-claim slot can never be
+        overwritten by a concurrent edit.
+        """
+
+        if session not in _LOCAL_MUTATION_SESSIONS:
+            raise ValueError("local mutation session is not supported")
+        if not callable(install):
+            raise TypeError("local mutation install must be callable")
+        with self._local_mutation_lock:
+            return self._execute_local_mutation_locked(
+                envelope,
+                operation_kind=operation_kind,
+                draft_id=draft_id,
+                draft_revision=draft_revision,
+                payload=payload,
+                workspace=workspace,
+                install=install,
+                session=session,
+                expected_identity=expected_identity,
+                project=project,
+            )
+
+    def _execute_local_mutation_locked(
+        self,
+        envelope: AuthoringMutationEnvelope,
+        *,
+        operation_kind: str,
+        draft_id: str,
+        draft_revision: int,
+        payload: Mapping[str, Any],
+        workspace: "AuthoringWorkspace",
+        install: Callable[[], bool],
+        session: str,
+        expected_identity: "AuthoringWorkspaceIdentity | None",
+        project: Mapping[str, Any] | None,
+    ) -> "AuthoringWorkspaceSnapshot":
+        """Run the fixed local sequence with the single pending slot owned."""
+
+        if workspace.failed_closed is not None:
+            raise self._unavailable(
+                "composer_workspace_failed_closed",
+                "the Composer authoring workspace is contained: "
+                f"{workspace.failed_closed}",
+            )
+        payload_digest = canonical_digest(
+            {
+                "operation_kind": operation_kind,
+                "draft_id": draft_id,
+                "draft_revision": draft_revision,
+                "payload": dict(payload),
+            }
+        )
+        self._settle_pending_local_claim()
+        self._require_mutation_ready()
+        admission = self._client.authoring_admission()
+        if admission.get("authoring_allowed") is not True:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "authoring_not_ready",
+                    "message": "editing requires idle execution and healthy components",
+                },
+            )
+        if (
+            admission.get("admission_generation")
+            != envelope.expected_admission_generation
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "stale_generation",
+                    "message": "authoring admission generation changed",
+                },
+            )
+        revision_before = workspace.revision
+        transaction_id = owner_transaction_id(
+            envelope.request_owner_epoch, envelope.request_id
+        )
+        claim = self._acquire_local_claim(
+            transaction_id=transaction_id,
+            payload_digest=payload_digest,
+            expected_admission_generation=envelope.expected_admission_generation,
+            operation_kind=operation_kind,
+        )
+        # The browser is presentation only. Recheck backend-owned readiness
+        # after acquiring the exact claim, as the durable path does.
+        self._require_mutation_ready()
+        installed: list[bool] = []
+
+        def tracked_install() -> bool:
+            changed = install()
+            installed.append(changed)
+            return changed
+
+        # Once installation begins, a failure is not proof of no effect. A
+        # refusal before the installer runs changes this back to
+        # ``proven_no_effect`` in the exception path below.
+        with self._local_claim_lock:
+            assert self._pending_local_claim is not None
+            self._pending_local_claim.settlement_kind = "owner_commit"
+        try:
+            snapshot = self._commit_local(
+                session=session,
+                workspace=workspace,
+                draft_id=draft_id,
+                expected_identity=expected_identity,
+                install=tracked_install,
+                project=project,
+            )
+        except Exception as error:
+            if not installed and workspace.failed_closed is None:
+                # The prepared install never ran and the workspace is still
+                # consistent, so the claim is released truthfully as a proven
+                # no-effect and the caller's typed refusal is preserved.
+                self._settle_pending_local_claim("proven_no_effect")
+                raise
+            self._block(
+                "local authoring install outcome is unknown: "
+                f"{type(error).__name__}: {error}"
+            )
+            raise
+        if workspace.revision != revision_before:
+            # Retain the one deferred wake with the claim. If settlement is
+            # temporarily unavailable, recover() publishes it after settling
+            # this exact claim instead of losing the committed notification.
+            with self._local_claim_lock:
+                assert self._pending_local_claim is not None
+                self._pending_local_claim.publish_wake = (
+                    workspace.publish_commit_wake
+                )
+        self._settle_pending_local_claim()
+        return snapshot
+
+    @staticmethod
+    def _commit_local(
+        *,
+        session: str,
+        workspace: "AuthoringWorkspace",
+        draft_id: str,
+        expected_identity: "AuthoringWorkspaceIdentity | None",
+        install: Callable[[], bool],
+        project: Mapping[str, Any] | None,
+    ) -> "AuthoringWorkspaceSnapshot":
+        """Commit one prepared value with the workspace wake deferred."""
+
+        if session == "whole-workspace":
+            return workspace.replace(
+                expected_identity=expected_identity,
+                install=install,
+                project=project,
+                notify=False,
+            )
+        if session == "deployment":
+            return workspace.commit_deployment(
+                draft_id=draft_id,
+                expected_identity=expected_identity,
+                install=install,
+                notify=False,
+            )
+        return workspace.commit_program(
+            draft_id=draft_id,
+            expected_identity=expected_identity,
+            install=install,
+            notify=False,
+        )
+
+    def _acquire_local_claim(
+        self,
+        *,
+        transaction_id: str,
+        payload_digest: str,
+        expected_admission_generation: int,
+        operation_kind: str,
+    ) -> dict[str, Any]:
+        """Acquire the exact Kernel authoring claim for one local mutation."""
+
+        request = {
+            "request_id": transaction_id,
+            "request_owner_epoch": self.owner_epoch,
+            "source_label": "manyforge_composer",
+            "correlation_id": None,
+            "expected_admission_generation": expected_admission_generation,
+            "request_payload_digest": payload_digest,
+            "owner_transaction_id": transaction_id,
+        }
+        # Retain the request before transport. If Acquire succeeds remotely but
+        # its response is lost, recover() replays this exact identity and then
+        # settles it as proven-no-effect because installation never began.
+        with self._local_claim_lock:
+            self._pending_local_claim = _PendingLocalClaim(
+                acquire_request=request,
+                owner_transaction_id=transaction_id,
+                operation_kind=operation_kind,
+                payload_digest=payload_digest,
+            )
+        try:
+            response = self._client.acquire_authoring_transaction(request)
+        except HeadlessClientError as error:
+            self._block(
+                "local authoring claim acquire is uncertain: " + str(error)
+            )
+            raise self._unavailable(error.code, str(error)) from error
+        claim = response.get("claim")
+        if not isinstance(claim, dict):
+            self._block("local authoring claim acquire omitted the exact claim")
+            raise self._unavailable(
+                "composer_authoring_claim_invalid",
+                "Headless omitted the exact authoring claim",
+            )
+        with self._local_claim_lock:
+            assert self._pending_local_claim is not None
+            self._pending_local_claim.claim = claim
+        return claim
+
+    @staticmethod
+    def _local_release_evidence(
+        pending: _PendingLocalClaim, settlement_kind: str
+    ) -> str:
+        """Derive the release evidence for one retained local claim."""
+
+        return canonical_digest(
+            {
+                "owner_transaction_id": pending.owner_transaction_id,
+                "operation_kind": pending.operation_kind,
+                "payload_digest": pending.payload_digest,
+                "settlement_kind": settlement_kind,
+            }
+        )
+
+    def _settle_pending_local_claim(
+        self, settlement_kind: str | None = None
+    ) -> dict[str, Any] | None:
+        """Settle the one retained local claim, if any.
+
+        Returns the Kernel admission projection, or ``None`` when no local claim
+        is outstanding. An uncertain settlement keeps the exact claim evidence,
+        contains authoring and raises a typed unavailability; it never infers a
+        release from elapsed time and never rolls back a committed edit.
+        """
+
+        with self._local_claim_lock:
+            pending = self._pending_local_claim
+            if pending is not None and settlement_kind is not None:
+                pending.settlement_kind = settlement_kind
+        if pending is None:
+            return None
+        if pending.claim is None:
+            try:
+                acquired = self._client.acquire_authoring_transaction(
+                    pending.acquire_request
+                )
+            except Exception as error:
+                self._block(
+                    "local authoring claim acquire is uncertain: "
+                    f"{type(error).__name__}: {error}"
+                )
+                raise self._unavailable(
+                    "composer_authoring_claim_uncertain",
+                    "the exact local authoring claim is unresolved; authoring "
+                    "stays closed until recovery can replay its identity",
+                ) from error
+            claim = acquired.get("claim")
+            if not isinstance(claim, dict):
+                self._block("replayed local authoring acquire omitted the claim")
+                raise self._unavailable(
+                    "composer_authoring_claim_invalid",
+                    "Headless omitted the replayed local authoring claim",
+                )
+            with self._local_claim_lock:
+                pending.claim = claim
+        try:
+            response = self._client.settle_authoring_transaction(
+                {
+                    "claim": pending.claim,
+                    "settlement_kind": pending.settlement_kind,
+                    "evidence_digest": self._local_release_evidence(
+                        pending, pending.settlement_kind
+                    ),
+                }
+            )
+        except Exception as error:
+            self._block(
+                "local authoring claim settlement is uncertain: "
+                f"{type(error).__name__}: {error}"
+            )
+            raise self._unavailable(
+                "composer_authoring_release_uncertain",
+                "the exact local authoring claim is unsettled; authoring stays "
+                "closed until the existing recovery call settles it",
+            ) from error
+        with self._local_claim_lock:
+            self._pending_local_claim = None
+        if pending.publish_wake is not None:
+            pending.publish_wake()
+        return response
 
 
 __all__ = [

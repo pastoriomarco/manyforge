@@ -112,6 +112,23 @@ def _mutate(session: ComposerDraftSession, tool_id: str, arguments: dict):
     )
 
 
+def test_prepared_program_replacement_is_deeply_immutable() -> None:
+    session = ComposerDraftSession(_program())
+    prepared = session.prepare_open_replacement(
+        _program(), source_path=str(_PROGRAM_PATH)
+    )
+
+    with pytest.raises(TypeError):
+        prepared.authoring["scene"][0]["scene_resource_id"] = "tampered"
+    with pytest.raises(TypeError):
+        prepared.saved_document["name"] = "tampered"
+
+    session.install_prepared_replacement(prepared)
+    assert session.snapshot()["authoring"]["scene"][0]["scene_resource_id"] != (
+        "tampered"
+    )
+
+
 def _pick_macro_arguments() -> dict:
     return {
         "macro_id": "pick_subtree",

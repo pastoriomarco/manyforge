@@ -293,6 +293,19 @@ class AuthoringWorkspace:
         return self._epoch
 
     @property
+    def failed_closed(self) -> str | None:
+        """Return the containment reason, or ``None`` while the workspace is usable.
+
+        A non-``None`` value means an in-memory install violated its contract,
+        so the workspace refuses further commits and a caller must not treat a
+        refused commit as a proven no-op. This diagnostic read stays available
+        while the workspace is contained.
+        """
+
+        with self._lock:
+            return self._failed_closed
+
+    @property
     def revision(self) -> int:
         with self._lock:
             self._require_usable_locked()
@@ -342,8 +355,14 @@ class AuthoringWorkspace:
         document_path: str | None = None,
         source_document_digest: str | None = None,
         source_diagnostics: list[dict[str, str]] | None = None,
+        notify: bool = True,
     ) -> AuthoringWorkspaceSnapshot:
-        """Install the Scenario project facts in one composite commit."""
+        """Install the Scenario project facts in one composite commit.
+
+        ``notify=False`` suppresses the wake so the local admission path can
+        publish exactly one wake after the Kernel authoring claim is settled;
+        the caller then calls :meth:`publish_commit_wake`.
+        """
 
         with self._lock:
             self._require_usable_locked()
@@ -361,9 +380,18 @@ class AuthoringWorkspace:
                 self._project_facts_locked() != before
             )
             captured = self._snapshot_locked()
-        if advanced:
+        if advanced and notify:
             self._notify_once()
         return captured
+
+    def publish_commit_wake(self) -> None:
+        """Publish the one latest-only wake for an already committed change.
+
+        The local admission path commits with ``notify=False`` so the workspace
+        wake follows the exact Kernel claim settlement instead of preceding it.
+        """
+
+        self._notify_once()
 
     def migrate_project_facts(
         self, overrides: Mapping[str, Any]
@@ -414,6 +442,7 @@ class AuthoringWorkspace:
         draft_id: str,
         expected_identity: AuthoringWorkspaceIdentity | None = None,
         install: Callable[[], bool],
+        notify: bool = True,
     ) -> AuthoringWorkspaceSnapshot:
         """Commit one already-prepared Program Draft change.
 
@@ -421,6 +450,9 @@ class AuthoringWorkspace:
         it changed workspace state. It must fence the Program Draft identity
         itself through the existing session API; this owner additionally
         verifies that the install did not rotate the Program Draft identity.
+        ``notify=False`` defers the single wake to
+        :meth:`publish_commit_wake`, so the local admission path can publish it
+        after the Kernel authoring claim is settled.
         """
 
         return self._commit(
@@ -428,6 +460,7 @@ class AuthoringWorkspace:
             draft_id=draft_id,
             expected_identity=expected_identity,
             install=install,
+            notify=notify,
         )
 
     def commit_deployment(
@@ -436,6 +469,7 @@ class AuthoringWorkspace:
         draft_id: str,
         expected_identity: AuthoringWorkspaceIdentity | None = None,
         install: Callable[[], bool],
+        notify: bool = True,
     ) -> AuthoringWorkspaceSnapshot:
         """Commit one already-prepared Deployment Draft change.
 
@@ -448,6 +482,7 @@ class AuthoringWorkspace:
             draft_id=draft_id,
             expected_identity=expected_identity,
             install=install,
+            notify=notify,
         )
 
     def replace(
@@ -456,6 +491,7 @@ class AuthoringWorkspace:
         expected_identity: AuthoringWorkspaceIdentity | None = None,
         install: Callable[[], bool],
         project: Mapping[str, Any] | None = None,
+        notify: bool = True,
     ) -> AuthoringWorkspaceSnapshot:
         """Replace the whole workspace, allowing both Draft identities to rotate.
 
@@ -500,7 +536,7 @@ class AuthoringWorkspace:
             changed = changed or self._project_facts_locked() != project_before
             advanced = self._finish_commit_locked(changed)
             captured = self._snapshot_locked()
-        if advanced:
+        if advanced and notify:
             self._notify_once()
         return captured
 
@@ -513,6 +549,7 @@ class AuthoringWorkspace:
         draft_id: str,
         expected_identity: AuthoringWorkspaceIdentity | None,
         install: Callable[[], bool],
+        notify: bool = True,
     ) -> AuthoringWorkspaceSnapshot:
         if not callable(install):
             raise TypeError("authoring workspace install must be callable")
@@ -529,7 +566,7 @@ class AuthoringWorkspace:
             self._require_commit_scope_locked(session, before, after, changed)
             advanced = self._finish_commit_locked(changed)
             captured = self._snapshot_locked()
-        if advanced:
+        if advanced and notify:
             self._notify_once()
         return captured
 

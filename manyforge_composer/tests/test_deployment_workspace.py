@@ -619,6 +619,20 @@ def _document() -> dict[str, Any]:
     }
 
 
+def test_prepared_deployment_replacement_is_deeply_immutable() -> None:
+    session = DeploymentDraftSession(compiler=_compile)
+    compiled = session.preview_source(json.dumps(_document()))
+    prepared = session.prepare_open_replacement(compiled, "/tmp/deployment.yaml")
+
+    with pytest.raises(TypeError):
+        prepared.compiled.document["graph"]["runtime_units"] = ["tampered"]
+
+    session.install_prepared_replacement(prepared)
+    assert session.snapshot()["draft"]["document"]["graph"][
+        "runtime_units"
+    ] == []
+
+
 def _focused_document() -> dict[str, Any]:
     document = _document()
     document["graph"]["control_bindings"] = [

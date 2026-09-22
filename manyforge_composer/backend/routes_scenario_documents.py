@@ -17,7 +17,12 @@ from .authoring_forest import (
     derive_candidate,
     validate_invariants,
 )
+from .authoring_identity import canonical_digest
 from .authoring_transaction_journal import AuthoringJournalError
+from .authoring_workspace import (
+    AuthoringWorkspaceError,
+    AuthoringWorkspaceIdentity,
+)
 from .deployment_draft import DeploymentDraftError
 from .draft_session import DraftSessionError
 from .scenario_artifacts import (
@@ -191,6 +196,62 @@ def _workspace_post_state(
     }
 
 
+def _document_content_digest(document: dict[str, Any]) -> str:
+    """Return the exact identity of the complete persisted Scenario document."""
+
+    return canonical_digest(document)
+
+
+def _published_content_digest(state: ComposerState, target: str) -> str | None:
+    """Return the content identity already published at one exact target.
+
+    A lost response is resolved by rereading the exact target and comparing this
+    identity with the content captured for that request; a missing or different
+    target returns ``None``, so the ordinary overwrite rules still apply.
+    """
+
+    try:
+        document, _source, _digest = capture_scenario_artifact(
+            target, allowed_roots=state.allowed_fs_roots
+        )
+    except (ScenarioArtifactError, OSError):
+        return None
+    try:
+        return _document_content_digest(document)
+    except (ScenarioArtifactError, OSError, TypeError, ValueError):
+        return None
+
+
+def _require_captured_workspace_fence(
+    body: _ScenarioFence, identity: AuthoringWorkspaceIdentity
+) -> None:
+    """Require the captured composite identity to match the client's fence.
+
+    ``_require_fence`` gives the established typed stale errors; this closes the
+    window between that check and the capture, so the bytes written and the
+    saved baseline adopted always come from the revision the client fenced.
+    """
+
+    if (
+        identity.program_draft_id != body.draft_id
+        or identity.program_draft_revision != body.expected_draft_revision
+        or identity.deployment_draft_id != body.deployment_draft_id
+        or identity.deployment_draft_revision
+        != body.expected_deployment_draft_revision
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "scenario_workspace_stale",
+                "message": (
+                    "the authoring workspace advanced while this request was "
+                    "captured; refresh the workspace identity and retry"
+                ),
+                "workspace": identity.as_dict(),
+            },
+        )
+
+
 def _require_fence(state: ComposerState, body: _ScenarioFence) -> None:
     state.draft_session.require_identity(
         body.draft_id, body.expected_draft_revision
@@ -227,12 +288,22 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
     def save_document(body: SaveScenarioDocumentRequest) -> dict[str, Any]:
         try:
             _require_fence(state, body)
-            program_state = state.draft_session.retained_state()
-            deployment_state = state.deployment_draft_session.retained_state()
-            deployment = deployment_state.get("document")
-            assignment = deepcopy(state.scenario_program_role_assignment)
+            # One immutable composite capture: the project written and the saved
+            # baseline adopted come from the same consistent revision, and the
+            # identity is rechecked atomically when that baseline is adopted.
+            snapshot = state.authoring_workspace.snapshot()
+            _require_captured_workspace_fence(body, snapshot.identity)
+            workspace_identity = snapshot.identity
+            # ``as_dict`` is the detached plain-JSON projection; the snapshot's
+            # own members are recursively read-only.
+            captured_workspace = snapshot.as_dict()
+            project = captured_workspace["project"]
+            authoring = captured_workspace["program"]["authoring"]
+            deployment = captured_workspace["deployment"]["document"]
+            assignment = project["program_role_assignment"]
+            overrides = project["typed_parameter_overrides"]
             complete = (
-                isinstance(program_state.get("authoring"), dict)
+                isinstance(authoring, dict)
                 and isinstance(deployment, dict)
                 and isinstance(assignment, dict)
             )
@@ -240,35 +311,60 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 scenario_id=body.scenario_id,
                 name=body.name.strip(),
                 description=body.description.strip(),
-                program_draft=program_state.get("authoring"),
+                program_draft=authoring,
                 deployment_draft=deployment,
                 program_role_assignment=assignment,
-                typed_parameter_overrides=deepcopy(
-                    state.scenario_typed_parameter_overrides
-                ),
+                typed_parameter_overrides=overrides,
                 manyforge_version=_version(),
                 last_known_status="unknown" if complete else "incomplete",
             )
             target = normalize_scenario_save_path(body.path)
-            current_target = state.scenario_document_path
+            current_target = project["document_path"]
             overwrite = body.confirm_overwrite or (
                 current_target is not None
                 and str(Path(target).expanduser().resolve()) == current_target
             )
-            saved_path = save_scenario_artifact(
-                document,
-                target,
-                allowed_roots=state.allowed_fs_roots,
-                overwrite=overwrite,
-                source_project_path=current_target,
-            )
+            if _published_content_digest(state, target) == _document_content_digest(
+                document
+            ):
+                # This exact content is already published at the target, so a
+                # lost response is resolved without repeating the write.
+                saved_path = str(Path(target).expanduser().resolve())
+            else:
+                saved_path = save_scenario_artifact(
+                    document,
+                    target,
+                    allowed_roots=state.allowed_fs_roots,
+                    overwrite=overwrite,
+                    source_project_path=current_target,
+                )
             captured, _, source_digest = capture_scenario_artifact(
                 saved_path, allowed_roots=state.allowed_fs_roots
             )
-            state.scenario_document_path = saved_path
-            state.remember_scenario_document(
-                captured, source_document_digest=source_digest
-            )
+            try:
+                state.authoring_workspace.remember_project(
+                    expected_identity=workspace_identity,
+                    document=captured,
+                    document_path=saved_path,
+                    source_document_digest=source_digest,
+                )
+            except AuthoringWorkspaceError as error:
+                if error.code != "composer_workspace_stale":
+                    raise
+                # The project is correctly written; only the Saved baseline is
+                # refused, so newer in-memory content is never labelled Saved.
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "scenario_saved_baseline_not_adopted",
+                        "message": (
+                            "the Scenario project was written but a newer "
+                            "workspace revision was not adopted as Saved"
+                        ),
+                        "path": saved_path,
+                        "currentWorkspace": error.detail.get("workspace"),
+                    },
+                ) from error
             return {
                 "status": "saved",
                 "path": saved_path,
@@ -382,42 +478,49 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
     def export_document(body: ExportScenarioDocumentRequest) -> dict[str, Any]:
         try:
             _require_fence(state, body)
-            source_path = state.scenario_document_path
-            if source_path is None:
+            # Export reads one immutable composite capture and never changes the
+            # workspace, so it takes no local commit and no saved baseline.
+            snapshot = state.authoring_workspace.snapshot()
+            _require_captured_workspace_fence(body, snapshot.identity)
+            captured_workspace = snapshot.as_dict()
+            project = captured_workspace["project"]
+            source_path = project["document_path"]
+            if not isinstance(source_path, str):
                 raise ScenarioArtifactError(
                     "scenario_export_source_unavailable",
                     "Save the Scenario project before exporting it",
                     status_code=409,
                 )
-            program_state = state.draft_session.retained_state()
-            deployment_state = state.deployment_draft_session.retained_state()
             document = build_scenario_document(
                 scenario_id=(
-                    state.scenario_document_id
-                    if isinstance(state.scenario_document_id, str)
+                    project["document_id"]
+                    if isinstance(project["document_id"], str)
                     else Path(source_path).name
                 ),
                 name=(
-                    state.scenario_document_name
-                    if isinstance(state.scenario_document_name, str)
+                    project["document_name"]
+                    if isinstance(project["document_name"], str)
                     else Path(source_path).name
                 ),
                 description=(
-                    state.scenario_document_description
-                    if isinstance(state.scenario_document_description, str)
+                    project["document_description"]
+                    if isinstance(project["document_description"], str)
                     else ""
                 ),
-                program_draft=program_state.get("authoring"),
-                deployment_draft=deployment_state.get("document"),
-                program_role_assignment=deepcopy(
-                    state.scenario_program_role_assignment
-                ),
-                typed_parameter_overrides=deepcopy(
-                    state.scenario_typed_parameter_overrides
-                ),
+                program_draft=captured_workspace["program"]["authoring"],
+                deployment_draft=captured_workspace["deployment"]["document"],
+                program_role_assignment=project["program_role_assignment"],
+                typed_parameter_overrides=project["typed_parameter_overrides"],
                 manyforge_version=_version(),
                 last_known_status="unknown",
             )
+            destination = str(Path(body.destination_path).expanduser().resolve())
+            if _published_content_digest(state, destination) == (
+                _document_content_digest(document)
+            ):
+                # The exact content is already published at the destination, so
+                # a lost response is resolved without repeating the export.
+                return {"status": "exported", "path": destination}
             exported_path = export_scenario_artifact(
                 document,
                 body.destination_path,

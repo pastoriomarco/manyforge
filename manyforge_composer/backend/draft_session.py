@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import threading
 import uuid
-from typing import Any, Callable, NoReturn, TypeVar
+from typing import Any, Callable, Mapping, NoReturn, TypeVar
 
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.canonical_artifact import (
@@ -44,6 +44,7 @@ from .authoring_forest import (
     empty_authoring,
     from_program,
 )
+from .authoring_identity import freeze_json, thaw_json
 
 
 _DRAFT_API_VERSION = "manyforge.composer_draft.v2"
@@ -221,6 +222,74 @@ class DraftMutationResult:
     mutation: str
     details: dict[str, Any]
     snapshot: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedProgramMutation:
+    """One Program Draft mutation prepared outside every owner lock.
+
+    Preparation copies one exact Draft revision, applies the edit and derives the
+    candidate plus diagnostics. The commit installs this value after rechecking
+    the same Draft fence, without repeating the edit or the derivation.
+    """
+
+    tool_id: str
+    details: Mapping[str, Any]
+    draft_id: str
+    base_revision: int
+    authoring: Mapping[str, Any]
+    program: Program | None
+    diagnostics: tuple[Mapping[str, Any], ...]
+    changed: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "details", freeze_json(self.details))
+        object.__setattr__(self, "authoring", freeze_json(self.authoring))
+        object.__setattr__(
+            self, "diagnostics", tuple(freeze_json(row) for row in self.diagnostics)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedProgramReplacement:
+    """One successor Program Draft state prepared outside every owner lock.
+
+    Covers the whole-Draft replacements: Open, New, Discard and whole-project
+    Load. ``successor_draft_id``/``successor_revision`` are explicit for Load,
+    which adopts the retained identities, and ``None`` means "keep the current
+    identity" respectively "advance the current revision by one". A Discard
+    replacement preserves the Saved baseline; Open, New and Load replace it.
+    """
+
+    kind: str
+    authoring: Mapping[str, Any] | None
+    program: Program | None
+    diagnostics: tuple[Mapping[str, Any], ...]
+    successor_draft_id: str | None
+    successor_revision: int | None
+    saved_path: str | None
+    saved_program_revision: str | None
+    saved_document: Mapping[str, Any] | None
+    preserve_saved: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "authoring",
+            None if self.authoring is None else freeze_json(self.authoring),
+        )
+        object.__setattr__(
+            self, "diagnostics", tuple(freeze_json(row) for row in self.diagnostics)
+        )
+        object.__setattr__(
+            self,
+            "saved_document",
+            (
+                None
+                if self.saved_document is None
+                else freeze_json(self.saved_document)
+            ),
+        )
 
 
 def _error(
@@ -808,6 +877,19 @@ class ComposerDraftSession:
     ) -> None:
         """Validate and atomically restore one journal-owned local post-image."""
 
+        self.install_prepared_replacement(
+            self.prepare_load_replacement(state, catalog)
+        )
+
+    def prepare_load_replacement(
+        self, state: dict[str, Any], catalog: NodeCatalog
+    ) -> PreparedProgramReplacement:
+        """Validate one retained Program Draft state without installing it.
+
+        Whole-project Load takes this prepared value, so a route no longer calls
+        :meth:`restore_retained_state` as a general mutation primitive.
+        """
+
         expected_fields = {
             "schema_version",
             "draft_id",
@@ -906,18 +988,17 @@ class ComposerDraftSession:
                     f"retained Saved Program path is invalid: {error}",
                     status_code=503,
                 )
-        with self._lock:
-            prior_identity = (self._draft_id, self._revision)
-            self._draft_id = draft_id
-            self._revision = revision
-            self._authoring = deepcopy(authoring)
-            self._program = program
-            self._diagnostics = normalized_diagnostics
-            self._saved_path = resolved_saved_path
-            self._saved_program_revision = saved_revision
-            self._saved_document = deepcopy(saved_document)
-            if prior_identity != (self._draft_id, self._revision):
-                self._notify_identity_change_locked()
+        return PreparedProgramReplacement(
+            kind="load",
+            authoring=deepcopy(authoring),
+            program=program,
+            diagnostics=tuple(normalized_diagnostics),
+            successor_draft_id=draft_id,
+            successor_revision=revision,
+            saved_path=resolved_saved_path,
+            saved_program_revision=saved_revision,
+            saved_document=deepcopy(saved_document),
+        )
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -1168,6 +1249,150 @@ class ComposerDraftSession:
                 expected_revision=expected_revision,
             )
 
+    # -- prepared Draft replacements (UA2D.3) -----------------------------
+
+    @staticmethod
+    def _program_document(program: Program | None) -> dict[str, Any] | None:
+        return program.to_dict() if program is not None else None
+
+    def install_prepared_replacement(
+        self,
+        prepared: PreparedProgramReplacement,
+        *,
+        expected_draft_id: str | None = None,
+        expected_revision: int | None = None,
+        before_install: Callable[[], None] | None = None,
+    ) -> bool:
+        """Install one prepared replacement after rechecking its exact fence.
+
+        Returns whether a real change was installed. A replacement without an
+        explicit successor revision advances the current revision by one; a
+        Discard replacement of already-current content reports a validated
+        no-op. Omitting both fence fields is reserved for the recovery and
+        whole-workspace Load paths, which adopt the prepared identities.
+        """
+
+        if not isinstance(prepared, PreparedProgramReplacement):
+            raise TypeError("prepared Program replacement has an invalid type")
+        if (expected_draft_id is None) != (expected_revision is None):
+            raise ValueError("a prepared replacement fence needs both fields")
+        with self._lock:
+            if expected_draft_id is not None:
+                self._require_identity_locked(
+                    draft_id=expected_draft_id,
+                    expected_revision=expected_revision,
+                )
+            if before_install is not None:
+                before_install()
+            content_unchanged = (
+                thaw_json(prepared.authoring) == self._authoring
+                and self._program_document(prepared.program)
+                == self._program_document(self._program)
+                and [thaw_json(row) for row in prepared.diagnostics]
+                == self._diagnostics
+            )
+            if prepared.preserve_saved and content_unchanged:
+                return False
+            successor_draft_id = prepared.successor_draft_id or self._draft_id
+            successor_revision = prepared.successor_revision
+            if successor_revision is None:
+                if self._revision >= _MAXIMUM_DRAFT_REVISION:
+                    _error(
+                        "composer_draft_revision_exhausted",
+                        "Composer Draft revision is exhausted",
+                        status_code=503,
+                    )
+                successor_revision = self._revision + 1
+            prior_identity = (self._draft_id, self._revision)
+            self._draft_id = successor_draft_id
+            self._revision = successor_revision
+            self._authoring = thaw_json(prepared.authoring)
+            self._program = prepared.program
+            self._diagnostics = [thaw_json(row) for row in prepared.diagnostics]
+            if not prepared.preserve_saved:
+                self._saved_path = prepared.saved_path
+                self._saved_program_revision = prepared.saved_program_revision
+                self._saved_document = (
+                    None
+                    if prepared.saved_document is None
+                    else thaw_json(prepared.saved_document)
+                )
+            if prior_identity != (self._draft_id, self._revision):
+                self._notify_identity_change_locked()
+            return True
+
+    def prepare_open_replacement(
+        self,
+        program: Program,
+        *,
+        source_path: str,
+    ) -> PreparedProgramReplacement:
+        """Prepare one Open-as-Draft replacement from an independently safe read."""
+
+        return PreparedProgramReplacement(
+            kind="open",
+            authoring=from_program(program),
+            program=program,
+            diagnostics=(),
+            successor_draft_id=f"draft-{uuid.uuid4().hex}",
+            successor_revision=1,
+            saved_path=str(Path(source_path).resolve()),
+            saved_program_revision=program.program_revision,
+            saved_document=program.to_dict(),
+        )
+
+    def prepare_new_replacement(
+        self, catalog: NodeCatalog
+    ) -> PreparedProgramReplacement:
+        """Prepare one fresh empty Program Draft replacement."""
+
+        authoring = empty_authoring(catalog)
+        program, diagnostics = derive_candidate(authoring, catalog)
+        assert program is None
+        return PreparedProgramReplacement(
+            kind="new",
+            authoring=authoring,
+            program=program,
+            diagnostics=tuple(diagnostics),
+            successor_draft_id=f"draft-{uuid.uuid4().hex}",
+            successor_revision=1,
+            saved_path=None,
+            saved_program_revision=None,
+            saved_document=None,
+        )
+
+    def prepare_discard_replacement(
+        self, applied: Program
+    ) -> PreparedProgramReplacement:
+        """Prepare one Discard-to-Applied replacement that preserves Saved."""
+
+        return PreparedProgramReplacement(
+            kind="discard",
+            authoring=from_program(applied),
+            program=applied,
+            diagnostics=(),
+            successor_draft_id=None,
+            successor_revision=None,
+            saved_path=None,
+            saved_program_revision=None,
+            saved_document=None,
+            preserve_saved=True,
+        )
+
+    def _require_discard_confirmation_locked(
+        self, message: str, discard_changes: bool
+    ) -> None:
+        if (
+            self._authoring is not None
+            and not self._matches_saved_locked()
+            and not discard_changes
+        ):
+            _error(
+                "composer_draft_discard_confirmation_required",
+                message,
+                status_code=409,
+            )
+
     def replace_program(
         self,
         program: Program,
@@ -1179,30 +1404,16 @@ class ComposerDraftSession:
     ) -> dict[str, Any]:
         """Atomically replace Draft and Saved after an independently safe read."""
 
+        self.install_prepared_replacement(
+            self.prepare_open_replacement(program, source_path=source_path),
+            expected_draft_id=draft_id,
+            expected_revision=expected_revision,
+            before_install=lambda: self._require_discard_confirmation_locked(
+                "opening another Program would discard unsaved Draft changes",
+                discard_changes,
+            ),
+        )
         with self._lock:
-            self._require_identity_locked(
-                draft_id=draft_id,
-                expected_revision=expected_revision,
-            )
-            if (
-                self._authoring is not None
-                and not self._matches_saved_locked()
-                and not discard_changes
-            ):
-                _error(
-                    "composer_draft_discard_confirmation_required",
-                    "opening another Program would discard unsaved Draft changes",
-                    status_code=409,
-                )
-            self._draft_id = f"draft-{uuid.uuid4().hex}"
-            self._authoring = from_program(program)
-            self._program = program
-            self._diagnostics = []
-            self._revision = 1
-            self._saved_path = str(Path(source_path).resolve())
-            self._saved_program_revision = program.program_revision
-            self._saved_document = program.to_dict()
-            self._notify_identity_change_locked()
             return self._workspace_snapshot_locked()
 
     def apply_current_program(
@@ -1278,16 +1489,10 @@ class ComposerDraftSession:
                 draft_id=draft_id,
                 expected_revision=expected_revision,
             )
-            if (
-                self._authoring is not None
-                and not self._matches_saved_locked()
-                and not confirm_discard
-            ):
-                _error(
-                    "composer_draft_discard_confirmation_required",
-                    "creating a new Program would discard unsaved Draft changes",
-                    status_code=409,
-                )
+            self._require_discard_confirmation_locked(
+                "creating a new Program would discard unsaved Draft changes",
+                confirm_discard,
+            )
             if (
                 self._authoring is not None
                 and not confirm_discard
@@ -1302,21 +1507,16 @@ class ComposerDraftSession:
                     "creating a new Program would discard unapplied Draft changes",
                     status_code=409,
                 )
-
-            catalog = catalog_reader()
-            authoring = empty_authoring(catalog)
-            program, diagnostics = derive_candidate(authoring, catalog)
-            assert program is None
-
-            self._draft_id = f"draft-{uuid.uuid4().hex}"
-            self._authoring = authoring
-            self._program = program
-            self._diagnostics = diagnostics
-            self._revision = 1
-            self._saved_path = None
-            self._saved_program_revision = None
-            self._saved_document = None
-            self._notify_identity_change_locked()
+        # The successor Draft is built outside the session lock; the install
+        # rechecks this exact fence, which keeps the checks above authoritative
+        # for the state it installs into.
+        prepared = self.prepare_new_replacement(catalog_reader())
+        self.install_prepared_replacement(
+            prepared,
+            expected_draft_id=draft_id,
+            expected_revision=expected_revision,
+        )
+        with self._lock:
             return self._workspace_snapshot_locked()
 
     def discard_to_applied(
@@ -1328,31 +1528,17 @@ class ComposerDraftSession:
     ) -> dict[str, Any]:
         """Replace Draft from one action-local authoritative Applied read."""
 
+        self.require_current(
+            draft_id=draft_id,
+            expected_revision=expected_revision,
+        )
+        applied = reader()
+        self.install_prepared_replacement(
+            self.prepare_discard_replacement(applied),
+            expected_draft_id=draft_id,
+            expected_revision=expected_revision,
+        )
         with self._lock:
-            self._require_identity_locked(
-                draft_id=draft_id,
-                expected_revision=expected_revision,
-            )
-            applied = reader()
-            if (
-                self._program is not None
-                and self._program.to_dict() == applied.to_dict()
-                and self._authoring == from_program(applied)
-            ):
-                return self._workspace_snapshot_locked(
-                    applied_program_revision=applied.program_revision,
-                )
-            if self._revision >= _MAXIMUM_DRAFT_REVISION:
-                _error(
-                    "composer_draft_revision_exhausted",
-                    "Composer Draft revision is exhausted",
-                    status_code=503,
-                )
-            self._authoring = from_program(applied)
-            self._program = applied
-            self._diagnostics = []
-            self._revision += 1
-            self._notify_identity_change_locked()
             return self._workspace_snapshot_locked(
                 applied_program_revision=applied.program_revision,
             )
@@ -1429,6 +1615,96 @@ class ComposerDraftSession:
                 applied_program_revision=validated_saved.program_revision,
             )
 
+    def prepare_mutation(
+        self,
+        *,
+        tool_id: str,
+        arguments: dict[str, Any],
+        expected_revision: int,
+        catalog: NodeCatalog,
+        draft_id: str | None = None,
+    ) -> PreparedProgramMutation:
+        """Apply one edit and derive its candidate without holding the lock."""
+
+        if type(arguments) is not dict:
+            _error("draft_arguments_invalid", "callback arguments must be an object")
+        base_draft_id, base_revision, base_authoring = (
+            self._capture_for_preparation(
+                expected_revision=expected_revision,
+                draft_id=draft_id,
+            )
+        )
+        document = deepcopy(base_authoring)
+        try:
+            mutation, details = self._edit(
+                document,
+                tool_id=tool_id,
+                arguments=deepcopy(arguments),
+                catalog=catalog,
+            )
+        except DraftSessionError:
+            raise
+        except (
+            AttributeError,
+            IndexError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            _error(
+                "draft_arguments_invalid",
+                f"Draft mutation arguments are invalid for {tool_id}: {error}",
+            )
+        try:
+            candidate, diagnostics = derive_candidate(document, catalog)
+        except AuthoringForestError as error:
+            _error(
+                error.code,
+                str(error),
+                detail=error.detail,
+            )
+        return PreparedProgramMutation(
+            tool_id=mutation,
+            details=details,
+            draft_id=base_draft_id,
+            base_revision=base_revision,
+            authoring=document,
+            program=candidate,
+            diagnostics=tuple(diagnostics),
+            changed=document != base_authoring,
+        )
+
+    def install_prepared_mutation(
+        self, prepared: PreparedProgramMutation
+    ) -> bool:
+        """Install one prepared mutation after rechecking its exact fence.
+
+        Returns whether a real change was installed; a validated no-op returns
+        ``False`` without advancing the Draft revision.
+        """
+
+        if not isinstance(prepared, PreparedProgramMutation):
+            raise TypeError("prepared Program mutation has an invalid type")
+        with self._lock:
+            self._require_identity_locked(
+                draft_id=prepared.draft_id,
+                expected_revision=prepared.base_revision,
+            )
+            if not prepared.changed:
+                return False
+            if self._revision >= _MAXIMUM_DRAFT_REVISION:
+                _error(
+                    "composer_draft_revision_exhausted",
+                    "Composer Draft revision is exhausted",
+                    status_code=503,
+                )
+            self._authoring = thaw_json(prepared.authoring)
+            self._program = prepared.program
+            self._diagnostics = [thaw_json(row) for row in prepared.diagnostics]
+            self._revision += 1
+            self._notify_identity_change_locked()
+            return True
+
     def mutate(
         self,
         *,
@@ -1438,8 +1714,48 @@ class ComposerDraftSession:
         catalog: NodeCatalog,
         draft_id: str | None = None,
     ) -> DraftMutationResult:
-        if type(arguments) is not dict:
-            _error("draft_arguments_invalid", "callback arguments must be an object")
+        prepared = self.prepare_mutation(
+            tool_id=tool_id,
+            arguments=arguments,
+            expected_revision=expected_revision,
+            catalog=catalog,
+            draft_id=draft_id,
+        )
+        self.install_prepared_mutation(prepared)
+        return self._mutation_result(prepared)
+
+    def preview_mutation(
+        self,
+        *,
+        tool_id: str,
+        arguments: dict[str, Any],
+        expected_revision: int,
+        catalog: NodeCatalog,
+        draft_id: str | None = None,
+    ) -> DraftMutationResult:
+        """Validate one mutation against one exact Draft snapshot.
+
+        The edit and its derivation run outside this session's lock and nothing
+        is installed, so a preview cannot change the Draft it validated.
+        """
+
+        prepared = self.prepare_mutation(
+            tool_id=tool_id,
+            arguments=arguments,
+            expected_revision=expected_revision,
+            catalog=catalog,
+            draft_id=draft_id,
+        )
+        return self._mutation_result(prepared)
+
+    def _capture_for_preparation(
+        self,
+        *,
+        expected_revision: int,
+        draft_id: str | None,
+    ) -> tuple[str, int, dict[str, Any]]:
+        """Copy one exact Draft revision after the ordinary mutation fence."""
+
         with self._lock:
             if self._authoring is None:
                 _error(
@@ -1468,72 +1784,21 @@ class ComposerDraftSession:
                         "receivedDraftRevision": expected_revision,
                     },
                 )
-            document = deepcopy(self._authoring)
-            try:
-                mutation, details = self._edit(
-                    document,
-                    tool_id=tool_id,
-                    arguments=deepcopy(arguments),
-                    catalog=catalog,
-                )
-            except DraftSessionError:
-                raise
-            except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
-                _error(
-                    "draft_arguments_invalid",
-                    f"Draft mutation arguments are invalid for {tool_id}: {error}",
-                )
-            try:
-                candidate, diagnostics = derive_candidate(document, catalog)
-            except AuthoringForestError as error:
-                _error(
-                    error.code,
-                    str(error),
-                    detail=error.detail,
-                )
-            if document == self._authoring:
-                return DraftMutationResult(
-                    mutation=mutation,
-                    details=details,
-                    snapshot=self._snapshot_locked(),
-                )
-            if self._revision >= _MAXIMUM_DRAFT_REVISION:
-                _error(
-                    "composer_draft_revision_exhausted",
-                    "Composer Draft revision is exhausted",
-                    status_code=503,
-                )
-            self._authoring = document
-            self._program = candidate
-            self._diagnostics = diagnostics
-            self._revision += 1
-            self._notify_identity_change_locked()
-            return DraftMutationResult(
-                mutation=mutation,
-                details=details,
-                snapshot=self._snapshot_locked(),
+            return (
+                self._draft_id,
+                self._revision,
+                deepcopy(self._authoring),
             )
 
-    def preview_mutation(
-        self,
-        *,
-        tool_id: str,
-        arguments: dict[str, Any],
-        expected_revision: int,
-        catalog: NodeCatalog,
-        draft_id: str | None = None,
+    def _mutation_result(
+        self, prepared: PreparedProgramMutation
     ) -> DraftMutationResult:
-        """Validate one mutation against an isolated exact Draft snapshot."""
-
-        preview = ComposerDraftSession()
-        preview.restore_retained_state(self.retained_state(), catalog)
-        return preview.mutate(
-            tool_id=tool_id,
-            arguments=arguments,
-            expected_revision=expected_revision,
-            catalog=catalog,
-            draft_id=draft_id,
-        )
+        with self._lock:
+            return DraftMutationResult(
+                mutation=prepared.tool_id,
+                details=thaw_json(prepared.details),
+                snapshot=self._snapshot_locked(),
+            )
 
     def _edit(
         self,
@@ -3265,5 +3530,7 @@ __all__ = [
     "DraftMutationResult",
     "DraftSessionError",
     "OPERATOR_DRAFT_MUTATIONS",
+    "PreparedProgramMutation",
+    "PreparedProgramReplacement",
     "SUPPORTED_DRAFT_MUTATIONS",
 ]

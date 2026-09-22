@@ -8,7 +8,7 @@ import json
 import math
 from pathlib import Path
 import threading
-from typing import Any, Callable, NoReturn, Sequence
+from typing import Any, Callable, Mapping, NoReturn, Sequence
 import uuid
 
 from manyforge_behavior.canonical_artifact import (
@@ -22,6 +22,7 @@ from .deployment_intent import (
     DeploymentIntentError,
     validate_deployment_intent,
 )
+from .authoring_identity import freeze_json, thaw_json
 
 
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
@@ -51,6 +52,48 @@ class CompiledDeploymentDocument:
 
 
 DeploymentCompiler = Callable[[str], CompiledDeploymentDocument]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedDeploymentReplacement:
+    """One successor Deployment Draft state prepared outside every owner lock.
+
+    ``successor_draft_id``/``successor_revision`` are explicit for Load, which
+    adopts the retained identities; ``None`` keeps the current identity and
+    advances the current revision by one (Open). ``preserve_saved`` keeps the
+    Saved baseline, which only whole-project Load needs to replace explicitly.
+    """
+
+    kind: str
+    compiled: CompiledDeploymentDocument | None
+    successor_draft_id: str | None
+    successor_revision: int | None
+    saved_path: str | None
+    saved_document: Mapping[str, Any] | None
+    preserve_saved: bool = False
+
+    def __post_init__(self) -> None:
+        if self.compiled is not None:
+            object.__setattr__(
+                self,
+                "compiled",
+                CompiledDeploymentDocument(
+                    document=freeze_json(self.compiled.document),
+                    canonical_json=self.compiled.canonical_json,
+                    deployment_artifact_id=self.compiled.deployment_artifact_id,
+                    deployment_revision=self.compiled.deployment_revision,
+                    graph_revision=self.compiled.graph_revision,
+                ),
+            )
+        object.__setattr__(
+            self,
+            "saved_document",
+            (
+                None
+                if self.saved_document is None
+                else freeze_json(self.saved_document)
+            ),
+        )
 
 
 def validate_deployment_draft_document(source: str) -> CompiledDeploymentDocument:
@@ -841,6 +884,16 @@ class DeploymentDraftSession:
         self._saved_document: dict[str, Any] | None = None
 
     @property
+    def draft_id(self) -> str:
+        with self._lock:
+            return self._draft_id
+
+    @property
+    def revision(self) -> int:
+        with self._lock:
+            return self._revision
+
+    @property
     def loaded(self) -> bool:
         with self._lock:
             return self._compiled is not None
@@ -959,16 +1012,23 @@ class DeploymentDraftSession:
         *,
         draft_id: str,
         expected_revision: int,
-    ) -> None:
+    ) -> bool:
+        """Install one already-prepared compiled document under the Draft fence.
+
+        Returns whether the Draft changed, so the composite workspace owner can
+        commit the same value atomically.
+        """
+
         with self._lock:
             self._require_current(draft_id, expected_revision)
             if (
                 self._compiled is not None
                 and self._compiled.document == compiled.document
             ):
-                return
+                return False
             self._compiled = compiled
             self._revision += 1
+            return True
 
     def retained_state(self) -> dict[str, Any]:
         with self._lock:
@@ -986,6 +1046,17 @@ class DeploymentDraftSession:
             }
 
     def restore_retained_state(self, state: dict[str, Any]) -> None:
+        self.install_prepared_replacement(self.prepare_load_replacement(state))
+
+    def prepare_load_replacement(
+        self, state: dict[str, Any]
+    ) -> PreparedDeploymentReplacement:
+        """Validate one retained Deployment Draft state without installing it.
+
+        Whole-project Load takes this prepared value, so a route no longer calls
+        :meth:`restore_retained_state` as a general mutation primitive.
+        """
+
         expected = {
             "schema_version",
             "draft_id",
@@ -1027,12 +1098,107 @@ class DeploymentDraftSession:
         )
         if state["saved_document"] is not None:
             self._compiler(_source(state["saved_document"]))
+        return PreparedDeploymentReplacement(
+            kind="load",
+            compiled=compiled,
+            successor_draft_id=state["draft_id"],
+            successor_revision=state["draft_revision"],
+            saved_path=state["saved_path"],
+            saved_document=deepcopy(state["saved_document"]),
+        )
+
+    def prepare_open_replacement(
+        self,
+        compiled: CompiledDeploymentDocument,
+        source_path: str,
+    ) -> PreparedDeploymentReplacement:
+        """Prepare one Open replacement from an independently safe read."""
+
+        resolved_source_path = str(Path(source_path).resolve())
+        return PreparedDeploymentReplacement(
+            kind="open",
+            compiled=compiled,
+            successor_draft_id=None,
+            successor_revision=None,
+            saved_path=resolved_source_path,
+            saved_document=deepcopy(compiled.document),
+        )
+
+    def install_prepared_replacement(
+        self,
+        prepared: PreparedDeploymentReplacement,
+        *,
+        expected_draft_id: str | None = None,
+        expected_revision: int | None = None,
+        before_install: Callable[[], None] | None = None,
+    ) -> bool:
+        """Install one prepared replacement after rechecking its exact fence.
+
+        Returns whether a real change was installed. A replacement without an
+        explicit successor revision advances the current revision by one;
+        installing content that already matches returns a validated no-op.
+        """
+
+        if not isinstance(prepared, PreparedDeploymentReplacement):
+            raise TypeError("prepared Deployment replacement has an invalid type")
+        if (expected_draft_id is None) != (expected_revision is None):
+            raise ValueError("a prepared replacement fence needs both fields")
         with self._lock:
-            self._draft_id = state["draft_id"]
-            self._revision = state["draft_revision"]
-            self._compiled = compiled
-            self._saved_path = state["saved_path"]
-            self._saved_document = deepcopy(state["saved_document"])
+            if expected_draft_id is not None:
+                self._require_current(expected_draft_id, expected_revision)
+            if before_install is not None:
+                before_install()
+            successor_draft_id = prepared.successor_draft_id or self._draft_id
+            successor_saved_path = (
+                self._saved_path if prepared.preserve_saved else prepared.saved_path
+            )
+            successor_saved_document = (
+                self._saved_document
+                if prepared.preserve_saved
+                else (
+                    None
+                    if prepared.saved_document is None
+                    else thaw_json(prepared.saved_document)
+                )
+            )
+            successor_document = (
+                thaw_json(prepared.compiled.document)
+                if prepared.compiled is not None
+                else None
+            )
+            current_document = (
+                self._compiled.document if self._compiled is not None else None
+            )
+            unchanged = (
+                successor_draft_id == self._draft_id
+                and successor_document == current_document
+                and successor_saved_path == self._saved_path
+                and successor_saved_document == self._saved_document
+            )
+            successor_revision = prepared.successor_revision
+            if successor_revision is None:
+                if unchanged:
+                    return False
+                successor_revision = self._revision + 1
+            elif unchanged and successor_revision == self._revision:
+                return False
+            self._draft_id = successor_draft_id
+            self._revision = successor_revision
+            self._compiled = (
+                None
+                if prepared.compiled is None
+                else CompiledDeploymentDocument(
+                    document=successor_document,
+                    canonical_json=prepared.compiled.canonical_json,
+                    deployment_artifact_id=prepared.compiled.deployment_artifact_id,
+                    deployment_revision=prepared.compiled.deployment_revision,
+                    graph_revision=prepared.compiled.graph_revision,
+                )
+            )
+            if not prepared.preserve_saved:
+                self._saved_path = prepared.saved_path
+                self._saved_document = successor_saved_document
+            return True
 
     def commit_open(
         self,
@@ -1042,31 +1208,29 @@ class DeploymentDraftSession:
         draft_id: str,
         expected_revision: int,
         confirm_discard: bool,
-    ) -> None:
-        with self._lock:
-            self._require_current(draft_id, expected_revision)
-            # The coordinator called require_open_allowed while holding the
-            # authoring claim. Retain the argument in this boundary so callers
-            # cannot accidentally bypass that explicit discard decision.
-            if not confirm_discard and self._compiled is not None:
-                if self._compiled.document != self._saved_document:
-                    _fail(
-                        "deployment_discard_confirmation_required",
-                        "opening another Deployment would discard Draft changes",
-                        status_code=409,
-                    )
-            resolved_source_path = str(Path(source_path).resolve())
-            if (
-                self._compiled is not None
-                and self._compiled.document == compiled.document
-                and self._saved_document == compiled.document
-                and self._saved_path == resolved_source_path
-            ):
-                return
-            self._compiled = compiled
-            self._saved_path = resolved_source_path
-            self._saved_document = deepcopy(compiled.document)
-            self._revision += 1
+    ) -> bool:
+        """Install one prepared Open replacement under the Draft fence."""
+
+        return self.install_prepared_replacement(
+            self.prepare_open_replacement(compiled, source_path),
+            expected_draft_id=draft_id,
+            expected_revision=expected_revision,
+            before_install=lambda: self._require_open_confirmed_locked(
+                confirm_discard
+            ),
+        )
+
+    def _require_open_confirmed_locked(self, confirm_discard: bool) -> None:
+        # The coordinator called require_open_allowed while holding the
+        # authoring claim. Retain the argument in this boundary so callers
+        # cannot accidentally bypass that explicit discard decision.
+        if not confirm_discard and self._compiled is not None:
+            if self._compiled.document != self._saved_document:
+                _fail(
+                    "deployment_discard_confirmation_required",
+                    "opening another Deployment would discard Draft changes",
+                    status_code=409,
+                )
 
     def mark_saved(self, path: str, *, draft_id: str, expected_revision: int) -> None:
         with self._lock:

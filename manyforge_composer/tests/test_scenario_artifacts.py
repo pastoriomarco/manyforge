@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from manyforge_composer.backend.routes_scenario_documents import (
+    _document_content_digest,
     create_scenario_document_router,
 )
 from manyforge_composer.backend.scenario_artifacts import (
@@ -65,6 +66,17 @@ def _document(*, version: str = "1.0.0", overrides: dict | None = None) -> dict:
         typed_parameter_overrides={} if overrides is None else overrides,
         manyforge_version=version,
         last_known_status="ready",
+    )
+
+
+def test_persisted_document_identity_includes_authorable_metadata() -> None:
+    original = _document()
+    renamed = {**original, "name": "Renamed cell"}
+    redescribed = {**original, "description": "Updated description"}
+
+    assert _document_content_digest(original) != _document_content_digest(renamed)
+    assert _document_content_digest(original) != _document_content_digest(
+        redescribed
     )
 
 
