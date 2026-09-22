@@ -30,6 +30,7 @@ from .log_throttle import ThrottledLog
 from .models import UnavailableDetail, UnavailableResponse
 from .routes_assistant import create_assistant_router
 from .routes_assistant_draft import create_assistant_draft_router
+from .routes_authoring_workspace import create_authoring_workspace_router
 from .routes_catalog import create_catalog_router
 from .routes_draft import create_draft_router
 from .routes_deployment_draft import create_deployment_draft_router
@@ -464,6 +465,10 @@ def create_app(
     app.include_router(
         create_draft_router(state),
         tags=["composer-draft"],
+    )
+    app.include_router(
+        create_authoring_workspace_router(state),
+        tags=["composer-authoring-workspace"],
     )
     app.include_router(
         create_deployment_draft_router(state),

@@ -14,6 +14,8 @@ import time
 import uuid
 from typing import Any, Mapping
 
+from .authoring_identity import canonical_digest
+
 
 _SCHEMA_VERSION = 1
 _MAXIMUM_TRANSACTIONS = 1024
@@ -58,17 +60,6 @@ class AuthoringTransaction:
     @property
     def complete(self) -> bool:
         return self.release_receipt is not None
-
-
-def canonical_digest(value: Mapping[str, Any]) -> str:
-    encoded = json.dumps(
-        dict(value),
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def owner_transaction_id(request_owner_epoch: str, request_id: str) -> str:

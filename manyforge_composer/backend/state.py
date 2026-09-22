@@ -49,6 +49,7 @@ from .authoring_transaction_journal import (
     AuthoringTransaction,
     canonical_digest,
 )
+from .authoring_workspace import AuthoringWorkspace
 from .node_environment_client import read_active_node_environment
 from .program_artifacts import (
     ProgramArtifactError,
@@ -183,19 +184,15 @@ class ComposerState:
             raise ValueError(
                 "authoring_state_root is required with Headless-backed authoring"
             )
-        # Editable-document presentation state only. Runtime Scenario truth
-        # remains the exact Headless/Manager/Applied projection. Initialize it
-        # before journal recovery so a recovered Save may restore its path.
-        self.scenario_document_path: str | None = None
-        self.scenario_document_id: str | None = None
-        self.scenario_document_name: str | None = None
-        self.scenario_document_description: str | None = None
-        self.scenario_source_diagnostics: list[dict[str, str]] = []
-        self.scenario_source_document_digest: str | None = None
-        self.scenario_program_role_assignment: dict[str, Any] | None = None
-        self.scenario_typed_parameter_overrides: dict[str, Any] = {}
-        self.scenario_source_program_digest: str | None = None
-        self.scenario_source_deployment_digest: str | None = None
+        # One composite in-memory authoring workspace per backend. It owns the
+        # Scenario project facts beside the two Draft sessions and carries the
+        # workspace epoch/revision. Runtime Scenario truth remains the exact
+        # Headless/Manager/Applied projection. Construct it before journal
+        # recovery so a recovered Save may restore its project path.
+        self.authoring_workspace = AuthoringWorkspace(
+            program_session=self.draft_session,
+            deployment_session=self.deployment_draft_session,
+        )
         self.authoring_admission = (
             AuthoringAdmissionCoordinator(
                 headless_client,
@@ -251,6 +248,91 @@ class ComposerState:
     def node_catalog(self):
         return self.node_environment.catalog
 
+    # -- temporary migration shims (UA2D.2) -------------------------------
+    # The Scenario project facts now live in the composite workspace owner.
+    # These accessors keep the writers that have not migrated yet working: the
+    # Composer Scenario-document and Deployment-candidate paths migrate in
+    # UA2D.5, the external Scenario-load publication in UA3. Each accessor is
+    # deleted with its last caller.
+    #
+    # A legacy writer that assigns several fields for one logical operation
+    # produces more than one composite advance until its substep collapses the
+    # operation into a single commit. That is conservative: the composite
+    # revision is a staleness fence, so an extra advance only makes one more
+    # client refresh, while a missed advance would be a correctness defect. No
+    # consumer may read ``workspace_revision`` as a count of user changes.
+    def _authoring_project_fact(self, name: str) -> Any:
+        return self.authoring_workspace.project_facts()[name]
+
+    def _set_authoring_project_fact(self, name: str, value: Any) -> None:
+        self.authoring_workspace.migrate_project_facts({name: value})
+
+    @property
+    def scenario_document_path(self) -> str | None:
+        return self._authoring_project_fact("document_path")
+
+    @scenario_document_path.setter
+    def scenario_document_path(self, value: str | None) -> None:
+        self._set_authoring_project_fact("document_path", value)
+
+    @property
+    def scenario_document_id(self) -> str | None:
+        return self._authoring_project_fact("document_id")
+
+    @property
+    def scenario_document_name(self) -> str | None:
+        return self._authoring_project_fact("document_name")
+
+    @property
+    def scenario_document_description(self) -> str | None:
+        return self._authoring_project_fact("document_description")
+
+    @property
+    def scenario_source_diagnostics(self) -> list[dict[str, str]]:
+        return self._authoring_project_fact("source_diagnostics")
+
+    @property
+    def scenario_source_document_digest(self) -> str | None:
+        return self._authoring_project_fact("source_document_digest")
+
+    @scenario_source_document_digest.setter
+    def scenario_source_document_digest(self, value: str | None) -> None:
+        self._set_authoring_project_fact("source_document_digest", value)
+
+    @property
+    def scenario_program_role_assignment(self) -> dict[str, Any] | None:
+        return self._authoring_project_fact("program_role_assignment")
+
+    @scenario_program_role_assignment.setter
+    def scenario_program_role_assignment(
+        self, value: dict[str, Any] | None
+    ) -> None:
+        self._set_authoring_project_fact("program_role_assignment", value)
+
+    @property
+    def scenario_typed_parameter_overrides(self) -> dict[str, Any]:
+        return self._authoring_project_fact("typed_parameter_overrides")
+
+    @scenario_typed_parameter_overrides.setter
+    def scenario_typed_parameter_overrides(self, value: dict[str, Any]) -> None:
+        self._set_authoring_project_fact("typed_parameter_overrides", value)
+
+    @property
+    def scenario_source_program_digest(self) -> str | None:
+        return self._authoring_project_fact("source_program_digest")
+
+    @scenario_source_program_digest.setter
+    def scenario_source_program_digest(self, value: str | None) -> None:
+        self._set_authoring_project_fact("source_program_digest", value)
+
+    @property
+    def scenario_source_deployment_digest(self) -> str | None:
+        return self._authoring_project_fact("source_deployment_digest")
+
+    @scenario_source_deployment_digest.setter
+    def scenario_source_deployment_digest(self, value: str | None) -> None:
+        self._set_authoring_project_fact("source_deployment_digest", value)
+
     def remember_scenario_document(
         self,
         document: dict[str, Any] | None,
@@ -258,52 +340,35 @@ class ComposerState:
         source_document_digest: str | None = None,
         source_diagnostics: list[dict[str, str]] | None = None,
     ) -> None:
-        if document is None:
-            self.scenario_document_id = None
-            self.scenario_document_name = None
-            self.scenario_document_description = None
-            self.scenario_source_diagnostics = []
-            self.scenario_source_document_digest = None
-            self.scenario_program_role_assignment = None
-            self.scenario_typed_parameter_overrides = {}
-            self.scenario_source_program_digest = None
-            self.scenario_source_deployment_digest = None
-            return
-        self.scenario_document_id = document.get("scenario_id")
-        self.scenario_document_name = document.get("name")
-        self.scenario_document_description = document.get("description")
-        self.scenario_source_diagnostics = deepcopy(source_diagnostics or [])
-        self.scenario_source_document_digest = source_document_digest
-        self.scenario_program_role_assignment = deepcopy(
-            document.get("program_role_assignment")
-        )
-        self.scenario_typed_parameter_overrides = deepcopy(
-            document.get("typed_parameter_overrides", {})
-        )
-        self.scenario_source_program_digest = canonical_digest(
-            {"value": document.get("program_draft")}
-        )
-        self.scenario_source_deployment_digest = canonical_digest(
-            {"value": document.get("deployment_draft")}
+        """Remember one loaded Scenario project through the workspace owner."""
+
+        self.authoring_workspace.remember_project(
+            document=document,
+            document_path=self.scenario_document_path,
+            source_document_digest=source_document_digest,
+            source_diagnostics=source_diagnostics,
         )
 
     def current_drafts_match_remembered_scenario(self) -> bool:
+        facts = self.authoring_workspace.project_facts()
         if (
-            self.scenario_source_program_digest is None
-            or self.scenario_source_deployment_digest is None
+            facts["source_program_digest"] is None
+            or facts["source_deployment_digest"] is None
         ):
             return False
         return (
             canonical_digest(
                 {"value": self.draft_session.retained_state().get("authoring")}
             )
-            == self.scenario_source_program_digest
-            and canonical_digest({
-                "value": self.deployment_draft_session.retained_state().get(
-                    "document"
-                )
-            })
-            == self.scenario_source_deployment_digest
+            == facts["source_program_digest"]
+            and canonical_digest(
+                {
+                    "value": self.deployment_draft_session.retained_state().get(
+                        "document"
+                    )
+                }
+            )
+            == facts["source_deployment_digest"]
         )
 
     def _active_authoring_catalog(self):
