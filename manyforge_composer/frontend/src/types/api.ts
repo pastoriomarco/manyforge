@@ -1402,7 +1402,7 @@ export interface ManagerDeploymentCandidateReceipt {
   schema_version: 'manyforge.manager_deployment_candidate_receipt.v1';
   deployment_artifact_id: string;
   deployment_revision: string;
-  scenario_catalog_revision: string;
+  prepared_activation_id: string;
   candidate_retained_bundle_id: string;
   candidate_graph_revision: string;
   expected_current: {
@@ -1412,17 +1412,6 @@ export interface ManagerDeploymentCandidateReceipt {
   expected_admission_generation: number;
   manager_owner_epoch: string;
   receipt_digest: string;
-}
-
-export interface ManagerDeploymentCandidatePreviewRequest {
-  deployment_artifact_id: string;
-  deployment_revision: string;
-  expected_current: {
-    graph_revision: string;
-    retained_bundle_id: string;
-  };
-  expected_admission_generation: number;
-  request_owner_epoch: string;
 }
 
 export interface ManagerDeploymentRecordDiff {
@@ -1436,22 +1425,6 @@ export interface ManagerDeploymentCandidatePreviewResponse {
   candidateReceipt: ManagerDeploymentCandidateReceipt;
   converged: boolean;
   diff: Record<string, ManagerDeploymentRecordDiff>;
-}
-
-export interface ManagerApplyRequest {
-  request_id: string;
-  request_owner_epoch: string;
-  source_label: 'composer_ui';
-  correlation_id: string | null;
-  deployment_artifact_id: string;
-  deployment_revision: string;
-  expected_current: {
-    graph_revision: string;
-    retained_bundle_id: string;
-  };
-  reject_if_affected_busy: true;
-  expected_admission_generation: number;
-  candidate_receipt: ManagerDeploymentCandidateReceipt;
 }
 
 export interface ManagerSourceMetadata {
@@ -1523,7 +1496,7 @@ export interface ManagerApplyRecord {
     requestOwnerEpoch: string;
     sourceLabel: string;
   };
-  terminalState: 'succeeded' | null;
+  terminalState: 'succeeded' | 'failed' | 'unknown_effect' | null;
 }
 
 export interface ManagerApplyAvailability {
@@ -1569,6 +1542,51 @@ export interface ManagerDiffProjection {
 
 export type ManagerApplyReplayStatus = 'accepted_new' | 'replayed_exact';
 
+export type ManagerApplyLifecyclePhase =
+  | 'accepted'
+  | 'fence_acquired'
+  | 'fence_accepted'
+  | 'runtime_converged'
+  | 'scene_staged'
+  | 'scene_activated'
+  | 'composed'
+  | 'published'
+  | 'settled';
+
+export interface ManagerApplyPreparedActivation {
+  capturedInputDigest: string;
+  deploymentArtifactId: string;
+  deploymentRevision: string;
+  programBindingId: string;
+  preparedActivationId: string;
+}
+
+export interface ManagerApplyFailure {
+  code: string;
+  message: string;
+  phase: ManagerApplyLifecyclePhase;
+  effectDisposition: 'known' | 'unknown';
+}
+
+export interface ManagerApplyStatus {
+  apiVersion: 'manyforge.manager_command_response.v1';
+  applyGeneration: number;
+  applyId: string;
+  candidateProjectionRevision: ProjectionRevision | null;
+  error: null;
+  failure: ManagerApplyFailure | null;
+  lastProgress: {
+    phase: ManagerApplyLifecyclePhase;
+    recordDigest: string;
+  };
+  ok: true;
+  phase: ManagerApplyLifecyclePhase;
+  preparedActivation: ManagerApplyPreparedActivation;
+  requestId: string;
+  requestOwnerEpoch: string;
+  state: 'pending' | 'succeeded' | 'failed' | 'unknown_effect';
+}
+
 export interface ManagerApplyPendingResponse {
   apiVersion: 'manyforge.manager_command_response.v1';
   applyGeneration: number;
@@ -1595,9 +1613,23 @@ export interface ManagerApplySucceededResponse {
   state: 'succeeded';
 }
 
+export interface ManagerApplyTerminalFailureResponse {
+  apiVersion: 'manyforge.manager_command_response.v1';
+  applyGeneration: number;
+  applyId: string;
+  candidateProjectionRevision: null;
+  error: null;
+  ok: true;
+  replayStatus: ManagerApplyReplayStatus;
+  requestId: string;
+  requestOwnerEpoch: string;
+  state: 'failed' | 'unknown_effect';
+}
+
 export type ManagerApplyResponse =
   | ManagerApplyPendingResponse
-  | ManagerApplySucceededResponse;
+  | ManagerApplySucceededResponse
+  | ManagerApplyTerminalFailureResponse;
 
 export interface DraftMutationResponse {
   mutation: string;

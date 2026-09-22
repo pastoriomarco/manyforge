@@ -146,7 +146,18 @@ ApplyIntent(std::string apply_id = "apply-1",
       },
       bundle.retained_bundle_id(),
       graph.graph_revision,
-      AdmissionGeneration(7U),
+      ManagerApplyPreparedActivationDTO{
+          core::ContentDigest(
+              "sha256:1414141414141414141414141414141414141414141414141414141414141414"),
+          core::DeploymentArtifactId("deployment-artifact-1"),
+          core::DeploymentRevision(
+              "sha256:1515151515151515151515151515151515151515151515151515151515151515"),
+          core::ProgramBindingId(
+              "sha256:1717171717171717171717171717171717171717171717171717171717171717"),
+          core::ContentDigest(
+              "sha256:1616161616161616161616161616161616161616161616161616161616161616"),
+      },
+      core::AdmissionGeneration(7U),
       std::nullopt,
   };
 }

@@ -16,13 +16,57 @@ from typing import Any
 import rfc8785
 
 
-COMPONENT_OVERVIEW_VERSION = "manyforge.component_overview.v1"
+COMPONENT_OVERVIEW_VERSION = "manyforge.component_overview.v2"
 
 _HEALTHY = "healthy"
 _WAITING = "waiting"
 _WARNING = "warning"
 _FAULT = "fault"
 _OFFLINE = "offline"
+
+_ADMITTED_MANAGER_APPLY_PHASES = {
+    "fence_held",
+    "runtime_convergence_pending",
+    "runtime_staged_ready",
+    "scene_stage_pending",
+    "scene_staged",
+    "activation_selected",
+    "scene_activated",
+    "private_materialized",
+    "command_surfaces_retired",
+    "active_bundle_published",
+    "scene_finalized",
+    "fence_release_pending",
+}
+
+
+def _affected_runtime_unit_ids(
+    operation: Mapping[str, Any], active_graph: Mapping[str, Any]
+) -> list[str]:
+    """Map the durable fence component scope through the active graph.
+
+    An incomplete intent alone is not maintenance.  Only the accepted fence
+    scope proves which active runtime units Manager is authorized to remove.
+    """
+    fence = _mapping(operation.get("fence"))
+    scope = _mapping(fence.get("scope"))
+    component_ids = {
+        value
+        for value in _sequence(scope.get("controllable_component_ids"))
+        if isinstance(value, str) and value
+    }
+    affected: set[str] = set()
+    for component in _sequence(active_graph.get("controllable_components")):
+        if not isinstance(component, Mapping):
+            continue
+        if component.get("controllable_component_id") not in component_ids:
+            continue
+        affected.update(
+            value
+            for value in _sequence(component.get("runtime_unit_ids"))
+            if isinstance(value, str) and value
+        )
+    return sorted(affected)
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,8 +248,54 @@ def build_component_overview(
     manager_source_status, manager_source_reason = _source_status(manager_section)
     manager_payload = _mapping(manager_section.get("payload"))
     manager_runtime = _mapping(manager_payload.get("runtime"))
+    manager_apply = _mapping(manager_payload.get("apply"))
     active = _mapping(manager_payload.get("active"))
     active_graph = _mapping(active.get("cell_graph"))
+    pending_maintenance = [
+        _mapping(record)
+        for record in _sequence(manager_apply.get("records"))
+        if isinstance(record, Mapping) and record.get("incomplete") is True
+    ]
+    maintenance_operation: dict[str, Any] | None = None
+    if len(pending_maintenance) == 1:
+        operation = pending_maintenance[0]
+        apply_id = operation.get("apply_id")
+        apply_generation = operation.get("apply_generation")
+        phase = operation.get("phase")
+        if (
+            isinstance(apply_id, str)
+            and bool(apply_id)
+            and isinstance(apply_generation, int)
+            and not isinstance(apply_generation, bool)
+            and apply_generation >= 1
+            and phase in _ADMITTED_MANAGER_APPLY_PHASES
+        ):
+            affected_runtime_unit_ids = _affected_runtime_unit_ids(
+                operation, active_graph
+            )
+            desired_runtime_unit_ids = sorted(
+                row.get("runtime_unit_id")
+                for row in _sequence(manager_runtime.get("desired_units"))
+                if isinstance(row, Mapping)
+                and isinstance(row.get("runtime_unit_id"), str)
+                and row.get("runtime_unit_id")
+            )
+            # Current planned maintenance tears down the complete active
+            # runtime. Do not suppress health unless the durable admitted
+            # scope proves that it covers every required desired unit.
+            if (
+                not desired_runtime_unit_ids
+                or affected_runtime_unit_ids != desired_runtime_unit_ids
+            ):
+                affected_runtime_unit_ids = []
+            else:
+                maintenance_operation = {
+                    "apply_id": apply_id,
+                    "apply_generation": apply_generation,
+                    "phase": phase,
+                    "affected_runtime_unit_ids": affected_runtime_unit_ids,
+                    "reason_code": "planned_maintenance_in_progress",
+                }
     active_graph_revision = active.get("graph_revision")
     active_bundle_id = active.get("retained_bundle_id")
     manager_status = manager_source_status
@@ -215,6 +305,13 @@ def build_component_overview(
         manager_reason = _bounded_reason(
             _fact_error(errors, "runtime").get("code"), "runtime_projection_unavailable"
         )
+    elif (
+        manager_status == _HEALTHY
+        and maintenance_operation is not None
+        and manager_payload.get("manager_ready") is not True
+    ):
+        manager_status = _WAITING
+        manager_reason = "planned_maintenance_in_progress"
     elif manager_status == _HEALTHY and manager_payload.get("manager_ready") is not True:
         manager_status = _WAITING
         manager_reason = "manager_not_ready"
@@ -273,7 +370,15 @@ def build_component_overview(
             for reason in _sequence(observed.get("reason_codes"))
             if isinstance(reason, str) and reason
         ]
-        if observed and observed.get("source_health") not in (None, "healthy"):
+        if (
+            maintenance_operation is not None
+            and runtime_unit_id
+            in maintenance_operation["affected_runtime_unit_ids"]
+            and not converged
+        ):
+            unit_status = _WAITING
+            reason_codes = ["planned_maintenance_in_progress"]
+        elif observed and observed.get("source_health") not in (None, "healthy"):
             unit_status = _FAULT
         elif reason_codes and not converged:
             unit_status = _WARNING
@@ -755,6 +860,12 @@ def build_component_overview(
         "fault": "An owner-issued fault or exact-coordinate mismatch affects a required scope.",
         "offline": "No complete current projection exists for the required runtime scopes.",
     }
+    if maintenance_operation is not None and readiness == "waiting":
+        labels["waiting"] = "Deployment maintenance in progress"
+        messages["waiting"] = (
+            "Controls remain disabled while Manager applies the admitted "
+            "Deployment transition."
+        )
     profile_label = ", ".join(runtime_profiles)
     if not profile_label:
         profile_label = str(active_graph.get("cell_id") or manager_payload.get("cell_id") or "No active profile")
@@ -768,6 +879,7 @@ def build_component_overview(
         "user_message": messages[readiness],
         "capabilities": [label for _component_id, label, _contributors in scopes],
         "components": [*scope_components, *components],
+        "maintenance_operation": maintenance_operation,
         "basis": {
             "runtime_projection_owner_epoch": runtime.get("projection_owner_epoch"),
             "runtime_projection_generation": runtime.get("projection_generation"),

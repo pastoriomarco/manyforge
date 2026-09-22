@@ -361,7 +361,17 @@ ManagerActiveRuntimeCoordinator::ManagerActiveRuntimeCoordinator(
 }
 
 ManagerActiveRuntimeConvergenceResult
-ManagerActiveRuntimeCoordinator::Reconcile() {
+ManagerActiveRuntimeCoordinator::Observe() {
+  return Converge(ConvergenceMode::kObserveOnly);
+}
+
+ManagerActiveRuntimeConvergenceResult
+ManagerActiveRuntimeCoordinator::Initialize() {
+  return Converge(ConvergenceMode::kInitialize);
+}
+
+ManagerActiveRuntimeConvergenceResult
+ManagerActiveRuntimeCoordinator::Converge(const ConvergenceMode mode) {
   std::lock_guard operation_lock(operation_mutex_);
   auto plan = plan_source_.ReadCurrentPlan();
   if (!plan.valid()) {
@@ -387,7 +397,8 @@ ManagerActiveRuntimeCoordinator::Reconcile() {
     const auto query = MakeQuery(plan, row);
     auto process = ObserveProcess(process_port_, query);
     IngestPresence(reducer, query, process);
-    if (row.lifecycle_control ==
+    if (mode == ConvergenceMode::kInitialize &&
+        row.lifecycle_control ==
             manyforge::core::RuntimeLifecycleControl::kManagerManaged &&
         process.state() != ProcessPresenceState::kPresent) {
       RequireRuntimeContractAdmission(query.plan);

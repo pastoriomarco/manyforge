@@ -116,9 +116,24 @@ struct ManagerActiveRuntimeShutdownResult final {
 
 /// Steady-state runtime-unit lifecycle owner for the currently selected plan.
 ///
-/// Reconcile is dependency ordered and observe-first. Explicit Shutdown is
-/// reverse-dependency ordered and uses only the closed process-port shutdown
-/// operation. Destroying this coordinator has no process effect.
+/// Observation and process mutation are two explicit surfaces, both dependency
+/// ordered and observe-first:
+///
+/// - Observe() calls only ObserveProcess/ObserveProgress. A missing
+///   Manager-managed runtime unit is reported as non-converged fault evidence
+///   and is never started. This is the surface for periodic runtime/readiness
+///   observation and the public reconcile command; independent liveness
+///   renewal may consume its snapshot but performs no lifecycle effect.
+/// - Initialize() may additionally call EnsureRunning for absent
+///   Manager-managed runtime units in dependency order. It is reserved for
+///   bootstrap and for an admitted maintenance operation that already holds
+///   the exact operation admission.
+///
+/// There is deliberately no boolean selector and no background repair loop,
+/// retry timer or replacement policy: a caller chooses behaviour by naming the
+/// surface it needs. Explicit Shutdown is reverse-dependency ordered and uses
+/// only the closed process-port shutdown operation. Destroying this
+/// coordinator has no process effect.
 class ManagerActiveRuntimeCoordinator final {
 public:
   ManagerActiveRuntimeCoordinator(
@@ -128,7 +143,14 @@ public:
       RuntimeObservationReducer::Clock clock_ns,
       RuntimePreStartGuard pre_start_guard = {});
 
-  [[nodiscard]] ManagerActiveRuntimeConvergenceResult Reconcile();
+  /// Effect-free evaluation of the current plan. Never starts a process.
+  [[nodiscard]] ManagerActiveRuntimeConvergenceResult Observe();
+
+  /// Effect-permitted evaluation. Starts absent Manager-managed runtime units
+  /// in dependency order. Only bootstrap and an admitted maintenance operation
+  /// may call this.
+  [[nodiscard]] ManagerActiveRuntimeConvergenceResult Initialize();
+
   [[nodiscard]] ManagerActiveRuntimeShutdownResult Shutdown();
 
   ManagerActiveRuntimeCoordinator(const ManagerActiveRuntimeCoordinator &) =
@@ -137,6 +159,14 @@ public:
   operator=(const ManagerActiveRuntimeCoordinator &) = delete;
 
 private:
+  enum class ConvergenceMode {
+    kObserveOnly,
+    kInitialize,
+  };
+
+  [[nodiscard]] ManagerActiveRuntimeConvergenceResult
+  Converge(ConvergenceMode mode);
+
   const IManagerActiveRuntimePlanSource &plan_source_;
   IRuntimeUnitProcessPort &process_port_;
   IRuntimeUnitProgressPort &progress_port_;

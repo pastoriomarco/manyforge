@@ -104,7 +104,7 @@ def _component_overview() -> dict[str, Any]:
     alarms = _alarms()
     sections = runtime["sections"]
     return {
-        "schema_version": "manyforge.component_overview.v1",
+        "schema_version": "manyforge.component_overview.v2",
         "overview_revision": "sha256:" + "a" * 64,
         "readiness": "ready",
         "summary_label": "Application surfaces ready",
@@ -981,7 +981,7 @@ class _ComposerTestClient(TestClient):
 def _composer(client: HeadlessHttpClient) -> TestClient:
     state_root = tempfile.mkdtemp(prefix="manyforge-composer-journal-")
     return _ComposerTestClient(
-        ComposerState(headless_client=client, authoring_state_root=state_root)
+        ComposerState(headless_client=client)
     )
 
 
@@ -990,7 +990,6 @@ def _composer_with_program(client: HeadlessHttpClient) -> TestClient:
         program_path=str(_PROGRAM_PATH),
         allowed_fs_roots=[str(_ROOT / "examples")],
         headless_client=client,
-        authoring_state_root=tempfile.mkdtemp(prefix="manyforge-composer-journal-"),
     )
     return _ComposerTestClient(
         state,
@@ -2028,7 +2027,6 @@ def test_composer_rejects_draft_and_save_during_an_active_run(
         program_path=str(program_path),
         allowed_fs_roots=[str(tmp_path)],
         headless_client=ActiveRunnerClient(),  # type: ignore[arg-type]
-        authoring_state_root=str(tmp_path),
     )
     snapshot = state.draft_session.snapshot()
     body = {
@@ -2616,105 +2614,6 @@ def test_composer_preserves_complete_scene_rejection(
         "transaction_sequence": None,
         "update_status": None,
     }
-
-
-def test_composer_preserves_headless_unavailability_code(
-    headless_client,
-) -> None:
-    client, _requests, _node_environment = headless_client
-    with _composer(client) as composer:
-        response = composer.post(
-            "/api/manager/apply",
-            json={
-                **_caller(),
-                "deployment_artifact_id": "deployment.1",
-                "deployment_revision": "sha256:" + "a" * 64,
-                "expected_current": {
-                    "graph_revision": "graph.1",
-                    "retained_bundle_id": "bundle.1",
-                },
-                "reject_if_affected_busy": True,
-                "expected_admission_generation": 7,
-                "candidate_receipt": {
-                    "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
-                    "deployment_artifact_id": "deployment.1",
-                    "deployment_revision": "sha256:" + "a" * 64,
-                    "scenario_catalog_revision": "sha256:" + "b" * 64,
-                    "candidate_retained_bundle_id": "bundle.next",
-                    "candidate_graph_revision": "graph.next",
-                    "expected_current": {
-                        "graph_revision": "graph.1",
-                        "retained_bundle_id": "bundle.1",
-                    },
-                    "expected_admission_generation": 7,
-                    "manager_owner_epoch": "alarm.epoch.1",
-                    "receipt_digest": "sha256:" + "c" * 64,
-                },
-            },
-        )
-    assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "kernel_owner_unavailable"
-
-
-def test_composer_preserves_manager_apply_success_receipt(
-    headless_client,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client, _requests, _node_environment = headless_client
-    receipt = {
-        "api_version": "manyforge.manager_command_response.v1",
-        "apply_generation": 3,
-        "apply_id": "apply.3",
-        "candidate_projection_revision": {
-            "graph_revision": "sha256:" + "b" * 64,
-            "retained_bundle_id": "sha256:" + "c" * 64,
-            "scene_revision": {
-                "content_hash": "sha256:" + "d" * 64,
-                "revision_id": 2,
-                "scene_id": "sha256:" + "e" * 64,
-            },
-        },
-        "error": None,
-        "ok": True,
-        "replay_status": "replayed_exact",
-        "request_id": "request.1",
-        "request_owner_epoch": "alarm.epoch.1",
-        "state": "succeeded",
-    }
-    monkeypatch.setattr(client, "manager_apply", lambda _body: receipt)
-    with _composer(client) as composer:
-        response = composer.post(
-            "/api/manager/apply",
-            json={
-                **_caller(),
-                "deployment_artifact_id": "deployment.3",
-                "deployment_revision": "sha256:" + "a" * 64,
-                "expected_current": {
-                    "graph_revision": "graph.2",
-                    "retained_bundle_id": "bundle.2",
-                },
-                "reject_if_affected_busy": True,
-                "expected_admission_generation": 7,
-                "candidate_receipt": {
-                    "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
-                    "deployment_artifact_id": "deployment.3",
-                    "deployment_revision": "sha256:" + "a" * 64,
-                    "scenario_catalog_revision": "sha256:" + "b" * 64,
-                    "candidate_retained_bundle_id": "bundle.3",
-                    "candidate_graph_revision": "graph.3",
-                    "expected_current": {
-                        "graph_revision": "graph.2",
-                        "retained_bundle_id": "bundle.2",
-                    },
-                    "expected_admission_generation": 7,
-                    "manager_owner_epoch": "alarm.epoch.1",
-                    "receipt_digest": "sha256:" + "c" * 64,
-                },
-            },
-        )
-
-    assert response.status_code == 200
-    assert response.json() == receipt
 
 
 def test_viewer_demand_lease_expires_without_waiting_for_wall_clock(

@@ -103,16 +103,6 @@ def _client_scenario_selection() -> dict[str, object]:
     }
 
 
-def _client_scenario_load_selection() -> dict[str, object]:
-    selection = _client_scenario_selection()
-    selection["schema_version"] = "manyforge.scenario_load_selection.v1"
-    selection["deployment"] = {
-        "deployment_artifact_id": selection["deployment_artifact_id"],
-        "deployment_revision": selection["deployment_revision"],
-    }
-    return selection
-
-
 def _sized_context_payload(size: int, *, native: bool = False) -> bytes:
     prefix = b'{"ok":true,"value":' if native else b""
     prefix += (
@@ -168,7 +158,7 @@ def test_client_uses_the_component_overview_route() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.component_overview.v1"},
+            json={"schema_version": "manyforge.component_overview.v2"},
             request=request,
         )
 
@@ -179,7 +169,7 @@ def test_client_uses_the_component_overview_route() -> None:
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
         assert client.component_overview()["schema_version"] == (
-            "manyforge.component_overview.v1"
+            "manyforge.component_overview.v2"
         )
     finally:
         raw.close()
@@ -515,8 +505,6 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
         requests.append(request)
         if request.url.path.endswith("/program-selection"):
             payload = _client_scenario_selection()
-        elif request.url.path.endswith("/load-selection"):
-            payload = _client_scenario_load_selection()
         elif request.url.path == "/api/program/applied":
             payload = _client_applied()
         else:
@@ -530,7 +518,6 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
         client.scenario_program_selection("cell-pick")
-        client.scenario_load_selection("cell-pick")
         client.program_applied()
         client.program_runs(active_only=True, limit=7)
         client.program_run_start({"request_id": "request.1"})
@@ -548,7 +535,6 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
 
     assert [request.url.path for request in requests] == [
         "/api/scenarios/cell-pick/program-selection",
-        "/api/scenarios/cell-pick/load-selection",
         "/api/program/applied",
         "/api/program/runs",
         "/api/program/runs",

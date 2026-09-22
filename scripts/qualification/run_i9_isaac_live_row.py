@@ -2543,7 +2543,6 @@ def _process_commands(
     execution_run_root = layout.run_root / "execution-host"
     program_runner_state_root = layout.owner_state_root("program-runner")
     program_selection_state_root = layout.owner_state_root("program-selection")
-    authoring_state_root = layout.owner_state_root("composer-authoring")
     program_cycle_journal = program_runner_state_root / "program-cycle.sqlite3"
     program_runner_liveness_socket = (
         manager_run_root / "program-runner-liveness.sock"
@@ -2567,8 +2566,6 @@ def _process_commands(
             str(layout.owner_state_root("logical-scene") / "scene.sqlite3"),
             "--program-cycle-journal",
             str(program_cycle_journal),
-            "--authoring-transaction-journal",
-            str(authoring_state_root / "composer-authoring-transactions.sqlite3"),
             "--projection-root",
             str(layout.projection_root),
             "--program-runner-liveness-socket",
@@ -2690,8 +2687,6 @@ def _process_commands(
             api_url,
             "--headless-api-timeout-s",
             "15",
-            "--authoring-state-root",
-            str(authoring_state_root),
         ]
     return commands
 

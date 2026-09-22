@@ -31,7 +31,6 @@ _SCENARIO_SELECTION_FIELDS = frozenset(
         "typed_parameter_overrides",
     }
 )
-_SCENARIO_LOAD_SELECTION_FIELDS = _SCENARIO_SELECTION_FIELDS | {"deployment"}
 _APPLIED_SELECTION_FIELDS = frozenset(
     {
         "assistant_mode",
@@ -182,46 +181,6 @@ def validate_scenario_program_selection(
     _binding_correspondence(value, label=label)
     return value
 
-
-def validate_scenario_load_selection(
-    value: object,
-    *,
-    scenario_id: str,
-    label: str = "scenario_load_selection",
-) -> dict[str, Any]:
-    """Validate an effect-free Scenario Load projection."""
-
-    if not isinstance(value, dict) or set(value) != _SCENARIO_LOAD_SELECTION_FIELDS:
-        _fail(label, "the closed Scenario Load selection record")
-    if value.get("schema_version") != "manyforge.scenario_load_selection.v1":
-        _fail(f"{label}.schema_version", "manyforge.scenario_load_selection.v1")
-    program_selection = {
-        key: nested
-        for key, nested in value.items()
-        if key != "deployment"
-    }
-    program_selection["schema_version"] = "manyforge.scenario_program_selection.v2"
-    validate_scenario_program_selection(
-        program_selection,
-        scenario_id=scenario_id,
-        label=label,
-    )
-    deployment = value.get("deployment")
-    if not isinstance(deployment, dict):
-        _fail(f"{label}.deployment", "an object")
-    if deployment.get("deployment_artifact_id") != value.get(
-        "deployment_artifact_id"
-    ):
-        _fail(
-            f"{label}.deployment.deployment_artifact_id",
-            "the selected Deployment artifact ID",
-        )
-    if deployment.get("deployment_revision") != value.get("deployment_revision"):
-        _fail(
-            f"{label}.deployment.deployment_revision",
-            "the selected Deployment revision",
-        )
-    return value
 
 
 def validate_applied_program_selection(

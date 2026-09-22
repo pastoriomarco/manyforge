@@ -148,7 +148,7 @@ constexpr std::string_view kFenceReleaseIntentDigestDomain =
 constexpr std::string_view kFenceReleasedDigestDomain =
     "manyforge.component-manager-fence-released.v1";
 constexpr std::string_view kTerminalOutcomeDigestDomain =
-    "manyforge.component-manager-terminal-outcome.v1";
+    "manyforge.component-manager-terminal-outcome.v2";
 constexpr int kBusyTimeoutMilliseconds = 10000;
 constexpr std::int64_t kWalCheckpointTargetBytes = 16LL * 1024LL * 1024LL;
 constexpr std::int64_t kExpectedSchemaObjectCardinality = 54;
@@ -587,6 +587,21 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
                           "candidate_retained_bundle_id");
   ValidateBoundedIdentity(intent.candidate_graph_revision.value(),
                           "candidate_graph_revision");
+  if (!intent.prepared_activation.valid()) {
+    throw std::invalid_argument(
+        "manager Apply intent has no exact prepared activation");
+  }
+  ValidateDigest(intent.prepared_activation.captured_input_digest.value(),
+                 "captured_input_digest");
+  ValidateBoundedIdentity(
+      intent.prepared_activation.deployment_artifact_id.value(),
+      "deployment_artifact_id");
+  ValidateDigest(intent.prepared_activation.deployment_revision.value(),
+                 "deployment_revision");
+  ValidateDigest(intent.prepared_activation.program_binding_id.value(),
+                 "program_binding_id");
+  ValidateDigest(intent.prepared_activation.prepared_activation_id.value(),
+                 "prepared_activation_id");
 
   const auto generation =
       CheckedSigned(intent.apply_generation.value(), "apply_generation");
@@ -636,6 +651,16 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
               intent.candidate_retained_bundle_id.value());
   AppendField(record, "candidate_graph_revision",
               intent.candidate_graph_revision.value());
+  AppendField(record, "captured_input_digest",
+              intent.prepared_activation.captured_input_digest.value());
+  AppendField(record, "deployment_artifact_id",
+              intent.prepared_activation.deployment_artifact_id.value());
+  AppendField(record, "deployment_revision",
+              intent.prepared_activation.deployment_revision.value());
+  AppendField(record, "program_binding_id",
+              intent.prepared_activation.program_binding_id.value());
+  AppendField(record, "prepared_activation_id",
+              intent.prepared_activation.prepared_activation_id.value());
   AppendField(record, "admission_context_kind",
               expected_admission_generation.has_value()
                   ? "direct"
@@ -1265,7 +1290,7 @@ EncodeFenceReleasedRecord(const ManagerApplyFenceReleasedDTO &record_value) {
 
 struct EncodedTerminalOutcome final {
   std::int64_t apply_generation;
-  std::int64_t candidate_scene_revision_id;
+  std::optional<std::int64_t> candidate_scene_revision_id;
   std::string state;
   std::string digest;
 };
@@ -1276,44 +1301,110 @@ EncodeTerminalOutcome(const ManagerApplyTerminalOutcomeDTO &outcome) {
     throw std::invalid_argument("Manager terminal Apply outcome is invalid");
   }
   ValidateBoundedIdentity(outcome.apply_id.value(), "apply_id");
-  ValidateDigest(outcome.publication_receipt_digest.value(),
-                 "publication_receipt_digest");
-  ValidateDigest(outcome.scene_finalized_digest.value(),
-                 "scene_finalized_digest");
-  ValidateDigest(outcome.fence_released_digest.value(),
-                 "fence_released_digest");
-  const auto &candidate = outcome.candidate_projection_revision;
   EncodedTerminalOutcome encoded{
       CheckedSigned(outcome.apply_generation.value(), "apply_generation"),
-      CheckedSigned(candidate.scene_revision.revision_id,
-                    "candidate_scene_revision_id"),
+      std::nullopt,
       ToString(outcome.state),
       {},
   };
   std::string record;
   AppendField(record, "domain", kTerminalOutcomeDigestDomain);
-  AppendField(record, "fence_released_digest",
-              outcome.fence_released_digest.value());
-  AppendField(record, "scene_finalized_digest",
-              outcome.scene_finalized_digest.value());
-  AppendField(record, "publication_receipt_digest",
-              outcome.publication_receipt_digest.value());
   AppendField(record, "apply_id", outcome.apply_id.value());
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
-  AppendField(record, "candidate_retained_bundle_id",
-              candidate.retained_bundle_id.value());
-  AppendField(record, "candidate_graph_revision",
-              candidate.graph_revision.value());
-  AppendField(record, "candidate_scene_id",
-              candidate.scene_revision.scene_id.value());
-  AppendField(record, "candidate_scene_revision_id",
-              std::to_string(encoded.candidate_scene_revision_id));
-  AppendField(record, "candidate_scene_content_hash",
-              candidate.scene_revision.content_hash.value());
   AppendField(record, "outcome_state", encoded.state);
+  if (outcome.state == ManagerApplyTerminalOutcomeState::kSucceeded) {
+    ValidateDigest(outcome.fence_released_digest->value(),
+                   "fence_released_digest");
+    ValidateDigest(outcome.scene_finalized_digest->value(),
+                   "scene_finalized_digest");
+    ValidateDigest(outcome.publication_receipt_digest->value(),
+                   "publication_receipt_digest");
+    const auto &candidate = *outcome.candidate_projection_revision;
+    encoded.candidate_scene_revision_id = CheckedSigned(
+        candidate.scene_revision.revision_id, "candidate_scene_revision_id");
+    AppendField(record, "fence_released_digest",
+                outcome.fence_released_digest->value());
+    AppendField(record, "scene_finalized_digest",
+                outcome.scene_finalized_digest->value());
+    AppendField(record, "publication_receipt_digest",
+                outcome.publication_receipt_digest->value());
+    AppendField(record, "candidate_retained_bundle_id",
+                candidate.retained_bundle_id.value());
+    AppendField(record, "candidate_graph_revision",
+                candidate.graph_revision.value());
+    AppendField(record, "candidate_scene_id",
+                candidate.scene_revision.scene_id.value());
+    AppendField(record, "candidate_scene_revision_id",
+                std::to_string(*encoded.candidate_scene_revision_id));
+    AppendField(record, "candidate_scene_content_hash",
+                candidate.scene_revision.content_hash.value());
+  } else {
+    const auto &failure = *outcome.failure;
+    ValidateDigest(failure.intent_digest.value(), "intent_digest");
+    ValidateBoundedText(failure.failure_code,
+                        kMaximumManagerApplyFailureCodeBytes, "failure_code");
+    ValidateBoundedText(failure.failure_message,
+                        kMaximumManagerApplyFailureMessageBytes,
+                        "failure_message");
+    AppendField(record, "intent_digest", failure.intent_digest.value());
+    AppendField(record, "failure_phase", ToString(failure.phase));
+    AppendField(record, "failure_code", failure.failure_code);
+    AppendField(record, "failure_message", failure.failure_message);
+    AppendField(record, "effect_disposition",
+                ToString(failure.effect_disposition));
+  }
   encoded.digest = RawDigest(record);
   return encoded;
+}
+
+[[nodiscard]] ManagerApplyTerminalOutcomeState ParseTerminalOutcomeState(
+    const std::string_view value) {
+  if (value == "succeeded") {
+    return ManagerApplyTerminalOutcomeState::kSucceeded;
+  }
+  if (value == "failed") {
+    return ManagerApplyTerminalOutcomeState::kFailed;
+  }
+  if (value == "unknown_effect") {
+    return ManagerApplyTerminalOutcomeState::kUnknownEffect;
+  }
+  throw ManagerApplyJournalIntegrityError(
+      "stored terminal Apply outcome has an unknown state");
+}
+
+[[nodiscard]] ManagerApplyPhase ParseManagerApplyPhase(
+    const std::string_view value) {
+  constexpr std::array<ManagerApplyPhase, 9U> kPhases{
+      ManagerApplyPhase::kAccepted,
+      ManagerApplyPhase::kFenceAcquired,
+      ManagerApplyPhase::kFenceAccepted,
+      ManagerApplyPhase::kRuntimeConverged,
+      ManagerApplyPhase::kSceneStaged,
+      ManagerApplyPhase::kSceneActivated,
+      ManagerApplyPhase::kComposed,
+      ManagerApplyPhase::kPublished,
+      ManagerApplyPhase::kSettled,
+  };
+  for (const auto phase : kPhases) {
+    if (value == ToString(phase)) {
+      return phase;
+    }
+  }
+  throw ManagerApplyJournalIntegrityError(
+      "stored terminal Apply failure has an unknown phase");
+}
+
+[[nodiscard]] ManagerApplyEffectDisposition ParseEffectDisposition(
+    const std::string_view value) {
+  if (value == "known") {
+    return ManagerApplyEffectDisposition::kKnown;
+  }
+  if (value == "unknown") {
+    return ManagerApplyEffectDisposition::kUnknown;
+  }
+  throw ManagerApplyJournalIntegrityError(
+      "stored terminal Apply failure has an unknown effect disposition");
 }
 
 bool SameFenceIntent(const ApplyConfigurationFenceIntentDTO &lhs,
@@ -3272,6 +3363,84 @@ void PreflightApplyJournal(const std::filesystem::path &database_path,
 
 } // namespace
 
+bool ManagerApplyPreparedActivationDTO::valid() const noexcept {
+  return core::IsExactLowercaseSha256Digest(captured_input_digest.value()) &&
+         !deployment_artifact_id.empty() &&
+         core::IsExactLowercaseSha256Digest(deployment_revision.value()) &&
+         core::IsExactLowercaseSha256Digest(program_binding_id.value()) &&
+         core::IsExactLowercaseSha256Digest(prepared_activation_id.value());
+}
+
+const char *ToString(const ManagerApplyPhase phase) noexcept {
+  switch (phase) {
+  case ManagerApplyPhase::kAccepted:
+    return "accepted";
+  case ManagerApplyPhase::kFenceAcquired:
+    return "fence_acquired";
+  case ManagerApplyPhase::kFenceAccepted:
+    return "fence_accepted";
+  case ManagerApplyPhase::kRuntimeConverged:
+    return "runtime_converged";
+  case ManagerApplyPhase::kSceneStaged:
+    return "scene_staged";
+  case ManagerApplyPhase::kSceneActivated:
+    return "scene_activated";
+  case ManagerApplyPhase::kComposed:
+    return "composed";
+  case ManagerApplyPhase::kPublished:
+    return "published";
+  case ManagerApplyPhase::kSettled:
+    return "settled";
+  }
+  return "unknown";
+}
+
+ManagerApplyProgressDTO DeriveManagerApplyProgress(
+    const PersistedManagerApplyStatus &status) {
+  if (status.terminal_outcome.has_value()) {
+    return {ManagerApplyPhase::kSettled,
+            status.terminal_outcome->terminal_outcome_digest};
+  }
+  if (status.fence_released.has_value()) {
+    return {ManagerApplyPhase::kSettled,
+            status.fence_released->fence_released_digest};
+  }
+  if (status.scene_finalized.has_value()) {
+    return {ManagerApplyPhase::kPublished,
+            status.scene_finalized->scene_finalized_digest};
+  }
+  if (status.publication_receipt.has_value()) {
+    return {ManagerApplyPhase::kPublished,
+            status.publication_receipt->publication_receipt_digest};
+  }
+  if (status.private_materialization.has_value()) {
+    return {ManagerApplyPhase::kComposed,
+            status.private_materialization
+                ->private_materialization_content_digest};
+  }
+  if (status.scene_activated.has_value()) {
+    return {ManagerApplyPhase::kSceneActivated,
+            status.scene_activated->scene_activated_digest};
+  }
+  if (status.scene_staged.has_value()) {
+    return {ManagerApplyPhase::kSceneStaged,
+            status.scene_staged->scene_staged_digest};
+  }
+  if (status.latest_runtime_staged_ready.has_value()) {
+    return {ManagerApplyPhase::kRuntimeConverged,
+            status.latest_runtime_staged_ready->staged_ready_digest};
+  }
+  if (status.fence_acceptance.has_value()) {
+    return {ManagerApplyPhase::kFenceAccepted,
+            status.fence_acceptance->acceptance_digest};
+  }
+  if (status.affected_scope.has_value()) {
+    return {ManagerApplyPhase::kFenceAcquired,
+            status.affected_scope->affected_scope_digest};
+  }
+  return {ManagerApplyPhase::kAccepted, status.intent.intent_digest};
+}
+
 bool ManagerApplyIntentDTO::valid() const noexcept {
   const bool direct = expected_admission_generation.has_value() &&
                       expected_admission_generation->nonzero() &&
@@ -3293,7 +3462,7 @@ bool ManagerApplyIntentDTO::valid() const noexcept {
          !apply_id.empty() && apply_generation.nonzero() && !cell_id.empty() &&
          expected_active_projection_revision.valid() &&
          !candidate_retained_bundle_id.empty() &&
-         !candidate_graph_revision.empty();
+         !candidate_graph_revision.empty() && prepared_activation.valid();
 }
 
 class SqliteManagerApplyJournal::Impl final {
@@ -3628,6 +3797,37 @@ public:
         [&] { return IntentUncachedLocked(apply_id, apply_generation); });
   }
 
+  /// Compose one complete status view for exactly one Apply generation. Used by
+  /// both the single-identity read and the bounded inventory read so the two
+  /// surfaces cannot derive different membership.
+  std::optional<PersistedManagerApplyStatus>
+  StatusLocked(const ApplyId &apply_id,
+               const std::int64_t apply_generation) const {
+    auto intent = IntentLocked(apply_id, apply_generation);
+    if (!intent.has_value()) {
+      return std::nullopt;
+    }
+    return PersistedManagerApplyStatus{
+        std::move(*intent),
+        AffectedScopeLocked(apply_id, apply_generation),
+        FenceAttemptLocked(apply_id, apply_generation),
+        FenceAcceptanceLocked(apply_id, apply_generation),
+        RuntimeConvergenceIntentLocked(apply_id, apply_generation),
+        LatestRuntimeStagedReadyLocked(apply_id, apply_generation),
+        SceneStageIntentLocked(apply_id, apply_generation),
+        SceneStagedLocked(apply_id, apply_generation),
+        ActivationSelectionLocked(apply_id, apply_generation),
+        SceneActivatedLocked(apply_id, apply_generation),
+        PrivateMaterializationLocked(apply_id, apply_generation),
+        RetiredCommandSurfacesLocked(apply_id, apply_generation),
+        PublicationReceiptLocked(apply_id, apply_generation),
+        SceneFinalizedLocked(apply_id, apply_generation),
+        FenceReleaseIntentLocked(apply_id, apply_generation),
+        FenceReleasedLocked(apply_id, apply_generation),
+        TerminalOutcomeLocked(apply_id, apply_generation),
+    };
+  }
+
   std::optional<PersistedManagerApplyIntent>
   IntentUncachedLocked(const ApplyId &apply_id,
                        const std::int64_t apply_generation) const {
@@ -3638,6 +3838,8 @@ public:
         "predecessor_graph_revision,predecessor_scene_id,"
         "predecessor_scene_revision_id,predecessor_scene_content_hash,"
         "candidate_retained_bundle_id,candidate_graph_revision,"
+        "captured_input_digest,deployment_artifact_id,deployment_revision,"
+        "program_binding_id,prepared_activation_id,"
         "expected_admission_generation,parent_authoring_claim,intent_digest "
         "FROM manager_apply_intents "
         "WHERE apply_id=? AND apply_generation=?");
@@ -3659,9 +3861,14 @@ public:
     const auto predecessor_scene_content_hash = row.Text(10);
     const auto candidate_retained_bundle_id = row.Text(11);
     const auto candidate_graph_revision = row.Text(12);
+    const auto captured_input_digest = row.Text(13);
+    const auto deployment_artifact_id = row.Text(14);
+    const auto deployment_revision = row.Text(15);
+    const auto program_binding_id = row.Text(16);
+    const auto prepared_activation_id = row.Text(17);
     std::optional<core::AdmissionGeneration> expected_admission_generation;
-    if (!row.IsNull(13)) {
-      const auto stored_admission_generation = row.Integer(13);
+    if (!row.IsNull(18)) {
+      const auto stored_admission_generation = row.Integer(18);
       if (stored_admission_generation <= 0) {
         throw ManagerApplyJournalIntegrityError(
             "stored Apply admission generation is invalid");
@@ -3669,8 +3876,8 @@ public:
       expected_admission_generation.emplace(
           static_cast<std::uint64_t>(stored_admission_generation));
     }
-    const auto parent_authoring_claim = row.OptionalBlob(14);
-    const auto stored_digest = row.Text(15);
+    const auto parent_authoring_claim = row.OptionalBlob(19);
+    const auto stored_digest = row.Text(20);
     if (row.Step()) {
       throw ManagerApplyJournalIntegrityError(
           "Apply intent identity is not unique");
@@ -3701,6 +3908,13 @@ public:
         },
         RetainedBundleId(candidate_retained_bundle_id),
         GraphRevision(candidate_graph_revision),
+        ManagerApplyPreparedActivationDTO{
+            ContentDigest(captured_input_digest),
+            core::DeploymentArtifactId(deployment_artifact_id),
+            core::DeploymentRevision(deployment_revision),
+            core::ProgramBindingId(program_binding_id),
+            ContentDigest(prepared_activation_id),
+        },
         expected_admission_generation,
         parent_authoring_claim.has_value()
             ? std::optional<core::CellAdmissionClaimDTO>(
@@ -5205,7 +5419,8 @@ public:
                   "publication_receipt_digest,candidate_retained_bundle_id,"
                   "candidate_graph_revision,candidate_scene_id,"
                   "candidate_scene_revision_id,candidate_scene_content_hash,"
-                  "outcome_state,terminal_outcome_digest "
+                  "intent_digest,failure_phase,failure_code,failure_message,"
+                  "effect_disposition,outcome_state,terminal_outcome_digest "
                   "FROM manager_apply_terminal_outcomes "
                   "WHERE apply_id=? AND apply_generation=?");
     row.Bind(1, apply_id.value());
@@ -5213,18 +5428,9 @@ public:
     if (!row.Step()) {
       return std::nullopt;
     }
-    const auto fence_released_digest = row.Text(0);
-    const auto scene_finalized_digest = row.Text(1);
-    const auto publication_digest = row.Text(2);
-    const auto candidate_bundle = row.Text(3);
-    const auto candidate_graph = row.Text(4);
-    const auto candidate_scene = row.Text(5);
-    const auto candidate_scene_revision = row.Integer(6);
-    const auto candidate_scene_digest = row.Text(7);
-    const auto state = row.Text(8);
-    const auto stored_digest = row.Text(9);
-    if (row.Step() || apply_generation <= 0 || candidate_scene_revision <= 0 ||
-        state != "succeeded") {
+    const auto state = row.Text(13);
+    const auto stored_digest = row.Text(14);
+    if (row.Step() || apply_generation <= 0) {
       throw ManagerApplyJournalIntegrityError(
           "stored terminal Apply outcome is structurally invalid");
     }
@@ -5232,38 +5438,83 @@ public:
       ManagerApplyTerminalOutcomeDTO outcome{
           apply_id,
           ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
-          ProjectionRevisionDTO{
-              RetainedBundleId(candidate_bundle),
-              GraphRevision(candidate_graph),
-              SceneRevision{
-                  SceneId(candidate_scene),
-                  static_cast<std::uint64_t>(candidate_scene_revision),
-                  ContentDigest(candidate_scene_digest),
-              },
-          },
-          ContentDigest(publication_digest),
-          ContentDigest(scene_finalized_digest),
-          ContentDigest(fence_released_digest),
-          ManagerApplyTerminalOutcomeState::kSucceeded,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          std::nullopt,
+          ParseTerminalOutcomeState(state),
+          std::nullopt,
       };
+      if (outcome.state == ManagerApplyTerminalOutcomeState::kSucceeded) {
+        const auto candidate_scene_revision = row.Integer(6);
+        if (candidate_scene_revision <= 0) {
+          throw ManagerApplyJournalIntegrityError(
+              "stored terminal Apply outcome has an invalid scene revision");
+        }
+        outcome.candidate_projection_revision = ProjectionRevisionDTO{
+            RetainedBundleId(row.Text(3)),
+            GraphRevision(row.Text(4)),
+            SceneRevision{
+                SceneId(row.Text(5)),
+                static_cast<std::uint64_t>(candidate_scene_revision),
+                ContentDigest(row.Text(7)),
+            },
+        };
+        outcome.publication_receipt_digest = ContentDigest(row.Text(2));
+        outcome.scene_finalized_digest = ContentDigest(row.Text(1));
+        outcome.fence_released_digest = ContentDigest(row.Text(0));
+      } else {
+        const auto disposition = ParseEffectDisposition(row.Text(12));
+        const auto required_disposition =
+            outcome.state == ManagerApplyTerminalOutcomeState::kFailed
+                ? ManagerApplyEffectDisposition::kKnown
+                : ManagerApplyEffectDisposition::kUnknown;
+        if (disposition != required_disposition) {
+          throw ManagerApplyJournalIntegrityError(
+              "stored terminal Apply failure disposition does not match its "
+              "state");
+        }
+        outcome.failure = ManagerApplyFailureEvidenceDTO{
+            ContentDigest(row.Text(8)),
+            ParseManagerApplyPhase(row.Text(9)),
+            row.Text(10),
+            row.Text(11),
+            disposition,
+        };
+      }
       const auto encoded = EncodeTerminalOutcome(outcome);
-      const auto released = FenceReleasedLocked(apply_id, apply_generation);
-      const auto finalized = SceneFinalizedLocked(apply_id, apply_generation);
-      const auto publication =
-          PublicationReceiptLocked(apply_id, apply_generation);
-      if (encoded.digest != stored_digest || !released.has_value() ||
-          released->fence_released_digest != outcome.fence_released_digest ||
-          !finalized.has_value() ||
-          finalized->scene_finalized_digest != outcome.scene_finalized_digest ||
-          finalized->scene_finalized.finalized_result
-                  .candidate_projection_revision !=
-              outcome.candidate_projection_revision ||
-          !publication.has_value() ||
-          publication->publication_receipt_digest !=
-              outcome.publication_receipt_digest) {
+      if (encoded.digest != stored_digest) {
         throw ManagerApplyJournalIntegrityError(
-            "stored terminal Apply outcome is not bound to exact completion "
-            "evidence");
+            "stored terminal Apply outcome digest is inconsistent");
+      }
+      if (outcome.state == ManagerApplyTerminalOutcomeState::kSucceeded) {
+        const auto released = FenceReleasedLocked(apply_id, apply_generation);
+        const auto finalized = SceneFinalizedLocked(apply_id, apply_generation);
+        const auto publication =
+            PublicationReceiptLocked(apply_id, apply_generation);
+        if (!released.has_value() ||
+            released->fence_released_digest != outcome.fence_released_digest ||
+            !finalized.has_value() ||
+            finalized->scene_finalized_digest !=
+                outcome.scene_finalized_digest ||
+            finalized->scene_finalized.finalized_result
+                    .candidate_projection_revision !=
+                outcome.candidate_projection_revision ||
+            !publication.has_value() ||
+            publication->publication_receipt_digest !=
+                outcome.publication_receipt_digest) {
+          throw ManagerApplyJournalIntegrityError(
+              "stored terminal Apply outcome is not bound to exact completion "
+              "evidence");
+        }
+      } else {
+        const auto intent = IntentLocked(apply_id, apply_generation);
+        if (!intent.has_value() ||
+            intent->intent_digest != outcome.failure->intent_digest) {
+          throw ManagerApplyJournalIntegrityError(
+              "stored terminal Apply failure is not bound to its exact "
+              "intent");
+        }
       }
       return PersistedManagerApplyTerminalOutcome{std::move(outcome),
                                                   ContentDigest(stored_digest)};
@@ -5439,7 +5690,7 @@ public:
                                    kMaximumManagerApplyFenceReleasedRecords) ||
         terminal_outcome_count >
             static_cast<std::int64_t>(kMaximumManagerApplyTerminalOutcomes) ||
-        terminal_outcome_count > fence_released_count ||
+        terminal_outcome_count > intent_count ||
         fence_released_count > fence_release_intent_count ||
         fence_release_intent_count > scene_finalized_count ||
         scene_finalized_count > publication_receipt_count ||
@@ -5925,8 +6176,10 @@ SqliteManagerApplyJournal::EnsureIntent(const ManagerApplyIntentDTO &intent) {
       "predecessor_graph_revision,predecessor_scene_id,"
       "predecessor_scene_revision_id,predecessor_scene_content_hash,"
       "candidate_retained_bundle_id,candidate_graph_revision,"
+      "captured_input_digest,deployment_artifact_id,deployment_revision,"
+      "program_binding_id,prepared_activation_id,"
       "expected_admission_generation,parent_authoring_claim,intent_digest"
-      ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+      ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
   insert.Bind(1, intent.apply_id.value());
   insert.Bind(2, encoded.apply_generation);
   insert.Bind(3, intent.request_context.request_id.value());
@@ -5948,17 +6201,22 @@ SqliteManagerApplyJournal::EnsureIntent(const ManagerApplyIntentDTO &intent) {
                       .content_hash.value());
   insert.Bind(12, intent.candidate_retained_bundle_id.value());
   insert.Bind(13, intent.candidate_graph_revision.value());
+  insert.Bind(14, intent.prepared_activation.captured_input_digest.value());
+  insert.Bind(15, intent.prepared_activation.deployment_artifact_id.value());
+  insert.Bind(16, intent.prepared_activation.deployment_revision.value());
+  insert.Bind(17, intent.prepared_activation.program_binding_id.value());
+  insert.Bind(18, intent.prepared_activation.prepared_activation_id.value());
   if (encoded.expected_admission_generation.has_value()) {
-    insert.Bind(14, *encoded.expected_admission_generation);
+    insert.Bind(19, *encoded.expected_admission_generation);
   } else {
-    insert.BindNull(14);
+    insert.BindNull(19);
   }
   if (encoded.parent_authoring_claim.has_value()) {
-    insert.BindBlob(15, *encoded.parent_authoring_claim);
+    insert.BindBlob(20, *encoded.parent_authoring_claim);
   } else {
-    insert.BindNull(15);
+    insert.BindNull(20);
   }
-  insert.Bind(16, encoded.intent_digest);
+  insert.Bind(21, encoded.intent_digest);
   static_cast<void>(insert.Step());
 
   const auto stored =
@@ -6010,33 +6268,29 @@ SqliteManagerApplyJournal::ReadStatusInventory() const {
   std::vector<PersistedManagerApplyStatus> result;
   result.reserve(keys.size());
   for (const auto &[apply_id, generation] : keys) {
-    auto intent = impl_->IntentLocked(apply_id, generation);
-    if (!intent.has_value()) {
+    auto status = impl_->StatusLocked(apply_id, generation);
+    if (!status.has_value()) {
       throw ManagerApplyJournalIntegrityError(
           "Apply status inventory references a missing intent");
     }
-    result.push_back(PersistedManagerApplyStatus{
-        std::move(*intent),
-        impl_->AffectedScopeLocked(apply_id, generation),
-        impl_->FenceAttemptLocked(apply_id, generation),
-        impl_->FenceAcceptanceLocked(apply_id, generation),
-        impl_->RuntimeConvergenceIntentLocked(apply_id, generation),
-        impl_->LatestRuntimeStagedReadyLocked(apply_id, generation),
-        impl_->SceneStageIntentLocked(apply_id, generation),
-        impl_->SceneStagedLocked(apply_id, generation),
-        impl_->ActivationSelectionLocked(apply_id, generation),
-        impl_->SceneActivatedLocked(apply_id, generation),
-        impl_->PrivateMaterializationLocked(apply_id, generation),
-        impl_->RetiredCommandSurfacesLocked(apply_id, generation),
-        impl_->PublicationReceiptLocked(apply_id, generation),
-        impl_->SceneFinalizedLocked(apply_id, generation),
-        impl_->FenceReleaseIntentLocked(apply_id, generation),
-        impl_->FenceReleasedLocked(apply_id, generation),
-        impl_->TerminalOutcomeLocked(apply_id, generation),
-    });
+    result.push_back(std::move(*status));
   }
   transaction.Commit();
   return result;
+}
+
+std::optional<PersistedManagerApplyStatus>
+SqliteManagerApplyJournal::ReadStatus(
+    const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
+  ValidateBoundedIdentity(apply_id.value(), "apply_id");
+  const auto generation =
+      CheckedSigned(apply_generation.value(), "apply_generation");
+  std::lock_guard lock(impl_->mutex_);
+  impl_->RequireOpen();
+  Transaction transaction(impl_->database_, "BEGIN");
+  auto status = impl_->StatusLocked(apply_id, generation);
+  transaction.Commit();
+  return status;
 }
 
 std::optional<PersistedManagerApplyIntent>
@@ -7577,26 +7831,40 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
   static_cast<void>(impl_->VerifyIntegrityLocked());
-  const auto released = impl_->FenceReleasedLocked(terminal_outcome.apply_id,
-                                                   encoded.apply_generation);
-  const auto finalized = impl_->SceneFinalizedLocked(terminal_outcome.apply_id,
+  const bool succeeded =
+      terminal_outcome.state == ManagerApplyTerminalOutcomeState::kSucceeded;
+  if (succeeded) {
+    const auto released = impl_->FenceReleasedLocked(terminal_outcome.apply_id,
                                                      encoded.apply_generation);
-  const auto publication = impl_->PublicationReceiptLocked(
-      terminal_outcome.apply_id, encoded.apply_generation);
-  if (!released.has_value() ||
-      released->fence_released_digest !=
-          terminal_outcome.fence_released_digest ||
-      !finalized.has_value() ||
-      finalized->scene_finalized_digest !=
-          terminal_outcome.scene_finalized_digest ||
-      finalized->scene_finalized.finalized_result
-              .candidate_projection_revision !=
-          terminal_outcome.candidate_projection_revision ||
-      !publication.has_value() ||
-      publication->publication_receipt_digest !=
-          terminal_outcome.publication_receipt_digest) {
-    throw ManagerApplyJournalConflictError(
-        "terminal Apply outcome does not match exact completion evidence");
+    const auto finalized = impl_->SceneFinalizedLocked(
+        terminal_outcome.apply_id, encoded.apply_generation);
+    const auto publication = impl_->PublicationReceiptLocked(
+        terminal_outcome.apply_id, encoded.apply_generation);
+    if (!released.has_value() ||
+        released->fence_released_digest !=
+            terminal_outcome.fence_released_digest ||
+        !finalized.has_value() ||
+        finalized->scene_finalized_digest !=
+            terminal_outcome.scene_finalized_digest ||
+        finalized->scene_finalized.finalized_result
+                .candidate_projection_revision !=
+            terminal_outcome.candidate_projection_revision ||
+        !publication.has_value() ||
+        publication->publication_receipt_digest !=
+            terminal_outcome.publication_receipt_digest) {
+      throw ManagerApplyJournalConflictError(
+          "terminal Apply outcome does not match exact completion evidence");
+    }
+  } else {
+    // A destructive failure is retained against the exact accepted intent and
+    // is never repaired, retried, rolled back or repaired from current state.
+    const auto intent = impl_->IntentLocked(terminal_outcome.apply_id,
+                                            encoded.apply_generation);
+    if (!intent.has_value() ||
+        intent->intent_digest != terminal_outcome.failure->intent_digest) {
+      throw ManagerApplyJournalConflictError(
+          "terminal Apply failure does not match its exact durable intent");
+    }
   }
   if (const auto existing = impl_->TerminalOutcomeLocked(
           terminal_outcome.apply_id, encoded.apply_generation);
@@ -7616,7 +7884,6 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
     throw ManagerApplyJournalLimitError(
         "terminal Apply outcome inventory reached its fixed limit");
   }
-  const auto &candidate = terminal_outcome.candidate_projection_revision;
   Statement insert(
       impl_->database_,
       "INSERT INTO manager_apply_terminal_outcomes ("
@@ -7624,20 +7891,45 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
       "scene_finalized_digest,publication_receipt_digest,"
       "candidate_retained_bundle_id,candidate_graph_revision,"
       "candidate_scene_id,candidate_scene_revision_id,"
-      "candidate_scene_content_hash,outcome_state,terminal_outcome_digest) "
-      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+      "candidate_scene_content_hash,intent_digest,failure_phase,failure_code,"
+      "failure_message,effect_disposition,"
+      "outcome_state,terminal_outcome_digest) "
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
   insert.Bind(1, terminal_outcome.apply_id.value());
   insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, terminal_outcome.fence_released_digest.value());
-  insert.Bind(4, terminal_outcome.scene_finalized_digest.value());
-  insert.Bind(5, terminal_outcome.publication_receipt_digest.value());
-  insert.Bind(6, candidate.retained_bundle_id.value());
-  insert.Bind(7, candidate.graph_revision.value());
-  insert.Bind(8, candidate.scene_revision.scene_id.value());
-  insert.Bind(9, encoded.candidate_scene_revision_id);
-  insert.Bind(10, candidate.scene_revision.content_hash.value());
-  insert.Bind(11, encoded.state);
-  insert.Bind(12, encoded.digest);
+  if (succeeded) {
+    const auto &candidate = *terminal_outcome.candidate_projection_revision;
+    insert.Bind(3, terminal_outcome.fence_released_digest->value());
+    insert.Bind(4, terminal_outcome.scene_finalized_digest->value());
+    insert.Bind(5, terminal_outcome.publication_receipt_digest->value());
+    insert.Bind(6, candidate.retained_bundle_id.value());
+    insert.Bind(7, candidate.graph_revision.value());
+    insert.Bind(8, candidate.scene_revision.scene_id.value());
+    insert.Bind(9, *encoded.candidate_scene_revision_id);
+    insert.Bind(10, candidate.scene_revision.content_hash.value());
+    insert.BindNull(11);
+    insert.BindNull(12);
+    insert.BindNull(13);
+    insert.BindNull(14);
+    insert.BindNull(15);
+  } else {
+    const auto &failure = *terminal_outcome.failure;
+    insert.BindNull(3);
+    insert.BindNull(4);
+    insert.BindNull(5);
+    insert.BindNull(6);
+    insert.BindNull(7);
+    insert.BindNull(8);
+    insert.BindNull(9);
+    insert.BindNull(10);
+    insert.Bind(11, failure.intent_digest.value());
+    insert.Bind(12, ToString(failure.phase));
+    insert.Bind(13, failure.failure_code);
+    insert.Bind(14, failure.failure_message);
+    insert.Bind(15, ToString(failure.effect_disposition));
+  }
+  insert.Bind(16, encoded.state);
+  insert.Bind(17, encoded.digest);
   static_cast<void>(insert.Step());
   const auto stored = impl_->TerminalOutcomeLocked(terminal_outcome.apply_id,
                                                    encoded.apply_generation);
@@ -7726,6 +8018,10 @@ core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
         "JOIN manager_apply_terminal_outcomes t "
         "ON t.apply_id=i.apply_id AND "
         "t.apply_generation=i.apply_generation "
+        // Only a published success settles a Kernel admission claim. A terminal
+        // failure or unknown-effect operation never releases the fence, so it
+        // can never prove a settled claim.
+        "AND t.outcome_state='succeeded' "
         "WHERE i.apply_id=? AND i.request_owner_epoch=? AND i.request_id=? "
         "AND i.intent_digest=? AND i.expected_admission_generation=? "
         "AND i.parent_authoring_claim IS NULL");
@@ -7750,6 +8046,125 @@ core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
   } catch (const std::exception &) {
     sqlite3_close(database);
     return rejected("manager_apply_journal_read_failed");
+  }
+}
+
+core::Result<core::CellAdmissionReconcileValidationDTO>
+ValidateManagerAuthoringOwnerReconciliationReadOnly(
+    const std::filesystem::path &database_path, const core::CellId &cell_id,
+    const std::vector<core::CellAdmissionClaimDTO> &held_claims,
+    const std::vector<core::CellAdmissionCurrentOwnerEpochDTO>
+        &current_owner_epochs,
+    const core::CellAdmissionReconcileDTO &reconcile) {
+  const auto rejected = [](std::string reason) {
+    return core::Result<core::CellAdmissionReconcileValidationDTO>::Err(
+        core::ErrorDTO{
+            "invariant_violation",
+            "Composer authoring owner reconciliation is not proven",
+            {{"reason", std::move(reason)}}});
+  };
+  constexpr auto role = core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+  if (held_claims != reconcile.retained_claims) {
+    return rejected("authoring_reconciliation_inventory_mismatch");
+  }
+  const auto predecessor = std::find_if(
+      current_owner_epochs.begin(), current_owner_epochs.end(),
+      [](const auto &owner) { return owner.owner_role == role; });
+  const auto successor = std::find_if(
+      reconcile.current_owner_epochs.begin(),
+      reconcile.current_owner_epochs.end(),
+      [](const auto &owner) { return owner.owner_role == role; });
+  if (successor == reconcile.current_owner_epochs.end() ||
+      successor->owner_epoch.empty() ||
+      (predecessor != current_owner_epochs.end() &&
+       predecessor->owner_epoch == successor->owner_epoch)) {
+    return rejected("authoring_reconciliation_successor_invalid");
+  }
+  for (const auto &owner : current_owner_epochs) {
+    if (owner.owner_role == role) {
+      continue;
+    }
+    if (std::find(reconcile.current_owner_epochs.begin(),
+                  reconcile.current_owner_epochs.end(), owner) ==
+        reconcile.current_owner_epochs.end()) {
+      return rejected("authoring_reconciliation_changes_unrelated_owner");
+    }
+  }
+  for (const auto &owner : reconcile.current_owner_epochs) {
+    if (owner.owner_role == role) {
+      continue;
+    }
+    if (std::find(current_owner_epochs.begin(), current_owner_epochs.end(),
+                  owner) == current_owner_epochs.end()) {
+      return rejected("authoring_reconciliation_changes_unrelated_owner");
+    }
+  }
+  const auto expected_evidence =
+      core::CellAdmissionOwnerEpochReconciliationEvidenceDigest(
+          role, successor->owner_epoch);
+  if (!expected_evidence.ok() ||
+      reconcile.reconciliation_evidence_digest != expected_evidence.value()) {
+    return rejected("authoring_reconciliation_evidence_mismatch");
+  }
+
+  sqlite3 *database = nullptr;
+  const int flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
+                    SQLITE_OPEN_NOFOLLOW;
+  if (sqlite3_open_v2(database_path.string().c_str(), &database, flags,
+                      nullptr) != SQLITE_OK) {
+    if (database != nullptr) {
+      sqlite3_close(database);
+    }
+    return rejected("manager_apply_journal_unavailable");
+  }
+  try {
+    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
+          "configure authoring reconciliation timeout");
+    Exec(database, "PRAGMA query_only=ON");
+    Transaction snapshot(database, "BEGIN");
+    ValidateApplyJournalIdentityAndSchema(database, cell_id);
+    core::CellAdmissionReconcileValidationDTO validation{
+        reconcile.current_owner_epochs, {}};
+    for (const auto &claim : held_claims) {
+      if (claim.intent.owner_role != role ||
+          (predecessor != current_owner_epochs.end() &&
+           claim.intent.owner_epoch != predecessor->owner_epoch)) {
+        continue;
+      }
+      const auto encoded_claim = EncodeParentAuthoringClaim(claim);
+      Statement operation(
+          database,
+          "SELECT t.outcome_state,t.effect_disposition,t.failure_phase "
+          "FROM manager_apply_intents i "
+          "LEFT JOIN manager_apply_terminal_outcomes t "
+          "ON t.apply_id=i.apply_id AND "
+          "t.apply_generation=i.apply_generation "
+          "WHERE i.parent_authoring_claim=?");
+      operation.BindBlob(1, encoded_claim);
+      const bool transferred = operation.Step();
+      const bool terminal_known =
+          transferred && !operation.IsNull(0) &&
+          (operation.Text(0) == "succeeded" ||
+           (operation.Text(0) == "failed" && !operation.IsNull(1) &&
+            operation.Text(1) == "known" && !operation.IsNull(2) &&
+            operation.Text(2) == "accepted"));
+      const bool duplicate = transferred && operation.Step();
+      if (duplicate || (transferred && !terminal_known)) {
+        throw std::runtime_error(
+            "accepted Manager operation is not known terminal");
+      }
+      validation.settlements.push_back(
+          {claim, role, successor->owner_epoch,
+           core::CellAdmissionSettlementKindDTO::kReconciled,
+           reconcile.reconciliation_evidence_digest});
+    }
+    snapshot.Commit();
+    sqlite3_close(database);
+    return core::Result<core::CellAdmissionReconcileValidationDTO>::Ok(
+        std::move(validation));
+  } catch (const std::exception &) {
+    sqlite3_close(database);
+    return rejected("authoring_reconciliation_manager_evidence_invalid");
   }
 }
 

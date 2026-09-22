@@ -321,7 +321,7 @@ function authoringSnapshot(
     complete: true,
     executionControlStatus: null,
     componentOverview: {
-      schemaVersion: 'manyforge.component_overview.v1',
+      schemaVersion: 'manyforge.component_overview.v2',
       overviewRevision: `sha256:${'a'.repeat(64)}`,
       readiness: 'ready',
       summaryLabel: 'Ready',
@@ -330,6 +330,7 @@ function authoringSnapshot(
       userMessage: 'Current.',
       capabilities: [],
       components: [],
+      maintenanceOperation: null,
       basis: {
         runtimeProjectionOwnerEpoch: null,
         runtimeProjectionGeneration: null,

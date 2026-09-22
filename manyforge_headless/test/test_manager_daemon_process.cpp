@@ -340,9 +340,6 @@ public:
   [[nodiscard]] std::filesystem::path program_cycle_journal() const {
     return root_ / "program-cycle.sqlite3";
   }
-  [[nodiscard]] std::filesystem::path authoring_transaction_journal() const {
-    return root_ / "authoring-transactions.sqlite3";
-  }
   [[nodiscard]] std::filesystem::path socket_path() const {
     return manager_run_root() / "manager-command.sock";
   }
@@ -393,8 +390,6 @@ public:
     const auto scene_database = directory.scene_database().string();
     const auto program_cycle_journal =
         directory.program_cycle_journal().string();
-    const auto authoring_transaction_journal =
-        directory.authoring_transaction_journal().string();
     const auto publication_root = projection_root.empty()
                                       ? directory.publication_root().string()
                                       : projection_root;
@@ -420,9 +415,7 @@ public:
                 execution_state_root.c_str(), "--execution-run-root",
                 execution_run_root.c_str(), "--logical-scene-database",
                 scene_database.c_str(), "--program-cycle-journal",
-                program_cycle_journal.c_str(),
-                "--authoring-transaction-journal",
-                authoring_transaction_journal.c_str(), "--projection-root",
+                program_cycle_journal.c_str(), "--projection-root",
                 publication_root.c_str(), "--reconciliation-period-ms", "10",
                 static_cast<char *>(nullptr));
       } else {
@@ -435,8 +428,7 @@ public:
             execution_state_root.c_str(), "--execution-run-root",
             execution_run_root.c_str(), "--logical-scene-database",
             scene_database.c_str(), "--program-cycle-journal",
-            program_cycle_journal.c_str(), "--authoring-transaction-journal",
-            authoring_transaction_journal.c_str(), "--projection-root",
+            program_cycle_journal.c_str(), "--projection-root",
             publication_root.c_str(), "--program-runner-liveness-socket",
             program_runner_liveness_socket.c_str(),
             "--reconciliation-period-ms", "10", static_cast<char *>(nullptr));
@@ -1024,10 +1016,35 @@ std::string ApplyRequest(
       {"graph_revision", CanonicalValue(resolved_graph_revision)},
       {"retained_bundle_id", CanonicalValue(resolved_retained_bundle_id)},
   });
+  std::ifstream catalog_stream(
+      directory.apply_package_root() / "maintained.scenario-catalog.yaml",
+      std::ios::binary);
+  if (!catalog_stream) {
+    throw std::runtime_error("Manager candidate catalog fixture is absent");
+  }
+  const std::string catalog_bytes{std::istreambuf_iterator<char>(catalog_stream),
+                                  std::istreambuf_iterator<char>()};
+  const auto catalog =
+      deployment::parse_strict_json_model_yaml(catalog_bytes).root();
+  std::string candidate_bundle;
+  std::string candidate_graph;
+  for (const auto &row : RequiredMember(catalog, "scenarios").as_array()) {
+    if (RequiredText(row, "deployment_artifact_id") == deployment_artifact_id &&
+        RequiredText(row, "deployment_revision") == deployment_revision) {
+      candidate_bundle = RequiredText(row, "retained_bundle_id");
+      candidate_graph = RequiredText(row, "graph_revision");
+      break;
+    }
+  }
+  if (candidate_bundle.empty() || candidate_graph.empty()) {
+    throw std::runtime_error("Manager candidate catalog fixture has no match");
+  }
   const auto preview_request =
       content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue("manyforge.manager_command.v1")},
           {"command", CanonicalValue("deployment_candidate_preview")},
+          {"candidate_graph_revision", CanonicalValue(candidate_graph)},
+          {"candidate_retained_bundle_id", CanonicalValue(candidate_bundle)},
           {"deployment_artifact_id",
            CanonicalValue(std::string(deployment_artifact_id))},
           {"deployment_revision",
@@ -1035,6 +1052,9 @@ std::string ApplyRequest(
           {"expected_admission_generation",
            CanonicalValue(static_cast<double>(expected_admission_generation))},
           {"expected_current", expected},
+          {"prepared_activation_id",
+           CanonicalValue("sha256:1616161616161616161616161616161616161616161616"
+                          "1616161616161616")},
           {"request_owner_epoch", CanonicalValue(std::string(owner))},
       }));
   const auto preview_response =
@@ -1063,6 +1083,22 @@ std::string ApplyRequest(
        CanonicalValue(std::string(deployment_artifact_id))},
       {"deployment_revision", CanonicalValue(std::string(deployment_revision))},
       {"expected_current", expected},
+      {"prepared_activation",
+       CanonicalValue(CanonicalValue::Object{
+           {"captured_input_digest",
+            CanonicalValue("sha256:1414141414141414141414141414141414141414141414"
+                           "1414141414141414")},
+           {"deployment_artifact_id",
+            CanonicalValue(std::string(deployment_artifact_id))},
+           {"deployment_revision",
+            CanonicalValue(std::string(deployment_revision))},
+           {"program_binding_id",
+            CanonicalValue("sha256:1717171717171717171717171717171717171717171717"
+                           "1717171717171717")},
+           {"prepared_activation_id",
+            CanonicalValue("sha256:1616161616161616161616161616161616161616161616"
+                           "1616161616161616")},
+       })},
       {"reject_if_affected_busy", CanonicalValue(true)},
       {"request_id", CanonicalValue(std::string(request_id))},
       {"request_owner_epoch", CanonicalValue(std::string(manager_owner_epoch))},
@@ -2408,7 +2444,7 @@ TEST(ManagerDaemonProcess,
 }
 
 TEST(ManagerDaemonProcess,
-     PhysicalCompositionReopensAfterChildAndManagerReplacement) {
+     PhysicalCompositionClosesOnChildLossAndReopensAfterManagerReplacement) {
   const auto fixture = ReadManagerApplyFixtureMetadata();
   DaemonDirectory directory;
   std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
@@ -2419,9 +2455,8 @@ TEST(ManagerDaemonProcess,
   ProgramRunnerProcess program_runner(directory, fixture.cell_id);
   std::string first_manager_epoch;
   std::string apply_request;
-  std::string child_recovered_owner_epoch;
+  std::string applied_owner_epoch;
   RuntimeOfferProjection initial_offer;
-  RuntimeOfferProjection child_recovered_offer;
   std::uint64_t advanced_scene_generation = 0U;
   {
     ManagerProcess manager(directory, package_root, fixture.admission_filename,
@@ -2463,6 +2498,7 @@ TEST(ManagerDaemonProcess,
     const auto initial = WaitForExecutionReady(
         directory, fixture.physical_candidate_retained_bundle_id);
     ASSERT_FALSE(initial.owner_epoch.empty());
+    applied_owner_epoch = initial.owner_epoch;
     initial_offer =
         WaitForRuntimeOfferProjection(manager_source, initial.owner_epoch);
     EXPECT_EQ(initial_offer.selected, initial_offer.observed);
@@ -2502,31 +2538,36 @@ TEST(ManagerDaemonProcess,
         WaitForSoleManagedChild(manager.pid(), "before deliberate SIGKILL");
     ASSERT_EQ(::kill(first_child, SIGKILL), 0);
 
-    const auto recovered = WaitForExecutionReady(
-        directory, fixture.physical_candidate_retained_bundle_id);
-    EXPECT_TRUE(recovered.observed_closed) << recovered.response;
-    EXPECT_NE(recovered.owner_epoch, initial.owner_epoch);
-    child_recovered_owner_epoch = recovered.owner_epoch;
-    // A small PID namespace may immediately reuse the numeric PID. The fresh
-    // owner epoch above and one live direct child prove replacement without
-    // treating PID allocation as runtime identity.
-    EXPECT_GT(WaitForSoleManagedChild(manager.pid(),
-                                      "after fresh execution owner epoch"),
-              0);
-
-    child_recovered_offer =
-        WaitForRuntimeOfferProjection(manager_source, recovered.owner_epoch);
-    EXPECT_EQ(recovered.owner_epoch,
-              "kernel-owner-" + child_recovered_offer.observed_epoch);
-    const auto after = manager_source.Read();
-    ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(child_recovered_offer.selected, child_recovered_offer.observed);
-    EXPECT_EQ(child_recovered_offer.selected, initial_offer.selected);
-    EXPECT_NE(child_recovered_offer.observed_epoch,
-              initial_offer.observed_epoch);
-    EXPECT_NE(content_identity::canonical_json(after->payload)
-                  .find(fixture.physical_candidate_retained_bundle_id),
-              std::string::npos);
+    // Unexpected loss of a required owner is contained fault evidence, not an
+    // implicit replacement request. Steady-state observation and the public
+    // reconcile command must never start the lost managed unit again; only the
+    // Manager's own bootstrap may reinitialize it.
+    const auto reap_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < reap_deadline &&
+           !ReadDirectChildren(manager.pid()).empty()) {
+      static_cast<void>(SendCommand(
+          directory.socket_path(),
+          R"({"api_version":"manyforge.manager_command.v1","command":"reconcile"})"));
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(ReadDirectChildren(manager.pid()).empty())
+        << "the exited managed child was not observed and reaped";
+    for (int attempt = 0; attempt < 5; ++attempt) {
+      const auto reconciled = SendCommand(
+          directory.socket_path(),
+          R"({"api_version":"manyforge.manager_command.v1","command":"reconcile"})");
+      EXPECT_NE(reconciled.find("\"ok\":true"), std::string::npos)
+          << reconciled;
+      EXPECT_TRUE(ReadDirectChildren(manager.pid()).empty())
+          << "steady-state observation restarted a lost managed child";
+    }
+    const auto manager_loss = manager_source.Read();
+    ASSERT_TRUE(manager_loss.has_value());
+    EXPECT_NE(content_identity::canonical_json(manager_loss->payload)
+                  .find("\"manager_ready\":false"),
+              std::string::npos)
+        << "lost required owner must keep readiness closed";
     const auto status = manager.Stop(SIGKILL);
     ASSERT_TRUE(WIFSIGNALED(status));
   }
@@ -2542,7 +2583,7 @@ TEST(ManagerDaemonProcess,
   const auto recovered_scene = scene_source.Read();
   ASSERT_TRUE(recovered_scene.has_value());
   EXPECT_GE(recovered_scene->source_generation, advanced_scene_generation);
-  EXPECT_NE(recovered.owner_epoch, child_recovered_owner_epoch);
+  EXPECT_NE(recovered.owner_epoch, applied_owner_epoch);
   EXPECT_NE(
       recovered.response.find(fixture.physical_candidate_retained_bundle_id),
       std::string::npos);
@@ -2557,7 +2598,7 @@ TEST(ManagerDaemonProcess,
   EXPECT_EQ(manager_recovered_offer.selected, manager_recovered_offer.observed);
   EXPECT_EQ(manager_recovered_offer.selected, initial_offer.selected);
   EXPECT_NE(manager_recovered_offer.observed_epoch,
-            child_recovered_offer.observed_epoch);
+            initial_offer.observed_epoch);
   EXPECT_NE(manager_recovered->source_owner_epoch, first_manager_epoch);
   EXPECT_NE(content_identity::canonical_json(manager_recovered->payload)
                 .find(fixture.physical_candidate_retained_bundle_id),

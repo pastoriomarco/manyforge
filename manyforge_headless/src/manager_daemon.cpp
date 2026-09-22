@@ -399,7 +399,6 @@ struct DaemonConfig final {
   std::filesystem::path execution_run_root;
   std::filesystem::path logical_scene_database;
   std::filesystem::path program_cycle_journal;
-  std::filesystem::path authoring_transaction_journal;
   std::filesystem::path projection_root;
   std::filesystem::path program_runner_liveness_socket;
   std::chrono::milliseconds reconciliation_period{500};
@@ -448,7 +447,7 @@ RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
 struct DeploymentCandidateReceipt final {
   core::DeploymentArtifactId deployment_artifact_id;
   core::DeploymentRevision deployment_revision;
-  core::ScenarioCatalogRevision scenario_catalog_revision;
+  core::ContentDigest prepared_activation_id;
   core::RetainedBundleId candidate_retained_bundle_id;
   core::GraphRevision candidate_graph_revision;
   core::RetainedBundleId expected_current_retained_bundle_id;
@@ -491,6 +490,8 @@ struct ManagerCommand final {
   std::optional<core::AdmissionGeneration> expected_admission_generation{};
   std::optional<core::CellAdmissionClaimDTO> parent_authoring_claim{};
   std::optional<DeploymentCandidateReceipt> deployment_candidate_receipt{};
+  std::optional<component_manager::ManagerApplyPreparedActivationDTO>
+      prepared_activation{};
   std::optional<core::ProjectionRevisionDTO> expected_scene_projection{};
   std::vector<core::SceneResourceId> scene_resource_ids{};
   std::optional<core::ResolvedSceneCandidatePreviewRequestDTO>
@@ -506,6 +507,9 @@ struct ManagerCommand final {
   std::optional<bool> pose_eligible{};
   std::optional<CanonicalValue> pose_payload{};
   std::vector<PoseObserverBinding> pose_observer_bindings{};
+  std::optional<core::RetainedBundleId> candidate_retained_bundle_id{};
+  std::optional<core::GraphRevision> candidate_graph_revision{};
+  std::optional<core::ContentDigest> prepared_activation_id{};
   std::optional<core::ApplyId> apply_id{};
   std::optional<core::ApplyGeneration> apply_generation{};
 };
@@ -563,8 +567,8 @@ DeploymentCandidateReceiptPayload(const DeploymentCandidateReceipt &receipt) {
                 receipt.expected_current_retained_bundle_id.value())},
        })},
       {"manager_owner_epoch", CanonicalValue(receipt.manager_owner_epoch)},
-      {"scenario_catalog_revision",
-       CanonicalValue(receipt.scenario_catalog_revision.value())},
+      {"prepared_activation_id",
+       CanonicalValue(receipt.prepared_activation_id.value())},
       {"schema_version",
        CanonicalValue("manyforge.manager_deployment_candidate_receipt.v1")},
   });
@@ -598,8 +602,7 @@ RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
       core::DeploymentArtifactId(
           RequiredString(value, "deployment_artifact_id")),
       core::DeploymentRevision(RequiredString(value, "deployment_revision")),
-      core::ScenarioCatalogRevision(
-          RequiredString(value, "scenario_catalog_revision")),
+      core::ContentDigest(RequiredString(value, "prepared_activation_id")),
       core::RetainedBundleId(
           RequiredString(value, "candidate_retained_bundle_id")),
       core::GraphRevision(RequiredString(value, "candidate_graph_revision")),
@@ -614,13 +617,46 @@ RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
   Require(
       core::IsExactLowercaseSha256Digest(receipt.deployment_revision.value()) &&
           core::IsExactLowercaseSha256Digest(
-              receipt.scenario_catalog_revision.value()) &&
+              receipt.prepared_activation_id.value()) &&
           core::IsExactLowercaseSha256Digest(receipt.receipt_digest.value()) &&
           content_identity::digest_equal(
               receipt.receipt_digest.value(),
               DeploymentCandidateReceiptDigest(receipt).value()),
       "deployment candidate receipt identity is invalid");
   return receipt;
+}
+
+/// Decode the exact UA2A prepared activation accepted by one named Apply.
+///
+/// The Manager records these facts in the durable intent and never reopens a
+/// mutable Scenario/catalog selection, draft or current-selection fact to
+/// reconstruct the operation input.
+component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
+    const CanonicalValue &value) {
+  RequireExactObjectSize(value, 5U, "Apply prepared activation");
+  const auto captured_input_digest =
+      RequiredString(value, "captured_input_digest");
+  const auto deployment_revision = RequiredString(value, "deployment_revision");
+  const auto prepared_activation_id =
+      RequiredString(value, "prepared_activation_id");
+  Require(core::IsExactLowercaseSha256Digest(captured_input_digest),
+          "Apply captured_input_digest must be canonical SHA-256");
+  Require(core::IsExactLowercaseSha256Digest(deployment_revision),
+          "Apply prepared activation deployment_revision must be canonical "
+          "SHA-256");
+  Require(core::IsExactLowercaseSha256Digest(prepared_activation_id),
+          "Apply prepared_activation_id must be canonical SHA-256");
+  const auto program_binding_id = RequiredString(value, "program_binding_id");
+  Require(core::IsExactLowercaseSha256Digest(program_binding_id),
+          "Apply program_binding_id must be canonical SHA-256");
+  return {
+      core::ContentDigest(captured_input_digest),
+      core::DeploymentArtifactId(
+          RequiredString(value, "deployment_artifact_id")),
+      core::DeploymentRevision(deployment_revision),
+      core::ProgramBindingId(program_binding_id),
+      core::ContentDigest(prepared_activation_id),
+  };
 }
 
 std::optional<std::string> OptionalString(const CanonicalValue &root,
@@ -1135,7 +1171,7 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
           "command api_version is unsupported");
   const auto command = RequiredString(root, "command");
   if (command == "deployment_candidate_preview") {
-    RequireExactObjectSize(root, 7U, "deployment candidate preview command");
+    RequireExactObjectSize(root, 10U, "deployment candidate preview command");
     const auto deployment_revision =
         RequiredString(root, "deployment_revision");
     Require(core::IsExactLowercaseSha256Digest(deployment_revision),
@@ -1156,7 +1192,18 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
             core::AdmissionGeneration(RequiredUnsigned(
                 RequiredMember(root, "expected_admission_generation"),
                 "candidate expected_admission_generation")),
+        .candidate_retained_bundle_id = core::RetainedBundleId(
+            RequiredString(root, "candidate_retained_bundle_id")),
+        .candidate_graph_revision = core::GraphRevision(
+            RequiredString(root, "candidate_graph_revision")),
+        .prepared_activation_id = core::ContentDigest(
+            RequiredString(root, "prepared_activation_id")),
     };
+    Require(!result.candidate_retained_bundle_id->empty() &&
+                !result.candidate_graph_revision->empty() &&
+                core::IsExactLowercaseSha256Digest(
+                    result.prepared_activation_id->value()),
+            "candidate preview prepared activation identity is invalid");
     return result;
   }
   if (command == "reconcile") {
@@ -1286,7 +1333,7 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     return result;
   }
   Require(command == "apply", "command kind is unsupported");
-  RequireExactObjectSize(root, 12U, "Apply command");
+  RequireExactObjectSize(root, 13U, "Apply command");
   const auto request_id = RequiredString(root, "request_id");
   const auto request_owner_epoch = RequiredString(root, "request_owner_epoch");
   const auto source_label = RequiredString(root, "source_label");
@@ -1315,6 +1362,8 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
   result.deployment_revision = core::DeploymentRevision(deployment_revision);
   result.deployment_candidate_receipt = RequiredDeploymentCandidateReceipt(
       RequiredMember(root, "candidate_receipt"));
+  result.prepared_activation =
+      RequiredPreparedActivation(RequiredMember(root, "prepared_activation"));
   result.expected_current_retained_bundle_id =
       core::RetainedBundleId(expected_retained_bundle_id);
   result.expected_current_graph_revision =
@@ -1829,7 +1878,9 @@ ApplyResponse(const ManagerCommand &command,
   const auto succeeded =
       result.state ==
       component_manager::ManagerNamedApplyResultState::kSucceeded;
-  Require(succeeded == result.terminal_outcome.has_value(),
+  Require(succeeded ==
+              (result.terminal_outcome.has_value() &&
+               result.terminal_outcome->succeeded()),
           "Manager Apply result has inconsistent terminal evidence");
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
@@ -1838,9 +1889,10 @@ ApplyResponse(const ManagerCommand &command,
        Unsigned(result.apply_generation.value(), "Apply generation")},
       {"apply_id", CanonicalValue(result.apply_id.value())},
       {"candidate_projection_revision",
-       succeeded ? ProjectionRevision(
-                       result.terminal_outcome->candidate_projection_revision)
-                 : CanonicalValue(nullptr)},
+       succeeded
+           ? ProjectionRevision(
+                 *result.terminal_outcome->candidate_projection_revision)
+           : CanonicalValue(nullptr)},
       {"error", CanonicalValue(nullptr)},
       {"ok", CanonicalValue(true)},
       {"replay_status",
@@ -1848,28 +1900,100 @@ ApplyResponse(const ManagerCommand &command,
                                               : "accepted_new")},
       {"request_id", CanonicalValue(*command.request_id)},
       {"request_owner_epoch", CanonicalValue(*command.request_owner_epoch)},
-      {"state", CanonicalValue(succeeded ? "succeeded" : "pending")},
+      {"state",
+       CanonicalValue(result.state ==
+                              component_manager::ManagerNamedApplyResultState::
+                                  kPending
+                          ? std::string("pending")
+                          : std::string(component_manager::ToString(
+                                result.terminal_outcome->state)))},
   });
 }
 
+/// Exact UA2A prepared activation accepted by one named Apply.
+CanonicalValue ApplyPreparedActivationValue(
+    const component_manager::ManagerApplyPreparedActivationDTO &activation) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"captured_input_digest",
+       CanonicalValue(activation.captured_input_digest.value())},
+      {"deployment_artifact_id",
+       CanonicalValue(activation.deployment_artifact_id.value())},
+      {"deployment_revision",
+       CanonicalValue(activation.deployment_revision.value())},
+      {"program_binding_id",
+       CanonicalValue(activation.program_binding_id.value())},
+      {"prepared_activation_id",
+       CanonicalValue(activation.prepared_activation_id.value())},
+  });
+}
+
+/// One bounded lifecycle status for one durable Apply generation.
+///
+/// The status exposes only durable facts: the operation identity, the accepted
+/// prepared-activation identity, the deepest durably reached milestone with its
+/// exact evidence digest, and exactly one terminal outcome. `phase` and
+/// `last_progress` are pure projections over immutable parent-linked records; no
+/// mutable phase label, heartbeat or socket responsiveness is reported as
+/// progress. A failure is reported once, with its first retained failure and
+/// effect certainty, and is never repaired, retried or rolled back.
 CanonicalValue ApplyStatusResponse(
-    const core::ApplyId &apply_id, const core::ApplyGeneration apply_generation,
-    const std::optional<component_manager::PersistedManagerApplyTerminalOutcome>
-        &terminal) {
+    const component_manager::PersistedManagerApplyStatus &status) {
+  const auto &intent = status.intent.intent;
+  const auto progress =
+      component_manager::DeriveManagerApplyProgress(status);
+  const auto phase =
+      CanonicalValue(std::string(component_manager::ToString(progress.phase)));
+  const auto terminal = status.terminal_outcome.has_value()
+                            ? &status.terminal_outcome->terminal_outcome
+                            : nullptr;
+  const bool succeeded =
+      terminal != nullptr && terminal->state ==
+                                 component_manager::
+                                     ManagerApplyTerminalOutcomeState::kSucceeded;
+  auto failure = CanonicalValue(nullptr);
+  if (terminal != nullptr && terminal->failure.has_value()) {
+    const auto &retained = *terminal->failure;
+    failure = CanonicalValue(CanonicalValue::Object{
+        {"code", CanonicalValue(retained.failure_code)},
+        {"effect_disposition",
+         CanonicalValue(std::string(
+             component_manager::ToString(retained.effect_disposition)))},
+        {"message", CanonicalValue(retained.failure_message)},
+        {"phase", CanonicalValue(
+                      std::string(component_manager::ToString(retained.phase)))},
+    });
+  }
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
       {"apply_generation",
-       Unsigned(apply_generation.value(), "Apply generation")},
-      {"apply_id", CanonicalValue(apply_id.value())},
+       Unsigned(intent.apply_generation.value(), "Apply generation")},
+      {"apply_id", CanonicalValue(intent.apply_id.value())},
       {"candidate_projection_revision",
-       terminal.has_value()
-           ? ProjectionRevision(
-                 terminal->terminal_outcome.candidate_projection_revision)
-           : CanonicalValue(nullptr)},
+       succeeded ? ProjectionRevision(
+                       *terminal->candidate_projection_revision)
+                 : CanonicalValue(nullptr)},
       {"error", CanonicalValue(nullptr)},
+      {"failure", std::move(failure)},
+      {"last_progress",
+       CanonicalValue(CanonicalValue::Object{
+           {"phase", phase},
+           {"record_digest",
+            CanonicalValue(progress.record_digest.value())},
+       })},
       {"ok", CanonicalValue(true)},
-      {"state", CanonicalValue(terminal.has_value() ? "succeeded" : "pending")},
+      {"phase", phase},
+      {"prepared_activation",
+       ApplyPreparedActivationValue(intent.prepared_activation)},
+      {"request_id",
+       CanonicalValue(intent.request_context.request_id.value())},
+      {"request_owner_epoch",
+       CanonicalValue(intent.request_context.request_owner_epoch.value())},
+      {"state",
+       CanonicalValue(terminal == nullptr
+                          ? std::string("pending")
+                          : std::string(component_manager::ToString(
+                                terminal->state)))},
   });
 }
 
@@ -2082,6 +2206,32 @@ private:
   return native_execution_hosts == 1U;
 }
 
+class DaemonPlannedMaintenanceGate final
+    : public component_manager::IPlannedMaintenanceGate {
+public:
+  using StateReader =
+      std::function<component_manager::ManagementIdleState()>;
+  using AdmissionCloser = std::function<bool()>;
+
+  DaemonPlannedMaintenanceGate(StateReader state_reader,
+                               AdmissionCloser admission_closer)
+      : state_reader_(std::move(state_reader)),
+        admission_closer_(std::move(admission_closer)) {}
+
+  [[nodiscard]] component_manager::ManagementIdleState
+  ReadIdleState() const override {
+    return state_reader_();
+  }
+
+  [[nodiscard]] bool CloseAdmissionAndProveClosed() override {
+    return admission_closer_();
+  }
+
+private:
+  StateReader state_reader_;
+  AdmissionCloser admission_closer_;
+};
+
 class ManagerDaemon final {
 public:
   explicit ManagerDaemon(DaemonConfig config)
@@ -2100,11 +2250,6 @@ public:
             config_.candidate_package_root.empty()
                 ? std::nullopt
                 : std::optional(config_.candidate_package_root)),
-        candidate_source_(package_generation_.descriptor_bound_root(),
-                          "maintained",
-                          config_.candidate_package_root.empty()
-                              ? std::nullopt
-                              : std::optional(config_.candidate_package_root)),
         native_runtime_adapter_(
             InstalledTargetRoot(), package_generation_.descriptor_bound_root(),
             config_.manager_state_root, config_.manager_run_root,
@@ -2117,7 +2262,6 @@ public:
                     deployment::ros2_control_execution_runtime_contract::
                         kLaunchEnvironmentContract)},
             config_.logical_scene_database, config_.program_cycle_journal,
-            config_.authoring_transaction_journal,
             config_.candidate_package_root),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
@@ -2142,6 +2286,11 @@ public:
             plan_source_, runtime_adapter_router_, runtime_adapter_router_,
             [this] { return ElapsedNs(); },
             [this] { RequireCurrentPackageGeneration(); }),
+        planned_maintenance_gate_(
+            [this] { return ReadPlannedMaintenanceState(); },
+            [this] { return ClosePlannedMaintenanceAdmission(); }),
+        planned_maintenance_(plan_source_, active_runtime_,
+                             planned_maintenance_gate_),
         manager_runtime_epoch_(RandomToken("manager-runtime-")),
         named_apply_(
             stores_.apply_journal(), plan_source_, verified_package_,
@@ -2149,6 +2298,7 @@ public:
             scene_owner_, &scene_owner_, native_runtime_adapter_,
             native_runtime_adapter_, native_runtime_adapter_,
             runtime_adapter_router_, runtime_adapter_router_,
+            planned_maintenance_,
             manager_runtime_epoch_, "linux",
             {std::string(deployment::native_execution_runtime_contract::
                              kLaunchEnvironmentContract),
@@ -2181,8 +2331,9 @@ public:
     // never survive its restart. Recreate the runtime selected by the durable
     // public pointer before the progression lane resumes an incomplete Apply.
     // Constructor/bootstrap work never advances that Apply: the command socket
-    // must be available while its exact durable status is observed.
-    static_cast<void>(ReconcileAndPublish());
+    // must be available while its exact durable status is observed. This is the
+    // only non-Apply caller permitted to start a managed runtime unit.
+    static_cast<void>(InitializeRuntimeAndPublish());
   }
 
   int Run() {
@@ -2324,12 +2475,9 @@ private:
         DatabasePath(std::move(config.logical_scene_database));
     config.program_cycle_journal = ProspectiveDatabasePath(
         std::move(config.program_cycle_journal), "Program-cycle journal");
-    config.authoring_transaction_journal =
-        ProspectiveDatabasePath(std::move(config.authoring_transaction_journal),
-                                "Composer authoring transaction journal");
-    const std::array<const std::filesystem::path *, 4U> durable_paths{
+    const std::array<const std::filesystem::path *, 3U> durable_paths{
         &config.logical_scene_database, &config.program_cycle_journal,
-        &config.authoring_transaction_journal, &config.projection_root};
+        &config.projection_root};
     const std::array<const std::filesystem::path *, 2U> run_roots{
         &config.manager_run_root, &config.execution_run_root};
     for (const auto *durable_path : durable_paths) {
@@ -2470,9 +2618,28 @@ private:
             stage->scene_stage_intent.predecessor_publication_generation};
   }
 
-  PublicationGenerations ReconcileAndPublish() {
+  /// Observation-only convergence and publication. Used by periodic runtime
+  /// observation and the public `reconcile` command. The independent liveness
+  /// lane consumes the resulting snapshot; it does not call this method. A
+  /// missing required Manager-managed unit is reported as non-converged fault
+  /// evidence that closes readiness; this surface never starts or replaces a
+  /// process.
+  PublicationGenerations ObserveRuntimeAndPublish() {
     RequireCurrentPackageGeneration();
-    const auto runtime = active_runtime_.Reconcile();
+    return PublishActiveRuntime(active_runtime_.Observe());
+  }
+
+  /// Effect-permitted convergence and publication. Restricted to bootstrap and
+  /// to an admitted maintenance operation that already holds the exact
+  /// operation admission; it may start absent Manager-managed units in
+  /// dependency order.
+  PublicationGenerations InitializeRuntimeAndPublish() {
+    RequireCurrentPackageGeneration();
+    return PublishActiveRuntime(active_runtime_.Initialize());
+  }
+
+  PublicationGenerations PublishActiveRuntime(
+      component_manager::ManagerActiveRuntimeConvergenceResult runtime) {
     last_runtime_ = runtime;
     kernel_apply_available_ = HasConvergedKernelApplyOwner(runtime);
     if (kernel_apply_available_ && !scene_admission_reconciled_.exchange(
@@ -2631,6 +2798,50 @@ private:
     });
   }
 
+  [[nodiscard]] component_manager::ManagementIdleState
+  ReadPlannedMaintenanceState() const noexcept {
+    if (config_.program_runner_liveness_socket.empty()) {
+      return component_manager::ManagementIdleState::kUnavailable;
+    }
+    try {
+      const auto status = ProbeProgramRunnerLiveness(
+                              config_.program_runner_liveness_socket,
+                              admission_.cell_id())
+                              .program_cycle_status;
+      switch (status.state) {
+      case core::ProgramCycleStateDTO::kIdleAfterReset:
+        return component_manager::ManagementIdleState::kIdle;
+      case core::ProgramCycleStateDTO::kStarting:
+        return component_manager::ManagementIdleState::kStarting;
+      case core::ProgramCycleStateDTO::kRunning:
+        return component_manager::ManagementIdleState::kActive;
+      case core::ProgramCycleStateDTO::kStopping:
+        return component_manager::ManagementIdleState::kStopping;
+      case core::ProgramCycleStateDTO::kTerminalAwaitingReset:
+        return component_manager::ManagementIdleState::kTerminalAwaitingReset;
+      case core::ProgramCycleStateDTO::kInterventionOrRecovery:
+        return component_manager::ManagementIdleState::kInterventionOrRecovery;
+      case core::ProgramCycleStateDTO::kResetting:
+        return component_manager::ManagementIdleState::kResetting;
+      case core::ProgramCycleStateDTO::kRecoveryRequired:
+        return component_manager::ManagementIdleState::kRecoveryRequired;
+      }
+    } catch (...) {
+    }
+    return component_manager::ManagementIdleState::kUnavailable;
+  }
+
+  [[nodiscard]] bool ClosePlannedMaintenanceAdmission() noexcept {
+    if (!last_submitted_readiness_.has_value()) {
+      return false;
+    }
+    SubmitFailClosedReadiness(last_submitted_readiness_->program_cycle_status);
+    return last_submitted_readiness_.has_value() &&
+           !last_submitted_readiness_->program_cycle_status_current &&
+           !last_submitted_readiness_->required_component_status_current &&
+           !last_submitted_readiness_->deployment_status_current;
+  }
+
   void SubmitCellAdmissionReadiness(
       const core::CellAdmissionReadinessSnapshotDTO &snapshot) {
     const auto updated =
@@ -2765,6 +2976,26 @@ private:
     manager_liveness_lane_condition_.notify_one();
   }
 
+  /// Renew the independent Program Runner lease and every required native
+  /// receiver, publish their observations to the Kernel and reduce one
+  /// cell-admission readiness snapshot.
+  ///
+  /// Traced path (UA3.1): ProbeProgramRunnerLiveness (read-only socket probe) ->
+  /// required-set construction from the currently observed epochs ->
+  /// RenewProgramRunnerLiveness -> RetainedNativeRuntimeAdapter
+  /// RenewManagerLivenessBatch -> Kernel liveness publication ->
+  /// BuildCellAdmissionReadiness. This lane performs no process lifecycle call:
+  /// it never reaches the active-runtime coordinator's Observe/Initialize and
+  /// therefore never starts a managed unit.
+  ///
+  /// Detector conclusion: the existing lease/renewal path is the
+  /// required-owner-loss detector. A required owner that is missing, foreign or
+  /// stale makes the observation lane report non-converged evidence and makes
+  /// this renewal throw; every throw path above calls SubmitFailClosedReadiness,
+  /// which publishes `required_component_status_current=false` and
+  /// `deployment_status_current=false` before returning. No interval was found in
+  /// which the Kernel stays open after required-owner evidence has expired, so no
+  /// additional progress lease, watchdog or second Stop owner is added here.
   void TryRenewNativeManagerLiveness(
       const NativeManagerLivenessSnapshot &snapshot, const bool forced_closed,
       const std::uint64_t readiness_barrier, const bool allow_native) noexcept {
@@ -3196,11 +3427,11 @@ private:
         RequestApplyProgress();
         return;
       }
-      if (!ActiveProjectionRecoveryCurrent()) {
-        static_cast<void>(ReconcileAndPublish());
-        return;
-      }
-      static_cast<void>(ReconcileAndPublish());
+      // Steady-state observation. A required managed unit that is absent is
+      // contained fault evidence: it closes readiness and is never started or
+      // replaced here. Only an explicit admitted maintenance operation may
+      // initialize it again.
+      static_cast<void>(ObserveRuntimeAndPublish());
     } catch (const ManagerPackageGenerationRestartRequired &error) {
       TrySubmitFailClosedReadiness();
       PublishPackageRestartRequired();
@@ -3304,20 +3535,6 @@ private:
           apply_progress_requested_ = true;
         }
       }
-    }
-  }
-
-  [[nodiscard]] bool ActiveProjectionRecoveryCurrent() const {
-    if (!last_runtime_.has_value() || last_active_bundle_ == nullptr ||
-        !last_reconciled_native_runtime_bindings_.has_value()) {
-      return false;
-    }
-    try {
-      return *last_reconciled_native_runtime_bindings_ ==
-             component_manager::DeriveActiveNativeProjectionRuntimeBindings(
-                 last_active_bundle_->value(), last_runtime_->observations);
-    } catch (...) {
-      return false;
     }
   }
 
@@ -3633,6 +3850,9 @@ private:
         Require(command.request_owner_epoch.has_value() &&
                     command.deployment_artifact_id.has_value() &&
                     command.deployment_revision.has_value() &&
+                    command.candidate_retained_bundle_id.has_value() &&
+                    command.candidate_graph_revision.has_value() &&
+                    command.prepared_activation_id.has_value() &&
                     command.expected_current_retained_bundle_id.has_value() &&
                     command.expected_current_graph_revision.has_value() &&
                     command.expected_admission_generation.has_value(),
@@ -3658,12 +3878,11 @@ private:
                     "Manager current Deployment changed before preview"));
             return false;
           }
-          const auto selection = candidate_source_.ResolveExact(
-              {*command.deployment_artifact_id, *command.deployment_revision});
           const auto current_bundle = verified_package_.get_verified(
               current_pointer.candidate_retained_bundle_id);
           const auto candidate_bundle =
-              verified_package_.get_verified(selection.retained_bundle_id);
+              verified_package_.get_verified(
+                  *command.candidate_retained_bundle_id);
           Require(
               current_bundle != nullptr && candidate_bundle != nullptr &&
                   current_bundle->retained_bundle_id() ==
@@ -3671,16 +3890,18 @@ private:
                   current_bundle->value().cell_graph.graph_revision ==
                       current_pointer.candidate_graph_revision &&
                   candidate_bundle->retained_bundle_id() ==
-                      selection.retained_bundle_id &&
+                      *command.candidate_retained_bundle_id &&
+                  candidate_bundle->value().cell_graph.graph_revision ==
+                      *command.candidate_graph_revision &&
                   candidate_bundle->value().cell_graph.cell_id ==
                       current_bundle->value().cell_graph.cell_id,
               "candidate preview could not resolve exact compatible graphs");
           DeploymentCandidateReceipt receipt{
               *command.deployment_artifact_id,
               *command.deployment_revision,
-              selection.scenario_catalog_revision,
-              selection.retained_bundle_id,
-              candidate_bundle->value().cell_graph.graph_revision,
+              *command.prepared_activation_id,
+              *command.candidate_retained_bundle_id,
+              *command.candidate_graph_revision,
               *command.expected_current_retained_bundle_id,
               *command.expected_current_graph_revision,
               *command.expected_admission_generation,
@@ -3718,7 +3939,8 @@ private:
                     command.request_id.has_value() &&
                     command.request_owner_epoch.has_value() &&
                     command.source_label.has_value() &&
-                    command.deployment_candidate_receipt.has_value(),
+                    command.deployment_candidate_receipt.has_value() &&
+                    command.prepared_activation.has_value(),
                 "decoded Apply command lacks its exact selection");
         try {
           const auto existing = stores_.apply_journal().ReadRequest(
@@ -3756,7 +3978,13 @@ private:
                candidate_receipt.expected_current_graph_revision !=
                    *command.expected_current_graph_revision ||
                candidate_receipt.expected_admission_generation !=
-                   receipt_admission_generation)) {
+                   receipt_admission_generation ||
+               candidate_receipt.prepared_activation_id !=
+                   command.prepared_activation->prepared_activation_id ||
+               command.prepared_activation->deployment_artifact_id !=
+                   *command.deployment_artifact_id ||
+               command.prepared_activation->deployment_revision !=
+                   *command.deployment_revision)) {
             TrySendResponse(
                 client.get(),
                 ApplyErrorResponse(
@@ -3785,19 +4013,17 @@ private:
             }
             const auto active = plan_source_.ReadCurrentPlan();
             const auto &current_pointer = active.active_publication.request;
-            const auto selection =
-                candidate_source_.ResolveExact({*command.deployment_artifact_id,
-                                                *command.deployment_revision});
-            const auto candidate_bundle =
-                verified_package_.get_verified(selection.retained_bundle_id);
+            // The accepted operation carries the exact candidate identity that
+            // the preview resolved. The Manager must not reopen a mutable
+            // Scenario/catalog selection here: the sealed package and the
+            // current public pointer are the only facts rechecked, and both
+            // are immutable or already versioned.
+            const auto candidate_bundle = verified_package_.get_verified(
+                candidate_receipt.candidate_retained_bundle_id);
             if (current_pointer.candidate_retained_bundle_id !=
                     candidate_receipt.expected_current_retained_bundle_id ||
                 current_pointer.candidate_graph_revision !=
                     candidate_receipt.expected_current_graph_revision ||
-                selection.scenario_catalog_revision !=
-                    candidate_receipt.scenario_catalog_revision ||
-                selection.retained_bundle_id !=
-                    candidate_receipt.candidate_retained_bundle_id ||
                 candidate_bundle == nullptr ||
                 candidate_bundle->value().cell_graph.graph_revision !=
                     candidate_receipt.candidate_graph_revision) {
@@ -3812,10 +4038,7 @@ private:
           const auto candidate_retained_bundle_id =
               existing.has_value()
                   ? existing->intent.candidate_retained_bundle_id
-                  : candidate_source_
-                        .ResolveExact({*command.deployment_artifact_id,
-                                       *command.deployment_revision})
-                        .retained_bundle_id;
+                  : candidate_receipt.candidate_retained_bundle_id;
           const auto result = named_apply_.AcceptOrReplay({
               core::PublicRequestContextDTO{
                   core::RequestId(*command.request_id),
@@ -3828,6 +4051,7 @@ private:
               *command.expected_current_retained_bundle_id,
               *command.expected_current_graph_revision,
               candidate_retained_bundle_id,
+              *command.prepared_activation,
               command.expected_admission_generation,
               command.parent_authoring_claim,
           });
@@ -3860,19 +4084,15 @@ private:
         Require(command.apply_id.has_value() &&
                     command.apply_generation.has_value(),
                 "decoded Apply status command lacks its durable identity");
-        const auto intent = stores_.apply_journal().ReadIntent(
+        const auto status = stores_.apply_journal().ReadStatus(
             *command.apply_id, *command.apply_generation);
-        if (!intent.has_value()) {
+        if (!status.has_value()) {
           TrySendResponse(client.get(),
                           ErrorResponse("apply_status_not_found",
                                         "Manager Apply identity is unknown"));
           return false;
         }
-        const auto terminal = stores_.apply_journal().ReadTerminalOutcome(
-            *command.apply_id, *command.apply_generation);
-        TrySendResponse(client.get(), ApplyStatusResponse(
-                                          *command.apply_id,
-                                          *command.apply_generation, terminal));
+        TrySendResponse(client.get(), ApplyStatusResponse(*status));
         return false;
       }
       case CommandKind::kSceneCommit: {
@@ -4264,7 +4484,10 @@ private:
       case CommandKind::kReconcile: {
         const auto generations = [this] {
           try {
-            return ReconcileAndPublish();
+            // The public reconcile command is a status refresh, not an
+            // authorized maintenance operation, so it stays observation only:
+            // a missing managed unit is reported, never restarted.
+            return ObserveRuntimeAndPublish();
           } catch (...) {
             TrySubmitFailClosedReadiness();
             throw;
@@ -4306,7 +4529,6 @@ private:
   DaemonLock daemon_lock_;
   deployment::CanonicalEmptyRetainedBundleAdmission admission_;
   ManagerVerifiedPackageView verified_package_;
-  deployment::FilesystemScenarioApplyCandidateSource candidate_source_;
   component_manager::RetainedNativeRuntimeUnitAdapter native_runtime_adapter_;
   component_manager::ExternallyProvisionedManagerStores stores_;
   manyforge::scene::CanonicalEmptySceneOwner scene_owner_;
@@ -4315,6 +4537,9 @@ private:
   component_manager::RetainedPosixRuntimeUnitAdapter reference_runtime_adapter_;
   component_manager::RuntimeUnitAdapterRouter runtime_adapter_router_;
   component_manager::ManagerActiveRuntimeCoordinator active_runtime_;
+  DaemonPlannedMaintenanceGate planned_maintenance_gate_;
+  component_manager::ManagerPlannedMaintenanceCoordinator
+      planned_maintenance_;
   bool kernel_apply_available_{};
   std::atomic<bool> scene_admission_reconciled_{false};
   std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>
@@ -4386,7 +4611,6 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   bool execution_run = false;
   bool scene = false;
   bool program_cycle = false;
-  bool authoring = false;
   bool projection = false;
   bool program_runner_liveness = false;
   bool period = false;
@@ -4421,9 +4645,6 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     } else if (option == "--program-cycle-journal" && !program_cycle) {
       config.program_cycle_journal = value;
       program_cycle = true;
-    } else if (option == "--authoring-transaction-journal" && !authoring) {
-      config.authoring_transaction_journal = value;
-      authoring = true;
     } else if (option == "--projection-root" && !projection) {
       config.projection_root = value;
       projection = true;
@@ -4441,11 +4662,11 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   }
   Require(
       install && manager && manager_run && execution_state && execution_run &&
-          scene && program_cycle && authoring && projection,
+          scene && program_cycle && projection,
       "--install-root, --manager-state-root, --manager-run-root, "
       "--execution-state-root, --execution-run-root, "
       "--logical-scene-database, --program-cycle-journal, "
-      "--authoring-transaction-journal, and --projection-root are required");
+      "and --projection-root are required");
   return config;
 }
 

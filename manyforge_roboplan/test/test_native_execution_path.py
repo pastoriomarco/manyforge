@@ -1775,16 +1775,11 @@ def test_pick_place_planning_crosses_real_cpp_owner_and_thin_clients(
     )
     headless = HeadlessHttpClient("http://headless.test", client=raw_api)
     behavior = KernelClient(RecordingTransport(headless))
-    authoring_root = tmp_path / "composer-authoring"
-    authoring_root.mkdir()
     composer_app = FastAPI()
     composer_app.include_router(
         create_headless_router(
             headless,
-            ComposerState(
-                headless_client=headless,
-                authoring_state_root=str(authoring_root),
-            ),
+            ComposerState(headless_client=headless),
         )
     )
     raw_composer = TestClient(composer_app)
@@ -2125,16 +2120,11 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
     recording = RecordingTransport(headless)
     runner = OrchestratorRunner(KernelClient(recording))
 
-    authoring_root = tmp_path / "composer-authoring"
-    authoring_root.mkdir()
     composer_app = FastAPI()
     composer_app.include_router(
         create_headless_router(
             headless,
-            ComposerState(
-                headless_client=headless,
-                authoring_state_root=str(authoring_root),
-            ),
+            ComposerState(headless_client=headless),
         )
     )
     raw_composer = TestClient(composer_app)

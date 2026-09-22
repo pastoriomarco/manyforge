@@ -394,7 +394,7 @@ class ManagerDeploymentCandidateReceipt(StrictRequest):
     schema_version: Literal["manyforge.manager_deployment_candidate_receipt.v1"]
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    scenario_catalog_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     candidate_retained_bundle_id: str
     candidate_graph_revision: str
     expected_current: ExpectedCurrentRequest
@@ -420,11 +420,19 @@ class ManagerDeploymentCandidateReceipt(StrictRequest):
 class ManagerDeploymentCandidatePreviewRequest(StrictRequest):
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    candidate_retained_bundle_id: str
+    candidate_graph_revision: str
+    prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     expected_current: ExpectedCurrentRequest
     expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     request_owner_epoch: str
 
-    @field_validator("deployment_artifact_id", "request_owner_epoch")
+    @field_validator(
+        "deployment_artifact_id",
+        "candidate_retained_bundle_id",
+        "candidate_graph_revision",
+        "request_owner_epoch",
+    )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -442,7 +450,9 @@ class ActivationPreparationRequest(StrictRequest):
     program: dict[str, Any]
     program_role_assignment: dict[str, Any]
     typed_parameter_overrides: dict[str, Any]
-    authoring_claim: dict[str, Any]
+    expected_admission_generation: Annotated[
+        int, Field(ge=1, le=9_007_199_254_740_991)
+    ]
 
     @model_validator(mode="after")
     def require_complete_input(self) -> "ActivationPreparationRequest":
@@ -459,11 +469,39 @@ class ActivationPreparationRequest(StrictRequest):
         return self
 
 
+class ManagerApplyPreparedActivation(StrictRequest):
+    """Exact UA2A prepared activation accepted by one named Apply.
+
+    Every member is captured once before acceptance. The Manager records these
+    facts in its durable Apply intent and never reopens a mutable
+    Scenario/catalog selection, draft or current-selection fact to reconstruct
+    the operation input. The bounded prepared runtime input itself stays with
+    its existing owner: ``prepared_activation_id`` is that owner's exact
+    transfer handle and binds the whole prepared value.
+    """
+
+    captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    deployment_artifact_id: str
+    deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+
+    @field_validator("deployment_artifact_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
 class ManagerApplyRequest(CallerAttributionRequest):
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     expected_current: ExpectedCurrentRequest
     reject_if_affected_busy: bool
+    prepared_activation: ManagerApplyPreparedActivation
     expected_admission_generation: Annotated[
         int | None, Field(ge=1, le=9_007_199_254_740_991)
     ] = None
@@ -501,6 +539,17 @@ class ManagerApplyRequest(CallerAttributionRequest):
             or self.candidate_receipt.expected_current != self.expected_current
         ):
             raise ValueError("candidate receipt does not match Apply selection")
+        if (
+            self.prepared_activation.deployment_artifact_id
+            != self.deployment_artifact_id
+            or self.prepared_activation.deployment_revision
+            != self.deployment_revision
+            or self.candidate_receipt.prepared_activation_id
+            != self.prepared_activation.prepared_activation_id
+        ):
+            raise ValueError(
+                "prepared activation does not match the Apply deployment selection"
+            )
         return self
 
 
@@ -989,6 +1038,145 @@ class ProjectionRevisionRequest(StrictRequest):
             label=info.field_name,
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
+
+
+ManagerApplyPhase = Literal[
+    "accepted",
+    "fence_acquired",
+    "fence_accepted",
+    "runtime_converged",
+    "scene_staged",
+    "scene_activated",
+    "composed",
+    "published",
+    "settled",
+]
+
+
+class ManagerApplyProgress(StrictRequest):
+    """Last real progress: the deepest durably reached milestone and its exact
+    evidence digest. Never a heartbeat or socket responsiveness."""
+
+    phase: ManagerApplyPhase
+    record_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+
+
+MAX_APPLY_FAILURE_CODE_BYTES = 128
+MAX_APPLY_FAILURE_MESSAGE_BYTES = 1024
+
+ManagerApplyTerminalState = Literal[
+    "pending",
+    "succeeded",
+    "failed",
+    "unknown_effect",
+]
+
+
+class ManagerApplyFailure(StrictRequest):
+    """The first meaningful failure retained by one terminal Apply operation.
+
+    It is reported once and is never repaired, retried, rolled back or assumed
+    to have had no effect. The effect disposition states whether every effect of
+    the operation is exactly established; an unknown disposition is never
+    presented as if the failed work left nothing behind.
+    """
+
+    code: str
+    message: str
+    phase: ManagerApplyPhase
+    effect_disposition: Literal["known", "unknown"]
+
+    @field_validator("code")
+    @classmethod
+    def validate_code(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="code",
+            maximum_bytes=MAX_APPLY_FAILURE_CODE_BYTES,
+        )
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, value: str) -> str:
+        return _bounded_nfc(
+            value,
+            label="message",
+            maximum_bytes=MAX_APPLY_FAILURE_MESSAGE_BYTES,
+        )
+
+
+class ManagerApplyStatus(StrictRequest):
+    """One bounded lifecycle status for one durable Manager Apply operation.
+
+    Shared by Apply, Revert and activating a loaded Scenario, because all three
+    submit the same operation owner. Every member is a durable fact: the
+    operation identity (Apply ID/generation plus the caller request owner/id),
+    the accepted UA2A prepared activation, the deepest durably reached phase
+    with its evidence digest, and exactly one terminal outcome: pending while
+    the operation remains resumable, otherwise succeeded, failed or
+    unknown_effect.
+    """
+
+    apply_id: str
+    apply_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    request_id: str
+    request_owner_epoch: str
+    prepared_activation: ManagerApplyPreparedActivation
+    phase: ManagerApplyPhase
+    last_progress: ManagerApplyProgress
+    state: ManagerApplyTerminalState
+    candidate_projection_revision: ProjectionRevisionRequest | None = None
+    failure: ManagerApplyFailure | None = None
+
+    @field_validator("apply_id", "request_id", "request_owner_epoch")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+    @model_validator(mode="after")
+    def require_one_consistent_lifecycle(self) -> "ManagerApplyStatus":
+        if self.last_progress.phase != self.phase:
+            raise ValueError(
+                "last progress must describe the reported operation phase"
+            )
+        if (self.state == "succeeded") != (
+            self.candidate_projection_revision is not None
+        ):
+            raise ValueError(
+                "only a terminal success carries its candidate projection "
+                "revision"
+            )
+        if (self.state in ("failed", "unknown_effect")) != (
+            self.failure is not None
+        ):
+            raise ValueError(
+                "a terminal failure, and only a terminal failure, carries its "
+                "retained first failure"
+            )
+        if self.state == "succeeded" and self.phase != "settled":
+            raise ValueError("a successful operation must be settled")
+        if self.failure is not None:
+            if self.failure.phase != self.phase:
+                raise ValueError(
+                    "the retained failure must describe the reported operation "
+                    "phase"
+                )
+            # A known failure and an unknown effect are distinct dispositions:
+            # neither may be presented as the other, and a failure never implies
+            # that the failed work left nothing behind.
+            required_disposition = (
+                "known" if self.state == "failed" else "unknown"
+            )
+            if self.failure.effect_disposition != required_disposition:
+                raise ValueError(
+                    "the retained failure disposition must match the terminal "
+                    "state"
+                )
+        return self
 
 
 class SceneResourcePoseQuery(StrictRequest):

@@ -19,9 +19,6 @@ from manyforge_composer.backend.deployment_draft import (
     DeploymentDraftSession,
 )
 from manyforge_composer.backend.state import ComposerState
-from manyforge_composer.backend.authoring_transaction_journal import (
-    AuthoringJournalError,
-)
 from manyforge_headless_api.client import HeadlessClientError
 
 
@@ -92,17 +89,6 @@ class _Headless:
         self.manager_apply_bodies: list[dict[str, Any]] = []
         self.program_apply_bodies: list[dict[str, Any]] = []
         self.scene_preparations: list[dict[str, Any]] = []
-
-    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
-        assert scenario_id == self.selection["scenario_id"]
-        return deepcopy(self.selection)
-
-    def scenario_load_selection(
-        self, scenario_id: str, *, timeout_seconds: float | None = None
-    ) -> dict[str, Any]:
-        assert scenario_id == self.selection["scenario_id"]
-        assert timeout_seconds is None or timeout_seconds > 0
-        return deepcopy(self.selection)
 
     def program_applied(self) -> dict[str, Any]:
         if self.applied is None:
@@ -272,11 +258,9 @@ def _state(
 
 
 @pytest.mark.parametrize("replay_status", ["accepted_new", "replayed_exact"])
-@pytest.mark.parametrize("foreign_status", [False, True])
-def test_candidate_apply_retains_acceptance_across_status_polling(
+def test_candidate_apply_returns_acceptance_without_polling(
     monkeypatch: pytest.MonkeyPatch,
     replay_status: str,
-    foreign_status: bool,
 ) -> None:
     program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
     headless = _Headless(_selection(program.to_dict()))
@@ -294,33 +278,15 @@ def test_candidate_apply_retains_acceptance_across_status_polling(
         "state": "pending",
         "candidate_projection_revision": None,
     }
-    terminal = {
-        key: value
-        for key, value in acceptance.items()
-        if key not in ("request_id", "request_owner_epoch", "replay_status")
-    }
-    terminal.update(
-        state="succeeded",
-        apply_id="foreign-apply" if foreign_status else "apply-1",
-        candidate_projection_revision={
-            "retained_bundle_id": headless.selection["retained_bundle_id"],
-            "graph_revision": headless.selection["graph_revision"],
-        },
-    )
     monkeypatch.setattr(headless, "manager_apply", lambda _body: deepcopy(acceptance))
-
-    def status(
-        apply_id: str,
-        generation: int,
-        *,
-        timeout_seconds: float | None = None,
-    ) -> dict[str, Any]:
-        assert (apply_id, generation) == ("apply-1", 1)
-        assert timeout_seconds is None or timeout_seconds > 0
-        return deepcopy(terminal)
-
-    monkeypatch.setattr(headless, "manager_apply_status", status, raising=False)
-    monkeypatch.setattr("manyforge_composer.backend.state.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        headless,
+        "manager_apply_status",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Composer must not poll an accepted Manager operation"
+        ),
+        raising=False,
+    )
     intent = {
         "manager_apply": {
             "candidate_receipt": {
@@ -331,284 +297,9 @@ def test_candidate_apply_retains_acceptance_across_status_polling(
             }
         }
     }
-    if foreign_status:
-        with pytest.raises(AuthoringJournalError) as error:
-            state.apply_manager_deployment_candidate(intent, {})
-        assert error.value.code == "manager_apply_status_identity_mismatch"
-    else:
-        result = state.apply_manager_deployment_candidate(intent, {})
-        assert result == {**acceptance, **terminal}
-        assert acceptance["state"] == "pending"
-
-
-def test_scene_preparation_retains_readiness_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
-    headless = _Headless(_selection(program.to_dict()))
-    headless.applied = _applied(headless.selection)
-    monkeypatch.setattr(
-        headless,
-        "authoring_admission",
-        lambda: {"admission_generation": 38, "authoring_allowed": False},
-    )
-    monkeypatch.setattr(
-        headless,
-        "program_scene_prepare",
-        lambda _body: pytest.fail("unready scene preparation must not be submitted"),
-    )
-    state = _state(headless, _Coordinator(), program=None)
-    with pytest.raises(AuthoringJournalError, match="authoring readiness") as error:
-        state.prepare_current_applied_scene(
-            request_owner_epoch="test-owner",
-            request_id="test-apply",
-        )
-    assert error.value.code == "program_scene_preparation_unavailable"
-    assert not headless.program_apply_bodies
-
-
-def test_admitted_handover_rebinds_inactive_program(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
-    headless = _Headless(_selection(program.to_dict()))
-    headless.applied = _applied(headless.selection)
-    prior_digest = headless.applied["source"]["record_digest"]
-    original = headless.program_applied
-
-    def current_applied() -> dict[str, Any]:
-        if headless.manager_target and not headless.program_apply_bodies:
-            raise HeadlessClientError(
-                "program_applied_selection_not_active",
-                "old Deployment binding",
-                status_code=409,
-            )
-        return original()
-
-    monkeypatch.setattr(headless, "program_applied", current_applied)
-    # Reuse this file's orchestration-only response fixture; wire validation
-    # is exercised by the native browser workflow, not this stub.
-    monkeypatch.setattr(
-        "manyforge_composer.backend.state.validate_program_apply_result",
-        lambda value: value,
-    )
-    state = _state(headless, _Coordinator(), program=None)
-    state.load_startup_scenario(headless.selection["scenario_id"])
-    assert len(headless.program_apply_bodies) == 1
-    assert (
-        headless.program_apply_bodies[0]["expected_applied_record_digest"]
-        == prior_digest
-    )
-
-
-def test_startup_load_activates_deployment_then_program(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
-    selection = _selection(program.to_dict())
-    headless = _Headless(selection)
-    coordinator = _Coordinator()
-    monkeypatch.setattr(
-        "manyforge_composer.backend.state.validate_program_apply_result",
-        lambda value: value,
-    )
-
-    state = _state(headless, coordinator, program=program)
-    state._active_authoring_catalog = (  # type: ignore[method-assign]
-        lambda: (_ for _ in ()).throw(
-            AssertionError("admitted Scenario load re-read transient availability")
-        )
-    )
-
-    result = state.load_startup_scenario(selection["scenario_id"])
-
-    assert result["status"] == "loaded"
-    assert coordinator.executions[0]["operation_kind"] == "load_scenario"
-    assert coordinator.executions[0]["prepared"]["external_kind"] == "scenario_load"
-    assert len(headless.manager_apply_bodies) == 1
-    assert headless.manager_apply_bodies[0]["request_owner_epoch"] == "manager-owner-1"
-    assert (
-        headless.manager_apply_bodies[0]["parent_authoring_claim"]["intent"][
-            "claim_kind"
-        ]
-        == "authoring_mutation"
-    )
-    assert len(headless.program_apply_bodies) == 1
-    assert len(headless.scene_preparations) == 1
-    assert headless.program_apply_bodies[0]["program"] == selection["program"]
-    assert result["workspace"]["saved"]["matchesDraft"] is True
-    assert result["workspace"]["applied"]["matchesDraft"] is True
-
-
-def test_scenario_deployment_is_the_saved_revert_baseline() -> None:
-    """Scenario selection must preserve a baseline for post-Apply Revert."""
-
-    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
-    selection = _selection(program.to_dict())
-    state = _state(_Headless(selection), _Coordinator(), program=None)
-
-    # Initial Scenario load resolves the maintained Deployment artifact as the
-    # Saved baseline, so Revert has a complete identity rather than an
-    # unnamed revision.
-    initial = state._scenario_post_state(
-        selection,
-        state.draft_session.retained_state(),
-        program,
-    )
-    deployment = initial["deployment"]
-    assert deployment["saved_path"] == str(_DEPLOYMENT_PATH.resolve())
-    assert deployment["saved_document"] == selection["deployment"]
-
-    # The equal-document branch is also used when a retained Draft already
-    # names the selected Scenario but came from an older session without the
-    # baseline.  It must be repaired without changing the Draft identity.
-    retained = state.deployment_draft_session.retained_state()
-    retained.update(
-        {
-            "document": deepcopy(selection["deployment"]),
-            "saved_path": None,
-            "saved_document": None,
-        }
-    )
-    state.deployment_draft_session.restore_retained_state(retained)
-    repaired = state._scenario_post_state(
-        selection,
-        state.draft_session.retained_state(),
-        program,
-    )
-    assert repaired["deployment"]["draft_id"] == retained["draft_id"]
-    assert repaired["deployment"]["saved_path"] == str(_DEPLOYMENT_PATH.resolve())
-    assert repaired["deployment"]["saved_document"] == selection["deployment"]
-
-
-def test_startup_load_waits_for_reconciled_authoring_admission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
-    selection = _selection(program.to_dict())
-    headless = _Headless(selection)
-    coordinator = _Coordinator()
-    admissions = [
-        {"authoring_allowed": False, "admission_generation": 7},
-        {"authoring_allowed": False, "admission_generation": 8},
-        {"authoring_allowed": True, "admission_generation": 9},
-    ]
-    sleeps: list[float] = []
-    headless.authoring_admission = (  # type: ignore[method-assign]
-        lambda: admissions.pop(0) if len(admissions) > 1 else admissions[0]
-    )
-    monkeypatch.setattr("manyforge_composer.backend.state.time.sleep", sleeps.append)
-    monkeypatch.setattr(
-        "manyforge_composer.backend.state.validate_program_apply_result",
-        lambda value: value,
-    )
-
-    result = _state(headless, coordinator, program=program).load_startup_scenario(
-        selection["scenario_id"]
-    )
-
-    assert result["status"] == "loaded"
-    assert sleeps == [0.1, 0.1]
-    assert coordinator.executions[0]["envelope"].expected_admission_generation == 9
-
-
-def test_startup_load_retries_incomplete_authoring_recovery(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
-    selection = _selection(program.to_dict())
-    headless = _Headless(selection)
-
-    class RecoveringCoordinator(_Coordinator):
-        def __init__(self) -> None:
-            super().__init__()
-            self.mutation_ready = False
-            self.recovery_attempts = 0
-
-        def recover(self) -> None:
-            self.recovery_attempts += 1
-            self.mutation_ready = self.recovery_attempts == 2
-
-    coordinator = RecoveringCoordinator()
-    headless.authoring_admission = lambda: {  # type: ignore[method-assign]
-        "authoring_allowed": coordinator.mutation_ready,
-        "admission_generation": 9,
-    }
-    monkeypatch.setattr("manyforge_composer.backend.state.time.sleep", lambda _: None)
-    monkeypatch.setattr(
-        "manyforge_composer.backend.state.validate_program_apply_result",
-        lambda value: value,
-    )
-
-    result = _state(headless, coordinator, program=program).load_startup_scenario(
-        selection["scenario_id"]
-    )
-
-    assert result["status"] == "loaded"
-    assert coordinator.recovery_attempts == 2
-    assert coordinator.executions[0]["envelope"].expected_admission_generation == 9
-
-
-def test_startup_load_is_effect_idempotent_when_scenario_is_already_current() -> None:
-    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
-    selection = _selection(program.to_dict())
-    headless = _Headless(selection)
-    headless.manager_target = True
-    headless.applied = _applied(selection)
-    coordinator = _Coordinator()
-
-    result = _state(headless, coordinator, program=program).load_startup_scenario(
-        selection["scenario_id"]
-    )
-
-    assert result["status"] == "loaded"
-    assert len(coordinator.executions) == 1
-    assert headless.manager_apply_bodies == []
-    assert headless.program_apply_bodies == []
-    assert len(headless.scene_preparations) == 1
-
-
-def test_startup_load_does_not_confirm_discard_for_an_empty_draft(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
-    selection = _selection(program.to_dict())
-    headless = _Headless(selection)
-    coordinator = _Coordinator()
-    monkeypatch.setattr(
-        "manyforge_composer.backend.state.validate_program_apply_result",
-        lambda value: value,
-    )
-
-    result = _state(headless, coordinator, program=None).load_startup_scenario(
-        selection["scenario_id"]
-    )
-
-    assert result["status"] == "loaded"
-    assert len(headless.manager_apply_bodies) == 1
-    assert len(headless.program_apply_bodies) == 1
-
-
-def test_load_rejects_discarding_a_different_unapplied_draft() -> None:
-    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
-    selected_program = Program(
-        str(_ROOT / "examples/pick_and_place_minimal.program.yaml"),
-        build_node_environment().catalog,
-    ).to_dict()
-    selection = _selection(selected_program)
-    headless = _Headless(selection)
-    coordinator = _Coordinator()
-
-    with pytest.raises(
-        DraftSessionError,
-        match="discard unsaved or unapplied Draft changes",
-    ):
-        _state(headless, coordinator, program=program).load_startup_scenario(
-            selection["scenario_id"]
-        )
-
-    assert coordinator.executions == []
-    assert headless.manager_apply_bodies == []
+    result = state.apply_manager_deployment_candidate(intent, {})
+    assert result == acceptance
+    assert result["state"] == "pending"
 
 
 def test_current_scenario_requires_both_exact_owner_projections() -> None:

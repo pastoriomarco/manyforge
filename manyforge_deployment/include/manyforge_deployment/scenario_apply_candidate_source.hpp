@@ -17,27 +17,6 @@ public:
   using std::runtime_error::runtime_error;
 };
 
-struct ScenarioApplyCandidateQuery final {
-  manyforge::core::DeploymentArtifactId deployment_artifact_id;
-  manyforge::core::DeploymentRevision deployment_revision;
-
-  [[nodiscard]] bool valid() const noexcept;
-
-  friend bool operator==(const ScenarioApplyCandidateQuery &,
-                         const ScenarioApplyCandidateQuery &) = default;
-};
-
-struct ScenarioApplyCandidateSelection final {
-  ScenarioApplyCandidateQuery query;
-  manyforge::core::ScenarioCatalogRevision scenario_catalog_revision;
-  manyforge::core::RetainedBundleId retained_bundle_id;
-
-  [[nodiscard]] bool valid() const noexcept;
-
-  friend bool operator==(const ScenarioApplyCandidateSelection &,
-                         const ScenarioApplyCandidateSelection &) = default;
-};
-
 struct ScenarioProgramSelection final {
   std::string scenario_id;
   core::ScenarioCatalogRevision scenario_catalog_revision;
@@ -79,9 +58,6 @@ public:
       std::optional<std::filesystem::path> candidate_package_root =
           std::nullopt);
 
-  [[nodiscard]] ScenarioApplyCandidateSelection
-  ResolveExact(const ScenarioApplyCandidateQuery &query) const;
-
   /// Load and independently verify the complete immutable catalog without
   /// selecting an active/current scenario or acquiring publication authority.
   [[nodiscard]] CanonicalValue LoadVerifiedCatalog() const;
@@ -90,12 +66,6 @@ public:
   /// Program closure. Aliases and source paths are deliberately not accepted.
   [[nodiscard]] ScenarioProgramSelection
   LoadExactProgramSelection(std::string_view scenario_id) const;
-
-  /// Load the exact normalized authored Deployment named by a previously
-  /// verified Scenario selection. This is an authoring projection only: it
-  /// never compiles, publishes, selects, or activates a Deployment.
-  [[nodiscard]] CanonicalValue
-  LoadExactDeploymentDocument(const ScenarioProgramSelection &selection) const;
 
   /// Resolve one Scenario from the exact immutable catalog revision named by
   /// an addressed request.  Candidate publication never changes the meaning

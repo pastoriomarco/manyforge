@@ -3,6 +3,7 @@
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
 #include <manyforge_component_manager/manager_apply_fence_coordinator.hpp>
 #include <manyforge_component_manager/manager_apply_fence_release_coordinator.hpp>
+#include <manyforge_component_manager/manager_planned_maintenance_coordinator.hpp>
 #include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
 #include <manyforge_component_manager/manager_scene_activation_coordinator.hpp>
 #include <manyforge_component_manager/manager_scene_stage_coordinator.hpp>
@@ -43,6 +44,7 @@ struct ManagerNamedApplyRequestDTO final {
   manyforge::core::RetainedBundleId expected_current_retained_bundle_id;
   manyforge::core::GraphRevision expected_current_graph_revision;
   manyforge::core::RetainedBundleId candidate_retained_bundle_id;
+  ManagerApplyPreparedActivationDTO prepared_activation;
   std::optional<manyforge::core::AdmissionGeneration>
       expected_admission_generation;
   std::optional<manyforge::core::CellAdmissionClaimDTO>
@@ -57,6 +59,8 @@ struct ManagerNamedApplyRequestDTO final {
 enum class ManagerNamedApplyResultState {
   kPending,
   kSucceeded,
+  kFailed,
+  kUnknownEffect,
 };
 
 struct ManagerNamedApplyResult final {
@@ -97,6 +101,7 @@ public:
       IManagerSelectedRuntimeCompositionPort &runtime_composition,
       IRuntimeUnitProcessPort &process_port,
       IRuntimeUnitProgressPort &progress_port,
+      ManagerPlannedMaintenanceCoordinator &planned_maintenance,
       manyforge::core::RuntimeEpoch manager_runtime_epoch,
       std::string operating_system,
       std::vector<std::string> launch_environment_contracts,
@@ -137,6 +142,7 @@ private:
   ApplyIdFactory apply_id_factory_;
   ApplyProgressObserver apply_progress_observer_;
   ManagerApplyFenceCoordinator fence_coordinator_;
+  ManagerPlannedMaintenanceCoordinator &planned_maintenance_;
   ManagerApplyRuntimeConvergenceCoordinator runtime_coordinator_;
   ManagerSceneStageCoordinator scene_stage_coordinator_;
   ManagerSceneActivationCoordinator scene_activation_coordinator_;

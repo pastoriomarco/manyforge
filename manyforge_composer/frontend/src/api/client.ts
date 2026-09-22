@@ -12,8 +12,7 @@ import {
   parseHistorianDetail,
   parseHistorianDiscovery,
   parseExecutionIdentity,
-  parseManagerApplyResponse,
-  parseManagerDeploymentCandidatePreviewResponse,
+  parseManagerApplyStatus,
   parseManagerDiffProjection,
   parseManagerGraphProjection,
   parseManagerStatusProjection,
@@ -56,9 +55,6 @@ import type {
   AppliedProgramSelection,
   AuthoringWorkspaceSnapshot,
   CatalogResponse,
-  ManagerApplyRequest,
-  ManagerDeploymentCandidatePreviewRequest,
-  ManagerDeploymentCandidatePreviewResponse,
   DraftFenceRequest,
   LocalWorkspaceFenceRequest,
   DraftMutationResponse,
@@ -69,7 +65,7 @@ import type {
   FileBrowserResponse,
   HealthResponse,
   JsonValue,
-  ManagerApplyResponse,
+  ManagerApplyStatus,
   NodeEnvironmentResponse,
   ManagerDiffProjection,
   ManagerGraphProjection,
@@ -866,33 +862,32 @@ export const api = {
       parseManagerDiffProjection,
       signal,
     ),
-    previewDeploymentCandidate: (
-      request: ManagerDeploymentCandidatePreviewRequest,
+    applyStatus: (
+      applyId: string,
+      applyGeneration: number,
       signal?: AbortSignal,
-    ): Promise<ManagerDeploymentCandidatePreviewResponse> => requestJson(
-      '/api/manager/deployment-candidates/preview',
-      parseManagerDeploymentCandidatePreviewResponse,
-      signal,
-      { method: 'POST', body: JSON.stringify(request) },
-    ),
-    apply: (
-      request: ManagerApplyRequest,
-      signal?: AbortSignal,
-    ): Promise<ManagerApplyResponse> => requestJson(
-      '/api/manager/apply',
-      (value) => {
-        const response = parseManagerApplyResponse(value);
-        if (
-          response.requestId !== request.request_id
-          || response.requestOwnerEpoch !== request.request_owner_epoch
-        ) {
-          throw new Error('Manager Apply response identity does not match the request');
-        }
-        return response;
-      },
-      signal,
-      { method: 'POST', body: JSON.stringify(request) },
-    ),
+    ): Promise<ManagerApplyStatus> => {
+      const params = new URLSearchParams({
+        apply_id: applyId,
+        apply_generation: String(applyGeneration),
+      });
+      return requestJson(
+        `/api/manager/apply/status?${params.toString()}`,
+        (value) => {
+          const status = parseManagerApplyStatus(value);
+          if (
+            status.applyId !== applyId
+            || status.applyGeneration !== applyGeneration
+          ) {
+            throw new Error(
+              'Manager Apply status identity does not match the request',
+            );
+          }
+          return status;
+        },
+        signal,
+      );
+    },
   },
   files: {
     browse: (

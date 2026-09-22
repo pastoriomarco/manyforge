@@ -1,7 +1,10 @@
--- ManyForge O1.5 typed named-Apply journal, version 10.
+-- ManyForge O1.5 typed named-Apply journal, version 12.
 -- Runtime staged-ready rows retain exact managed predecessor withdrawal.
 --
--- This schema stores immutable named-Apply intents, their exact generation-
+-- This schema stores immutable named-Apply intents, including the exact UA2A
+-- prepared activation each operation accepted (captured source-closure digest,
+-- candidate Deployment identity, prepared Program-binding identity and the
+-- prepared-activation transfer handle), their exact generation-
 -- bound whole-Apply affected scopes, configuration-fence attempts, and
 -- successful fence acceptances, complete runtime convergence intents, and
 -- immutable candidate staged-ready sets, scene-stage intents, and complete
@@ -9,16 +12,18 @@
 -- successful activation/retirement evidence, private selected-bundle
 -- materialization, obsolete-command-surface disposition, public publication,
 -- successful scene Finalize evidence, exact Kernel-fence release intent and
--- receipt, and the terminal successful outcome.
+-- receipt, and exactly one terminal outcome per operation: either the
+-- successful publication, or the first retained failure with its effect
+-- certainty. A terminal failure is never repaired, retried or rolled back.
 -- It is deliberately not a mutable phase/event journal.
 
 PRAGMA application_id = 1296450128;
-PRAGMA user_version = 10;
+PRAGMA user_version = 12;
 
 CREATE TABLE IF NOT EXISTS apply_journal_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 10),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 12),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_apply_intents INTEGER NOT NULL
@@ -147,6 +152,11 @@ CREATE TABLE IF NOT EXISTS manager_apply_intents (
     predecessor_scene_content_hash TEXT NOT NULL,
     candidate_retained_bundle_id TEXT NOT NULL,
     candidate_graph_revision TEXT NOT NULL,
+    captured_input_digest TEXT NOT NULL,
+    deployment_artifact_id TEXT NOT NULL,
+    deployment_revision TEXT NOT NULL,
+    program_binding_id TEXT NOT NULL,
+    prepared_activation_id TEXT NOT NULL,
     expected_admission_generation INTEGER
         CHECK (
             expected_admission_generation IS NULL
@@ -555,17 +565,74 @@ CREATE TABLE IF NOT EXISTS manager_apply_fence_released_records (
 CREATE TABLE IF NOT EXISTS manager_apply_terminal_outcomes (
     apply_id TEXT NOT NULL,
     apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
-    fence_released_digest TEXT NOT NULL,
-    scene_finalized_digest TEXT NOT NULL,
-    publication_receipt_digest TEXT NOT NULL,
-    candidate_retained_bundle_id TEXT NOT NULL,
-    candidate_graph_revision TEXT NOT NULL,
-    candidate_scene_id TEXT NOT NULL,
-    candidate_scene_revision_id INTEGER NOT NULL
-        CHECK (candidate_scene_revision_id > 0),
-    candidate_scene_content_hash TEXT NOT NULL,
-    outcome_state TEXT NOT NULL CHECK (outcome_state = 'succeeded'),
+    fence_released_digest TEXT,
+    scene_finalized_digest TEXT,
+    publication_receipt_digest TEXT,
+    candidate_retained_bundle_id TEXT,
+    candidate_graph_revision TEXT,
+    candidate_scene_id TEXT,
+    candidate_scene_revision_id INTEGER
+        CHECK (
+            candidate_scene_revision_id IS NULL
+            OR (
+                candidate_scene_revision_id > 0
+                AND candidate_scene_revision_id <= 9223372036854775807
+            )
+        ),
+    candidate_scene_content_hash TEXT,
+    intent_digest TEXT,
+    failure_phase TEXT,
+    failure_code TEXT,
+    failure_message TEXT,
+    effect_disposition TEXT
+        CHECK (
+            effect_disposition IS NULL
+            OR effect_disposition IN ('known', 'unknown')
+        ),
+    outcome_state TEXT NOT NULL
+        CHECK (outcome_state IN ('succeeded', 'failed', 'unknown_effect')),
     terminal_outcome_digest TEXT NOT NULL,
+    CHECK (
+        (
+            outcome_state = 'succeeded'
+            AND fence_released_digest IS NOT NULL
+            AND scene_finalized_digest IS NOT NULL
+            AND publication_receipt_digest IS NOT NULL
+            AND candidate_retained_bundle_id IS NOT NULL
+            AND candidate_graph_revision IS NOT NULL
+            AND candidate_scene_id IS NOT NULL
+            AND candidate_scene_revision_id IS NOT NULL
+            AND candidate_scene_content_hash IS NOT NULL
+            AND intent_digest IS NULL
+            AND failure_phase IS NULL
+            AND failure_code IS NULL
+            AND failure_message IS NULL
+            AND effect_disposition IS NULL
+        )
+        OR (
+            outcome_state <> 'succeeded'
+            AND fence_released_digest IS NULL
+            AND scene_finalized_digest IS NULL
+            AND publication_receipt_digest IS NULL
+            AND candidate_retained_bundle_id IS NULL
+            AND candidate_graph_revision IS NULL
+            AND candidate_scene_id IS NULL
+            AND candidate_scene_revision_id IS NULL
+            AND candidate_scene_content_hash IS NULL
+            AND intent_digest IS NOT NULL
+            AND failure_phase IS NOT NULL
+            AND failure_code IS NOT NULL
+            AND failure_message IS NOT NULL
+            AND effect_disposition IS NOT NULL
+            AND (
+                (outcome_state = 'failed' AND effect_disposition = 'known')
+                OR (
+                    outcome_state = 'unknown_effect'
+                    AND effect_disposition = 'unknown'
+                )
+            )
+        )
+    ),
     PRIMARY KEY (apply_id, apply_generation),
     UNIQUE (apply_id, apply_generation, terminal_outcome_digest),
     FOREIGN KEY (apply_id, apply_generation, fence_released_digest)
@@ -579,6 +646,10 @@ CREATE TABLE IF NOT EXISTS manager_apply_terminal_outcomes (
     FOREIGN KEY (apply_id, apply_generation, publication_receipt_digest)
         REFERENCES manager_apply_publication_receipts (
             apply_id, apply_generation, publication_receipt_digest
+        ),
+    FOREIGN KEY (apply_id, apply_generation, intent_digest)
+        REFERENCES manager_apply_intents (
+            apply_id, apply_generation, intent_digest
         )
 ) WITHOUT ROWID, STRICT;
 

@@ -76,11 +76,6 @@ class ProcessStack:
             path.mkdir()
         self.scene_database = root / "logical-scene.sqlite3"
         self.program_cycle_journal = root / "program-cycle.sqlite3"
-        self.composer_authoring_root = root / "composer-authoring"
-        self.composer_authoring_root.mkdir()
-        self.authoring_transaction_journal = (
-            self.composer_authoring_root / "composer-authoring-transactions.sqlite3"
-        )
         self.program_runner_liveness_socket = self.manager_run_root / "program-runner-liveness.sock"
         self.history_database = root / "history.sqlite3"
         self.manager_executable = _required_path("MANYFORGE_MANAGER_DAEMON")
@@ -168,8 +163,6 @@ class ProcessStack:
             str(self.scene_database),
             "--program-cycle-journal",
             str(self.program_cycle_journal),
-            "--authoring-transaction-journal",
-            str(self.authoring_transaction_journal),
             "--projection-root",
             str(manager_publication_root),
             "--reconciliation-period-ms",
@@ -377,7 +370,7 @@ class ProcessStack:
             time.sleep(0.01)
         raise RuntimeError(f"authoring admission did not become available: {last_error}")
 
-    def start_composer(self, *, startup_scenario: str | None = None) -> None:
+    def start_composer(self) -> None:
         assert self.composer is None
         command = [
             sys.executable,
@@ -391,13 +384,9 @@ class ProcessStack:
             self.base_url,
             "--headless-api-timeout-s",
             "8",
-            "--authoring-state-root",
-            str(self.composer_authoring_root),
         ]
         if self.program_path is not None:
             command.extend(("--program-path", str(self.program_path)))
-        if startup_scenario is not None:
-            command.extend(("--startup-scenario", startup_scenario))
         environment = os.environ.copy()
         if self.composer_fs_roots is not None:
             environment["MANYFORGE_FS_ROOTS"] = ",".join(
@@ -628,8 +617,7 @@ def _assistant_stack(
             assert stale.value.code == "stale_generation"
         assert (stack.execution_run_root / "execution-command.sock").is_socket()
         assert (stack.execution_run_root / "execution-observation.sock").is_socket()
-        assert stack.authoring_transaction_journal.parent == (stack.composer_authoring_root)
-        stack.start_composer(startup_scenario=startup_scenario)
+        stack.start_composer()
         stack.wait_composer()
         yield stack
     finally:
@@ -729,6 +717,17 @@ def _apply_body(
             "retained_bundle_id": active["retained_bundle_id"],
         },
         "reject_if_affected_busy": True,
+        # The UA2A prepared activation is a caller-asserted identity owned by
+        # the existing prepared-value owner; the Manager records it without
+        # reopening a mutable Scenario/catalog selection. This process fixture
+        # supplies one exact, self-consistent identity for the Apply it submits.
+        "prepared_activation": {
+            "captured_input_digest": "sha256:" + "e" * 64,
+            "deployment_artifact_id": "candidate",
+            "deployment_revision": "sha256:" + "a" * 64,
+            "program_binding_id": "sha256:" + "9" * 64,
+            "prepared_activation_id": "sha256:" + "f" * 64,
+        },
         "expected_admission_generation": admission_generation,
     }
     preview = client.manager_deployment_candidate_preview(
@@ -1060,7 +1059,6 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             assert max(callback_latencies_s) < 0.5, callback_latencies_s
 
         stack.kill_composer()
-        assert stack.authoring_transaction_journal.is_file()
         stack.start_composer()
         stack.wait_composer()
         with (
@@ -1512,7 +1510,6 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             )
 
         stack.kill_composer()
-        assert stack.authoring_transaction_journal.is_file()
         with HeadlessHttpClient(stack.base_url) as client:
             assert (
                 _owner_identity(

@@ -12,6 +12,7 @@ import rfc8785
 
 from .models import (
     ManagerApplyRequest,
+    ManagerApplyStatus,
     ManagerDeploymentCandidatePreviewRequest,
     ProjectionRevisionRequest,
     SceneResourcePoseQuery,
@@ -185,6 +186,9 @@ class ManagerCommandClient:
                 "command": "deployment_candidate_preview",
                 "deployment_artifact_id": request.deployment_artifact_id,
                 "deployment_revision": request.deployment_revision,
+                "candidate_retained_bundle_id": request.candidate_retained_bundle_id,
+                "candidate_graph_revision": request.candidate_graph_revision,
+                "prepared_activation_id": request.prepared_activation_id,
                 "expected_admission_generation": (
                     request.expected_admission_generation
                 ),
@@ -205,6 +209,7 @@ class ManagerCommandClient:
                 "deployment_revision": request.deployment_revision,
                 "expected_current": request.expected_current.model_dump(),
                 "reject_if_affected_busy": request.reject_if_affected_busy,
+                "prepared_activation": request.prepared_activation.model_dump(),
                 "request_id": request.request_id,
                 "request_owner_epoch": request.request_owner_epoch,
                 "source_label": request.source_label,
@@ -271,39 +276,26 @@ class ManagerCommandClient:
                     "Manager Apply status rejection is malformed",
                 )
             return response
-        expected = {
-            "api_version",
-            "apply_generation",
-            "apply_id",
-            "candidate_projection_revision",
-            "error",
-            "ok",
-            "state",
-        }
-        state = response.get("state")
-        candidate = response.get("candidate_projection_revision")
-        if (
-            set(response) != expected
-            or response.get("error") is not None
-            or state not in {"pending", "succeeded"}
-            or (state == "pending" and candidate is not None)
-            or (state == "succeeded" and not isinstance(candidate, dict))
+        members = set(ManagerApplyStatus.model_fields)
+        if set(response) != (members | {"api_version", "error", "ok"}) or (
+            response.get("error") is not None
         ):
             raise HeadlessApiError(
                 "manager_command_response_invalid",
                 "Manager Apply status response is malformed",
             )
-        if isinstance(candidate, dict):
-            try:
-                ProjectionRevisionRequest.model_validate(candidate)
-            except (TypeError, ValueError) as error:
-                raise HeadlessApiError(
-                    "manager_command_response_invalid",
-                    "Manager Apply status projection is malformed",
-                ) from error
+        try:
+            status = ManagerApplyStatus.model_validate(
+                {name: response[name] for name in members}
+            )
+        except (TypeError, ValueError) as error:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "Manager Apply status response is malformed",
+            ) from error
         if (
-            response.get("apply_id") != apply_id
-            or response.get("apply_generation") != apply_generation
+            status.apply_id != apply_id
+            or status.apply_generation != apply_generation
         ):
             raise HeadlessApiError(
                 "manager_command_response_identity_mismatch",

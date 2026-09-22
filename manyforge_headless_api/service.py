@@ -83,7 +83,6 @@ from .program_binding_projection import (
     validate_applied_program_selection,
     validate_program_apply_result,
     validate_scenario_program_selection,
-    validate_scenario_load_selection,
 )
 
 
@@ -1157,25 +1156,6 @@ class HeadlessService:
             raise HeadlessApiError(
                 "scenario_program_selection_invalid",
                 "native core returned an unsupported scenario Program selection",
-            ) from error
-        return projection
-
-    def scenario_load_selection(self, scenario_id: str) -> dict[str, Any]:
-        projection = self.core.scenario_load_selection(scenario_id)
-        if not isinstance(projection, dict):
-            raise HeadlessApiError(
-                "scenario_program_selection_invalid",
-                "native core returned an unsupported Scenario Load selection",
-            )
-        try:
-            validate_scenario_load_selection(
-                projection,
-                scenario_id=scenario_id,
-            )
-        except (ProgramBindingTransportError, TypeError, ValueError) as error:
-            raise HeadlessApiError(
-                "scenario_program_selection_invalid",
-                "native core returned an unsupported Scenario Load selection",
             ) from error
         return projection
 
@@ -2383,6 +2363,27 @@ class HeadlessService:
     def manager_deployment_candidate_preview(
         self, request: ManagerDeploymentCandidatePreviewRequest
     ) -> dict[str, Any]:
+        if self.activation_preparer is None:
+            raise HeadlessApiError(
+                "activation_preparer_unavailable",
+                "Deployment preview requires an exact prepared activation",
+            )
+        prepared = self.activation_preparer.prepared_value(
+            request.prepared_activation_id
+        )
+        if (
+            prepared is None
+            or prepared.get("deployment_artifact_id")
+            != request.deployment_artifact_id
+            or prepared.get("deployment_revision") != request.deployment_revision
+            or prepared.get("retained_bundle_id")
+            != request.candidate_retained_bundle_id
+            or prepared.get("graph_revision") != request.candidate_graph_revision
+        ):
+            raise HeadlessApiError(
+                "prepared_activation_mismatch",
+                "Deployment preview does not match the retained prepared activation",
+            )
         return self.manager.preview_deployment_candidate(request)
 
     def prepare_activation(
@@ -2393,26 +2394,18 @@ class HeadlessService:
                 "activation_preparer_unavailable",
                 "Activation preparation is not configured",
             )
-        claim = request.authoring_claim
-        intent = claim.get("intent") if isinstance(claim, dict) else None
-        if (
-            not isinstance(intent, dict)
-            or intent.get("claim_kind") != "authoring_mutation"
-            or intent.get("owner_role") != "authoring_owner"
-        ):
-            raise HeadlessApiError(
-                "authoring_not_ready",
-                "Activation preparation requires an exact held "
-                "authoring claim",
-            )
         try:
-            replay = self._cell_admission().acquire(intent)
+            admission = self._cell_admission().get()
         except CellAdmissionError as error:
             raise self._admission_error(error) from error
-        if replay != claim:
+        if (
+            admission.get("authoring_allowed") is not True
+            or admission.get("admission_generation")
+            != request.expected_admission_generation
+        ):
             raise HeadlessApiError(
                 "stale_generation",
-                "Deployment candidate authoring claim is no longer exact",
+                "Activation preparation requires the current idle admission",
             )
         return {
             "prepared_activation": self.activation_preparer.prepare(

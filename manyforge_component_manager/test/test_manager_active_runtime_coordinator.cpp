@@ -150,6 +150,27 @@ private:
   ManagerActiveRuntimePlanDTO plan_;
 };
 
+/// Returns one admitted plan on its first read and a different plan on every
+/// later read, proving the coordinator re-validates the active plan instead of
+/// applying its result against a plan that changed underneath it.
+class PlanChangingAfterFirstReadSource final
+    : public IManagerActiveRuntimePlanSource {
+public:
+  PlanChangingAfterFirstReadSource(ManagerActiveRuntimePlanDTO admitted,
+                                   ManagerActiveRuntimePlanDTO changed)
+      : admitted_(std::move(admitted)), changed_(std::move(changed)) {}
+
+  [[nodiscard]] ManagerActiveRuntimePlanDTO ReadCurrentPlan() const override {
+    return ++read_calls == 1 ? admitted_ : changed_;
+  }
+
+  mutable int read_calls{0};
+
+private:
+  ManagerActiveRuntimePlanDTO admitted_;
+  ManagerActiveRuntimePlanDTO changed_;
+};
+
 class ScriptedLifecyclePorts final : public IRuntimeUnitProcessPort,
                                      public IRuntimeUnitProgressPort {
 public:
@@ -250,7 +271,7 @@ TEST(ManagerActiveRuntimeCoordinator,
   ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
                                                [&now]() { return ++now; });
 
-  const auto result = coordinator.Reconcile();
+  const auto result = coordinator.Initialize();
   EXPECT_EQ(result.state, ManagerActiveRuntimeConvergenceState::kConverged);
   ASSERT_FALSE(ports.observed_owners.empty());
   const auto *owner = std::get_if<RuntimeUnitConvergenceBootstrapOwnerDTO>(
@@ -270,7 +291,7 @@ TEST(ManagerActiveRuntimeCoordinator,
   ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
                                               [&now]() { return ++now; });
 
-  const auto first = coordinator.Reconcile();
+  const auto first = coordinator.Initialize();
   EXPECT_EQ(first.state, ManagerActiveRuntimeConvergenceState::kConverged);
   EXPECT_EQ(ports.events, (std::vector<std::string>{
                               "observe:runtime.a",
@@ -286,7 +307,7 @@ TEST(ManagerActiveRuntimeCoordinator,
   const auto first_epochs = ports.epochs;
 
   ports.events.clear();
-  const auto replay = coordinator.Reconcile();
+  const auto replay = coordinator.Initialize();
   EXPECT_EQ(replay.state, ManagerActiveRuntimeConvergenceState::kConverged);
   EXPECT_EQ(ports.start_calls["runtime.a"], 1);
   EXPECT_EQ(ports.start_calls["runtime.b"], 1);
@@ -306,7 +327,7 @@ TEST(ManagerActiveRuntimeCoordinator,
   EXPECT_TRUE(ports.epochs.empty());
 
   ports.events.clear();
-  EXPECT_EQ(coordinator.Reconcile().state,
+  EXPECT_EQ(coordinator.Initialize().state,
             ManagerActiveRuntimeConvergenceState::kConverged);
   EXPECT_NE(ports.epochs, first_epochs);
   static_cast<void>(coordinator.Shutdown());
@@ -326,14 +347,14 @@ TEST(ManagerActiveRuntimeCoordinator,
 
   ports.throw_after_start_effect = "runtime.a";
   try {
-    static_cast<void>(coordinator.Reconcile());
+    static_cast<void>(coordinator.Initialize());
     FAIL() << "expected uncertain start response";
   } catch (const ManagerActiveRuntimeProcessEffectUncertainError &error) {
     EXPECT_EQ(error.effect(), ManagerActiveRuntimeProcessEffect::kStart);
     EXPECT_EQ(error.recovery_query().plan.runtime_unit_id,
               RuntimeUnitId("runtime.a"));
   }
-  EXPECT_EQ(coordinator.Reconcile().state,
+  EXPECT_EQ(coordinator.Initialize().state,
             ManagerActiveRuntimeConvergenceState::kConverged);
   EXPECT_EQ(ports.start_calls["runtime.a"], 1);
 
@@ -365,10 +386,10 @@ TEST(ManagerActiveRuntimeCoordinator,
   ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
                                               [&now]() { return ++now; });
 
-  EXPECT_EQ(coordinator.Reconcile().state,
+  EXPECT_EQ(coordinator.Initialize().state,
             ManagerActiveRuntimeConvergenceState::kConverged);
   ports.replay_last_report = true;
-  EXPECT_THROW(static_cast<void>(coordinator.Reconcile()),
+  EXPECT_THROW(static_cast<void>(coordinator.Initialize()),
                ManagerActiveRuntimeCoordinatorError);
   EXPECT_EQ(ports.start_calls["runtime.a"], 1);
   static_cast<void>(coordinator.Shutdown());
@@ -387,7 +408,7 @@ TEST(ManagerActiveRuntimeCoordinator,
   ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
                                               [&now]() { return ++now; });
 
-  const auto first = coordinator.Reconcile();
+  const auto first = coordinator.Initialize();
   EXPECT_EQ(first.state, ManagerActiveRuntimeConvergenceState::kPending);
   EXPECT_EQ(ports.events, (std::vector<std::string>{
                               "observe:runtime.a",
@@ -411,7 +432,7 @@ TEST(ManagerActiveRuntimeCoordinator,
             ManagedCommandSurfaceState::kClosedNoActiveEffect);
 
   ports.events.clear();
-  const auto replay = coordinator.Reconcile();
+  const auto replay = coordinator.Initialize();
   EXPECT_EQ(replay.state, ManagerActiveRuntimeConvergenceState::kPending);
   EXPECT_EQ(ports.events, (std::vector<std::string>{
                               "observe:runtime.a",
@@ -440,7 +461,7 @@ TEST(ManagerActiveRuntimeCoordinator,
   ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
                                               [&now]() { return ++now; });
 
-  EXPECT_EQ(coordinator.Reconcile().state,
+  EXPECT_EQ(coordinator.Observe().state,
             ManagerActiveRuntimeConvergenceState::kPending);
   EXPECT_TRUE(ports.start_calls.empty());
   const auto stopped = coordinator.Shutdown();
@@ -462,7 +483,7 @@ TEST(ManagerActiveRuntimeCoordinator,
   ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
                                               [&now]() { return ++now; });
 
-  EXPECT_THROW(static_cast<void>(coordinator.Reconcile()),
+  EXPECT_THROW(static_cast<void>(coordinator.Initialize()),
                ManagerActiveRuntimeCoordinatorError);
   EXPECT_TRUE(ports.events.empty());
 }
@@ -484,7 +505,7 @@ TEST(ManagerActiveRuntimeCoordinator,
   ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
                                                [&now]() { return ++now; });
 
-  EXPECT_EQ(coordinator.Reconcile().state,
+  EXPECT_EQ(coordinator.Initialize().state,
             ManagerActiveRuntimeConvergenceState::kConverged);
   EXPECT_EQ(ports.start_calls["runtime.a"], 1);
   static_cast<void>(coordinator.Shutdown());
@@ -507,9 +528,91 @@ TEST(ManagerActiveRuntimeCoordinator,
         throw std::runtime_error("test package generation replacement");
       });
 
-  EXPECT_THROW(static_cast<void>(coordinator.Reconcile()), std::runtime_error);
+  EXPECT_THROW(static_cast<void>(coordinator.Initialize()), std::runtime_error);
   EXPECT_TRUE(guard_called);
   EXPECT_TRUE(ports.start_calls.empty());
+}
+
+TEST(ManagerActiveRuntimeCoordinator,
+     ObservationOfAnAbsentManagedUnitHasZeroProcessEffects) {
+  FixedPlanSource source(ThreeUnitPlan());
+  ScriptedLifecyclePorts ports;
+  bool guard_called = false;
+  std::uint64_t now = 700U;
+  ManagerActiveRuntimeCoordinator coordinator(
+      source, ports, ports, [&now] { return ++now; },
+      [&guard_called] { guard_called = true; });
+
+  const auto observed = coordinator.Observe();
+  EXPECT_EQ(observed.state, ManagerActiveRuntimeConvergenceState::kPending);
+  EXPECT_EQ(ports.events, (std::vector<std::string>{
+                              "observe:runtime.a",
+                              "observe:runtime.b",
+                              "observe:runtime.c",
+                          }));
+  EXPECT_TRUE(ports.start_calls.empty());
+  EXPECT_TRUE(ports.stop_calls.empty());
+  EXPECT_TRUE(ports.epochs.empty());
+  EXPECT_FALSE(guard_called);
+  ASSERT_EQ(observed.observations.observations().size(), 3U);
+  for (const auto &observation : observed.observations.observations()) {
+    EXPECT_FALSE(observation.converged());
+    EXPECT_EQ(observation.derived_state(), RuntimeConvergenceState::kLost);
+    EXPECT_EQ(observation.process_presence(), ProcessPresenceState::kAbsent);
+    EXPECT_NE(std::find(observation.reason_codes().begin(),
+                        observation.reason_codes().end(), "process_absent"),
+              observation.reason_codes().end());
+  }
+}
+
+TEST(ManagerActiveRuntimeCoordinator,
+     ObservationNeverRestartsAUnitLostAfterOrderlyShutdown) {
+  FixedPlanSource source(ThreeUnitPlan());
+  ScriptedLifecyclePorts ports;
+  std::uint64_t now = 800U;
+  ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
+                                              [&now]() { return ++now; });
+
+  EXPECT_EQ(coordinator.Initialize().state,
+            ManagerActiveRuntimeConvergenceState::kConverged);
+  EXPECT_EQ(ports.start_calls["runtime.a"], 1);
+  EXPECT_EQ(ports.start_calls["runtime.b"], 1);
+  EXPECT_EQ(ports.start_calls["runtime.c"], 1);
+  static_cast<void>(coordinator.Shutdown());
+  EXPECT_TRUE(ports.epochs.empty());
+
+  ports.events.clear();
+  const auto observed = coordinator.Observe();
+  EXPECT_EQ(observed.state, ManagerActiveRuntimeConvergenceState::kPending);
+  EXPECT_EQ(ports.events, (std::vector<std::string>{
+                              "observe:runtime.a",
+                              "observe:runtime.b",
+                              "observe:runtime.c",
+                          }));
+  EXPECT_EQ(ports.start_calls["runtime.a"], 1);
+  EXPECT_EQ(ports.start_calls["runtime.b"], 1);
+  EXPECT_EQ(ports.start_calls["runtime.c"], 1);
+  for (const auto &observation : observed.observations.observations()) {
+    EXPECT_EQ(observation.derived_state(), RuntimeConvergenceState::kLost);
+  }
+}
+
+TEST(ManagerActiveRuntimeCoordinator,
+     ObservationRejectsAChangedActivePlanWithoutProcessEffects) {
+  PlanChangingAfterFirstReadSource source(BootstrapHostPlan(),
+                                         ThreeUnitPlan());
+  ScriptedLifecyclePorts ports;
+  std::uint64_t now = 900U;
+  ManagerActiveRuntimeCoordinator coordinator(source, ports, ports,
+                                              [&now]() { return ++now; });
+
+  EXPECT_THROW(static_cast<void>(coordinator.Observe()),
+               ManagerActiveRuntimeCoordinatorError);
+  EXPECT_EQ(ports.events, (std::vector<std::string>{
+                              "observe:runtime.bootstrap",
+                          }));
+  EXPECT_TRUE(ports.start_calls.empty());
+  EXPECT_TRUE(ports.stop_calls.empty());
 }
 
 } // namespace

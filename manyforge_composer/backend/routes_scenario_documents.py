@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 from pathlib import Path
 from typing import Any, NoReturn
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.routing import APIRoute
 from manyforge_behavior.program import Program
+from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha256_digest
+from manyforge_behavior.model_source_capture import capture_deployment_model_sources
 from pydantic import BaseModel, ConfigDict, Field
 
 from .authoring_admission import AuthoringMutationEnvelope
@@ -18,7 +22,7 @@ from .authoring_forest import (
     validate_invariants,
 )
 from .authoring_identity import canonical_digest
-from .authoring_transaction_journal import AuthoringJournalError
+from .authoring_admission import AuthoringOperationError
 from .authoring_workspace import (
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
@@ -102,6 +106,7 @@ class SaveScenarioDocumentRequest(_ScenarioFence):
 class LoadScenarioDocumentRequest(_ScenarioFence):
     path: str = Field(min_length=1, max_length=4096)
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
+    activate: bool = False
 
 
 class ConvertLegacyScenarioDocumentRequest(BaseModel):
@@ -141,7 +146,7 @@ def _raise(error: Exception) -> NoReturn:
             status_code=400,
             detail={"code": error.code, "message": str(error)},
         ) from error
-    if isinstance(error, AuthoringJournalError):
+    if isinstance(error, AuthoringOperationError):
         raise HTTPException(
             status_code=409,
             detail={"code": error.code, "message": str(error)},
@@ -447,6 +452,78 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 or deployment is None
                 or scenario_document["program_role_assignment"] is None
             )
+            activation_intent: dict[str, Any] | None = None
+            activation_prepared: dict[str, Any] | None = None
+            if body.activate:
+                if incomplete or program is None or not isinstance(deployment, dict):
+                    raise ScenarioArtifactError(
+                        "scenario_activation_incomplete",
+                        "only a complete v2 Scenario document can be activated",
+                        status_code=409,
+                    )
+                if state.headless_client is None:
+                    raise ScenarioArtifactError(
+                        "scenario_activation_unavailable",
+                        "Scenario activation requires the configured Manager",
+                        status_code=503,
+                    )
+                source_closure = capture_deployment_model_sources(
+                    deployment, project_root=Path(source_path)
+                )
+                assignment = deepcopy(
+                    scenario_document["program_role_assignment"]
+                )
+                overrides = deepcopy(
+                    scenario_document["typed_parameter_overrides"]
+                )
+                captured_digest = raw_sha256_digest(
+                    canonical_json_bytes(
+                        {
+                            "source_document_digest": source_digest,
+                            "deployment": deployment,
+                            "model_source_closure": source_closure,
+                            "program": program.to_dict(),
+                            "program_role_assignment": assignment,
+                            "typed_parameter_overrides": overrides,
+                        }
+                    )
+                )
+                bundle, graph, _epoch = state._manager_current(
+                    state.headless_client.manager_status()
+                )
+                activation_intent = {
+                    "source_document_digest": source_digest,
+                    "captured_input_digest": captured_digest,
+                    "deployment": deepcopy(deployment),
+                    "model_source_closure": source_closure,
+                    "program": program.to_dict(),
+                    "program_role_assignment": assignment,
+                    "typed_parameter_overrides": overrides,
+                    "expected_manager_current": {
+                        "retained_bundle_id": bundle,
+                        "graph_revision": graph,
+                    },
+                    "expected_admission_generation": (
+                        body.expected_admission_generation
+                    ),
+                    "manager_request_id": "scenario-document-activation-"
+                    + hashlib.sha256(
+                        f"{body.request_owner_epoch}:{body.request_id}".encode()
+                    ).hexdigest()[:32],
+                    "correlation_id": body.request_id,
+                    "confirmation_token": None,
+                    "draft_id": body.draft_id,
+                    "draft_revision": body.expected_draft_revision,
+                }
+                activation_prepared = state.execute_authored_deployment_candidate(
+                    activation_intent, None, apply=True, prepare_only=True
+                )
+                if activation_prepared.get("confirmation_required") is True:
+                    raise ScenarioArtifactError(
+                        "scenario_activation_confirmation_required",
+                        "Scenario activation requires explicit Deployment confirmation",
+                        status_code=409,
+                    )
             current_program = state.draft_session.retained_state()
             current_deployment = state.deployment_draft_session.retained_state()
             if not body.confirm_discard and not state.current_drafts_match_remembered_scenario() and (
@@ -503,9 +580,60 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 ),
                 install=install_load,
             )
+            activation = None
+            if activation_intent is not None and activation_prepared is not None:
+                coordinator = state.authoring_admission
+                if coordinator is None:
+                    raise ScenarioArtifactError(
+                        "scenario_activation_unavailable",
+                        "Scenario activation requires authoring admission",
+                        status_code=503,
+                    )
+                activation_intent["expected_admission_generation"] = (
+                    commit.admission_generation
+                )
+                manager_apply = activation_prepared.get("manager_apply")
+                if isinstance(manager_apply, dict):
+                    manager_apply["expected_admission_generation"] = (
+                        commit.admission_generation
+                    )
+                activation_envelope = AuthoringMutationEnvelope(
+                    expected_admission_generation=commit.admission_generation,
+                    request_owner_epoch=body.request_owner_epoch,
+                    request_id=body.request_id + ".activate",
+                )
+                committed_identity = commit.snapshot.identity()
+
+                def validate_activation(_claim: dict[str, Any]) -> None:
+                    if state.authoring_workspace.identity() != committed_identity:
+                        raise ScenarioArtifactError(
+                            "scenario_activation_workspace_changed",
+                            "Scenario workspace changed before activation submission",
+                            status_code=409,
+                        )
+
+                activation = coordinator.execute_external_submission(
+                    activation_envelope,
+                    operation_kind="activate_scenario_document",
+                    draft_id=commit.snapshot.program["draftId"],
+                    draft_revision=commit.snapshot.program["draftRevision"],
+                    payload={
+                        "source_document_digest": source_digest,
+                        "captured_input_digest": activation_intent[
+                            "captured_input_digest"
+                        ],
+                    },
+                    validate_under_claim=validate_activation,
+                    submit=lambda claim: state.execute_authored_deployment_candidate(
+                        activation_intent,
+                        claim,
+                        apply=True,
+                        prepared=activation_prepared,
+                    ),
+                )
             return {
-                "status": "opened",
-                "activation": None,
+                "status": "accepted" if activation is not None else "opened",
+                "activation": activation,
                 "diagnostics": diagnostics,
                 "source_diagnostics": source_diagnostics,
                 "path": source_path,
@@ -596,3 +724,31 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             _raise(error)
 
     return router
+
+
+def load_exact_scenario_document(
+    state: ComposerState, body: LoadScenarioDocumentRequest
+) -> dict[str, Any]:
+    """Use the one Scenario-document Open/activate implementation at startup.
+
+    Startup is intentionally not a second loader. Constructing the bounded
+    router only binds its handlers; invoking this exact handler performs the
+    same validation, workspace CAS, admission claim and Manager submission as
+    the public API without starting an HTTP client against ourselves.
+    """
+
+    router = create_scenario_document_router(state)
+    route = next(
+        route
+        for route in router.routes
+        if isinstance(route, APIRoute)
+        and route.path == "/api/scenario-documents/load"
+    )
+    return route.endpoint(body)
+
+
+__all__ = [
+    "LoadScenarioDocumentRequest",
+    "create_scenario_document_router",
+    "load_exact_scenario_document",
+]

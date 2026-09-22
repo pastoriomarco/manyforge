@@ -302,10 +302,6 @@ class NativeLauncherConfig:
         return self.instance_root / "state" / "composer-authoring"
 
     @property
-    def authoring_transaction_journal(self) -> Path:
-        return self.authoring_state_root / "composer-authoring-transactions.sqlite3"
-
-    @property
     def headless_url(self) -> str:
         return f"http://127.0.0.1:{SERVICE_PORTS['headless']}/"
 
@@ -367,8 +363,6 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
                 config.logical_scene_database,
                 "--program-cycle-journal",
                 config.program_cycle_journal,
-                "--authoring-transaction-journal",
-                config.authoring_transaction_journal,
                 "--projection-root",
                 config.projection_root,
                 "--program-runner-liveness-socket",
@@ -473,8 +467,6 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
         config.headless_url,
         "--headless-api-timeout-s",
         "30",
-        "--authoring-state-root",
-        str(config.authoring_state_root),
     )
     if config.composer_static_dir is not None:
         composer_argv += ("--static-dir", str(config.composer_static_dir))

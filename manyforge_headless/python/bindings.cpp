@@ -259,13 +259,6 @@ public:
     });
   }
 
-  std::string ScenarioLoadSelection(std::string scenario_id) {
-    py::gil_scoped_release release;
-    return Invoke([this, scenario_id = std::move(scenario_id)]() {
-      return core_->ScenarioLoadSelection(scenario_id);
-    });
-  }
-
   std::string PrepareProgramApply(std::string scenario_id,
                                   std::string scenario_catalog_revision,
                                   std::string canonical_program_json) {
@@ -747,8 +740,6 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            &HeadlessApiBridge::ScenarioCatalogProjection)
       .def("scenario_program_selection",
            &HeadlessApiBridge::ScenarioProgramSelection, py::arg("scenario_id"))
-      .def("scenario_load_selection", &HeadlessApiBridge::ScenarioLoadSelection,
-           py::arg("scenario_id"))
       .def("prepare_program_apply", &HeadlessApiBridge::PrepareProgramApply,
            py::arg("scenario_id"), py::arg("scenario_catalog_revision"),
            py::arg("canonical_program_json"))

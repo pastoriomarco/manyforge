@@ -216,19 +216,6 @@ def _scenario_selection(
     }
 
 
-def _scenario_load_selection(
-    *,
-    scenario_id: str = "cell-pick",
-) -> dict[str, Any]:
-    selection = _scenario_selection(scenario_id=scenario_id)
-    selection["schema_version"] = "manyforge.scenario_load_selection.v1"
-    selection["deployment"] = {
-        "deployment_artifact_id": selection["deployment_artifact_id"],
-        "deployment_revision": selection["deployment_revision"],
-    }
-    return selection
-
-
 def _remove_program_tree_with_valid_identity(value: dict[str, Any]) -> None:
     value["program"].pop("tree")
     value["program"]["program_revision"] = compute_content_identity(
@@ -299,16 +286,6 @@ def test_scenario_program_selection_rejects_rehashed_malformed_binding() -> None
 
     assert response.status_code == 502
     assert response.json()["detail"]["code"] == "scenario_program_selection_invalid"
-
-
-def test_scenario_load_selection_uses_effect_free_package_projection() -> None:
-    core = FakeCore()
-    client = TestClient(create_app(service=_service(core, FakeManager())))
-
-    response = client.get("/api/scenarios/cell-pick/load-selection")
-
-    assert response.status_code == 200
-    assert response.json() == _scenario_load_selection()
 
 
 @pytest.mark.parametrize(
@@ -572,17 +549,6 @@ class FakeCore:
         if self.scenario_selection_override is not None:
             return copy.deepcopy(self.scenario_selection_override)
         return _scenario_selection(scenario_id=scenario_id)
-
-    def scenario_load_selection(self, scenario_id: str) -> dict[str, Any]:
-        if self.scenario_selection_override is not None:
-            selection = copy.deepcopy(self.scenario_selection_override)
-            selection["schema_version"] = "manyforge.scenario_load_selection.v1"
-            selection["deployment"] = {
-                "deployment_artifact_id": selection["deployment_artifact_id"],
-                "deployment_revision": selection["deployment_revision"],
-            }
-            return selection
-        return _scenario_load_selection(scenario_id=scenario_id)
 
     def prepare_program_apply(
         self,
@@ -879,7 +845,21 @@ class FakeManager:
             "apply_id": apply_id,
             "candidate_projection_revision": None,
             "error": None,
+            "last_progress": {
+                "phase": "accepted",
+                "record_digest": "sha256:" + "f" * 64,
+            },
             "ok": True,
+            "phase": "accepted",
+            "prepared_activation": {
+                "captured_input_digest": "sha256:" + "d" * 64,
+                "deployment_artifact_id": "deployment.1",
+                "deployment_revision": "sha256:" + "b" * 64,
+                "program_binding_id": "sha256:" + "9" * 64,
+                "prepared_activation_id": "sha256:" + "e" * 64,
+            },
+            "request_id": "request.1",
+            "request_owner_epoch": "client.epoch.1",
             "state": "pending",
         }
 
@@ -1654,7 +1634,7 @@ class FakeActivationPreparer:
         }
 
 
-def test_activation_preparation_requires_and_replays_exact_claim() -> None:
+def test_activation_preparation_requires_current_idle_generation() -> None:
     core = FakeCore()
     manager = FakeManager()
     preparer = FakeActivationPreparer()
@@ -1672,7 +1652,7 @@ def test_activation_preparation_requires_and_replays_exact_claim() -> None:
         "program": {"api_version": "manyforge.program.v2"},
         "program_role_assignment": {"component_roles": [], "target_roles": []},
         "typed_parameter_overrides": {},
-        "authoring_claim": _authoring_claim(),
+        "expected_admission_generation": _ADMISSION_GENERATION,
     }
 
     response = client.post("/api/activation-preparations", json=body)
@@ -1694,10 +1674,10 @@ def test_activation_preparation_requires_and_replays_exact_claim() -> None:
         }
     ]
 
-    body["authoring_claim"] = {"intent": {"claim_kind": "not-authoring"}}
+    body["expected_admission_generation"] = _ADMISSION_GENERATION + 1
     rejected = client.post("/api/activation-preparations", json=body)
     assert rejected.status_code == 409
-    assert rejected.json()["detail"]["code"] == "authoring_not_ready"
+    assert rejected.json()["detail"]["code"] == "stale_generation"
 
 
 class FakeCCLC:
@@ -1899,7 +1879,7 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert "ready" not in health
         assert "robot_readiness" not in health
         overview = client.get("/api/component-overview").json()
-        assert overview["schema_version"] == "manyforge.component_overview.v1"
+        assert overview["schema_version"] == "manyforge.component_overview.v2"
         assert overview["readiness"] == "degraded"
         assert overview["overview_revision"].startswith("sha256:")
         assert (
@@ -2779,12 +2759,19 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                     "retained_bundle_id": "bundle.1",
                 },
                 "reject_if_affected_busy": True,
+                "prepared_activation": {
+                    "captured_input_digest": "sha256:" + "d" * 64,
+                    "deployment_artifact_id": "deployment.1",
+                    "deployment_revision": "sha256:" + "b" * 64,
+                    "program_binding_id": "sha256:" + "9" * 64,
+                    "prepared_activation_id": "sha256:" + "e" * 64,
+                },
                 "expected_admission_generation": 7,
                 "candidate_receipt": {
                     "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
                     "deployment_artifact_id": "deployment.1",
                     "deployment_revision": "sha256:" + "b" * 64,
-                    "scenario_catalog_revision": "sha256:" + "c" * 64,
+                    "prepared_activation_id": "sha256:" + "e" * 64,
                     "candidate_retained_bundle_id": "bundle.2",
                     "candidate_graph_revision": "graph.2",
                     "expected_current": {
@@ -2799,7 +2786,9 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
         )
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "kernel_owner_unavailable"
-    assert manager.requests[0].source_label == "operator_ui"
+    forwarded = manager.requests[0]
+    assert forwarded.source_label == "operator_ui"
+    assert forwarded.prepared_activation.prepared_activation_id == "sha256:" + "e" * 64
 
 
 def test_apply_status_is_a_read_only_durable_identity_observation() -> None:
@@ -2811,7 +2800,13 @@ def test_apply_status_is_a_read_only_durable_identity_observation() -> None:
         )
 
     assert response.status_code == 200
-    assert response.json()["state"] == "pending"
+    body = response.json()
+    assert body["state"] == "pending"
+    # One bounded lifecycle: the phase and the last real progress agree, and
+    # neither is derived from responsiveness or a heartbeat.
+    assert body["phase"] == body["last_progress"]["phase"] == "accepted"
+    assert body["request_id"] == "request.1"
+    assert body["prepared_activation"]["program_binding_id"] == "sha256:" + "9" * 64
     assert manager.apply_observations == [("apply/7", 7)]
 
 

@@ -382,86 +382,7 @@ TEST(OwnerSettlementReaders,
 }
 
 TEST(OwnerSettlementReaders,
-     AuthoringCommitRequiresExactOutcomeDigestAndNoPrematureReceipt) {
-  const auto claim_json = ClaimJson("authoring_mutation", "authoring_owner",
-                                    "author.1", "author.tx.1", "author.tx.1");
-  const std::string outcome =
-      "{\"body\":{\"status\":\"saved\"},\"kind\":\"mapping\"}";
-  const std::string preimage = "{\"outcome\":" + outcome +
-                               ",\"owner_transaction_id\":\"author.tx.1\","
-                               "\"settlement_kind\":\"owner_commit\"}";
-  const auto evidence = content_identity::sha256_digest(preimage);
-  const auto release_json =
-      ReleaseJson("authoring_owner", "author.1", "author.tx.1", "author.tx.1",
-                  "owner_commit", evidence);
-  const auto claim = DecodeCellAdmissionClaim(claim_json);
-  const auto release = DecodeCellAdmissionClaimRelease(release_json);
-  const std::string release_intent = "{\"evidence_digest\":\"" + evidence +
-                                     "\",\"settlement_kind\":\"owner_commit\"}";
-  TemporaryDatabase fixture;
-  fixture.Exec(
-      "PRAGMA user_version=1; CREATE TABLE transactions(owner_transaction_id "
-      "TEXT,owner_epoch TEXT,claim_json TEXT,effect_intent_json TEXT,"
-      "outcome_json TEXT,post_image_json TEXT,release_intent_json TEXT,"
-      "release_receipt_json TEXT); INSERT INTO transactions VALUES("
-      "'author.tx.1','author.1','" +
-      claim_json + "','{\"effect_class\":\"local\"}','" + outcome +
-      "','{\"draft_revision\":2}','" + release_intent + "',NULL)");
-  fixture.Close();
-  EXPECT_TRUE(
-      ValidateAuthoringSettlementReadOnly(fixture.path(), claim, release).ok());
-
-  TemporaryDatabase premature_receipt;
-  premature_receipt.Exec(
-      "PRAGMA user_version=1; CREATE TABLE transactions(owner_transaction_id "
-      "TEXT,owner_epoch TEXT,claim_json TEXT,effect_intent_json TEXT,"
-      "outcome_json TEXT,post_image_json TEXT,release_intent_json TEXT,"
-      "release_receipt_json TEXT); INSERT INTO transactions VALUES("
-      "'author.tx.1','author.1','" +
-      claim_json + "','{\"effect_class\":\"local\"}','" + outcome +
-      "','{\"draft_revision\":2}','" + release_intent +
-      "','{\"status\":\"released_exact\"}')");
-  premature_receipt.Close();
-  EXPECT_FALSE(ValidateAuthoringSettlementReadOnly(premature_receipt.path(),
-                                                   claim, release)
-                   .ok());
-}
-
-TEST(OwnerSettlementReaders,
-     AuthoringIdleRotationRequiresExactActiveSuccessorAndRoleEvidence) {
-  TemporaryDatabase fixture;
-  fixture.Exec(
-      "PRAGMA user_version=1;"
-      "CREATE TABLE owner_epochs(owner_epoch TEXT,active INTEGER);"
-      "INSERT INTO owner_epochs VALUES('author.2',1);"
-      "CREATE TABLE transactions(owner_epoch TEXT,release_receipt_json TEXT);");
-  fixture.Close();
-  const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> current{
-      {core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-       core::RequestOwnerEpoch("author.1")}};
-  const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> requested{
-      {core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-       core::RequestOwnerEpoch("author.2")}};
-  const auto evidence =
-      core::CellAdmissionOwnerEpochReconciliationEvidenceDigest(
-          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-          core::RequestOwnerEpoch("author.2"));
-  ASSERT_TRUE(evidence.ok());
-  core::CellAdmissionReconcileDTO reconcile{
-      core::RequestOwnerEpoch("kernel.1"), {}, requested, evidence.value()};
-  EXPECT_TRUE(ValidateAuthoringOwnerReconciliationReadOnly(fixture.path(), {},
-                                                           current, reconcile)
-                  .ok());
-
-  reconcile.reconciliation_evidence_digest =
-      core::ContentDigest(std::string(kDigestA));
-  EXPECT_FALSE(ValidateAuthoringOwnerReconciliationReadOnly(fixture.path(), {},
-                                                            current, reconcile)
-                   .ok());
-}
-
-TEST(OwnerSettlementReaders,
-     ProgramRunnerIdleRotationCannotBeAuthorizedByAuthoringJournal) {
+     ProgramRunnerIdleRotationRequiresExactProgramEvidence) {
   const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> current{
       {core::CellAdmissionOwnerRoleDTO::kProgramRunner,
        core::RequestOwnerEpoch("runner.1")}};
@@ -491,10 +412,6 @@ TEST(OwnerSettlementReaders,
   EXPECT_TRUE(ValidateProgramRunnerOwnerReconciliationReadOnly(
                   fixture.path(), {}, current, reconcile)
                   .ok());
-  EXPECT_FALSE(ValidateAuthoringOwnerReconciliationReadOnly(fixture.path(), {},
-                                                            current, reconcile)
-                   .ok());
-
   const auto claim_json = ClaimJson("program_cycle", "program_runner",
                                     "runner.1", "cycle.1", "start.1");
   const auto claim = DecodeCellAdmissionClaim(claim_json);

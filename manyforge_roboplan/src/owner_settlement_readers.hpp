@@ -31,21 +31,8 @@ ReadActiveProgramRunProductForReconciliation(
     const core::CellAdmissionClaimDTO &claim,
     const core::CellAdmissionClaimReleaseDTO &release);
 
-[[nodiscard]] core::Result<void> ValidateAuthoringSettlementReadOnly(
-    const std::filesystem::path &database_path,
-    const core::CellAdmissionClaimDTO &claim,
-    const core::CellAdmissionClaimReleaseDTO &release);
-
 [[nodiscard]] core::Result<core::CellAdmissionReconcileValidationDTO>
 ValidateProgramRunnerOwnerReconciliationReadOnly(
-    const std::filesystem::path &database_path,
-    const std::vector<core::CellAdmissionClaimDTO> &held_claims,
-    const std::vector<core::CellAdmissionCurrentOwnerEpochDTO>
-        &current_owner_epochs,
-    const core::CellAdmissionReconcileDTO &reconcile);
-
-[[nodiscard]] core::Result<core::CellAdmissionReconcileValidationDTO>
-ValidateAuthoringOwnerReconciliationReadOnly(
     const std::filesystem::path &database_path,
     const std::vector<core::CellAdmissionClaimDTO> &held_claims,
     const std::vector<core::CellAdmissionCurrentOwnerEpochDTO>

@@ -139,24 +139,6 @@ ExactReleaseIdentity(const core::CellAdmissionClaimDTO &claim,
   return member.as_string();
 }
 
-[[nodiscard]] std::string
-AuthoringEvidenceDigest(std::string_view owner_transaction_id,
-                        std::string_view settlement_kind,
-                        std::string_view outcome_json) {
-  // Python's journal uses sorted compact JSON. These three sorted keys and the
-  // already-canonical retained outcome let us reproduce its exact preimage
-  // without interpreting or reformatting outcome numbers.
-  const auto quoted_transaction =
-      ci::canonical_json(ci::CanonicalValue(std::string(owner_transaction_id)));
-  const auto quoted_kind =
-      ci::canonical_json(ci::CanonicalValue(std::string(settlement_kind)));
-  const std::string preimage =
-      "{\"outcome\":" + std::string(outcome_json) +
-      ",\"owner_transaction_id\":" + quoted_transaction +
-      ",\"settlement_kind\":" + quoted_kind + "}";
-  return ci::sha256_digest(preimage);
-}
-
 [[nodiscard]] bool ProgramStartSettlementMatches(
     std::string_view encoded, const core::CellAdmissionClaimDTO &claim,
     std::string_view program_run_id, std::string_view reference) {
@@ -294,28 +276,6 @@ struct RoleReplacement final {
       throw std::runtime_error("held claim owner inventory differs");
   }
   return *replacement;
-}
-
-[[nodiscard]] core::CellAdmissionClaimReleaseDTO
-AuthoringRelease(const core::CellAdmissionClaimDTO &claim,
-                 const ci::CanonicalValue &settlement) {
-  core::CellAdmissionClaimReleaseDTO release{
-      claim.intent.owner_role,
-      claim.intent.owner_epoch,
-      claim.intent.owner_transaction_id,
-      claim.intent.request_id,
-      claim.intent.request_payload_digest,
-      claim.acquired_admission_generation,
-      claim.claim_generation,
-      {core::CellAdmissionSettlementKindDTO::kOwnerCommit,
-       core::ContentDigest(StringMember(settlement, "evidence_digest"))}};
-  const auto kind = StringMember(settlement, "settlement_kind");
-  if (kind == "proven_no_effect")
-    release.settlement.settlement_kind =
-        core::CellAdmissionSettlementKindDTO::kProvenNoEffect;
-  else if (kind != "owner_commit")
-    throw std::runtime_error("authoring reconciliation settlement differs");
-  return release;
 }
 
 } // namespace
@@ -478,138 +438,6 @@ core::Result<void> ValidateProgramCycleSettlementReadOnly(
     return core::Result<void>::Ok();
   } catch (const std::exception &) {
     return Rejected("Program-cycle", "program_cycle_journal_read_failed");
-  }
-}
-
-core::Result<void> ValidateAuthoringSettlementReadOnly(
-    const std::filesystem::path &database_path,
-    const core::CellAdmissionClaimDTO &claim,
-    const core::CellAdmissionClaimReleaseDTO &release) {
-  const auto settlement_kind = release.settlement.settlement_kind;
-  if (!ExactReleaseIdentity(claim, release) ||
-      claim.intent.claim_kind !=
-          core::CellAdmissionClaimKindDTO::kAuthoringMutation ||
-      claim.intent.owner_role !=
-          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner ||
-      (settlement_kind != core::CellAdmissionSettlementKindDTO::kOwnerCommit &&
-       settlement_kind !=
-           core::CellAdmissionSettlementKindDTO::kProvenNoEffect))
-    return Rejected("Composer authoring",
-                    "authoring_release_identity_mismatch");
-  try {
-    auto database = OpenReadOnly(database_path);
-    Statement version(database.get(), "PRAGMA user_version");
-    if (!version.Step() || version.Integer(0) != 1 || version.Step())
-      throw std::runtime_error("Composer authoring journal schema differs");
-    Statement row(
-        database.get(),
-        "SELECT owner_epoch,claim_json,effect_intent_json,outcome_json,"
-        "post_image_json,release_intent_json,release_receipt_json,"
-        "json_valid(outcome_json),json_type(outcome_json) "
-        "FROM transactions WHERE owner_transaction_id=?");
-    row.Bind(1, claim.intent.owner_transaction_id);
-    if (!row.Step())
-      throw std::runtime_error("Composer authoring transaction is absent");
-    const auto retained_claim = DecodeCellAdmissionClaim(row.Text(1));
-    const auto outcome_json = row.Text(3);
-    const auto release_intent = ci::parse_canonical_json(row.Text(5));
-    const auto expected_kind = std::string(core::to_string(settlement_kind));
-    const bool valid =
-        row.Text(0) == claim.intent.owner_epoch.value() &&
-        retained_claim == claim && release_intent.is_object() &&
-        release_intent.as_object().size() == 2U &&
-        StringMember(release_intent, "settlement_kind") == expected_kind &&
-        StringMember(release_intent, "evidence_digest") ==
-            release.settlement.evidence_digest.value() &&
-        AuthoringEvidenceDigest(claim.intent.owner_transaction_id,
-                                expected_kind, outcome_json) ==
-            release.settlement.evidence_digest.value() &&
-        (settlement_kind ==
-             core::CellAdmissionSettlementKindDTO::kProvenNoEffect ||
-         (!row.IsNull(2) && !row.IsNull(4))) &&
-        row.IsNull(6) && row.Integer(7) == 1 && row.Text(8) == "object" &&
-        !row.Step();
-    Exec(database.get(), "COMMIT");
-    if (!valid)
-      return Rejected("Composer authoring",
-                      "authoring_terminal_evidence_mismatch");
-    return core::Result<void>::Ok();
-  } catch (const std::exception &) {
-    return Rejected("Composer authoring", "authoring_journal_read_failed");
-  }
-}
-
-core::Result<core::CellAdmissionReconcileValidationDTO>
-ValidateAuthoringOwnerReconciliationReadOnly(
-    const std::filesystem::path &database_path,
-    const std::vector<core::CellAdmissionClaimDTO> &held_claims,
-    const std::vector<core::CellAdmissionCurrentOwnerEpochDTO>
-        &current_owner_epochs,
-    const core::CellAdmissionReconcileDTO &reconcile) {
-  try {
-    const auto replacement = ValidateRoleReplacementEnvelope(
-        core::CellAdmissionOwnerRoleDTO::kAuthoringOwner, held_claims,
-        current_owner_epochs, reconcile);
-    auto database = OpenReadOnly(database_path);
-    Statement version(database.get(), "PRAGMA user_version");
-    if (!version.Step() || version.Integer(0) != 1 || version.Step())
-      throw std::runtime_error("Composer authoring journal schema differs");
-    Statement active(database.get(),
-                     "SELECT owner_epoch FROM owner_epochs WHERE active=1");
-    if (!active.Step() || active.Text(0) != replacement.successor.value() ||
-        active.Step())
-      throw std::runtime_error("Composer authoring successor is not active");
-
-    core::CellAdmissionReconcileValidationDTO validation{
-        reconcile.current_owner_epochs, {}};
-    std::int64_t predecessor_unresolved = 0;
-    Statement unresolved(
-        database.get(), "SELECT count(*) FROM transactions WHERE owner_epoch=? "
-                        "AND release_receipt_json IS NULL");
-    unresolved.Bind(1, replacement.predecessor.value());
-    if (!unresolved.Step())
-      throw std::runtime_error("Composer authoring unresolved count is absent");
-    predecessor_unresolved = unresolved.Integer(0);
-    if (unresolved.Step())
-      throw std::runtime_error("Composer authoring unresolved count differs");
-
-    for (const auto &claim : held_claims) {
-      if (claim.intent.owner_role !=
-              core::CellAdmissionOwnerRoleDTO::kAuthoringOwner ||
-          claim.intent.owner_epoch == replacement.successor)
-        continue;
-      Statement row(database.get(),
-                    "SELECT release_intent_json FROM transactions "
-                    "WHERE owner_transaction_id=? AND owner_epoch=? "
-                    "AND release_receipt_json IS NULL");
-      row.Bind(1, claim.intent.owner_transaction_id);
-      row.Bind(2, replacement.predecessor.value());
-      if (!row.Step())
-        throw std::runtime_error("authoring predecessor settlement is absent");
-      const auto release =
-          AuthoringRelease(claim, ci::parse_canonical_json(row.Text(0)));
-      if (row.Step() ||
-          !ValidateAuthoringSettlementReadOnly(database_path, claim, release)
-               .ok())
-        throw std::runtime_error("authoring predecessor settlement differs");
-      validation.settlements.push_back(
-          {claim, core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-           replacement.successor,
-           core::CellAdmissionSettlementKindDTO::kReconciled,
-           reconcile.reconciliation_evidence_digest});
-    }
-    if (predecessor_unresolved !=
-        static_cast<std::int64_t>(validation.settlements.size()))
-      throw std::runtime_error("unresolved authoring inventory is not held");
-    Exec(database.get(), "COMMIT");
-    return core::Result<core::CellAdmissionReconcileValidationDTO>::Ok(
-        std::move(validation));
-  } catch (const std::exception &) {
-    return core::Result<core::CellAdmissionReconcileValidationDTO>::Err(
-        core::ErrorDTO{
-            "invariant_violation",
-            "Composer authoring owner reconciliation is not proven",
-            {{"reason", "authoring_owner_reconciliation_evidence_invalid"}}});
   }
 }
 

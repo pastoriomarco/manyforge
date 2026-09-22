@@ -150,15 +150,9 @@ def gen_rest_api() -> str:
     # the configured thin-client superset without making a request or starting
     # a Headless process, so the reference does not silently omit optional
     # runtime-client routes.
-    with tempfile.TemporaryDirectory(
-        prefix="manyforge-structural-contract-"
-    ) as authoring_state_root:
-        spec = create_app(
-            ComposerState(
-                headless_client=object(),  # type: ignore[arg-type]
-                authoring_state_root=authoring_state_root,
-            ),
-        ).openapi()
+    spec = create_app(
+        ComposerState(headless_client=object()),  # type: ignore[arg-type]
+    ).openapi()
     body: list[str] = [
         _stamp("gen_rest_api", "structural-rest"),
         "# Composer REST API\n\n",
@@ -265,9 +259,8 @@ def gen_mcp_api() -> str:
     from manyforge_composer.backend.mcp_adapter import tool_contracts
     from manyforge_composer.backend.state import ComposerState
 
-    with tempfile.TemporaryDirectory(prefix="manyforge-mcp-contract-") as state_root:
-        app = create_app(ComposerState(headless_client=object(), authoring_state_root=state_root))
-        contracts = tool_contracts(app)
+    app = create_app(ComposerState(headless_client=object()))
+    contracts = tool_contracts(app)
     body = [
         _stamp("gen_mcp_api", "mcp"),
         "# ManyForge MCP HTTP contract\n\n",

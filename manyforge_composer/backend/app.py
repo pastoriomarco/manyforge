@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -224,6 +225,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         try:
+            if state.authoring_admission is not None:
+                await asyncio.to_thread(state.authoring_admission.recover)
             yield
         finally:
             if state.execution_observation_source is not None:

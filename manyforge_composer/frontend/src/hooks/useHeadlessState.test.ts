@@ -17,7 +17,7 @@ import {
 
 function componentOverview(): ComposerHeadlessState['componentOverview'] {
   return {
-    schemaVersion: 'manyforge.component_overview.v1',
+    schemaVersion: 'manyforge.component_overview.v2',
     overviewRevision: `sha256:${'a'.repeat(64)}`,
     readiness: 'ready',
     summaryLabel: 'Application surfaces ready',
@@ -254,7 +254,7 @@ function wireState(generation: number): Record<string, unknown> {
   return {
     schema_version: 'manyforge.composer_headless_state.v2',
     component_overview: {
-      schema_version: 'manyforge.component_overview.v1',
+      schema_version: 'manyforge.component_overview.v2',
       overview_revision: `sha256:${'a'.repeat(64)}`,
       readiness: 'ready',
       summary_label: 'Application surfaces ready',
@@ -263,6 +263,7 @@ function wireState(generation: number): Record<string, unknown> {
       user_message: 'Current.',
       capabilities: ['Observe / Render', 'Plan / Preview', 'Execute / Control'],
       components: [],
+      maintenance_operation: null,
       basis: {
         runtime_projection_owner_epoch: null,
         runtime_projection_generation: null,

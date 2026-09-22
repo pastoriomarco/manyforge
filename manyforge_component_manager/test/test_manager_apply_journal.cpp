@@ -140,6 +140,14 @@ ManagerApplyIntentDTO Intent(std::string apply_id = "apply-1",
       },
       RetainedBundleId(std::move(candidate)),
       GraphRevision("candidate-graph"),
+      ManagerApplyPreparedActivationDTO{
+          ContentDigest("sha256:1414141414141414141414141414141414141414141414141414141414141414"),
+          core::DeploymentArtifactId("deployment-artifact-1"),
+          core::DeploymentRevision(
+              "sha256:1515151515151515151515151515151515151515151515151515151515151515"),
+          core::ProgramBindingId(kDigestTwo),
+          ContentDigest("sha256:1616161616161616161616161616161616161616161616161616161616161616"),
+      },
       core::AdmissionGeneration(7U),
       std::nullopt,
   };
@@ -965,6 +973,383 @@ TEST(ManagerApplyIntent, ValidityRejectsMissingRequiredIdentity) {
   intent = Intent();
   intent.candidate_retained_bundle_id = RetainedBundleId("");
   EXPECT_FALSE(intent.valid());
+
+  // The exact UA2A prepared activation is part of the operation identity: an
+  // intent without it cannot name the input it accepted.
+  intent = Intent();
+  intent.prepared_activation.captured_input_digest = ContentDigest("");
+  EXPECT_FALSE(intent.valid());
+  intent = Intent();
+  intent.prepared_activation.deployment_artifact_id =
+      core::DeploymentArtifactId("");
+  EXPECT_FALSE(intent.valid());
+  intent = Intent();
+  intent.prepared_activation.deployment_revision =
+      core::DeploymentRevision("");
+  EXPECT_FALSE(intent.valid());
+  intent = Intent();
+  intent.prepared_activation.program_binding_id = core::ProgramBindingId("");
+  EXPECT_FALSE(intent.valid());
+  intent = Intent();
+  intent.prepared_activation.prepared_activation_id = ContentDigest("");
+  EXPECT_FALSE(intent.valid());
+}
+
+TEST(ManagerApplyJournal,
+     DerivesOneBoundedOperationStatusFromDurableMilestones) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "status.sqlite3",
+                                    CellId("cell-1"));
+  const auto intent = journal.EnsureIntent(Intent()).record;
+
+  // An unknown durable identity is not an operation.
+  EXPECT_FALSE(
+      journal.ReadStatus(ApplyId("apply-unknown"), ApplyGeneration(1U))
+          .has_value());
+
+  const auto accepted =
+      journal.ReadStatus(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(accepted.has_value());
+  EXPECT_EQ(accepted->intent.intent_digest, intent.intent_digest);
+  EXPECT_FALSE(accepted->terminal_outcome.has_value());
+  const auto accepted_progress = DeriveManagerApplyProgress(*accepted);
+  EXPECT_EQ(accepted_progress.phase, ManagerApplyPhase::kAccepted);
+  EXPECT_EQ(accepted_progress.record_digest, intent.intent_digest);
+  EXPECT_EQ(std::string(ToString(accepted_progress.phase)), "accepted");
+
+  // The phase advances only with the exact parent-linked durable record; a
+  // heartbeat or any elapsed time changes nothing.
+  const auto scope =
+      journal.EnsureAffectedScope(intent.intent_digest, AffectedScope()).record;
+  const auto fenced =
+      journal.ReadStatus(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(fenced.has_value());
+  const auto fenced_progress = DeriveManagerApplyProgress(*fenced);
+  EXPECT_EQ(fenced_progress.phase, ManagerApplyPhase::kFenceAcquired);
+  EXPECT_EQ(fenced_progress.record_digest, scope.affected_scope_digest);
+  EXPECT_EQ(std::string(ToString(fenced_progress.phase)), "fence_acquired");
+}
+
+TEST(ManagerApplyTerminalOutcome, RequiresExactlyOneCompleteDisposition) {
+  const auto projection = ProjectionRevisionDTO{
+      RetainedBundleId("bundle.candidate"),
+      GraphRevision("graph.candidate"),
+      SceneRevision{
+          SceneId(std::string(kSceneIdOne)),
+          3U,
+          ContentDigest(std::string(kDigestOne)),
+      },
+  };
+  const auto failure = ManagerApplyFailureEvidenceDTO{
+      ContentDigest(std::string(kDigestThree)),
+      ManagerApplyPhase::kRuntimeConverged,
+      "runtime_initialization_failed",
+      "replacement initialization failed after teardown",
+      ManagerApplyEffectDisposition::kKnown,
+  };
+  EXPECT_TRUE(failure.valid());
+
+  const ManagerApplyTerminalOutcomeDTO full_success{
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      projection,
+      ContentDigest(std::string(kDigestTwo)),
+      ContentDigest(std::string(kDigestThree)),
+      ContentDigest(std::string(kDigestOne)),
+      ManagerApplyTerminalOutcomeState::kSucceeded,
+      std::nullopt,
+  };
+  EXPECT_TRUE(full_success.valid());
+  EXPECT_TRUE(full_success.succeeded());
+
+  // A success carries the complete publication evidence and no failure.
+  auto partial = full_success;
+  partial.fence_released_digest.reset();
+  EXPECT_FALSE(partial.valid());
+  partial = full_success;
+  partial.scene_finalized_digest.reset();
+  EXPECT_FALSE(partial.valid());
+  partial = full_success;
+  partial.publication_receipt_digest.reset();
+  EXPECT_FALSE(partial.valid());
+  partial = full_success;
+  partial.candidate_projection_revision.reset();
+  EXPECT_FALSE(partial.valid());
+  partial = full_success;
+  partial.publication_receipt_digest = ContentDigest(std::string());
+  EXPECT_FALSE(partial.valid());
+  partial = full_success;
+  partial.failure = failure;
+  EXPECT_FALSE(partial.valid());
+
+  const ManagerApplyTerminalOutcomeDTO failed{
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      ManagerApplyTerminalOutcomeState::kFailed,
+      failure,
+  };
+  EXPECT_TRUE(failed.valid());
+  EXPECT_FALSE(failed.succeeded());
+
+  // A failure carries no publication evidence at all: one stray success field
+  // is rejected even though the complete success set is obviously absent.
+  auto stray = failed;
+  stray.fence_released_digest = ContentDigest(std::string(kDigestOne));
+  EXPECT_FALSE(stray.valid());
+  stray = failed;
+  stray.scene_finalized_digest = ContentDigest(std::string(kDigestOne));
+  EXPECT_FALSE(stray.valid());
+  stray = failed;
+  stray.publication_receipt_digest = ContentDigest(std::string(kDigestOne));
+  EXPECT_FALSE(stray.valid());
+  stray = failed;
+  stray.candidate_projection_revision = projection;
+  EXPECT_FALSE(stray.valid());
+
+  // A known failure and an unknown effect are distinct dispositions.
+  auto mismatched = failed;
+  mismatched.failure->effect_disposition =
+      ManagerApplyEffectDisposition::kUnknown;
+  EXPECT_FALSE(mismatched.valid());
+  auto uncertain = failed;
+  uncertain.state = ManagerApplyTerminalOutcomeState::kUnknownEffect;
+  EXPECT_FALSE(uncertain.valid());
+  uncertain.failure->effect_disposition =
+      ManagerApplyEffectDisposition::kUnknown;
+  EXPECT_TRUE(uncertain.valid());
+  EXPECT_FALSE(uncertain.succeeded());
+  uncertain.state = ManagerApplyTerminalOutcomeState::kSucceeded;
+  EXPECT_FALSE(uncertain.valid());
+
+  // A terminal failure retains exactly one valid, bounded, intent-bound failure.
+  auto missing = failed;
+  missing.failure.reset();
+  EXPECT_FALSE(missing.valid());
+  auto unbound = failed;
+  unbound.failure->intent_digest = ContentDigest(std::string());
+  EXPECT_FALSE(unbound.valid());
+  auto empty_code = failed;
+  empty_code.failure->failure_code.clear();
+  EXPECT_FALSE(empty_code.valid());
+  auto empty_message = failed;
+  empty_message.failure->failure_message.clear();
+  EXPECT_FALSE(empty_message.valid());
+  auto oversized_code = failed;
+  oversized_code.failure->failure_code =
+      std::string(kMaximumManagerApplyFailureCodeBytes + 1U, 'c');
+  EXPECT_FALSE(oversized_code.valid());
+  auto oversized_message = failed;
+  oversized_message.failure->failure_message =
+      std::string(kMaximumManagerApplyFailureMessageBytes + 1U, 'm');
+  EXPECT_FALSE(oversized_message.valid());
+
+  // The persisted vocabulary never spells an unknown-effect failure as a
+  // success or as clean absence.
+  EXPECT_EQ(std::string(ToString(ManagerApplyEffectDisposition::kKnown)),
+            "known");
+  EXPECT_EQ(std::string(ToString(ManagerApplyEffectDisposition::kUnknown)),
+            "unknown");
+  EXPECT_EQ(std::string(ToString(ManagerApplyTerminalOutcomeState::kFailed)),
+            "failed");
+  EXPECT_EQ(
+      std::string(ToString(ManagerApplyTerminalOutcomeState::kUnknownEffect)),
+      "unknown_effect");
+}
+
+TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "terminal-failure.sqlite3";
+  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+  const auto intent = journal.EnsureIntent(Intent()).record;
+
+  // Initialization failed after destructive teardown, so the effects are not
+  // established and the operation must not claim clean absence.
+  const auto failure = ManagerApplyFailureEvidenceDTO{
+      intent.intent_digest,
+      ManagerApplyPhase::kRuntimeConverged,
+      "runtime_initialization_failed",
+      "replacement initialization failed after teardown",
+      ManagerApplyEffectDisposition::kUnknown,
+  };
+  const auto retained = journal.EnsureTerminalOutcome({
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      ManagerApplyTerminalOutcomeState::kUnknownEffect,
+      failure,
+  });
+  EXPECT_TRUE(retained.inserted);
+
+  // Exact replay is a read of the same immutable terminal outcome.
+  const auto replay = journal.EnsureTerminalOutcome({
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      ManagerApplyTerminalOutcomeState::kUnknownEffect,
+      failure,
+  });
+  EXPECT_FALSE(replay.inserted);
+  EXPECT_EQ(replay.record, retained.record);
+
+  // A different failure for the same operation identity is rejected: the
+  // terminal result is retained exactly once and is never rewritten.
+  auto conflicting = failure;
+  conflicting.failure_message = "another failure";
+  EXPECT_THROW(journal.EnsureTerminalOutcome({
+                   ApplyId("apply-1"),
+                   ApplyGeneration(1U),
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   ManagerApplyTerminalOutcomeState::kUnknownEffect,
+                   conflicting,
+               }),
+               ManagerApplyJournalConflictError);
+
+  const auto status =
+      journal.ReadStatus(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(status.has_value());
+  ASSERT_TRUE(status->terminal_outcome.has_value());
+  const auto &terminal = status->terminal_outcome->terminal_outcome;
+  EXPECT_FALSE(terminal.succeeded());
+  EXPECT_EQ(terminal.state, ManagerApplyTerminalOutcomeState::kUnknownEffect);
+  ASSERT_TRUE(terminal.failure.has_value());
+  EXPECT_EQ(terminal.failure->failure_code, "runtime_initialization_failed");
+  EXPECT_EQ(terminal.failure->effect_disposition,
+            ManagerApplyEffectDisposition::kUnknown);
+  EXPECT_EQ(terminal.failure->intent_digest, intent.intent_digest);
+  EXPECT_FALSE(terminal.candidate_projection_revision.has_value());
+  // The milestone projection is unaffected: a terminal failure is not progress.
+  EXPECT_EQ(DeriveManagerApplyProgress(*status).phase,
+            ManagerApplyPhase::kAccepted);
+
+  journal.Close();
+
+  // The retained first failure survives a Manager restart exactly.
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  const auto stored = reopened.ReadTerminalOutcome(ApplyId("apply-1"),
+                                                   ApplyGeneration(1U));
+  ASSERT_TRUE(stored.has_value());
+  EXPECT_EQ(stored->terminal_outcome, retained.record.terminal_outcome);
+  EXPECT_EQ(stored->terminal_outcome_digest,
+            retained.record.terminal_outcome_digest);
+  EXPECT_EQ(reopened.VerifyIntegrity().terminal_outcome_count, 1);
+}
+
+TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "failure-binding.sqlite3",
+                                    CellId("cell-1"));
+  const auto intent = journal.EnsureIntent(Intent()).record;
+
+  // An unknown operation is not a durable identity.
+  EXPECT_THROW(journal.EnsureTerminalOutcome({
+                   ApplyId("apply-unknown"),
+                   ApplyGeneration(1U),
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   ManagerApplyTerminalOutcomeState::kFailed,
+                   ManagerApplyFailureEvidenceDTO{
+                       intent.intent_digest,
+                       ManagerApplyPhase::kAccepted,
+                       "preflight_refused",
+                       "candidate validation failed before any effect",
+                       ManagerApplyEffectDisposition::kKnown,
+                   },
+               }),
+               ManagerApplyJournalConflictError);
+
+  // A failure must name the exact accepted intent of the same generation.
+  EXPECT_THROW(journal.EnsureTerminalOutcome({
+                   ApplyId("apply-1"),
+                   ApplyGeneration(1U),
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   ManagerApplyTerminalOutcomeState::kFailed,
+                   ManagerApplyFailureEvidenceDTO{
+                       ContentDigest(std::string(kDigestThree)),
+                       ManagerApplyPhase::kAccepted,
+                       "preflight_refused",
+                       "candidate validation failed before any effect",
+                       ManagerApplyEffectDisposition::kKnown,
+                   },
+               }),
+               ManagerApplyJournalConflictError);
+
+  // A mismatched state/disposition pair is rejected before any write.
+  EXPECT_THROW(journal.EnsureTerminalOutcome({
+                   ApplyId("apply-1"),
+                   ApplyGeneration(1U),
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   ManagerApplyTerminalOutcomeState::kFailed,
+                   ManagerApplyFailureEvidenceDTO{
+                       intent.intent_digest,
+                       ManagerApplyPhase::kAccepted,
+                       "preflight_refused",
+                       "candidate validation failed before any effect",
+                       ManagerApplyEffectDisposition::kUnknown,
+                   },
+               }),
+               std::invalid_argument);
+
+  // Empty and oversized retained failure text is rejected before any write.
+  EXPECT_THROW(journal.EnsureTerminalOutcome({
+                   ApplyId("apply-1"),
+                   ApplyGeneration(1U),
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   ManagerApplyTerminalOutcomeState::kFailed,
+                   ManagerApplyFailureEvidenceDTO{
+                       intent.intent_digest,
+                       ManagerApplyPhase::kAccepted,
+                       "",
+                       "candidate validation failed before any effect",
+                       ManagerApplyEffectDisposition::kKnown,
+                   },
+               }),
+               std::invalid_argument);
+  EXPECT_THROW(journal.EnsureTerminalOutcome({
+                   ApplyId("apply-1"),
+                   ApplyGeneration(1U),
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   std::nullopt,
+                   ManagerApplyTerminalOutcomeState::kFailed,
+                   ManagerApplyFailureEvidenceDTO{
+                       intent.intent_digest,
+                       ManagerApplyPhase::kAccepted,
+                       std::string(kMaximumManagerApplyFailureCodeBytes + 1U, 'c'),
+                       "candidate validation failed before any effect",
+                       ManagerApplyEffectDisposition::kKnown,
+                   },
+               }),
+               std::invalid_argument);
+
+  // None of the refusals left a terminal record behind.
+  EXPECT_FALSE(journal.ReadTerminalOutcome(ApplyId("apply-1"),
+                                           ApplyGeneration(1U))
+                   .has_value());
 }
 
 TEST(ManagerApplyJournalValues,
@@ -1194,6 +1579,26 @@ TEST(ManagerApplyJournalIntegrity,
   add([](auto &value) {
     value.candidate_graph_revision = GraphRevision("candidate-graph-2");
   });
+  add([](auto &value) {
+    value.prepared_activation.captured_input_digest =
+        ContentDigest(std::string(kDigestTwo));
+  });
+  add([](auto &value) {
+    value.prepared_activation.deployment_artifact_id =
+        core::DeploymentArtifactId("deployment-artifact-2");
+  });
+  add([](auto &value) {
+    value.prepared_activation.deployment_revision =
+        core::DeploymentRevision(std::string(kDigestTwo));
+  });
+  add([](auto &value) {
+    value.prepared_activation.program_binding_id =
+        core::ProgramBindingId("program-binding-2");
+  });
+  add([](auto &value) {
+    value.prepared_activation.prepared_activation_id =
+        ContentDigest(std::string(kDigestTwo));
+  });
 
   std::set<std::string> digests;
   for (std::size_t index = 0U; index < variants.size(); ++index) {
@@ -1272,6 +1677,89 @@ TEST(ManagerApplyJournal, PersistsExactParentAuthoringClaimAcrossRestart) {
   ASSERT_TRUE(record.has_value());
   EXPECT_EQ(record->intent, intent);
   EXPECT_EQ(reopened.VerifyIntegrity().apply_intent_count, 1);
+}
+
+TEST(ManagerApplyJournal,
+     AuthoringOwnerRotationSettlesOnlyClaimsWithoutPendingManagerEffects) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "authoring-owner-rotation.sqlite3";
+  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+  const auto claim = *ParentClaimIntent().parent_authoring_claim;
+  const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> current{
+      {core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+       RequestOwnerEpoch("composer-owner-1")}};
+  const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> successor{
+      {core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+       RequestOwnerEpoch("composer-owner-2")}};
+  const auto evidence =
+      core::CellAdmissionOwnerEpochReconciliationEvidenceDigest(
+          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
+          RequestOwnerEpoch("composer-owner-2"));
+  ASSERT_TRUE(evidence.ok());
+  const core::CellAdmissionReconcileDTO reconcile{
+      RequestOwnerEpoch("kernel-owner-1"), {claim}, successor,
+      evidence.value()};
+
+  const auto local = ValidateManagerAuthoringOwnerReconciliationReadOnly(
+      path, CellId("cell-1"), {claim}, current, reconcile);
+  ASSERT_TRUE(local.ok());
+  ASSERT_EQ(local.value().settlements.size(), 1U);
+  EXPECT_EQ(local.value().settlements[0].predecessor_claim, claim);
+  EXPECT_EQ(local.value().settlements[0].successor_owner_epoch,
+            RequestOwnerEpoch("composer-owner-2"));
+
+  static_cast<void>(journal.EnsureIntent(ParentClaimIntent()));
+  const auto pending = ValidateManagerAuthoringOwnerReconciliationReadOnly(
+      path, CellId("cell-1"), {claim}, current, reconcile);
+  EXPECT_FALSE(pending.ok());
+
+  const auto durable_intent =
+      journal.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(durable_intent.has_value());
+  static_cast<void>(journal.EnsureTerminalOutcome({
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      ManagerApplyTerminalOutcomeState::kFailed,
+      ManagerApplyFailureEvidenceDTO{
+          durable_intent->intent_digest,
+          ManagerApplyPhase::kAccepted,
+          "maintenance_preflight_refused",
+          "maintenance was refused before any runtime effect",
+          ManagerApplyEffectDisposition::kKnown},
+  }));
+  const auto refused_before_effect =
+      ValidateManagerAuthoringOwnerReconciliationReadOnly(
+          path, CellId("cell-1"), {claim}, current, reconcile);
+  EXPECT_TRUE(refused_before_effect.ok());
+
+  const auto destructive_path =
+      directory.path() / "authoring-owner-destructive-failure.sqlite3";
+  SqliteManagerApplyJournal destructive(destructive_path, CellId("cell-1"));
+  const auto destructive_intent =
+      destructive.EnsureIntent(ParentClaimIntent()).record;
+  static_cast<void>(destructive.EnsureTerminalOutcome({
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      ManagerApplyTerminalOutcomeState::kFailed,
+      ManagerApplyFailureEvidenceDTO{
+          destructive_intent.intent_digest,
+          ManagerApplyPhase::kRuntimeConverged,
+          "runtime_initialization_failed",
+          "replacement initialization failed after teardown",
+          ManagerApplyEffectDisposition::kKnown},
+  }));
+  const auto destructive_failure =
+      ValidateManagerAuthoringOwnerReconciliationReadOnly(
+          destructive_path, CellId("cell-1"), {claim}, current, reconcile);
+  EXPECT_FALSE(destructive_failure.ok());
 }
 
 TEST(ManagerApplyJournal,
@@ -1355,6 +1843,8 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "predecessor_graph_revision,predecessor_scene_id,"
         "predecessor_scene_revision_id,predecessor_scene_content_hash,"
         "candidate_retained_bundle_id,candidate_graph_revision,"
+        "captured_input_digest,deployment_artifact_id,deployment_revision,"
+        "program_binding_id,prepared_activation_id,"
         "expected_admission_generation,parent_authoring_claim,intent_digest"
         ") VALUES ("
         "'apply-uncommitted',1,'request-uncommitted','owner-epoch-1',"
@@ -1363,7 +1853,14 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "',"
         "7,'" +
         std::string(kDigestOne) +
-        "','candidate-bundle','candidate-graph',7,NULL,'sha256:"
+        "','candidate-bundle','candidate-graph',"
+        "'sha256:14141414141414141414141414141414141414141414141414141414"
+        "14141414','deployment-artifact-1',"
+        "'sha256:15151515151515151515151515151515151515151515151515151515"
+        "15151515','sha256:17171717171717171717171717171717171717171717171717171717"
+        "17171717',"
+        "'sha256:16161616161616161616161616161616161616161616161616161616"
+        "16161616',7,NULL,'sha256:"
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
         ");";
     if (sqlite3_exec(database, sql.c_str(), nullptr, nullptr, nullptr) !=
@@ -2618,6 +3115,13 @@ TEST(ManagerApplyCompletionJournal,
         TerminalOutcome(*transition, expected->released));
     EXPECT_FALSE(terminal.inserted);
     EXPECT_EQ(terminal.record, expected->terminal);
+    const auto status = journal.ReadStatus(ApplyId("apply-1"),
+                                           ApplyGeneration(1U));
+    ASSERT_TRUE(status.has_value());
+    const auto progress = DeriveManagerApplyProgress(*status);
+    EXPECT_EQ(progress.phase, ManagerApplyPhase::kSettled);
+    EXPECT_EQ(progress.record_digest,
+              expected->terminal.terminal_outcome_digest);
 
     const auto report = journal.VerifyIntegrity();
     EXPECT_EQ(report.fence_release_intent_count, 1);
@@ -2697,6 +3201,7 @@ TEST(ManagerApplyCompletionJournal,
       transition.finalized.scene_finalized_digest,
       ContentDigest(std::string(kDigestOne)),
       ManagerApplyTerminalOutcomeState::kSucceeded,
+      std::nullopt,
   };
   EXPECT_THROW(journal.EnsureTerminalOutcome(impossible_terminal),
                ManagerApplyJournalConflictError);

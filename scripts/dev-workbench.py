@@ -998,9 +998,6 @@ class Workbench:
         runner_socket = paths["manager_run"] / "program-runner-liveness.sock"
         _remove_stale_socket(manager_socket, "Manager command socket")
         _remove_stale_socket(runner_socket, "Program runner liveness socket")
-        authoring_journal = (
-            paths["composer_authoring"] / "composer-authoring-transactions.sqlite3"
-        )
         # Bring up the two reconciliation services before Manager.  A new
         # Manager must be able to reconcile the retained Program Runner owner
         # on its first heartbeat; starting Manager first creates a needless
@@ -1113,8 +1110,6 @@ class Workbench:
                 str(STATE_ROOT / "logical-scene.sqlite3"),
                 "--program-cycle-journal",
                 str(STATE_ROOT / "program-cycle.sqlite3"),
-                "--authoring-transaction-journal",
-                str(authoring_journal),
                 "--projection-root",
                 str(paths["publications"]),
                 "--canonical-empty-admission-filename",
@@ -1185,11 +1180,8 @@ class Workbench:
             self.artifact_root
         )
         print("starting Composer backend", flush=True)
-        # Composer owns recovery of its durable authoring transactions. Start
-        # it once the current Manager/Kernel baseline is reachable, even when
-        # an interrupted prior transaction still holds authoring admission;
-        # waiting for admission first would prevent the sole recovery owner
-        # from ever running.
+        # Composer owns only process-lifetime Draft state. Runtime transitions
+        # are durable Manager operations and need no Composer state root.
         composer_command = [
             sys.executable,
             "-m",
@@ -1204,11 +1196,7 @@ class Workbench:
             base_url,
             "--headless-api-timeout-s",
             "20",
-            "--authoring-state-root",
-            str(paths["composer_authoring"]),
         ]
-        if startup_cycle_state == "idle_after_reset":
-            composer_command.extend(("--startup-scenario", self.scenario_id))
         composer = subprocess.Popen(
             composer_command,
             env=composer_environment,

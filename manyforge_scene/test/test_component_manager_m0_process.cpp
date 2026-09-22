@@ -186,6 +186,17 @@ ApplyIntent(const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
       predecessor.request.candidate_projection_revision,
       candidate.retained_bundle_id(),
       candidate.value().cell_graph.graph_revision,
+      component_manager::ManagerApplyPreparedActivationDTO{
+          core::ContentDigest(
+              "sha256:1414141414141414141414141414141414141414141414141414141414141414"),
+          core::DeploymentArtifactId("deployment-artifact-1"),
+          core::DeploymentRevision(
+              "sha256:1515151515151515151515151515151515151515151515151515151515151515"),
+          core::ProgramBindingId(
+              "sha256:1717171717171717171717171717171717171717171717171717171717171717"),
+          core::ContentDigest(
+              "sha256:1616161616161616161616161616161616161616161616161616161616161616"),
+      },
       core::AdmissionGeneration(1U),
       std::nullopt,
   };
@@ -685,7 +696,7 @@ TEST(ComponentManagerM0Process,
     std::uint64_t now = 3'000U;
     component_manager::ManagerActiveRuntimeCoordinator active(
         plan_source, adapter, adapter, [&now] { return ++now; });
-    return ActiveEpoch(active.Reconcile());
+    return ActiveEpoch(active.Initialize());
   });
   EXPECT_EQ(active_epoch, first_epoch);
 
@@ -709,7 +720,7 @@ TEST(ComponentManagerM0Process,
     std::uint64_t now = 4'000U;
     component_manager::ManagerActiveRuntimeCoordinator active(
         plan_source, adapter, adapter, [&now] { return ++now; });
-    return ActiveEpoch(active.Reconcile());
+    return ActiveEpoch(active.Initialize());
   });
   EXPECT_NE(crash_restarted_epoch, first_epoch);
 
@@ -756,7 +767,7 @@ TEST(ComponentManagerM0Process,
     std::uint64_t now = 6'000U;
     component_manager::ManagerActiveRuntimeCoordinator active(
         plan_source, adapter, adapter, [&now] { return ++now; });
-    const auto epoch = ActiveEpoch(active.Reconcile());
+    const auto epoch = ActiveEpoch(active.Initialize());
     static_cast<void>(active.Shutdown());
     return epoch;
   });

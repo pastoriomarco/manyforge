@@ -169,7 +169,7 @@ TEST(ScenarioCatalogRepositoryTest,
 }
 
 TEST(ScenarioApplyCandidateSourceTest,
-     ResolvesOneExactBundleAcrossMultipleProgramRows) {
+     LoadsOneVerifiedCatalogAcrossMultipleProgramRows) {
   TemporaryDirectory root;
   auto first = row("alpha", '1');
   auto second = row("beta", '1');
@@ -184,18 +184,6 @@ TEST(ScenarioApplyCandidateSourceTest,
   FilesystemScenarioApplyCandidateSource source(root.path(), "maintained");
   const auto verified = source.LoadVerifiedCatalog();
   EXPECT_EQ(verified, catalog->normalized_root());
-  const auto selected = source.ResolveExact({
-      first.deployment_artifact_id,
-      first.deployment_revision,
-  });
-  EXPECT_TRUE(selected.valid());
-  EXPECT_EQ(selected.query.deployment_artifact_id,
-            first.deployment_artifact_id);
-  EXPECT_EQ(selected.scenario_catalog_revision, catalog->revision());
-  EXPECT_EQ(selected.retained_bundle_id, first.retained_bundle_id);
-  EXPECT_THROW(source.ResolveExact({core::DeploymentArtifactId("missing"),
-                                    first.deployment_revision}),
-               ScenarioApplyCandidateError);
 }
 
 TEST(ScenarioApplyCandidateSourceTest,
@@ -232,23 +220,6 @@ TEST(ScenarioApplyCandidateSourceTest,
   EXPECT_EQ(source.catalog_path_for_revision(candidate_catalog->revision()),
             candidate_root.path() / "maintained.scenario-catalog.yaml");
 
-  // Addressed candidate lookup can select the candidate, while an exact
-  // active query that is absent from it falls back to the installed catalog.
-  const auto selected_candidate = source.ResolveExact({
-      candidate_row.deployment_artifact_id,
-      candidate_row.deployment_revision,
-  });
-  EXPECT_EQ(selected_candidate.scenario_catalog_revision,
-            candidate_catalog->revision());
-  EXPECT_EQ(selected_candidate.retained_bundle_id,
-            candidate_row.retained_bundle_id);
-  const auto selected_active = source.ResolveExact({
-      active_row.deployment_artifact_id,
-      active_row.deployment_revision,
-  });
-  EXPECT_EQ(selected_active.scenario_catalog_revision,
-            active_catalog->revision());
-  EXPECT_EQ(selected_active.retained_bundle_id, active_row.retained_bundle_id);
 }
 
 }  // namespace

@@ -927,11 +927,7 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
 
     blocked_apply = client.post(
         "/api/program/apply",
-        json={
-            key: value
-            for key, value in _fence(body["workspace"]).items()
-            if key not in {"expectedWorkspaceEpoch", "expectedWorkspaceRevision"}
-        },
+        json=_fence(body["workspace"]),
     )
     assert blocked_apply.status_code == 409
     assert blocked_apply.json()["detail"] == {

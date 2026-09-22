@@ -55,7 +55,7 @@ def test_optional_off_does_not_construct_mcp(tmp_path, monkeypatch):
 
 
 def test_all_19_tools_derive_action_schemas_from_real_routes(tmp_path):
-    state = ComposerState(headless_client=object(), authoring_state_root=str(tmp_path))
+    state = ComposerState(headless_client=object())
     app = create_app(state, security=_security(tmp_path))
     contracts = tool_contracts(app)
     assert len(contracts) == len(TOOL_ROUTES) == 19
@@ -114,7 +114,7 @@ def test_real_mcp_skill_expansion_uses_existing_headless_http_client(tmp_path):
         base_url="http://headless.test", transport=httpx.MockTransport(owner)
     ) as transport:
         headless = HeadlessHttpClient("http://headless.test", client=transport)
-        state = ComposerState(headless_client=headless, authoring_state_root=str(tmp_path))
+        state = ComposerState(headless_client=headless)
         before = state.draft_session.snapshot()
         with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
             calls.clear()  # exclude the application's independent startup recovery probe
@@ -230,7 +230,7 @@ def test_runtime_failure_and_malformed_stop_keep_real_route_semantics(tmp_path, 
             return {"accepted": True, "reason": "recognized_malformed_stop"}
 
     owner = Owner()
-    state = ComposerState(headless_client=owner, authoring_state_root=str(tmp_path))
+    state = ComposerState(headless_client=owner)
     with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         invalid = _call(
             client, "manyforge_cycle_control", {"action": "command", "body": {}}
@@ -302,7 +302,7 @@ def test_real_mcp_stop_bypasses_a_saturated_ordinary_worker_pool(tmp_path):
             return {"accepted": True, "path": path}
 
     app = create_app(
-        ComposerState(headless_client=Owner(), authoring_state_root=str(tmp_path)),
+        ComposerState(headless_client=Owner()),
         security=_security(tmp_path),
         enable_mcp=True,
     )
@@ -433,7 +433,7 @@ def test_nonfinite_recognized_stop_body_reaches_the_owner(tmp_path):
         def recognized_malformed_stop(self, path):
             return {"accepted": True, "path": path}
 
-    state = ComposerState(headless_client=Owner(), authoring_state_root=str(tmp_path))
+    state = ComposerState(headless_client=Owner())
     with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",
@@ -464,7 +464,7 @@ def test_raw_duplicate_stop_selectors_reach_malformed_containment(tmp_path, acti
             return {"accepted": True, "malformed": True}
 
     owner = Owner()
-    state = ComposerState(headless_client=owner, authoring_state_root=str(tmp_path))
+    state = ComposerState(headless_client=owner)
     with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",
@@ -497,7 +497,7 @@ def test_raw_duplicate_stop_selectors_reach_malformed_containment(tmp_path, acti
 )
 def test_raw_duplicate_routing_or_ordinary_bodies_are_rejected(tmp_path, params):
     # A sentinel owner has no effect methods: rejection must precede dispatch.
-    state = ComposerState(headless_client=object(), authoring_state_root=str(tmp_path))
+    state = ComposerState(headless_client=object())
     with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",
@@ -551,7 +551,7 @@ def test_lossy_duplicate_decoding_must_not_turn_malformed_stop_into_scoped_stop(
             return {"accepted": True}
 
     owner = Owner()
-    state = ComposerState(headless_client=owner, authoring_state_root=str(tmp_path))
+    state = ComposerState(headless_client=owner)
     with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",

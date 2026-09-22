@@ -325,6 +325,15 @@ private:
   ManagerActiveRuntimePlanDTO plan_;
 };
 
+class AlwaysIdleMaintenanceGate final : public IPlannedMaintenanceGate {
+public:
+  [[nodiscard]] ManagementIdleState ReadIdleState() const override {
+    return ManagementIdleState::kIdle;
+  }
+
+  [[nodiscard]] bool CloseAdmissionAndProveClosed() override { return true; }
+};
+
 class ExactFencePort final : public IManagerKernelApplyFencePort {
 public:
   [[nodiscard]] ConfigurationFenceAdmissionSnapshotDTO
@@ -2556,11 +2565,17 @@ TEST(ManagerNamedApplyCoordinator,
   AggregateFencePort kernel_fence(independent_reader, predecessor);
   ScriptedRuntimeCompositionPort runtime_composition;
   ScriptedCellAdmissionPort cell_admission;
+  ManagerActiveRuntimeCoordinator active_runtime(
+      active_plan_source, runtime_ports, runtime_ports, [] { return 1'000U; });
+  AlwaysIdleMaintenanceGate maintenance_gate;
+  ManagerPlannedMaintenanceCoordinator planned_maintenance(
+      active_plan_source, active_runtime, maintenance_gate);
   ManagerNamedApplyCoordinator coordinator(
       journal, active_plan_source, *package.bundle_source,
       *package.artifact_source, publication_store, scene_owner, nullptr,
       kernel_fence, cell_admission, runtime_composition, runtime_ports,
-      runtime_ports, RuntimeEpoch("manager-runtime.aggregate.1"), "linux",
+      runtime_ports, planned_maintenance,
+      RuntimeEpoch("manager-runtime.aggregate.1"), "linux",
       {"posix.1-2017"}, [] { return 1'000U; },
       [] { return ApplyId("apply.aggregate.1"); });
   const ManagerNamedApplyRequestDTO request{
@@ -2570,6 +2585,7 @@ TEST(ManagerNamedApplyCoordinator,
       predecessor.request.candidate_retained_bundle_id,
       predecessor.request.candidate_graph_revision,
       package.bundle->retained_bundle_id(),
+      intent_template.prepared_activation,
       core::AdmissionGeneration(7U),
       std::nullopt,
   };
@@ -2593,18 +2609,6 @@ TEST(ManagerNamedApplyCoordinator,
           .has_value());
 
   scene_owner.activation_pending = false;
-  runtime_ports.report_available = false;
-  const auto readiness_checks_before_recovery = runtime_ports.progress_calls;
-  EXPECT_THROW(static_cast<void>(coordinator.RecoverIncompleteApply()),
-               ManagerRuntimeConvergenceCoordinatorError);
-  EXPECT_EQ(runtime_ports.progress_calls, readiness_checks_before_recovery + 1);
-  EXPECT_EQ(scene_owner.activation_calls, 1);
-  EXPECT_FALSE(
-      journal
-          .ReadSceneActivated(ApplyId("apply.aggregate.1"), ApplyGeneration(1U))
-          .has_value());
-
-  runtime_ports.report_available = true;
   const auto applied = coordinator.RecoverIncompleteApply();
   ASSERT_TRUE(applied.has_value());
   EXPECT_EQ(applied->state, ManagerNamedApplyResultState::kSucceeded);

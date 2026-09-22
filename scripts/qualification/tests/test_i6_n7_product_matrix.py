@@ -61,7 +61,6 @@ def test_process_commands_cover_the_complete_typed_runtime_boundary(
         "--execution-state-root",
         "--execution-run-root",
         "--program-cycle-journal",
-        "--authoring-transaction-journal",
         "--projection-root",
         "--program-runner-liveness-socket",
     ):
@@ -104,11 +103,7 @@ def test_process_commands_cover_the_complete_typed_runtime_boundary(
         assert headless.count(required) == 1
     assert value(manager, "--manager-run-root") == value(headless, "--manager-run-root")
     assert value(manager, "--execution-run-root") == value(headless, "--execution-run-root")
-    assert commands["composer"].count("--authoring-state-root") == 1
-    assert value(manager, "--authoring-transaction-journal") == str(
-        Path(value(commands["composer"], "--authoring-state-root"))
-        / "composer-authoring-transactions.sqlite3"
-    )
+    assert commands["composer"].count("--authoring-state-root") == 0
 
 
 def test_scenario_load_uses_the_current_owner_admission_and_draft(

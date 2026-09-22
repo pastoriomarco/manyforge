@@ -1323,7 +1323,6 @@ def test_process_commands_bind_exact_component_world_and_pose_config(
         "--execution-state-root",
         "--execution-run-root",
         "--program-cycle-journal",
-        "--authoring-transaction-journal",
         "--projection-root",
         "--program-runner-liveness-socket",
     ):
@@ -1381,11 +1380,7 @@ def test_process_commands_bind_exact_component_world_and_pose_config(
         for index, argument in enumerate(headless)
         if argument == "--resource-id"
     ) == scenario.runtime_resource_ids
-    assert commands["composer"].count("--authoring-state-root") == 1
-    assert value(manager, "--authoring-transaction-journal") == str(
-        Path(value(commands["composer"], "--authoring-state-root"))
-        / "composer-authoring-transactions.sqlite3"
-    )
+    assert commands["composer"].count("--authoring-state-root") == 0
 
 
 def test_recovery_evidence_requires_new_provider_epoch_and_bounded_outage(

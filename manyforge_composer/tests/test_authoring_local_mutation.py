@@ -129,6 +129,14 @@ class _Headless:
         self.settlements: list[dict[str, Any]] = []
         self.settle_error: Exception | None = None
         self.acquire_error: Exception | None = None
+        self.reconcile_error: Exception | None = None
+        self.recovery_receipt: dict[str, Any] = {
+            "status": "unknown",
+            "kernel_owner_epoch": "kernel.1",
+            "held_claims": [],
+            "current_owner_epochs": [],
+        }
+        self.reconciliations: list[dict[str, Any]] = []
 
     def authoring_admission(self) -> dict[str, Any]:
         return {
@@ -167,18 +175,14 @@ class _Headless:
     def recover_authoring_transaction(
         self, _body: dict[str, Any]
     ) -> dict[str, Any]:
-        return {
-            "recovery_receipt": {
-                "status": "unknown",
-                "kernel_owner_epoch": "kernel.1",
-                "held_claims": [],
-                "current_owner_epochs": [],
-            }
-        }
+        return {"recovery_receipt": self.recovery_receipt}
 
     def reconcile_authoring_owner(
-        self, _body: dict[str, Any]
+        self, body: dict[str, Any]
     ) -> dict[str, Any]:
+        if self.reconcile_error is not None:
+            raise self.reconcile_error
+        self.reconciliations.append(body)
         return {"admission": {"admission_generation": self.generation}}
 
 
@@ -198,7 +202,7 @@ def _fixture(
         deployment_session=deployment,
     )
     headless = _Headless(generation=generation, allowed=allowed)
-    coordinator = AuthoringAdmissionCoordinator(headless, tmp_path)
+    coordinator = AuthoringAdmissionCoordinator(headless)
     coordinator.recover()
     assert coordinator.mutation_ready
     return workspace, program, deployment, headless, coordinator
@@ -560,3 +564,127 @@ def test_unsupported_session_and_payload_are_rejected(tmp_path) -> None:
 
     assert headless.claims == []
     assert headless.events == []
+
+
+def test_startup_rotates_only_authoring_owner_and_retains_exact_claims() -> None:
+    headless = _Headless()
+    retained_claim = {"claim_generation": 4, "intent": {"owner_role": "authoring_owner"}}
+    headless.recovery_receipt = {
+        "status": "unknown",
+        "kernel_owner_epoch": "kernel.7",
+        "held_claims": [retained_claim],
+        "current_owner_epochs": [
+            {"owner_role": "program_runner", "owner_epoch": "runner.2"},
+            {"owner_role": "authoring_owner", "owner_epoch": "composer.old"},
+            {"owner_role": "manager", "owner_epoch": "manager.3"},
+        ],
+    }
+    coordinator = AuthoringAdmissionCoordinator(headless)
+
+    coordinator.recover()
+
+    assert len(headless.reconciliations) == 1
+    request = headless.reconciliations[0]
+    assert request["kernel_owner_epoch"] == "kernel.7"
+    assert request["retained_claims"] == [retained_claim]
+    assert request["current_owner_epochs"] == [
+        {"owner_role": "program_runner", "owner_epoch": "runner.2"},
+        {"owner_role": "authoring_owner", "owner_epoch": coordinator.owner_epoch},
+        {"owner_role": "manager", "owner_epoch": "manager.3"},
+    ]
+    assert request["reconciliation_evidence_digest"].startswith("sha256:")
+    assert coordinator.mutation_ready is True
+
+
+def test_startup_reconciliation_failure_keeps_authoring_contained() -> None:
+    headless = _Headless()
+    headless.reconcile_error = HeadlessClientError(
+        "authoring_reconciliation_rejected", "predecessor effect is unresolved"
+    )
+    coordinator = AuthoringAdmissionCoordinator(headless)
+
+    with pytest.raises(HTTPException) as raised:
+        coordinator.recover()
+
+    assert raised.value.status_code == 503
+    assert raised.value.detail["code"] == "authoring_reconciliation_rejected"
+    assert coordinator.mutation_ready is False
+
+
+def test_external_submission_transfers_claim_after_manager_acceptance(tmp_path) -> None:
+    _workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+    submitted: list[dict[str, Any]] = []
+
+    result = coordinator.execute_external_submission(
+        _envelope(),
+        operation_kind="apply_program",
+        draft_id=program.draft_id,
+        draft_revision=program.revision,
+        payload={"prepared_activation_id": "sha256:" + "1" * 64},
+        validate_under_claim=lambda _claim: None,
+        submit=lambda claim: submitted.append(claim) or {
+            "status": "accepted",
+            "state": "pending",
+            "apply_id": "apply.1",
+            "apply_generation": 1,
+        },
+    )
+
+    assert result["state"] == "pending"
+    assert len(submitted) == 1
+    assert headless.settlements == []
+    assert coordinator.local_claim_pending is False
+
+
+def test_authoritative_acquire_rejection_does_not_contain(tmp_path) -> None:
+    _workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+    headless.acquire_error = HeadlessClientError(
+        "stale_generation", "claim was rejected", status_code=409
+    )
+
+    with pytest.raises(HTTPException):
+        coordinator.execute_external_submission(
+            _envelope(),
+            operation_kind="apply_program",
+            draft_id=program.draft_id,
+            draft_revision=program.revision,
+            payload={},
+            validate_under_claim=lambda _claim: None,
+            submit=lambda _claim: pytest.fail("rejected claim must not submit"),
+        )
+
+    assert coordinator.local_claim_pending is False
+    assert coordinator.mutation_ready is True
+
+
+def test_external_submission_rejects_composite_workspace_race(tmp_path) -> None:
+    workspace, program, _deployment, _headless, coordinator = _fixture(tmp_path)
+    captured = workspace.identity()
+    submitted = False
+
+    # A different browser wins the local workspace commit before this request
+    # obtains admission. The under-claim recheck must reject the stale request
+    # before any Manager submission occurs.
+    program._revision += 1
+
+    def validate(_claim: dict[str, Any]) -> None:
+        workspace.require_identity(captured)
+
+    def submit(_claim: dict[str, Any]) -> None:
+        nonlocal submitted
+        submitted = True
+
+    with pytest.raises(AuthoringWorkspaceError):
+        coordinator.execute_external_submission(
+            _envelope(),
+            operation_kind="apply_program",
+            draft_id=program.draft_id,
+            draft_revision=0,
+            payload={},
+            validate_under_claim=validate,
+            submit=submit,
+        )
+
+    assert submitted is False
+    assert coordinator.local_claim_pending is False
+    assert coordinator.mutation_ready is True

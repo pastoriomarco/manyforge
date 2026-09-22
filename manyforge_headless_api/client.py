@@ -28,7 +28,6 @@ from .program_binding_projection import (
     validate_applied_program_selection,
     validate_program_apply_result,
     validate_scenario_program_selection,
-    validate_scenario_load_selection,
 )
 from .models import (
     MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES,
@@ -664,32 +663,6 @@ class HeadlessHttpClient:
             raise HeadlessClientError(
                 "scenario_program_selection_invalid",
                 "headless API returned an invalid scenario Program selection",
-            ) from error
-        return projection
-
-    def scenario_load_selection(
-        self, scenario_id: str, *, timeout_seconds: float | None = None
-    ) -> dict[str, Any]:
-        if (
-            not isinstance(scenario_id, str)
-            or not scenario_id
-            or len(scenario_id.encode("utf-8")) > 128
-        ):
-            raise ValueError("scenario_id is invalid")
-        projection = self.request(
-            "GET",
-            f"/api/scenarios/{quote(scenario_id, safe='')}/load-selection",
-            timeout_seconds=timeout_seconds,
-        )
-        try:
-            validate_scenario_load_selection(
-                projection,
-                scenario_id=scenario_id,
-            )
-        except (ProgramBindingTransportError, TypeError, ValueError) as error:
-            raise HeadlessClientError(
-                "scenario_program_selection_invalid",
-                "headless API returned an invalid Scenario Load selection",
             ) from error
         return projection
 

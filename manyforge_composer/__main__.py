@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import logging
+import hashlib
 import sys
 from typing import Any, Final, Sequence
 
 import uvicorn
 
 from manyforge_composer.backend.app import create_app
-from manyforge_composer.backend.draft_session import DraftSessionError
 from manyforge_composer.backend.logging_config import setup_logging
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import (
@@ -80,20 +79,16 @@ def main() -> None:
     parser.add_argument("--program-path")
     parser.add_argument("--static-dir")
     parser.add_argument("--headless-api-url")
-    parser.add_argument("--authoring-state-root")
     parser.add_argument("--headless-api-timeout-s", type=float, default=2.0)
+    parser.add_argument(
+        "--startup-scenario-document",
+        help="open and activate one exact complete v2 Scenario document",
+    )
     parser.add_argument("--assistant-bridge-url")
     parser.add_argument(
         "--mcp-http",
         action="store_true",
         help="enable the optional stateless MCP adapter at /mcp/ (requires the mcp extra)",
-    )
-    parser.add_argument(
-        "--startup-scenario",
-        help=(
-            "explicitly Load one complete launcher-selected Scenario before "
-            "serving; intended for the supported development entrypoint"
-        ),
     )
     parser.add_argument("--assistant-request-timeout-s", type=float, default=10.0)
     parser.add_argument(
@@ -108,8 +103,6 @@ def main() -> None:
     headless_client = None
     assistant_client = None
     if args.headless_api_url is not None:
-        if args.authoring_state_root is None:
-            parser.error("--headless-api-url requires --authoring-state-root")
         from manyforge_headless_api.client import HeadlessHttpClient
 
         headless_client = HeadlessHttpClient(
@@ -134,27 +127,57 @@ def main() -> None:
             allowed_program_write_roots=security.allowed_program_write_roots,
             allowed_deployment_write_roots=security.allowed_deployment_write_roots,
             headless_client=headless_client,
-            authoring_state_root=args.authoring_state_root,
             assistant_client=assistant_client,
         )
-        if args.startup_scenario is not None:
-            try:
-                state.load_startup_scenario(args.startup_scenario)
-            except DraftSessionError as error:
-                if error.code != "composer_draft_discard_confirmation_required":
-                    raise
-                # The launcher scenario is only a bootstrap default. A
-                # recovered user Draft wins; explicit Load remains available
-                # in the running application with its normal confirmation.
-                logging.getLogger(__name__).info(
-                    "startup Scenario load skipped to preserve recovered Drafts"
-                )
         app = create_app(
             state,
             static_dir=args.static_dir,
             security=security,
             enable_mcp=args.mcp_http,
         )
+        if args.startup_scenario_document is not None:
+            if headless_client is None:
+                parser.error("--startup-scenario-document requires --headless-api-url")
+            if state.authoring_admission is None:
+                raise RuntimeError("startup authoring admission is unavailable")
+            # This activation precedes ASGI lifespan entry. Establish the
+            # process' exact authoring-owner epoch before the shared loader
+            # acquires its claim; lifespan recovery is an idempotent recheck.
+            state.authoring_admission.recover()
+            from manyforge_composer.backend.routes_scenario_documents import (
+                LoadScenarioDocumentRequest,
+                load_exact_scenario_document,
+            )
+
+            program_state = state.draft_session.retained_state()
+            deployment_state = state.deployment_draft_session.retained_state()
+            workspace = state.authoring_workspace.identity()
+            admission = headless_client.authoring_admission()
+            generation = admission.get("admission_generation")
+            if type(generation) is not int:
+                raise RuntimeError("startup authoring admission is unavailable")
+            request = LoadScenarioDocumentRequest.model_validate(
+                {
+                    "path": args.startup_scenario_document,
+                    "activate": True,
+                    "confirmDiscard": False,
+                    "draftId": program_state["draft_id"],
+                    "expectedDraftRevision": program_state["draft_revision"],
+                    "deploymentDraftId": deployment_state["draft_id"],
+                    "expectedDeploymentDraftRevision": deployment_state[
+                        "draft_revision"
+                    ],
+                    "expectedWorkspaceEpoch": workspace.workspace_epoch,
+                    "expectedWorkspaceRevision": workspace.workspace_revision,
+                    "expectedAdmissionGeneration": generation,
+                    "requestOwnerEpoch": state.authoring_admission.owner_epoch,
+                    "requestId": "startup-scenario-document-"
+                    + hashlib.sha256(
+                        args.startup_scenario_document.encode("utf-8")
+                    ).hexdigest()[:24],
+                }
+            )
+            load_exact_scenario_document(state, request)
         # The application middleware already emits bounded structured access
         # records. Uvicorn's per-request duplicate is unbounded hot-path I/O
         # and can delay the control WebSocket under read-heavy workloads.

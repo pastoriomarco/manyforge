@@ -32,7 +32,6 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
     "manyforge_program_load": {
         "open_draft": ("POST", "/api/program/open-draft"),
         "new_draft": ("POST", "/api/program/new-draft"),
-        "load_scenario": ("POST", "/api/scenarios/load"),
         "apply": ("POST", "/api/program/apply"),
     },
     "manyforge_program_tree": {

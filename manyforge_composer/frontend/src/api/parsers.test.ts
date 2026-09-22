@@ -28,6 +28,8 @@ import {
   parseNodeEnvironmentResponse,
   parseLogicalSceneProjection,
   parseManagerApplyResponse,
+  parseManagerApplyStatus,
+  parseManagerDeploymentCandidatePreviewResponse,
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
   parseProgramRunStatus,
@@ -1124,6 +1126,49 @@ describe('Program product projections', () => {
 });
 
 describe('Deployment workspace parser', () => {
+  it('binds a candidate receipt to one prepared activation identity', () => {
+    const digestA = `sha256:${'a'.repeat(64)}`;
+    const digestB = `sha256:${'b'.repeat(64)}`;
+    const preview = {
+      api_version: 'manyforge.manager_command_response.v1',
+      candidate_receipt: {
+        schema_version: 'manyforge.manager_deployment_candidate_receipt.v1',
+        deployment_artifact_id: 'deployment.fixture',
+        deployment_revision: digestA,
+        prepared_activation_id: digestB,
+        candidate_retained_bundle_id: 'bundle.next',
+        candidate_graph_revision: 'graph.next',
+        expected_current: {
+          graph_revision: 'graph.current',
+          retained_bundle_id: 'bundle.current',
+        },
+        expected_admission_generation: 7,
+        manager_owner_epoch: 'manager.epoch.1',
+        receipt_digest: digestA,
+      },
+      converged: false,
+      diff: Object.fromEntries([
+        'component_attachments',
+        'controllable_components',
+        'control_bindings',
+        'control_domains',
+        'model_instances',
+        'runtime_units',
+      ].map((kind) => [kind, { added: [], changed: [], removed: [] }])),
+      ok: true,
+    };
+
+    expect(
+      parseManagerDeploymentCandidatePreviewResponse(preview)
+        .candidateReceipt.prepared_activation_id,
+    ).toBe(digestB);
+    const stale = structuredClone(preview);
+    delete (stale.candidate_receipt as Record<string, unknown>)
+      .prepared_activation_id;
+    expect(() => parseManagerDeploymentCandidatePreviewResponse(stale))
+      .toThrow(/closed record/);
+  });
+
   it('retains bounded Apply phase timings and preparation identity', () => {
     const digestA = `sha256:${'a'.repeat(64)}`;
     const digestB = `sha256:${'b'.repeat(64)}`;
@@ -1815,7 +1860,7 @@ describe('headless projection parsers', () => {
     };
     delete pendingWithCandidate.projection_status;
     expect(() => parseManagerApplyResponse(pendingWithCandidate)).toThrow(
-      /null while Apply is pending/,
+      /null unless Apply succeeded/,
     );
 
     const succeededWithoutCandidate = {
@@ -1828,6 +1873,67 @@ describe('headless projection parsers', () => {
     expect(() => parseManagerApplyResponse(succeededWithoutCandidate)).toThrow(
       /projection revision while Apply has succeeded/,
     );
+
+    const failedReceipt = {
+      ...extra,
+      projection_status: undefined,
+      state: 'unknown_effect',
+    };
+    delete failedReceipt.projection_status;
+    const failed = parseManagerApplyResponse(failedReceipt);
+    expect(failed.state).toBe('unknown_effect');
+  });
+
+  it('parses durable Manager Apply progress and terminal failure exactly', () => {
+    const base = {
+      api_version: 'manyforge.manager_command_response.v1',
+      apply_generation: 4,
+      apply_id: 'apply-4',
+      candidate_projection_revision: null,
+      error: null,
+      failure: null,
+      last_progress: {
+        phase: 'runtime_converged',
+        record_digest: `sha256:${'1'.repeat(64)}`,
+      },
+      ok: true,
+      phase: 'runtime_converged',
+      prepared_activation: {
+        captured_input_digest: `sha256:${'2'.repeat(64)}`,
+        deployment_artifact_id: 'deployment-1',
+        deployment_revision: `sha256:${'3'.repeat(64)}`,
+        program_binding_id: `sha256:${'4'.repeat(64)}`,
+        prepared_activation_id: `sha256:${'5'.repeat(64)}`,
+      },
+      request_id: 'request-4',
+      request_owner_epoch: 'owner-4',
+      state: 'pending',
+    };
+    expect(parseManagerApplyStatus(base).phase).toBe('runtime_converged');
+
+    const failed = parseManagerApplyStatus({
+      ...base,
+      failure: {
+        code: 'runtime_initialization_failed',
+        effect_disposition: 'unknown',
+        message: 'replacement state could not be established',
+        phase: 'runtime_converged',
+      },
+      state: 'unknown_effect',
+    });
+    expect(failed.state).toBe('unknown_effect');
+    expect(failed.failure?.effectDisposition).toBe('unknown');
+
+    expect(() => parseManagerApplyStatus({
+      ...base,
+      failure: {
+        code: 'runtime_initialization_failed',
+        effect_disposition: 'known',
+        message: 'mismatched disposition',
+        phase: 'runtime_converged',
+      },
+      state: 'unknown_effect',
+    })).toThrow(/unknown/);
   });
 
   it('keeps the maximum visible scene projection parse bounded', () => {
@@ -1935,6 +2041,16 @@ describe('headless projection parsers', () => {
     expect(status.status.apply.records[0]?.phase).toBe('fence_held');
     expect(graph.retainedBundleId).toBe('bundle.1');
     expect(diff.converged).toBe(true);
+
+    const terminal = managerApplyRecordFixture();
+    terminal.incomplete = false;
+    terminal.phase = 'terminal';
+    terminal.terminal_state = 'unknown_effect';
+    statusWire.status.apply.records = [terminal];
+    expect(
+      parseManagerStatusProjection(statusWire).status.apply.records[0]
+        ?.terminalState,
+    ).toBe('unknown_effect');
 
     const malformed = managerApplyRecordFixture();
     malformed.phase = 'browser_waiting';

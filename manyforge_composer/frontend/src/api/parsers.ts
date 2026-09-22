@@ -27,10 +27,12 @@ import type {
   AppliedProgramSelection,
   ManagerActiveProjection,
   ManagerApplyAvailability,
+  ManagerApplyLifecyclePhase,
   ManagerApplyPhase,
   ManagerApplyRecord,
   ManagerApplyReplayStatus,
   ManagerApplyResponse,
+  ManagerApplyStatus,
   ManagerDeploymentCandidatePreviewResponse,
   ManagerDeploymentRecordDiff,
   ManagerDiffProjection,
@@ -1942,8 +1944,21 @@ function parseManagerApplyRecord(
     record.terminal_state,
     path + '.terminal_state',
   );
-  if (terminalState !== null && terminalState !== 'succeeded') {
-    return fail(path + '.terminal_state', 'succeeded or null');
+  if (
+    terminalState !== null
+    && !['succeeded', 'failed', 'unknown_effect'].includes(terminalState)
+  ) {
+    return fail(
+      path + '.terminal_state',
+      'succeeded, failed, unknown_effect, or null',
+    );
+  }
+  const incomplete = booleanAt(record.incomplete, path + '.incomplete');
+  if (incomplete !== (terminalState === null)) {
+    return fail(
+      path + '.incomplete',
+      'true exactly while the operation has no terminal state',
+    );
   }
   return {
     applyGeneration: positiveIntegerAt(
@@ -1981,7 +1996,7 @@ function parseManagerApplyRecord(
       scope,
       state: fenceState as ManagerApplyRecord['fence']['state'],
     },
-    incomplete: booleanAt(record.incomplete, path + '.incomplete'),
+    incomplete,
     intentDigest: stringAt(record.intent_digest, path + '.intent_digest'),
     phase: phase as ManagerApplyPhase,
     request: {
@@ -2181,8 +2196,8 @@ export function parseManagerDeploymentCandidatePreviewResponse(
       'expected_admission_generation',
       'expected_current',
       'manager_owner_epoch',
+      'prepared_activation_id',
       'receipt_digest',
-      'scenario_catalog_revision',
       'schema_version',
     ],
     'managerDeploymentCandidatePreview.candidate_receipt',
@@ -2243,8 +2258,8 @@ export function parseManagerDeploymentCandidatePreviewResponse(
     candidateReceipt: {
       schema_version: schemaVersion,
       deployment_artifact_id: stringAt(receipt.deployment_artifact_id, 'candidateReceipt.deployment_artifact_id'),
-      deployment_revision: stringAt(receipt.deployment_revision, 'candidateReceipt.deployment_revision'),
-      scenario_catalog_revision: stringAt(receipt.scenario_catalog_revision, 'candidateReceipt.scenario_catalog_revision'),
+      deployment_revision: digestAt(receipt.deployment_revision, 'candidateReceipt.deployment_revision'),
+      prepared_activation_id: digestAt(receipt.prepared_activation_id, 'candidateReceipt.prepared_activation_id'),
       candidate_retained_bundle_id: stringAt(receipt.candidate_retained_bundle_id, 'candidateReceipt.candidate_retained_bundle_id'),
       candidate_graph_revision: stringAt(receipt.candidate_graph_revision, 'candidateReceipt.candidate_graph_revision'),
       expected_current: {
@@ -2253,7 +2268,7 @@ export function parseManagerDeploymentCandidatePreviewResponse(
       },
       expected_admission_generation: positiveIntegerAt(receipt.expected_admission_generation, 'candidateReceipt.expected_admission_generation'),
       manager_owner_epoch: stringAt(receipt.manager_owner_epoch, 'candidateReceipt.manager_owner_epoch'),
-      receipt_digest: stringAt(receipt.receipt_digest, 'candidateReceipt.receipt_digest'),
+      receipt_digest: digestAt(receipt.receipt_digest, 'candidateReceipt.receipt_digest'),
     },
     converged: booleanAt(record.converged, 'managerDeploymentCandidatePreview.converged'),
     diff: parsedDiff,
@@ -2303,8 +2318,11 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
     );
   }
   const state = stringAt(record.state, 'managerApply.state');
-  if (state !== 'pending' && state !== 'succeeded') {
-    return fail('managerApply.state', 'pending or succeeded');
+  if (!['pending', 'succeeded', 'failed', 'unknown_effect'].includes(state)) {
+    return fail(
+      'managerApply.state',
+      'pending, succeeded, failed, or unknown_effect',
+    );
   }
   const applyId = stringAt(record.apply_id, 'managerApply.apply_id');
   if (applyId.length === 0) {
@@ -2337,14 +2355,18 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
     requestId,
     requestOwnerEpoch,
   };
-  if (state === 'pending') {
+  if (state !== 'succeeded') {
     if (record.candidate_projection_revision !== null) {
       return fail(
         'managerApply.candidate_projection_revision',
-        'null while Apply is pending',
+        'null unless Apply succeeded',
       );
     }
-    return { ...base, candidateProjectionRevision: null, state };
+    return {
+      ...base,
+      candidateProjectionRevision: null,
+      state: state as 'pending' | 'failed' | 'unknown_effect',
+    };
   }
   if (record.candidate_projection_revision === null) {
     return fail(
@@ -2358,7 +2380,229 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
       record.candidate_projection_revision,
       'managerApply.candidate_projection_revision',
     ),
-    state,
+    state: 'succeeded',
+  };
+}
+
+const MANAGER_APPLY_LIFECYCLE_PHASES = new Set<ManagerApplyLifecyclePhase>([
+  'accepted',
+  'fence_acquired',
+  'fence_accepted',
+  'runtime_converged',
+  'scene_staged',
+  'scene_activated',
+  'composed',
+  'published',
+  'settled',
+]);
+
+function managerApplyLifecyclePhaseAt(
+  value: unknown,
+  path: string,
+): ManagerApplyLifecyclePhase {
+  const phase = stringAt(value, path) as ManagerApplyLifecyclePhase;
+  if (!MANAGER_APPLY_LIFECYCLE_PHASES.has(phase)) {
+    return fail(path, 'a supported Manager Apply lifecycle phase');
+  }
+  return phase;
+}
+
+export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
+  const boundedText = (
+    text: unknown,
+    path: string,
+    maximumBytes: number,
+  ): string => {
+    const parsed = nonEmptyStringAt(text, path);
+    if (
+      parsed !== parsed.normalize('NFC')
+      || new TextEncoder().encode(parsed).length > maximumBytes
+    ) {
+      return fail(path, `nonempty NFC text of at most ${maximumBytes} bytes`);
+    }
+    return parsed;
+  };
+  const record = objectAt(value, 'managerApplyStatus');
+  exactKeysAt(record, [
+    'api_version', 'apply_generation', 'apply_id',
+    'candidate_projection_revision', 'error', 'failure', 'last_progress',
+    'ok', 'phase', 'prepared_activation', 'request_id',
+    'request_owner_epoch', 'state',
+  ], 'managerApplyStatus');
+  const apiVersion = stringAt(
+    record.api_version,
+    'managerApplyStatus.api_version',
+  );
+  if (apiVersion !== 'manyforge.manager_command_response.v1') {
+    return fail(
+      'managerApplyStatus.api_version',
+      'manyforge.manager_command_response.v1',
+    );
+  }
+  if (!booleanAt(record.ok, 'managerApplyStatus.ok')) {
+    return fail('managerApplyStatus.ok', 'true for an observed operation');
+  }
+  if (record.error !== null) {
+    return fail('managerApplyStatus.error', 'null for an observed operation');
+  }
+  const phase = managerApplyLifecyclePhaseAt(
+    record.phase,
+    'managerApplyStatus.phase',
+  );
+  const progress = objectAt(
+    record.last_progress,
+    'managerApplyStatus.last_progress',
+  );
+  exactKeysAt(
+    progress,
+    ['phase', 'record_digest'],
+    'managerApplyStatus.last_progress',
+  );
+  const progressPhase = managerApplyLifecyclePhaseAt(
+    progress.phase,
+    'managerApplyStatus.last_progress.phase',
+  );
+  if (progressPhase !== phase) {
+    return fail(
+      'managerApplyStatus.last_progress.phase',
+      'the reported operation phase',
+    );
+  }
+  const activation = objectAt(
+    record.prepared_activation,
+    'managerApplyStatus.prepared_activation',
+  );
+  exactKeysAt(activation, [
+    'captured_input_digest', 'deployment_artifact_id', 'deployment_revision',
+    'program_binding_id', 'prepared_activation_id',
+  ], 'managerApplyStatus.prepared_activation');
+  const state = stringAt(record.state, 'managerApplyStatus.state');
+  if (!['pending', 'succeeded', 'failed', 'unknown_effect'].includes(state)) {
+    return fail(
+      'managerApplyStatus.state',
+      'pending, succeeded, failed, or unknown_effect',
+    );
+  }
+  const candidate = record.candidate_projection_revision === null
+    ? null
+    : parseProjectionRevision(
+      record.candidate_projection_revision,
+      'managerApplyStatus.candidate_projection_revision',
+    );
+  const failure = record.failure === null
+    ? null
+    : (() => {
+      const failureRecord = objectAt(record.failure, 'managerApplyStatus.failure');
+      exactKeysAt(failureRecord, [
+        'code', 'effect_disposition', 'message', 'phase',
+      ], 'managerApplyStatus.failure');
+      const failurePhase = managerApplyLifecyclePhaseAt(
+        failureRecord.phase,
+        'managerApplyStatus.failure.phase',
+      );
+      const effectDisposition = stringAt(
+        failureRecord.effect_disposition,
+        'managerApplyStatus.failure.effect_disposition',
+      );
+      if (effectDisposition !== 'known' && effectDisposition !== 'unknown') {
+        return fail(
+          'managerApplyStatus.failure.effect_disposition',
+          'known or unknown',
+        );
+      }
+      return {
+        code: boundedText(
+          failureRecord.code,
+          'managerApplyStatus.failure.code',
+          128,
+        ),
+        message: boundedText(
+          failureRecord.message,
+          'managerApplyStatus.failure.message',
+          1024,
+        ),
+        phase: failurePhase,
+        effectDisposition,
+      };
+    })();
+  if ((state === 'succeeded') !== (candidate !== null)) {
+    return fail(
+      'managerApplyStatus.candidate_projection_revision',
+      'present only for a terminal success',
+    );
+  }
+  const failed = state === 'failed' || state === 'unknown_effect';
+  if (failed !== (failure !== null)) {
+    return fail(
+      'managerApplyStatus.failure',
+      'present only for a terminal failure',
+    );
+  }
+  if (state === 'succeeded' && phase !== 'settled') {
+    return fail('managerApplyStatus.phase', 'settled for terminal success');
+  }
+  if (failure !== null) {
+    if (failure.phase !== phase) {
+      return fail(
+        'managerApplyStatus.failure.phase',
+        'the reported operation phase',
+      );
+    }
+    const expected = state === 'failed' ? 'known' : 'unknown';
+    if (failure.effectDisposition !== expected) {
+      return fail(
+        'managerApplyStatus.failure.effect_disposition',
+        expected,
+      );
+    }
+  }
+  return {
+    apiVersion,
+    applyGeneration: positiveIntegerAt(
+      record.apply_generation,
+      'managerApplyStatus.apply_generation',
+    ),
+    applyId: stringAt(record.apply_id, 'managerApplyStatus.apply_id'),
+    candidateProjectionRevision: candidate,
+    error: null,
+    failure,
+    lastProgress: {
+      phase: progressPhase,
+      recordDigest: digestAt(
+        progress.record_digest,
+        'managerApplyStatus.last_progress.record_digest',
+      ),
+    },
+    ok: true,
+    phase,
+    preparedActivation: {
+      capturedInputDigest: digestAt(
+        activation.captured_input_digest,
+        'managerApplyStatus.prepared_activation.captured_input_digest',
+      ),
+      deploymentArtifactId: stringAt(
+        activation.deployment_artifact_id,
+        'managerApplyStatus.prepared_activation.deployment_artifact_id',
+      ),
+      deploymentRevision: digestAt(
+        activation.deployment_revision,
+        'managerApplyStatus.prepared_activation.deployment_revision',
+      ),
+      programBindingId: digestAt(
+        activation.program_binding_id,
+        'managerApplyStatus.prepared_activation.program_binding_id',
+      ),
+      preparedActivationId: digestAt(
+        activation.prepared_activation_id,
+        'managerApplyStatus.prepared_activation.prepared_activation_id',
+      ),
+    },
+    requestId: stringAt(record.request_id, 'managerApplyStatus.request_id'),
+    requestOwnerEpoch: stringAt(
+      record.request_owner_epoch,
+      'managerApplyStatus.request_owner_epoch',
+    ),
+    state: state as ManagerApplyStatus['state'],
   };
 }
 
@@ -3384,6 +3628,8 @@ export function parseDeploymentCandidateOperationResponse(
         !== preparedActivation.retainedBundleId
       || candidatePreview.candidateReceipt.candidate_graph_revision
         !== preparedActivation.graphRevision
+      || candidatePreview.candidateReceipt.prepared_activation_id
+        !== preparedActivation.preparedActivationId
     )
   ) {
     return fail(`${path}.result.candidate_preview`, 'the compiled candidate');
@@ -6716,11 +6962,11 @@ export function parseComponentOverviewProjection(
   exactKeysAt(record, [
     'schema_version', 'overview_revision', 'readiness', 'summary_label',
     'profile_label', 'authority_label', 'user_message', 'capabilities',
-    'components', 'basis',
+    'components', 'maintenance_operation', 'basis',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.component_overview.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.component_overview.v1');
+  if (schemaVersion !== 'manyforge.component_overview.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.component_overview.v2');
   }
   const readiness = stringAt(record.readiness, `${path}.readiness`);
   if (!['ready', 'waiting', 'degraded', 'fault', 'offline'].includes(readiness)) {
@@ -6778,6 +7024,46 @@ export function parseComponentOverviewProjection(
   const nullableGeneration = (name: string): number | null => (
     basis[name] === null ? null : integerAt(basis[name], `${basisPath}.${name}`)
   );
+  const maintenanceOperation = record.maintenance_operation === null
+    ? null
+    : (() => {
+      const operationPath = `${path}.maintenance_operation`;
+      const operation = objectAt(record.maintenance_operation, operationPath);
+      exactKeysAt(operation, [
+        'apply_id', 'apply_generation', 'phase',
+        'affected_runtime_unit_ids', 'reason_code',
+      ], operationPath);
+      const reasonCode = stringAt(
+        operation.reason_code,
+        `${operationPath}.reason_code`,
+      );
+      if (reasonCode !== 'planned_maintenance_in_progress') {
+        return fail(
+          `${operationPath}.reason_code`,
+          'planned_maintenance_in_progress',
+        );
+      }
+      const phase = stringAt(operation.phase, `${operationPath}.phase`);
+      if (!MANAGER_APPLY_PHASES.has(phase as ManagerApplyPhase)) {
+        return fail(
+          `${operationPath}.phase`,
+          'a supported Manager Apply inventory phase',
+        );
+      }
+      return {
+        applyId: stringAt(operation.apply_id, `${operationPath}.apply_id`),
+        applyGeneration: positiveIntegerAt(
+          operation.apply_generation,
+          `${operationPath}.apply_generation`,
+        ),
+        phase: phase as ManagerApplyPhase,
+        affectedRuntimeUnitIds: stringArrayAt(
+          operation.affected_runtime_unit_ids,
+          `${operationPath}.affected_runtime_unit_ids`,
+        ),
+        reasonCode,
+      };
+    })();
   return {
     schemaVersion,
     overviewRevision: digestAt(record.overview_revision, `${path}.overview_revision`),
@@ -6788,6 +7074,7 @@ export function parseComponentOverviewProjection(
     userMessage: stringAt(record.user_message, `${path}.user_message`),
     capabilities: stringArrayAt(record.capabilities, `${path}.capabilities`),
     components,
+    maintenanceOperation,
     basis: {
       runtimeProjectionOwnerEpoch: nullableStringAt(
         basis.runtime_projection_owner_epoch,

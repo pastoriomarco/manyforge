@@ -364,87 +364,7 @@ VerifyCatalog(const std::string_view bytes) {
   return {std::move(root), std::move(verified_revision)};
 }
 
-[[nodiscard]] ScenarioApplyCandidateSelection
-ResolveCatalog(const std::string_view bytes,
-               const ScenarioApplyCandidateQuery &query) {
-  auto catalog = VerifyCatalog(bytes);
-  std::optional<core::RetainedBundleId> selected_bundle;
-  const auto &rows =
-      Array(Member(catalog.root, "scenarios", "$"), "$.scenarios");
-  for (const auto &row : rows) {
-    const auto &artifact_id =
-        Text(Member(row, "deployment_artifact_id", "$.scenarios[]"),
-             "$.scenarios[].deployment_artifact_id");
-    const auto &deployment_revision =
-        Text(Member(row, "deployment_revision", "$.scenarios[]"),
-             "$.scenarios[].deployment_revision");
-    if (artifact_id == query.deployment_artifact_id.value() &&
-        deployment_revision == query.deployment_revision.value()) {
-      const core::RetainedBundleId candidate(
-          Text(Member(row, "retained_bundle_id", "$.scenarios[]"),
-               "$.scenarios[].retained_bundle_id"));
-      Require(!selected_bundle.has_value() || *selected_bundle == candidate,
-              "scenario Apply catalog maps one deployment revision to "
-              "multiple retained bundles");
-      selected_bundle = candidate;
-    }
-  }
-  Require(selected_bundle.has_value(),
-          "scenario Apply catalog has no exact requested deployment "
-          "revision");
-  return {
-      query,
-      std::move(catalog.revision),
-      std::move(*selected_bundle),
-  };
-}
-
-[[nodiscard]] std::optional<ScenarioApplyCandidateSelection>
-TryResolveCatalog(const std::string_view bytes,
-                  const ScenarioApplyCandidateQuery &query) {
-  auto catalog = VerifyCatalog(bytes);
-  std::optional<core::RetainedBundleId> selected_bundle;
-  const auto &rows =
-      Array(Member(catalog.root, "scenarios", "$"), "$.scenarios");
-  for (const auto &row : rows) {
-    const auto &artifact_id =
-        Text(Member(row, "deployment_artifact_id", "$.scenarios[]"),
-             "$.scenarios[].deployment_artifact_id");
-    const auto &deployment_revision =
-        Text(Member(row, "deployment_revision", "$.scenarios[]"),
-             "$.scenarios[].deployment_revision");
-    if (artifact_id == query.deployment_artifact_id.value() &&
-        deployment_revision == query.deployment_revision.value()) {
-      const core::RetainedBundleId candidate(
-          Text(Member(row, "retained_bundle_id", "$.scenarios[]"),
-               "$.scenarios[].retained_bundle_id"));
-      Require(!selected_bundle.has_value() || *selected_bundle == candidate,
-              "scenario Apply catalog maps one deployment revision to "
-              "multiple retained bundles");
-      selected_bundle = candidate;
-    }
-  }
-  if (!selected_bundle.has_value()) {
-    return std::nullopt;
-  }
-  return ScenarioApplyCandidateSelection{
-      query,
-      std::move(catalog.revision),
-      std::move(*selected_bundle),
-  };
-}
-
 } // namespace
-
-bool ScenarioApplyCandidateQuery::valid() const noexcept {
-  return !deployment_artifact_id.empty() &&
-         is_sha256_digest(deployment_revision.value());
-}
-
-bool ScenarioApplyCandidateSelection::valid() const noexcept {
-  return query.valid() && !scenario_catalog_revision.empty() &&
-         !retained_bundle_id.empty();
-}
 
 bool ScenarioProgramSelection::valid() const noexcept {
   const bool assistant_absent = std::holds_alternative<std::nullptr_t>(
@@ -495,25 +415,6 @@ FilesystemScenarioApplyCandidateSource::FilesystemScenarioApplyCandidateSource(
           "scenario Apply catalog name is invalid");
 }
 
-ScenarioApplyCandidateSelection
-FilesystemScenarioApplyCandidateSource::ResolveExact(
-    const ScenarioApplyCandidateQuery &query) const {
-  Require(query.valid(), "scenario Apply candidate query is invalid");
-  if (const auto candidate = candidate_catalog_path(); candidate.has_value()) {
-    auto result = TryResolveCatalog(
-        ReadExactArtifact(*candidate, "candidate scenario Apply catalog"),
-        query);
-    if (result.has_value()) {
-      Require(result->valid(), "scenario Apply candidate selection is invalid");
-      return *result;
-    }
-  }
-  auto result = ResolveCatalog(
-      ReadExactArtifact(catalog_path(), "scenario Apply catalog"), query);
-  Require(result.valid(), "scenario Apply candidate selection is invalid");
-  return result;
-}
-
 CanonicalValue
 FilesystemScenarioApplyCandidateSource::LoadVerifiedCatalog() const {
   return VerifyCatalog(ReadExactArtifact(catalog_path(), "scenario catalog"))
@@ -524,76 +425,6 @@ ScenarioProgramSelection
 FilesystemScenarioApplyCandidateSource::LoadExactProgramSelection(
     const std::string_view scenario_id) const {
   return LoadExactProgramSelectionFrom(scenario_id, catalog_path());
-}
-
-CanonicalValue
-FilesystemScenarioApplyCandidateSource::LoadExactDeploymentDocument(
-    const ScenarioProgramSelection &selection) const {
-  Require(selection.valid(), "scenario Deployment selection is invalid");
-  const auto load_from =
-      [&](const std::filesystem::path &root) -> std::optional<CanonicalValue> {
-    std::vector<std::filesystem::path> candidates;
-    std::size_t entry_count = 0U;
-    std::error_code error;
-    for (std::filesystem::directory_iterator iterator(root, error), end;
-         !error && iterator != end; iterator.increment(error)) {
-      Require(entry_count < 4096U,
-              "scenario package contains too many direct entries");
-      ++entry_count;
-      const auto &path = iterator->path();
-      const auto name = path.filename().string();
-      const bool deployment_name = name.ends_with(".deployment.yaml") ||
-                                   name.ends_with(".deployment.yml") ||
-                                   name.ends_with(".deployment.json");
-      const auto status = iterator->symlink_status(error);
-      if (error) {
-        break;
-      }
-      if (deployment_name && std::filesystem::is_regular_file(status) &&
-          !std::filesystem::is_symlink(status)) {
-        candidates.push_back(path);
-      }
-    }
-    Require(!error, "scenario Deployment source enumeration failed");
-    std::sort(candidates.begin(), candidates.end());
-    std::optional<CanonicalValue> selected_document;
-    for (const auto &path : candidates) {
-      try {
-        const auto verified = verify_deployment_draft(
-            ReadExactArtifact(path, "scenario Deployment"));
-        if (verified.deployment_artifact_id !=
-                selection.deployment_artifact_id.value() ||
-            verified.deployment_revision !=
-                selection.deployment_revision.value() ||
-            verified.graph_revision != selection.graph_revision.value()) {
-          continue;
-        }
-        Require(!selected_document.has_value(),
-                "scenario Deployment source is ambiguous");
-        selected_document =
-            parse_strict_json_model_yaml(verified.canonical_json).root();
-      } catch (const std::invalid_argument &) {
-        continue;
-      }
-    }
-    return selected_document;
-  };
-
-  // The generated artifact repository is a sparse overlay. Prefer an exact
-  // authored Deployment source published there, but do not mistake the
-  // presence of another artifact from the same retained bundle for a complete
-  // package. An unchanged exact Deployment remains owned by the installed
-  // package beneath that overlay.
-  std::optional<CanonicalValue> selected;
-  if (candidate_package_root_.has_value()) {
-    selected = load_from(*candidate_package_root_);
-  }
-  if (!selected.has_value()) {
-    selected = load_from(package_root_);
-  }
-  Require(selected.has_value(),
-          "scenario Deployment source is absent or unverifiable");
-  return std::move(*selected);
 }
 
 ScenarioProgramSelection

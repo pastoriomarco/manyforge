@@ -85,6 +85,7 @@ PersistTerminal(SqliteManagerApplyJournal &journal,
       finalized.scene_finalized_digest,
       released.fence_released_digest,
       ManagerApplyTerminalOutcomeState::kSucceeded,
+      std::nullopt,
   });
 }
 

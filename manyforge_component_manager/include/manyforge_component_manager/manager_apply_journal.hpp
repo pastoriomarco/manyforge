@@ -10,6 +10,8 @@
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/projection_common.hpp>
+#include <manyforge_core/types/retained_product.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -20,8 +22,8 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.o1.5.v10";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 10;
+    "manyforge.internal.component-manager.apply-journal.o1.5.v12";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 12;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -93,6 +95,28 @@ public:
   using ManagerApplyJournalError::ManagerApplyJournalError;
 };
 
+/// Exact UA2A prepared activation accepted by one named Apply.
+///
+/// Every fact here is captured once before acceptance. The Manager records it
+/// in the durable intent and must never reopen a mutable Scenario/catalog
+/// selection, draft or current-selection fact to reconstruct the operation
+/// input afterwards. The bounded prepared runtime input itself stays with its
+/// existing prepared-value owner: this record carries that owner's exact
+/// `prepared_activation_id` transfer handle together with the prepared Program
+/// binding identity and the captured source-closure digest.
+struct ManagerApplyPreparedActivationDTO final {
+  manyforge::core::ContentDigest captured_input_digest;
+  manyforge::core::DeploymentArtifactId deployment_artifact_id;
+  manyforge::core::DeploymentRevision deployment_revision;
+  manyforge::core::ProgramBindingId program_binding_id;
+  manyforge::core::ContentDigest prepared_activation_id;
+
+  [[nodiscard]] bool valid() const noexcept;
+
+  friend bool operator==(const ManagerApplyPreparedActivationDTO &,
+                         const ManagerApplyPreparedActivationDTO &) = default;
+};
+
 /// Immutable named-Apply input for the first durable Apply boundary.
 ///
 /// The predecessor projection is the complete active composite expected by
@@ -112,6 +136,7 @@ struct ManagerApplyIntentDTO final {
   manyforge::core::ProjectionRevisionDTO expected_active_projection_revision;
   manyforge::core::RetainedBundleId candidate_retained_bundle_id;
   manyforge::core::GraphRevision candidate_graph_revision;
+  ManagerApplyPreparedActivationDTO prepared_activation;
   std::optional<manyforge::core::AdmissionGeneration>
       expected_admission_generation;
   std::optional<manyforge::core::CellAdmissionClaimDTO>
@@ -392,6 +417,20 @@ struct PersistedManagerApplyStatus final {
   std::optional<PersistedManagerApplyTerminalOutcome> terminal_outcome;
 };
 
+/// Last real progress for one Apply generation: the deepest durably reached
+/// milestone and the exact evidence digest that established it.
+struct ManagerApplyProgressDTO final {
+  ManagerApplyPhase phase;
+  manyforge::core::ContentDigest record_digest;
+
+  friend bool operator==(const ManagerApplyProgressDTO &,
+                         const ManagerApplyProgressDTO &) = default;
+};
+
+/// Return the deepest durably reached milestone for a complete status view.
+[[nodiscard]] ManagerApplyProgressDTO DeriveManagerApplyProgress(
+    const PersistedManagerApplyStatus &status);
+
 struct ManagerApplyJournalIntegrityReport final {
   manyforge::core::CellId cell_id;
   std::string schema_id;
@@ -454,6 +493,10 @@ public:
              manyforge::core::ApplyGeneration apply_generation) const;
   [[nodiscard]] std::vector<PersistedManagerApplyStatus>
   ReadStatusInventory() const;
+  /// One transactionally consistent immutable view of every durable record for
+  /// exactly one Apply generation, or nullopt when that identity is unknown.
+  [[nodiscard]] std::optional<PersistedManagerApplyStatus>
+  ReadStatus(const ApplyId &apply_id, ApplyGeneration apply_generation) const;
   [[nodiscard]] std::optional<PersistedManagerApplyIntent>
   ReadRequest(const manyforge::core::RequestOwnerEpoch &request_owner_epoch,
               const manyforge::core::RequestId &request_id) const;
@@ -580,5 +623,20 @@ ValidateManagerApplyCellAdmissionSettlementReadOnly(
     const manyforge::core::CellId &cell_id,
     const manyforge::core::CellAdmissionClaimDTO &claim,
     const manyforge::core::CellAdmissionClaimReleaseDTO &release);
+
+/// Authorize one Composer owner-epoch rotation without a Composer journal.
+/// A short local claim absent from the Manager journal is proven to have no
+/// surviving external effect. A claim transferred to Manager is eligible only
+/// after that exact operation has a known terminal outcome; pending and
+/// unknown-effect operations remain held and keep authoring closed.
+[[nodiscard]] manyforge::core::Result<
+    manyforge::core::CellAdmissionReconcileValidationDTO>
+ValidateManagerAuthoringOwnerReconciliationReadOnly(
+    const std::filesystem::path &database_path,
+    const manyforge::core::CellId &cell_id,
+    const std::vector<manyforge::core::CellAdmissionClaimDTO> &held_claims,
+    const std::vector<manyforge::core::CellAdmissionCurrentOwnerEpochDTO>
+        &current_owner_epochs,
+    const manyforge::core::CellAdmissionReconcileDTO &reconcile);
 
 } // namespace manyforge::component_manager

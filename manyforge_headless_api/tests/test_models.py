@@ -8,7 +8,11 @@ from pydantic import ValidationError
 from manyforge_headless_api.models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
+    ManagerApplyPreparedActivation,
     ManagerApplyRequest,
+    ManagerApplyStatus,
+    ManagerDeploymentCandidatePreviewRequest,
+    MAX_APPLY_FAILURE_MESSAGE_BYTES,
     ManualProgramHandover,
     ManualProgramHandoverContext,
     MotionParticipantRequest,
@@ -24,6 +28,28 @@ from manyforge_headless_api.models import (
     SceneTransactionRequest,
     StopIntentRequest,
 )
+
+
+def test_candidate_preview_requires_exact_prepared_activation_identity() -> None:
+    body = {
+        "deployment_artifact_id": "deployment.1",
+        "deployment_revision": "sha256:" + "a" * 64,
+        "candidate_retained_bundle_id": "bundle.2",
+        "candidate_graph_revision": "graph.2",
+        "prepared_activation_id": "sha256:" + "e" * 64,
+        "expected_current": {
+            "graph_revision": "graph.1",
+            "retained_bundle_id": "bundle.1",
+        },
+        "expected_admission_generation": 7,
+        "request_owner_epoch": "manager.1",
+    }
+    parsed = ManagerDeploymentCandidatePreviewRequest.model_validate(body)
+    assert parsed.prepared_activation_id == "sha256:" + "e" * 64
+    missing = dict(body)
+    del missing["prepared_activation_id"]
+    with pytest.raises(ValidationError):
+        ManagerDeploymentCandidatePreviewRequest.model_validate(missing)
 
 
 @pytest.mark.parametrize("groups", [["arm", "grippers"], [], ["bad group"], "arm"])
@@ -76,6 +102,19 @@ def _caller() -> dict[str, object]:
         "source_label": "operator_ui",
         "correlation_id": None,
     }
+
+
+def _prepared_activation() -> dict[str, object]:
+    activation = ManagerApplyPreparedActivation.model_validate(
+        {
+            "captured_input_digest": "sha256:" + "d" * 64,
+            "deployment_artifact_id": "deployment.1",
+            "deployment_revision": "sha256:" + "a" * 64,
+            "program_binding_id": "sha256:" + "9" * 64,
+            "prepared_activation_id": "sha256:" + "e" * 64,
+        }
+    )
+    return activation.model_dump(mode="json")
 
 
 def _planning_pose(z_m: float = 0.0) -> dict[str, object]:
@@ -606,12 +645,13 @@ def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
             "retained_bundle_id": "bundle.1",
         },
         "reject_if_affected_busy": False,
+        "prepared_activation": _prepared_activation(),
         "expected_admission_generation": 7,
         "candidate_receipt": {
             "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
             "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
-            "scenario_catalog_revision": "sha256:" + "b" * 64,
+            "prepared_activation_id": "sha256:" + "e" * 64,
             "candidate_retained_bundle_id": "bundle.2",
             "candidate_graph_revision": "graph.2",
             "expected_current": {
@@ -632,6 +672,293 @@ def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
             {**body, "reject_if_affected_busy": True, "principal_id": "forged"}
         )
     assert "Extra inputs are not permitted" in str(captured.value)
+
+
+def test_apply_requires_one_exact_ua2a_prepared_activation() -> None:
+    body = {
+        **_caller(),
+        "deployment_artifact_id": "deployment.1",
+        "deployment_revision": "sha256:" + "a" * 64,
+        "expected_current": {
+            "graph_revision": "graph.1",
+            "retained_bundle_id": "bundle.1",
+        },
+        "reject_if_affected_busy": True,
+        "prepared_activation": _prepared_activation(),
+        "expected_admission_generation": 7,
+        "candidate_receipt": {
+            "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+            "deployment_artifact_id": "deployment.1",
+            "deployment_revision": "sha256:" + "a" * 64,
+            "prepared_activation_id": "sha256:" + "e" * 64,
+            "candidate_retained_bundle_id": "bundle.2",
+            "candidate_graph_revision": "graph.2",
+            "expected_current": {
+                "graph_revision": "graph.1",
+                "retained_bundle_id": "bundle.1",
+            },
+            "expected_admission_generation": 7,
+            "manager_owner_epoch": "owner.1",
+            "receipt_digest": "sha256:" + "c" * 64,
+        },
+    }
+    request = ManagerApplyRequest.model_validate(body)
+    assert request.prepared_activation.program_binding_id == "sha256:" + "9" * 64
+
+    # The accepted operation must name the input it accepted, so the exact
+    # prepared activation is mandatory rather than optional.
+    missing = dict(body)
+    del missing["prepared_activation"]
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyRequest.model_validate(missing)
+    assert "prepared_activation" in str(captured.value)
+
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyRequest.model_validate(
+            {
+                **body,
+                "prepared_activation": {
+                    **_prepared_activation(),
+                    "unexpected_member": "value",
+                },
+            }
+        )
+    assert "Extra inputs are not permitted" in str(captured.value)
+
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyRequest.model_validate(
+            {
+                **body,
+                "prepared_activation": {
+                    **_prepared_activation(),
+                    "captured_input_digest": "not-a-digest",
+                },
+            }
+        )
+    assert "captured_input_digest" in str(captured.value)
+
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyRequest.model_validate(
+            {
+                **body,
+                "prepared_activation": {
+                    **_prepared_activation(),
+                    "program_binding_id": "not-a-content-digest",
+                },
+            }
+        )
+    assert "program_binding_id" in str(captured.value)
+
+    # The prepared activation cannot name a different candidate Deployment than
+    # the request it is submitted with.
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyRequest.model_validate(
+            {
+                **body,
+                "prepared_activation": {
+                    **_prepared_activation(),
+                    "deployment_artifact_id": "deployment.2",
+                },
+            }
+        )
+    assert "prepared activation does not match" in str(captured.value)
+
+
+def _status_body() -> dict[str, object]:
+    return {
+        "apply_id": "apply.3",
+        "apply_generation": 3,
+        "request_id": "request.3",
+        "request_owner_epoch": "client.epoch.3",
+        "prepared_activation": _prepared_activation(),
+        "phase": "accepted",
+        "last_progress": {
+            "phase": "accepted",
+            "record_digest": "sha256:" + "f" * 64,
+        },
+        "state": "pending",
+        "candidate_projection_revision": None,
+    }
+
+
+def _retained_failure(
+    *, phase: str = "runtime_converged", disposition: str = "known"
+) -> dict[str, object]:
+    return {
+        "code": "runtime_initialization_failed",
+        "message": "replacement initialization failed after teardown",
+        "phase": phase,
+        "effect_disposition": disposition,
+    }
+
+
+@pytest.mark.parametrize(
+    "state,disposition",
+    [("failed", "known"), ("unknown_effect", "unknown")],
+)
+def test_apply_status_reports_one_exact_failure_disposition(
+    state: str, disposition: str
+) -> None:
+    body = {
+        **_status_body(),
+        "phase": "runtime_converged",
+        "last_progress": {
+            "phase": "runtime_converged",
+            "record_digest": "sha256:" + "f" * 64,
+        },
+        "state": state,
+        "failure": _retained_failure(disposition=disposition),
+    }
+    status = ManagerApplyStatus.model_validate(body)
+    assert status.state == state
+    assert status.failure is not None
+    assert status.failure.effect_disposition == disposition
+    # A failure never published a configuration.
+    assert status.candidate_projection_revision is None
+
+    # A known failure and an unknown effect are distinct: neither may be
+    # presented as the other.
+    wrong = "unknown" if disposition == "known" else "known"
+    with pytest.raises(ValidationError, match="disposition must match"):
+        ManagerApplyStatus.model_validate(
+            {**body, "failure": _retained_failure(disposition=wrong)}
+        )
+
+    # The retained failure must describe the reported phase.
+    with pytest.raises(ValidationError, match="must describe the reported"):
+        ManagerApplyStatus.model_validate(
+            {
+                **body,
+                "failure": _retained_failure(
+                    phase="published", disposition=disposition
+                ),
+            }
+        )
+
+    # A terminal failure carries no success evidence of any kind.
+    with pytest.raises(ValidationError, match="only a terminal success"):
+        ManagerApplyStatus.model_validate(
+            {
+                **body,
+                "candidate_projection_revision": {
+                    "retained_bundle_id": "sha256:" + "2" * 64,
+                    "graph_revision": "sha256:" + "3" * 64,
+                    "scene_revision": {
+                        "scene_id": "sha256:" + "1" * 64,
+                        "revision_id": 4,
+                        "content_hash": "sha256:" + "2" * 64,
+                    },
+                },
+            }
+        )
+
+    # Without its retained failure the state is not a terminal failure.
+    without_failure = dict(body)
+    del without_failure["failure"]
+    with pytest.raises(ValidationError, match="only a terminal failure"):
+        ManagerApplyStatus.model_validate(without_failure)
+
+    # Empty and oversized retained failure text is rejected.
+    with pytest.raises(ValidationError):
+        ManagerApplyStatus.model_validate(
+            {**body, "failure": {**_retained_failure(), "code": ""}}
+        )
+    with pytest.raises(ValidationError, match="exceeds"):
+        ManagerApplyStatus.model_validate(
+            {
+                **body,
+                "failure": {
+                    **_retained_failure(),
+                    "message": "m" * (MAX_APPLY_FAILURE_MESSAGE_BYTES + 1),
+                },
+            }
+        )
+
+    # A pending or successful operation never carries a failure.
+    for consistent_state in ("pending", "succeeded"):
+        with pytest.raises(ValidationError, match="only a terminal failure"):
+            ManagerApplyStatus.model_validate(
+                {**_status_body(), "state": consistent_state,
+                 "failure": _retained_failure()}
+            )
+
+
+def test_apply_status_is_one_closed_bounded_lifecycle() -> None:
+    status = ManagerApplyStatus.model_validate(_status_body())
+    assert status.phase == "accepted"
+    assert status.last_progress.phase == status.phase
+    assert status.state == "pending"
+
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyStatus.model_validate(
+            {**_status_body(), "unexpected_member": "value"}
+        )
+    assert "Extra inputs are not permitted" in str(captured.value)
+
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyStatus.model_validate(
+            {**_status_body(), "phase": "not_a_phase"}
+        )
+    assert "phase" in str(captured.value)
+
+    # A status may not claim progress that its reported phase does not describe.
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyStatus.model_validate(
+            {
+                **_status_body(),
+                "last_progress": {
+                    "phase": "published",
+                    "record_digest": "sha256:" + "f" * 64,
+                },
+            }
+        )
+    assert "last progress must describe" in str(captured.value)
+
+    # The terminal success carries its candidate configuration identity and
+    # nothing else may claim one.
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyStatus.model_validate({**_status_body(), "state": "succeeded"})
+    assert "terminal success carries" in str(captured.value)
+
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyStatus.model_validate(
+            {
+                **_status_body(),
+                "state": "succeeded",
+                "candidate_projection_revision": {
+                    "retained_bundle_id": "bundle.2",
+                    "graph_revision": "graph.2",
+                    "scene_revision": {
+                        "scene_id": "sha256:" + "1" * 64,
+                        "revision_id": 4,
+                        "content_hash": "sha256:" + "2" * 64,
+                    },
+                },
+            }
+        )
+    assert "successful operation must be settled" in str(captured.value)
+
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyStatus.model_validate(
+            {
+                **_status_body(),
+                "candidate_projection_revision": {
+                    "retained_bundle_id": "bundle.2",
+                    "graph_revision": "graph.2",
+                    "scene_revision": {
+                        "scene_id": "sha256:" + "1" * 64,
+                        "revision_id": 4,
+                        "content_hash": "sha256:" + "2" * 64,
+                    },
+                },
+            }
+        )
+    assert "terminal success carries" in str(captured.value)
+
+    with pytest.raises(ValidationError):
+        ManagerApplyStatus.model_validate(
+            {**_status_body(), "apply_generation": 0}
+        )
 
 
 def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:

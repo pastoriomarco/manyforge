@@ -534,7 +534,6 @@ struct ManagedRuntimeChildConfig final {
   std::filesystem::path manager_run_root;
   std::filesystem::path logical_scene_database;
   std::filesystem::path program_cycle_journal;
-  std::filesystem::path authoring_transaction_journal;
   std::filesystem::path execution_state_root;
   std::filesystem::path execution_run_root;
   std::filesystem::path candidate_worker;
@@ -605,8 +604,6 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       config.logical_scene_database = value;
     } else if (option == "--manyforge-managed-program-cycle-journal") {
       config.program_cycle_journal = value;
-    } else if (option == "--manyforge-managed-authoring-transaction-journal") {
-      config.authoring_transaction_journal = value;
     } else if (option == "--manyforge-managed-execution-state-root") {
       config.execution_state_root = value;
     } else if (option == "--manyforge-managed-execution-run-root") {
@@ -631,15 +628,14 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() >= 16U && seen.size() <= 19U &&
+  Require(seen.size() >= 15U && seen.size() <= 18U &&
               config.manager_channel_fd >= 0 &&
               config.manager_liveness_channel_fd >= 0 &&
               config.manager_liveness_channel_fd != config.manager_channel_fd &&
               config.package_root_fd == kManagedPackageRootFd &&
               config.program_artifact_root_fd ==
                   kManagedProgramArtifactRootFd &&
-              config.program_cycle_journal.empty() ==
-                  config.authoring_transaction_journal.empty(),
+              !config.program_cycle_journal.empty(),
           "managed runtime invocation is incomplete");
   Require(IsPortableRuntimeIdentity(config.cell_id) &&
               IsPortableRuntimeIdentity(config.runtime_unit_id) &&
@@ -700,9 +696,6 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
     config.program_cycle_journal =
         validate_future_database(std::move(config.program_cycle_journal),
                                  "managed Program-cycle journal");
-    config.authoring_transaction_journal = validate_future_database(
-        std::move(config.authoring_transaction_journal),
-        "managed Composer authoring transaction journal");
   }
   config.execution_state_root = ExistingPrivateDirectory(
       std::move(config.execution_state_root), "managed execution state root");
@@ -725,9 +718,8 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
                                  "managed Program/runtime capabilities");
     }
   }
-  const std::array<const std::filesystem::path *, 3U> durable_paths{
-      &config.logical_scene_database, &config.program_cycle_journal,
-      &config.authoring_transaction_journal};
+  const std::array<const std::filesystem::path *, 2U> durable_paths{
+      &config.logical_scene_database, &config.program_cycle_journal};
   const std::array<const std::filesystem::path *, 2U> run_roots{
       &config.manager_run_root, &config.execution_run_root};
   for (const auto *durable_path : durable_paths) {
@@ -8247,7 +8239,6 @@ struct CompositionBuildInput final {
   std::filesystem::path manager_run_root;
   std::filesystem::path logical_scene_database;
   std::filesystem::path program_cycle_journal;
-  std::filesystem::path authoring_transaction_journal;
   std::shared_ptr<RetainedPlannerSceneProjection> planner_scene_projection;
   std::optional<core::ControllableComponentId> selected_component_id{};
   std::shared_ptr<RetainedObservationWake> observation_wake{};
@@ -8264,18 +8255,15 @@ BuildOwnerSettlementValidator(
     std::filesystem::path manager_apply_journal,
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
-    std::filesystem::path authoring_transaction_journal,
     std::filesystem::path lifecycle_journal, core::CellId cell_id) {
   if (manager_apply_journal.empty() && logical_scene_database.empty() &&
-      program_cycle_journal.empty() && authoring_transaction_journal.empty() &&
-      lifecycle_journal.empty()) {
+      program_cycle_journal.empty() && lifecycle_journal.empty()) {
     return {};
   }
   return
       [manager_apply_journal = std::move(manager_apply_journal),
        logical_scene_database = std::move(logical_scene_database),
        program_cycle_journal = std::move(program_cycle_journal),
-       authoring_transaction_journal = std::move(authoring_transaction_journal),
        lifecycle_journal = std::move(lifecycle_journal),
        cell_id = std::move(cell_id)](
           const core::CellAdmissionClaimDTO &claim,
@@ -8292,8 +8280,11 @@ BuildOwnerSettlementValidator(
           return detail::ValidateProgramCycleSettlementReadOnly(
               program_cycle_journal, claim, release);
         case core::CellAdmissionClaimKindDTO::kAuthoringMutation:
-          return detail::ValidateAuthoringSettlementReadOnly(
-              authoring_transaction_journal, claim, release);
+          // Composer local edits own no durable or runtime effect. Kernel's
+          // exact claim/release identity validation is therefore the complete
+          // settlement proof; requiring a second Composer journal would only
+          // duplicate the in-memory workspace owner.
+          return core::Result<void>::Ok();
         case core::CellAdmissionClaimKindDTO::kManagerApply:
           return component_manager::
               ValidateManagerApplyCellAdmissionSettlementReadOnly(
@@ -8315,12 +8306,11 @@ BuildOwnerSettlementValidator(
 
 [[nodiscard]] core::CellAdmissionReconcileValidator
 BuildOwnerReconciliationValidator(
+    std::filesystem::path manager_apply_journal,
     std::filesystem::path program_cycle_journal,
-    std::filesystem::path authoring_transaction_journal,
     std::filesystem::path lifecycle_journal, core::CellId cell_id) {
-  return [program_cycle_journal = std::move(program_cycle_journal),
-          authoring_transaction_journal =
-              std::move(authoring_transaction_journal),
+  return [manager_apply_journal = std::move(manager_apply_journal),
+          program_cycle_journal = std::move(program_cycle_journal),
           lifecycle_journal = std::move(lifecycle_journal),
           cell_id = std::move(cell_id)](
              const std::vector<core::CellAdmissionClaimDTO> &held_claims,
@@ -8377,9 +8367,10 @@ BuildOwnerReconciliationValidator(
       return detail::ValidateProgramRunnerOwnerReconciliationReadOnly(
           program_cycle_journal, held_claims, current_owner_epochs, reconcile);
     case core::CellAdmissionOwnerRoleDTO::kAuthoringOwner:
-      return detail::ValidateAuthoringOwnerReconciliationReadOnly(
-          authoring_transaction_journal, held_claims, current_owner_epochs,
-          reconcile);
+      return component_manager::
+          ValidateManagerAuthoringOwnerReconciliationReadOnly(
+              manager_apply_journal, cell_id, held_claims,
+              current_owner_epochs, reconcile);
     case core::CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner:
       return core::ValidateCCLCCellAdmissionReconciliationReadOnly(
           lifecycle_journal, cell_id, held_claims, current_owner_epochs,
@@ -9089,12 +9080,12 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   runtime_config.cell_admission_settlement_validator =
       BuildOwnerSettlementValidator(
           manager_apply_journal, input.logical_scene_database,
-          input.program_cycle_journal, input.authoring_transaction_journal,
+          input.program_cycle_journal,
           input.execution_state_root / std::string(core::kCCLCJournalFilename),
           input.cell_id);
   runtime_config.cell_admission_reconcile_validator =
       BuildOwnerReconciliationValidator(
-          input.program_cycle_journal, input.authoring_transaction_journal,
+          manager_apply_journal, input.program_cycle_journal,
           input.execution_state_root / std::string(core::kCCLCJournalFilename),
           input.cell_id);
   auto runtime = input.attach_addressed_owner
@@ -10065,7 +10056,6 @@ TryBuildCurrentManagedCompositionInput(
       config.manager_run_root,
       config.logical_scene_database,
       config.program_cycle_journal,
-      config.authoring_transaction_journal,
       std::move(planner_scene_projection),
       {},
       {},
@@ -10277,7 +10267,6 @@ struct ManagedBootstrapStopProduct final {
       config.manager_run_root,
       config.logical_scene_database,
       config.program_cycle_journal,
-      config.authoring_transaction_journal,
       std::move(planner_scene_projection),
       {},
       {},
@@ -10403,7 +10392,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   bootstrap_kernel_config.cell_admission_claim_capacity = 1024U;
   bootstrap_kernel_config.cell_admission_reconcile_validator =
       BuildOwnerReconciliationValidator(
-          config.program_cycle_journal, config.authoring_transaction_journal,
+          config.manager_state_root /
+              std::string(component_manager::kManagerApplyJournalFilename),
+          config.program_cycle_journal,
           config.execution_state_root / std::string(core::kCCLCJournalFilename),
           core::CellId(config.cell_id));
   bootstrap_kernel_config.cell_admission_settlement_validator =
@@ -10411,7 +10402,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           config.manager_state_root /
               std::string(component_manager::kManagerApplyJournalFilename),
           config.logical_scene_database, config.program_cycle_journal,
-          config.authoring_transaction_journal,
           config.execution_state_root / std::string(core::kCCLCJournalFilename),
           core::CellId(config.cell_id));
   detached_addressed_kernel =
@@ -11091,13 +11081,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                                               kManagerApplyJournalFilename),
                           config.logical_scene_database,
                           config.program_cycle_journal,
-                          config.authoring_transaction_journal,
                           config.execution_state_root /
                               std::string(core::kCCLCJournalFilename),
                           core::CellId(config.cell_id)),
                       BuildOwnerReconciliationValidator(
+                          config.manager_state_root /
+                              std::string(component_manager::
+                                              kManagerApplyJournalFilename),
                           config.program_cycle_journal,
-                          config.authoring_transaction_journal,
                           config.execution_state_root /
                               std::string(core::kCCLCJournalFilename),
                           core::CellId(config.cell_id)),

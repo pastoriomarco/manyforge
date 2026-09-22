@@ -857,7 +857,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
        std::vector<std::string> selected_launch_environment_contracts,
        std::filesystem::path logical_scene_database,
        std::filesystem::path program_cycle_journal,
-       std::filesystem::path authoring_transaction_journal,
        std::filesystem::path candidate_package_root)
       : target_root_path(
             NormalizedPlainDirectory(std::move(trusted_installed_target_root),
@@ -880,8 +879,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
             std::move(execution_run_root), "native execution run root")),
         logical_scene_database_path(std::move(logical_scene_database)),
         program_cycle_journal_path(std::move(program_cycle_journal)),
-        authoring_transaction_journal_path(
-            std::move(authoring_transaction_journal)),
         bundle_source(selected_bundle_source),
         artifact_source(selected_artifact_source),
         operating_system(std::move(selected_operating_system)),
@@ -915,9 +912,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       candidate_package_root_fd =
           OpenPinnedPackageRoot(candidate_package_root_path);
     }
-    const std::array<const std::filesystem::path *, 3U> durable_paths{
-        &logical_scene_database_path, &program_cycle_journal_path,
-        &authoring_transaction_journal_path};
+    const std::array<const std::filesystem::path *, 2U> durable_paths{
+        &logical_scene_database_path, &program_cycle_journal_path};
     const std::array<const std::filesystem::path *, 2U> run_roots{
         &manager_run_root_path, &execution_run_root_path};
     for (const auto *durable_path : durable_paths) {
@@ -1746,11 +1742,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       arguments.emplace_back("--manyforge-managed-program-cycle-journal");
       arguments.push_back(program_cycle_journal_path.string());
     }
-    if (!authoring_transaction_journal_path.empty()) {
-      arguments.emplace_back(
-          "--manyforge-managed-authoring-transaction-journal");
-      arguments.push_back(authoring_transaction_journal_path.string());
-    }
     std::vector<char *> argv;
     argv.reserve(arguments.size() + 1U);
     for (auto &argument : arguments) {
@@ -2077,7 +2068,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   std::filesystem::path execution_run_root_path;
   std::filesystem::path logical_scene_database_path;
   std::filesystem::path program_cycle_journal_path;
-  std::filesystem::path authoring_transaction_journal_path;
   const manyforge::deployment::IVerifiedRetainedBundleSource &bundle_source;
   const manyforge::deployment::IVerifiedRetainedProductArtifactSource
       &artifact_source;
@@ -2369,7 +2359,6 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::string operating_system, std::string launch_environment_contract,
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
-    std::filesystem::path authoring_transaction_journal,
     std::filesystem::path candidate_package_root)
     : RetainedNativeRuntimeUnitAdapter(
           std::move(trusted_installed_target_root),
@@ -2379,7 +2368,6 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(operating_system),
           std::vector<std::string>{std::move(launch_environment_contract)},
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(authoring_transaction_journal),
           std::move(candidate_package_root)) {}
 
 RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
@@ -2396,7 +2384,6 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::vector<std::string> launch_environment_contracts,
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
-    std::filesystem::path authoring_transaction_journal,
     std::filesystem::path candidate_package_root)
     : impl_(std::make_shared<Impl>(
           std::move(trusted_installed_target_root),
@@ -2405,7 +2392,6 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(execution_run_root), bundle_source, artifact_source,
           std::move(operating_system), std::move(launch_environment_contracts),
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(authoring_transaction_journal),
           std::move(candidate_package_root))) {}
 
 RetainedNativeRuntimeUnitAdapter::~RetainedNativeRuntimeUnitAdapter() = default;

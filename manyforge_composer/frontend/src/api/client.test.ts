@@ -10,7 +10,6 @@ import {
 import type {
   DraftFenceRequest,
   LocalWorkspaceFenceRequest,
-  ManagerApplyRequest,
 } from '../types/api';
 import type { OperatorAlarmRecord } from '../types/headless';
 import type { RuntimeScaleControlSelector } from '../types/robotControl';
@@ -451,47 +450,6 @@ function managerDiffFixture(): Record<string, unknown> {
   };
 }
 
-function managerApplyFixture(request: ManagerApplyRequest): Record<string, unknown> {
-  return {
-    api_version: 'manyforge.manager_command_response.v1',
-    apply_generation: 1,
-    apply_id: 'apply-1',
-    candidate_projection_revision: {
-      retained_bundle_id: 'sha256:' + 'b'.repeat(64),
-      graph_revision: 'sha256:' + 'c'.repeat(64),
-      scene_revision: {
-        scene_id: 'sha256:' + 'd'.repeat(64),
-        revision_id: 2,
-        content_hash: 'sha256:' + 'e'.repeat(64),
-      },
-    },
-    ok: true,
-    error: null,
-    replay_status: 'replayed_exact',
-    request_id: request.request_id,
-    request_owner_epoch: request.request_owner_epoch,
-    state: 'succeeded',
-  };
-}
-
-function managerCandidateReceipt() {
-  return {
-    schema_version: 'manyforge.manager_deployment_candidate_receipt.v1' as const,
-    deployment_artifact_id: 'artifact-1',
-    deployment_revision: 'rev-2',
-    scenario_catalog_revision: `sha256:${'a'.repeat(64)}`,
-    candidate_retained_bundle_id: 'bundle-next',
-    candidate_graph_revision: 'graph-next',
-    expected_current: {
-      graph_revision: 'graph-9',
-      retained_bundle_id: 'bundle-9',
-    },
-    expected_admission_generation: 7,
-    manager_owner_epoch: 'owner.epoch.1',
-    receipt_digest: `sha256:${'b'.repeat(64)}`,
-  };
-}
-
 describe('structural API client', () => {
   it('uses the owner mode index and bridge-owned request status routes', async () => {
     const fetchMock = vi.fn()
@@ -923,87 +881,72 @@ describe('headless intent client', () => {
     expect(receipt.committed_projection_revision.scene_revision.revision_id).toBe(2);
   });
 
-  it('posts manager apply with revision fences and calls manager graph endpoint', async () => {
-    const request: ManagerApplyRequest = {
-      request_id: 'request-manager-1',
-      request_owner_epoch: 'owner.epoch.1',
-      source_label: 'composer_ui',
-      correlation_id: null,
-      deployment_artifact_id: 'artifact-1',
-      deployment_revision: 'rev-2',
-      expected_current: {
-        graph_revision: 'graph-9',
-        retained_bundle_id: 'bundle-9',
+  it('observes one exact Manager Apply without replaying the effect', async () => {
+    const payload = {
+      api_version: 'manyforge.manager_command_response.v1',
+      apply_generation: 3,
+      apply_id: 'apply-3',
+      candidate_projection_revision: null,
+      error: null,
+      failure: null,
+      last_progress: {
+        phase: 'fence_accepted',
+        record_digest: `sha256:${'1'.repeat(64)}`,
       },
-      reject_if_affected_busy: true,
-      expected_admission_generation: 7,
-      candidate_receipt: managerCandidateReceipt(),
+      ok: true,
+      phase: 'fence_accepted',
+      prepared_activation: {
+        captured_input_digest: `sha256:${'2'.repeat(64)}`,
+        deployment_artifact_id: 'deployment-1',
+        deployment_revision: `sha256:${'3'.repeat(64)}`,
+        program_binding_id: `sha256:${'4'.repeat(64)}`,
+        prepared_activation_id: `sha256:${'5'.repeat(64)}`,
+      },
+      request_id: 'request-3',
+      request_owner_epoch: 'owner-3',
+      state: 'pending',
     };
-
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(response(managerGraphFixture()))
-      .mockResolvedValueOnce(response(managerApplyFixture(request)))
-      .mockResolvedValueOnce(response(managerDiffFixture()));
+    const fetchMock = vi.fn().mockResolvedValue(response(payload));
     vi.stubGlobal('fetch', fetchMock);
 
-    await api.manager.graph();
-    const receipt = await api.manager.apply(request);
-    await api.manager.diff();
+    const observed = await api.manager.applyStatus('apply-3', 3);
 
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/manager/graph');
-    expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/manager/apply');
-    expect(fetchMock.mock.calls[2]?.[0]).toBe('/api/manager/diff');
-
-    const [, applyOptions] = fetchMock.mock.calls[1] as [string, RequestInit];
-    expect(applyOptions.method).toBe('POST');
-    expect(JSON.parse(String(applyOptions.body))).toEqual(request);
-    expect(receipt).toEqual({
-      apiVersion: 'manyforge.manager_command_response.v1',
-      applyId: 'apply-1',
-      applyGeneration: 1,
-      candidateProjectionRevision: {
-        retained_bundle_id: 'sha256:' + 'b'.repeat(64),
-        graph_revision: 'sha256:' + 'c'.repeat(64),
-        scene_revision: {
-          scene_id: 'sha256:' + 'd'.repeat(64),
-          revision_id: 2,
-          content_hash: 'sha256:' + 'e'.repeat(64),
-        },
-      },
-      error: null,
-      ok: true,
-      replayStatus: 'replayed_exact',
-      requestId: request.request_id,
-      requestOwnerEpoch: request.request_owner_epoch,
-      state: 'succeeded',
-    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/manager/apply/status?apply_id=apply-3&apply_generation=3',
+    );
+    expect(observed.phase).toBe('fence_accepted');
   });
 
-  it('rejects a Manager Apply receipt with a mismatched request identity', async () => {
-    const request: ManagerApplyRequest = {
-      request_id: 'request-manager-identity',
-      request_owner_epoch: 'owner.epoch.1',
-      source_label: 'composer_ui',
-      correlation_id: null,
-      deployment_artifact_id: 'artifact-1',
-      deployment_revision: 'rev-2',
-      expected_current: {
-        graph_revision: 'graph-9',
-        retained_bundle_id: 'bundle-9',
+  it('rejects an Apply status for a different durable identity', async () => {
+    const payload = {
+      api_version: 'manyforge.manager_command_response.v1',
+      apply_generation: 4,
+      apply_id: 'different-apply',
+      candidate_projection_revision: null,
+      error: null,
+      failure: null,
+      last_progress: {
+        phase: 'accepted',
+        record_digest: `sha256:${'1'.repeat(64)}`,
       },
-      reject_if_affected_busy: true,
-      expected_admission_generation: 7,
-      candidate_receipt: managerCandidateReceipt(),
+      ok: true,
+      phase: 'accepted',
+      prepared_activation: {
+        captured_input_digest: `sha256:${'2'.repeat(64)}`,
+        deployment_artifact_id: 'deployment-1',
+        deployment_revision: `sha256:${'3'.repeat(64)}`,
+        program_binding_id: `sha256:${'4'.repeat(64)}`,
+        prepared_activation_id: `sha256:${'5'.repeat(64)}`,
+      },
+      request_id: 'request-4',
+      request_owner_epoch: 'owner-4',
+      state: 'pending',
     };
-    const responsePayload = managerApplyFixture({
-      ...request,
-      request_id: 'request-manager-other',
-    });
-    const fetchMock = vi.fn().mockResolvedValue(response(responsePayload));
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(payload)));
 
-    await expect(api.manager.apply(request)).rejects.toThrow(
-      'Manager Apply response identity does not match the request',
+    await expect(api.manager.applyStatus('apply-4', 4)).rejects.toThrow(
+      'Manager Apply status identity does not match the request',
     );
   });
 

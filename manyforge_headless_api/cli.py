@@ -143,6 +143,12 @@ def _parser() -> argparse.ArgumentParser:
     apply.add_argument("deployment_revision")
     apply.add_argument("expected_graph_revision")
     apply.add_argument("expected_retained_bundle_id")
+    # The exact UA2A prepared activation accepted by this Apply. The Manager
+    # records these facts and never reopens a mutable Scenario/catalog
+    # selection, so the caller must name the input it accepted.
+    apply.add_argument("captured_input_digest")
+    apply.add_argument("program_binding_id")
+    apply.add_argument("prepared_activation_id")
     _caller_fields(apply)
 
     for name in ("cclc-component", "cclc-route-templates"):
@@ -347,6 +353,13 @@ def _request(args: argparse.Namespace) -> int:
                         "retained_bundle_id": args.expected_retained_bundle_id,
                     },
                     "reject_if_affected_busy": True,
+                    "prepared_activation": {
+                        "captured_input_digest": args.captured_input_digest,
+                        "deployment_artifact_id": args.deployment_artifact_id,
+                        "deployment_revision": args.deployment_revision,
+                        "program_binding_id": args.program_binding_id,
+                        "prepared_activation_id": args.prepared_activation_id,
+                    },
                     "expected_admission_generation": admission[
                         "admission_generation"
                     ],

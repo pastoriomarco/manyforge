@@ -202,6 +202,7 @@ add_library(manyforge_component_manager
   src/manager_liveness_rpc_internal.cpp
   src/manager_named_apply_coordinator.cpp
   src/manager_active_runtime_coordinator.cpp
+  src/manager_planned_maintenance_coordinator.cpp
   src/manager_runtime_convergence_coordinator.cpp
   src/manager_scene_activation_coordinator.cpp
   src/manager_scene_stage_coordinator.cpp
@@ -389,6 +390,14 @@ if(BUILD_TESTING)
     manyforge::deployment
     GTest::gtest_main)
   gtest_discover_tests(test_manager_apply_fence_coordinator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_manager_planned_maintenance_coordinator
+    test/test_manager_planned_maintenance_coordinator.cpp)
+  target_link_libraries(test_manager_planned_maintenance_coordinator PRIVATE
+    manyforge_component_manager
+    GTest::gtest_main)
+  gtest_discover_tests(test_manager_planned_maintenance_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_manager_runtime_convergence_coordinator

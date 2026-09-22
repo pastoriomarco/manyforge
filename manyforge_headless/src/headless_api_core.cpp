@@ -73,9 +73,6 @@ HeadlessApiCoreConfig ValidateConfig(HeadlessApiCoreConfig config) {
               !config.owner_epoch.empty(),
           "headless_api_configuration_invalid",
           "cell and owner identities are required");
-  Require(config.runtime_transition_alarm_grace_ns > 0,
-          "headless_api_configuration_invalid",
-          "runtime transition alarm grace must be positive");
   return config;
 }
 
@@ -207,24 +204,6 @@ CanonicalValue ScenarioSelectionProjection(
   });
 }
 
-CanonicalValue ScenarioLoadSelectionProjection(
-    const deployment::ScenarioProgramSelection &selection,
-    CanonicalValue deployment_document) {
-  auto projection = ScenarioSelectionProjection(
-      selection, CanonicalValue(CanonicalValue::Array{}));
-  auto fields = projection.as_object();
-  auto schema =
-      std::find_if(fields.begin(), fields.end(), [](const auto &field) {
-        return field.first == "schema_version";
-      });
-  Require(schema != fields.end(), "scenario_load_selection_invalid",
-          "scenario Load selection has no schema");
-  schema->second =
-      CanonicalValue(std::string(kScenarioLoadSelectionSchemaVersion));
-  fields.emplace_back("deployment", std::move(deployment_document));
-  return CanonicalValue(std::move(fields));
-}
-
 CanonicalValue Number(const std::uint64_t value, const std::string_view label) {
   Require(value <= kMaximumSafeInteger, "headless_value_invalid",
           std::string(label) + " exceeds the I-JSON safe integer range");
@@ -274,6 +253,18 @@ ManagerApplyTransitionId(const CanonicalValue &runtime) {
   Require(rows != nullptr, "headless_source_invalid",
           "Manager Apply records must be an array");
   std::optional<std::string> transition;
+  const auto admitted_phase = [](const std::string_view phase) noexcept {
+    return phase == "fence_held" ||
+           phase == "runtime_convergence_pending" ||
+           phase == "runtime_staged_ready" ||
+           phase == "scene_stage_pending" || phase == "scene_staged" ||
+           phase == "activation_selected" || phase == "scene_activated" ||
+           phase == "private_materialized" ||
+           phase == "command_surfaces_retired" ||
+           phase == "active_bundle_published" ||
+           phase == "scene_finalized" ||
+           phase == "fence_release_pending";
+  };
   for (const auto &row : *rows) {
     Require(row.is_object(), "headless_source_invalid",
             "Manager Apply record must be an object");
@@ -283,7 +274,42 @@ ManagerApplyTransitionId(const CanonicalValue &runtime) {
     const auto *pending = std::get_if<bool>(&incomplete->storage());
     Require(pending != nullptr, "headless_source_invalid",
             "Manager Apply completion state must be boolean");
-    if (!*pending) {
+    if (!*pending || !admitted_phase(RequiredString(row, "phase"))) {
+      continue;
+    }
+    const auto &fence = RequiredSection(row, "fence");
+    const auto &scope = RequiredSection(fence, "scope");
+    std::set<std::string> affected_components;
+    for (const auto &value :
+         RequiredArray(scope, "controllable_component_ids")) {
+      const auto *component_id = std::get_if<std::string>(&value.storage());
+      Require(component_id != nullptr, "headless_source_invalid",
+              "Manager Apply component scope must contain strings");
+      affected_components.insert(*component_id);
+    }
+    std::set<std::string> affected_units;
+    const auto &active = RequiredSection(manager, "active");
+    const auto &graph = RequiredSection(active, "cell_graph");
+    for (const auto &component :
+         RequiredArray(graph, "controllable_components")) {
+      if (!affected_components.contains(
+              RequiredString(component, "controllable_component_id"))) {
+        continue;
+      }
+      for (const auto &value : RequiredArray(component, "runtime_unit_ids")) {
+        const auto *runtime_unit_id =
+            std::get_if<std::string>(&value.storage());
+        Require(runtime_unit_id != nullptr, "headless_source_invalid",
+                "runtime unit scope must contain strings");
+        affected_units.insert(*runtime_unit_id);
+      }
+    }
+    std::set<std::string> desired_units;
+    const auto &manager_runtime = RequiredSection(manager, "runtime");
+    for (const auto &unit : RequiredArray(manager_runtime, "desired_units")) {
+      desired_units.insert(RequiredString(unit, "runtime_unit_id"));
+    }
+    if (desired_units.empty() || affected_units != desired_units) {
       continue;
     }
     Require(!transition.has_value(), "headless_source_invalid",
@@ -766,47 +792,6 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
           owner_identity("scene_runtime", scene_runtime_section),
           owner_identity("scene_transactions", logical_scene_section),
       }));
-}
-
-CanonicalValue
-HeadlessApiCore::ScenarioLoadSelection(const std::string_view scenario_id) {
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  try {
-    const auto runtime = RefreshLocked();
-    const auto &manager_section = RequiredSection(runtime.root, "manager");
-    if (SectionFresh(manager_section)) {
-      const auto &manager_payload = RequiredMember(manager_section, "payload");
-      if (manager_payload.is_object() &&
-          RequiredBool(manager_payload, "manager_ready") &&
-          RequiredBool(RequiredMember(manager_payload, "runtime"),
-                       "converged")) {
-        const auto &active = RequiredMember(manager_payload, "active");
-        auto selected =
-            scenario_catalog_source_.TryLoadExactProgramSelectionForActive(
-                scenario_id,
-                core::RetainedBundleId(
-                    RequiredString(active, "retained_bundle_id")),
-                core::GraphRevision(RequiredString(active, "graph_revision")));
-        if (selected.has_value()) {
-          return ScenarioLoadSelectionProjection(
-              *selected,
-              scenario_catalog_source_.LoadExactDeploymentDocument(*selected));
-        }
-      }
-    }
-    const auto selected =
-        scenario_catalog_source_.LoadExactProgramSelection(scenario_id);
-    return ScenarioLoadSelectionProjection(
-        selected,
-        scenario_catalog_source_.LoadExactDeploymentDocument(selected));
-  } catch (const deployment::ScenarioApplyCandidateError &error) {
-    CoreFail("scenario_program_selection_unavailable", error.what());
-  } catch (const deployment::ScenarioCatalogError &error) {
-    CoreFail("scenario_program_selection_unavailable", error.what());
-  } catch (const std::exception &error) {
-    CoreFail("scenario_program_selection_invalid", error.what());
-  }
 }
 
 CanonicalValue HeadlessApiCore::PrepareProgramApply(
@@ -2601,16 +2586,8 @@ void HeadlessApiCore::RefreshRuntimeHealthAdapterLocked(
     const HeadlessRuntimeSnapshot &runtime) {
   const bool complete = RequiredBool(runtime.root, "complete");
   const auto transition_id = ManagerApplyTransitionId(runtime.root);
-  const auto now_ns = clocks_.monotonic_time_ns();
   if (complete) {
     runtime_health_baseline_observed_ = true;
-    if (!transition_id.has_value()) {
-      runtime_health_transition_id_.reset();
-      runtime_health_transition_started_at_ns_.reset();
-    } else if (runtime_health_transition_id_ != transition_id) {
-      runtime_health_transition_id_ = transition_id;
-      runtime_health_transition_started_at_ns_ = now_ns;
-    }
   } else if (!runtime_health_baseline_observed_) {
     // Retained publications can be valid but stale while a workbench starts.
     // Until this Headless owner observes one complete fresh source set there
@@ -2622,26 +2599,15 @@ void HeadlessApiCore::RefreshRuntimeHealthAdapterLocked(
                                           runtime_health_adapter_.source_epoch);
     return;
   } else if (transition_id.has_value()) {
-    if (runtime_health_transition_id_ != transition_id ||
-        !runtime_health_transition_started_at_ns_.has_value()) {
-      runtime_health_transition_id_ = transition_id;
-      runtime_health_transition_started_at_ns_ = now_ns;
-    }
-    const auto started_at = *runtime_health_transition_started_at_ns_;
-    Require(now_ns >= started_at, "headless_clock_invalid",
-            "runtime transition monotonic clock regressed");
-    if (now_ns - started_at < config_.runtime_transition_alarm_grace_ns) {
-      // Apply already fences command admission. Keep runtime readiness
-      // fail-closed, but do not manufacture an acknowledgement obligation for
-      // its bounded, explicitly identified provider replacement interval.
-      alarm_owner_.MarkSourceQualityUnknown(
-          runtime_health_adapter_.source_id,
-          runtime_health_adapter_.source_epoch);
-      return;
-    }
-  } else {
-    runtime_health_transition_id_.reset();
-    runtime_health_transition_started_at_ns_.reset();
+    // Manager's durable incomplete operation is the owner-issued explanation
+    // for this planned unavailable interval. Keep readiness fail-closed and
+    // expose that operation's phase, but do not turn its intentional teardown
+    // into a runtime-loss alarm. A terminal failure removes the incomplete
+    // operation, so a still-unavailable provider is alarmed on the next owner
+    // publication without a timeout or inferred recovery.
+    alarm_owner_.MarkSourceQualityUnknown(runtime_health_adapter_.source_id,
+                                          runtime_health_adapter_.source_epoch);
+    return;
   }
   const bool active = !complete;
   const auto reasons = StringArray(runtime.root, "reasons");

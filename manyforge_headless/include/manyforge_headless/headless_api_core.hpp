@@ -31,8 +31,6 @@ inline constexpr std::string_view kViewerModelAssetSchemaVersion =
     "manyforge.viewer_model_asset.v1";
 inline constexpr std::string_view kScenarioProgramSelectionSchemaVersion =
     "manyforge.scenario_program_selection.v2";
-inline constexpr std::string_view kScenarioLoadSelectionSchemaVersion =
-    "manyforge.scenario_load_selection.v1";
 inline constexpr std::string_view kSourceModelContextSchemaVersion =
     "manyforge.source_model_context.v1";
 inline constexpr std::string_view kAssistantModeContextSchemaVersion =
@@ -151,7 +149,6 @@ struct HeadlessApiCoreConfig final {
   RuntimeSnapshotFreshnessPolicy freshness_policy;
   std::size_t historian_queue_capacity{kDefaultHistorianQueueCapacity};
   std::size_t historian_record_retention{kDefaultHistorianRecordRetention};
-  std::int64_t runtime_transition_alarm_grace_ns{15'000'000'000LL};
 };
 
 struct HeadlessApiCoreClocks final {
@@ -186,8 +183,6 @@ public:
   ScenarioCatalogProjection();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ScenarioProgramSelection(std::string_view scenario_id);
-  [[nodiscard]] manyforge::content_identity::CanonicalValue
-  ScenarioLoadSelection(std::string_view scenario_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   PrepareProgramApply(std::string_view scenario_id,
                       std::string_view expected_scenario_catalog_revision,
@@ -371,8 +366,6 @@ private:
   AlarmLifecycleOwner alarm_owner_;
   AdapterCursor runtime_health_adapter_;
   bool runtime_health_baseline_observed_{};
-  std::optional<std::string> runtime_health_transition_id_;
-  std::optional<std::int64_t> runtime_health_transition_started_at_ns_;
   AdapterCursor scene_adapter_;
   AdapterCursor operation_adapter_;
   std::uint64_t operation_native_sequence_{};

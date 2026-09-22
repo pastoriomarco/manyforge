@@ -6,12 +6,13 @@ function overview(
   values: Pick<RuntimeStatusView, 'readiness' | 'summaryLabel' | 'userMessage'>,
 ): RuntimeStatusView {
   return {
-    schemaVersion: 'manyforge.component_overview.v1',
+    schemaVersion: 'manyforge.component_overview.v2',
     overviewRevision: `sha256:${'a'.repeat(64)}`,
     profileLabel: 'native',
     authorityLabel: 'owner-issued scoped facts',
     capabilities: [],
     components: [],
+    maintenanceOperation: null,
     basis: {
       runtimeProjectionOwnerEpoch: null,
       runtimeProjectionGeneration: null,

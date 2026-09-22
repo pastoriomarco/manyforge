@@ -1,4 +1,4 @@
-import type { ProgramCycleStatus } from './api';
+import type { ManagerApplyPhase, ProgramCycleStatus } from './api';
 import type { Nanoseconds } from './nanoseconds';
 import type { ExecutionOwnerStatus } from './robotControl';
 
@@ -116,7 +116,7 @@ export interface ComponentOverviewComponent {
 }
 
 export interface ComponentOverviewProjection {
-  schemaVersion: 'manyforge.component_overview.v1';
+  schemaVersion: 'manyforge.component_overview.v2';
   overviewRevision: string;
   readiness: ComponentOverviewReadiness;
   summaryLabel: string;
@@ -125,6 +125,13 @@ export interface ComponentOverviewProjection {
   userMessage: string;
   capabilities: string[];
   components: ComponentOverviewComponent[];
+  maintenanceOperation: {
+    applyId: string;
+    applyGeneration: number;
+    phase: ManagerApplyPhase;
+    affectedRuntimeUnitIds: string[];
+    reasonCode: 'planned_maintenance_in_progress';
+  } | null;
   basis: {
     runtimeProjectionOwnerEpoch: string | null;
     runtimeProjectionGeneration: number | null;

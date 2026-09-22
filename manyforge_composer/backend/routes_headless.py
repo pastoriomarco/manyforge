@@ -24,8 +24,6 @@ from manyforge_headless_api.models import (
     ComponentLifecycleRequest,
     FullStopIntentRequest,
     HistorianReconcileRequest,
-    ManagerApplyRequest,
-    ManagerDeploymentCandidatePreviewRequest,
     OperationControlRequest,
     OperationIntentRequest,
     PickSequencePlanningRequest,
@@ -653,18 +651,6 @@ def create_headless_router(
         ],
     ) -> dict[str, Any]:
         return _call(lambda: client.assistant_mode(mode_id))
-
-    @router.post("/api/manager/deployment-candidates/preview")
-    def manager_deployment_candidate_preview(
-        body: ManagerDeploymentCandidatePreviewRequest,
-    ) -> dict[str, Any]:
-        return _call(
-            lambda: client.manager_deployment_candidate_preview(body.model_dump())
-        )
-
-    @router.post("/api/manager/apply")
-    def manager_apply(body: ManagerApplyRequest) -> dict[str, Any]:
-        return _call(lambda: client.manager_apply(body.model_dump()))
 
     @router.get("/api/manager/apply/status")
     def manager_apply_status(

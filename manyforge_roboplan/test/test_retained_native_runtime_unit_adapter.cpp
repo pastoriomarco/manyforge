@@ -1020,7 +1020,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       fixture.execution_state_root.path(), fixture.execution_run_root.path(),
       fixture.bundle_source, fixture.artifact_source,
       std::string(contract::kOperatingSystem),
-      std::string(contract::kLaunchEnvironmentContract), {}, {}, {},
+      std::string(contract::kLaunchEnvironmentContract), {}, {},
       authored.path());
 
   const auto started = adapter.EnsureRunning(*fixture.query);
@@ -2646,7 +2646,7 @@ TEST(RuntimeUnitAdapterRouter,
   component_manager::ManagerActiveRuntimeCoordinator coordinator(
       source, router, router, [&now] { return ++now; });
 
-  const auto converged = coordinator.Reconcile();
+  const auto converged = coordinator.Initialize();
   EXPECT_EQ(
       converged.state,
       component_manager::ManagerActiveRuntimeConvergenceState::kConverged);

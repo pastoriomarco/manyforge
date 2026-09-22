@@ -24,6 +24,16 @@ def test_manager_transport_accepts_bounded_cold_apply_timeout(tmp_path: Path) ->
         ManagerCommandClient(tmp_path, timeout_seconds=60.1)
 
 
+def _prepared_activation() -> dict[str, object]:
+    return {
+        "captured_input_digest": "sha256:" + "d" * 64,
+        "deployment_artifact_id": "deployment.1",
+        "deployment_revision": "sha256:" + "a" * 64,
+        "program_binding_id": "sha256:" + "9" * 64,
+        "prepared_activation_id": "sha256:" + "e" * 64,
+    }
+
+
 def _request() -> ManagerApplyRequest:
     return ManagerApplyRequest.model_validate(
         {
@@ -38,12 +48,13 @@ def _request() -> ManagerApplyRequest:
                 "retained_bundle_id": "bundle.1",
             },
             "reject_if_affected_busy": True,
+            "prepared_activation": _prepared_activation(),
             "expected_admission_generation": 7,
             "candidate_receipt": {
                 "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
                 "deployment_artifact_id": "deployment.1",
                 "deployment_revision": "sha256:" + "a" * 64,
-                "scenario_catalog_revision": "sha256:" + "b" * 64,
+                "prepared_activation_id": "sha256:" + "e" * 64,
                 "candidate_retained_bundle_id": "bundle.2",
                 "candidate_graph_revision": "graph.2",
                 "expected_current": {
@@ -154,6 +165,7 @@ def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> 
         "deployment_revision",
         "admission_context",
         "expected_current",
+        "prepared_activation",
         "reject_if_affected_busy",
         "request_id",
         "request_owner_epoch",
@@ -161,6 +173,7 @@ def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> 
     }
     assert decoded["source_label"] == "test"
     assert decoded["correlation_id"] == "correlation.1"
+    assert decoded["prepared_activation"] == _prepared_activation()
     assert decoded["admission_context"] == {
         "kind": "direct",
         "expected_admission_generation": 7,
@@ -234,26 +247,149 @@ def test_manager_client_observes_apply_without_replaying_submission(
 
     def exchange(command: dict[str, object]) -> dict[str, object]:
         commands.append(command)
-        return {
-            "api_version": "manyforge.manager_command_response.v1",
-            "apply_generation": 3,
-            "apply_id": "apply.3",
-            "candidate_projection_revision": None,
-            "error": None,
-            "ok": True,
-            "state": "pending",
-        }
+        return _status_response()
 
     monkeypatch.setattr(client, "_exchange", exchange)
     response = client.observe_apply("apply.3", 3)
 
     assert response["state"] == "pending"
+    assert response["phase"] == "accepted"
+    # Observation is one read of the durable identity: it submits nothing, so a
+    # reconnecting client can never repeat teardown, startup or publication.
     assert commands == [{
         "api_version": "manyforge.manager_command.v1",
         "apply_generation": 3,
         "apply_id": "apply.3",
         "command": "apply_status",
     }]
+
+
+def _status_response() -> dict[str, object]:
+    return {
+        "api_version": "manyforge.manager_command_response.v1",
+        "apply_generation": 3,
+        "apply_id": "apply.3",
+        "candidate_projection_revision": None,
+        "error": None,
+        "last_progress": {
+            "phase": "accepted",
+            "record_digest": "sha256:" + "f" * 64,
+        },
+        "ok": True,
+        "phase": "accepted",
+        "prepared_activation": _prepared_activation(),
+        "request_id": "request.3",
+        "request_owner_epoch": "client.epoch.3",
+        "state": "pending",
+    }
+
+
+def test_manager_client_keeps_one_bounded_apply_status_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+
+    def exchange(_command: dict[str, object]) -> dict[str, object]:
+        response = _status_response()
+        response["prepared_activation"] = {
+            **_prepared_activation(),
+            "unexpected_member": "value",
+        }
+        return response
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    with pytest.raises(HeadlessApiError) as captured:
+        client.observe_apply("apply.3", 3)
+    assert captured.value.code == "manager_command_response_invalid"
+
+
+def test_manager_client_rejects_a_status_that_is_not_one_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+
+    def exchange(_command: dict[str, object]) -> dict[str, object]:
+        response = _status_response()
+        # A status may not claim progress the reported phase does not describe.
+        response["last_progress"] = {
+            "phase": "published",
+            "record_digest": "sha256:" + "f" * 64,
+        }
+        return response
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    with pytest.raises(HeadlessApiError) as captured:
+        client.observe_apply("apply.3", 3)
+    assert captured.value.code == "manager_command_response_invalid"
+
+
+def test_manager_client_rejects_a_status_for_another_durable_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+
+    def exchange(_command: dict[str, object]) -> dict[str, object]:
+        response = _status_response()
+        response["apply_id"] = "apply.4"
+        return response
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    with pytest.raises(HeadlessApiError) as captured:
+        client.observe_apply("apply.3", 3)
+    assert captured.value.code == "manager_command_response_identity_mismatch"
+
+
+def test_manager_client_reports_an_unknown_operation_status_as_a_typed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+
+    def exchange(_command: dict[str, object]) -> dict[str, object]:
+        return {
+            "api_version": "manyforge.manager_command_response.v1",
+            "error": {
+                "code": "apply_status_not_found",
+                "message": "Manager Apply identity is unknown",
+            },
+            "ok": False,
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    response = client.observe_apply("apply.3", 3)
+    assert response["ok"] is False
+    assert response["error"]["code"] == "apply_status_not_found"
+
+
+def test_manager_client_keeps_a_terminal_success_replay_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+    projection = {
+        "retained_bundle_id": "bundle.2",
+        "graph_revision": "graph.2",
+        "scene_revision": {
+            "scene_id": "sha256:" + "1" * 64,
+            "revision_id": 4,
+            "content_hash": "sha256:" + "2" * 64,
+        },
+    }
+
+    def exchange(_command: dict[str, object]) -> dict[str, object]:
+        return {
+            **_status_response(),
+            "candidate_projection_revision": projection,
+            "last_progress": {
+                "phase": "settled",
+                "record_digest": "sha256:" + "3" * 64,
+            },
+            "phase": "settled",
+            "state": "succeeded",
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    response = client.observe_apply("apply.3", 3)
+    assert response["state"] == "succeeded"
+    assert response["candidate_projection_revision"] == projection
 
 
 def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(

@@ -343,7 +343,6 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
         program=program,
         program_source_path=str(_PROGRAM_PATH),
         headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
-        authoring_state_root=str(tmp_path),
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 
@@ -436,7 +435,6 @@ def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
         headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
-        authoring_state_root=str(tmp_path),
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 
@@ -481,7 +479,6 @@ def test_callback_reapplies_field_narrowing_before_draft_mutation(
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
         headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
-        authoring_state_root=str(tmp_path),
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 
@@ -526,7 +523,6 @@ def test_malformed_assistant_mode_is_rejected_before_projection_lookup(
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
         headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
-        authoring_state_root=str(tmp_path),
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 
@@ -565,7 +561,6 @@ def test_callback_cannot_mutate_a_program_that_forbids_assistant_authoring(
         program=Program(_ASSISTANT_FORBIDDEN_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_ASSISTANT_FORBIDDEN_PROGRAM_PATH),
         headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
-        authoring_state_root=str(tmp_path),
     )
     from manyforge_composer.backend import routes_assistant_draft as route
 

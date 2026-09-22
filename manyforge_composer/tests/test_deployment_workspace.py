@@ -24,10 +24,10 @@ from manyforge_composer.backend.routes_deployment_draft import (
     _raise,
     create_deployment_draft_router,
 )
-from manyforge_composer.backend.authoring_transaction_journal import (
-    AuthoringJournalError,
+from manyforge_composer.backend.authoring_admission import (
+    AuthoringOperationError,
+    LocalAuthoringCommit,
 )
-from manyforge_composer.backend.authoring_admission import LocalAuthoringCommit
 from manyforge_composer.backend.authoring_workspace import AuthoringWorkspace
 from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_composer.backend.state import ComposerState
@@ -37,7 +37,7 @@ _DIGEST = "sha256:" + "1" * 64
 
 
 def test_scene_preparation_unavailable_keeps_typed_http_error() -> None:
-    failure = AuthoringJournalError(
+    failure = AuthoringOperationError(
         "program_scene_preparation_unavailable",
         "Program is applied, but backend authoring readiness is not established",
     )
@@ -718,9 +718,6 @@ def _focused_document() -> dict[str, Any]:
 
 
 class _Coordinator:
-    def replay_or_recover_exact(self, *_args, **_kwargs):
-        return False, None
-
     def execute(
         self,
         _envelope,
@@ -737,6 +734,25 @@ class _Coordinator:
             validate_under_claim({"claim": "test"})
         result = effect({"claim": "test"})
         post_image()
+        if after_release is not None:
+            after_release()
+        return result
+
+    def execute_external_submission(
+        self,
+        _envelope,
+        *,
+        validate_under_claim,
+        submit,
+        commit_before_submit=None,
+        after_release=None,
+        **_kwargs,
+    ):
+        claim = {"claim": "test"}
+        validate_under_claim(claim)
+        if commit_before_submit is not None:
+            commit_before_submit()
+        result = submit(claim)
         if after_release is not None:
             after_release()
         return result
@@ -783,23 +799,11 @@ class _Coordinator:
 
 
 class _Headless:
-    applied_deployment: dict[str, Any] | None = None
-
-    def scenarios(self):
-        return {"scenario_catalog_revision": _DIGEST, "scenarios": []}
-
-    def scenario_program_selection(self, _scenario_id: str):
-        return {"program_binding": {"program_binding_id": _DIGEST}}
-
-    def scenario_load_selection(
-        self, _scenario_id: str, *, timeout_seconds: float | None = None
-    ):
-        assert timeout_seconds is None or timeout_seconds > 0
-        return {"deployment": deepcopy(self.applied_deployment)}
+    pass
 
 
 def _request(workspace: dict[str, Any], **extra: Any) -> dict[str, Any]:
-    local = extra.pop("local", True)
+    extra.pop("local", True)
     identity = workspace["authoringWorkspace"]
     request = {
         "draftId": workspace["draft"]["id"],
@@ -814,9 +818,6 @@ def _request(workspace: dict[str, Any], **extra: Any) -> dict[str, Any]:
         "expectedWorkspaceRevision": identity["workspaceRevision"],
         **extra,
     }
-    if not local:
-        request.pop("expectedWorkspaceEpoch")
-        request.pop("expectedWorkspaceRevision")
     return request
 
 
@@ -897,7 +898,7 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     )
     workspace = response.json()
     assert applied is not None
-    state.headless_client.applied_deployment = applied  # type: ignore[attr-defined]
+    state.applied_deployment_document = applied
     state.current_scenario = lambda: {  # type: ignore[method-assign]
         "ready": True,
         "current_scenario": {
@@ -1013,13 +1014,10 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     state.scenario_source_document_digest = "sha256:" + "6" * 64
     state.scenario_typed_parameter_overrides = {}
     capture_calls = 0
-    refuse_additional_capture = False
     capture_sources = routes_deployment_draft._capture_model_sources
 
     def counted_capture(*args, **kwargs):
-        nonlocal capture_calls, refuse_additional_capture
-        if refuse_additional_capture:
-            raise AssertionError("confirmation must not recapture model sources")
+        nonlocal capture_calls
         capture_calls += 1
         return capture_sources(*args, **kwargs)
 
@@ -1123,10 +1121,20 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
         return result
 
     state.execute_authored_deployment_candidate = execute_candidate  # type: ignore[method-assign]
-    prepared: list[tuple[str, str]] = []
-    state.prepare_current_applied_scene = lambda **kwargs: prepared.append(  # type: ignore[method-assign]
-        (kwargs["request_owner_epoch"], kwargs["request_id"])
+
+    class PreviewMustNotClaim(_Coordinator):
+        def execute_external_submission(self, *args, **kwargs):
+            pytest.fail("effect-free Deployment Preview must not claim admission")
+
+    coordinator = state.authoring_admission
+    state.authoring_admission = PreviewMustNotClaim()  # type: ignore[assignment]
+    preview = client.post(
+        "/api/deployment/draft/preview",
+        json=_request(edited, kind="preview", local=False),
     )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["result"]["status"] == "previewed"
+    state.authoring_admission = coordinator
 
     confirmation = client.post(
         "/api/deployment/draft/apply",
@@ -1138,12 +1146,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     assert current["deployment_revision"] == base_revision
     assert effects[-1][0]["program"] == program
     assert effects[-1][0]["deployment"] == edited["draft"]["document"]
-    assert prepared == []
     capture_calls_after_preparation = capture_calls
-    refuse_additional_capture = True
-    state.retained_deployment_candidate_input = (  # type: ignore[method-assign]
-        lambda _owner, _request: deepcopy(effects[-1][0])
-    )
 
     applied = client.post(
         "/api/deployment/draft/apply",
@@ -1160,88 +1163,128 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
             local=False,
         ),
     )
-    assert applied.status_code == 200, applied.text
+    assert applied.status_code == 202, applied.text
     assert applied.json()["result"]["status"] == "applied"
     # This UA2A regression proves preparation reuse only. The test double does
     # not publish the candidate bundle as Manager current; UA3 owns that live
     # transition, so assert the Manager-facing observation stayed unchanged.
     assert current["deployment_revision"] == base_revision
-    assert capture_calls == capture_calls_after_preparation
+    # Confirmation performs the same bounded source capture again and rejects
+    # a changed digest before Manager teardown; Composer retains no operation
+    # journal or hidden candidate package.
+    assert capture_calls == capture_calls_after_preparation + 2
     assert applied.json()["result"]["prepared_activation"] == (
         confirmation.json()["result"]["prepared_activation"]
     )
-    assert prepared == [("browser-test", "request-2-apply-confirmed")]
 
 
-def test_retained_confirmation_input_is_an_immutable_journal_copy() -> None:
+def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -> None:
     state = ComposerState()
-    retained = {
-        "operation_kind": "apply_deployment_candidate",
-        "captured_input_digest": "sha256:" + "1" * 64,
-        "model_source_closure": {"sources": [{"source_id": "robot"}]},
+    receipt = {
+        "expected_current": {
+            "retained_bundle_id": "sha256:" + "2" * 64,
+            "graph_revision": "sha256:" + "3" * 64,
+        },
+        "candidate_retained_bundle_id": "sha256:" + "4" * 64,
+        "candidate_graph_revision": "sha256:" + "5" * 64,
     }
-    transaction = SimpleNamespace(
-        complete=True,
-        effect_intent=retained,
-    )
-    state.authoring_admission = SimpleNamespace(
-        prepared_authoring_transaction=lambda _owner, _request: transaction
-    )
-
-    first = state.retained_deployment_candidate_input("owner", "request")
-    first["model_source_closure"]["sources"][0]["source_id"] = "changed"
-
-    second = state.retained_deployment_candidate_input("owner", "request")
-    assert second == retained
-
-
-def test_exact_candidate_replay_precedes_fresh_runtime_prerequisites(
-    tmp_path: Path,
-) -> None:
-    client, state = _client(tmp_path)
-    source = tmp_path / "cell_a.deployment.yaml"
-    source.write_text(json.dumps(_document()), encoding="utf-8")
-    workspace = client.get("/api/deployment/workspace").json()
-    opened = client.post(
-        "/api/deployment/open-draft",
-        json=_request(workspace, path=str(source), confirmDiscard=False, kind="open"),
-    ).json()
-    request = _request(opened, kind="apply-replay", local=False)
-    expected = {
-        "schemaVersion": "manyforge.composer_deployment_candidate_operation.v1",
-        "workspace": opened,
-        "result": {"status": "applied"},
+    prepared_activation = {
+        "prepared_activation_id": "sha256:" + "6" * 64,
+        "source_document_digest": "sha256:" + "7" * 64,
+        "captured_input_digest": "sha256:" + "8" * 64,
+        "deployment_artifact_id": "cell-a",
+        "deployment_revision": "sha256:" + "9" * 64,
+        "retained_bundle_id": receipt["candidate_retained_bundle_id"],
+        "graph_revision": receipt["candidate_graph_revision"],
+        "program_id": "program-a",
+        "program_revision": "sha256:" + "a" * 64,
+        "program_binding_id": "sha256:" + "b" * 64,
+        "node_environment_digest": "sha256:" + "c" * 64,
+        "assistant_mode": "forbidden",
+        "typed_parameter_overrides": {},
     }
+    manager_requests: list[dict[str, Any]] = []
 
-    class ExactReplay:
-        def replay_or_recover_exact(self, envelope, **kwargs):
-            assert envelope.request_id == request["requestId"]
-            assert kwargs["operation_kind"] == "apply_deployment_candidate"
-            return True, deepcopy(expected)
+    class Headless:
+        def manager_apply(self, body):
+            manager_requests.append(deepcopy(body))
+            return {
+                "ok": True,
+                "state": "pending",
+                "apply_id": "apply.1",
+                "apply_generation": 1,
+                "candidate_projection_revision": {
+                    "retained_bundle_id": receipt["candidate_retained_bundle_id"],
+                    "graph_revision": receipt["candidate_graph_revision"],
+                },
+            }
 
-        def execute(self, *_args, **_kwargs):
-            pytest.fail("exact replay must not start a fresh operation")
-
-    state.authoring_admission = ExactReplay()  # type: ignore[assignment]
-    state.headless_client = None
-    state.current_scenario = lambda: pytest.fail(  # type: ignore[method-assign]
-        "exact replay consulted mutable current Scenario state"
+    state.headless_client = Headless()  # type: ignore[assignment]
+    parent_claim = {"intent": {"owner_role": "authoring_owner"}}
+    result = state.execute_authored_deployment_candidate(
+        {},
+        parent_claim,
+        apply=True,
+        prepared={
+            "prepared_activation": prepared_activation,
+            "candidate_preview": {"candidate_receipt": receipt},
+            "manager_apply": {
+                "request_id": "request.1",
+                "request_owner_epoch": "manager.epoch.1",
+                "source_label": "manyforge_composer_deployment_apply",
+                "correlation_id": "browser.1",
+                "deployment_artifact_id": "cell-a",
+                "deployment_revision": "sha256:" + "9" * 64,
+                "expected_current": receipt["expected_current"],
+                "reject_if_affected_busy": True,
+                "prepared_activation": {
+                    key: prepared_activation[key]
+                    for key in (
+                        "captured_input_digest",
+                        "deployment_artifact_id",
+                        "deployment_revision",
+                        "program_binding_id",
+                        "prepared_activation_id",
+                    )
+                },
+                "expected_admission_generation": 7,
+                "candidate_receipt": receipt,
+            },
+            "confirmation_required": False,
+            "confirmation_token": None,
+            "preparation": None,
+            "phases_ms": {},
+        },
     )
-    preparations: list[dict[str, Any]] = []
-    state.prepare_current_applied_scene = lambda **kwargs: preparations.append(  # type: ignore[method-assign]
-        kwargs
+
+    assert result["status"] == "accepted"
+    assert manager_requests[0]["prepared_activation"]["program_binding_id"] == (
+        prepared_activation["program_binding_id"]
+    )
+    assert "expected_admission_generation" not in manager_requests[0]
+    assert manager_requests[0]["parent_authoring_claim"] == parent_claim
+
+
+def test_legacy_catalog_scenario_load_is_explicitly_retired(tmp_path: Path) -> None:
+    client, _state = _client(tmp_path)
+    draft = _state.draft_session.retained_state()
+
+    response = client.post(
+        "/api/scenarios/load",
+        json={
+            "scenarioId": "legacy-catalog-scenario",
+            "scenarioCatalogRevision": "sha256:" + "1" * 64,
+            "confirmDiscard": False,
+            "draftId": draft["draft_id"],
+            "expectedDraftRevision": draft["draft_revision"],
+            "expectedAdmissionGeneration": 1,
+            "requestOwnerEpoch": "browser.epoch.1",
+            "requestId": "browser.request.1",
+        },
     )
 
-    response = client.post("/api/deployment/draft/apply", json=request)
-
-    assert response.status_code == 200, response.text
-    assert response.json() == expected
-    assert preparations == [
-        {
-            "request_owner_epoch": request["requestOwnerEpoch"],
-            "request_id": request["requestId"],
-        }
-    ]
+    assert response.status_code == 410
+    assert response.json()["detail"]["code"] == "catalog_scenario_load_removed"
 
 
 def test_focused_motion_target_limit_updates_one_exact_target_atomically(
@@ -1506,68 +1549,6 @@ def test_deployment_draft_retained_state_round_trips_exactly() -> None:
 
     assert restored.retained_state() == retained
     assert restored.snapshot() == source.snapshot()
-
-
-def test_named_scenario_candidates_project_the_complete_exact_pairing(
-    tmp_path: Path,
-) -> None:
-    client, state = _client(tmp_path)
-    source = tmp_path / "cell_a.deployment.yaml"
-    source.write_text(json.dumps(_document()), encoding="utf-8")
-    initial = client.get("/api/deployment/workspace").json()
-    opened = client.post(
-        "/api/deployment/open-draft",
-        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
-    ).json()
-    deployment_revision = opened["draft"]["deploymentRevision"]
-    state.headless_client.scenarios = lambda: {  # type: ignore[method-assign]
-        "scenario_catalog_revision": _DIGEST,
-        "scenarios": [
-            {
-                "scenario_id": "cell-a",
-                "description": "Cell A",
-                "deployment_artifact_id": "cell_a",
-                "deployment_revision": deployment_revision,
-                "retained_bundle_id": _DIGEST,
-                "program_binding_id": _DIGEST,
-            }
-        ],
-    }
-
-    reads = []
-
-    def selection(scenario_id):
-        reads.append(scenario_id)
-        return {
-            **state.headless_client.scenarios()["scenarios"][0],
-            "scenario_catalog_revision": _DIGEST,
-            "program_id": "pick",
-            "program_revision": _DIGEST,
-        }
-
-    state.headless_client.scenario_load_selection = selection
-    result = client.get("/api/deployment/workspace").json()
-    candidate = result["scenarioCandidates"][0]
-    assert result["savedScenarioCandidates"] == [candidate]
-    assert reads == ["cell-a"]  # Draft and Saved reuse the one exact read.
-    assert candidate == {
-        "scenarioId": "cell-a",
-        "scenarioCatalogRevision": _DIGEST,
-        "deploymentArtifactId": "cell_a",
-        "deploymentRevision": deployment_revision,
-        "retainedBundleId": _DIGEST,
-        "programId": "pick",
-        "programRevision": _DIGEST,
-        "programBindingId": _DIGEST,
-        "description": "Cell A",
-    }
-    state.headless_client.scenario_load_selection = lambda scenario_id: {
-        **selection(scenario_id),
-        "program_binding_id": "sha256:" + "f" * 64,
-    }
-    crossed = client.get("/api/deployment/workspace").json()
-    assert crossed["scenarioCandidates"] == crossed["savedScenarioCandidates"] == []
-    assert "scenario_candidate_selection_mismatch" in crossed["unavailableReasons"]
 
 
 def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():

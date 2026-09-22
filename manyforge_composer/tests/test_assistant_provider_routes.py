@@ -97,7 +97,6 @@ def test_composer_forwards_exact_owner_context_without_owning_request_state(
     provider = RecordingProvider()
     state = ComposerState(
         headless_client=AdmissionHeadless(),  # type: ignore[arg-type]
-        authoring_state_root=str(tmp_path),
         assistant_client=provider,  # type: ignore[arg-type]
     )
     node = SimpleNamespace(

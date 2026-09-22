@@ -4,24 +4,24 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from contextvars import ContextVar
-from functools import wraps
 import hashlib
 import math
+from pathlib import Path
 from typing import Any, NoReturn
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from manyforge_behavior.canonical_artifact import (
     canonical_json_bytes,
+    raw_sha256_digest,
     StrictArtifactError,
 )
+from manyforge_behavior.model_source_capture import capture_deployment_model_sources
 from manyforge_behavior.program import Program, ProgramValidationError
 from manyforge_headless_api.client import HeadlessClientError
 from manyforge_headless_api.program_binding_transport import ProgramBindingTransportError
 from manyforge_headless_api.program_binding_projection import (
     validate_applied_program_selection,
-    validate_program_apply_result,
 )
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -100,14 +100,6 @@ _SOURCE_RESOLVED_MUTATIONS = frozenset(
     }
 )
 _DTO_CONFIG = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)
-_ACTIVE_AUTHORING_CLAIM: ContextVar[dict[str, Any] | None] = ContextVar(
-    "active_authoring_claim", default=None
-)
-_ACTIVE_AUTHORING_EFFECT: ContextVar[dict[str, Any] | None] = ContextVar(
-    "active_authoring_effect", default=None
-)
-
-
 class _DraftFence(BaseModel):
     model_config = _DTO_CONFIG
 
@@ -124,12 +116,25 @@ class _DraftFence(BaseModel):
         alias="requestOwnerEpoch", min_length=1, max_length=256
     )
     request_id: str = Field(alias="requestId", min_length=1, max_length=256)
+    expected_workspace_epoch: str = Field(
+        alias="expectedWorkspaceEpoch", min_length=1, max_length=256
+    )
+    expected_workspace_revision: int = Field(
+        alias="expectedWorkspaceRevision", ge=1, le=9_007_199_254_740_991
+    )
 
     def admission_envelope(self) -> AuthoringMutationEnvelope:
         return AuthoringMutationEnvelope(
             expected_admission_generation=self.expected_admission_generation,
             request_owner_epoch=self.request_owner_epoch,
             request_id=self.request_id,
+        )
+
+    def require_workspace_fence(self, identity) -> None:
+        require_captured_workspace_identity(
+            self.expected_workspace_epoch,
+            self.expected_workspace_revision,
+            identity,
         )
 
 
@@ -140,21 +145,7 @@ class _LocalDraftFence(_DraftFence):
     and keep the plain :class:`_DraftFence` shape.
     """
 
-    expected_workspace_epoch: str = Field(
-        alias="expectedWorkspaceEpoch", min_length=1, max_length=256
-    )
-    expected_workspace_revision: int = Field(
-        alias="expectedWorkspaceRevision", ge=1, le=9_007_199_254_740_991
-    )
-
-    def require_workspace_fence(
-        self, identity: "AuthoringWorkspaceIdentity"
-    ) -> None:
-        require_captured_workspace_identity(
-            self.expected_workspace_epoch,
-            self.expected_workspace_revision,
-            identity,
-        )
+    pass
 
 
 class DraftMutationRequest(_LocalDraftFence):
@@ -997,305 +988,88 @@ def _require_apply_ready(program: Program) -> None:
         )
 
 
-def _apply_program(
-    state: ComposerState,
-    *,
-    program: Program,
-    scenario_id: str,
-    scenario_catalog_revision: str,
-    expected_applied_record_digest: str | None,
-    authoring_claim: dict[str, Any],
-) -> dict[str, Any]:
-    _require_apply_ready(program)
-    if state.headless_client is None:
-        raise DraftSessionError(
-            "program_apply_unavailable",
-            "authoritative Program Apply requires a configured headless API",
-            status_code=503,
-        )
-    try:
-        candidate = Program.from_dict(
-            program.to_dict(),
-            _active_catalog(state),
-            path="<composer-program-apply>",
-        )
-    except ProgramValidationError as error:
-        raise DraftSessionError(
-            "composer_draft_validation_failed",
-            str(error),
-            detail=str(error),
-        ) from error
-    result = state.headless_client.program_apply(
-        {
-            "scenario_id": scenario_id,
-            "scenario_catalog_revision": scenario_catalog_revision,
-            "program": candidate.to_dict(),
-            "expected_applied_record_digest": expected_applied_record_digest,
-            "authoring_claim": authoring_claim,
-        }
-    )
-    try:
-        validate_program_apply_result(result)
-    except (ProgramBindingTransportError, TypeError, ValueError) as error:
-        raise DraftSessionError(
-            "program_apply_response_invalid",
-            "headless Program Apply returned a divergent result",
-            status_code=502,
-        ) from error
-    status = result.get("status")
-    applied = result.get("applied")
-    if (
-        result.get("schema_version") != "manyforge.program_apply_result.v2"
-        or status != "applied"
-        or not isinstance(applied, dict)
-        or applied.get("program_revision") != candidate.program_revision
-        or not isinstance(applied.get("source"), dict)
-        or not isinstance(applied["source"].get("record_digest"), str)
-    ):
-        raise DraftSessionError(
-            "program_apply_response_invalid",
-            "headless Program Apply returned a divergent result",
-            status_code=502,
-        )
-    return result
-
-
 def create_draft_router(state: ComposerState) -> APIRouter:
     """Expose revision-fenced authoring and thin authoritative Apply/Load."""
 
     router = APIRouter()
 
-    def retained_applied_context() -> dict[str, Any]:
-        context, reason = _applied_context(state)
-        if context is None:
-            return {"available": False, "reason": reason}
-        return {
-            "available": True,
-            "scenario_id": context.scenario_id,
-            "scenario_catalog_revision": context.scenario_catalog_revision,
-            "program_revision": context.program_revision,
-            "record_digest": context.record_digest,
-            "program_document": deepcopy(context.program_document),
-            "projection_document": deepcopy(context.projection_document),
-        }
+    def prepare_program_activation(
+        body: _DraftFence, program_document: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Prepare one complete immutable activation for a Program change."""
 
-    def prepare_authoring_effect(
-        body: _DraftFence, operation_kind: str
-    ) -> dict[str, Any]:
-        state.draft_session.require_current(
-            draft_id=body.draft_id,
-            expected_revision=body.expected_draft_revision,
-        )
-        pre_state = state.draft_session.retained_state()
-        prepared: dict[str, Any] = {
-            "schema_version": "manyforge.composer_authoring_effect.v1",
-            "operation_kind": operation_kind,
-            "effect_class": "local",
-            "pre_state": pre_state,
-        }
-        if operation_kind == "apply_draft":
-            document = pre_state["program"]
-            if document is None:
-                raise DraftSessionError(
-                    "composer_authoring_draft_incomplete",
-                    "Composer Draft has no strict Program candidate",
-                    status_code=409,
-                    detail={"diagnostics": pre_state["diagnostics"]},
-                )
-            _require_apply_ready(
-                Program.from_dict(document, _active_catalog(state), path="<apply-intent>")
-            )
-            try:
-                current_projection = state.current_scenario()
-            except HeadlessClientError as error:
-                raise headless_client_http_exception(error) from error
-            current = current_projection.get("current_scenario")
-            if current_projection.get("ready") is not True or not isinstance(
-                current, dict
-            ):
-                raise DraftSessionError(
-                    "program_current_scenario_unavailable",
-                    "Program Apply requires one exact current active Scenario; "
-                    "use Load Scenario first",
-                    status_code=409,
-                    detail={
-                        "unavailableReasons": current_projection.get(
-                            "unavailable_reasons", []
-                        )
-                    },
-                )
-            applied = retained_applied_context()
-            if applied["available"] is not True:
-                reason = applied.get("reason") or {
-                    "code": "program_applied_selection_invalid",
-                    "message": "Applied Program is absent",
-                }
-                raise DraftSessionError(
-                    reason["code"],
-                    reason["message"],
-                    status_code=502,
-                )
-            if (
-                current.get("scenario_id") != applied.get("scenario_id")
-                or current.get("scenario_catalog_revision")
-                != applied.get("scenario_catalog_revision")
-                or current.get("program_revision")
-                != applied.get("program_revision")
-            ):
-                raise DraftSessionError(
-                    "program_current_scenario_inconsistent",
-                    "current Scenario and Applied Program projections disagree",
-                    status_code=409,
-                )
-            prepared.update(
-                {
-                    "effect_class": "external",
-                    "external_kind": "program_apply",
-                    "program_document": deepcopy(document),
-                    "scenario_id": current["scenario_id"],
-                    "scenario_catalog_revision": current[
-                        "scenario_catalog_revision"
-                    ],
-                    "expected_applied_record_digest": applied["record_digest"],
-                    "applied_context": applied,
-                    "post_state": pre_state,
-                }
-            )
-        elif operation_kind == "revert_draft":
-            saved = pre_state["saved_document"]
-            if saved is None:
-                raise DraftSessionError(
-                    "composer_saved_program_unavailable",
-                    "Composer has no retained Saved Program",
-                    status_code=404,
-                )
-            applied = retained_applied_context()
-            if applied["available"] is not True:
-                reason = applied.get("reason") or {
-                    "code": "program_applied_selection_invalid",
-                    "message": "Applied Program is absent",
-                }
-                raise DraftSessionError(
-                    reason["code"],
-                    reason["message"],
-                    status_code=(
-                        404
-                        if reason["code"]
-                        == "program_applied_selection_not_found"
-                        else 502
-                        if reason["code"]
-                        == "program_applied_selection_invalid"
-                        else 503
-                    ),
-                )
-            post_state = deepcopy(pre_state)
-            if pre_state["program"] != saved:
-                post_state["draft_revision"] += 1
-                post_state["authoring"] = from_program(
-                    Program.from_dict(
-                        deepcopy(saved),
-                        _active_catalog(state),
-                        path="<revert-intent>",
-                    )
-                )
-                post_state["program"] = deepcopy(saved)
-                post_state["diagnostics"] = []
-            prepared.update(
-                {
-                    "effect_class": "external",
-                    "external_kind": "revert_program",
-                    "program_document": deepcopy(saved),
-                    "scenario_id": applied["scenario_id"],
-                    "scenario_catalog_revision": applied[
-                        "scenario_catalog_revision"
-                    ],
-                    "expected_applied_record_digest": applied["record_digest"],
-                    "applied_context": applied,
-                    "post_state": post_state,
-                }
-            )
-        return prepared
-
-    def authoring_effect(
-        body: _DraftFence,
-        operation_kind: str,
-        effect,
-    ):
-        """Run one external authoring effect through the durable owner.
-
-        Only the retained external callers use this: Program Apply and Revert.
-        Ordinary edits and saves commit through :func:`commit_local_authoring`
-        instead, and every local branch of :func:`prepare_authoring_effect` was
-        deleted when its last caller moved.
-        """
-
-        coordinator = state.authoring_admission
-        if coordinator is None:
-            raise HTTPException(
+        if state.headless_client is None:
+            raise DraftSessionError(
+                "program_apply_unavailable",
+                "Program activation requires the configured Manager",
                 status_code=503,
-                detail={
-                    "code": "authoring_not_ready",
-                    "message": "authoritative authoring admission is unavailable",
-                },
             )
-        prepared: dict[str, Any] = {}
-
-        def prepare() -> dict[str, Any]:
-            prepared.update(prepare_authoring_effect(body, operation_kind))
-            return prepared
-
-        def execute_effect(claim: dict[str, Any]):
-            claim_token = _ACTIVE_AUTHORING_CLAIM.set(claim)
-            effect_token = _ACTIVE_AUTHORING_EFFECT.set(prepared)
-            try:
-                return effect(claim)
-            finally:
-                _ACTIVE_AUTHORING_EFFECT.reset(effect_token)
-                _ACTIVE_AUTHORING_CLAIM.reset(claim_token)
-
-        try:
-            return coordinator.execute(
-                body.admission_envelope(),
-                operation_kind=operation_kind,
-                draft_id=body.draft_id,
-                draft_revision=body.expected_draft_revision,
-                payload=body.model_dump(mode="json", by_alias=True),
-                effect=execute_effect,
-                post_image=state.authoring_retained_state,
-                prepare_effect=prepare,
-                after_release=(
-                    lambda: state.prepare_current_applied_scene(
-                        request_owner_epoch=body.request_owner_epoch,
-                        request_id=body.request_id,
-                    )
-                    if operation_kind in {"apply_draft", "revert_draft"}
-                    else None
-                ),
+        deployment = state.deployment_draft_session.retained_state().get("document")
+        assignment = deepcopy(state.scenario_program_role_assignment)
+        source_digest = state.scenario_source_document_digest
+        project_path = state.scenario_document_path
+        if (
+            not isinstance(deployment, dict)
+            or not isinstance(assignment, dict)
+            or not isinstance(source_digest, str)
+            or not isinstance(project_path, str)
+        ):
+            raise DraftSessionError(
+                "activation_input_incomplete",
+                "Program Apply requires a complete Scenario workspace",
+                status_code=409,
             )
-        except (DraftSessionError, ProgramArtifactError) as error:
-            _raise_workspace_error(error)
-
-    def authoring_gate(endpoint):
-        @wraps(endpoint)
-        def guarded(body):
-            def invoke(_claim: dict[str, Any]):
-                return endpoint(body)
-
-            return authoring_effect(body, endpoint.__name__, invoke)
-
-        return guarded
-
-    def active_authoring_claim() -> dict[str, Any]:
-        claim = _ACTIVE_AUTHORING_CLAIM.get()
-        if claim is None:
-            raise RuntimeError("authoring claim context is absent")
-        return claim
-
-    def active_authoring_effect() -> dict[str, Any]:
-        effect = _ACTIVE_AUTHORING_EFFECT.get()
-        if effect is None:
-            raise RuntimeError("authoring effect context is absent")
-        return effect
+        source_closure = capture_deployment_model_sources(
+            deployment, project_root=Path(project_path)
+        )
+        overrides = deepcopy(state.scenario_typed_parameter_overrides)
+        captured_digest = raw_sha256_digest(
+            canonical_json_bytes(
+                {
+                    "source_document_digest": source_digest,
+                    "deployment": deployment,
+                    "model_source_closure": source_closure,
+                    "program": program_document,
+                    "program_role_assignment": assignment,
+                    "typed_parameter_overrides": overrides,
+                }
+            )
+        )
+        bundle, graph, _manager_epoch = state._manager_current(
+            state.headless_client.manager_status()
+        )
+        intent = {
+            "source_document_digest": source_digest,
+            "captured_input_digest": captured_digest,
+            "deployment": deepcopy(deployment),
+            "model_source_closure": source_closure,
+            "program": deepcopy(program_document),
+            "program_role_assignment": assignment,
+            "typed_parameter_overrides": overrides,
+            "expected_manager_current": {
+                "retained_bundle_id": bundle,
+                "graph_revision": graph,
+            },
+            "expected_admission_generation": body.expected_admission_generation,
+            "manager_request_id": "program-activation-"
+            + hashlib.sha256(
+                f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
+            ).hexdigest()[:32],
+            "correlation_id": body.request_id,
+            "confirmation_token": None,
+            "draft_id": body.draft_id,
+            "draft_revision": body.expected_draft_revision,
+        }
+        prepared = state.execute_authored_deployment_candidate(
+            intent, None, apply=True, prepare_only=True
+        )
+        if prepared.get("confirmation_required") is True:
+            raise DraftSessionError(
+                "program_apply_confirmation_required",
+                "Program Apply unexpectedly changed Deployment structure",
+                status_code=409,
+            )
+        return intent, prepared
 
     @router.get("/api/program/draft")
     def read_draft() -> dict[str, Any]:
@@ -1625,35 +1399,59 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             _raise_workspace_error(error)
 
     @router.post("/api/program/apply")
-    @authoring_gate
     def apply_draft(body: ApplyDraftRequest) -> JSONResponse:
         try:
-            prepared = active_authoring_effect()
-
-            def apply_current_program(program: Program) -> dict[str, Any]:
-                _require_apply_ready(program)
-                return _apply_program(
-                    state,
-                    program=program,
-                    scenario_id=prepared["scenario_id"],
-                    scenario_catalog_revision=prepared[
-                        "scenario_catalog_revision"
-                    ],
-                    expected_applied_record_digest=prepared[
-                        "expected_applied_record_digest"
-                    ],
-                    authoring_claim=active_authoring_claim(),
+            retained = state.draft_session.retained_state()
+            document = retained.get("program")
+            if not isinstance(document, dict):
+                raise DraftSessionError(
+                    "composer_authoring_draft_incomplete",
+                    "Composer Draft has no strict Program candidate",
+                    status_code=409,
                 )
+            program = Program.from_dict(
+                document, _active_catalog(state), path="<composer-program-apply>"
+            )
+            _require_apply_ready(program)
+            intent, prepared = prepare_program_activation(body, program.to_dict())
+            coordinator = state.authoring_admission
+            if coordinator is None:
+                raise DraftSessionError(
+                    "authoring_not_ready",
+                    "authoritative authoring admission is unavailable",
+                    status_code=503,
+                )
+            identity = state.authoring_workspace.identity()
+            body.require_workspace_fence(identity)
 
-            result = state.draft_session.apply_current_program(
+            def validate_submission(_claim: dict[str, Any]) -> None:
+                body.require_workspace_fence(state.authoring_workspace.identity())
+                state.draft_session.require_current(
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                )
+                if state.draft_session.retained_state() != retained:
+                    raise DraftSessionError(
+                        "composer_draft_stale",
+                        "Program Draft changed before activation submission",
+                        status_code=409,
+                    )
+
+            result = coordinator.execute_external_submission(
+                body.admission_envelope(),
+                operation_kind="apply_program",
                 draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                applier=apply_current_program,
+                draft_revision=body.expected_draft_revision,
+                payload=body.model_dump(mode="json", by_alias=True),
+                validate_under_claim=validate_submission,
+                submit=lambda claim: state.execute_authored_deployment_candidate(
+                    intent, claim, apply=True, prepared=prepared
+                ),
             )
             return JSONResponse(
-                status_code=200,
+                status_code=202,
                 content={
-                    "status": "applied",
+                    "status": "accepted",
                     "headless": result,
                     "workspace": _workspace(state),
                 },
@@ -1662,17 +1460,19 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             _raise_workspace_error(error)
 
     @router.post("/api/scenarios/load")
-    def load_scenario(body: LoadScenarioRequest) -> JSONResponse:
-        try:
-            result = state.load_scenario(
-                body.admission_envelope(),
-                scenario_id=body.scenario_id,
-                expected_catalog_revision=body.scenario_catalog_revision,
-                confirm_discard=body.confirm_discard,
-            )
-            return JSONResponse(status_code=200, content=result)
-        except Exception as error:
-            _raise_workspace_error(error)
+    def load_scenario(_body: LoadScenarioRequest) -> None:
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "code": "catalog_scenario_load_removed",
+                "message": (
+                    "Catalog Scenario activation was removed because it cannot "
+                    "provide the immutable source closure required by unified "
+                    "activation. Open a complete v2 Scenario document, then "
+                    "Apply its Deployment or Program."
+                ),
+            },
+        )
 
     @router.post("/api/program/load")
     def removed_program_load() -> None:
@@ -1690,7 +1490,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
     @router.post("/api/program/discard")
     def discard_draft(body: DiscardDraftRequest) -> dict[str, Any]:
         try:
-            def read_applied() -> Program:
+            def read_applied() -> tuple[Program, tuple[str, str, str]]:
                 context, reason = _applied_context(state)
                 if reason is not None or context is None:
                     raise DraftSessionError(
@@ -1731,15 +1531,31 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                         "headless Applied Program content is divergent",
                         status_code=502,
                     )
-                return candidate
+                return candidate, (
+                    context.scenario_id,
+                    context.program_revision,
+                    context.record_digest,
+                )
 
+            applied_program, applied_identity = read_applied()
             prepared = state.draft_session.prepare_discard_replacement(
-                read_applied()
+                applied_program
             )
+
+            def validate_applied_under_claim() -> None:
+                _program, current_identity = read_applied()
+                if current_identity != applied_identity:
+                    raise DraftSessionError(
+                        "program_applied_changed",
+                        "Applied Program changed before Discard committed",
+                        status_code=409,
+                    )
+
             commit = commit_local_authoring(
                 state,
                 body,
                 operation_kind="discard_draft",
+                validate_under_claim=validate_applied_under_claim,
                 install=lambda: state.draft_session.install_prepared_replacement(
                     prepared,
                     expected_draft_id=body.draft_id,
@@ -1753,99 +1569,84 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         except Exception as error:
             _raise_workspace_error(error)
 
-    @router.post("/api/program/revert")
-    @authoring_gate
+    @router.post("/api/program/revert", status_code=202)
     def revert_draft(body: RevertDraftRequest) -> JSONResponse:
         try:
-            def prepare_revert(
-                saved_document: dict[str, Any],
-            ) -> tuple[Program, Program, _AppliedContext]:
-                context, reason = _applied_context(state)
-                if reason is not None or context is None:
-                    raise DraftSessionError(
-                        (
-                            reason["code"]
-                            if reason
-                            else "program_applied_selection_invalid"
-                        ),
-                        reason["message"] if reason else "Applied Program is absent",
-                        status_code=(
-                            404
-                            if reason
-                            and reason["code"]
-                            == "program_applied_selection_not_found"
-                            else
-                            502
-                            if reason
-                            and reason["code"]
-                            == "program_applied_selection_invalid"
-                            else 503
-                        ),
-                    )
-                catalog = _active_catalog(state)
-                try:
-                    validated_saved = Program.from_dict(
-                        saved_document,
-                        catalog,
-                        path="<composer-program-revert-saved>",
-                    )
-                    applied = Program.from_dict(
-                        context.program_document,
-                        catalog,
-                        path="<composer-program-revert-applied>",
-                    )
-                except ProgramValidationError as error:
-                    raise DraftSessionError(
-                        "composer_revert_program_validation_failed",
-                        str(error),
-                        status_code=409,
-                        detail=str(error),
-                    ) from error
-                return validated_saved, applied, context
-
-            def apply_saved(
-                program: Program,
-                context: _AppliedContext,
-            ) -> dict[str, Any]:
-                result = _apply_program(
-                    state,
-                    program=program,
-                    scenario_id=context.scenario_id,
-                    scenario_catalog_revision=context.scenario_catalog_revision,
-                    expected_applied_record_digest=context.record_digest,
-                    authoring_claim=active_authoring_claim(),
+            retained = state.draft_session.retained_state()
+            saved_document = retained.get("saved_document")
+            if not isinstance(saved_document, dict):
+                raise DraftSessionError(
+                    "composer_saved_program_unavailable",
+                    "Composer has no retained Saved Program",
+                    status_code=404,
                 )
-                selected, selected_reason = _applied_context(state)
-                receipt = result["applied"]
-                if (
-                    selected_reason is not None
-                    or selected is None
-                    or selected.program_document != program.to_dict()
-                    or selected.program_revision != program.program_revision
-                    or selected.projection_document != receipt
-                    or selected.record_digest
-                    != receipt["source"]["record_digest"]
-                ):
+            saved_program = Program.from_dict(
+                saved_document,
+                _active_catalog(state),
+                path="<composer-program-revert-saved>",
+            )
+            intent, prepared = prepare_program_activation(
+                body, saved_program.to_dict()
+            )
+            replacement_state = deepcopy(retained)
+            if replacement_state.get("program") != saved_document:
+                replacement_state["draft_revision"] += 1
+            replacement_state["program"] = deepcopy(saved_document)
+            replacement_state["authoring"] = from_program(saved_program)
+            replacement_state["diagnostics"] = []
+            replacement = state.draft_session.prepare_load_replacement(
+                replacement_state, _active_catalog(state)
+            )
+            coordinator = state.authoring_admission
+            if coordinator is None:
+                raise DraftSessionError(
+                    "authoring_not_ready",
+                    "authoritative authoring admission is unavailable",
+                    status_code=503,
+                )
+            identity = state.authoring_workspace.identity()
+            body.require_workspace_fence(identity)
+
+            def validate_submission(_claim: dict[str, Any]) -> None:
+                body.require_workspace_fence(state.authoring_workspace.identity())
+                if state.draft_session.retained_state() != retained:
                     raise DraftSessionError(
-                        "program_apply_selection_stale",
-                        "Applied Program changed before Revert could commit its "
-                        "local Draft identity",
+                        "composer_draft_stale",
+                        "Program Draft changed before Revert submission",
                         status_code=409,
                     )
-                return result
 
-            result, _snapshot = state.draft_session.revert_saved_after_apply(
+            def commit_saved() -> None:
+                state.authoring_workspace.commit_program(
+                    draft_id=body.draft_id,
+                    expected_identity=identity,
+                    install=lambda: state.draft_session.install_prepared_replacement(
+                        replacement,
+                        expected_draft_id=body.draft_id,
+                        expected_revision=body.expected_draft_revision,
+                    ),
+                    notify=False,
+                )
+
+            result = coordinator.execute_external_submission(
+                body.admission_envelope(),
+                operation_kind="revert_program",
                 draft_id=body.draft_id,
-                expected_revision=body.expected_draft_revision,
-                prepare=prepare_revert,
-                applier=apply_saved,
+                draft_revision=body.expected_draft_revision,
+                payload=body.model_dump(mode="json", by_alias=True),
+                validate_under_claim=validate_submission,
+                commit_before_submit=commit_saved,
+                submit=lambda claim: state.execute_authored_deployment_candidate(
+                    intent, claim, apply=True, prepared=prepared
+                ),
+                after_release=state.authoring_workspace.publish_commit_wake,
             )
             return JSONResponse(
-                status_code=200,
+                status_code=202,
                 content={
-                    "status": "reverted",
+                    "status": "accepted",
                     "headless": result,
-                    "workspace": _snapshot,
+                    "workspace": _workspace(state),
                 },
             )
         except Exception as error:

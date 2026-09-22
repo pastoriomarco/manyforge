@@ -118,8 +118,6 @@ def _start_manager(root: Path) -> subprocess.Popen[bytes]:
             str(root / "logical-scene.sqlite3"),
             "--program-cycle-journal",
             str(root / "program-cycle.sqlite3"),
-            "--authoring-transaction-journal",
-            str(root / "authoring-transactions.sqlite3"),
             "--projection-root",
             str(publication_root),
             "--reconciliation-period-ms",

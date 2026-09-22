@@ -913,15 +913,6 @@ def create_app(
     ) -> dict[str, Any]:
         return service.scenario_program_selection(scenario_id)
 
-    @app.get("/api/scenarios/{scenario_id}/load-selection")
-    def scenario_load_selection(
-        scenario_id: Annotated[
-            str,
-            Path(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
-        ],
-    ) -> dict[str, Any]:
-        return service.scenario_load_selection(scenario_id)
-
     @app.get("/api/program/applied")
     def program_applied() -> dict[str, Any]:
         return service.program_applied()

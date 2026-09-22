@@ -41,6 +41,10 @@ def _facts() -> dict[str, Any]:
                                 {"capability_id": "execution.contact.geometric"},
                                 {"capability_id": "execution.stop.soft"},
                             ],
+                            "controllable_components": [{
+                                "controllable_component_id": "robot-a",
+                                "runtime_unit_ids": ["robot.native"],
+                            }],
                         },
                     },
                     "runtime": {
@@ -149,7 +153,7 @@ def test_ready_overview_keeps_normal_terminal_cycle_out_of_health() -> None:
 
     overview = build_component_overview(**facts)
 
-    assert overview["schema_version"] == "manyforge.component_overview.v1"
+    assert overview["schema_version"] == "manyforge.component_overview.v2"
     assert overview["readiness"] == "ready"
     assert overview["overview_revision"].startswith("sha256:")
     assert _by_id(overview)["program_runner"]["detail"] == (
@@ -193,6 +197,77 @@ def test_expected_manager_convergence_is_waiting_without_operator_retry() -> Non
     assert _by_id(overview)["manager"]["reason_code"] == (
         "manager_runtime_converging"
     )
+
+
+def test_admitted_maintenance_exposes_one_stable_reason_without_hiding_faults() -> None:
+    facts = _facts()
+    manager = facts["runtime"]["sections"]["manager"]["payload"]
+    manager["manager_ready"] = False
+    manager["runtime"]["converged"] = False
+    manager["runtime"]["observed_units"][0].update(
+        {"converged": False, "source_health": "unavailable"}
+    )
+    manager["apply"] = {
+        "records": [{
+            "apply_id": "apply-1",
+            "apply_generation": 4,
+            "phase": "runtime_convergence_pending",
+            "incomplete": True,
+            "fence": {
+                "scope": {"controllable_component_ids": ["robot-a"]},
+                "state": "held",
+            },
+        }]
+    }
+
+    overview = build_component_overview(**facts)
+
+    assert overview["readiness"] == "waiting"
+    assert overview["maintenance_operation"] == {
+        "apply_id": "apply-1",
+        "apply_generation": 4,
+        "phase": "runtime_convergence_pending",
+        "affected_runtime_unit_ids": ["robot.native"],
+        "reason_code": "planned_maintenance_in_progress",
+    }
+    assert _by_id(overview)["manager"]["reason_code"] == (
+        "planned_maintenance_in_progress"
+    )
+    assert _by_id(overview)["runtime_unit:robot.native"]["status"] == "waiting"
+    assert "Controls remain disabled" in overview["user_message"]
+
+    facts["source_model"]["source"]["freshness"] = "stale"
+    stale_viewer = build_component_overview(**facts)
+    assert _by_id(stale_viewer)["viewer_model"]["reason_code"] == "source_stale"
+    assert stale_viewer["maintenance_operation"] == overview[
+        "maintenance_operation"
+    ]
+
+    manager["apply"]["records"] = []
+    outside_maintenance = build_component_overview(**facts)
+    assert outside_maintenance["maintenance_operation"] is None
+    assert _by_id(outside_maintenance)["runtime_unit:robot.native"]["status"] == (
+        "fault"
+    )
+
+    manager["apply"]["records"] = [{
+        "apply_id": "apply-2",
+        "apply_generation": 1,
+        "phase": "fence_acquire_pending",
+        "incomplete": True,
+        "fence": {"scope": {"controllable_component_ids": ["robot-a"]}, "state": "acquire_pending"},
+    }]
+    before_admission = build_component_overview(**facts)
+    assert before_admission["maintenance_operation"] is None
+    assert _by_id(before_admission)["runtime_unit:robot.native"]["status"] == "fault"
+
+    manager["apply"]["records"][0].update({
+        "phase": "runtime_convergence_pending",
+        "fence": {"scope": {"controllable_component_ids": ["another-robot"]}, "state": "held"},
+    })
+    unrelated_scope = build_component_overview(**facts)
+    assert unrelated_scope["maintenance_operation"] is None
+    assert _by_id(unrelated_scope)["runtime_unit:robot.native"]["status"] == "fault"
 
 
 def test_returned_attention_does_not_relabel_health_but_active_fault_does() -> None:
