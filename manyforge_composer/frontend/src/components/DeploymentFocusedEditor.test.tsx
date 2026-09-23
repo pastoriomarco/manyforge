@@ -12,6 +12,11 @@ function controller(): DeploymentWorkspaceController {
   return {
     workspace: {
       schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+      authoringWorkspace: {
+        workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
+        programDraftId: 'draft-1', programDraftRevision: 1,
+        deploymentDraftId: 'deployment-draft-1', deploymentDraftRevision: 1,
+      },
       draft: {
         id: 'deployment-draft-1',
         revision: 1,

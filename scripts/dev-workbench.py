@@ -374,8 +374,10 @@ def _ensure_project_bootstrap_package(
             typed_parameter_overrides=overrides,
         )
     except HeadlessApiError as error:
+        detail = error.details.get("preparer_detail") if error.details else None
         raise WorkbenchError(
-            f"selected startup project could not be prepared: {error}"
+            "selected startup project could not be prepared: "
+            f"{detail or error}"
         ) from error
     admission_filename = f"canonical-empty-admission.{cell_id}.json"
     _regular_file(

@@ -106,6 +106,7 @@ class SaveScenarioDocumentRequest(_ScenarioFence):
 class LoadScenarioDocumentRequest(_ScenarioFence):
     path: str = Field(min_length=1, max_length=4096)
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
+    confirm_deployment: bool = Field(default=False, alias="confirmDeployment")
     activate: bool = False
 
 
@@ -521,11 +522,38 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     activation_intent, None, apply=True, prepare_only=True
                 )
                 if activation_prepared.get("confirmation_required") is True:
-                    raise ScenarioArtifactError(
-                        "scenario_activation_confirmation_required",
-                        "Scenario activation requires explicit Deployment confirmation",
-                        status_code=409,
+                    if not body.confirm_deployment:
+                        raise ScenarioArtifactError(
+                            "scenario_activation_confirmation_required",
+                            "Scenario activation requires explicit Deployment confirmation",
+                            status_code=409,
+                        )
+                    token = activation_prepared.get("confirmation_token")
+                    if not isinstance(token, str) or not token:
+                        raise ScenarioArtifactError(
+                            "scenario_activation_confirmation_unavailable",
+                            "Deployment confirmation has no exact preview identity",
+                            status_code=503,
+                        )
+                    activation_intent["confirmation_token"] = token
+                    confirmed = state.execute_authored_deployment_candidate(
+                        activation_intent, None, apply=True, prepare_only=True
                     )
+                    if (
+                        confirmed.get("confirmation_required") is not False
+                        or confirmed.get("prepared_activation", {}).get(
+                            "prepared_activation_id"
+                        )
+                        != activation_prepared.get("prepared_activation", {}).get(
+                            "prepared_activation_id"
+                        )
+                    ):
+                        raise ScenarioArtifactError(
+                            "scenario_activation_confirmation_stale",
+                            "Deployment changed during confirmation",
+                            status_code=409,
+                        )
+                    activation_prepared = confirmed
             current_program = state.draft_session.retained_state()
             current_deployment = state.deployment_draft_session.retained_state()
             if not body.confirm_discard and not state.current_drafts_match_remembered_scenario() and (
@@ -596,15 +624,47 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 )
                 manager_apply = activation_prepared.get("manager_apply")
                 if isinstance(manager_apply, dict):
+                    # The local workspace commit advances admission. A preview
+                    # receipt from before that commit cannot authorize Apply;
+                    # refresh only the cheap Manager preview, not preparation.
+                    selected = activation_prepared["prepared_activation"]
+                    refreshed = state.headless_client.manager_deployment_candidate_preview(
+                        {
+                            "prepared_activation_id": selected["prepared_activation_id"],
+                            "candidate_retained_bundle_id": selected["retained_bundle_id"],
+                            "candidate_graph_revision": selected["graph_revision"],
+                            "deployment_artifact_id": selected["deployment_artifact_id"],
+                            "deployment_revision": selected["deployment_revision"],
+                            "expected_current": manager_apply["expected_current"],
+                            "expected_admission_generation": commit.admission_generation,
+                            "request_owner_epoch": manager_apply["request_owner_epoch"],
+                        }
+                    )
+                    receipt = refreshed.get("candidate_receipt")
+                    previous = activation_prepared["candidate_preview"]
+                    if (
+                        refreshed.get("ok") is not True
+                        or not isinstance(receipt, dict)
+                        or refreshed.get("diff") != previous.get("diff")
+                        or receipt.get("prepared_activation_id")
+                        != selected["prepared_activation_id"]
+                    ):
+                        raise ScenarioArtifactError(
+                            "scenario_activation_preview_changed",
+                            "Deployment preview changed after the workspace commit",
+                            status_code=409,
+                        )
+                    manager_apply["candidate_receipt"] = receipt
                     manager_apply["expected_admission_generation"] = (
                         commit.admission_generation
                     )
+                    activation_prepared["candidate_preview"] = refreshed
                 activation_envelope = AuthoringMutationEnvelope(
                     expected_admission_generation=commit.admission_generation,
                     request_owner_epoch=body.request_owner_epoch,
                     request_id=body.request_id + ".activate",
                 )
-                committed_identity = commit.snapshot.identity()
+                committed_identity = commit.snapshot.identity
 
                 def validate_activation(_claim: dict[str, Any]) -> None:
                     if state.authoring_workspace.identity() != committed_identity:

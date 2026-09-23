@@ -6924,12 +6924,17 @@ CanonicalNullableText(const std::optional<std::string> &value) {
       }
     }
     if (ordinary_jerk_settings != nullptr) {
-      Require(motion_runtime_policy &&
-                  motion_runtime_policy->value().ordinary_motion_jerk,
-              "ordinary jerk descriptor requires its resolved policy");
-      const auto &profile =
-          *motion_runtime_policy->value().ordinary_motion_jerk;
       const auto &settings = *ordinary_jerk_settings;
+      const auto *profile =
+          motion_runtime_policy && motion_runtime_policy->value().ordinary_motion_jerk
+              ? &*motion_runtime_policy->value().ordinary_motion_jerk
+              : nullptr;
+      if (settings.enabled) {
+        Require(profile != nullptr && profile->enabled,
+                "enabled ordinary jerk descriptor requires its resolved policy");
+      } else {
+        effective_jerk = CanonicalValue(nullptr);
+      }
       const auto setting = std::find_if(
           settings.joint_limits.begin(), settings.joint_limits.end(),
           [&](const auto &row) {
@@ -6940,7 +6945,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
               ? &*setting->imported
               : nullptr;
       const char *source =
-          !profile.enabled ? "off"
+          !settings.enabled ? "off"
           : setting != settings.joint_limits.end() && setting->override_rad_s3
               ? "override"
           : imported != nullptr && imported->enabled ? "imported"
@@ -6949,10 +6954,10 @@ CanonicalNullableText(const std::optional<std::string> &value) {
           {"source_joint_name", CanonicalValue(*resource.source_joint_name)},
           {"source", CanonicalValue(source)},
           {"maximum_rad_s3",
-           profile.enabled
+           settings.enabled
                ? CanonicalValue(
                      std::get<core::AngularJerkDTO>(
-                         profile.limits.at(*resource.source_joint_name))
+                         profile->limits.at(*resource.source_joint_name))
                          .value_rad_s3)
                : CanonicalValue(nullptr)},
           {"preset_rad_s3",

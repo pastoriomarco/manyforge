@@ -326,6 +326,11 @@ function workspaceFixture(): Record<string, unknown> {
   };
   return {
     schemaVersion: 'manyforge.composer_program_workspace.v2',
+    authoringWorkspace: {
+      workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
+      programDraftId: 'draft-1', programDraftRevision: 1,
+      deploymentDraftId: 'deployment-draft-1', deploymentDraftRevision: 1,
+    },
     draft: {
       draftId: 'draft-1',
       draftRevision: 1,

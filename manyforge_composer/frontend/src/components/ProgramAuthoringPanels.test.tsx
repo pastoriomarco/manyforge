@@ -691,6 +691,11 @@ describe('Program authoring panels', () => {
         pendingAction: null,
         workspace: {
           schemaVersion: 'manyforge.composer_program_workspace.v2',
+          authoringWorkspace: {
+            workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
+            programDraftId: 'empty-draft', programDraftRevision: 0,
+            deploymentDraftId: 'deployment-draft-1', deploymentDraftRevision: 1,
+          },
           draft: {
             draftId: 'empty-draft',
             draftRevision: 0,
@@ -832,6 +837,11 @@ describe('Program authoring panels', () => {
     };
     const blockedWorkspace: ProgramWorkspaceResponse = {
       schemaVersion: 'manyforge.composer_program_workspace.v2',
+      authoringWorkspace: {
+        workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
+        programDraftId: 'draft-blocked', programDraftRevision: 2,
+        deploymentDraftId: 'deployment-draft-1', deploymentDraftRevision: 1,
+      },
       draft: {
         draftId: 'draft-blocked',
         draftRevision: 2,

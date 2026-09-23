@@ -1051,11 +1051,10 @@ create_retained_native_runtime_participants(
         "linear-speed maximum");
   }
 
-  if (input.ordinary_motion_jerk) {
-    if (!motion_runtime_policy ||
-        (input.ordinary_motion_jerk->enabled && input.backend_factory))
-      throw std::invalid_argument(
-          "ordinary jerk profile requires a qualified native execution policy");
+  if (input.ordinary_motion_jerk && input.ordinary_motion_jerk->enabled &&
+      (!motion_runtime_policy || input.backend_factory)) {
+    throw std::invalid_argument(
+        "ordinary jerk profile requires a qualified native execution policy");
   }
 
   auto runtime = std::make_shared<RetainedNativeRuntime>(input.motion_binding,
@@ -1116,7 +1115,7 @@ create_retained_native_runtime_participants(
           runtime->motion_state_channel->publication());
   runtime->kinematics = std::make_unique<RetainedRoboPlanKinematicsAdapter>(
       runtime->motion_binding, runtime->scene, runtime->scene_mutex);
-  if (input.ordinary_motion_jerk) {
+  if (input.ordinary_motion_jerk && input.ordinary_motion_jerk->enabled) {
     auto limits = runtime->kinematics->joint_limits(
         motion_value.controllable_component_id.value(),
         motion_value.command_target_id.value());

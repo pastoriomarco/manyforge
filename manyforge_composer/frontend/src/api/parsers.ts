@@ -2764,12 +2764,35 @@ function parseProgramDraftApplicability(
   return { applyReady, affectedInstanceIds, unavailableReason };
 }
 
+function parseWorkspaceResponseIdentity(value: unknown): AuthoringWorkspaceIdentity {
+  const path = 'workspace.authoringWorkspace';
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'workspaceEpoch', 'workspaceRevision', 'programDraftId',
+    'programDraftRevision', 'deploymentDraftId', 'deploymentDraftRevision',
+  ], path);
+  const identity = parseAuthoringWorkspaceIdentity({
+    workspace_epoch: record.workspaceEpoch,
+    workspace_revision: record.workspaceRevision,
+    program_draft_id: record.programDraftId,
+    program_draft_revision: record.programDraftRevision,
+    deployment_draft_id: record.deploymentDraftId,
+    deployment_draft_revision: record.deploymentDraftRevision,
+  }, path);
+  if (!identity.workspaceEpoch || !identity.programDraftId || !identity.deploymentDraftId
+    || identity.programDraftRevision < 0 || identity.deploymentDraftRevision < 0) {
+    return fail(path, 'non-empty identities and non-negative Draft revisions');
+  }
+  return identity;
+}
+
 export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceResponse {
   const record = objectAt(value, 'programWorkspace');
   exactKeysAt(
     record,
     [
       'schemaVersion',
+      'authoringWorkspace',
       'draft',
       'applicability',
       'saved',
@@ -2784,6 +2807,11 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
     return fail('programWorkspace.schemaVersion', 'the supported workspace version');
   }
   const draft = parseProgramDraftProjection(record.draft, 'programWorkspace.draft');
+  const authoringWorkspace = parseWorkspaceResponseIdentity(record.authoringWorkspace);
+  if (authoringWorkspace.programDraftId !== draft.draftId
+    || authoringWorkspace.programDraftRevision !== draft.draftRevision) {
+    return fail('programWorkspace.authoringWorkspace', 'the exact Program Draft identity');
+  }
   const applicability = parseProgramDraftApplicability(
     record.applicability,
     'programWorkspace.applicability',
@@ -2843,6 +2871,7 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
   }
   return {
     schemaVersion,
+    authoringWorkspace,
     draft,
     applicability,
     saved,
@@ -3220,7 +3249,7 @@ export function parseDeploymentWorkspaceResponse(
   exactKeysAt(record, [
     'schemaVersion', 'draft', 'saved', 'managerApplied', 'runAdmission',
     'binding', 'scenarioCandidates', 'savedScenarioCandidates',
-    'unavailableReasons',
+    'unavailableReasons', 'authoringWorkspace',
   ], path);
   const schemaVersion = stringAt(record.schemaVersion, `${path}.schemaVersion`);
   if (schemaVersion !== 'manyforge.composer_deployment_workspace.v1') {
@@ -3231,6 +3260,11 @@ export function parseDeploymentWorkspaceResponse(
     'id', 'revision', 'document', 'deploymentArtifactId',
     'deploymentRevision', 'graphRevision', 'differsFromSaved',
   ], `${path}.draft`);
+  const authoringWorkspace = parseWorkspaceResponseIdentity(record.authoringWorkspace);
+  if (authoringWorkspace.deploymentDraftId !== draftRecord.id
+    || authoringWorkspace.deploymentDraftRevision !== draftRecord.revision) {
+    return fail(`${path}.authoringWorkspace`, 'the exact Deployment Draft identity');
+  }
   const document = draftRecord.document === null
     ? null
     : jsonRecordAt(draftRecord.document, `${path}.draft.document`);
@@ -3249,13 +3283,33 @@ export function parseDeploymentWorkspaceResponse(
     deploymentRevision,
     graphRevision,
   ].filter((identity) => identity === null).length;
+  const authoredIntent = document?.api_version === 'manyforge.deployment_intent.v1';
   if (
     (document === null && missingDraftIdentities !== 3)
-    || (document !== null && missingDraftIdentities !== 0)
+    || (document !== null && !authoredIntent && missingDraftIdentities !== 0)
+    || (authoredIntent && (deploymentArtifactId === null
+      || deploymentRevision !== null || graphRevision !== null))
   ) {
     return fail(`${path}.draft`, 'complete identities exactly when a document is loaded');
   }
-  if (document !== null) {
+  if (document !== null && authoredIntent) {
+    // Source-referenced authoring intent has no compiler-issued identities.
+    // Those belong to the prepared activation, never to the mutable Draft.
+    allowedKeysAt(document,
+      ['api_version', 'deployment_artifact_id', 'cell_id', 'name',
+        'components', 'attachments', 'policies'],
+      ['description', 'assistant_profile_id', 'compatibility'],
+      `${path}.draft.document`);
+    if (stringAt(document.deployment_artifact_id,
+      `${path}.draft.document.deployment_artifact_id`) !== deploymentArtifactId) {
+      return fail(`${path}.draft`, 'one exact authored Deployment identity');
+    }
+    stringAt(document.cell_id, `${path}.draft.document.cell_id`);
+    stringAt(document.name, `${path}.draft.document.name`);
+    boundedArrayAt(document.components, `${path}.draft.document.components`, 4096);
+    boundedArrayAt(document.attachments, `${path}.draft.document.attachments`, 4096);
+    objectAt(document.policies, `${path}.draft.document.policies`);
+  } else if (document !== null) {
     const apiVersion = stringAt(
       document.api_version,
       `${path}.draft.document.api_version`,
@@ -3284,7 +3338,8 @@ export function parseDeploymentWorkspaceResponse(
   const savedRevision = savedRecord.deploymentRevision === null
     ? null
     : digestAt(savedRecord.deploymentRevision, `${path}.saved.deploymentRevision`);
-  if ((savedPath === null) !== (savedRevision === null)) {
+  // A saved source-referenced intent is a file, not a compiled Deployment.
+  if (savedPath === null && savedRevision !== null) {
     return fail(`${path}.saved`, 'one complete Saved identity');
   }
   const managerRecord = objectAt(record.managerApplied, `${path}.managerApplied`);
@@ -3416,6 +3471,7 @@ export function parseDeploymentWorkspaceResponse(
   }
   return {
     schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+    authoringWorkspace,
     draft: {
       id: stringAt(draftRecord.id, `${path}.draft.id`),
       revision: integerAt(draftRecord.revision, `${path}.draft.revision`),

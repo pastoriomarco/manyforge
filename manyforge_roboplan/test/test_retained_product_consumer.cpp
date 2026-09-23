@@ -3356,6 +3356,9 @@ TEST(RetainedProductCrossConsumer,
         {},
         {}};
     runtime_input.deployment_maximum_tcp_linear_speed_mps = 0.15;
+    runtime_input.ordinary_motion_jerk =
+        deployment::native_execution_runtime_contract::OrdinaryMotionJerkSettings{
+            false, 1.0, {}};
 
     std::shared_ptr<RetainedNativeRuntime> runtime;
     if (runtimes.empty()) {
@@ -3367,6 +3370,7 @@ TEST(RetainedProductCrossConsumer,
           runtimes.front()->clock, runtimes.front()->scheduler);
     }
     ASSERT_NE(runtime, nullptr);
+    EXPECT_FALSE(runtime->motion_runtime_policy.has_value());
     ASSERT_NE(runtime->participant_engine, nullptr);
     ASSERT_NE(runtime->motion_state_channel, nullptr);
     ASSERT_NE(runtime->reference_resolver, nullptr);

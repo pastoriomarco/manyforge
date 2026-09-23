@@ -74,17 +74,6 @@ constexpr std::string_view kExpectedEmptySceneContentHash =
     "sha256:bb42a1086f1fc8a45d1bcee2edc2bfce5ee2494029fdeeb5b2066717420cdfe5";
 constexpr std::int64_t kSustainedNoOpCommitP95BudgetNs = 50'000'000;
 
-std::int64_t NearestRankPercentileNs(std::vector<std::int64_t> samples,
-                                     const std::size_t percentile) {
-  if (samples.empty() || percentile == 0U || percentile > 100U) {
-    throw std::invalid_argument("invalid scene-owner percentile input");
-  }
-  std::sort(samples.begin(), samples.end());
-  const auto rank =
-      (samples.size() * percentile + 99U) / 100U;
-  return samples[std::min(rank, samples.size()) - 1U];
-}
-
 static_assert(
     !std::is_constructible_v<CanonicalEmptySceneOwner, std::filesystem::path,
                              ProjectionBootstrapPrerequisiteQueryDTO,
@@ -572,7 +561,6 @@ PublicationReceipt(const ProjectionBootstrapAcceptedDTO &accepted) {
       accepted.canonical_empty_target.retained_bundle_id,
       accepted.canonical_empty_target.graph_revision,
       std::nullopt,
-      Digest('a'),
       Digest('b'),
   };
   return {
@@ -2617,25 +2605,6 @@ void ResetProjections(
   }
 }
 
-void SetProjectionMode(OwnedFakePlannerSceneProjections &projections,
-                       const FakePlannerSceneProjection::Mode mode) {
-  for (auto &projection : projections) {
-    projection->SetMode(mode);
-  }
-}
-
-[[nodiscard]] std::vector<ProjectionNativeRuntimeBindingDTO>
-RebindRuntimeEpochs(
-    const std::vector<ProjectionNativeRuntimeBindingDTO> &bindings,
-    const std::string_view epoch_prefix) {
-  auto rebound = bindings;
-  for (std::size_t index = 0U; index < rebound.size(); ++index) {
-    rebound[index].runtime_epoch = core::RuntimeEpoch(
-        std::string(epoch_prefix) + "-" + std::to_string(index + 1U));
-  }
-  return rebound;
-}
-
 [[nodiscard]] ProjectionRevisionDTO FinalizeNativeCandidate(
     CanonicalEmptySceneOwner &owner,
     ControlledPublicationReader &publication_reader,
@@ -2794,17 +2763,19 @@ TEST(CanonicalEmptySceneOwner,
       package_root);
   TestCellAdmissionPort cell_admission;
   const auto database_path = directory.path() / "logical-scene.sqlite3";
-  core::ProjectionMaintenanceInitializationRequestDTO interrupted_request;
+  std::optional<core::ProjectionMaintenanceInitializationRequestDTO>
+      interrupted_request;
   {
     CanonicalEmptySceneOwner owner(database_path, admission,
                                    publication_reader, bundle_source, resolver,
                                    cell_admission);
     const auto accepted =
         FinalizeCanonicalBootstrap(owner, publication_reader, admission);
-    interrupted_request = {
+    interrupted_request.emplace(
+        core::ProjectionMaintenanceInitializationRequestDTO{
         ApplyId("maintenance-interrupted"), ApplyGeneration(1U),
-        accepted.canonical_empty_target, candidate.bundle->value(), bindings};
-    ASSERT_EQ(owner.BeginMaintenanceInitialization(interrupted_request).state,
+        accepted.canonical_empty_target, candidate.bundle->value(), bindings});
+    ASSERT_EQ(owner.BeginMaintenanceInitialization(*interrupted_request).state,
               core::ProjectionMaintenanceInitializationState::kInitialized);
     owner.Close();
   }
@@ -2817,20 +2788,20 @@ TEST(CanonicalEmptySceneOwner,
                                     publication_reader, bundle_source, resolver,
                                     cell_admission);
   const auto interrupted = reopened.ReadMaintenanceInitialization(
-      {interrupted_request.apply_id, interrupted_request.apply_generation});
+      {interrupted_request->apply_id, interrupted_request->apply_generation});
   ASSERT_TRUE(interrupted.has_value());
   EXPECT_EQ(interrupted->state,
             core::ProjectionMaintenanceInitializationState::kInterrupted);
   EXPECT_TRUE(interrupted->effects_unknown);
   EXPECT_FALSE(reopened.ReadAccessStatus().scene_writes_open);
   EXPECT_FALSE(reopened.ReadAccessStatus().projection_leases_open);
-  EXPECT_EQ(reopened.BeginMaintenanceInitialization(interrupted_request),
+  EXPECT_EQ(reopened.BeginMaintenanceInitialization(*interrupted_request),
             *interrupted);
   for (std::size_t index = 0U; index < projections.size(); ++index) {
     EXPECT_EQ(projections[index]->rebuild_calls(), rebuild_calls[index]);
   }
 
-  auto restoration_request = interrupted_request;
+  auto restoration_request = *interrupted_request;
   restoration_request.apply_id = ApplyId("maintenance-explicit-restoration");
   const auto restored =
       reopened.BeginMaintenanceInitialization(restoration_request);

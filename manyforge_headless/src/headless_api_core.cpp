@@ -544,7 +544,8 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
                               config_.artifact_root),
       program_repository_(config_.artifact_root),
       binding_repository_(config_.artifact_root),
-      retained_model_map_source_(config_.artifact_root),
+      retained_model_map_source_(package_root_descriptor_->root(),
+                                 config_.artifact_root),
       // This reader validates the final path component with symlink_status;
       // "." keeps that component directory-valued while traversal remains
       // anchored through the retained procfd root.
@@ -672,7 +673,7 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
           "Applied Program requires one converged active configuration");
   const auto &transaction = RequiredMember(
       RequiredMember(active, "publication"), "transaction");
-  Require(RequiredString(transaction, "kind") == "apply",
+  Require(RequiredString(transaction, "kind") == "named_apply",
           "program_applied_selection_not_found",
           "the active configuration was not installed from a Scenario");
   const auto apply_id = RequiredString(transaction, "apply_id");

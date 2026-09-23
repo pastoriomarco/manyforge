@@ -174,6 +174,7 @@ export function withSharedProgramAuthoring(
 ): ProgramWorkspaceResponse {
   return {
     ...projection,
+    authoringWorkspace: authoringWorkspaceIdentity(snapshot),
     draft: snapshot.program.draft,
     saved: snapshot.program.saved,
     hasUnsavedChanges: snapshot.program.draft.programLoaded
@@ -194,6 +195,7 @@ export function withSharedDeploymentAuthoring(
 ): DeploymentWorkspaceResponse {
   return {
     ...projection,
+    authoringWorkspace: authoringWorkspaceIdentity(snapshot),
     draft: {
       ...projection.draft,
       id: snapshot.deployment.draftId,

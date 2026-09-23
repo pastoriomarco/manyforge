@@ -251,6 +251,11 @@ function workspaceFixture(): Record<string, unknown> {
   delete programFields.tree;
   return {
     schemaVersion: 'manyforge.composer_program_workspace.v2',
+    authoringWorkspace: {
+      workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
+      programDraftId: 'draft-1', programDraftRevision: 2,
+      deploymentDraftId: 'deployment-draft-1', deploymentDraftRevision: 4,
+    },
     draft: {
       draftId: 'draft-1',
       draftRevision: 2,
@@ -298,6 +303,11 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
   const digestC = `sha256:${'c'.repeat(64)}`;
   return {
     schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+    authoringWorkspace: {
+      workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
+      programDraftId: 'draft-1', programDraftRevision: 2,
+      deploymentDraftId: 'deployment-draft-1', deploymentDraftRevision: 4,
+    },
     draft: {
       id: 'deployment-draft-1',
       revision: 4,
@@ -1230,6 +1240,36 @@ describe('Deployment workspace parser', () => {
     expect(parsed.runAdmission.ready).toBe(true);
   });
 
+  it('accepts source-referenced Deployment intent without inventing compiled identities', () => {
+    const fixture = deploymentWorkspaceFixture();
+    Object.assign(fixture.draft as Record<string, unknown>, {
+      document: {
+        api_version: 'manyforge.deployment_intent.v1',
+        deployment_artifact_id: 'deployment.fixture',
+        cell_id: 'cell.fixture', name: 'Fixture',
+        components: [], attachments: [], policies: {},
+      },
+      deploymentRevision: null, graphRevision: null,
+    });
+    fixture.binding = null;
+    fixture.scenarioCandidates = [];
+    fixture.savedScenarioCandidates = [];
+    fixture.saved = { path: '/workspace/deployment.yaml', deploymentRevision: null };
+    const parsed = parseDeploymentWorkspaceResponse(fixture);
+    expect(parsed.draft.document?.api_version).toBe('manyforge.deployment_intent.v1');
+    expect(parsed.draft.graphRevision).toBeNull();
+    expect(parsed.saved.path).toBe('/workspace/deployment.yaml');
+    expect(parsed.saved.deploymentRevision).toBeNull();
+    const intent = (fixture.draft as Record<string, unknown>).document as Record<string, unknown>;
+    for (const field of ['graph', 'graph_revision', 'deployment_revision']) {
+      intent[field] = `sha256:${'c'.repeat(64)}`;
+      expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow();
+      delete intent[field];
+    }
+    (fixture.draft as Record<string, unknown>).graphRevision = `sha256:${'c'.repeat(64)}`;
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow('complete identities');
+  });
+
   it('rejects mismatched or duplicate candidate identities', () => {
     const mismatched = deploymentWorkspaceFixture();
     (mismatched.scenarioCandidates as Record<string, unknown>[])[0]
@@ -1345,6 +1385,30 @@ describe('parseCatalogResponse', () => {
 });
 
 describe('Program workspace parsers', () => {
+  it('accepts and retains the backend workspace identity on both response contracts', () => {
+    for (const [fixture, parse] of [
+      [workspaceFixture(), parseProgramWorkspaceResponse],
+      [deploymentWorkspaceFixture(), parseDeploymentWorkspaceResponse],
+    ] as const) {
+      expect(parse(fixture).authoringWorkspace).toEqual(fixture.authoringWorkspace);
+      const identity = fixture.authoringWorkspace as Record<string, unknown>;
+      identity.unexpected = true;
+      expect(() => parse(fixture)).toThrow();
+      delete identity.unexpected;
+      delete fixture.authoringWorkspace;
+      expect(() => parse(fixture)).toThrow();
+    }
+  });
+
+  it('rejects a workspace identity that does not describe its returned draft', () => {
+    const program = workspaceFixture();
+    (program.authoringWorkspace as Record<string, unknown>).programDraftRevision = 3;
+    expect(() => parseProgramWorkspaceResponse(program)).toThrow('exact Program Draft identity');
+    const deployment = deploymentWorkspaceFixture();
+    (deployment.authoringWorkspace as Record<string, unknown>).deploymentDraftId = 'other';
+    expect(() => parseDeploymentWorkspaceResponse(deployment)).toThrow('exact Deployment Draft identity');
+  });
+
   it('preserves canonical execution membership without inventing runtime group state', () => {
     const fixture = workspaceFixture();
     const program = (fixture.draft as Record<string, unknown>).program as Record<string, unknown>;

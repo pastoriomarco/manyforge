@@ -266,6 +266,9 @@ void ReleaseAdmission(
               receipt.value().matched_claim.has_value(),
           "terminal Manager Apply has no exact held admission claim");
   const auto &claim = *receipt.value().matched_claim;
+  const auto settlement_kind = durable.intent.parent_authoring_claim.has_value()
+                                   ? core::CellAdmissionSettlementKindDTO::kOwnerCommit
+                                   : core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled;
   const core::CellAdmissionClaimReleaseDTO release{
       claim.intent.owner_role,
       claim.intent.owner_epoch,
@@ -274,8 +277,7 @@ void ReleaseAdmission(
       claim.intent.request_payload_digest,
       claim.acquired_admission_generation,
       claim.claim_generation,
-      {core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
-       terminal.terminal_outcome_digest},
+      {settlement_kind, terminal.terminal_outcome_digest},
   };
   const auto released = cell_admission.ReleaseCellAdmissionClaim(release);
   if (!released.ok()) {

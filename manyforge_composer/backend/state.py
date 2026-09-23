@@ -78,6 +78,7 @@ _CURRENT_SCENARIO_FIELDS = (
     "program_binding_id",
 )
 _PREPARED_ACTIVATION_FIELDS = (
+    "schema_version",
     "prepared_activation_id",
     "scenario_id",
     "source_document_digest",

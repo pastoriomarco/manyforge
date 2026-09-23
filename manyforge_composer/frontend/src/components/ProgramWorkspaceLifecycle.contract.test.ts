@@ -11,6 +11,11 @@ import { programWorkspaceTransitionResult } from '../hooks/useProgramWorkspace';
 function workspace(draftId: string, revision: number): ProgramWorkspaceResponse {
   return {
     schemaVersion: 'manyforge.composer_program_workspace.v2',
+    authoringWorkspace: {
+      workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
+      programDraftId: draftId, programDraftRevision: revision,
+      deploymentDraftId: 'deployment-draft-1', deploymentDraftRevision: 1,
+    },
     draft: {
       draftId,
       draftRevision: revision,

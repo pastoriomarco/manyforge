@@ -1,5 +1,6 @@
 import type { ProgramBindingDocument } from './programBindingTransport.generated';
 import type { Nanoseconds } from './nanoseconds';
+import type { AuthoringWorkspaceIdentity } from './headless';
 import type {
   RuntimeScaleControlSelector,
   RuntimeScaleControlStatus,
@@ -334,6 +335,7 @@ export interface ProgramDraftApplicability {
 
 export interface ProgramWorkspaceResponse {
   schemaVersion: 'manyforge.composer_program_workspace.v2';
+  authoringWorkspace: AuthoringWorkspaceIdentity;
   draft: ProgramDraftProjection;
   applicability: ProgramDraftApplicability;
   saved: {
@@ -487,6 +489,7 @@ export interface DeploymentScenarioCandidate {
 
 export interface DeploymentWorkspaceResponse {
   schemaVersion: 'manyforge.composer_deployment_workspace.v1';
+  authoringWorkspace: AuthoringWorkspaceIdentity;
   draft: {
     id: string;
     revision: number;

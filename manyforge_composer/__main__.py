@@ -161,6 +161,7 @@ def main() -> None:
                     "path": args.startup_scenario_document,
                     "activate": True,
                     "confirmDiscard": False,
+                    "confirmDeployment": True,
                     "draftId": program_state["draft_id"],
                     "expectedDraftRevision": program_state["draft_revision"],
                     "deploymentDraftId": deployment_state["draft_id"],

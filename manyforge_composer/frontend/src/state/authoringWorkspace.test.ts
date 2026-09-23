@@ -236,6 +236,11 @@ describe('authoringWorkspace', () => {
     const snapshot = workspaceSnapshot(5, 3, 4);
     const program = {
       schemaVersion: 'manyforge.composer_program_workspace.v2',
+      authoringWorkspace: {
+        workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
+        programDraftId: 'draft.1', programDraftRevision: 2,
+        deploymentDraftId: 'deployment-draft.1', deploymentDraftRevision: 1,
+      },
       draft: { draftId: 'draft.1', draftRevision: 2, programLoaded: false },
       applicability: { applyReady: true, affectedInstanceIds: [], unavailableReason: null },
       saved: { available: false, matchesDraft: false, path: null, programRevision: null },
@@ -250,6 +255,7 @@ describe('authoringWorkspace', () => {
     } as unknown as ProgramWorkspaceResponse;
 
     const mergedProgram = withSharedProgramAuthoring(program, snapshot);
+    expect(mergedProgram.authoringWorkspace).toEqual(authoringWorkspaceIdentity(snapshot));
     expect(mergedProgram.draft).toEqual(snapshot.program.draft);
     expect(mergedProgram.saved).toEqual(snapshot.program.saved);
     expect(mergedProgram.hasUnsavedChanges).toBe(true);
@@ -259,6 +265,11 @@ describe('authoringWorkspace', () => {
 
     const deployment = {
       schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+      authoringWorkspace: {
+        workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
+        programDraftId: 'draft.1', programDraftRevision: 2,
+        deploymentDraftId: 'deployment-draft.1', deploymentDraftRevision: 1,
+      },
       draft: {
         id: 'deployment-draft.1',
         revision: 1,
@@ -278,6 +289,7 @@ describe('authoringWorkspace', () => {
     } as DeploymentWorkspaceResponse;
 
     const mergedDeployment = withSharedDeploymentAuthoring(deployment, snapshot);
+    expect(mergedDeployment.authoringWorkspace).toEqual(authoringWorkspaceIdentity(snapshot));
     expect(mergedDeployment.draft.document).toEqual(
       snapshot.deployment.document,
     );

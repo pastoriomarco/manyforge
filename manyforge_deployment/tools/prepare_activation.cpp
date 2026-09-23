@@ -10,6 +10,7 @@
 
 #include <manyforge_deployment/activation_preparation_request.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/prepared_activation_input.hpp>
@@ -21,6 +22,7 @@
 #include <manyforge_deployment/scenario_program_admission.hpp>
 
 #include "activation_component_profile_internal.hpp"
+#include "build_manifest_internal.hpp"
 #include "canonical_empty_admission_internal.hpp"
 #include "activation_deployment_intent_internal.hpp"
 #include "activation_model_source_closure_internal.hpp"
@@ -523,6 +525,20 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       throw std::logic_error(
           "prepared activation omitted its canonical empty predecessor");
     }
+    // The ordinary activation store above publishes the candidate only.
+    // Publish its separately qualified empty predecessor before admitting it.
+    deployment::FilesystemRetainedBundleRepository bundles(
+        options.activation_root);
+    static_cast<void>(
+        bundles.put_if_absent(materialized.canonical_empty_bundle));
+    // The in-memory preparer qualified these same build authorities. The
+    // package verifier reads their persisted form before admitting the empty
+    // predecessor, so publish them in this package before its commit record.
+    deployment::FilesystemBuildManifestRepository manifests(
+        options.activation_root);
+    static_cast<void>(
+        deployment::detail::BuildQualifiedRetentionAuthority::qualify_persisted(
+            manifests));
     const auto admission_filename =
         deployment::cell_scoped_canonical_empty_admission_filename(
             materialized.canonical_empty_bundle->value().cell_graph.cell_id);
