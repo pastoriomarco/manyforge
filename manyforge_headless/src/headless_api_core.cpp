@@ -253,8 +253,8 @@ ManagerApplyTransitionId(const CanonicalValue &runtime) {
     if (!*pending || !admitted_phase(RequiredString(row, "phase"))) {
       continue;
     }
-    const auto &fence = RequiredSection(row, "fence");
-    const auto &scope = RequiredSection(fence, "scope");
+    const auto &fence = RequiredMember(row, "fence");
+    const auto &scope = RequiredMember(fence, "scope");
     std::set<std::string> affected_components;
     for (const auto &value :
          RequiredArray(scope, "controllable_component_ids")) {
@@ -264,8 +264,8 @@ ManagerApplyTransitionId(const CanonicalValue &runtime) {
       affected_components.insert(*component_id);
     }
     std::set<std::string> affected_units;
-    const auto &active = RequiredSection(manager, "active");
-    const auto &graph = RequiredSection(active, "cell_graph");
+    const auto &active = RequiredMember(*payload, "active");
+    const auto &graph = RequiredMember(active, "cell_graph");
     for (const auto &component :
          RequiredArray(graph, "controllable_components")) {
       if (!affected_components.contains(
@@ -281,7 +281,7 @@ ManagerApplyTransitionId(const CanonicalValue &runtime) {
       }
     }
     std::set<std::string> desired_units;
-    const auto &manager_runtime = RequiredSection(manager, "runtime");
+    const auto &manager_runtime = RequiredMember(*payload, "runtime");
     for (const auto &unit : RequiredArray(manager_runtime, "desired_units")) {
       desired_units.insert(RequiredString(unit, "runtime_unit_id"));
     }

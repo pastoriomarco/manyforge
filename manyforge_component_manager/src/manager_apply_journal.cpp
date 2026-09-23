@@ -121,7 +121,7 @@ constexpr std::string_view kTerminalOutcomeDigestDomain =
     "manyforge.component-manager-terminal-outcome.ua4.v3";
 constexpr int kBusyTimeoutMilliseconds = 10000;
 constexpr std::int64_t kWalCheckpointTargetBytes = 16LL * 1024LL * 1024LL;
-constexpr std::int64_t kExpectedSchemaObjectCardinality = 39;
+constexpr std::int64_t kExpectedSchemaObjectCardinality = 36;
 
 [[noreturn]] void ThrowSqlite(sqlite3 *database, const int result,
                               const std::string_view context) {
@@ -2637,7 +2637,6 @@ public:
       VerifiedRecordMap<PersistedManagerApplyRuntimeConvergenceIntent>,
       VerifiedRecordMap<PersistedManagerApplyRuntimeStagedReady>,
       VerifiedRecordMap<PersistedManagerApplyPrivateMaterialization>,
-      VerifiedRecordMap<PersistedManagerApplyObsoleteCommandSurfacesRetired>,
       VerifiedRecordMap<PersistedManagerApplyPublicationReceipt>,
       VerifiedRecordMap<PersistedManagerApplyFenceReleaseIntent>,
       VerifiedRecordMap<PersistedManagerApplyFenceReleased>,
@@ -3676,7 +3675,7 @@ public:
     }
     const auto state = row.Text(13);
     const auto stored_digest = row.Text(14);
-    if (row.Step() || apply_generation <= 0) {
+    if (apply_generation <= 0) {
       throw ManagerApplyJournalIntegrityError(
           "stored terminal Apply outcome is structurally invalid");
     }
@@ -3759,6 +3758,10 @@ public:
               "stored terminal Apply failure is not bound to its exact "
               "intent");
         }
+      }
+      if (row.Step()) {
+        throw ManagerApplyJournalIntegrityError(
+            "stored terminal Apply outcome is not unique");
       }
       return PersistedManagerApplyTerminalOutcome{std::move(outcome),
                                                   ContentDigest(stored_digest)};

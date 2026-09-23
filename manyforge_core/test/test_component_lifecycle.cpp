@@ -134,8 +134,7 @@ ActiveBundlePublicationReceiptDTO active_publication_receipt() {
       revision.retained_bundle_id,
       revision.graph_revision,
       std::nullopt,
-      ContentDigest("private-materialization-1"),
-      ContentDigest("retired-surfaces-1")};
+      ContentDigest("private-materialization-1")};
   return {request, ActiveBundlePublicationGeneration(1U), ContentDigest("public-pointer-1")};
 }
 

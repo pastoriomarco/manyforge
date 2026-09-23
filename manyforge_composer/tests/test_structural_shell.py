@@ -148,7 +148,7 @@ def test_program_workspace_is_available_while_effectful_actions_need_headless() 
         },
     )
     assert unavailable_apply.status_code == 503
-    assert unavailable_apply.json()["detail"]["code"] == "authoring_not_ready"
+    assert unavailable_apply.json()["detail"]["code"] == "program_apply_unavailable"
 
 
 def test_composer_bounds_callback_bodies_without_narrowing_other_routes() -> None:

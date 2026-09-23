@@ -717,9 +717,6 @@ TEST(CanonicalEmptyBootstrapAdvance, MismatchedPublicationFailsBeforeEffect) {
       ContentDigest(
           "sha256:"
           "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-      ContentDigest(
-          "sha256:"
-          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
   };
   ASSERT_TRUE(wrong_request.valid());
   ASSERT_EQ(

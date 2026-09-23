@@ -417,7 +417,6 @@ PublishActiveFixture(NativeFixture &fixture) {
       fixture.bundle->value().cell_graph.graph_revision,
       std::nullopt,
       digest,
-      digest,
   });
   store.Close();
   return receipt;
@@ -1379,10 +1378,10 @@ TEST(RetainedNativeRuntimeUnitAdapter,
        claimed.value().claim_generation,
        {core::CellAdmissionSettlementKindDTO::kOwnerCommit,
         core::ContentDigest(std::string(kIntentDigest))}});
-  ASSERT_FALSE(released_claim.ok());
-  EXPECT_EQ(released_claim.error().code, "authoring_not_ready");
-  EXPECT_EQ(released_claim.error().details.at("reason"),
-            "settlement_not_proven");
+  ASSERT_TRUE(released_claim.ok()) << released_claim.error().message;
+  EXPECT_TRUE(released_claim.value().authoring_allowed);
+  EXPECT_GT(released_claim.value().admission_generation,
+            claimed.value().acquired_admission_generation);
 
   const auto physical_scope = PhysicalConfigurationScope(fixture);
   const core::RuntimeEpoch manager_epoch(
@@ -1498,19 +1497,13 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto rebuilt_candidate =
       resolved.value()->RebuildProjection(rebuild_request);
   ASSERT_TRUE(rebuilt_candidate.presence_valid());
-  EXPECT_TRUE(rebuilt_candidate.result ==
-                  core::ProjectionCommitResultStateDTO::kAccepted ||
-              rebuilt_candidate.result ==
-                  core::ProjectionCommitResultStateDTO::kCommitted);
-  auto candidate_health = resolved.value()->ProjectionHealth();
-  const auto candidate_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(10);
-  while (!candidate_health.healthy_for_target(candidate_revision) &&
-         std::chrono::steady_clock::now() < candidate_deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    candidate_health = resolved.value()->ProjectionHealth();
-  }
-  EXPECT_TRUE(candidate_health.healthy_for_target(candidate_revision));
+  EXPECT_EQ(rebuilt_candidate.result,
+            core::ProjectionCommitResultStateDTO::kRejectedRollbackProven);
+  ASSERT_TRUE(rebuilt_candidate.error.has_value());
+  EXPECT_EQ(rebuilt_candidate.error->details.at("reason"),
+            "native_projection_rebuild_not_required");
+  EXPECT_TRUE(resolved.value()->ProjectionHealth().healthy_for_target(
+      initial_revision));
 
   auto foreign = binding;
   foreign.provider_binding_revision =

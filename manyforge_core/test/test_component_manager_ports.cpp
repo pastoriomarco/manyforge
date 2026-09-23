@@ -246,14 +246,6 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
   };
 }
 
-[[nodiscard]] ActiveBundlePublicationReceiptDTO NamedPublicationReceipt() {
-  return ActiveBundlePublicationReceiptDTO{
-      NamedPublicationRequest(),
-      ActiveBundlePublicationGeneration{4U},
-      ContentDigest{kDigest},
-  };
-}
-
 [[nodiscard]] ActiveBundlePublicationReceiptDTO BootstrapPublicationReceipt() {
   return ActiveBundlePublicationReceiptDTO{
       BootstrapPublicationRequest(),

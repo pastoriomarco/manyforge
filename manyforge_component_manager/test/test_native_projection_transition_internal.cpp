@@ -69,7 +69,7 @@ Bundle(std::vector<RuntimeUnitDTO> runtime_units,
       DeploymentRevision("deployment.revision.test"),
       CellGraphDTO{"manyforge.cell_graph.test", GraphRevision("graph.candidate"),
                    CellId("cell.1"), std::move(runtime_units), {}, {}, {}, {},
-                   {}, {}},
+                   {}},
       RetainedCatalogDTO{
           "manyforge.catalog.test", ContentDigest(std::string(kDigestOne)),
           ContentDigest(std::string(kDigestTwo)), {}, {},
@@ -87,10 +87,10 @@ Bundle(std::vector<RuntimeUnitDTO> runtime_units,
                              ProductContractRevision(
                                  "product.contract.revision.test"),
                              {}},
-          std::nullopt, {}, {}, {}, {}},
+          std::nullopt, {}, {}, {}},
       RetainedBundleProvenanceDTO{
           ContentDigest(std::string(kDigestOne)),
-          ContentDigest(std::string(kDigestTwo)), {}, {}, {}, {}},
+          ContentDigest(std::string(kDigestTwo)), {}, {}, {}},
       std::nullopt,
       {},
       std::nullopt,
@@ -100,7 +100,7 @@ Bundle(std::vector<RuntimeUnitDTO> runtime_units,
 [[nodiscard]] RuntimeUnitStagedReadyEvidenceDTO
 StagedRuntime(std::string id, std::string epoch) {
   return {RuntimeUnitId(std::move(id)),
-          RuntimeLifecycleControl::kManagerManaged,
+          core::RuntimeLifecycleControl::kManagerManaged,
           RuntimeUnitCandidateDisposition::kAdded,
           RuntimeEpoch(std::move(epoch)),
           "manager-launch-adapter-1",
@@ -142,29 +142,6 @@ StagedReady(std::vector<RuntimeUnitStagedReadyEvidenceDTO> runtimes) {
                 {NativeBinding({RuntimeEndpoint(runtime_unit_id)})});
 }
 
-[[nodiscard]] RuntimeObservationSnapshot
-ActiveObservations(const std::string &epoch, const bool provide_evidence = true,
-                   const RuntimeLifecycleControl lifecycle =
-                       RuntimeLifecycleControl::kManagerManaged) {
-  RuntimeObservationReducer reducer([] { return 100U; }, {"runtime.native"});
-  if (provide_evidence) {
-    if (!reducer.ObserveProcess(ProcessPresenceObservation{
-            "runtime.native", "manager-observer", 1U,
-            ProcessPresenceState::kPresent, epoch}) ||
-        !reducer.IngestSourceReport(RuntimeUnitSourceReport{
-            "runtime.native", epoch, 1U, 1U, RuntimeSourcePhase::kServing,
-            RuntimeSourceHealth::kHealthy, "product.native", "config.native",
-            {"scene_projection"},
-            ManagedCommandSurfaceState::kClosedNoActiveEffect})) {
-      throw std::logic_error("test runtime observations were rejected");
-    }
-  }
-  return reducer.Evaluate({RuntimeUnitExpectation{
-      "runtime.native", lifecycle, "product.native", "config.native", 100U,
-      100U, std::nullopt, {}, {"scene_projection"},
-      ManagedCommandSurfaceState::kClosedNoActiveEffect}});
-}
-
 TEST(NativeProjectionInitialization, ZeroNativeBundleProducesNoBindings) {
   EXPECT_TRUE(DeriveCandidateNativeProjectionBindings(Bundle({}, {}),
                                                        StagedReady({}))
@@ -186,28 +163,6 @@ TEST(NativeProjectionInitialization,
   EXPECT_THROW(DeriveCandidateNativeProjectionBindings(NativeBundle(),
                                                        StagedReady({})),
                std::invalid_argument);
-}
-
-TEST(NativeProjectionInitialization,
-     ActiveBindingUsesOnlyExactConvergedManagerObservation) {
-  const auto bundle = NativeBundle();
-  const auto bindings =
-      manyforge::component_manager::DeriveActiveNativeProjectionRuntimeBindings(
-          bundle, ActiveObservations("epoch.manager-observed"));
-  ASSERT_EQ(bindings.size(), 1U);
-  EXPECT_EQ(bindings.front().runtime_epoch,
-            RuntimeEpoch("epoch.manager-observed"));
-
-  EXPECT_THROW(
-      manyforge::component_manager::DeriveActiveNativeProjectionRuntimeBindings(
-          bundle, ActiveObservations("", false)),
-      std::invalid_argument);
-  EXPECT_THROW(
-      manyforge::component_manager::DeriveActiveNativeProjectionRuntimeBindings(
-          bundle,
-          ActiveObservations("epoch.external", true,
-                             RuntimeLifecycleControl::kExternallyManaged)),
-      std::invalid_argument);
 }
 
 TEST(NativeProjectionInitialization,

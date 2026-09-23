@@ -47,6 +47,7 @@ public:
     path_ = created;
     std::filesystem::create_directory(publications());
     std::filesystem::create_directory(artifacts());
+    CreateRetentionSkeleton();
   }
 
   ~TemporaryDirectory() {
@@ -67,8 +68,8 @@ public:
     return path_ / "history.sqlite3";
   }
   void CreateRetentionSkeleton() const {
-    std::filesystem::create_directories(path_ / "retained-bundles/sha256");
-    std::filesystem::create_directories(path_ / "raw-artifacts/sha256");
+    std::filesystem::create_directories(artifacts() / "retained-bundles/sha256");
+    std::filesystem::create_directories(artifacts() / "raw-artifacts/sha256");
   }
 
 private:

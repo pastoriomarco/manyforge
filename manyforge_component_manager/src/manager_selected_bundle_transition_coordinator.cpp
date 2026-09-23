@@ -221,26 +221,27 @@ ManagerSelectedBundleTransitionCoordinator::AdvanceOrRecover(
                     predecessor_head.value()}
               : std::nullopt);
     }
-    core::ActiveBundlePublicationReceiptDTO receipt;
-    try {
-      receipt = publication_store_.PublishActiveBundle(publication_request);
-    } catch (const std::exception &error) {
-      const auto recovered = read_head(expected_generation);
-      if (!recovered.ok() ||
-          !ExactPublication(recovered.value(), publication_request,
-                            expected_generation)) {
-        throw ManagerSelectedBundleTransitionEffectUncertainError(
-            "active-bundle publication outcome is uncertain: " +
-                std::string(error.what()),
-            publication_request, scene_query,
-            recovered.ok()
-                ? std::optional<core::ActiveBundlePublicationReceiptDTO>{
-                      recovered.value()}
-                : std::nullopt);
+    const auto receipt = [&]() -> core::ActiveBundlePublicationReceiptDTO {
+      try {
+        return publication_store_.PublishActiveBundle(publication_request);
+      } catch (const std::exception &error) {
+        const auto recovered = read_head(expected_generation);
+        if (!recovered.ok() ||
+            !ExactPublication(recovered.value(), publication_request,
+                              expected_generation)) {
+          throw ManagerSelectedBundleTransitionEffectUncertainError(
+              "active-bundle publication outcome is uncertain: " +
+                  std::string(error.what()),
+              publication_request, scene_query,
+              recovered.ok()
+                  ? std::optional<core::ActiveBundlePublicationReceiptDTO>{
+                        recovered.value()}
+                  : std::nullopt);
+        }
+        path = ManagerSelectedBundleTransitionPath::kRecoveredPublicationHead;
+        return recovered.value();
       }
-      receipt = recovered.value();
-      path = ManagerSelectedBundleTransitionPath::kRecoveredPublicationHead;
-    }
+    }();
     if (!ExactPublication(receipt, publication_request, expected_generation)) {
       throw ManagerSelectedBundleTransitionEffectUncertainError(
           "publication store returned foreign evidence", publication_request,
@@ -265,19 +266,20 @@ ManagerSelectedBundleTransitionCoordinator::AdvanceOrRecover(
     return {materialization, durable_publication, false, path};
   }
 
-  core::ProjectionMaintenanceInitializationStatusDTO completed;
-  try {
-    completed = scene_owner_.CompleteMaintenanceInitialization({
-        apply_id, apply_generation, initialized->target_projection_revision,
-        initialized->authoritative_snapshot_identity,
-        durable_publication.record.publication.publication_receipt});
-  } catch (const std::exception &error) {
-    const auto observed = scene_owner_.ReadMaintenanceInitialization(scene_query);
-    throw ManagerSelectedBundleTransitionEffectUncertainError(
-        "Scene completion outcome is uncertain: " + std::string(error.what()),
-        publication_request, scene_query,
-        durable_publication.record.publication.publication_receipt, observed);
-  }
+  const auto completed = [&]() -> core::ProjectionMaintenanceInitializationStatusDTO {
+    try {
+      return scene_owner_.CompleteMaintenanceInitialization({
+          apply_id, apply_generation, initialized->target_projection_revision,
+          initialized->authoritative_snapshot_identity,
+          durable_publication.record.publication.publication_receipt});
+    } catch (const std::exception &error) {
+      const auto observed = scene_owner_.ReadMaintenanceInitialization(scene_query);
+      throw ManagerSelectedBundleTransitionEffectUncertainError(
+          "Scene completion outcome is uncertain: " + std::string(error.what()),
+          publication_request, scene_query,
+          durable_publication.record.publication.publication_receipt, observed);
+    }
+  }();
   if (!completed.valid() ||
       completed.state !=
           core::ProjectionMaintenanceInitializationState::kCompleted ||

@@ -5251,32 +5251,41 @@ TEST(
             core::ProjectionCommitResultStateDTO::kRejectedRollbackProven);
   ASSERT_TRUE(unprepared.error.has_value());
   EXPECT_EQ(unprepared.error->details.at("reason"),
-            "native_projection_candidate_model_not_prepared");
+            "native_projection_rebuild_mismatch");
   EXPECT_EQ(projection->snapshot(), predecessor_world);
-
-  const auto prepared = projection->PrepareCandidateProjection(
-      std::move(candidate_projector), request.planning_collision_model);
-  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-  const auto rebuilt = projection->RebuildProjection(request);
-  ASSERT_TRUE(rebuilt.presence_valid());
   EXPECT_TRUE(
-      projection->ProjectionHealth().healthy_for_target(candidate_revision));
-  EXPECT_EQ(projection->collision_shared_model(), candidate_shared_model);
-  EXPECT_NE(projection->snapshot(), predecessor_world);
-  EXPECT_NE(projection->snapshot()->publisher_id,
+      projection->ProjectionHealth().healthy_for_target(predecessor_revision));
+
+  // A different retained model is installed only after the old computational
+  // projection is retired; it is never swapped into a healthy projection.
+  projection.reset();
+  auto candidate_result = RetainedPlannerSceneProjection::CreateInitialized(
+      std::move(candidate_projector), request.planning_collision_model,
+      binding, initial_scene,
+      RetainedPlannerSceneProjectionConfig{
+          "cross-bundle-candidate-projection", 8U, 8U},
+      [&clock] { return clock++; });
+  ASSERT_TRUE(candidate_result.ok()) << candidate_result.error().message;
+  auto candidate_projection = std::move(candidate_result.value());
+  EXPECT_TRUE(candidate_projection->ProjectionHealth().healthy_for_target(
+      candidate_revision));
+  EXPECT_EQ(candidate_projection->collision_shared_model(),
+            candidate_shared_model);
+  EXPECT_NE(candidate_projection->snapshot(), predecessor_world);
+  EXPECT_NE(candidate_projection->snapshot()->publisher_id,
             predecessor_world->publisher_id);
-  const auto candidate_lease = projection->RetainProjection(
+  const auto candidate_lease = candidate_projection->RetainProjection(
       candidate_revision,
       core::ProjectionLeaseId("command-fenced-candidate-lease"));
   ASSERT_TRUE(candidate_lease.ok()) << candidate_lease.error().message;
   const auto candidate_frame =
-      projection->ResolveSceneFrame(core::SceneFrameResolutionQueryDTO{
+      candidate_projection->ResolveSceneFrame(core::SceneFrameResolutionQueryDTO{
           core::CellSceneFrameRefDTO{core::CellId(std::string(cell_id))},
           candidate_lease.value().projection_binding});
   ASSERT_FALSE(candidate_frame.ok());
   EXPECT_EQ(candidate_frame.error().details.at("reason"),
             "native_scene_frame_lease_unavailable");
-  projection->ReleaseProjection(
+  candidate_projection->ReleaseProjection(
       candidate_lease.value().projection_binding.projection_lease_id);
 }
 

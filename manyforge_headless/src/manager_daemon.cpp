@@ -631,7 +631,7 @@ RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
 /// reconstruct the operation input.
 component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
     const CanonicalValue &value) {
-  RequireExactObjectSize(value, 14U, "Apply prepared activation");
+  RequireExactObjectSize(value, 15U, "Apply prepared activation");
   Require(RequiredString(value, "schema_version") ==
               "manyforge.prepared_activation_input.v2",
           "Apply prepared activation schema is unsupported");

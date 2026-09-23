@@ -152,7 +152,6 @@ function controller(
   return {
     commandAllowed: vi.fn(() => true),
     state: {
-      catalog: null,
       currentScenario: null,
       applied: {
         schemaVersion: 'manyforge.applied_program_selection.v2',
@@ -251,7 +250,6 @@ function controller(
         message: '',
       },
       controls: null,
-      selectedScenarioId: null,
       runnerAvailable: true,
       loading: false,
       observationError: null,
@@ -268,8 +266,6 @@ function controller(
     ]
       .includes(state),
     refresh: vi.fn(),
-    selectScenario: vi.fn(),
-    clearScenarioSelection: vi.fn(),
     dismissError: vi.fn(),
     run: vi.fn(),
     stopMotion: vi.fn(),

@@ -119,24 +119,27 @@ private:
   ManagerActiveRuntimePlanDTO plan_;
 };
 
-/// Returns a different plan after the first read, modelling a configuration
-/// that changed between admission and teardown.
-class PlanChangingAfterFirstReadSource final
+/// Switches plans after initialization, modelling a changed active revision.
+class SwitchablePlanSource final
     : public IManagerActiveRuntimePlanSource {
 public:
-  PlanChangingAfterFirstReadSource(ManagerActiveRuntimePlanDTO admitted,
-                                   ManagerActiveRuntimePlanDTO changed)
+  SwitchablePlanSource(ManagerActiveRuntimePlanDTO admitted,
+                       ManagerActiveRuntimePlanDTO changed)
       : admitted_(std::move(admitted)), changed_(std::move(changed)) {}
 
   [[nodiscard]] ManagerActiveRuntimePlanDTO ReadCurrentPlan() const override {
-    return ++read_calls == 1 ? admitted_ : changed_;
+    ++read_calls;
+    return use_changed_ ? changed_ : admitted_;
   }
+
+  void UseChangedPlan() { use_changed_ = true; }
 
   mutable int read_calls{0};
 
 private:
   ManagerActiveRuntimePlanDTO admitted_;
   ManagerActiveRuntimePlanDTO changed_;
+  bool use_changed_{false};
 };
 
 class NoManagedProcessPort final : public IRuntimeUnitProcessPort,
@@ -154,7 +157,7 @@ public:
     const auto id = query.plan.runtime_unit_id.value();
     events.push_back("start:" + id);
     ++start_calls[id];
-    epochs[id] = "epoch-" + id;
+    epochs[id] = "epoch-" + id + "-" + std::to_string(++start_generations[id]);
     return Presence(query, id);
   }
 
@@ -189,7 +192,7 @@ public:
       roles.push_back(role.value());
     }
     return RuntimeUnitSourceReport(
-        id, found->second, 1U, 1U, RuntimeSourcePhase::kServing,
+        id, found->second, ++report_sequences[id], 1U, RuntimeSourcePhase::kServing,
         RuntimeSourceHealth::kHealthy, query.plan.product_identity.value(),
         query.plan.configuration_identity.value(), std::move(roles),
         ManagedCommandSurfaceState::kClosedNoActiveEffect, {},
@@ -200,6 +203,8 @@ public:
   std::map<std::string, int> start_calls;
   std::map<std::string, int> stop_calls;
   std::map<std::string, std::string> epochs;
+  std::map<std::string, std::uint64_t> start_generations;
+  std::map<std::string, std::uint64_t> report_sequences;
   std::string refuse_stop_for;
   std::string throw_after_stop_effect_for;
 
@@ -290,6 +295,8 @@ public:
         coordinator_(source_, runtime_, gate_) {
     gate_.events = &events;
     static_cast<void>(runtime_.Initialize());
+    source_.read_calls = 0;
+    ports_.start_calls.clear();
     ports_.events.clear();
     events.clear();
   }
@@ -432,18 +439,24 @@ TEST(ManagerPlannedMaintenanceCoordinator,
   EXPECT_EQ(fixture.events[0], "close_admission");
   EXPECT_EQ(fixture.events[1], "observe:runtime.c");
   EXPECT_EQ(fixture.gate_.idle_reads, 1);
-  EXPECT_EQ(fixture.source_.read_calls, 1);
+  // Preflight reads once; Shutdown reads at entry and verifies at exit.
+  EXPECT_EQ(fixture.source_.read_calls, 3);
 }
 
 TEST(ManagerPlannedMaintenanceCoordinator,
      StalePredecessorIsRejectedBeforeAnyEffect) {
   MaintenanceFixture fixture;
-  const auto replacement = ThreeUnitPlan();
-  PlanChangingAfterFirstReadSource changing(ThreeUnitPlan(), replacement);
+  auto replacement = ThreeUnitPlan();
+  replacement.active_publication.request.candidate_projection_revision
+      .graph_revision = GraphRevision("graph.changed");
+  replacement.active_publication.request.candidate_graph_revision =
+      GraphRevision("graph.changed");
+  SwitchablePlanSource changing(ThreeUnitPlan(), replacement);
   ManagerActiveRuntimeCoordinator runtime(changing, fixture.ports_,
                                           fixture.ports_,
                                           [&fixture] { return ++fixture.now_; });
   static_cast<void>(runtime.Initialize());
+  changing.UseChangedPlan();
   ScriptedGate gate(ManagementIdleState::kIdle);
   gate.events = &fixture.events;
   ManagerPlannedMaintenanceCoordinator coordinator(changing, runtime, gate);
@@ -531,7 +544,7 @@ TEST(ManagerPlannedMaintenanceCoordinator,
 
   EXPECT_EQ(result.outcome,
             ManagerPlannedMaintenanceOutcome::kUnknownEffect);
-  EXPECT_EQ(result.failure_code, "planned_maintenance_teardown_failed");
+  EXPECT_EQ(result.failure_code, "planned_maintenance_stop_uncertain");
   EXPECT_EQ(result.effect_disposition,
             ManagerApplyEffectDisposition::kUnknown);
   EXPECT_EQ(fixture.ports_.stop_calls.at("runtime.c"), 1);

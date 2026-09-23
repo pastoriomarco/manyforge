@@ -99,6 +99,8 @@ constexpr std::string_view kDigestOne =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 constexpr std::string_view kDigestTwo =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+constexpr std::string_view kDigestThree =
+    "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 constexpr std::string_view kSceneIdOne =
     "sha256:abababababababababababababababababababababababababababababababab";
 constexpr std::string_view kSceneIdTwo =
@@ -135,7 +137,7 @@ ManagerApplyIntentDTO Intent(std::string apply_id = "apply-1",
           core::DeploymentArtifactId("deployment-artifact-1"),
           core::DeploymentRevision(
               "sha256:1515151515151515151515151515151515151515151515151515151515151515"),
-          core::ProgramBindingId(kDigestTwo),
+          core::ProgramBindingId(std::string(kDigestTwo)),
           ContentDigest("sha256:1616161616161616161616161616161616161616161616161616161616161616"),
           R"({"schema_version":"test.prepared_activation_receipt.v1"})",
       },
@@ -488,6 +490,7 @@ TerminalOutcome(const SelectedBundleTransitionRecords &records,
       records.publication.publication_receipt_digest,
       released.fence_released_digest,
       ManagerApplyTerminalOutcomeState::kSucceeded,
+      std::nullopt,
   };
 }
 
@@ -1005,9 +1008,9 @@ TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
             ManagerApplyEffectDisposition::kUnknown);
   EXPECT_EQ(terminal.failure->intent_digest, intent.intent_digest);
   EXPECT_FALSE(terminal.candidate_projection_revision.has_value());
-  // The milestone projection is unaffected: a terminal failure is not progress.
+  // The terminal failure is the final durable milestone, not a successful Apply.
   EXPECT_EQ(DeriveManagerApplyProgress(*status).phase,
-            ManagerApplyPhase::kAccepted);
+            ManagerApplyPhase::kSettled);
 
   journal.Close();
 
@@ -1368,7 +1371,7 @@ TEST(ManagerApplyJournalIntegrity,
   });
   add([](auto &value) {
     value.prepared_activation.program_binding_id =
-        core::ProgramBindingId("program-binding-2");
+        core::ProgramBindingId(std::string(kDigestThree));
   });
   add([](auto &value) {
     value.prepared_activation.prepared_activation_id =

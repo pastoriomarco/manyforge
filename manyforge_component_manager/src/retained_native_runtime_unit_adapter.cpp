@@ -90,11 +90,10 @@ constexpr auto kTermStopTimeout = std::chrono::seconds(1);
 
 [[nodiscard]] std::string_view ProjectionOperationName(
     const detail::NativeProjectionRpcRequest &request) noexcept {
-  static constexpr std::array<std::string_view, 16U> names{
-      "prepare",          "health",       "transaction", "rebuild",
-      "bootstrap-rebuild", "bootstrap-status", "stage",       "activate",
-      "retire",           "retire-status", "discard",     "stage-status",
-      "retain",           "release",      "scene-frame", "effective-policy",
+  static constexpr std::array<std::string_view, 10U> names{
+      "prepare", "health", "transaction", "rebuild", "bootstrap-rebuild",
+      "bootstrap-status", "retain", "release", "scene-frame",
+      "effective-policy",
   };
   static_assert(names.size() ==
                 std::variant_size_v<detail::NativeProjectionRpcRequest>);

@@ -134,7 +134,6 @@ struct OwnerFixture final {
                                  core::ContentDigest(std::string(kSha))}},
          bundle->retained_bundle_id(),
          bundle->value().cell_graph.graph_revision, std::nullopt,
-         core::ContentDigest(std::string(kSha)),
          core::ContentDigest(std::string(kSha))});
     if (!publication.valid()) {
       throw std::runtime_error(

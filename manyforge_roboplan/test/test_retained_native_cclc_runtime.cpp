@@ -1457,7 +1457,7 @@ TEST(RetainedNativeCCLCRuntime,
            core::BootstrapGeneration(1U)},
        active_projection, bundle->retained_bundle_id(),
        bundle->value().cell_graph.graph_revision, std::nullopt,
-       core::ContentDigest(Sha('7')), core::ContentDigest(Sha('8'))});
+       core::ContentDigest(Sha('7'))});
   const auto integrity = publication_store.VerifyIntegrity();
   ASSERT_EQ(integrity.current_generation,
             published_bundle.publication_generation);

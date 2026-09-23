@@ -387,8 +387,6 @@ int main(int argc, char **argv) {
             std::nullopt,
             core::ContentDigest(
                 deployment::sha256_digest("i6-native-fixture-materialization")),
-            core::ContentDigest(deployment::sha256_digest(
-                "i6-native-fixture-retired-surfaces")),
         });
     publication_store.Close();
 

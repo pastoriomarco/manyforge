@@ -1470,6 +1470,16 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/model_sources/ur5_roboplan")
   set(MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT
     "${CMAKE_CURRENT_SOURCE_DIR}/../.docker/roboplan/roboplan_example_models/models/ur_robot_model")
+  if(NOT EXISTS "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/meshes/visual/base.dae")
+    find_package(roboplan_example_models CONFIG REQUIRED)
+    get_filename_component(MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT
+      "${roboplan_example_models_DIR}/../../../share/roboplan_example_models/models/ur_robot_model"
+      REALPATH)
+  endif()
+  if(NOT EXISTS "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/ur5_gripper.urdf" OR
+     NOT EXISTS "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/meshes/visual/base.dae")
+    message(FATAL_ERROR "UR5/RoboPlan qualification requires the installed example model resources")
+  endif()
 
   manyforge_prepare_maintained_model(
     lite6_lite_gripper "Lite6"

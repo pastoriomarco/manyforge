@@ -79,9 +79,6 @@ template <typename Callback> std::string Invoke(Callback &&callback) {
   } catch (const SourceSnapshotError &error) {
     return content_identity::canonical_json(
         ErrorValue("headless_source_snapshot_unavailable", error.what()));
-  } catch (const ProgramApplyError &error) {
-    return content_identity::canonical_json(
-        ErrorValue(error.code(), error.what()));
   } catch (const std::exception &error) {
     return content_identity::canonical_json(
         ErrorValue("headless_api_internal_failure", error.what()));

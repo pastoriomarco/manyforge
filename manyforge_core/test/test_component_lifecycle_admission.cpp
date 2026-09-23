@@ -20,7 +20,7 @@ constexpr std::int64_t kUnresolvedDisableTimeoutNs = 9'000;
   return {{ActiveBundlePublicationTransactionRefDTO{BootstrapPublicationTransactionDTO{
                BootstrapId("bootstrap.1"), BootstrapGeneration(1U)}},
            revision, revision.retained_bundle_id, revision.graph_revision, std::nullopt,
-           ContentDigest("private.1"), ContentDigest("retired.1")},
+           ContentDigest("private.1")},
           ActiveBundlePublicationGeneration(2U),
           ContentDigest("public-pointer.1")};
 }

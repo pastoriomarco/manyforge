@@ -234,8 +234,12 @@ DirectAdmissionIntent(const PersistedManagerApplyIntent &durable) {
           "Manager Apply admission claim is conflicting or already settled");
   const auto acquired = cell_admission.AcquireCellAdmissionClaim(intent);
   if (!acquired.ok()) {
+    const auto &error = acquired.error();
+    const auto reason = error.details.find("reason");
     Fail("Kernel rejected Manager Apply admission: " +
-         acquired.error().message);
+         error.code + ": " + error.message +
+         (reason == error.details.end() ? std::string{}
+                                        : " (" + reason->second + ")"));
   }
   return acquired.value();
 }
@@ -342,7 +346,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
       planned_maintenance_(planned_maintenance),
       active_runtime_coordinator_(active_plan_source, process_port,
                                   progress_port, clock_ns, pre_start_guard),
-      runtime_coordinator_(fence_coordinator_, apply_journal_,
+      runtime_coordinator_(apply_journal_,
                            publication_store, artifact_source, process_port,
                            progress_port, std::move(operating_system),
                            std::move(launch_environment_contracts),
@@ -453,6 +457,16 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
   };
   Require(intent.valid(), "Manager could not construct a valid Apply intent");
   const auto durable_intent = apply_journal_.EnsureIntent(intent).record;
+  // Claim the exact idle admission before exposing this Apply as pending.
+  // Publishing pending closes readiness; doing that first invalidates the
+  // admission generation carried by the accepted request itself.
+  try {
+    static_cast<void>(RequireHeldAdmission(durable_intent, cell_admission_));
+  } catch (const std::exception &error) {
+    return RetainTerminalFailure(
+        apply_journal_, durable_intent, "apply_admission_failed", error.what(),
+        ManagerApplyEffectDisposition::kKnown, false);
+  }
   captured_apply_inputs_.emplace(CapturedApplyInputs{
       intent.apply_id, intent.apply_generation, predecessor, candidate});
   if (apply_progress_observer_) {
@@ -612,7 +626,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
 
   try {
     const auto runtime = runtime_coordinator_.ConvergeOrRecover(
-        intent, predecessor, candidate, *expectation,
+        intent, predecessor, candidate,
         active_plan->active_publication.publication_generation);
     if (runtime.state == ManagerRuntimeConvergenceResultState::kPending) {
       return {intent.apply_id, intent.apply_generation,

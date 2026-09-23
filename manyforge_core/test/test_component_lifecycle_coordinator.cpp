@@ -87,7 +87,7 @@ class ScopedTemporaryDirectory final {
   return {{ActiveBundlePublicationTransactionRefDTO{BootstrapPublicationTransactionDTO{
                BootstrapId("bootstrap.1"), BootstrapGeneration(1U)}},
            revision, revision.retained_bundle_id, revision.graph_revision, std::nullopt,
-           ContentDigest("private.1"), ContentDigest("retired.1")},
+           ContentDigest("private.1")},
           ActiveBundlePublicationGeneration(2U),
           ContentDigest("public-pointer.1")};
 }

@@ -45,7 +45,12 @@ require_plain_file() {
 }
 
 require_plain_file "${EXTENSION}" "candidate extension"
-EXPECTED_EXTENSION="manyforge_core_py.cpython-312-x86_64-linux-gnu.so"
+EXPECTED_SUFFIX="$(/usr/local/bin/python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+case "${EXPECTED_SUFFIX}" in
+  .cpython-312-x86_64-linux-gnu.so|.cpython-312-aarch64-linux-gnu.so) ;;
+  *) echo "active CPython extension suffix differs from the supported I2 ABI" >&2; exit 2 ;;
+esac
+EXPECTED_EXTENSION="manyforge_core_py${EXPECTED_SUFFIX}"
 if [[ "${EXTENSION##*/}" != "${EXPECTED_EXTENSION}" ]]; then
   echo "candidate extension differs from the frozen I2 CPython ABI" >&2
   exit 2
@@ -72,7 +77,7 @@ mkdir "${GENERATED_ROOT}"
   --extension "${EXTENSION}" \
   --output-root "${GENERATED_ROOT}"
 
-EXPECTED_INVENTORY=$'manyforge_core_py-api.md\nmanyforge_core_py.api.json\nmanyforge_core_py.cpython-312-x86_64-linux-gnu.so\nmanyforge_core_py.pyi'
+EXPECTED_INVENTORY=$(printf '%s\n' manyforge_core_py-api.md manyforge_core_py.api.json "${EXPECTED_EXTENSION}" manyforge_core_py.pyi | LC_ALL=C sort)
 ACTUAL_INVENTORY="$(find "${GENERATED_ROOT}" -mindepth 1 -maxdepth 1 \
   -printf '%f\n' | LC_ALL=C sort)"
 if [[ "${ACTUAL_INVENTORY}" != "${EXPECTED_INVENTORY}" ]]; then

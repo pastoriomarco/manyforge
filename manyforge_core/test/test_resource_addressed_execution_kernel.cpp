@@ -13095,7 +13095,9 @@ TEST(ResourceAddressedExecutionKernelTest,
                                               hold = strongest.Blocker()] {
       if (calls->fetch_add(1) > 0) hold();
     };
-    ASSERT_TRUE(kernel.stop(stop_request("request.fault-gate.stop", first.value(), 1U)).ok());
+    const auto stopped =
+        kernel.stop(stop_request("request.fault-gate.stop", first.value(), 1U));
+    ASSERT_TRUE(stopped.ok());
     ASSERT_TRUE(strongest.Entered());
     ASSERT_TRUE(kernel.get_stop_fault_latch().has_value());
     if (mode == 1) {
@@ -13115,6 +13117,10 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_EQ(second_engine.resume_calls.load(), 0);
     first_engine.next_stop_result = StopResultDTO{true, std::nullopt};
     strongest.Release();
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    })) << "released Stop must settle before the Kernel test fixture is destroyed";
   }
 }
 

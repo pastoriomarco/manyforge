@@ -1095,6 +1095,14 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 "result": result,
             }
 
+        if not apply:
+            try:
+                body.require_workspace_fence(state.authoring_workspace.identity())
+                validate(None)
+                return effect(None)
+            except Exception as error:
+                _raise(error)
+
         return execute(
             body,
             intent["operation_kind"],

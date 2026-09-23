@@ -272,7 +272,6 @@ RetainedPlannerSceneProjection::CreateInitialized(
       2U,
       core::ProjectionHealthState::kHealthy,
       revision,
-      std::nullopt,
       1U,
       *digest,
       std::nullopt,
@@ -280,48 +279,6 @@ RetainedPlannerSceneProjection::CreateInitialized(
   projection->active_publisher_.store(std::move(publisher.value()),
                                       std::memory_order_release);
   return result;
-}
-
-core::Result<void> RetainedPlannerSceneProjection::PrepareCandidateProjection(
-    RetainedCollisionWorldProjector candidate_projector,
-    core::RetainedProductDTO candidate_planning_collision_model,
-    std::shared_ptr<const RetainedSceneFrameResolver>
-        candidate_frame_resolver) {
-  std::lock_guard lock(mutex_);
-  const auto rejected = [](std::string message, std::string reason) {
-    return core::Result<void>::Err(core::ErrorDTO{
-        std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
-        std::move(message),
-        {{"reason", std::move(reason)}}});
-  };
-  const auto &candidate_map = candidate_projector.model_map();
-  if (candidate_planning_collision_model.product_kind !=
-          core::RetainedProductKind::kPlanningCollisionModel ||
-      candidate_planning_collision_model.product_id.empty() ||
-      candidate_planning_collision_model.product_contract_id.empty() ||
-      candidate_planning_collision_model.product_contract_revision.empty() ||
-      candidate_map.retained_bundle_id.empty() ||
-      candidate_map.graph_revision.empty() || candidate_map.cell_id.empty() ||
-      candidate_map.cell_id != projector_.model_map().cell_id) {
-    return rejected("prepared native candidate model is invalid or belongs "
-                    "to another cell",
-                    "native_projection_candidate_model_invalid");
-  }
-  if (candidate_map.retained_bundle_id ==
-          projector_.model_map().retained_bundle_id &&
-      candidate_map.graph_revision == projector_.model_map().graph_revision &&
-      candidate_planning_collision_model == planning_collision_model_) {
-    if (candidate_frame_resolver) {
-      frame_resolver_ = std::move(candidate_frame_resolver);
-    }
-    prepared_candidate_model_.reset();
-    return core::Result<void>::Ok();
-  }
-  prepared_candidate_model_ =
-      PreparedCandidateModel{std::move(candidate_projector),
-                             std::move(candidate_planning_collision_model),
-                             std::move(candidate_frame_resolver)};
-  return core::Result<void>::Ok();
 }
 
 core::Result<void> RetainedPlannerSceneProjection::InstallActiveFrameResolver(

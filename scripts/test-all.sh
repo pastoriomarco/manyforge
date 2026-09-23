@@ -450,7 +450,7 @@ run_headless_cpp_tests() {
     if ! require_ctest_tests "manyforge_headless" \
         "ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop" \
         "ManagerDaemonProcess.RuntimeOnlyNamedApplyUsesTheRealManagedFenceAndSurvivesReplacement" \
-        "ManagerDaemonProcess.PhysicalCompositionReopensAfterChildAndManagerReplacement"; then
+        "ManagerDaemonProcess.PhysicalCompositionClosesOnChildLossAndReopensAfterManagerReplacement"; then
         FAIL=$((FAIL + 1))
     elif ! require_headless_native_packages "$build"; then
         FAIL=$((FAIL + 1))

@@ -221,6 +221,14 @@ component_manager::ManagerApplyIntentDTO ApplyIntent(
       ProjectionRevision(admission),
       admission.retained_bundle_id(),
       admission.graph_revision(),
+      component_manager::ManagerApplyPreparedActivationDTO{
+          core::ContentDigest(std::string(kDigestOne)),
+          core::DeploymentArtifactId("owner-publication-deployment"),
+          core::DeploymentRevision(std::string(kDigestTwo)),
+          core::ProgramBindingId(std::string(kDigestOne)),
+          core::ContentDigest(std::string(kDigestTwo)),
+          R"({"schema_version":"test.prepared_activation_receipt.v1"})",
+      },
       core::AdmissionGeneration(7U),
       std::nullopt,
   };

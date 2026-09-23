@@ -344,6 +344,7 @@ _EXPECTED_CONSTRUCTIBLE_DTO_PROPERTIES: dict[str, tuple[str, ...]] = {
         "retained_policy_records",
         "site_overlay_ref",
         "stop_stage_parameters",
+        "stop_timing_parameters",
     ),
     "DesiredControlBindingRouteDTO": (
         "control_binding_id",
@@ -423,6 +424,7 @@ _EXPECTED_CONSTRUCTOR_PARAMETERS: dict[str, tuple[str, ...]] = {
         "stop_stage_parameters",
         "commissioned_stop_interfaces",
         "retained_policy_records",
+        "stop_timing_parameters",
     ),
     "DesiredControlBindingRouteDTO": (
         "control_binding_id",
@@ -1305,6 +1307,7 @@ def _constructible_dto_fixture(module: ModuleType) -> dict[str, Any]:
         "stop_stage_parameters": (),
         "commissioned_stop_interfaces": (),
         "retained_policy_records": (),
+        "stop_timing_parameters": (),
     }
     applicability_inputs = module.DeploymentApplicabilityInputsDTO(
         **applicability_inputs_kwargs
@@ -1917,16 +1920,35 @@ def test_cpp_python_field_enum_default_ordering_and_error_parity() -> None:
     constructor_rejections: dict[str, list[str]] = {}
     constructor_parameters: dict[str, list[str]] = {}
     constructor_defaults: dict[str, list[str]] = {}
-    expected_required_constructor_arguments = {
+    expected_constructor_parameters = {
         name: list(parameters)
         for name, parameters in sorted(_EXPECTED_CONSTRUCTOR_PARAMETERS.items())
+    }
+    expected_constructor_defaults = {
+        name: (
+            ["stop_timing_parameters"]
+            if name == "DeploymentApplicabilityInputsDTO"
+            else []
+        )
+        for name in expected_constructor_parameters
+    }
+    expected_required_constructor_arguments = {
+        name: [
+            parameter
+            for parameter in parameters
+            if parameter not in expected_constructor_defaults[name]
+        ]
+        for name, parameters in expected_constructor_parameters.items()
     }
     for name, kwargs in sorted(dto_fixture["kwargs"].items()):
         value_type = getattr(module, name)
         parameters, defaults = _documented_constructor_contract(value_type)
         constructor_parameters[name] = list(parameters)
         constructor_defaults[name] = list(defaults)
-        if parameters != _EXPECTED_CONSTRUCTOR_PARAMETERS[name] or defaults:
+        if (
+            list(parameters) != expected_constructor_parameters[name]
+            or list(defaults) != expected_constructor_defaults[name]
+        ):
             _fail(
                 f"constructor order/defaults differ from the C++ binding: "
                 f"{name}: parameters={parameters}, defaults={defaults}"
@@ -1945,12 +1967,13 @@ def test_cpp_python_field_enum_default_ordering_and_error_parity() -> None:
             except TypeError:
                 rejected.append(omitted)
             else:
-                _fail(f"deployment DTO constructor made {name}.{omitted} optional")
+                if omitted not in expected_constructor_defaults[name]:
+                    _fail(f"deployment DTO constructor made {name}.{omitted} optional")
         constructor_rejections[name] = rejected
     if (
-        constructor_parameters != expected_required_constructor_arguments
+        constructor_parameters != expected_constructor_parameters
         or constructor_rejections != expected_required_constructor_arguments
-        or any(constructor_defaults.values())
+        or constructor_defaults != expected_constructor_defaults
     ):
         _fail("deployment DTO required-constructor argument inventory drifted")
     union_aliases: dict[str, list[str]] = {}
@@ -2033,10 +2056,8 @@ def test_cpp_python_field_enum_default_ordering_and_error_parity() -> None:
         "projection": expected,
         "trusted_fields": expected_fields,
         "deployment_dto_fields": expected_dto_fields,
-        "constructor_parameters": expected_required_constructor_arguments,
-        "constructor_defaults": {
-            name: [] for name in expected_required_constructor_arguments
-        },
+        "constructor_parameters": expected_constructor_parameters,
+        "constructor_defaults": expected_constructor_defaults,
         "required_constructor_arguments": expected_required_constructor_arguments,
         "enums": _EXPECTED_ENUMS,
         "union_aliases": expected_union_aliases,

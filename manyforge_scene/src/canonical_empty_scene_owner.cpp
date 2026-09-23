@@ -109,7 +109,7 @@ constexpr std::int64_t kExpectedBaseSchemaObjectCardinality = 24;
 constexpr std::int64_t kExpectedTransactionSchemaObjectCardinality = 42;
 constexpr std::int64_t kExpectedNativeHandoffSchemaObjectCardinality = 66;
 constexpr std::int64_t kExpectedBoundedHistorySchemaObjectCardinality = 71;
-constexpr std::int64_t kExpectedSchemaObjectCardinality = 58;
+constexpr std::int64_t kExpectedSchemaObjectCardinality = 60;
 constexpr std::int64_t kMaximumSchemaObjectCardinality = 71;
 constexpr std::int64_t kLogicalSceneTransactionStoreSchemaVersion = 4;
 constexpr std::string_view kLogicalSceneTransactionStoreSchemaId =
@@ -120,6 +120,8 @@ constexpr std::string_view kBoundedHistoryStoreSchemaId =
 constexpr std::int64_t kNativeProjectionHandoffStoreSchemaVersion = 5;
 constexpr std::string_view kNativeProjectionHandoffStoreSchemaId =
     "manyforge.internal.logical-scene.n5c.v5";
+// The retired handoff store recorded this bound; migration must verify it exactly.
+constexpr std::int64_t kHistoricalMaximumNativeRecoveries = 256;
 constexpr std::uint64_t kMaximumSafeIntegral = 9007199254740991ULL;
 constexpr int kMaximumSqliteValueBytes = 1024 * 1024;
 constexpr std::size_t kMaximumLogicalSceneOwnerEvents =
@@ -4462,8 +4464,7 @@ void ValidateNativeHandoffMigrationMetadata(sqlite3 *database) {
       statement.Text(2) == NativeHandoffMigrationArtifactDigest() &&
       statement.Integer(3) ==
           static_cast<std::int64_t>(kMaximumNativeProjectionBindings) &&
-      statement.Integer(4) ==
-          static_cast<std::int64_t>(kMaximumNativeProjectionRecoveries) &&
+      statement.Integer(4) == kHistoricalMaximumNativeRecoveries &&
       statement.Integer(5) ==
           static_cast<std::int64_t>(kMaximumLogicalSceneTransactionBytes) &&
       !statement.Step();
@@ -4698,8 +4699,7 @@ void InsertNativeHandoffMigrationMetadata(sqlite3 *database) {
   statement.Bind(3, NativeHandoffMigrationArtifactDigest());
   statement.Bind(
       4, static_cast<std::int64_t>(kMaximumNativeProjectionBindings));
-  statement.Bind(5,
-                 static_cast<std::int64_t>(kMaximumNativeProjectionRecoveries));
+  statement.Bind(5, kHistoricalMaximumNativeRecoveries);
   statement.Bind(
       6, static_cast<std::int64_t>(kMaximumLogicalSceneTransactionBytes));
   if (statement.Step()) {

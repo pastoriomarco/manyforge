@@ -745,12 +745,10 @@ describe('Program authoring panels', () => {
     } satisfies ProgramWorkspaceController;
     const runtime = {
       state: {
-        catalog: null,
         applied: null,
         currentScenario: null,
         run: null,
         controls: null,
-        selectedScenarioId: null,
         runnerAvailable: false,
         loading: false,
       observationError: null,
@@ -764,8 +762,6 @@ describe('Program authoring panels', () => {
       active: false,
       commandAllowed: vi.fn(() => false),
       refresh: vi.fn(),
-      selectScenario: vi.fn(),
-      clearScenarioSelection: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
       stopMotion: vi.fn(),

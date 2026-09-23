@@ -1016,28 +1016,35 @@ std::string ApplyRequest(
       {"graph_revision", CanonicalValue(resolved_graph_revision)},
       {"retained_bundle_id", CanonicalValue(resolved_retained_bundle_id)},
   });
-  std::string candidate_bundle;
-  std::string candidate_graph;
-  const deployment::FilesystemVerifiedRetainedBundleSource bundles(
-      directory.apply_package_root());
-  const auto retained_root =
-      directory.apply_package_root() / "retained-bundles" / "sha256";
-  for (const auto &entry : std::filesystem::directory_iterator(retained_root)) {
-    if (!entry.is_regular_file() || entry.path().extension() != ".json")
-      continue;
-    const auto bundle = bundles.get_verified(core::RetainedBundleId(
-        "sha256:" + entry.path().stem().string()));
-    if (bundle != nullptr &&
-        bundle->value().deployment_artifact_id.value() ==
-            deployment_artifact_id &&
-        bundle->value().deployment_revision.value() == deployment_revision) {
-      candidate_bundle = bundle->retained_bundle_id().value();
-      candidate_graph = bundle->value().cell_graph.graph_revision.value();
-      break;
+  // Negative preview tests intentionally have no candidate package (or have
+  // displaced it). Use well-formed absent identities so the Manager, not
+  // fixture lookup, reports the expected rejection.
+  std::string candidate_bundle = "sha256:" + std::string(64U, '1');
+  std::string candidate_graph = "sha256:" + std::string(64U, '2');
+  if (!preview_only) {
+    candidate_bundle.clear();
+    candidate_graph.clear();
+    const deployment::FilesystemVerifiedRetainedBundleSource bundles(
+        directory.apply_package_root());
+    const auto retained_root =
+        directory.apply_package_root() / "retained-bundles" / "sha256";
+    for (const auto &entry : std::filesystem::directory_iterator(retained_root)) {
+      if (!entry.is_regular_file() || entry.path().extension() != ".json")
+        continue;
+      const auto bundle = bundles.get_verified(core::RetainedBundleId(
+          "sha256:" + entry.path().stem().string()));
+      if (bundle != nullptr &&
+          bundle->value().deployment_artifact_id.value() ==
+              deployment_artifact_id &&
+          bundle->value().deployment_revision.value() == deployment_revision) {
+        candidate_bundle = bundle->retained_bundle_id().value();
+        candidate_graph = bundle->value().cell_graph.graph_revision.value();
+        break;
+      }
     }
-  }
-  if (candidate_bundle.empty() || candidate_graph.empty()) {
-    throw std::runtime_error("Manager retained fixture has no matching candidate");
+    if (candidate_bundle.empty() || candidate_graph.empty()) {
+      throw std::runtime_error("Manager retained fixture has no matching candidate");
+    }
   }
   const auto preview_request =
       content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
@@ -1054,7 +1061,7 @@ std::string ApplyRequest(
           {"expected_current", expected},
           {"prepared_activation_id",
            CanonicalValue("sha256:1616161616161616161616161616161616161616161616"
-                          "1616161616161616")},
+                          "161616161616161616")},
           {"request_owner_epoch", CanonicalValue(std::string(owner))},
       }));
   const auto preview_response =
@@ -1066,7 +1073,8 @@ std::string ApplyRequest(
       deployment::parse_strict_json_model_yaml(preview_response).root();
   const auto *ok = std::get_if<bool>(&RequiredMember(preview, "ok").storage());
   if (ok == nullptr || !*ok) {
-    throw std::runtime_error("Manager candidate preview failed in test setup");
+    throw std::runtime_error("Manager candidate preview failed in test setup: " +
+                             preview_response);
   }
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
       {"admission_context",
@@ -1088,7 +1096,7 @@ std::string ApplyRequest(
            {"assistant_mode", CanonicalValue("optional")},
            {"captured_input_digest",
             CanonicalValue("sha256:1414141414141414141414141414141414141414141414"
-                           "1414141414141414")},
+                           "141414141414141414")},
            {"deployment_artifact_id",
             CanonicalValue(std::string(deployment_artifact_id))},
            {"deployment_revision",
@@ -1096,24 +1104,24 @@ std::string ApplyRequest(
            {"graph_revision", CanonicalValue(candidate_graph)},
            {"node_environment_digest",
             CanonicalValue("sha256:1818181818181818181818181818181818181818181818"
-                           "1818181818181818")},
+                           "181818181818181818")},
            {"prepared_activation_id",
             CanonicalValue("sha256:1616161616161616161616161616161616161616161616"
-                           "1616161616161616")},
+                           "161616161616161616")},
            {"program_binding_id",
             CanonicalValue("sha256:1717171717171717171717171717171717171717171717"
-                           "1717171717171717")},
+                           "171717171717171717")},
            {"program_id", CanonicalValue("program.test")},
            {"program_revision",
             CanonicalValue("sha256:1919191919191919191919191919191919191919191919"
-                           "1919191919191919")},
+                           "191919191919191919")},
            {"retained_bundle_id", CanonicalValue(candidate_bundle)},
            {"scenario_id", CanonicalValue("scenario.test")},
            {"schema_version",
             CanonicalValue("manyforge.prepared_activation_input.v2")},
            {"source_document_digest",
             CanonicalValue("sha256:2020202020202020202020202020202020202020202020"
-                           "2020202020202020")},
+                           "202020202020202020")},
            {"typed_parameter_overrides",
             CanonicalValue(CanonicalValue::Object{})},
        })},
@@ -2134,6 +2142,8 @@ TEST(ManagerDaemonProcess,
   ASSERT_NE(package_a, package_b);
 
   DaemonDirectory directory_a;
+  std::filesystem::copy(package_a, directory_a.apply_package_root(),
+                        std::filesystem::copy_options::recursive);
   const auto installed_manager_a = PrepareManagerApplyInstalledTargets(
       directory_a, MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST);
   const auto identity_a = ReadNativePackageIdentity(
@@ -2173,6 +2183,7 @@ TEST(ManagerDaemonProcess,
                                       fixture_a.predecessor_retained_bundle_id,
                                       "manager-o1-4g-replacement-a.1");
     const auto submitted = SendCommand(directory_a.socket_path(), request);
+    ASSERT_NE(submitted.find("\"apply_id\""), std::string::npos) << submitted;
     const auto status_request = ApplyStatusRequest(submitted);
     auto applied = submitted;
     const auto apply_deadline =
@@ -2200,6 +2211,8 @@ TEST(ManagerDaemonProcess,
   }
 
   DaemonDirectory directory_b;
+  std::filesystem::copy(package_b, directory_b.apply_package_root(),
+                        std::filesystem::copy_options::recursive);
   const auto installed_manager_b = PrepareManagerApplyInstalledTargets(
       directory_b, MANYFORGE_HEADLESS_TEST_NATIVE_REPLACEMENT_EXECUTION_HOST);
   const auto identity_b = ReadNativePackageIdentity(
@@ -2250,6 +2263,7 @@ TEST(ManagerDaemonProcess,
                                       fixture_b.predecessor_retained_bundle_id,
                                       "manager-o1-4g-replacement-b.1");
     const auto submitted = SendCommand(directory_b.socket_path(), request);
+    ASSERT_NE(submitted.find("\"apply_id\""), std::string::npos) << submitted;
     const auto status_request = ApplyStatusRequest(submitted);
     auto applied = submitted;
     const auto apply_deadline =
@@ -2377,10 +2391,6 @@ TEST(ManagerDaemonProcess,
         execution_status.find("\"details\":{\"owner_epoch\":\"kernel-owner-"),
         std::string::npos)
         << execution_status;
-    const auto candidate_path =
-        directory.apply_package_root() / "retained-bundles" / "sha256" /
-        (fixture.candidate_retained_bundle_id.substr(7U) + ".json");
-    ASSERT_TRUE(std::filesystem::remove(candidate_path));
     const auto replayed = SendCommand(directory.socket_path(), request);
     EXPECT_NE(replayed.find("\"replay_status\":\"replayed_exact\""),
               std::string::npos)
@@ -2393,9 +2403,12 @@ TEST(ManagerDaemonProcess,
     const auto inventory = journal.ReadStatusInventory();
     ASSERT_EQ(inventory.size(), 1U);
     ASSERT_TRUE(inventory.front().terminal_outcome.has_value());
+    ASSERT_TRUE(inventory.front()
+                    .terminal_outcome->terminal_outcome
+                    .candidate_projection_revision.has_value());
     EXPECT_EQ(inventory.front()
                   .terminal_outcome->terminal_outcome
-                  .candidate_projection_revision.retained_bundle_id.value(),
+                  .candidate_projection_revision->retained_bundle_id.value(),
               fixture.candidate_retained_bundle_id);
 
     const auto manager_after = manager_source.Read();
@@ -2457,14 +2470,15 @@ TEST(ManagerDaemonProcess,
   const auto replay = SendCommand(directory.socket_path(), request);
   EXPECT_NE(replay.find("\"state\":\"succeeded\""), std::string::npos)
       << replay;
-  EXPECT_NE(replay.find("\"request_replayed\":true"), std::string::npos)
+  EXPECT_NE(replay.find("\"replay_status\":\"replayed_exact\""),
+            std::string::npos)
       << replay;
   const auto stopped = replacement.Stop(SIGTERM);
   EXPECT_TRUE(WIFEXITED(stopped));
 }
 
 TEST(ManagerDaemonProcess,
-     PhysicalCompositionClosesOnChildLossAndReopensAfterManagerReplacement) {
+     PhysicalCompositionStaysClosedAfterUnexpectedChildLossAndManagerReplacement) {
   const auto fixture = ReadManagerApplyFixtureMetadata();
   DaemonDirectory directory;
   std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
@@ -2598,35 +2612,42 @@ TEST(ManagerDaemonProcess,
   replacement.WaitReady(directory);
   AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
                                            "logical-scene-source.json");
-  const auto recovered = WaitForExecutionReady(
-      directory, fixture.physical_candidate_retained_bundle_id);
   const auto recovered_scene = scene_source.Read();
   ASSERT_TRUE(recovered_scene.has_value());
   EXPECT_GE(recovered_scene->source_generation, advanced_scene_generation);
-  EXPECT_NE(recovered.owner_epoch, applied_owner_epoch);
-  EXPECT_NE(
-      recovered.response.find(fixture.physical_candidate_retained_bundle_id),
-      std::string::npos);
   AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
                                              "manager-source.json");
-  const auto manager_recovered_offer =
-      WaitForRuntimeOfferProjection(manager_source, recovered.owner_epoch);
-  EXPECT_EQ(recovered.owner_epoch,
-            "kernel-owner-" + manager_recovered_offer.observed_epoch);
   const auto manager_recovered = manager_source.Read();
   ASSERT_TRUE(manager_recovered.has_value());
+  const auto manager_recovered_offer =
+      ReadRuntimeOfferProjection(manager_recovered->payload);
   EXPECT_EQ(manager_recovered_offer.selected, manager_recovered_offer.observed);
   EXPECT_EQ(manager_recovered_offer.selected, initial_offer.selected);
   EXPECT_NE(manager_recovered_offer.observed_epoch,
             initial_offer.observed_epoch);
+  EXPECT_NE("kernel-owner-" + manager_recovered_offer.observed_epoch,
+            applied_owner_epoch);
   EXPECT_NE(manager_recovered->source_owner_epoch, first_manager_epoch);
   EXPECT_NE(content_identity::canonical_json(manager_recovered->payload)
                 .find(fixture.physical_candidate_retained_bundle_id),
             std::string::npos);
+  // An unexpected required-child loss is not a new Apply request. A Manager
+  // restart may restore observation of the durable selection, but cannot
+  // silently rebuild the old physical product or reopen control admission.
+  const auto execution_status = SendCommand(
+      directory.execution_socket_path(),
+      R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+  EXPECT_NE(execution_status.find("\"code\":\"execution_owner_not_ready\""),
+            std::string::npos)
+      << execution_status;
+  EXPECT_FALSE(ReadAuthoringAdmissionProjection(directory).authoring_allowed)
+      << SendCommand(directory.execution_socket_path(),
+                     R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
   const auto replay = SendCommand(directory.socket_path(), apply_request);
   EXPECT_NE(replay.find("\"state\":\"succeeded\""), std::string::npos)
       << replay;
-  EXPECT_NE(replay.find("\"request_replayed\":true"), std::string::npos)
+  EXPECT_NE(replay.find("\"replay_status\":\"replayed_exact\""),
+            std::string::npos)
       << replay;
   const auto stopped = replacement.Stop(SIGTERM);
   EXPECT_TRUE(WIFEXITED(stopped));

@@ -162,10 +162,13 @@ prepare_cmake_metadata "${MODULE_BUILD}"
   manyforge_core_py
 
 EXTENSION_SUFFIX="$(/usr/local/bin/python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
-if [[ "${EXTENSION_SUFFIX}" != ".cpython-312-x86_64-linux-gnu.so" ]]; then
+case "${EXTENSION_SUFFIX}" in
+  .cpython-312-x86_64-linux-gnu.so|.cpython-312-aarch64-linux-gnu.so) ;;
+  *)
   echo "active CPython extension suffix differs from the frozen I2 ABI" >&2
   exit 2
-fi
+  ;;
+esac
 EXTENSION_NAME="manyforge_core_py${EXTENSION_SUFFIX}"
 BUILT_EXTENSION="${MODULE_BUILD}/${EXTENSION_NAME}"
 if [[ ! -f "${BUILT_EXTENSION}" || -L "${BUILT_EXTENSION}" ]]; then

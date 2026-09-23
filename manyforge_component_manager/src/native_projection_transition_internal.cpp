@@ -139,36 +139,3 @@ DeriveCandidateNativeProjectionBindings(
 }
 
 } // namespace manyforge::component_manager::detail
-
-namespace manyforge::component_manager {
-
-std::vector<core::ProjectionNativeRuntimeBindingDTO>
-DeriveActiveNativeProjectionRuntimeBindings(
-    const core::RetainedBundleDTO &active_bundle,
-    const RuntimeObservationSnapshot &observations) {
-  std::vector<core::ProjectionNativeRuntimeBindingDTO> bindings;
-  const auto requirements = detail::Requirements(active_bundle);
-  bindings.reserve(requirements.size());
-  for (const auto &requirement : requirements) {
-    const auto *observation =
-        observations.observation(requirement.runtime_unit_id.value());
-    if (observation == nullptr ||
-        observation->lifecycle_control() !=
-            RuntimeLifecycleControl::kManagerManaged ||
-        observation->process_presence() != ProcessPresenceState::kPresent ||
-        observation->runtime_epoch().empty()) {
-      detail::Fail(
-          "active native provider has no exact converged Manager-observed "
-          "runtime epoch");
-    }
-    bindings.push_back({requirement.provider_binding_id,
-                        requirement.provider_binding_revision,
-                        requirement.runtime_unit_id,
-                        core::RuntimeEpoch(observation->runtime_epoch())});
-  }
-  std::sort(bindings.begin(), bindings.end(),
-            core::CanonicalProjectionNativeBindingLess);
-  return bindings;
-}
-
-} // namespace manyforge::component_manager

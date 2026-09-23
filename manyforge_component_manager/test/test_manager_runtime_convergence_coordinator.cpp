@@ -71,6 +71,29 @@ struct RuntimePackage final {
       artifact_source;
 };
 
+class RefusingBundleReloadSource final
+    : public deployment::IVerifiedRetainedBundleSource {
+public:
+  explicit RefusingBundleReloadSource(
+      const deployment::IVerifiedRetainedBundleSource &source)
+      : source_(source) {}
+
+  [[nodiscard]] std::shared_ptr<const deployment::RetainedBundle>
+  get_verified(const RetainedBundleId &id) const override {
+    ++read_calls;
+    if (refuse_reads) {
+      throw std::runtime_error("accepted bundle was reloaded");
+    }
+    return source_.get_verified(id);
+  }
+
+  mutable int read_calls{0};
+  bool refuse_reads{false};
+
+private:
+  const deployment::IVerifiedRetainedBundleSource &source_;
+};
+
 [[nodiscard]] RuntimePackage
 MaterializeRuntimePackage(const std::filesystem::path &root,
                           const bool empty_runtime = false) {
@@ -166,15 +189,6 @@ ApplyIntent(const deployment::RetainedBundle &bundle) {
       AdmissionGeneration(7U),
       std::nullopt,
   };
-}
-
-[[nodiscard]] ManagerApplyIntentDTO
-ApplyIntent(const deployment::RetainedBundle &predecessor,
-            const deployment::RetainedBundle &candidate) {
-  auto intent = ApplyIntent(predecessor);
-  intent.candidate_retained_bundle_id = candidate.retained_bundle_id();
-  intent.candidate_graph_revision = candidate.value().cell_graph.graph_revision;
-  return intent;
 }
 
 [[nodiscard]] ActiveBundlePublicationReceiptDTO
@@ -1020,18 +1034,21 @@ struct CoordinatorFixture final {
         publication(PredecessorPublication(apply_intent)),
         runtime_ports(independent_reader),
         fence_coordinator(journal, kernel, RuntimeEpoch("manager-runtime-1")),
-        coordinator(fence_coordinator, journal, publication,
+        coordinator(journal, publication,
                     *package.artifact_source, runtime_ports, runtime_ports,
                     "linux", "posix.1-2017", [] { return 1'000U; }) {}
 
   [[nodiscard]] ManagerApplyRuntimeConvergenceResult Run() {
+    if (!journal.ReadFenceAcceptance(apply_intent.apply_id,
+                                     apply_intent.apply_generation)
+             .has_value()) {
+      static_cast<void>(fence_coordinator.AcquireOrRecoverFence(
+          apply_intent, *package.bundle, *package.bundle,
+          ManagerApplyFenceExpectationDTO{
+              0U, ConfigurationFenceGeneration(0U), {}}));
+    }
     return coordinator.ConvergeOrRecover(apply_intent, *package.bundle,
                                          *package.bundle,
-                                         ManagerApplyFenceExpectationDTO{
-                                             0U,
-                                             ConfigurationFenceGeneration(0U),
-                                             {},
-                                         },
                                          ActiveBundlePublicationGeneration(3U));
   }
 
@@ -1045,6 +1062,26 @@ struct CoordinatorFixture final {
   ManagerApplyFenceCoordinator fence_coordinator;
   ManagerApplyRuntimeConvergenceCoordinator coordinator;
 };
+
+TEST(ManagerApplyRuntimeConvergenceCoordinator,
+     MissingAcceptedFenceRejectsBeforeRuntimeEffect) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+
+  EXPECT_THROW(static_cast<void>(fixture.coordinator.ConvergeOrRecover(
+                   fixture.apply_intent, *fixture.package.bundle,
+                   *fixture.package.bundle,
+                   ActiveBundlePublicationGeneration(3U))),
+               ManagerRuntimeConvergenceCoordinatorError);
+  EXPECT_EQ(fixture.kernel.acquire_calls, 0);
+  EXPECT_EQ(fixture.kernel.rehydrate_calls, 0);
+  EXPECT_EQ(fixture.runtime_ports.observe_calls, 0);
+  EXPECT_EQ(fixture.runtime_ports.ensure_calls, 0);
+  EXPECT_FALSE(fixture.journal
+                   .ReadRuntimeConvergenceIntent(ApplyId("apply-1"),
+                                                 ApplyGeneration(1U))
+                   .has_value());
+}
 
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
@@ -1083,7 +1120,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_EQ(fixture.runtime_ports.ensure_calls, 1);
   EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
   EXPECT_EQ(fixture.kernel.acquire_calls, 1);
-  EXPECT_EQ(fixture.kernel.rehydrate_calls, 2);
+  EXPECT_EQ(fixture.kernel.rehydrate_calls, 1);
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
@@ -1323,18 +1360,13 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   // The sealed product is valid, but the selected host launch contract is
   // not offered by that product. This must fail before any owner effect.
   ManagerApplyRuntimeConvergenceCoordinator incompatible(
-      fixture.fence_coordinator, fixture.journal, fixture.publication,
+      fixture.journal, fixture.publication,
       *fixture.package.artifact_source, fixture.runtime_ports,
       fixture.runtime_ports, "linux", "foreign.shell", [] { return 1'000U; });
 
   EXPECT_THROW(static_cast<void>(incompatible.ConvergeOrRecover(
                    fixture.apply_intent, *fixture.package.bundle,
                    *fixture.package.bundle,
-                   ManagerApplyFenceExpectationDTO{
-                       0U,
-                       ConfigurationFenceGeneration(0U),
-                       {},
-                   },
                    ActiveBundlePublicationGeneration(3U))),
                ManagerRuntimeConvergenceCoordinatorError);
   EXPECT_EQ(fixture.kernel.acquire_calls, 0);
@@ -1386,20 +1418,19 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
       *package.artifact_source, "linux", "posix.1-2017");
   std::uint64_t now_ns = 1'000U;
   ManagerApplyRuntimeConvergenceCoordinator coordinator(
-      fence_coordinator, journal, publication, *package.artifact_source,
+      journal, publication, *package.artifact_source,
       runtime_adapter, runtime_adapter, "linux", "posix.1-2017",
       [&now_ns] { return now_ns++; });
   const auto run = [&] {
     return coordinator.ConvergeOrRecover(apply_intent, *package.bundle,
                                          *package.bundle,
-                                         ManagerApplyFenceExpectationDTO{
-                                             0U,
-                                             ConfigurationFenceGeneration(0U),
-                                             {},
-                                         },
                                          ActiveBundlePublicationGeneration(3U));
   };
 
+  static_cast<void>(fence_coordinator.AcquireOrRecoverFence(
+      apply_intent, *package.bundle, *package.bundle,
+      ManagerApplyFenceExpectationDTO{
+          0U, ConfigurationFenceGeneration(0U), {}}));
   const auto first = run();
   ASSERT_EQ(first.state, ManagerRuntimeConvergenceResultState::kStagedReady);
   ASSERT_TRUE(first.durable_staged_ready.has_value());
@@ -1438,10 +1469,11 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
 }
 
 TEST(ManagerNamedApplyCoordinator,
-     CapturesOnceProgressesAfterSourceRemovalAndReplaysWithoutEffects) {
+     CapturesOnceProgressesWithoutBundleReloadAndReplaysWithoutEffects) {
   ScopedPackageRoot package_root;
   ScopedPackageRoot state_root;
   auto package = MaterializeRuntimePackage(package_root.path());
+  RefusingBundleReloadSource bundle_source(*package.bundle_source);
   const auto intent_template = ApplyIntent(*package.bundle);
   const auto predecessor = PredecessorPublication(intent_template);
   SqliteManagerApplyJournal journal(state_root.path() / "named-apply.sqlite3",
@@ -1466,7 +1498,7 @@ TEST(ManagerNamedApplyCoordinator,
   ManagerPlannedMaintenanceCoordinator planned_maintenance(
       active_plan_source, active_runtime, maintenance_gate);
   ManagerNamedApplyCoordinator coordinator(
-      journal, active_plan_source, *package.bundle_source,
+      journal, active_plan_source, bundle_source,
       *package.artifact_source, publication_store, scene_owner, nullptr,
       kernel_fence, cell_admission, runtime_composition, runtime_ports,
       runtime_ports, planned_maintenance,
@@ -1491,12 +1523,20 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(runtime_ports.ensure_calls, 0);
   EXPECT_EQ(scene_owner.begin_calls, 0);
 
-  // Progress must use the sealed values captured at acceptance, not reopen the
-  // package repository. Removing the backing files before Continue makes that
-  // boundary explicit.
-  ASSERT_GT(std::filesystem::remove_all(package_root.path()), 0U);
+  // Continue must use the accepted bundles, not look them up again. Retained
+  // executable products remain available for their separate verification and
+  // process initialization.
+  const auto accepted_bundle_reads = bundle_source.read_calls;
+  bundle_source.refuse_reads = true;
   const auto completed = coordinator.RecoverIncompleteApply();
   ASSERT_TRUE(completed.has_value());
+  const auto failure_detail =
+      completed->terminal_outcome.has_value() &&
+              completed->terminal_outcome->failure.has_value()
+          ? completed->terminal_outcome->failure->failure_code + ": " +
+                completed->terminal_outcome->failure->failure_message
+          : std::string("no terminal failure");
+  SCOPED_TRACE(failure_detail);
   EXPECT_EQ(completed->state, ManagerNamedApplyResultState::kSucceeded);
   EXPECT_TRUE(completed->request_replayed);
   ASSERT_TRUE(completed->terminal_outcome.has_value());
@@ -1507,6 +1547,7 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(publication_store.publish_calls, 1);
   EXPECT_EQ(kernel_fence.acquire_calls, 1);
   EXPECT_EQ(kernel_fence.release_calls, 1);
+  EXPECT_EQ(bundle_source.read_calls, accepted_bundle_reads);
 
   const auto replayed = coordinator.AcceptOrReplay(request);
   EXPECT_EQ(replayed.state, ManagerNamedApplyResultState::kSucceeded);

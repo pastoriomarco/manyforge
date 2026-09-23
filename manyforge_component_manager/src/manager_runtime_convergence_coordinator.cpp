@@ -475,7 +475,6 @@ ManagerRuntimeProcessEffectUncertainError::recovery_query() const noexcept {
 
 ManagerApplyRuntimeConvergenceCoordinator::
     ManagerApplyRuntimeConvergenceCoordinator(
-        ManagerApplyFenceCoordinator &fence_coordinator,
         SqliteManagerApplyJournal &apply_journal,
         const manyforge::core::IActiveBundlePublicationReader
             &publication_reader,
@@ -486,14 +485,13 @@ ManagerApplyRuntimeConvergenceCoordinator::
         std::string shell_contract, RuntimeObservationReducer::Clock clock_ns,
         RuntimePreStartGuard pre_start_guard)
     : ManagerApplyRuntimeConvergenceCoordinator(
-          fence_coordinator, apply_journal, publication_reader, artifact_source,
+          apply_journal, publication_reader, artifact_source,
           process_port, progress_port, std::move(operating_system),
           std::vector<std::string>{std::move(shell_contract)},
           std::move(clock_ns), std::move(pre_start_guard)) {}
 
 ManagerApplyRuntimeConvergenceCoordinator::
     ManagerApplyRuntimeConvergenceCoordinator(
-        ManagerApplyFenceCoordinator &fence_coordinator,
         SqliteManagerApplyJournal &apply_journal,
         const manyforge::core::IActiveBundlePublicationReader
             &publication_reader,
@@ -504,7 +502,7 @@ ManagerApplyRuntimeConvergenceCoordinator::
         std::vector<std::string> launch_environment_contracts,
         RuntimeObservationReducer::Clock clock_ns,
         RuntimePreStartGuard pre_start_guard)
-    : fence_coordinator_(fence_coordinator), apply_journal_(apply_journal),
+    : apply_journal_(apply_journal),
       publication_reader_(publication_reader),
       artifact_source_(artifact_source), process_port_(process_port),
       progress_port_(progress_port),
@@ -534,7 +532,6 @@ ManagerApplyRuntimeConvergenceResult
 ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
     const ManagerApplyIntentDTO &apply_intent,
     const RetainedBundle &predecessor, const RetainedBundle &candidate,
-    const ManagerApplyFenceExpectationDTO &fence_expectation,
     const ActiveBundlePublicationGeneration
         predecessor_publication_generation) {
   std::lock_guard operation_lock(operation_mutex_);
@@ -550,12 +547,19 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
                          operating_system_, launch_environment_contracts_);
   const auto dependency_order = DependencyOrder(runtime_plans);
 
-  auto fence = fence_coordinator_.AcquireOrRecoverFence(
-      apply_intent, predecessor, candidate, fence_expectation);
+  // The named Apply owner acquired and durably recorded the fence before
+  // stopping the predecessor. Reacquiring here would contact that stopped
+  // child, so convergence consumes only the verified journal evidence.
+  const auto status = apply_journal_.ReadStatus(
+      apply_intent.apply_id, apply_intent.apply_generation);
+  if (!status.has_value() || status->intent.intent != apply_intent ||
+      !status->fence_acceptance.has_value()) {
+    Fail("runtime convergence requires the exact accepted Apply fence");
+  }
   const auto after_fence_publication = VerifyCurrentPredecessor(
       publication_reader_, apply_intent, predecessor_publication_generation);
   if (after_fence_publication != initial_publication) {
-    Fail("predecessor publication changed while acquiring the Apply fence");
+    Fail("predecessor publication changed before runtime convergence");
   }
 
   ManagerApplyRuntimeConvergenceIntentDTO convergence_intent{
@@ -563,13 +567,13 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       apply_intent.apply_generation,
       candidate.retained_bundle_id(),
       candidate.value().cell_graph.graph_revision,
-      fence.durable_acceptance.record.acceptance_digest,
+      status->fence_acceptance->acceptance_digest,
       initial_publication.publication_generation,
       initial_publication.durable_public_pointer_content_digest,
       std::move(runtime_plans),
   };
   const auto durable_intent = apply_journal_.EnsureRuntimeConvergenceIntent(
-      fence.durable_intent.record.intent_digest, convergence_intent);
+      status->intent.intent_digest, convergence_intent);
   const auto prior_staged_ready = apply_journal_.ReadLatestRuntimeStagedReady(
       apply_intent.apply_id, apply_intent.apply_generation);
   const auto prior_proves_candidate_preparation =
@@ -722,7 +726,6 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       Fail(detail);
     }
     return {
-        std::move(fence),
         durable_intent,
         std::move(snapshot),
         std::nullopt,
@@ -742,7 +745,6 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
   // original intent to newly observed children.
   if (prior_staged_ready.has_value()) {
     return {
-        std::move(fence),
         durable_intent,
         std::move(snapshot),
         ManagerApplyRuntimeStagedReadyWriteResult{*prior_staged_ready, false},
@@ -784,7 +786,6 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       apply_journal_.EnsureRuntimeStagedReady(staged_ready);
 
   return {
-      std::move(fence),
       durable_intent,
       std::move(snapshot),
       std::move(durable_staged_ready),

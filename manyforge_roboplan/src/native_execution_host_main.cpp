@@ -1855,42 +1855,28 @@ private:
     if (IsPrepared(key, request)) {
       return;
     }
-
+    Require(Find(request.native_runtime_binding) == nullptr,
+            "a different retained model requires stopping the native runtime "
+            "before initialization");
     auto assets = BuildProjectionAssets(request);
-    auto existing = Find(request.native_runtime_binding);
-    if (existing == nullptr) {
-      auto created = RetainedPlannerSceneProjection::CreateUninitialized(
-          std::move(assets.projector), request.planning_collision_model,
-          request.native_runtime_binding,
-          RetainedPlannerSceneProjectionConfig{
-              "managed-native-projection-" +
-                  request.native_runtime_binding.provider_binding_id.value(),
-              256U, RetainedCollisionWorldPublisher::kDefaultLedgerCapacity},
-          MonotonicNowNs);
-      if (!created.ok()) {
-        Fail("native projection construction failed: " +
-             created.error().message);
-      }
-      std::lock_guard lock(mutex_);
-      const auto [inserted, unique] =
-          projections_.emplace(key, RegisteredProjection{
-                                        request.native_runtime_binding,
-                                        std::move(created.value())});
-      Require(unique && inserted->second.projection != nullptr,
-              "native projection registry insertion conflicted");
-      prepared_.insert_or_assign(
-          key, PreparedIdentity{request.candidate_retained_bundle_id,
-                                request.candidate_graph_revision,
-                                request.planning_collision_model});
-      return;
+    auto created = RetainedPlannerSceneProjection::CreateUninitialized(
+        std::move(assets.projector), request.planning_collision_model,
+        request.native_runtime_binding,
+        RetainedPlannerSceneProjectionConfig{
+            "managed-native-projection-" +
+                request.native_runtime_binding.provider_binding_id.value(),
+            256U, RetainedCollisionWorldPublisher::kDefaultLedgerCapacity},
+        MonotonicNowNs);
+    if (!created.ok()) {
+      Fail("native projection construction failed: " +
+           created.error().message);
     }
-    auto prepared = existing->PrepareCandidateProjection(
-        std::move(assets.projector), request.planning_collision_model);
-    if (!prepared.ok()) {
-      Fail("native projection candidate preparation failed: " +
-           prepared.error().message);
-    }
-    std::lock_guard prepared_lock(mutex_);
+    std::lock_guard lock(mutex_);
+    const auto [inserted, unique] = projections_.emplace(
+        key, RegisteredProjection{request.native_runtime_binding,
+                                  std::move(created.value())});
+    Require(unique && inserted->second.projection != nullptr,
+            "native projection registry insertion conflicted");
     prepared_.insert_or_assign(
         key, PreparedIdentity{request.candidate_retained_bundle_id,
                               request.candidate_graph_revision,
@@ -9431,6 +9417,7 @@ LoadExactManagedCandidateBundle(
 struct ManagedBootstrapStopProduct final {
   std::optional<core::StopDeadlineBudgetDTO> deadline_budget;
   std::vector<core::ResourceId> resource_inventory;
+  bool requires_physical_composition{};
 };
 
 [[nodiscard]] ManagedBootstrapStopProduct LoadManagedBootstrapStopProduct(
@@ -9460,7 +9447,8 @@ struct ManagedBootstrapStopProduct final {
           "managed bootstrap resource inventory exceeds the Kernel bound");
   return {
       deployment::resolve_retained_stop_deadline_budget(*bundle, catalog_store),
-      {resources.begin(), resources.end()}};
+      {resources.begin(), resources.end()},
+      !bundle->value().cell_graph.controllable_components.empty()};
 }
 
 [[nodiscard]] std::optional<CompositionBuildInput> BuildManagedCompositionInput(
@@ -9657,6 +9645,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       kNativeMaximumLiveStopParticipants;
   auto bootstrap_stop = LoadManagedBootstrapStopProduct(
       config, bootstrap_retained_bundle_id, bootstrap_graph_revision);
+  const bool bootstrap_requires_physical_composition =
+      bootstrap_stop.requires_physical_composition;
   bootstrap_kernel_config.cell_stop_deadline_budget =
       std::move(bootstrap_stop.deadline_budget);
   bootstrap_kernel_config.empty_runtime_resource_inventory =
@@ -9696,6 +9686,11 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           *detached_owner_clock, *detached_owner_scheduler,
           *detached_operation_journal, std::move(bootstrap_kernel_config));
   auto *const stable_kernel_owner = detached_addressed_kernel.get();
+  if (bootstrap_requires_physical_composition) {
+    Require(stable_kernel_owner->SetRouteRecoveryPending(true).ok(),
+            "selected physical runtime could not close admission before "
+            "composition initialization");
+  }
   const auto bind_stable_kernel_to_runtime =
       [&](RetainedNativeRuntime &runtime) {
         runtime.cell_addressed_kernel = stable_kernel_owner;

@@ -232,6 +232,16 @@ ORDER BY r.provider_binding_id,r.provider_binding_revision;
 -- structural fact retained by the UA4 migration snapshot.
 DROP TRIGGER IF EXISTS logical_scene_history_state_no_delete;
 DROP TRIGGER IF EXISTS logical_scene_owner_events_no_delete;
+-- The bounded-history delete guards read this table. Remove them before the
+-- table swap, then restore the guards for tables that remain after migration.
+DROP TRIGGER IF EXISTS logical_scene_transaction_intents_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_request_outcomes_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_projection_attempts_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_projection_results_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_intents_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_bindings_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_results_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_completions_no_delete;
 CREATE TABLE logical_scene_history_state_ua4 (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     compaction_generation INTEGER NOT NULL CHECK (
@@ -328,6 +338,34 @@ CREATE TRIGGER logical_scene_history_state_no_delete
 BEFORE DELETE ON logical_scene_history_state
 BEGIN
     SELECT RAISE(ABORT, 'logical_scene_history_state is durable owner state');
+END;
+CREATE TRIGGER logical_scene_transaction_intents_no_delete
+BEFORE DELETE ON logical_scene_transaction_intents
+WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
+      WHERE singleton = 1) != 1
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_transaction_intents is immutable');
+END;
+CREATE TRIGGER logical_scene_request_outcomes_no_delete
+BEFORE DELETE ON logical_scene_request_outcomes
+WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
+      WHERE singleton = 1) != 1
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_request_outcomes is immutable');
+END;
+CREATE TRIGGER logical_scene_projection_attempts_no_delete
+BEFORE DELETE ON logical_scene_projection_attempts
+WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
+      WHERE singleton = 1) != 1
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_projection_attempts is immutable');
+END;
+CREATE TRIGGER logical_scene_projection_results_no_delete
+BEFORE DELETE ON logical_scene_projection_results
+WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
+      WHERE singleton = 1) != 1
+BEGIN
+    SELECT RAISE(ABORT, 'logical_scene_projection_results is immutable');
 END;
 
 -- Preserve the total order shared with ordinary logical Scene transactions,

@@ -6,6 +6,7 @@
 #include <manyforge_component_manager/apply_completion.hpp>
 #include <manyforge_component_manager/runtime_convergence.hpp>
 #include <manyforge_component_manager/selected_bundle_transition.hpp>
+#include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/projection_common.hpp>

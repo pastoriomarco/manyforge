@@ -87,8 +87,6 @@ class _Headless:
         self.applied: dict[str, Any] | None = None
         self.manager_target = False
         self.manager_apply_bodies: list[dict[str, Any]] = []
-        self.program_apply_bodies: list[dict[str, Any]] = []
-        self.scene_preparations: list[dict[str, Any]] = []
 
     def program_applied(self) -> dict[str, Any]:
         if self.applied is None:
@@ -177,30 +175,6 @@ class _Headless:
                 ],
                 "manager_owner_epoch": body["request_owner_epoch"],
                 "receipt_digest": "sha256:" + "8" * 64,
-            },
-        }
-
-    def program_apply(self, body: dict[str, Any]) -> dict[str, Any]:
-        self.program_apply_bodies.append(deepcopy(body))
-        self.applied = _applied(self.selection)
-        return {
-            "schema_version": "manyforge.program_apply_result.v2",
-            "status": "applied",
-            "preparation": {},
-            "applied": deepcopy(self.applied),
-        }
-
-    def program_scene_prepare(self, body: dict[str, Any]) -> dict[str, Any]:
-        self.scene_preparations.append(deepcopy(body))
-        assert self.applied is not None
-        return {
-            "schema_version": "manyforge.program_scene_preparation.v1",
-            "status": "prepared",
-            "applied_record_digest": self.applied["source"]["record_digest"],
-            "program_revision": self.applied["program_revision"],
-            "admission_generation": 7,
-            "prepared_scene": {
-                "schema_version": "manyforge.prepared_program_scene.v1"
             },
         }
 

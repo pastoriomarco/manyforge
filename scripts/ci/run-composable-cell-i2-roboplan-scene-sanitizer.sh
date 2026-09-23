@@ -32,7 +32,7 @@ if [[ "${SANITIZER}" == "thread" ]]; then
       exit 2
     fi
     export MANYFORGE_TSAN_SETARCH_REEXEC=1
-    exec /usr/bin/setarch x86_64 -R "$0" "$@"
+    exec /usr/bin/setarch "$(uname -m)" -R "$0" "$@"
   fi
   unset MANYFORGE_TSAN_SETARCH_REEXEC
   child_personality="$(sh -c 'cat /proc/self/personality')"

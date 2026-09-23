@@ -149,8 +149,7 @@ publication(const RetainedBundle &bundle) {
                core::BootstrapId("bootstrap.lifecycle"),
                core::BootstrapGeneration(1U)},
            revision, revision.retained_bundle_id, revision.graph_revision,
-           std::nullopt, core::ContentDigest("private-materialization"),
-           core::ContentDigest("retired-command-surfaces")},
+           std::nullopt, core::ContentDigest("private-materialization")},
           core::ActiveBundlePublicationGeneration(1U),
           core::ContentDigest("active-public-pointer")};
 }

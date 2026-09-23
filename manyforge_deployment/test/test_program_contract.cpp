@@ -15,7 +15,6 @@
 #include <utility>
 #include <vector>
 
-#include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
@@ -343,19 +342,29 @@ make_bundle(const std::filesystem::path &root) {
 [[nodiscard]] std::shared_ptr<const RetainedBundle> maintained_motion_bundle() {
   const std::filesystem::path path(MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT);
   const manyforge::core::CellId cell_id("lite6_pick_place_cell");
-  const auto admission =
-      manyforge::deployment::FilesystemCanonicalEmptyRetainedBundleSource(
-          path,
-          manyforge::deployment::cell_scoped_canonical_empty_admission_filename(
-              cell_id))
-          .load_verified();
-  const auto bundle = FilesystemVerifiedRetainedBundleSource(path).get_verified(
-      admission.retained_bundle_id());
-  if (bundle == nullptr || bundle->value().cell_graph.cell_id != cell_id) {
+  const FilesystemVerifiedRetainedBundleSource source(path);
+  std::shared_ptr<const RetainedBundle> selected;
+  for (const auto &entry :
+       std::filesystem::directory_iterator(path / "retained-bundles" / "sha256")) {
+    if (!entry.is_regular_file() || entry.path().extension() != ".json") {
+      continue;
+    }
+    const auto bundle = source.get_verified(manyforge::core::RetainedBundleId(
+        "sha256:" + entry.path().stem().string()));
+    if (bundle != nullptr && bundle->value().cell_graph.cell_id == cell_id &&
+        bundle->value().deployment_artifact_id.value() ==
+            "lite6_lite_gripper_pick_and_place") {
+      if (selected != nullptr) {
+        throw std::logic_error("maintained capture package has duplicate Lite6 motion bundles");
+      }
+      selected = bundle;
+    }
+  }
+  if (selected == nullptr) {
     throw std::logic_error(
         "maintained capture package has no exact verified Lite6 motion bundle");
   }
-  return bundle;
+  return selected;
 }
 
 void erase_member(CanonicalValue::Object &object, std::string_view name) {

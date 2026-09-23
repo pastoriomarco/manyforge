@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include <manyforge_component_manager/manager_apply_fence_coordinator.hpp>
+#include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_component_manager/runtime_convergence.hpp>
 #include <manyforge_core/ports/iactive_bundle_publication_store.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -48,7 +48,6 @@ enum class ManagerRuntimeConvergenceResultState {
 };
 
 struct ManagerApplyRuntimeConvergenceResult final {
-  ManagerApplyFenceAcquireResult fence;
   ManagerApplyRuntimeConvergenceIntentWriteResult durable_runtime_intent;
   RuntimeObservationSnapshot observations;
   std::optional<ManagerApplyRuntimeStagedReadyWriteResult> durable_staged_ready;
@@ -87,7 +86,6 @@ BuildVerifiedRuntimeConvergencePlan(
 class ManagerApplyRuntimeConvergenceCoordinator final {
 public:
   ManagerApplyRuntimeConvergenceCoordinator(
-      ManagerApplyFenceCoordinator &fence_coordinator,
       SqliteManagerApplyJournal &apply_journal,
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
@@ -97,7 +95,6 @@ public:
       std::string shell_contract, RuntimeObservationReducer::Clock clock_ns,
       RuntimePreStartGuard pre_start_guard = {});
   ManagerApplyRuntimeConvergenceCoordinator(
-      ManagerApplyFenceCoordinator &fence_coordinator,
       SqliteManagerApplyJournal &apply_journal,
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
@@ -112,7 +109,6 @@ public:
   ConvergeOrRecover(const ManagerApplyIntentDTO &apply_intent,
                     const manyforge::deployment::RetainedBundle &predecessor,
                     const manyforge::deployment::RetainedBundle &candidate,
-                    const ManagerApplyFenceExpectationDTO &fence_expectation,
                     manyforge::core::ActiveBundlePublicationGeneration
                         predecessor_publication_generation);
 
@@ -122,7 +118,6 @@ public:
   operator=(const ManagerApplyRuntimeConvergenceCoordinator &) = delete;
 
 private:
-  ManagerApplyFenceCoordinator &fence_coordinator_;
   SqliteManagerApplyJournal &apply_journal_;
   const manyforge::core::IActiveBundlePublicationReader &publication_reader_;
   const manyforge::deployment::IVerifiedRetainedProductArtifactSource

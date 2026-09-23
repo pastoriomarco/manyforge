@@ -230,6 +230,7 @@ def main() -> int:
     scenario_path = (workspace / args.scenario).resolve()
     manifest = load_strict_json_yaml(scenario_path / "scenario.yaml")
     document = {
+        "scenario_id": manifest["scenario_id"],
         "deployment_draft": load_strict_json_yaml(
             scenario_path / "deployment.yaml"
         ),

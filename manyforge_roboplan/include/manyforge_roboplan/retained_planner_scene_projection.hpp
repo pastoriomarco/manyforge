@@ -60,15 +60,6 @@ public:
       std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver =
           nullptr);
 
-  /// Preload one exact candidate structural model while the current
-  /// projection remains active. The next exact RebuildProjection consumes
-  /// this host-internal preparation without resolving deployment artifacts.
-  [[nodiscard]] core::Result<void> PrepareCandidateProjection(
-      RetainedCollisionWorldProjector candidate_projector,
-      core::RetainedProductDTO candidate_planning_collision_model,
-      std::shared_ptr<const RetainedSceneFrameResolver>
-          candidate_frame_resolver = nullptr);
-
   /// Install the direct-provider resolver assembled by the exact active
   /// physical composition. The caller performs this once while command
   /// admission is closed, after candidate participants are installed.
@@ -185,12 +176,6 @@ private:
   RetainedCollisionWorldProjector projector_;
   core::RetainedProductDTO planning_collision_model_;
   std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver_;
-  struct PreparedCandidateModel final {
-    RetainedCollisionWorldProjector projector;
-    core::RetainedProductDTO planning_collision_model;
-    std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver;
-  };
-  std::optional<PreparedCandidateModel> prepared_candidate_model_;
   core::ProjectionNativeRuntimeBindingDTO native_runtime_binding_;
   RetainedPlannerSceneProjectionConfig config_;
   Clock clock_;

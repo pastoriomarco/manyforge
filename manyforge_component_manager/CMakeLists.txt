@@ -394,6 +394,7 @@ if(BUILD_TESTING)
     test/test_manager_planned_maintenance_coordinator.cpp)
   target_link_libraries(test_manager_planned_maintenance_coordinator PRIVATE
     manyforge_component_manager
+    manyforge::deployment_verification_core
     GTest::gtest_main)
   gtest_discover_tests(test_manager_planned_maintenance_coordinator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

@@ -1,6 +1,7 @@
 #include <manyforge_deployment/scenario_program_admission.hpp>
 
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
+#include <manyforge_core/types/program_contract.hpp>
 
 #include <algorithm>
 #include <cmath>

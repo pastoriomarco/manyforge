@@ -79,7 +79,7 @@ if [[ "${current_personality}" != "${expected_personality}" ]]; then
     exit 2
   fi
   export MANYFORGE_BINDING_SANITIZER_SETARCH_REEXEC=1
-  exec /usr/bin/setarch x86_64 -R "$0" "$@"
+  exec /usr/bin/setarch "$(uname -m)" -R "$0" "$@"
 fi
 unset MANYFORGE_BINDING_SANITIZER_SETARCH_REEXEC
 child_personality="$(sh -c 'cat /proc/self/personality')"
@@ -246,7 +246,12 @@ prepare_cmake_metadata "${MODULE_BUILD}"
 /usr/bin/ninja -C "${MODULE_BUILD}" -j "${PARALLEL}" -d keeprsp \
   manyforge_core_py
 
-EXTENSION_NAME="manyforge_core_py.cpython-312-x86_64-linux-gnu.so"
+EXTENSION_SUFFIX="$("${PYTHON_EXECUTABLE}" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+case "${EXTENSION_SUFFIX}" in
+  .cpython-312-x86_64-linux-gnu.so|.cpython-312-aarch64-linux-gnu.so) ;;
+  *) echo "active CPython extension suffix differs from the supported I2 ABI" >&2; exit 2 ;;
+esac
+EXTENSION_NAME="manyforge_core_py${EXTENSION_SUFFIX}"
 BUILT_EXTENSION="${MODULE_BUILD}/${EXTENSION_NAME}"
 if [[ ! -f "${BUILT_EXTENSION}" || -L "${BUILT_EXTENSION}" ]]; then
   echo "sanitized binding build omitted the exact CPython extension" >&2
@@ -287,7 +292,9 @@ export MANYFORGE_I2_BINDING_EXECUTABLE="${PYTHON_EXECUTABLE}"
 
 if [[ "${SANITIZER}" == "thread" ]]; then
   export TSAN_SUPPRESSIONS="${SCRIPT_DIR}/tsan.supp"
-  export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtsan.so.2
+  TSAN_LIBRARY="$(/usr/bin/g++ -print-file-name=libtsan.so)"
+  [[ "${TSAN_LIBRARY}" == /* && -f "${TSAN_LIBRARY}" ]] || { echo "TSan runtime is unavailable" >&2; exit 2; }
+  export LD_PRELOAD="${TSAN_LIBRARY}"
   TEST_CASES=(
     verification/composable_cell_i2/binding_contract_tests.py::test_concurrent_pure_compiles_are_deterministic
   )

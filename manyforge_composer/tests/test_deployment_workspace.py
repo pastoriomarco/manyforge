@@ -1014,16 +1014,17 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     )
     edited = client.get("/api/deployment/workspace").json()
     state.authoring_workspace.remember_project(
-        document=None,
-        document_path=str(project),
-        source_document_digest="sha256:" + "6" * 64,
-        explicit={
+        document={
+            "scenario_id": "lite6_pick_and_place",
             "program_role_assignment": json.loads(
                 (project / "assignment.yaml").read_text(encoding="utf-8")
             ),
             "typed_parameter_overrides": {},
         },
+        document_path=str(project),
+        source_document_digest="sha256:" + "6" * 64,
     )
+    edited = client.get("/api/deployment/workspace").json()
     capture_calls = 0
     capture_sources = routes_deployment_draft._capture_model_sources
 
@@ -1150,7 +1151,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
         "/api/deployment/draft/apply",
         json=_request(edited, kind="apply", local=False),
     )
-    assert confirmation.status_code == 200, confirmation.text
+    assert confirmation.status_code == 202, confirmation.text
     assert confirmation.json()["result"]["status"] == "confirmation_required"
     assert confirmation.json()["result"]["confirmation_token"] == confirmation_token
     assert current["deployment_revision"] == base_revision

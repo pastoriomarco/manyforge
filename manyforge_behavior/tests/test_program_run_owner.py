@@ -3209,7 +3209,7 @@ def test_native_selection_join_rejects_a_catalog_change_before_construction() ->
             owner_availability=fixture_admission.readiness.owner_by_port,
         )
     except ProgramRunOwnerError as error:
-        assert "catalog changed" in str(error)
+        assert "Scenario source document changed" in str(error)
     else:
         raise AssertionError("stale applied configuration revision was admitted")
 
@@ -3304,6 +3304,6 @@ def test_applied_program_publication_is_complete_run_input() -> None:
             owner_availability=admission.readiness.owner_by_port,
         )
     except ProgramRunOwnerError as error:
-        assert "does not match" in str(error)
+        assert "scenario Program, binding, and retained identities disagree" in str(error)
     else:
         raise AssertionError("incoherent Applied publication was admitted")
