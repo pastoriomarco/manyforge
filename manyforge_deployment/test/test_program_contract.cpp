@@ -15,8 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/program_contract.hpp>
-#include <manyforge_deployment/scenario_catalog.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include "content_identity_internal.hpp"
@@ -342,18 +342,20 @@ make_bundle(const std::filesystem::path &root) {
 
 [[nodiscard]] std::shared_ptr<const RetainedBundle> maintained_motion_bundle() {
   const std::filesystem::path path(MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT);
-  const manyforge::deployment::FilesystemScenarioCatalogRepository catalog(
-      path, "maintained");
-  const auto source = catalog.get_verified();
-  if (source == nullptr)
-    throw std::logic_error("maintained capture package was not prepared");
-  for (const auto &row : source->rows()) {
-    if (row.scenario_id == "lite6_pick_and_place") {
-      return FilesystemVerifiedRetainedBundleSource(path).get_verified(
-          row.retained_bundle_id);
-    }
+  const manyforge::core::CellId cell_id("lite6_pick_place_cell");
+  const auto admission =
+      manyforge::deployment::FilesystemCanonicalEmptyRetainedBundleSource(
+          path,
+          manyforge::deployment::cell_scoped_canonical_empty_admission_filename(
+              cell_id))
+          .load_verified();
+  const auto bundle = FilesystemVerifiedRetainedBundleSource(path).get_verified(
+      admission.retained_bundle_id());
+  if (bundle == nullptr || bundle->value().cell_graph.cell_id != cell_id) {
+    throw std::logic_error(
+        "maintained capture package has no exact verified Lite6 motion bundle");
   }
-  throw std::logic_error("maintained capture fixture has no Lite6 scenario");
+  return bundle;
 }
 
 void erase_member(CanonicalValue::Object &object, std::string_view name) {

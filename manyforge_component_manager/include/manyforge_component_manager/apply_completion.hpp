@@ -10,13 +10,14 @@
 
 namespace manyforge::component_manager {
 
-/// Durable intent written after scene Finalize and before Kernel Release.
+/// Durable intent written after Scene maintenance completion and before Kernel
+/// Release.
 ///
 /// The complete compare-and-swap request is retained so a lost Release
 /// response can be reconciled against the exact request rather than retried
 /// from newly assembled state.
 struct ManagerApplyFenceReleaseIntentDTO final {
-  manyforge::core::ContentDigest scene_finalized_digest;
+  manyforge::core::ContentDigest scene_completion_digest;
   manyforge::core::ContentDigest fence_acceptance_digest;
   manyforge::core::ConfigurationFenceReleaseDTO release_request;
 
@@ -50,7 +51,6 @@ enum class ManagerApplyTerminalOutcomeState {
 /// projection never infers a label from process responsiveness, heartbeat
 /// traffic or wall time: a phase is reached only when its exact durable record
 /// exists. Intermediate records (`fence_attempt`, `runtime_convergence_intent`,
-/// `scene_stage_intent`, `activation_selection`, `retired_command_surfaces`,
 /// `publication_receipt`, `fence_release_intent`) are implied by the milestone
 /// that follows them in the parent chain.
 enum class ManagerApplyPhase {
@@ -58,8 +58,6 @@ enum class ManagerApplyPhase {
   kFenceAcquired,
   kFenceAccepted,
   kRuntimeConverged,
-  kSceneStaged,
-  kSceneActivated,
   kComposed,
   kPublished,
   kSettled,
@@ -99,10 +97,10 @@ struct ManagerApplyFailureEvidenceDTO final {
 /// The one immutable terminal outcome of one named-Apply generation.
 ///
 /// Exactly one disposition exists per operation. A success carries the exact
-/// Finalize, publication and Kernel-fence-release evidence and no failure. A
+/// Scene completion, publication and Kernel-fence-release evidence and no failure. A
 /// `failed` or `unknown_effect` outcome carries the first retained failure with
 /// its effect certainty and no publication evidence, because the operation
-/// never completed Scene Finalize, publication and fence release. A terminal
+/// never completed Scene maintenance, publication and fence release. A terminal
 /// failure is never repaired, retried or rolled back, and its effects are never
 /// assumed absent.
 struct ManagerApplyTerminalOutcomeDTO final {
@@ -111,7 +109,7 @@ struct ManagerApplyTerminalOutcomeDTO final {
   std::optional<manyforge::core::ProjectionRevisionDTO>
       candidate_projection_revision;
   std::optional<manyforge::core::ContentDigest> publication_receipt_digest;
-  std::optional<manyforge::core::ContentDigest> scene_finalized_digest;
+  std::optional<manyforge::core::ContentDigest> scene_completion_digest;
   std::optional<manyforge::core::ContentDigest> fence_released_digest;
   ManagerApplyTerminalOutcomeState state;
   std::optional<ManagerApplyFailureEvidenceDTO> failure;

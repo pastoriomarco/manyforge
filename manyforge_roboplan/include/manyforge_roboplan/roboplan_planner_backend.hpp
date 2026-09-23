@@ -52,7 +52,7 @@ struct RoboPlanPlannerBackendConfig final {
   double default_single_shot_ik_timeout_s{0.05};
 };
 
-/// Resource-addressed IPlannerBackend adapter for RoboPlan 0.6.
+/// Resource-addressed IPlannerBackend adapter for RoboPlan 0.7.
 ///
 /// This boundary validates the complete Kernel-issued participant/projection
 /// identity, strips it to the exact private candidate contract, and restores

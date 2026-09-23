@@ -544,7 +544,7 @@ def _fixture(
     admission = ProgramRunAdmission(
         scenario_id="ur5-pick-place",
         applied_record_digest="sha256:" + "9" * 64,
-        scenario_catalog_revision=_DIGEST_A,
+        source_document_digest=_DIGEST_A,
         program=program,
         environment=environment,
         program_binding_id=_DIGEST_A,
@@ -634,7 +634,7 @@ def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> No
     assert set(started.node_statuses.values()) == {"idle"}
     assert task.starts == 0
     assert started.capture.scenario_id == "ur5-pick-place"
-    assert started.capture.scenario_catalog_revision == _DIGEST_A
+    assert started.capture.source_document_digest == _DIGEST_A
     assert started.capture.program_id == admission.program.program_id
     assert started.capture.program_revision == admission.program.program_revision
     assert started.capture.program_binding_id == _DIGEST_A
@@ -3140,10 +3140,10 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
     program = admission.program
     environment = admission.environment
     return {
-        "schema_version": "manyforge.scenario_program_selection.v2",
+        "schema_version": "manyforge.program_run_input.v1",
         "applied_record_digest": admission.applied_record_digest,
         "scenario_id": admission.scenario_id,
-        "scenario_catalog_revision": admission.scenario_catalog_revision,
+        "source_document_digest": admission.source_document_digest,
         "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "d" * 64,
         "retained_bundle_id": admission.retained_bundle_id,
@@ -3191,8 +3191,8 @@ def test_native_selection_join_rejects_a_catalog_change_before_construction() ->
     admitted = build_program_run_admission(
         selection,
         expected_scenario_id=fixture_admission.scenario_id,
-        expected_scenario_catalog_revision=(
-            fixture_admission.scenario_catalog_revision
+        expected_source_document_digest=(
+            fixture_admission.source_document_digest
         ),
         environment=environment,
         owner_availability=fixture_admission.readiness.owner_by_port,
@@ -3204,14 +3204,14 @@ def test_native_selection_join_rejects_a_catalog_change_before_construction() ->
         build_program_run_admission(
             selection,
             expected_scenario_id=fixture_admission.scenario_id,
-            expected_scenario_catalog_revision="sha256:" + "e" * 64,
+            expected_source_document_digest="sha256:" + "e" * 64,
             environment=environment,
             owner_availability=fixture_admission.readiness.owner_by_port,
         )
     except ProgramRunOwnerError as error:
         assert "catalog changed" in str(error)
     else:
-        raise AssertionError("stale scenario-catalog revision was admitted")
+        raise AssertionError("stale applied configuration revision was admitted")
 
 
 def test_native_selection_join_accepts_compatible_producer_environment() -> None:
@@ -3231,7 +3231,7 @@ def test_native_selection_join_accepts_compatible_producer_environment() -> None
     joined = build_program_run_admission(
         selection,
         expected_scenario_id=admission.scenario_id,
-        expected_scenario_catalog_revision=admission.scenario_catalog_revision,
+        expected_source_document_digest=admission.source_document_digest,
         environment=admission.environment,
         owner_availability=admission.readiness.owner_by_port,
     )
@@ -3255,13 +3255,13 @@ def test_native_selection_join_rejects_unsupported_catalog_contract() -> None:
         build_program_run_admission(
             selection,
             expected_scenario_id=admission.scenario_id,
-            expected_scenario_catalog_revision=(admission.scenario_catalog_revision),
+            expected_source_document_digest=(admission.source_document_digest),
             environment=admission.environment,
             owner_availability=admission.readiness.owner_by_port,
         )
 
 
-def test_applied_program_join_uses_applied_content_and_fresh_owner_facts() -> None:
+def test_applied_program_publication_is_complete_run_input() -> None:
     _owner, admission, _task, _scope, _events = _fixture(
         initial_task_state=OwnerTaskState.SUCCEEDED
     )
@@ -3272,14 +3272,12 @@ def test_applied_program_join_uses_applied_content_and_fresh_owner_facts() -> No
         if key
         not in {
             "applied_record_digest",
-            "assistant_projection",
-            "owner_identities",
             "schema_version",
         }
     }
     applied.update(
         {
-            "schema_version": "manyforge.applied_program_selection.v1",
+            "schema_version": "manyforge.applied_program_selection.v2",
             "baseline_program_binding_id": admission.program_binding_id,
             "preparation_digest": _DIGEST_C,
             "source": {"record_digest": _DIGEST_B},
@@ -3288,26 +3286,24 @@ def test_applied_program_join_uses_applied_content_and_fresh_owner_facts() -> No
 
     joined = build_applied_program_run_admission(
         applied,
-        live,
         expected_scenario_id=admission.scenario_id,
-        expected_scenario_catalog_revision=admission.scenario_catalog_revision,
+        expected_source_document_digest=admission.source_document_digest,
         environment=admission.environment,
         owner_availability=admission.readiness.owner_by_port,
     )
 
     assert joined.program_binding_id == admission.program_binding_id
     assert joined.owner_identities[0].owner_role == "headless_projection"
-    live["graph_revision"] = _DIGEST_A
+    applied["graph_revision"] = _DIGEST_A
     try:
         build_applied_program_run_admission(
             applied,
-            live,
             expected_scenario_id=admission.scenario_id,
-            expected_scenario_catalog_revision=admission.scenario_catalog_revision,
+            expected_source_document_digest=admission.source_document_digest,
             environment=admission.environment,
             owner_availability=admission.readiness.owner_by_port,
         )
     except ProgramRunOwnerError as error:
-        assert "disagree" in str(error)
+        assert "does not match" in str(error)
     else:
-        raise AssertionError("stale live owner facts were joined to Applied")
+        raise AssertionError("incoherent Applied publication was admitted")

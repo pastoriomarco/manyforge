@@ -51,6 +51,9 @@ public:
       noexcept {
     return source_document_digest_;
   }
+  [[nodiscard]] std::string_view scenario_id() const noexcept {
+    return scenario_id_;
+  }
   [[nodiscard]] const core::ContentDigest &captured_input_digest() const
       noexcept {
     return captured_input_digest_;
@@ -103,6 +106,7 @@ private:
   PreparedActivationInput(
       core::ContentDigest prepared_activation_id,
       core::ContentDigest source_document_digest,
+      std::string scenario_id,
       core::ContentDigest captured_input_digest,
       core::DeploymentArtifactId deployment_artifact_id,
       core::DeploymentRevision deployment_revision,
@@ -116,6 +120,7 @@ private:
 
   core::ContentDigest prepared_activation_id_;
   core::ContentDigest source_document_digest_;
+  std::string scenario_id_;
   core::ContentDigest captured_input_digest_;
   core::DeploymentArtifactId deployment_artifact_id_;
   core::DeploymentRevision deployment_revision_;

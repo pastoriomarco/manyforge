@@ -1326,7 +1326,10 @@ def test_reconciliation_exception_uses_caught_host_failure_path(
             errors="replace"
         )
 
-        assert stderr == f"{injected_failure}\n"
+        assert stderr == (
+            "native command-free orphan reconciliation: resources=0\n"
+            f"{injected_failure}\n"
+        )
         assert process.poll() == 70
         assert not (execution_run_root / "execution-command.sock").exists()
         assert not (execution_run_root / "execution-control.sock").exists()
@@ -2200,7 +2203,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         )
         motion_descriptor = direct["target_descriptor"]
         assert motion_descriptor["schema_version"] == (
-            "manyforge.manual_control_motion_descriptor.v4"
+            "manyforge.manual_control_motion_descriptor.v5"
         )
         assert (
             motion_descriptor["controllable_component_id"]

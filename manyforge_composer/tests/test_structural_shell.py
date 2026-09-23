@@ -139,6 +139,12 @@ def test_program_workspace_is_available_while_effectful_actions_need_headless() 
             "expectedAdmissionGeneration": 1,
             "requestOwnerEpoch": "test-browser.epoch.1",
             "requestId": "test-browser.request.1",
+            "expectedWorkspaceEpoch": (
+                state.authoring_workspace.identity().workspace_epoch
+            ),
+            "expectedWorkspaceRevision": (
+                state.authoring_workspace.identity().workspace_revision
+            ),
         },
     )
     assert unavailable_apply.status_code == 503
@@ -156,17 +162,6 @@ def test_composer_bounds_callback_bodies_without_narrowing_other_routes() -> Non
 
     assert response.status_code == 413
     assert response.json()["detail"]["code"] == ("composer_request_body_oversized")
-
-    retained_route = client.post(
-        "/api/scenarios/load",
-        content=b"x" * (1024 * 1024 + 1),
-        headers={"content-type": "application/json"},
-    )
-    assert retained_route.status_code == 413
-    assert retained_route.json()["detail"]["code"] == (
-        "composer_request_body_oversized"
-    )
-
 
 @pytest.mark.parametrize(
     "path",

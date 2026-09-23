@@ -67,7 +67,7 @@ struct RoboPlanCandidateRequestDTO final {
 };
 
 /// Caller-owned bounded-control hooks. The production wrapper supplies these
-/// from the Kernel clock and its killable worker lifecycle. RoboPlan 0.6 has no
+/// from the Kernel clock and its killable worker lifecycle. RoboPlan 0.7 has no
 /// cooperative cancellation hook inside every opaque numerical phase, so the
 /// process wrapper remains the final cancellation authority.
 struct RoboPlanCandidateControl final {

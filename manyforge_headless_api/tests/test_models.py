@@ -107,10 +107,20 @@ def _caller() -> dict[str, object]:
 def _prepared_activation() -> dict[str, object]:
     activation = ManagerApplyPreparedActivation.model_validate(
         {
+            "schema_version": "manyforge.prepared_activation_input.v2",
+            "scenario_id": "scenario.1",
+            "source_document_digest": "sha256:" + "1" * 64,
             "captured_input_digest": "sha256:" + "d" * 64,
             "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
+            "retained_bundle_id": "sha256:" + "2" * 64,
+            "graph_revision": "sha256:" + "3" * 64,
+            "program_id": "program.1",
+            "program_revision": "sha256:" + "4" * 64,
             "program_binding_id": "sha256:" + "9" * 64,
+            "node_environment_digest": "sha256:" + "5" * 64,
+            "assistant_mode": "optional",
+            "typed_parameter_overrides": {},
             "prepared_activation_id": "sha256:" + "e" * 64,
         }
     )

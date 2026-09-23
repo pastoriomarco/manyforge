@@ -135,9 +135,9 @@ struct ManagedKernelApplyFenceOwnerConfig final {
   manyforge::core::RuntimeEpoch runtime_epoch;
   manyforge::core::RequestOwnerEpoch request_owner_epoch;
   std::function<std::int64_t()> now_ns;
-  // During a managed Apply the child is launched from the candidate package,
+  // During a managed Apply the child is launched from the activation root,
   // while the public pointer still names the predecessor.  Keep the
-  // candidate package as a bounded fallback so the Kernel can verify either
+  // activation root as a bounded fallback so the Kernel can verify either
   // exact retained bundle during that transition.  Standalone owners leave
   // this empty.
   std::filesystem::path candidate_retained_package_root{};

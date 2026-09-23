@@ -2,6 +2,7 @@
 
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
+#include <manyforge_core/ports/imanager_scene_projection.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <mutex>
 #include <optional>
@@ -35,19 +36,18 @@ class ManagerSelectedRuntimeCompositionCoordinator final {
 public:
   ManagerSelectedRuntimeCompositionCoordinator(
       SqliteManagerApplyJournal &apply_journal,
-      const manyforge::deployment::IVerifiedRetainedBundleSource
-          &retained_bundle_source,
+      manyforge::core::IManagerSceneProjectionMaintenancePort &scene_owner,
       IManagerSelectedRuntimeCompositionPort &runtime_composition,
       manyforge::core::RuntimeEpoch manager_runtime_epoch);
 
   [[nodiscard]] ManagerSelectedRuntimeCompositionCoordinatorResult
   InstallOrRecover(const manyforge::core::ApplyId &apply_id,
-                   manyforge::core::ApplyGeneration apply_generation);
+                   manyforge::core::ApplyGeneration apply_generation,
+                   const manyforge::deployment::RetainedBundle &candidate);
 
 private:
   SqliteManagerApplyJournal &apply_journal_;
-  const manyforge::deployment::IVerifiedRetainedBundleSource
-      &retained_bundle_source_;
+  manyforge::core::IManagerSceneProjectionMaintenancePort &scene_owner_;
   IManagerSelectedRuntimeCompositionPort &runtime_composition_;
   manyforge::core::RuntimeEpoch manager_runtime_epoch_;
   std::mutex operation_mutex_;

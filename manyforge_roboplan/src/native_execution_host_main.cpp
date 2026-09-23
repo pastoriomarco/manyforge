@@ -634,8 +634,7 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
               config.manager_liveness_channel_fd != config.manager_channel_fd &&
               config.package_root_fd == kManagedPackageRootFd &&
               config.program_artifact_root_fd ==
-                  kManagedProgramArtifactRootFd &&
-              !config.program_cycle_journal.empty(),
+                  kManagedProgramArtifactRootFd,
           "managed runtime invocation is incomplete");
   Require(IsPortableRuntimeIdentity(config.cell_id) &&
               IsPortableRuntimeIdentity(config.runtime_unit_id) &&
@@ -828,8 +827,8 @@ void AppendNativeProjectionTestTrace(const std::string &line) {
 /// Registry of the exact native projections owned by this runtime child.
 ///
 /// Lock order (AP-R1): the registry mutex_ is never held across a projection
-/// call, a future wait, or retained-artifact/model construction. A Stage or
-/// Rebuild worker owns the projection's own mutex for the whole collision-world
+/// call, a future wait, or retained-artifact/model construction. A Rebuild
+/// worker owns the projection's own mutex for the whole collision-world
 /// construction, so every request path resolves the exact projection handle and
 /// the pending-job identity under mutex_, releases it, and only then calls into
 /// the projection. Worker threads acquire no registry lock at all, so joining a
@@ -876,24 +875,6 @@ public:
               std::is_same_v<T,
                              core::NativeProjectionBootstrapStatusQueryDTO>) {
             return BootstrapStatus(value);
-          } else if constexpr (std::is_same_v<T,
-                                              core::NativeProjectionStageDTO>) {
-            return BeginStage(value);
-          } else if constexpr (std::is_same_v<
-                                   T, core::NativeProjectionActivationDTO>) {
-            return ActivateStage(value);
-          } else if constexpr (std::is_same_v<
-                                   T, core::NativeProjectionRetireDTO>) {
-            return BeginRetire(value);
-          } else if constexpr (
-              std::is_same_v<T, core::NativeProjectionRetireStatusQueryDTO>) {
-            return RetireStatus(value);
-          } else if constexpr (std::is_same_v<
-                                   T, core::NativeProjectionDiscardDTO>) {
-            return BeginDiscard(value);
-          } else if constexpr (std::is_same_v<
-                                   T, core::NativeProjectionStatusQueryDTO>) {
-            return StageStatus(value);
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
                                           NativeProjectionRetainRequest>) {
@@ -948,13 +929,8 @@ public:
     // ingress is closed: a projection worker acquires no registry lock and
     // never waits for the request strand, so neither the wait nor the join of
     // an already accepted worker can deadlock against work owned here. The
-    // deferred Stage worker only waits on a retained Rebuild job whose own
-    // worker never needs registry state.
+    // Rebuild workers never need registry state.
     std::lock_guard lock(mutex_);
-    for (auto &[_, pending] : pending_stages_) {
-      pending.result.wait();
-      pending.worker.join();
-    }
     for (auto &[_, pending] : pending_rebuilds_) {
       pending.result.wait();
       pending.worker.join();
@@ -966,7 +942,7 @@ public:
   [[nodiscard]] bool
   HasCurrentProjectionFor(const core::ProjectionRevisionDTO &expected) const {
     // Handles are resolved under mutex_ and then read without holding it, so
-    // a provider whose Stage/Rebuild worker owns the projection mutex cannot
+    // a provider whose Rebuild worker owns the projection mutex cannot
     // block this readiness hint.
     for (const auto &[key, registered] : Registered()) {
       const auto &projection = registered.projection;
@@ -1241,19 +1217,6 @@ private:
     }
   };
 
-  struct PendingStage final {
-    core::NativeProjectionStageDTO request;
-    /// Predecessor health captured at acceptance. It can describe what the
-    /// runtime had before this job; it can never prove candidate readiness.
-    core::ProjectionHealthDTO accepted_health;
-    std::shared_future<core::NativeProjectionStageResultDTO> result;
-    /// A Stage retained behind a pending Rebuild carries that dependency and
-    /// is executed by its own worker once the Rebuild has settled.
-    std::shared_future<core::ProjectionCommitResultDTO> dependency;
-    std::shared_ptr<JobProgress> progress;
-    JoinedWorker worker;
-  };
-
   struct PendingRebuild final {
     core::NativeProjectionRebuildDTO request;
     core::ProjectionHealthDTO accepted_health;
@@ -1300,10 +1263,6 @@ private:
   }
 
   [[nodiscard]] bool WorkPendingLocked(const ManagedProjectionKey &key) const {
-    const auto stage = pending_stages_.find(key);
-    if (stage != pending_stages_.end() && !Settled(stage->second.result)) {
-      return true;
-    }
     const auto rebuild = pending_rebuilds_.find(key);
     return rebuild != pending_rebuilds_.end() &&
            !Settled(rebuild->second.result);
@@ -1324,28 +1283,12 @@ private:
         !Settled(rebuild->second.result)) {
       return rebuild->second.accepted_health;
     }
-    const auto stage = pending_stages_.find(key);
-    if (stage != pending_stages_.end() && !Settled(stage->second.result)) {
-      return stage->second.accepted_health;
-    }
     return std::nullopt;
   }
 
   /// One stable terminal result per retained job. An abnormal worker
   /// termination becomes the existing typed uncertain contract, carrying the
   /// operation and provider identity needed to reconcile a lost response.
-  [[nodiscard]] static core::NativeProjectionStageResultDTO StageOutcome(
-      const PendingStage &job) {
-    if (const auto settled = ReadSettled(job.result); settled.has_value()) {
-      return *settled;
-    }
-    return UncertainStage(job.request, job.accepted_health,
-                          WorkerFailure("stage", job.request.transition_row
-                                                    .native_runtime_binding,
-                                        "native_projection_stage_aborted",
-                                        "the Stage worker did not settle"));
-  }
-
   [[nodiscard]] static core::ProjectionCommitResultDTO RebuildOutcome(
       const PendingRebuild &job) {
     if (const auto settled = ReadSettled(job.result); settled.has_value()) {
@@ -1373,8 +1316,8 @@ private:
   }
 
   /// Forces only the state needed to say "candidate readiness is not proven".
-  /// Observed revisions and any staged candidate are left untouched: an
-  /// exception alone does not prove that an effect rolled back.
+  /// Observed revisions are left untouched: an exception alone does not prove
+  /// that an effect rolled back.
   [[nodiscard]] static core::ProjectionHealthDTO UncertainHealth(
       core::ProjectionHealthDTO health, const core::ErrorDTO &failure) {
     if (health.state != core::ProjectionHealthState::kDesynchronized) {
@@ -1382,26 +1325,6 @@ private:
     }
     health.error = failure;
     return health;
-  }
-
-  [[nodiscard]] static core::NativeProjectionStageResultDTO UncertainStage(
-      const core::NativeProjectionStageDTO &request,
-      core::ProjectionHealthDTO health, const core::ErrorDTO &failure) {
-    auto uncertain = UncertainHealth(std::move(health), failure);
-    return core::NativeProjectionStageResultDTO{
-        request.apply_id,
-        request.apply_generation,
-        request.projection_stage_generation,
-        request.transition_row,
-        request.expected_predecessor_projection_revision,
-        request.candidate_projection_revision,
-        core::NativeProjectionStageResultState::kFailedProjectionUncertain,
-        std::nullopt,
-        uncertain.active_projection_revision,
-        uncertain.native_projection_generation,
-        uncertain.projection_content_digest,
-        std::move(uncertain),
-        failure};
   }
 
   [[nodiscard]] static core::ProjectionCommitResultDTO UncertainRebuild(
@@ -1419,23 +1342,7 @@ private:
         failure};
   }
 
-  /// Detaches one provider's settled Stage record, if any. Unsettled work is
-  /// never erased: its worker can still publish, so the job stays registered
-  /// until it settles. The caller owns the returned record and lets it go after
-  /// mutex_ is released, which keeps the bounded join of an already settled
-  /// worker outside the registry lock.
-  [[nodiscard]] std::optional<PendingStage> TakeSettledStageLocked(
-      const ManagedProjectionKey &key) {
-    const auto stage = pending_stages_.find(key);
-    if (stage == pending_stages_.end() || !Settled(stage->second.result)) {
-      return std::nullopt;
-    }
-    auto taken = std::make_optional(std::move(stage->second));
-    pending_stages_.erase(stage);
-    return taken;
-  }
-
-  /// The Rebuild counterpart of TakeSettledStageLocked.
+  /// Takes one settled Rebuild worker result without waiting.
   [[nodiscard]] std::optional<PendingRebuild> TakeSettledRebuildLocked(
       const ManagedProjectionKey &key) {
     const auto rebuild = pending_rebuilds_.find(key);
@@ -1634,139 +1541,6 @@ private:
     return result;
   }
 
-  [[nodiscard]] core::NativeProjectionRetireStatusDTO RetireStatus(
-      const core::NativeProjectionRetireStatusQueryDTO &query) {
-    Require(query.valid(), "native projection retire status is invalid");
-    const auto &binding =
-        query.request.transition_row.native_runtime_binding;
-    auto projection = Handle(binding);
-    std::optional<core::ProjectionHealthDTO> pending;
-    {
-      std::lock_guard lock(mutex_);
-      pending = CapturedJobHealthLocked(Key(binding));
-    }
-    if (!pending.has_value()) {
-      return projection->ProjectionRetireStatus(query);
-    }
-    const auto failure = PendingOperationError("retire_status", binding);
-    core::NativeProjectionRetireStatusDTO result{
-        query.request,
-        core::NativeProjectionRetireStatusState::kFailedProjectionUncertain,
-        pending->active_projection_revision,
-        pending->native_projection_generation,
-        pending->projection_content_digest,
-        *pending,
-        failure,
-    };
-    Require(result.presence_valid(),
-            "progressing native retire status result is invalid");
-    return result;
-  }
-
-  /// Accepts one exact Stage for one provider.
-  ///
-  /// The complete binding is validated, the one job that answers this request
-  /// is registered, and only then is Accepted returned. Nothing here waits for
-  /// a worker or for the projection mutex that the worker owns.
-  [[nodiscard]] core::NativeProjectionStageResultDTO
-  BeginStage(const core::NativeProjectionStageDTO &request) {
-    Require(request.valid(), "native projection stage request is invalid");
-    const auto &binding = request.transition_row.native_runtime_binding;
-    auto projection = Handle(binding);
-    const auto key = Key(binding);
-    std::optional<PendingStage> superseded;
-    bool live_stage_conflict = false;
-
-    // Resolve an existing job before touching the projection. In particular,
-    // a Stage arriving behind Rebuild is registered against that dependency
-    // without waiting for the Rebuild worker's projection mutex.
-    {
-      std::lock_guard lock(mutex_);
-      if (const auto pending = pending_stages_.find(key);
-          pending != pending_stages_.end()) {
-        if (!Settled(pending->second.result)) {
-          Require(pending->second.request == request,
-                  "another native projection stage is already progressing");
-          // The same registered job is observed again; no second worker starts
-          // and no second Accepted identity is minted.
-          return AcceptedStage(request, pending->second.accepted_health);
-        }
-        if (pending->second.request == request) {
-          return StageOutcome(pending->second);
-        }
-        const auto prior = StageOutcome(pending->second);
-        if (prior.state == core::NativeProjectionStageResultState::kStaged) {
-          // A still-publishable candidate owns this provider. Adjudicate the
-          // conflict synchronously below; do not register a second worker or
-          // return Accepted for work that cannot start.
-          live_stage_conflict = true;
-        } else if (prior.state == core::NativeProjectionStageResultState::
-                                      kFailedProjectionUncertain) {
-          return UncertainStage(
-              request, prior.resulting_health,
-              prior.error.value_or(WorkerFailure(
-                  "stage", binding, "native_projection_stage_predecessor_failed",
-                  "the preceding Stage ended without a proven state")));
-        } else {
-          superseded = TakeSettledStageLocked(key);
-        }
-      }
-
-      if (!live_stage_conflict) {
-        const auto rebuild = pending_rebuilds_.find(key);
-        if (rebuild == pending_rebuilds_.end()) {
-          // No prerequisite owns this provider.
-        } else if (!Settled(rebuild->second.result)) {
-          const auto accepted =
-              AcceptedStage(request, rebuild->second.accepted_health);
-          StartStageLocked(key, request, accepted.resulting_health, projection,
-                           rebuild->second.result);
-          return accepted;
-        } else {
-          const auto prerequisite = RebuildOutcome(rebuild->second);
-          if (prerequisite.result !=
-              core::ProjectionCommitResultStateDTO::kCommitted) {
-            return UncertainStage(
-                request, prerequisite.resulting_health,
-                prerequisite.error.value_or(WorkerFailure(
-                    "stage", binding, "native_projection_stage_rebuild_failed",
-                    "the preceding Rebuild did not commit")));
-          }
-        }
-      }
-    }
-
-    if (live_stage_conflict) {
-      return projection->StageProjection(request);
-    }
-
-    // No worker owns this projection now. Observe its predecessor outside the
-    // registry lock. A stale or still-staged predecessor is answered directly
-    // by the projection, which rejects/replays it without heavy construction.
-    const auto observed = projection->ProjectionHealth();
-    const bool expected_present =
-        request.transition_row.expected_local_active.has_value();
-    const bool predecessor_exact =
-        expected_present
-            ? observed.healthy_for_target(
-                  request.expected_predecessor_projection_revision)
-            : observed.state == core::ProjectionHealthState::kUninitialized &&
-                  !observed.active_projection_revision.has_value() &&
-                  !observed.staged_candidate.has_value() &&
-                  !observed.error.has_value();
-    if (!predecessor_exact) {
-      return projection->StageProjection(request);
-    }
-    const auto accepted = AcceptedStage(request, observed);
-    {
-      std::lock_guard lock(mutex_);
-      StartStageLocked(
-          key, request, accepted.resulting_health, projection,
-          std::shared_future<core::ProjectionCommitResultDTO>{});
-    }
-    return accepted;
-  }
-
   /// Accepts one exact recovery Rebuild for one provider.
   [[nodiscard]] core::ProjectionCommitResultDTO
   BeginRebuild(const core::NativeProjectionRebuildDTO &request) {
@@ -1774,13 +1548,10 @@ private:
     const auto &binding = request.expected_native_runtime_binding;
     auto projection = Handle(binding);
     const auto key = Key(binding);
-    std::optional<PendingStage> superseded_stage;
     std::optional<PendingRebuild> superseded_rebuild;
     {
       std::lock_guard lock(mutex_);
-      // Exact replay observes its already-retained Rebuild before a deferred
-      // Stage registered behind that job is considered. Only a genuinely new
-      // recovery request reaches Stage conflict/supersession handling.
+      // Exact replay observes its already-retained Rebuild.
       if (const auto pending = pending_rebuilds_.find(key);
           pending != pending_rebuilds_.end() &&
           pending->second.request == request) {
@@ -1788,15 +1559,6 @@ private:
           return AcceptedRebuild(request, pending->second.accepted_health);
         }
         return RebuildOutcome(pending->second);
-      }
-      if (const auto stage = pending_stages_.find(key);
-          stage != pending_stages_.end()) {
-        Require(Settled(stage->second.result),
-                "native projection stage is already progressing");
-        Require(StageOutcome(stage->second).state !=
-                    core::NativeProjectionStageResultState::kStaged,
-                "a staged native projection candidate is already progressing");
-        superseded_stage = TakeSettledStageLocked(key);
       }
       if (const auto pending = pending_rebuilds_.find(key);
           pending != pending_rebuilds_.end()) {
@@ -1818,7 +1580,6 @@ private:
     }
     accepted_health.state = core::ProjectionHealthState::kRebuilding;
     accepted_health.active_projection_revision = std::nullopt;
-    accepted_health.staged_candidate = std::nullopt;
     accepted_health.error = std::nullopt;
     if (accepted_health.source_sequence !=
         std::numeric_limits<std::uint64_t>::max()) {
@@ -1830,94 +1591,6 @@ private:
       StartRebuildLocked(key, request, accepted.resulting_health, projection);
     }
     return accepted;
-  }
-
-  /// Registers one Stage job and starts its single worker. Callers hold mutex_.
-  void StartStageLocked(
-      const ManagedProjectionKey &key,
-      const core::NativeProjectionStageDTO &request,
-      const core::ProjectionHealthDTO &accepted_health,
-      const std::shared_ptr<RetainedPlannerSceneProjection> &projection,
-      std::shared_future<core::ProjectionCommitResultDTO> dependency) {
-    auto job = std::make_shared<
-        std::promise<core::NativeProjectionStageResultDTO>>();
-    auto result = job->get_future().share();
-    const auto binding = request.transition_row.native_runtime_binding;
-    auto progress = std::make_shared<JobProgress>(
-        "stage", binding,
-        dependency.valid() ? "waiting_for_rebuild" : "input_ready");
-    const auto [inserted, unique] = pending_stages_.emplace(
-        key, PendingStage{request, accepted_health, result,
-                          std::move(dependency), progress, JoinedWorker{}});
-    Require(unique, "native projection stage registration conflicted");
-    try {
-      inserted->second.worker = JoinedWorker{std::thread(
-          [job, projection, request, dependency = inserted->second.dependency,
-           binding, progress = std::move(progress)]() mutable {
-            try {
-              if (dependency.valid()) {
-                // Retained deferred Stage work settles its dependency first.
-                // This wait belongs to the job's own worker; it never holds up
-                // the request strand or the registry mutex.
-                const auto rebuilt = ReadSettled(dependency);
-                const bool rebuild_committed =
-                    rebuilt.has_value() &&
-                    rebuilt->result ==
-                        core::ProjectionCommitResultStateDTO::kCommitted;
-                if (!rebuild_committed) {
-                  // The prerequisite Rebuild ended in a terminal failure, so
-                  // this Stage must not run and publish a candidate into a
-                  // runtime the Rebuild left unhealthy. The Stage effect
-                  // itself never happened, which proves candidate readiness
-                  // absent rather than a proven rollback, so the Rebuild's
-                  // health row and error are propagated verbatim as the typed
-                  // uncertain result.
-                  progress->Advance("dependency_failed");
-                  job->set_value(UncertainStage(
-                      request,
-                      rebuilt.has_value() ? rebuilt->resulting_health
-                                          : ObservedHealth(projection, binding),
-                      rebuilt.has_value() && rebuilt->error.has_value()
-                          ? *rebuilt->error
-                          : WorkerFailure(
-                                "stage", binding,
-                                "native_projection_stage_rebuild_failed",
-                                "the Rebuild this Stage waits for did not "
-                                "commit")));
-                  return;
-                }
-                progress->Advance("input_ready");
-              }
-              progress->Advance("collision_world_construction");
-              auto outcome = projection->StageProjection(request);
-              progress->Advance(
-                  outcome.state ==
-                          core::NativeProjectionStageResultState::kStaged
-                      ? "prepared_publication"
-                      : "terminal_result");
-              job->set_value(std::move(outcome));
-            } catch (const std::exception &error) {
-              progress->Advance("worker_failed");
-              job->set_value(UncertainStage(
-                  request, ObservedHealth(projection, binding),
-                  WorkerFailure("stage", binding,
-                                "native_projection_stage_worker_failed",
-                                error.what())));
-            } catch (...) {
-              progress->Advance("worker_failed");
-              job->set_value(UncertainStage(
-                  request, ObservedHealth(projection, binding),
-                  WorkerFailure("stage", binding,
-                                "native_projection_stage_worker_failed",
-                                "unknown Stage worker failure")));
-            }
-          })};
-    } catch (...) {
-      // The registration is removed before the exception reaches the caller, so
-      // an Accepted result is never returned for work this child cannot run.
-      pending_stages_.erase(key);
-      throw;
-    }
   }
 
   /// Registers one Rebuild job and starts its single worker. Callers hold
@@ -1982,7 +1655,7 @@ private:
                                        core::ProjectionHealthState::
                                            kUnavailable,
                                        std::nullopt, std::nullopt, std::nullopt,
-                                       std::nullopt, std::nullopt};
+                                       std::nullopt};
     }
   }
 
@@ -2024,13 +1697,6 @@ private:
       if (const auto pending = CapturedJobHealthLocked(key);
           pending.has_value()) {
         captured = pending;
-      } else if (const auto stage = pending_stages_.find(key);
-                 stage != pending_stages_.end()) {
-        const auto outcome = StageOutcome(stage->second);
-        if (outcome.state == core::NativeProjectionStageResultState::
-                                 kFailedProjectionUncertain) {
-          terminal = outcome.resulting_health;
-        }
       }
       if (!captured.has_value() && !terminal.has_value()) {
         if (const auto rebuild = pending_rebuilds_.find(key);
@@ -2050,383 +1716,6 @@ private:
       return *terminal;
     }
     return projection->ProjectionHealth();
-  }
-
-  [[nodiscard]] static core::NativeProjectionStageResultDTO
-  AcceptedStage(const core::NativeProjectionStageDTO &request,
-                const core::ProjectionHealthDTO &health) {
-    core::NativeProjectionStageResultDTO accepted{
-        request.apply_id,
-        request.apply_generation,
-        request.projection_stage_generation,
-        request.transition_row,
-        request.expected_predecessor_projection_revision,
-        request.candidate_projection_revision,
-        core::NativeProjectionStageResultState::kAccepted,
-        std::nullopt,
-        health.active_projection_revision,
-        health.native_projection_generation,
-        health.projection_content_digest,
-        health,
-        std::nullopt,
-    };
-    Require(accepted.presence_valid(),
-            "accepted native projection stage result is invalid");
-    return accepted;
-  }
-
-  /// Observes one Stage operation. Polling never starts, replaces or repeats
-  /// projection computation.
-  [[nodiscard]] core::NativeProjectionStatusDTO
-  StageStatus(const core::NativeProjectionStatusQueryDTO &query) {
-    Require(query.valid(), "native projection stage status query is invalid");
-    const auto &binding = query.transition_row.native_runtime_binding;
-    // Full binding identity first, pending-map reads second.
-    auto projection = Handle(binding);
-    const auto key = Key(binding);
-    std::optional<core::NativeProjectionStageResultDTO> outcome;
-    std::optional<core::NativeProjectionStageDTO> progressing;
-    std::optional<core::ProjectionHealthDTO> accepted_health;
-    std::optional<core::ProjectionHealthDTO> incompatible_rebuild;
-    {
-      std::lock_guard lock(mutex_);
-      const auto pending = pending_stages_.find(key);
-      if (pending != pending_stages_.end()) {
-        const auto &job = pending->second;
-        const bool exact =
-            job.request.apply_id == query.apply_id &&
-            job.request.apply_generation == query.apply_generation &&
-            job.request.projection_stage_generation ==
-                query.projection_stage_generation &&
-            job.request.transition_row == query.transition_row;
-        Require(exact, "another native projection stage owns this runtime");
-        if (Settled(job.result)) {
-          outcome = StageOutcome(job);
-        } else {
-          progressing = job.request;
-          accepted_health = job.accepted_health;
-        }
-      } else if (const auto rebuild = pending_rebuilds_.find(key);
-                 rebuild != pending_rebuilds_.end() &&
-                 !Settled(rebuild->second.result)) {
-        incompatible_rebuild = rebuild->second.accepted_health;
-      }
-    }
-    if (incompatible_rebuild.has_value()) {
-      const auto failure = PendingOperationError("stage_status", binding);
-      core::NativeProjectionStatusDTO pending_status{
-          query,
-          core::NativeProjectionStatusState::kFailedProjectionUncertain,
-          std::nullopt,
-          incompatible_rebuild->active_projection_revision,
-          incompatible_rebuild->native_projection_generation,
-          incompatible_rebuild->projection_content_digest,
-          *incompatible_rebuild,
-          failure,
-      };
-      Require(pending_status.presence_valid(),
-              "rebuilding native projection stage status is invalid");
-      return pending_status;
-    }
-    if (progressing.has_value()) {
-      Require(accepted_health.has_value(),
-              "progressing native projection stage has no accepted health");
-      core::NativeProjectionStatusDTO pending_status{
-          query,
-          core::NativeProjectionStatusState::kProgressing,
-          progressing->candidate_projection_revision,
-          accepted_health->active_projection_revision,
-          accepted_health->native_projection_generation,
-          accepted_health->projection_content_digest,
-          *accepted_health,
-          std::nullopt,
-      };
-      Require(pending_status.presence_valid(),
-              "progressing native projection stage status is invalid");
-      return pending_status;
-    }
-    if (outcome.has_value() &&
-        outcome->state != core::NativeProjectionStageResultState::kStaged) {
-      // A settled job never reports kProgressing: its terminal result is
-      // either a rejection whose runtime is unchanged or an uncertain effect.
-      const auto state =
-          outcome->state == core::NativeProjectionStageResultState::kRejected
-              ? core::NativeProjectionStatusState::kAbsent
-              : core::NativeProjectionStatusState::kFailedProjectionUncertain;
-      core::NativeProjectionStatusDTO completed{
-          query,
-          state,
-          std::nullopt,
-          outcome->observed_local_active,
-          outcome->native_projection_generation,
-          outcome->projection_content_digest,
-          outcome->resulting_health,
-          state == core::NativeProjectionStatusState::kAbsent
-              ? std::nullopt
-              : outcome->error,
-      };
-      Require(completed.presence_valid(),
-              "completed native projection stage status is invalid");
-      return completed;
-    }
-    // A staged result is owned by the projection's own bounded terminal record,
-    // which also carries the activated and discarded outcomes.
-    return projection->ProjectionStageStatus(query);
-  }
-
-  /// Discards one staged candidate through the existing discard lifecycle.
-  ///
-  /// Pending work is neither erased nor reported discarded before it settles:
-  /// its worker can still publish the candidate, so a discard cannot be
-  /// confirmed and the answer is the existing uncertain-reconciliation result
-  /// while the job stays registered. Because confirmation is only ever reached
-  /// once that worker has settled - and the projection then releases every
-  /// candidate capture - no worker can publish after a confirmed discard.
-  /// Repeating the discard is stable: the projection's own terminal record
-  /// keeps reporting the same lifecycle instead of a reconstructed success.
-  [[nodiscard]] core::NativeProjectionDiscardResultDTO BeginDiscard(
-      const core::NativeProjectionDiscardDTO &request) {
-    Require(request.valid(), "native projection discard request is invalid");
-    const auto &binding = request.transition_row.native_runtime_binding;
-    auto projection = Handle(binding);
-    const auto key = Key(binding);
-    {
-      std::lock_guard lock(mutex_);
-      const auto stage = pending_stages_.find(key);
-      if (stage != pending_stages_.end() && !Settled(stage->second.result)) {
-        Require(stage->second.request.apply_id == request.apply_id &&
-                    stage->second.request.apply_generation ==
-                        request.apply_generation &&
-                    stage->second.request.projection_stage_generation ==
-                        request.projection_stage_generation &&
-                    stage->second.request.transition_row ==
-                        request.transition_row &&
-                    stage->second.request.candidate_projection_revision ==
-                        request.candidate_projection_revision,
-                "another native projection stage is already progressing");
-        const auto &health = stage->second.accepted_health;
-        core::NativeProjectionDiscardResultDTO pending{
-            request,
-            core::NativeProjectionDiscardResultState::
-                kFailedProjectionUncertain,
-            health.active_projection_revision,
-            health.native_projection_generation,
-            health.projection_content_digest,
-            health,
-            core::ErrorDTO{"projection_state_uncertain",
-                           "native stage discard cannot settle while Stage "
-                           "work is progressing",
-                           {{"reason",
-                             "native_projection_discard_progressing"},
-                            {"operation", "discard"},
-                            {"provider_binding_id",
-                             binding.provider_binding_id.value()}}},
-        };
-        Require(pending.presence_valid(),
-                "progressing native projection discard result is invalid");
-        return pending;
-      }
-      if (const auto rebuild = pending_rebuilds_.find(key);
-          rebuild != pending_rebuilds_.end() &&
-          !Settled(rebuild->second.result)) {
-        const auto &health = rebuild->second.accepted_health;
-        const auto failure = PendingOperationError("discard", binding);
-        core::NativeProjectionDiscardResultDTO pending{
-            request,
-            core::NativeProjectionDiscardResultState::
-                kFailedProjectionUncertain,
-            health.active_projection_revision,
-            health.native_projection_generation,
-            health.projection_content_digest,
-            health,
-            failure,
-        };
-        Require(pending.presence_valid(),
-                "rebuilding native projection discard result is invalid");
-        return pending;
-      }
-    }
-    auto discarded = projection->DiscardStagedProjection(request);
-    std::optional<PendingStage> superseded;
-    if (discarded.state ==
-            core::NativeProjectionDiscardResultState::kDiscarded ||
-        discarded.state ==
-            core::NativeProjectionDiscardResultState::kAlreadyAbsent) {
-      // Only a confirmed discard releases the registry's view of this
-      // operation, and only the Stage record it discards. The projection has
-      // already released the candidate captures - so no worker can publish
-      // them - and keeps its own terminal record, which is what keeps the
-      // exact repeat answering from the discard lifecycle instead of a
-      // reconstructed success. The detached record is released below, after
-      // mutex_ is released.
-      std::lock_guard lock(mutex_);
-      superseded = TakeSettledStageLocked(key);
-    }
-    return discarded;
-  }
-
-  /// Retires one provider through the registry lifecycle, refusing to retire
-  /// while that provider still owns unsettled work.
-  [[nodiscard]] core::NativeProjectionRetireResultDTO BeginRetire(
-      const core::NativeProjectionRetireDTO &request) {
-    Require(request.valid(), "native projection retire request is invalid");
-    const auto &binding = request.transition_row.native_runtime_binding;
-    auto projection = Handle(binding);
-    const auto key = Key(binding);
-    {
-      std::lock_guard lock(mutex_);
-      if (const auto captured = CapturedJobHealthLocked(key);
-          captured.has_value()) {
-        core::NativeProjectionRetireResultDTO pending{
-            request,
-            core::NativeProjectionRetireResultState::kStale,
-            captured->active_projection_revision,
-            captured->native_projection_generation,
-            captured->projection_content_digest,
-            *captured,
-            core::ErrorDTO{"invariant_violation",
-                           "native retirement cannot settle while projection "
-                           "work is progressing",
-                           {{"reason",
-                             "native_projection_retire_progressing"},
-                            {"operation", "retire"},
-                            {"provider_binding_id",
-                             binding.provider_binding_id.value()}}},
-        };
-        Require(pending.presence_valid(),
-                "progressing native projection retire result is invalid");
-        return pending;
-      }
-    }
-    auto retired = projection->RetireProjection(request);
-    std::optional<PendingStage> superseded_stage;
-    std::optional<PendingRebuild> superseded_rebuild;
-    if (retired.state == core::NativeProjectionRetireResultState::kRetired ||
-        retired.state ==
-            core::NativeProjectionRetireResultState::kAlreadyAbsent) {
-      // Retirement is the terminal lifecycle of this provider's projection, so
-      // both settled job records go with it; the projection's own retirement
-      // record keeps answering the exact repeat. Both are released below, after
-      // mutex_ is released.
-      std::lock_guard lock(mutex_);
-      superseded_stage = TakeSettledStageLocked(key);
-      superseded_rebuild = TakeSettledRebuildLocked(key);
-    }
-    return retired;
-  }
-
-  [[nodiscard]] core::NativeProjectionActivationResultDTO
-  ActivateStage(const core::NativeProjectionActivationDTO &request) {
-    Require(request.valid(),
-            "native projection activation request is invalid");
-    const auto &binding = request.transition_row.native_runtime_binding;
-    auto projection = Handle(binding);
-    const auto key = Key(binding);
-    std::optional<core::NativeProjectionActivationResultDTO> uncertain;
-    {
-      std::lock_guard lock(mutex_);
-      // With no job registered for this provider there is nothing to observe
-      // here: the projection's own terminal record decides between an exact
-      // activation replay and a stale request.
-      if (const auto pending = pending_stages_.find(key);
-          pending != pending_stages_.end()) {
-        if (!Settled(pending->second.result)) {
-          const auto &stage = pending->second.request;
-          Require(stage.apply_id == request.apply_id &&
-                      stage.apply_generation == request.apply_generation &&
-                      stage.projection_stage_generation ==
-                          request.projection_stage_generation &&
-                      stage.transition_row == request.transition_row &&
-                      stage.candidate_projection_revision ==
-                          request.candidate_projection_revision,
-                  "activation does not match the progressing native stage");
-          return AcceptedActivation(request, pending->second.accepted_health);
-        }
-        if (MatchesActivation(pending->second.request, request)) {
-          const auto outcome = StageOutcome(pending->second);
-          if (outcome.state == core::NativeProjectionStageResultState::
-                                   kFailedProjectionUncertain) {
-            // A Stage worker that ended uncertain cannot be acknowledged as an
-            // activation; the same failure is replayed instead.
-            auto failed = core::NativeProjectionActivationResultDTO{
-                request,
-                core::NativeProjectionActivationResultState::
-                    kFailedProjectionUncertain,
-                std::nullopt,
-                outcome.resulting_health.native_projection_generation,
-                outcome.resulting_health.projection_content_digest,
-                outcome.resulting_health,
-                outcome.error};
-            if (failed.presence_valid()) {
-              uncertain = failed;
-            }
-          }
-        }
-      }
-      if (const auto rebuild = pending_rebuilds_.find(key);
-          rebuild != pending_rebuilds_.end() &&
-          !Settled(rebuild->second.result)) {
-        const auto failure = PendingOperationError("activation", binding);
-        core::NativeProjectionActivationResultDTO blocked{
-            request,
-            core::NativeProjectionActivationResultState::kStale,
-            std::nullopt,
-            rebuild->second.accepted_health.native_projection_generation,
-            rebuild->second.accepted_health.projection_content_digest,
-            rebuild->second.accepted_health,
-            failure,
-        };
-        Require(blocked.presence_valid(),
-                "rebuilding native projection activation result is invalid");
-        return blocked;
-      }
-    }
-    if (uncertain.has_value()) {
-      return *uncertain;
-    }
-    auto activated = projection->ActivateStagedProjection(request);
-    std::optional<PendingStage> consumed;
-    if (activated.state ==
-        core::NativeProjectionActivationResultState::kActivated) {
-      std::lock_guard lock(mutex_);
-      const auto pending = pending_stages_.find(key);
-      if (pending != pending_stages_.end() &&
-          MatchesActivation(pending->second.request, request)) {
-        consumed = TakeSettledStageLocked(key);
-      }
-    }
-    std::cerr << "native projection activation completed: "
-              << binding.provider_binding_id.value() << '\n';
-    return activated;
-  }
-
-  [[nodiscard]] static bool MatchesActivation(
-      const core::NativeProjectionStageDTO &stage,
-      const core::NativeProjectionActivationDTO &request) {
-    return stage.apply_id == request.apply_id &&
-           stage.apply_generation == request.apply_generation &&
-           stage.projection_stage_generation ==
-               request.projection_stage_generation &&
-           stage.transition_row == request.transition_row &&
-           stage.candidate_projection_revision ==
-               request.candidate_projection_revision;
-  }
-
-  [[nodiscard]] static core::NativeProjectionActivationResultDTO
-  AcceptedActivation(const core::NativeProjectionActivationDTO &request,
-                     const core::ProjectionHealthDTO &health) {
-    core::NativeProjectionActivationResultDTO accepted{
-        request,
-        core::NativeProjectionActivationResultState::kAccepted,
-        std::nullopt,
-        health.native_projection_generation,
-        health.projection_content_digest,
-        health,
-        std::nullopt,
-    };
-    Require(accepted.presence_valid(),
-            "accepted native projection activation result is invalid");
-    return accepted;
   }
 
   [[nodiscard]] const core::CapabilityProviderBindingDTO &
@@ -2632,7 +1921,6 @@ private:
   // single stable terminal observation for that operation and is released when
   // a later submission or a confirmed discard/retirement supersedes it; it is
   // never a second history database.
-  std::map<ManagedProjectionKey, PendingStage> pending_stages_;
   std::map<ManagedProjectionKey, PendingRebuild> pending_rebuilds_;
   mutable std::string last_projection_readiness_detail_;
   mutable std::mutex readiness_report_mutex_;
@@ -10097,8 +9385,6 @@ TryBuildCurrentManagedCompositionInput(
           &publication.value().request.transaction_ref);
   Require(transaction != nullptr && transaction->apply_id == request.apply_id &&
               transaction->apply_generation == request.apply_generation &&
-              transaction->projection_stage_generation ==
-                  request.projection_stage_generation &&
               publication.value().request.candidate_projection_revision ==
                   request.candidate_projection_revision &&
               publication.value()
@@ -11342,8 +10628,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 installed_request->apply_id == named->apply_id &&
                 installed_request->apply_generation ==
                     named->apply_generation &&
-                installed_request->projection_stage_generation ==
-                    named->projection_stage_generation &&
                 installed_request->candidate_projection_revision ==
                     current_publication->request
                         .candidate_projection_revision &&

@@ -1,9 +1,6 @@
 #include "native_projection_transition_internal.hpp"
 
-#include <manyforge_component_manager/active_native_projection_runtime_set.hpp>
-
 #include <algorithm>
-#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -19,11 +16,7 @@ using core::CapabilityEndpointSourceKind;
 using core::CapabilityProviderBindingDTO;
 using core::CapabilityProviderBindingId;
 using core::CapabilityProviderBindingRevision;
-using core::ProjectionHealthDTO;
 using core::ProjectionNativeRuntimeBindingDTO;
-using core::ProjectionRevisionDTO;
-using core::ProjectionTransitionDisposition;
-using core::ProjectionTransitionRowDTO;
 using core::RetainedBundleDTO;
 using core::RuntimeEpoch;
 using core::RuntimeUnitId;
@@ -33,9 +26,6 @@ struct ProviderRequirement final {
   CapabilityProviderBindingRevision provider_binding_revision;
   RuntimeUnitId runtime_unit_id;
 };
-
-using ProviderKey =
-    std::pair<CapabilityProviderBindingId, CapabilityProviderBindingRevision>;
 
 [[noreturn]] void Fail(const std::string &detail) {
   throw std::invalid_argument("native projection transition: " + detail);
@@ -133,70 +123,19 @@ CandidateBindings(const std::vector<ProviderRequirement> &requirements,
   return result;
 }
 
-[[nodiscard]] std::vector<ProjectionNativeRuntimeBindingDTO>
-PredecessorBindings(const std::vector<ProviderRequirement> &requirements,
-                    const ProjectionRevisionDTO &predecessor_revision,
-                    const std::span<const ProjectionHealthDTO> health,
-                    const ManagerApplyRuntimeStagedReadyDTO &ready) {
-  if (requirements.empty()) {
-    if (!health.empty()) {
-      Fail("zero-native predecessor has unexpected live projection health");
-    }
-    return {};
-  }
-  if (health.size() != requirements.size()) {
-    Fail("predecessor health does not cover every native provider binding");
-  }
-  std::map<ProviderKey, const ProviderRequirement *> expected;
-  for (const auto &requirement : requirements) {
-    expected.emplace(ProviderKey{requirement.provider_binding_id,
-                                 requirement.provider_binding_revision},
-                     &requirement);
-  }
-  std::vector<ProjectionNativeRuntimeBindingDTO> result;
-  result.reserve(health.size());
-  for (const auto &observation : health) {
-    const auto &binding = observation.native_runtime_binding;
-    const bool withdrawn =
-        std::any_of(ready.runtime_units.begin(), ready.runtime_units.end(),
-                    [&](const auto &runtime) {
-                      return runtime.predecessor_withdrawal &&
-                             runtime.predecessor_withdrawal->runtime_unit_id ==
-                                 binding.runtime_unit_id &&
-                             runtime.predecessor_withdrawal->runtime_epoch ==
-                                 binding.runtime_epoch;
-                    });
-    if (!withdrawn && !observation.healthy_for_target(predecessor_revision)) {
-      Fail("predecessor native projection is not healthy at the current "
-           "active revision");
-    }
-    const auto found = expected.find(
-        {binding.provider_binding_id, binding.provider_binding_revision});
-    if (found == expected.end() ||
-        found->second->runtime_unit_id != binding.runtime_unit_id) {
-      Fail("predecessor live projection differs from the compiled provider "
-           "and runtime mapping");
-    }
-    result.push_back(binding);
-    expected.erase(found);
-  }
-  if (!expected.empty()) {
-    Fail("predecessor live projection set is incomplete");
-  }
-  std::sort(result.begin(), result.end(),
-            core::CanonicalProjectionNativeBindingLess);
-  if (std::adjacent_find(result.begin(), result.end()) != result.end()) {
-    Fail("predecessor live projection set repeats a native instance");
-  }
-  return result;
-}
-
 } // namespace
 
 bool HasNativeProjectionRequirements(const RetainedBundleDTO &bundle) noexcept {
   return std::any_of(bundle.capability_provider_bindings.begin(),
                      bundle.capability_provider_bindings.end(),
                      IsNativeRequirement);
+}
+
+std::vector<ProjectionNativeRuntimeBindingDTO>
+DeriveCandidateNativeProjectionBindings(
+    const RetainedBundleDTO &candidate,
+    const ManagerApplyRuntimeStagedReadyDTO &candidate_staged_ready) {
+  return CandidateBindings(Requirements(candidate), candidate_staged_ready);
 }
 
 } // namespace manyforge::component_manager::detail
@@ -232,105 +171,4 @@ DeriveActiveNativeProjectionRuntimeBindings(
   return bindings;
 }
 
-core::ActiveProjectionRuntimeSetDTO DeriveActiveNativeProjectionRuntimeSet(
-    const core::RetainedBundleDTO &active_bundle,
-    const core::ProjectionRevisionDTO &active_projection_revision,
-    const RuntimeObservationSnapshot &observations) {
-  if (!active_projection_revision.valid() ||
-      active_bundle.retained_bundle_id !=
-          active_projection_revision.retained_bundle_id ||
-      active_bundle.cell_graph.graph_revision !=
-          active_projection_revision.graph_revision) {
-    detail::Fail("active bundle differs from its selected projection revision");
-  }
-  core::ActiveProjectionRuntimeSetDTO result{
-      active_projection_revision,
-      DeriveActiveNativeProjectionRuntimeBindings(active_bundle, observations),
-  };
-  if (!result.valid()) {
-    detail::Fail("active native runtime set is not exact and canonical");
-  }
-  return result;
-}
-
 } // namespace manyforge::component_manager
-
-namespace manyforge::component_manager::detail {
-
-std::vector<ProjectionTransitionRowDTO> DeriveNativeProjectionTransitionRows(
-    const RetainedBundleDTO &predecessor, const RetainedBundleDTO &candidate,
-    const ProjectionRevisionDTO &predecessor_revision,
-    const std::span<const ProjectionHealthDTO> predecessor_health,
-    const ManagerApplyRuntimeStagedReadyDTO &candidate_staged_ready) {
-  if (!predecessor_revision.valid() || !candidate_staged_ready.valid() ||
-      predecessor.retained_bundle_id !=
-          predecessor_revision.retained_bundle_id ||
-      predecessor.cell_graph.graph_revision !=
-          predecessor_revision.graph_revision) {
-    Fail("predecessor bundle and active revision differ");
-  }
-
-  const auto predecessor_bindings =
-      PredecessorBindings(Requirements(predecessor), predecessor_revision,
-                          predecessor_health, candidate_staged_ready);
-  const auto candidate_bindings =
-      CandidateBindings(Requirements(candidate), candidate_staged_ready);
-
-  std::vector<ProjectionTransitionRowDTO> rows;
-  rows.reserve(predecessor_bindings.size() + candidate_bindings.size());
-  std::size_t predecessor_index = 0U;
-  std::size_t candidate_index = 0U;
-  while (predecessor_index < predecessor_bindings.size() ||
-         candidate_index < candidate_bindings.size()) {
-    if (predecessor_index == predecessor_bindings.size()) {
-      rows.push_back({candidate_bindings[candidate_index++],
-                      ProjectionTransitionDisposition::kAdded, std::nullopt});
-      continue;
-    }
-    if (candidate_index == candidate_bindings.size()) {
-      rows.push_back({predecessor_bindings[predecessor_index++],
-                      ProjectionTransitionDisposition::kRemoved,
-                      predecessor_revision});
-      continue;
-    }
-    const auto &predecessor_binding = predecessor_bindings[predecessor_index];
-    const auto &candidate_binding = candidate_bindings[candidate_index];
-    if (predecessor_binding == candidate_binding) {
-      rows.push_back({predecessor_binding,
-                      ProjectionTransitionDisposition::kRetained,
-                      predecessor_revision});
-      ++predecessor_index;
-      ++candidate_index;
-    } else if (core::CanonicalProjectionNativeBindingLess(predecessor_binding,
-                                                          candidate_binding)) {
-      rows.push_back({predecessor_binding,
-                      ProjectionTransitionDisposition::kRemoved,
-                      predecessor_revision});
-      ++predecessor_index;
-    } else {
-      rows.push_back({candidate_binding,
-                      ProjectionTransitionDisposition::kAdded, std::nullopt});
-      ++candidate_index;
-    }
-  }
-  for (auto &row : rows) {
-    if (row.disposition != ProjectionTransitionDisposition::kRemoved)
-      continue;
-    for (const auto &runtime : candidate_staged_ready.runtime_units) {
-      if (runtime.predecessor_withdrawal &&
-          runtime.predecessor_withdrawal->runtime_unit_id ==
-              row.native_runtime_binding.runtime_unit_id &&
-          runtime.predecessor_withdrawal->runtime_epoch ==
-              row.native_runtime_binding.runtime_epoch) {
-        row.managed_withdrawal = runtime.predecessor_withdrawal;
-        break;
-      }
-    }
-  }
-  if (!core::CanonicalProjectionTransitionRows(rows)) {
-    Fail("derived transition rows are not exact and canonical");
-  }
-  return rows;
-}
-
-} // namespace manyforge::component_manager::detail

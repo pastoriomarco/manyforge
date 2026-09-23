@@ -798,9 +798,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     std::set<ProjectionBindingKey> admitted_projection_bindings;
     std::map<ProjectionBindingKey, ProjectionPreparation>
         prepared_projection_products;
-    std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO>
-        predecessor_withdrawal;
-
     Child(pid_t child_pid, RuntimeEpoch child_epoch, UniqueFd child_channel,
           std::string selected_product_identity,
           std::string selected_configuration_identity,
@@ -857,17 +854,17 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
        std::vector<std::string> selected_launch_environment_contracts,
        std::filesystem::path logical_scene_database,
        std::filesystem::path program_cycle_journal,
-       std::filesystem::path candidate_package_root)
+       std::filesystem::path activation_root)
       : target_root_path(
             NormalizedPlainDirectory(std::move(trusted_installed_target_root),
                                      "trusted installed-target root")),
         package_root_path(NormalizedPlainDirectory(
             std::move(trusted_package_root), "trusted retained-package root")),
         package_root_fd(OpenPinnedPackageRoot(package_root_path)),
-        candidate_package_root_path(
-            candidate_package_root.empty()
+        activation_root_path(
+            activation_root.empty()
                 ? std::filesystem::path{}
-                : NormalizedPlainDirectory(std::move(candidate_package_root),
+                : NormalizedPlainDirectory(std::move(activation_root),
                                            "candidate retained-package root")),
         manager_state_root_path(NormalizedPlainDirectory(
             std::move(manager_state_root), "Manager state root")),
@@ -902,15 +899,15 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     for (const auto *typed_root : typed_roots) {
       RequireDisjointDirectories(target_root_path, *typed_root);
       RequireDisjointDirectories(package_root_path, *typed_root);
-      if (!candidate_package_root_path.empty()) {
-        RequireDisjointDirectories(candidate_package_root_path, *typed_root);
+      if (!activation_root_path.empty()) {
+        RequireDisjointDirectories(activation_root_path, *typed_root);
       }
     }
-    if (!candidate_package_root_path.empty()) {
+    if (!activation_root_path.empty()) {
       RequireDisjointDirectories(package_root_path,
-                                 candidate_package_root_path);
-      candidate_package_root_fd =
-          OpenPinnedPackageRoot(candidate_package_root_path);
+                                 activation_root_path);
+      activation_root_fd =
+          OpenPinnedPackageRoot(activation_root_path);
     }
     const std::array<const std::filesystem::path *, 2U> durable_paths{
         &logical_scene_database_path, &program_cycle_journal_path};
@@ -1010,53 +1007,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       Fail("fixed native execution target is not one protected regular file");
     }
     return target;
-  }
-
-  [[nodiscard]] bool
-  ApprovedPredecessor(const RuntimeUnitConvergenceQueryDTO &query,
-                      const RetainedBundle &candidate, const Child &child) {
-    if (!query.replacement)
-      return false;
-    const auto predecessor = bundle_source.get_verified(
-        query.replacement->expected_old_retained_bundle_id);
-    if (!predecessor ||
-        predecessor->value().cell_graph.graph_revision !=
-            query.replacement->expected_old_graph_revision ||
-        manyforge::deployment::derive_apply_configuration_fence_scope(
-            *predecessor, candidate) != query.replacement->persisted_scope)
-      Fail("native replacement does not carry the exact whole-Apply scope");
-    const auto old = VerifyNativeExecutionRuntimeUnitForHost(
-        *predecessor, query.plan.runtime_unit_id, artifact_source,
-        operating_system, launch_environment_contracts);
-    return old &&
-           old->product().product_contract_id() ==
-               query.plan.product_contract_id &&
-           old->product().product_contract_revision() ==
-               query.plan.product_contract_revision &&
-           old->runtime_contract_offer_digest() ==
-               query.plan.runtime_contract_offer_digest.value() &&
-           SameChildProduct(*old, child.product_identity,
-                            child.configuration_identity,
-                            child.runtime_contract_offer_digest);
-  }
-
-  void RequireHeldReplacementFence(
-      Child &child,
-      const manyforge::core::ApplyFenceRehydrateDTO &replacement) {
-    const auto held =
-        ExchangeKernelFence<manyforge::core::ApplyFenceReconcileResultDTO>(
-            child, replacement);
-    if (!held.matches(replacement) || held.admission_fenced || held.error ||
-        held.execution_host_epoch.runtime_epoch != child.runtime_epoch ||
-        held.fence_results.size() != 1U ||
-        held.fence_results.front().state !=
-            manyforge::core::ApplyFenceReconcileState::kMatched)
-      Fail("native replacement requires the current exact held Apply fence");
-    // Rehydrate is the single replacement proof.  It restores the exact
-    // durable fence and verifies zero affected work against the bound Kernel
-    // table.  A second admission snapshot here races bootstrap: the
-    // predecessor's active configuration rows are deliberately absent until
-    // the restarted child reconstructs its composition.
   }
 
   [[nodiscard]] std::uint64_t NextObservationSequence() {
@@ -1752,8 +1702,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     const int selected_package_root_fd =
         PackageRootFd(bundle.retained_bundle_id());
     const int selected_program_artifact_root_fd =
-        candidate_package_root_path.empty() ? selected_package_root_fd
-                                            : candidate_package_root_fd.get();
+        activation_root_path.empty() ? selected_package_root_fd
+                                            : activation_root_fd.get();
     const pid_t parent = ::getpid();
     const pid_t pid = ::fork();
     if (pid < 0) {
@@ -1843,9 +1793,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     if (contains_bundle(package_root_path, "installed")) {
       return package_root_fd.get();
     }
-    if (!candidate_package_root_path.empty() &&
-        contains_bundle(candidate_package_root_path, "authored")) {
-      return candidate_package_root_fd.get();
+    if (!activation_root_path.empty() &&
+        contains_bundle(activation_root_path, "authored")) {
+      return activation_root_fd.get();
     }
     return package_root_fd.get();
   }
@@ -1863,21 +1813,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                           found->second.configuration_identity,
                           found->second.runtime_contract_offer_digest)) {
       if (ChildIsLive(found->second)) {
-        if (!ApprovedPredecessor(query, *bundle, found->second))
-          Fail("live native runtime child differs from the selected product: " +
-               query.plan.runtime_unit_id.value() + " at " +
-               found->second.runtime_epoch.value() + "; expected product=" +
-               admission.product().product_identity().value() +
-               ", configuration=" +
-               admission.product().configuration_identity().value() +
-               ", offer=" + admission.runtime_contract_offer_digest() +
-               "; observed product=" + found->second.product_identity +
-               ", configuration=" + found->second.configuration_identity +
-               ", offer=" + found->second.runtime_contract_offer_digest);
-        // Presence is not candidate readiness. EnsureRunning must replace
-        // this exact predecessor before a candidate source report is usable.
-        return Presence(query, ProcessPresenceState::kPresent,
-                        found->second.runtime_epoch.value());
+        Fail("live native runtime child differs from the selected product; "
+             "planned maintenance must stop it before initialization");
       }
       EraseChild(found);
       return Presence(query, ProcessPresenceState::kAbsent);
@@ -1895,35 +1832,14 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     auto [bundle, admission] = Admission(query);
     std::lock_guard lock(mutex);
     const auto runtime_id = query.plan.runtime_unit_id.value();
-    std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO> withdrawal;
     auto found = children.find(runtime_id);
     if (found != children.end()) {
       if (!SameChildProduct(admission, found->second.product_identity,
                             found->second.configuration_identity,
                             found->second.runtime_contract_offer_digest)) {
-        if (ChildIsLive(found->second)) {
-          if (!ApprovedPredecessor(query, *bundle, found->second))
-            Fail("cannot replace a live native child with another product");
-          RequireHeldReplacementFence(found->second, *query.replacement);
-          const auto &owner =
-              std::get<RuntimeUnitConvergenceApplyOwnerDTO>(query.owner);
-          withdrawal = manyforge::core::ManagedRuntimeWithdrawalDTO{
-              owner.apply_id,
-              owner.apply_generation,
-              query.runtime_convergence_intent_digest,
-              query.plan.runtime_unit_id,
-              found->second.runtime_epoch,
-              manyforge::core::ContentDigest(found->second.product_identity),
-              manyforge::core::ContentDigest(
-                  found->second.configuration_identity),
-              observer_instance_id,
-              0U};
-          std::cerr << "replacing native runtime child: runtime_unit="
-                    << runtime_id << " predecessor_epoch="
-                    << found->second.runtime_epoch.value() << '\n';
-          StopChild(found->second);
-          withdrawal->process_observation_sequence = NextObservationSequence();
-        }
+        if (ChildIsLive(found->second))
+          Fail("cannot initialize over a live native child with another "
+               "product; planned maintenance must stop it first");
         EraseChild(found);
       } else if (ChildIsLive(found->second)) {
         PrepareChildProjectionBindings(found->second, *bundle,
@@ -1935,9 +1851,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       }
     }
     auto launched = LaunchChild(admission, *bundle);
-    // One receipt travels with the replacement, not an accumulating registry.
-    // A failed launch or a crash before the journal records it stays unknown.
-    launched.predecessor_withdrawal = std::move(withdrawal);
     auto [inserted, unique] =
         children.try_emplace(runtime_id, std::move(launched));
     if (!unique) {
@@ -1969,28 +1882,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     StopChild(found->second);
     EraseChild(found);
     return Presence(query, ProcessPresenceState::kAbsent);
-  }
-
-  [[nodiscard]] std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO>
-  ReadPredecessorWithdrawal(const RuntimeUnitConvergenceQueryDTO &query) {
-    auto [bundle, admission] = Admission(query);
-    static_cast<void>(bundle);
-    std::lock_guard lock(mutex);
-    const auto found = children.find(query.plan.runtime_unit_id.value());
-    const auto *owner =
-        std::get_if<RuntimeUnitConvergenceApplyOwnerDTO>(&query.owner);
-    if (owner == nullptr || found == children.end() ||
-        !SameChildProduct(admission, found->second.product_identity,
-                          found->second.configuration_identity,
-                          found->second.runtime_contract_offer_digest))
-      return std::nullopt;
-    const auto &receipt = found->second.predecessor_withdrawal;
-    if (!receipt || !receipt->valid() || receipt->apply_id != owner->apply_id ||
-        receipt->apply_generation != owner->apply_generation ||
-        receipt->runtime_convergence_intent_digest !=
-            query.runtime_convergence_intent_digest)
-      return std::nullopt;
-    return receipt;
   }
 
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
@@ -2060,8 +1951,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   std::filesystem::path target_root_path;
   std::filesystem::path package_root_path;
   UniqueFd package_root_fd;
-  std::filesystem::path candidate_package_root_path;
-  UniqueFd candidate_package_root_fd;
+  std::filesystem::path activation_root_path;
+  UniqueFd activation_root_fd;
   std::filesystem::path manager_state_root_path;
   std::filesystem::path manager_run_root_path;
   std::filesystem::path execution_state_root_path;
@@ -2190,79 +2081,6 @@ public:
     return result;
   }
 
-  manyforge::core::NativeProjectionStageResultDTO StageProjection(
-      const manyforge::core::NativeProjectionStageDTO &request) override {
-    RequireTransitionRow(request.transition_row, "stage request");
-    auto result = adapter_
-        ->ProjectionCall<manyforge::core::NativeProjectionStageResultDTO>(
-            binding_, request);
-    RequireTransitionRow(result.transition_row, "stage response");
-    RequireHealth(result.resulting_health);
-    return result;
-  }
-
-  manyforge::core::NativeProjectionActivationResultDTO ActivateStagedProjection(
-      const manyforge::core::NativeProjectionActivationDTO &request) override {
-    RequireTransitionRow(request.transition_row, "activation request");
-    auto result = adapter_
-        ->ProjectionCall<manyforge::core::NativeProjectionActivationResultDTO>(
-            binding_, request);
-    RequireTransitionRow(result.request.transition_row,
-                         "activation response");
-    RequireHealth(result.resulting_health);
-    return result;
-  }
-
-  manyforge::core::NativeProjectionRetireResultDTO RetireProjection(
-      const manyforge::core::NativeProjectionRetireDTO &request) override {
-    RequireTransitionRow(request.transition_row, "retirement request");
-    auto result = adapter_
-        ->ProjectionCall<manyforge::core::NativeProjectionRetireResultDTO>(
-            binding_, request);
-    RequireTransitionRow(result.request.transition_row,
-                         "retirement response");
-    RequireHealth(result.resulting_health);
-    return result;
-  }
-
-  manyforge::core::NativeProjectionRetireStatusDTO ProjectionRetireStatus(
-      const manyforge::core::NativeProjectionRetireStatusQueryDTO &request)
-      const override {
-    RequireTransitionRow(request.request.transition_row,
-                         "retirement status request");
-    auto result = adapter_
-        ->ProjectionCall<manyforge::core::NativeProjectionRetireStatusDTO>(
-            binding_, request);
-    RequireTransitionRow(result.request.transition_row,
-                         "retirement status response");
-    RequireHealth(result.resulting_health);
-    return result;
-  }
-
-  manyforge::core::NativeProjectionDiscardResultDTO DiscardStagedProjection(
-      const manyforge::core::NativeProjectionDiscardDTO &request) override {
-    RequireTransitionRow(request.transition_row, "discard request");
-    auto result = adapter_
-        ->ProjectionCall<manyforge::core::NativeProjectionDiscardResultDTO>(
-            binding_, request);
-    RequireTransitionRow(result.request.transition_row, "discard response");
-    RequireHealth(result.resulting_health);
-    return result;
-  }
-
-  manyforge::core::NativeProjectionStatusDTO ProjectionStageStatus(
-      const manyforge::core::NativeProjectionStatusQueryDTO &request)
-      const override {
-    RequireTransitionRow(request.transition_row, "stage status request");
-    auto result =
-        adapter_->ProjectionCall<manyforge::core::NativeProjectionStatusDTO>(
-            binding_, request);
-    RequireTransitionRow(result.query.transition_row,
-                         "stage status response");
-    RequireHealth(result.resulting_health);
-    return result;
-  }
-
   manyforge::core::Result<manyforge::core::SceneFrameResolutionReceiptDTO>
   ResolveSceneFrame(const manyforge::core::SceneFrameResolutionQueryDTO &query)
       const override {
@@ -2291,12 +2109,6 @@ private:
       Fail("native projection " + std::string(surface) +
            " names a different provider, runtime unit, or runtime epoch");
     }
-  }
-
-  void RequireTransitionRow(
-      const manyforge::core::ProjectionTransitionRowDTO &row,
-      const std::string_view surface) const {
-    RequireBinding(row.native_runtime_binding, surface);
   }
 
   void RequireHealth(
@@ -2359,7 +2171,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::string operating_system, std::string launch_environment_contract,
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
-    std::filesystem::path candidate_package_root)
+    std::filesystem::path activation_root)
     : RetainedNativeRuntimeUnitAdapter(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
@@ -2368,7 +2180,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(operating_system),
           std::vector<std::string>{std::move(launch_environment_contract)},
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(candidate_package_root)) {}
+          std::move(activation_root)) {}
 
 RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_installed_target_root,
@@ -2384,7 +2196,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::vector<std::string> launch_environment_contracts,
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
-    std::filesystem::path candidate_package_root)
+    std::filesystem::path activation_root)
     : impl_(std::make_shared<Impl>(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
@@ -2392,7 +2204,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(execution_run_root), bundle_source, artifact_source,
           std::move(operating_system), std::move(launch_environment_contracts),
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(candidate_package_root))) {}
+          std::move(activation_root))) {}
 
 RetainedNativeRuntimeUnitAdapter::~RetainedNativeRuntimeUnitAdapter() = default;
 
@@ -2409,12 +2221,6 @@ ProcessPresenceObservation RetainedNativeRuntimeUnitAdapter::EnsureRunning(
 ProcessPresenceObservation RetainedNativeRuntimeUnitAdapter::EnsureStopped(
     const RuntimeUnitConvergenceQueryDTO &query) {
   return impl_->EnsureStopped(query);
-}
-
-std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO>
-RetainedNativeRuntimeUnitAdapter::ReadPredecessorWithdrawal(
-    const RuntimeUnitConvergenceQueryDTO &query) {
-  return impl_->ReadPredecessorWithdrawal(query);
 }
 
 std::optional<RuntimeUnitSourceReport>

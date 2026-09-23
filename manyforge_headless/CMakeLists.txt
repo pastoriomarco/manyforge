@@ -86,7 +86,6 @@ set_target_properties(manyforge_node_environment_projection PROPERTIES
 add_library(manyforge_event_historian
   src/event_historian.cpp
   src/headless_api_core.cpp
-  src/program_apply_owner.cpp
   src/sqlite_event_history_store.cpp)
 add_library(manyforge::event_historian ALIAS manyforge_event_historian)
 target_include_directories(manyforge_event_historian PUBLIC
@@ -614,21 +613,6 @@ if(BUILD_TESTING)
     manyforge::deployment_admission
     GTest::gtest_main)
   gtest_discover_tests(test_headless_api_core
-    PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_program_apply_owner
-    test/test_program_apply_owner.cpp)
-  add_dependencies(test_program_apply_owner
-    manyforge_headless_test_assistant_package)
-  target_compile_definitions(test_program_apply_owner PRIVATE
-    MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}")
-  target_include_directories(test_program_apply_owner PRIVATE
-    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src")
-  target_link_libraries(test_program_apply_owner PRIVATE
-    manyforge_event_historian
-    manyforge::deployment
-    GTest::gtest_main)
-  gtest_discover_tests(test_program_apply_owner
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_owner_publication test/test_owner_publication.cpp)

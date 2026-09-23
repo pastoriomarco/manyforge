@@ -155,9 +155,9 @@ function controller(
       catalog: null,
       currentScenario: null,
       applied: {
-        schemaVersion: 'manyforge.applied_program_selection.v1',
+        schemaVersion: 'manyforge.applied_program_selection.v2',
         scenarioId: 'cell-pick',
-        scenarioCatalogRevision: `sha256:${'a'.repeat(64)}`,
+        sourceDocumentDigest: `sha256:${'a'.repeat(64)}`,
         programId: 'next-pick',
         programRevision: `sha256:${'b'.repeat(64)}`,
         programBindingId: `sha256:${'c'.repeat(64)}`,
@@ -168,6 +168,12 @@ function controller(
         sourceOwnerId: 'headless.program-apply',
         sourceOwnerEpoch: 'headless.epoch.1',
         sourceGeneration: 1,
+        assistantProjection: null,
+        ownerIdentities: [{
+          ownerRole: 'headless_projection',
+          ownerId: 'headless.program-apply',
+          ownerEpoch: 'headless.epoch.1',
+        }],
         program: {
           api_version: 'manyforge.program.v2',
           program_id: 'next-pick',
@@ -222,7 +228,7 @@ function controller(
           programRunId: 'program-run.1',
           appliedRecordDigest: `sha256:${'d'.repeat(64)}`,
           scenarioId: 'cell-pick',
-          scenarioCatalogRevision: `sha256:${'a'.repeat(64)}`,
+          sourceDocumentDigest: `sha256:${'a'.repeat(64)}`,
           programId: 'pick',
           programRevision: `sha256:${'b'.repeat(64)}`,
           programBindingId: `sha256:${'c'.repeat(64)}`,

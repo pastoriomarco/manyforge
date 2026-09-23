@@ -26,19 +26,16 @@ NODE_ENVIRONMENT_MANIFEST = Path(
 def _config(root: Path, owner_epoch: str) -> HeadlessApiConfig:
     publication_root = root / "publications"
     artifact_root = root / "artifacts"
-    program_selection_state_root = root / "program-selection-state"
     manager_run_root = root / "manager-run"
     execution_run_root = root / "execution-run"
     publication_root.mkdir(exist_ok=True)
     artifact_root.mkdir(exist_ok=True)
-    program_selection_state_root.mkdir(exist_ok=True)
     manager_run_root.mkdir(exist_ok=True)
     execution_run_root.mkdir(exist_ok=True)
     return HeadlessApiConfig(
         projection_root=publication_root,
         install_root=Path(os.environ["MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT"]),
         artifact_root=artifact_root,
-        program_selection_state_root=program_selection_state_root,
         node_catalog_path=NODE_CATALOG,
         node_environment_manifest_path=NODE_ENVIRONMENT_MANIFEST,
         alarm_catalog_path=CATALOG,

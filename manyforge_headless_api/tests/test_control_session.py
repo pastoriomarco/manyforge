@@ -88,7 +88,7 @@ def _running_cycle(node_revision: int) -> dict[str, Any]:
         key: digest
         for key in (
             "applied_record_digest",
-            "scenario_catalog_revision",
+            "source_document_digest",
             "program_revision",
             "program_binding_id",
             "retained_bundle_id",

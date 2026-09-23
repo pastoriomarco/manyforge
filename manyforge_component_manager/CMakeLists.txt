@@ -204,8 +204,7 @@ add_library(manyforge_component_manager
   src/manager_active_runtime_coordinator.cpp
   src/manager_planned_maintenance_coordinator.cpp
   src/manager_runtime_convergence_coordinator.cpp
-  src/manager_scene_activation_coordinator.cpp
-  src/manager_scene_stage_coordinator.cpp
+  src/manager_scene_initialization_coordinator.cpp
   src/manager_selected_bundle_transition_coordinator.cpp
   src/manager_selected_runtime_composition_coordinator.cpp
   src/native_projection_rpc_internal.cpp
@@ -218,7 +217,6 @@ add_library(manyforge_component_manager
   src/runtime_convergence.cpp
   src/runtime_observation.cpp
   src/runtime_unit_adapter_router.cpp
-  src/scene_staging.cpp
   src/selected_bundle_transition.cpp
   src/selected_runtime_composition_rpc_internal.cpp
   src/sqlite_store_startup_internal.cpp

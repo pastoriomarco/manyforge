@@ -57,7 +57,6 @@ template <typename StrongCounter>
               {"apply_generation", counter(selected.apply_generation)},
               {"apply_id", identity(selected.apply_id)},
               {"kind", CanonicalValue("named_apply")},
-              {"projection_stage_generation", counter(selected.projection_stage_generation)},
           });
         } else {
           return CanonicalValue(CanonicalValue::Object{
@@ -77,8 +76,6 @@ template <typename StrongCounter>
       {"candidate_projection_revision",
        projection_revision_value(value.candidate_projection_revision)},
       {"candidate_retained_bundle_id", identity(value.candidate_retained_bundle_id)},
-      {"obsolete_managed_command_surfaces_retired_evidence_digest",
-       identity(value.obsolete_managed_command_surfaces_retired_evidence_digest)},
       {"private_materialization_content_digest",
        identity(value.private_materialization_content_digest)},
       {"transaction_ref", publication_transaction_value(value.transaction_ref)},

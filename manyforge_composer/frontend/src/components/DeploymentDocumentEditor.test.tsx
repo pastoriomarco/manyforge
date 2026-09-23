@@ -97,7 +97,7 @@ describe('DeploymentDocumentEditor', () => {
       runAdmission: { ready: false, reason: 'runtime still converging' },
       savedScenarioCandidates: [{
         scenarioId: 'cell-a',
-        scenarioCatalogRevision: `sha256:${'3'.repeat(64)}`,
+        sourceDocumentDigest: `sha256:${'3'.repeat(64)}`,
         deploymentArtifactId: 'cell-a',
         deploymentRevision: `sha256:${'1'.repeat(64)}`,
         retainedBundleId: `sha256:${'4'.repeat(64)}`,

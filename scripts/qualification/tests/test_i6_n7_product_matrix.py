@@ -95,7 +95,6 @@ def test_process_commands_cover_the_complete_typed_runtime_boundary(
         "--projection-root",
         "--install-root",
         "--artifact-root",
-        "--program-selection-state-root",
         "--node-environment-manifest-path",
         "--manager-run-root",
         "--execution-run-root",
@@ -104,52 +103,3 @@ def test_process_commands_cover_the_complete_typed_runtime_boundary(
     assert value(manager, "--manager-run-root") == value(headless, "--manager-run-root")
     assert value(manager, "--execution-run-root") == value(headless, "--execution-run-root")
     assert commands["composer"].count("--authoring-state-root") == 0
-
-
-def test_scenario_load_uses_the_current_owner_admission_and_draft(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    matrix = _load_matrix(tmp_path, monkeypatch)
-    workspace = {
-        "schemaVersion": "manyforge.composer_program_workspace.v2",
-        "draft": {"draftId": "draft.1", "draftRevision": 7},
-    }
-    snapshot = {
-        "schema_version": "manyforge.composer_headless_state.v2",
-        "complete": True,
-        "receiver_epoch": "receiver.1",
-        "snapshot_sequence": 9,
-        "authoring_admission": {
-            "authoring_allowed": True,
-            "admission_generation": 4,
-        },
-        "program_cycle": {"state": "idle_after_reset"},
-        "draft_identity": {"draft_id": "draft.1", "draft_revision": 7},
-    }
-    body = matrix._scenario_load_body(  # noqa: SLF001
-        workspace=workspace,
-        snapshot=snapshot,
-        scenario_id="lite6_pick_and_place",
-        scenario_catalog_revision="sha256:" + "a" * 64,
-    )
-    assert body == {
-        "draftId": "draft.1",
-        "expectedDraftRevision": 7,
-        "expectedAdmissionGeneration": 4,
-        "requestOwnerEpoch": "n7-product-matrix.authoring",
-        "requestId": "n7.load.lite6_pick_and_place",
-        "scenarioCatalogRevision": "sha256:" + "a" * 64,
-        "scenarioId": "lite6_pick_and_place",
-    }
-
-    snapshot["draft_identity"] = {
-        "draft_id": "draft.1",
-        "draft_revision": 8,
-    }
-    with pytest.raises(RuntimeError, match="Load-ready snapshot"):
-        matrix._scenario_load_body(  # noqa: SLF001
-            workspace=workspace,
-            snapshot=snapshot,
-            scenario_id="lite6_pick_and_place",
-            scenario_catalog_revision="sha256:" + "a" * 64,
-        )

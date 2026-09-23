@@ -2,3 +2,4 @@
 7ddf2e2f899678876d36016a334743d03daff9ed8c9c7c51b39f5dc1936ecb05  patches/0011-bound-roboplan-070-toppra-output-samples.patch
 aab3c280517c7759ab28f094a87cb3aa6bd261f8ec7e727ff12d9adfc7db980a  patches/0012-initialize-roboplan-070-dynotree-variant-state.patch
 db7acbac01e3868495966bc79fa0fbc0f0d37f0a3af88596a5a76b66a29998ce  patches/0013-direct-initialize-roboplan-070-pose-constraint-scratch.patch
+f8c679e03d2a7387247906e09b82bd828b84b7217cce3ac898c78bf37a4a6b07  patches/0014-describe-image-owned-native-dependencies.patch

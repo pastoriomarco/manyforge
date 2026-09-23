@@ -715,11 +715,13 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         program = state.draft_session.retained_state().get("program")
         assignment = deepcopy(state.scenario_program_role_assignment)
         source_document_digest = state.scenario_source_document_digest
+        scenario_id = state.scenario_document_id
         overrides = deepcopy(state.scenario_typed_parameter_overrides)
         if (
             not isinstance(program, dict)
             or not isinstance(assignment, dict)
             or not isinstance(source_document_digest, str)
+            or not isinstance(scenario_id, str)
         ):
             _raise(
                 DeploymentDraftError(
@@ -732,6 +734,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         captured_input_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
+                    "scenario_id": scenario_id,
                     "source_document_digest": source_document_digest,
                     "deployment": saved,
                     "model_source_closure": source_closure,
@@ -758,6 +761,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             "operation_kind": "revert_deployment",
             "effect_class": "external",
             "external_kind": "revert_deployment",
+            "scenario_id": scenario_id,
             "source_document_digest": source_document_digest,
             "captured_input_digest": captured_input_digest,
             "model_source_closure": source_closure,
@@ -904,11 +908,13 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         program = state.draft_session.retained_state().get("program")
         assignment = deepcopy(state.scenario_program_role_assignment)
         source_document_digest = state.scenario_source_document_digest
+        scenario_id = state.scenario_document_id
         overrides = deepcopy(state.scenario_typed_parameter_overrides)
         if (
             not isinstance(program, dict)
             or not isinstance(assignment, dict)
             or not isinstance(source_document_digest, str)
+            or not isinstance(scenario_id, str)
         ):
             _raise(
                 DeploymentDraftError(
@@ -922,6 +928,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         captured_input_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
+                    "scenario_id": scenario_id,
                     "source_document_digest": source_document_digest,
                     "deployment": deployment,
                     "model_source_closure": source_closure,
@@ -942,6 +949,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 if apply
                 else "deployment_candidate_preview"
             ),
+            "scenario_id": scenario_id,
             "source_document_digest": source_document_digest,
             "captured_input_digest": captured_input_digest,
             "model_source_closure": source_closure,

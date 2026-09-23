@@ -66,7 +66,6 @@ from .models import (
     AuthoringMutationRecoveryRequest,
     AuthoringMutationSettlementRequest,
     AuthoringOwnerReconciliationRequest,
-    ProgramApplyRequest,
     ProgramModelAttemptRequest,
     ProgramDiagnosticRequest,
     SkillExpansionRequest,
@@ -104,7 +103,6 @@ from .models import (
 from .native import (
     HeadlessApiConfig,
     HeadlessApiError,
-    MAX_PROGRAM_APPLY_REQUEST_BYTES,
     MAX_ACTIVATION_PREPARATION_REQUEST_BYTES,
     MAX_PROGRAM_MODEL_ATTEMPT_BYTES,
     NativeHeadlessCore,
@@ -295,8 +293,6 @@ class RequestBodyLimitMiddleware:
 
 
 def _error_status(code: str) -> int:
-    if code == "program_apply_request_oversized":
-        return 413
     if code == "full_stack_restart_required":
         return 409
     if code in {
@@ -311,19 +307,9 @@ def _error_status(code: str) -> int:
         "node_environment_projection_invalid",
         "assistant_mode_context_invalid",
         "source_model_context_invalid",
-        "program_apply_active_selection_invalid",
-        "program_apply_baseline_binding_invalid",
-        "program_apply_bundle_invalid",
-        "program_apply_compilation_invalid",
-        "program_apply_expected_selection_invalid",
-        "program_apply_preparation_invalid",
-        "program_apply_repository_invalid",
         "source_model_projection_invalid",
-        "scenario_catalog_projection_invalid",
-        "program_apply_response_invalid",
         "program_applied_selection_invalid",
         "program_runner_response_invalid",
-        "scenario_program_selection_invalid",
         "viewer_model_asset_invalid",
         "assistant_mode_projection_invalid",
     }:
@@ -346,7 +332,6 @@ def _error_status(code: str) -> int:
             "command_not_allowed",
             "manual_handover_required",
             "object_already_exists",
-            "program_apply_deployment_not_active",
             "scene_projection_transition_in_progress",
             "program_run_admission_failed",
             "program_run_already_active",
@@ -446,9 +431,11 @@ def create_app(
         activation_preparer = None
         if config.activation_preparer_path is not None:
             assert config.activation_preparer_capability_root is not None
+            assert config.activation_preparer_activation_root is not None
             activation_preparer = ActivationPreparer(
                 executable=config.activation_preparer_path,
                 capability_root=config.activation_preparer_capability_root,
+                activation_root=config.activation_preparer_activation_root,
                 timeout_seconds=config.activation_preparer_timeout_seconds,
             )
         service = HeadlessService(
@@ -498,14 +485,7 @@ def create_app(
             config.projection_root / "scene-runtime-source.json",
         )
     )
-    cold_watch_paths = (
-        cold_freshness_paths
-        if config is None
-        else (
-            *cold_freshness_paths,
-            config.program_selection_state_root / "program-selection-owner.json",
-        )
-    )
+    cold_watch_paths = cold_freshness_paths
     control_state_source = HeadlessControlStateSource(
         service,
         control_ingress,
@@ -649,7 +629,6 @@ def create_app(
         RequestBodyLimitMiddleware,
         maximum_bytes=maximum_body,
         path_maximum_bytes={
-            "/api/program/apply": MAX_PROGRAM_APPLY_REQUEST_BYTES,
             "/api/activation-preparations": (
                 MAX_ACTIVATION_PREPARATION_REQUEST_BYTES
             ),
@@ -900,33 +879,9 @@ def create_app(
     def source_model_context() -> dict[str, Any]:
         return service.source_model_context()
 
-    @app.get("/api/scenarios")
-    def scenarios() -> dict[str, Any]:
-        return service.scenarios()
-
-    @app.get("/api/scenarios/{scenario_id}/program-selection")
-    def scenario_program_selection(
-        scenario_id: Annotated[
-            str,
-            Path(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
-        ],
-    ) -> dict[str, Any]:
-        return service.scenario_program_selection(scenario_id)
-
     @app.get("/api/program/applied")
     def program_applied() -> dict[str, Any]:
         return service.program_applied()
-
-    @app.post("/api/program/apply")
-    def program_apply(request: ProgramApplyRequest) -> JSONResponse:
-        response = service.program_apply(request)
-        status = response.get("status")
-        if status != "applied":
-            raise HeadlessApiError(
-                "program_apply_response_invalid",
-                "Program Apply returned an unsupported status",
-            )
-        return JSONResponse(status_code=200, content=response)
 
     @app.post("/api/program/model-attempts")
     def program_model_attempt(

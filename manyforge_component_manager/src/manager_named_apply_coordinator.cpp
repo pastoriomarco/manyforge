@@ -318,7 +318,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
     const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
     core::IActiveBundlePublicationStore &publication_store,
-    core::IManagerSceneProjectionHandoffPort &scene_owner,
+    core::IManagerSceneProjectionMaintenancePort &scene_owner,
     core::IManagerSceneProjectionBootstrapPort *bootstrap_scene_owner,
     core::IManagerKernelApplyFencePort &kernel_fence,
     core::IKernelCellAdmissionPort &cell_admission,
@@ -340,23 +340,22 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
       apply_progress_observer_(std::move(apply_progress_observer)),
       fence_coordinator_(apply_journal_, kernel_fence_, manager_runtime_epoch_),
       planned_maintenance_(planned_maintenance),
+      active_runtime_coordinator_(active_plan_source, process_port,
+                                  progress_port, clock_ns, pre_start_guard),
       runtime_coordinator_(fence_coordinator_, apply_journal_,
                            publication_store, artifact_source, process_port,
                            progress_port, std::move(operating_system),
                            std::move(launch_environment_contracts),
                            std::move(clock_ns), std::move(pre_start_guard)),
-      scene_stage_coordinator_(apply_journal_, retained_bundle_source_,
-                               publication_store, scene_owner,
-                               bootstrap_scene_owner, &process_port),
-      scene_activation_coordinator_(apply_journal_, scene_owner),
-      runtime_composition_coordinator_(apply_journal_, retained_bundle_source_,
+      scene_initialization_coordinator_(apply_journal_, scene_owner),
+      runtime_composition_coordinator_(apply_journal_, scene_owner,
                                        runtime_composition,
                                        manager_runtime_epoch_),
-      selected_bundle_coordinator_(apply_journal_, retained_bundle_source_,
-                                   publication_store, scene_owner,
-                                   &artifact_source),
-      fence_release_coordinator_(apply_journal_, kernel_fence_,
+      selected_bundle_coordinator_(apply_journal_, publication_store,
+                                   scene_owner),
+      fence_release_coordinator_(apply_journal_, kernel_fence_, scene_owner,
                                  manager_runtime_epoch_) {
+  static_cast<void>(bootstrap_scene_owner);
   Require(!manager_runtime_epoch_.empty(),
           "Manager runtime epoch cannot be empty");
   Require(static_cast<bool>(apply_id_factory_), "Apply ID factory is required");
@@ -427,6 +426,14 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
                   request.expected_current_graph_revision,
           "named Apply expected_current does not match the active pointer");
 
+  const auto predecessor =
+      LoadBundle(retained_bundle_source_, active_revision.retained_bundle_id,
+                 "predecessor");
+  Require(predecessor->value().cell_graph.cell_id == apply_journal_.cell_id() &&
+              predecessor->value().cell_graph.graph_revision ==
+                  active_revision.graph_revision,
+          "selected predecessor does not match the active cell graph");
+
   const auto scene_revision = scene_owner_.CurrentProjectionRevision();
   Require(scene_revision.valid() &&
               SameDeploymentRevision(scene_revision, active_revision),
@@ -446,6 +453,8 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
   };
   Require(intent.valid(), "Manager could not construct a valid Apply intent");
   const auto durable_intent = apply_journal_.EnsureIntent(intent).record;
+  captured_apply_inputs_.emplace(CapturedApplyInputs{
+      intent.apply_id, intent.apply_generation, predecessor, candidate});
   if (apply_progress_observer_) {
     apply_progress_observer_(durable_intent.intent);
   }
@@ -459,32 +468,23 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   Require(intent.valid() && intent.cell_id == apply_journal_.cell_id(),
           "durable Apply intent is invalid or belongs to another cell");
   const auto durable_intent = apply_journal_.EnsureIntent(intent).record;
-  if (apply_progress_observer_) {
+  if (apply_progress_observer_)
     apply_progress_observer_(durable_intent.intent);
-  }
 
   if (const auto terminal = apply_journal_.ReadTerminalOutcome(
           intent.apply_id, intent.apply_generation);
       terminal.has_value()) {
-    // Exact terminal replay is observation-only. Success proves settlement;
-    // failure may deliberately retain closed admission, especially when an
-    // effect is unknown, and replay must never release or repeat it.
     return {intent.apply_id, intent.apply_generation,
-            ResultStateFromTerminal(terminal->terminal_outcome), request_replayed,
-            terminal->terminal_outcome};
+            ResultStateFromTerminal(terminal->terminal_outcome),
+            request_replayed, terminal->terminal_outcome};
   }
 
   const auto retain_pre_effect_failure =
       [&](const std::string &code, const std::string &message,
           const ManagerApplyEffectDisposition disposition) {
-        auto result = RetainTerminalFailure(apply_journal_, durable_intent, code,
-                                            message, disposition,
+        auto result = RetainTerminalFailure(apply_journal_, durable_intent,
+                                            code, message, disposition,
                                             request_replayed);
-        // Composer transferred a real, already-held parent claim when this
-        // operation was accepted. A rejection before the maintenance fence
-        // has any effect must not strand authoring. Manager owns the terminal
-        // release because Composer deliberately stopped tracking the claim at
-        // acceptance.
         if (durable_intent.intent.parent_authoring_claim.has_value() &&
             disposition == ManagerApplyEffectDisposition::kKnown) {
           const auto terminal = apply_journal_.ReadTerminalOutcome(
@@ -496,46 +496,16 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
         return result;
       };
 
-  std::shared_ptr<const deployment::RetainedBundle> predecessor;
-  std::shared_ptr<const deployment::RetainedBundle> candidate;
-  try {
-    predecessor = LoadBundle(
-        retained_bundle_source_,
-        intent.expected_active_projection_revision.retained_bundle_id,
-        "predecessor");
-    candidate = LoadBundle(retained_bundle_source_,
-                           intent.candidate_retained_bundle_id, "candidate");
-  } catch (const std::exception &error) {
-    return retain_pre_effect_failure("apply_bundle_validation_failed",
-                                     error.what(),
-                                     ManagerApplyEffectDisposition::kKnown);
-  }
+  Require(captured_apply_inputs_.has_value() &&
+              captured_apply_inputs_->apply_id == intent.apply_id &&
+              captured_apply_inputs_->apply_generation ==
+                  intent.apply_generation &&
+              captured_apply_inputs_->predecessor != nullptr &&
+              captured_apply_inputs_->candidate != nullptr,
+          "named Apply continuation lacks its process-local captured inputs");
+  const auto &predecessor = *captured_apply_inputs_->predecessor;
+  const auto &candidate = *captured_apply_inputs_->candidate;
 
-  // A prior accepted fence without the first candidate-initialization intent
-  // straddles the teardown crash window. Resolve it before admission recovery:
-  // recovery is observation-only and may not reacquire a lost claim or repeat
-  // predecessor effects.
-  if (apply_journal_
-          .ReadFenceAcceptance(intent.apply_id, intent.apply_generation)
-          .has_value() &&
-      !apply_journal_
-           .ReadRuntimeConvergenceIntent(intent.apply_id,
-                                         intent.apply_generation)
-           .has_value()) {
-    return RetainTerminalFailure(
-        apply_journal_, durable_intent, "planned_maintenance_interrupted",
-        "maintenance admission was accepted but candidate initialization was "
-        "not durably reached; recovery will not reacquire admission or repeat "
-        "teardown effects",
-        ManagerApplyEffectDisposition::kUnknown, request_replayed);
-  }
-
-  // Ordinary idle/stale refusals are decided before the configuration fence or
-  // any process effect. A transferred parent authoring claim may already be
-  // held, but the failure path releases it from durable pre-effect evidence so
-  // the predecessor remains authoritative and controls remain usable. The
-  // maintenance owner repeats this check after admission closes to catch races;
-  // a refusal at that later boundary remains contained.
   if (!apply_journal_
            .ReadFenceAttempt(intent.apply_id, intent.apply_generation)
            .has_value()) {
@@ -544,15 +514,12 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
     if (refusal.has_value()) {
       Require(refusal->valid() && refusal->terminal_failure(),
               "planned maintenance preflight returned an invalid refusal");
-      return retain_pre_effect_failure(
-          refusal->failure_code, refusal->failure_message,
-          refusal->effect_disposition);
+      return retain_pre_effect_failure(refusal->failure_code,
+                                       refusal->failure_message,
+                                       refusal->effect_disposition);
     }
   }
 
-  // The Apply intent is durable before this exact Kernel claim is acquired or
-  // validated. Every external phase below therefore has one restart-stable
-  // recovery identity and can never run outside the cell admission decision.
   try {
     static_cast<void>(RequireHeldAdmission(durable_intent, cell_admission_));
   } catch (const std::exception &error) {
@@ -567,371 +534,135 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
         disposition, request_replayed);
   }
 
-  const auto finalized = apply_journal_.ReadSceneFinalized(
-      intent.apply_id, intent.apply_generation);
-  const auto release_started = apply_journal_.ReadFenceReleaseIntent(
-      intent.apply_id, intent.apply_generation);
-  if (finalized.has_value() || release_started.has_value()) {
-    // Scene Finalize and the public successor can be durable while the
-    // Manager/native child is replaced.  The Scene activation row is the
-    // durable owner of native projection membership, so replay it before
-    // composing the successor.  Otherwise BuildManagedCompositionInput sees
-    // a live child whose candidate projections are still only prepared and
-    // correctly rejects the composition as not active at the candidate
-    // revision.  Only after that replay do we install the exact composition
-    // under the still-held Apply fence and query/release the fence.
-    if (apply_journal_.ReadSceneActivated(intent.apply_id,
-                                          intent.apply_generation)
-            .has_value()) {
-      try {
-        static_cast<void>(scene_activation_coordinator_.ActivateOrRecover(
-            intent.apply_id, intent.apply_generation));
-      } catch (const ManagerSceneActivationPending &) {
-        return {intent.apply_id, intent.apply_generation,
-                ManagerNamedApplyResultState::kPending, request_replayed,
-                std::nullopt};
-      } catch (const std::exception &error) {
-        return RetainTerminalFailure(
-            apply_journal_, durable_intent, "scene_activation_failed",
-            error.what(), ManagerApplyEffectDisposition::kUnknown,
-            request_replayed);
-      }
-    }
-    std::optional<ManagerSelectedRuntimeCompositionCoordinatorResult>
-        composition;
+  std::optional<ManagerActiveRuntimePlanDTO> active_plan;
+  std::optional<ManagerApplyFenceExpectationDTO> expectation;
+  try {
+    active_plan.emplace(active_plan_source_.ReadCurrentPlan());
+    Require(active_plan->valid() &&
+                SameDeploymentRevision(
+                    active_plan->active_publication.request
+                        .candidate_projection_revision,
+                    intent.expected_active_projection_revision),
+            "predecessor publication changed before initialization");
+    expectation.emplace(FenceExpectation(
+        intent, predecessor, candidate, *active_plan, apply_journal_,
+        kernel_fence_, manager_runtime_epoch_));
+  } catch (const std::exception &error) {
+    return RetainTerminalFailure(
+        apply_journal_, durable_intent, "apply_fence_evidence_failed",
+        error.what(), ManagerApplyEffectDisposition::kUnknown,
+        request_replayed);
+  }
+
+  if (!apply_journal_
+           .ReadRuntimeConvergenceIntent(intent.apply_id,
+                                         intent.apply_generation)
+           .has_value()) {
+    std::optional<ManagerApplyFenceAcquireResult> acquired_fence;
     try {
-      composition.emplace(runtime_composition_coordinator_.InstallOrRecover(
-          intent.apply_id, intent.apply_generation));
-    } catch (const std::exception &error) {
+      acquired_fence.emplace(fence_coordinator_.AcquireOrRecoverFence(
+          intent, predecessor, candidate, *expectation));
+    } catch (const ManagerApplyFenceEffectUncertainError &error) {
       return RetainTerminalFailure(
-          apply_journal_, durable_intent, "runtime_composition_failed",
+          apply_journal_, durable_intent, "apply_fence_effect_unknown",
           error.what(), ManagerApplyEffectDisposition::kUnknown,
           request_replayed);
+    } catch (const std::exception &error) {
+      return RetainTerminalFailure(
+          apply_journal_, durable_intent, "apply_fence_acquire_failed",
+          error.what(), ManagerApplyEffectDisposition::kKnown,
+          request_replayed);
     }
-    if (composition->state ==
+    if (acquired_fence->path !=
+            ManagerApplyFenceAcquirePath::kAcquiredFromNewAttempt &&
+        acquired_fence->path !=
+            ManagerApplyFenceAcquirePath::kRetriedAfterAuthoritativeNotSeen) {
+      return RetainTerminalFailure(
+          apply_journal_, durable_intent, "planned_maintenance_interrupted",
+          "maintenance admission belongs to an earlier Manager incarnation; "
+          "effects will not be resumed or repeated",
+          ManagerApplyEffectDisposition::kUnknown, request_replayed);
+    }
+
+    const auto maintenance = planned_maintenance_.EnterIdleMaintenance(
+        intent, intent.expected_active_projection_revision);
+    if (!maintenance.valid()) {
+      return RetainTerminalFailure(
+          apply_journal_, durable_intent,
+          "planned_maintenance_result_invalid",
+          "planned maintenance returned invalid evidence",
+          ManagerApplyEffectDisposition::kUnknown, request_replayed);
+    }
+    if (maintenance.terminal_failure()) {
+      return RetainTerminalFailure(
+          apply_journal_, durable_intent, maintenance.failure_code,
+          maintenance.failure_message,
+          ManagerApplyEffectDisposition::kUnknown, request_replayed);
+    }
+
+    try {
+      static_cast<void>(active_runtime_coordinator_.Shutdown());
+    } catch (const std::exception &error) {
+      return RetainTerminalFailure(
+          apply_journal_, durable_intent,
+          "planned_maintenance_shutdown_failed", error.what(),
+          ManagerApplyEffectDisposition::kUnknown, request_replayed);
+    }
+  }
+
+  try {
+    const auto runtime = runtime_coordinator_.ConvergeOrRecover(
+        intent, predecessor, candidate, *expectation,
+        active_plan->active_publication.publication_generation);
+    if (runtime.state == ManagerRuntimeConvergenceResultState::kPending) {
+      return {intent.apply_id, intent.apply_generation,
+              ManagerNamedApplyResultState::kPending, request_replayed,
+              std::nullopt};
+    }
+  } catch (const std::exception &error) {
+    return RetainTerminalFailure(
+        apply_journal_, durable_intent,
+        "planned_maintenance_initialization_failed", error.what(),
+        ManagerApplyEffectDisposition::kUnknown, request_replayed);
+  }
+
+  try {
+    static_cast<void>(scene_initialization_coordinator_.Initialize(
+        intent.apply_id, intent.apply_generation, candidate));
+  } catch (const ManagerSceneInitializationPending &) {
+    return {intent.apply_id, intent.apply_generation,
+            ManagerNamedApplyResultState::kPending, request_replayed,
+            std::nullopt};
+  } catch (const std::exception &error) {
+    return RetainTerminalFailure(
+        apply_journal_, durable_intent, "scene_initialization_failed",
+        error.what(), ManagerApplyEffectDisposition::kUnknown,
+        request_replayed);
+  }
+
+  try {
+    const auto composition = runtime_composition_coordinator_.InstallOrRecover(
+        intent.apply_id, intent.apply_generation, candidate);
+    if (composition.state ==
         ManagerSelectedRuntimeCompositionResultState::kPending) {
       return {intent.apply_id, intent.apply_generation,
               ManagerNamedApplyResultState::kPending, request_replayed,
               std::nullopt};
     }
-    std::optional<ManagerApplyFenceReleaseResult> release;
-    try {
-      release.emplace(fence_release_coordinator_.ReleaseOrRecover(
-          intent.apply_id, intent.apply_generation));
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent, "apply_fence_release_failed",
-          error.what(), ManagerApplyEffectDisposition::kUnknown,
-          request_replayed);
-    }
-    const auto terminal = apply_journal_.ReadTerminalOutcome(
-        intent.apply_id, intent.apply_generation);
-    Require(terminal.has_value(),
-            "Manager Apply release completed without terminal evidence");
-    ReleaseAdmission(durable_intent, *terminal, cell_admission_);
-    return {intent.apply_id, intent.apply_generation,
-            ManagerNamedApplyResultState::kSucceeded, request_replayed,
-            release->durable_terminal_outcome.record.terminal_outcome};
-  }
-
-  // Runtime convergence and scene projection activation form one ordered
-  // hand-off.  The candidate native child may be launched and prepared before
-  // staging, but its candidate projection is not usable for composition until
-  // Scene activates it. On restart, an already-activated scene must still
-  // verify the exact retained child epoch before authority can advance.
-  bool scene_was_activated =
-      apply_journal_.ReadSceneActivated(intent.apply_id,
-                                        intent.apply_generation)
-          .has_value();
-  if (scene_was_activated) {
-    // Scene activation is durable, but it cannot substitute for current
-    // readiness of the exact retained component epochs. Convergence is an
-    // observe-only replay once staged-ready evidence exists and fails closed
-    // on loss or epoch drift; it never recreates a child for this Apply.
-    std::optional<ManagerActiveRuntimePlanDTO> active_plan;
-    try {
-      active_plan.emplace(active_plan_source_.ReadCurrentPlan());
-      Require(active_plan->valid() &&
-                  SameDeploymentRevision(
-                      active_plan->active_publication.request
-                          .candidate_projection_revision,
-                      intent.expected_active_projection_revision),
-              "predecessor publication changed before runtime convergence");
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent, "active_plan_recheck_failed",
-          error.what(), ManagerApplyEffectDisposition::kUnknown,
-          request_replayed);
-    }
-    std::optional<ManagerApplyFenceExpectationDTO> expectation;
-    try {
-      expectation.emplace(FenceExpectation(
-          intent, *predecessor, *candidate, *active_plan, apply_journal_,
-          kernel_fence_, manager_runtime_epoch_));
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent, "apply_fence_evidence_failed",
-          error.what(), ManagerApplyEffectDisposition::kUnknown,
-          request_replayed);
-    }
-    std::optional<ManagerApplyRuntimeConvergenceResult> runtime;
-    try {
-      runtime.emplace(runtime_coordinator_.ConvergeOrRecover(
-          intent, *predecessor, *candidate, *expectation,
-          active_plan->active_publication.publication_generation));
-    } catch (const ManagerRuntimeProcessEffectUncertainError &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent,
-          "planned_maintenance_initialization_effect_unknown", error.what(),
-          ManagerApplyEffectDisposition::kUnknown, request_replayed);
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent,
-          "planned_maintenance_initialization_failed", error.what(),
-          ManagerApplyEffectDisposition::kUnknown, request_replayed);
-    }
-    if (runtime->state == ManagerRuntimeConvergenceResultState::kPending) {
-      return {intent.apply_id, intent.apply_generation,
-              ManagerNamedApplyResultState::kPending, request_replayed,
-              std::nullopt};
-    }
-    try {
-      static_cast<void>(scene_activation_coordinator_.ActivateOrRecover(
-          intent.apply_id, intent.apply_generation));
-    } catch (const ManagerSceneActivationPending &) {
-      return {intent.apply_id, intent.apply_generation,
-              ManagerNamedApplyResultState::kPending, request_replayed,
-              std::nullopt};
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent, "scene_activation_failed",
-          error.what(), ManagerApplyEffectDisposition::kUnknown,
-          request_replayed);
-    }
-  }
-  if (!scene_was_activated) {
-    // Durable Scene Stage success only records what an earlier runtime process
-    // prepared.  It does not prove that the intended component epochs are
-    // currently ready, so converge before either staging or activating.  The
-    // coordinator is idempotent when the exact current child still matches.
-    std::optional<ManagerActiveRuntimePlanDTO> active_plan;
-    try {
-      active_plan.emplace(active_plan_source_.ReadCurrentPlan());
-      Require(active_plan->valid() &&
-                  SameDeploymentRevision(
-                      active_plan->active_publication.request
-                          .candidate_projection_revision,
-                      intent.expected_active_projection_revision),
-              "predecessor publication changed before runtime convergence");
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent, "active_plan_recheck_failed",
-          error.what(), ManagerApplyEffectDisposition::kUnknown,
-          request_replayed);
-    }
-    std::optional<ManagerApplyFenceExpectationDTO> expectation;
-    try {
-      expectation.emplace(FenceExpectation(
-          intent, *predecessor, *candidate, *active_plan, apply_journal_,
-          kernel_fence_, manager_runtime_epoch_));
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent, "apply_fence_evidence_failed",
-          error.what(), ManagerApplyEffectDisposition::kUnknown,
-          request_replayed);
-    }
-    // The runtime convergence intent is committed before the first candidate
-    // start effect. Its presence therefore proves that predecessor teardown
-    // already completed for this operation and prevents a pending candidate
-    // initialization from being mistaken for a predecessor on the next poll.
-    if (!apply_journal_
-             .ReadRuntimeConvergenceIntent(intent.apply_id,
-                                           intent.apply_generation)
-             .has_value()) {
-      std::optional<ManagerApplyFenceAcquireResult> acquired_fence;
-      try {
-        acquired_fence.emplace(fence_coordinator_.AcquireOrRecoverFence(
-            intent, *predecessor, *candidate, *expectation));
-      } catch (const ManagerApplyFenceEffectUncertainError &error) {
-        return RetainTerminalFailure(
-            apply_journal_, durable_intent, "apply_fence_effect_unknown",
-            error.what(), ManagerApplyEffectDisposition::kUnknown,
-            request_replayed);
-      } catch (const std::exception &error) {
-        return RetainTerminalFailure(
-            apply_journal_, durable_intent, "apply_fence_acquire_failed",
-            error.what(), ManagerApplyEffectDisposition::kKnown,
-            request_replayed);
-      }
-      if (acquired_fence->path !=
-              ManagerApplyFenceAcquirePath::kAcquiredFromNewAttempt &&
-          acquired_fence->path !=
-              ManagerApplyFenceAcquirePath::kRetriedAfterAuthoritativeNotSeen) {
-        return RetainTerminalFailure(
-            apply_journal_, durable_intent,
-            "planned_maintenance_interrupted",
-            "a prior Manager incarnation accepted the maintenance fence but "
-            "did not durably reach candidate initialization; teardown effects "
-            "will not be repeated",
-            ManagerApplyEffectDisposition::kUnknown, request_replayed);
-      }
-      std::optional<ManagerPlannedMaintenanceResult> maintenance;
-      try {
-        maintenance.emplace(planned_maintenance_.EnterIdleMaintenance(
-            intent, intent.expected_active_projection_revision));
-      } catch (const std::exception &error) {
-        return RetainTerminalFailure(
-            apply_journal_, durable_intent,
-            "planned_maintenance_boundary_failed", error.what(),
-            ManagerApplyEffectDisposition::kUnknown, request_replayed);
-      }
-      if (!maintenance->valid()) {
-        return RetainTerminalFailure(
-            apply_journal_, durable_intent,
-            "planned_maintenance_result_invalid",
-            "planned maintenance returned an invalid result",
-            ManagerApplyEffectDisposition::kUnknown, request_replayed);
-      }
-      if (maintenance->terminal_failure()) {
-        const auto disposition =
-            maintenance->effect_disposition ==
-                    ManagerApplyEffectDisposition::kKnown
-                ? ManagerApplyEffectDisposition::kUnknown
-                : maintenance->effect_disposition;
-        return RetainTerminalFailure(
-            apply_journal_, durable_intent, maintenance->failure_code,
-            maintenance->failure_message, disposition,
-            request_replayed);
-      }
-    }
-    std::optional<ManagerApplyRuntimeConvergenceResult> runtime;
-    try {
-      runtime.emplace(runtime_coordinator_.ConvergeOrRecover(
-          intent, *predecessor, *candidate, *expectation,
-          active_plan->active_publication.publication_generation));
-    } catch (const ManagerRuntimeProcessEffectUncertainError &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent,
-          "planned_maintenance_initialization_effect_unknown", error.what(),
-          ManagerApplyEffectDisposition::kUnknown, request_replayed);
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent,
-          "planned_maintenance_initialization_failed", error.what(),
-          ManagerApplyEffectDisposition::kUnknown, request_replayed);
-    }
-    if (runtime->state == ManagerRuntimeConvergenceResultState::kPending) {
-      return {intent.apply_id, intent.apply_generation,
-              ManagerNamedApplyResultState::kPending, request_replayed,
-              std::nullopt};
-    }
-    if (!apply_journal_
-             .ReadSceneStaged(intent.apply_id, intent.apply_generation)
-             .has_value()) {
-      try {
-        static_cast<void>(scene_stage_coordinator_.StageOrRecover(
-            intent.apply_id, intent.apply_generation));
-      } catch (const ManagerSceneStagePending &) {
-        return {intent.apply_id, intent.apply_generation,
-                ManagerNamedApplyResultState::kPending, request_replayed,
-                std::nullopt};
-      } catch (const std::exception &error) {
-        return RetainTerminalFailure(
-            apply_journal_, durable_intent, "scene_stage_failed",
-            error.what(), ManagerApplyEffectDisposition::kUnknown,
-            request_replayed);
-      }
-    }
-    try {
-      static_cast<void>(scene_activation_coordinator_.ActivateOrRecover(
-          intent.apply_id, intent.apply_generation));
-    } catch (const ManagerSceneActivationPending &) {
-      return {intent.apply_id, intent.apply_generation,
-              ManagerNamedApplyResultState::kPending, request_replayed,
-              std::nullopt};
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent, "scene_activation_failed",
-          error.what(), ManagerApplyEffectDisposition::kUnknown,
-          request_replayed);
-    }
-    scene_was_activated = true;
-  }
-
-  // Once Scene has activated the candidate, recheck aggregate readiness of
-  // the same retained epochs before installation. Pending or failed current
-  // readiness cannot switch runtime authority.
-  if (scene_was_activated) {
-    std::optional<ManagerActiveRuntimePlanDTO> active_plan;
-    try {
-      active_plan.emplace(active_plan_source_.ReadCurrentPlan());
-      Require(active_plan->valid() &&
-                  SameDeploymentRevision(
-                      active_plan->active_publication.request
-                          .candidate_projection_revision,
-                      intent.expected_active_projection_revision),
-              "predecessor publication changed before runtime convergence");
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent, "active_plan_recheck_failed",
-          error.what(), ManagerApplyEffectDisposition::kUnknown,
-          request_replayed);
-    }
-    std::optional<ManagerApplyFenceExpectationDTO> expectation;
-    try {
-      expectation.emplace(FenceExpectation(
-          intent, *predecessor, *candidate, *active_plan, apply_journal_,
-          kernel_fence_, manager_runtime_epoch_));
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent, "apply_fence_evidence_failed",
-          error.what(), ManagerApplyEffectDisposition::kUnknown,
-          request_replayed);
-    }
-    std::optional<ManagerApplyRuntimeConvergenceResult> runtime;
-    try {
-      runtime.emplace(runtime_coordinator_.ConvergeOrRecover(
-          intent, *predecessor, *candidate, *expectation,
-          active_plan->active_publication.publication_generation));
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent, "runtime_readiness_recheck_failed",
-          error.what(), ManagerApplyEffectDisposition::kUnknown,
-          request_replayed);
-    }
-    if (runtime->state == ManagerRuntimeConvergenceResultState::kPending) {
-      return {intent.apply_id, intent.apply_generation,
-              ManagerNamedApplyResultState::kPending, request_replayed,
-              std::nullopt};
-    }
-  }
-
-  std::optional<ManagerSelectedRuntimeCompositionCoordinatorResult>
-      composition;
-  try {
-    composition.emplace(runtime_composition_coordinator_.InstallOrRecover(
-        intent.apply_id, intent.apply_generation));
   } catch (const std::exception &error) {
     return RetainTerminalFailure(
         apply_journal_, durable_intent, "runtime_composition_failed",
         error.what(), ManagerApplyEffectDisposition::kUnknown,
         request_replayed);
   }
-  if (composition->state ==
-      ManagerSelectedRuntimeCompositionResultState::kPending) {
-    return {intent.apply_id, intent.apply_generation,
-            ManagerNamedApplyResultState::kPending, request_replayed,
-            std::nullopt};
-  }
 
-  bool finalized_now = false;
+  bool completed = false;
   try {
     for (std::size_t advance = 0U;
-         advance < kMaximumSelectedBundleAdvances && !finalized_now;
-         ++advance) {
+         advance < kMaximumSelectedBundleAdvances && !completed; ++advance) {
       const auto result = selected_bundle_coordinator_.AdvanceOrRecover(
-          intent.apply_id, intent.apply_generation);
-      finalized_now = result.durable_finalized.has_value();
+          intent.apply_id, intent.apply_generation, predecessor, candidate);
+      completed = result.scene_completed;
     }
   } catch (const std::exception &error) {
     return RetainTerminalFailure(
@@ -939,11 +670,11 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
         error.what(), ManagerApplyEffectDisposition::kUnknown,
         request_replayed);
   }
-  if (!finalized_now) {
+  if (!completed) {
     return RetainTerminalFailure(
         apply_journal_, durable_intent,
         "configuration_publication_incomplete",
-        "selected-bundle transition exceeded its bounded two effects",
+        "coherent publication exceeded its bounded two effects",
         ManagerApplyEffectDisposition::kUnknown, request_replayed);
   }
 
@@ -973,18 +704,34 @@ ManagerNamedApplyCoordinator::RecoverIncompleteApply() {
   const auto inventory = apply_journal_.ReadStatusInventory();
   const PersistedManagerApplyStatus *pending = nullptr;
   for (const auto &status : inventory) {
-    if (IsTerminal(status)) {
+    if (IsTerminal(status))
       continue;
-    }
-    Require(
-        pending == nullptr,
-        "multiple nonterminal Applies contradict the sole progression owner");
+    Require(pending == nullptr,
+            "multiple nonterminal Applies contradict the sole progression owner");
     pending = &status;
   }
   if (pending == nullptr) {
+    captured_apply_inputs_.reset();
     return std::nullopt;
   }
-  return Continue(pending->intent.intent, true);
+
+  if (captured_apply_inputs_.has_value() &&
+      captured_apply_inputs_->apply_id == pending->intent.intent.apply_id &&
+      captured_apply_inputs_->apply_generation ==
+          pending->intent.intent.apply_generation) {
+    auto result = Continue(pending->intent.intent, true);
+    if (result.state != ManagerNamedApplyResultState::kPending) {
+      captured_apply_inputs_.reset();
+    }
+    return result;
+  }
+
+  return RetainTerminalFailure(
+      apply_journal_, pending->intent, "planned_maintenance_interrupted",
+      "Manager reopened a nonterminal maintenance operation; effects remain "
+      "unknown and admission stays closed until explicit diagnosis and a "
+      "later authorized operation",
+      ManagerApplyEffectDisposition::kUnknown, true);
 }
 
 } // namespace manyforge::component_manager

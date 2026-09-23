@@ -44,8 +44,8 @@ from manyforge_behavior.orchestration_values import ProgramValueError
 
 
 PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v2"
-SCENARIO_PROGRAM_SELECTION_API: Final = "manyforge.scenario_program_selection.v2"
-APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v1"
+PROGRAM_RUN_INPUT_API: Final = "manyforge.program_run_input.v1"
+APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v2"
 _MAX_RETAINED_RUNS: Final = 4_096
 _MAX_NODE_STATUSES: Final = 100_000
 _NODE_STATUSES: Final = frozenset({"idle", "running", "success", "failure"})
@@ -154,7 +154,7 @@ class ProgramRunAdmission:
 
     scenario_id: str
     applied_record_digest: str
-    scenario_catalog_revision: str
+    source_document_digest: str
     program: Program
     environment: NodeEnvironment
     program_binding_id: str
@@ -171,7 +171,7 @@ class ProgramRunAdmission:
         _text(self.scenario_id, field="scenario_id", maximum_bytes=128)
         for field_name in (
             "applied_record_digest",
-            "scenario_catalog_revision",
+            "source_document_digest",
             "program_binding_id",
             "retained_bundle_id",
             "graph_revision",
@@ -265,7 +265,7 @@ class ProgramRunAdmission:
             program_run_id=program_run_id,
             applied_record_digest=self.applied_record_digest,
             scenario_id=self.scenario_id,
-            scenario_catalog_revision=self.scenario_catalog_revision,
+            source_document_digest=self.source_document_digest,
             program_id=self.program.program_id,
             program_revision=self.program.program_revision,
             program_binding_id=self.program_binding_id,
@@ -567,7 +567,7 @@ class ProgramRunOwner:
             program_run_id=admitted_program_run_id,
             applied_record_digest=admission.applied_record_digest,
             scenario_id=admission.scenario_id,
-            scenario_catalog_revision=admission.scenario_catalog_revision,
+            source_document_digest=admission.source_document_digest,
             program_id=admission.program.program_id,
             program_revision=admission.program.program_revision,
             program_binding_id=admission.program_binding_id,
@@ -2415,15 +2415,15 @@ def build_program_run_admission(
     selection: Mapping[str, Any],
     *,
     expected_scenario_id: str,
-    expected_scenario_catalog_revision: str,
+    expected_source_document_digest: str,
     environment: NodeEnvironment,
     owner_availability: Mapping[str, AvailabilityFact],
     additional_owner_identities: tuple[ProgramRunOwnerIdentity, ...] = (),
 ) -> ProgramRunAdmission:
-    """Join one exact package selection to a compatible Python runner."""
+    """Validate one complete normalized Program-run input."""
 
     if not isinstance(selection, Mapping):
-        raise TypeError("scenario Program selection must be a mapping")
+        raise TypeError("Program-run input must be a mapping")
     expected_fields = {
         "applied_record_digest",
         "assistant_projection",
@@ -2439,15 +2439,15 @@ def build_program_run_admission(
         "program_id",
         "program_revision",
         "retained_bundle_id",
-        "scenario_catalog_revision",
+        "source_document_digest",
         "scenario_id",
         "schema_version",
         "typed_parameter_overrides",
     }
     if set(selection) != expected_fields:
-        raise ProgramRunOwnerError("scenario Program selection has wrong fields")
-    if selection.get("schema_version") != SCENARIO_PROGRAM_SELECTION_API:
-        raise ProgramRunOwnerError("scenario Program selection version is unsupported")
+        raise ProgramRunOwnerError("Program-run input has wrong fields")
+    if selection.get("schema_version") != PROGRAM_RUN_INPUT_API:
+        raise ProgramRunOwnerError("Program-run input version is unsupported")
     _text(selection.get("deployment_artifact_id"), field="deployment_artifact_id")
     _digest(selection.get("deployment_revision"), field="deployment_revision")
     if selection.get("assistant_mode") not in {
@@ -2467,14 +2467,16 @@ def build_program_run_admission(
     if assistant_mode == "forbidden" and assistant_projection is not None:
         raise ProgramRunOwnerError("scenario forbids a present assistant projection")
     scenario_id = _text(selection.get("scenario_id"), field="scenario_id")
-    scenario_catalog_revision = _digest(
-        selection.get("scenario_catalog_revision"),
-        field="scenario_catalog_revision",
+    source_document_digest = _digest(
+        selection.get("source_document_digest"),
+        field="source_document_digest",
     )
     if scenario_id != expected_scenario_id:
         raise ProgramRunOwnerError("scenario Program selection changed scenario ID")
-    if scenario_catalog_revision != expected_scenario_catalog_revision:
-        raise ProgramRunOwnerError("scenario catalog changed during Run admission")
+    if source_document_digest != expected_source_document_digest:
+        raise ProgramRunOwnerError(
+            "Scenario source document changed during Run admission"
+        )
     if not isinstance(environment, NodeEnvironment):
         raise TypeError("environment must be one retained NodeEnvironment")
     node_environment_digest = _digest(
@@ -2602,7 +2604,7 @@ def build_program_run_admission(
             selection.get("applied_record_digest"),
             field="applied_record_digest",
         ),
-        scenario_catalog_revision=scenario_catalog_revision,
+        source_document_digest=source_document_digest,
         program=program,
         environment=environment,
         program_binding_id=program_binding_id,
@@ -2618,25 +2620,26 @@ def build_program_run_admission(
 
 def build_applied_program_run_admission(
     applied: Mapping[str, Any],
-    live_scenario_selection: Mapping[str, Any],
     *,
     expected_scenario_id: str,
-    expected_scenario_catalog_revision: str,
+    expected_source_document_digest: str,
     environment: NodeEnvironment,
     owner_availability: Mapping[str, AvailabilityFact],
     additional_owner_identities: tuple[ProgramRunOwnerIdentity, ...] = (),
 ) -> ProgramRunAdmission:
-    """Join authoritative Applied content to fresh scenario-owner identities."""
+    """Build admission from one complete authoritative Applied publication."""
 
     if not isinstance(applied, Mapping):
         raise TypeError("Applied Program selection must be a mapping")
     expected_applied_fields = {
         "assistant_mode",
+        "assistant_projection",
         "baseline_program_binding_id",
         "deployment_artifact_id",
         "deployment_revision",
         "graph_revision",
         "node_environment_digest",
+        "owner_identities",
         "preparation_digest",
         "program",
         "program_binding",
@@ -2644,7 +2647,7 @@ def build_applied_program_run_admission(
         "program_id",
         "program_revision",
         "retained_bundle_id",
-        "scenario_catalog_revision",
+        "source_document_digest",
         "scenario_id",
         "schema_version",
         "source",
@@ -2652,7 +2655,7 @@ def build_applied_program_run_admission(
     }
     if set(applied) != expected_applied_fields:
         raise ProgramRunOwnerError("Applied Program selection has wrong fields")
-    if applied.get("schema_version") != APPLIED_PROGRAM_SELECTION_API:
+    if applied.get("schema_version") != "manyforge.applied_program_selection.v2":
         raise ProgramRunOwnerError("Applied Program selection version is unsupported")
     _digest(
         applied.get("baseline_program_binding_id"), field="baseline_program_binding_id"
@@ -2663,33 +2666,14 @@ def build_applied_program_run_admission(
         raise ProgramRunOwnerError("Applied Program source identity is invalid")
     _digest(source.get("record_digest"), field="source.record_digest")
 
-    if not isinstance(live_scenario_selection, Mapping):
-        raise TypeError("live scenario Program selection must be a mapping")
-    for field_name in (
-        "assistant_mode",
-        "deployment_artifact_id",
-        "deployment_revision",
-        "graph_revision",
-        "node_environment_digest",
-        "retained_bundle_id",
-        "scenario_catalog_revision",
-        "scenario_id",
-        "typed_parameter_overrides",
-    ):
-        if live_scenario_selection.get(field_name) != applied.get(field_name):
-            raise ProgramRunOwnerError(
-                "Applied Program and live scenario occurrence disagree"
-            )
-    owner_identities = live_scenario_selection.get("owner_identities")
+    owner_identities = applied.get("owner_identities")
     if not isinstance(owner_identities, list):
         raise ProgramRunOwnerError(
-            "live scenario selection has no exact owner identities"
+            "Applied Program publication has no exact owner identities"
         )
     normalized_selection = {
         "applied_record_digest": source["record_digest"],
-        "assistant_projection": deepcopy(
-            live_scenario_selection.get("assistant_projection")
-        ),
+        "assistant_projection": deepcopy(applied.get("assistant_projection")),
         "assistant_mode": applied["assistant_mode"],
         "deployment_artifact_id": applied["deployment_artifact_id"],
         "deployment_revision": applied["deployment_revision"],
@@ -2702,15 +2686,15 @@ def build_applied_program_run_admission(
         "program_id": applied["program_id"],
         "program_revision": applied["program_revision"],
         "retained_bundle_id": applied["retained_bundle_id"],
-        "scenario_catalog_revision": applied["scenario_catalog_revision"],
+        "source_document_digest": applied["source_document_digest"],
         "scenario_id": applied["scenario_id"],
-        "schema_version": SCENARIO_PROGRAM_SELECTION_API,
+        "schema_version": PROGRAM_RUN_INPUT_API,
         "typed_parameter_overrides": deepcopy(applied["typed_parameter_overrides"]),
     }
     return build_program_run_admission(
         normalized_selection,
         expected_scenario_id=expected_scenario_id,
-        expected_scenario_catalog_revision=expected_scenario_catalog_revision,
+        expected_source_document_digest=expected_source_document_digest,
         environment=environment,
         owner_availability=owner_availability,
         additional_owner_identities=additional_owner_identities,
@@ -2720,7 +2704,7 @@ def build_applied_program_run_admission(
 __all__ = [
     "APPLIED_PROGRAM_SELECTION_API",
     "PROGRAM_RUN_STATUS_API",
-    "SCENARIO_PROGRAM_SELECTION_API",
+    "PROGRAM_RUN_INPUT_API",
     "ProgramRunAdmission",
     "ProgramRunOwner",
     "ProgramRunOwnerError",

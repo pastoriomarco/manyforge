@@ -223,6 +223,7 @@ parse_artifacts(const CanonicalValue &value, const std::string_view label,
 PreparedActivationInput::PreparedActivationInput(
     core::ContentDigest prepared_activation_id,
     core::ContentDigest source_document_digest,
+    std::string scenario_id,
     core::ContentDigest captured_input_digest,
     core::DeploymentArtifactId deployment_artifact_id,
     core::DeploymentRevision deployment_revision,
@@ -235,6 +236,7 @@ PreparedActivationInput::PreparedActivationInput(
     VerifiedPreparedActivationClosure closure)
     : prepared_activation_id_(std::move(prepared_activation_id)),
       source_document_digest_(std::move(source_document_digest)),
+      scenario_id_(std::move(scenario_id)),
       captured_input_digest_(std::move(captured_input_digest)),
       deployment_artifact_id_(std::move(deployment_artifact_id)),
       deployment_revision_(std::move(deployment_revision)),
@@ -255,7 +257,8 @@ parse_prepared_activation_input(const CanonicalValue &value) {
        "deployment_artifact_id", "deployment_revision", "graph_revision",
        "node_environment_digest", "prepared_activation_id",
        "program_binding_id", "program_id", "program_revision",
-       "retained_bundle_id", "schema_version", "source_document_digest",
+       "retained_bundle_id", "scenario_id", "schema_version",
+       "source_document_digest",
        "typed_parameter_overrides"},
       "prepared activation input");
   if (text(member(value, "schema_version"), "schema_version") !=
@@ -266,6 +269,10 @@ parse_prepared_activation_input(const CanonicalValue &value) {
       text(member(value, "prepared_activation_id"), "prepared_activation_id");
   const auto &source_digest =
       text(member(value, "source_document_digest"), "source_document_digest");
+  const auto &scenario_id = text(member(value, "scenario_id"), "scenario_id");
+  if (scenario_id.size() > 256U) {
+    fail("prepared activation input scenario_id exceeds its bound");
+  }
   const auto &captured_digest =
       text(member(value, "captured_input_digest"), "captured_input_digest");
   const auto &deployment_revision =
@@ -367,6 +374,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
       std::move(raw_artifacts), std::move(catalog_artifacts)};
   return PreparedActivationInput(
       core::ContentDigest(prepared_id), core::ContentDigest(source_digest),
+      scenario_id,
       core::ContentDigest(captured_digest),
       core::DeploymentArtifactId(text(member(value, "deployment_artifact_id"),
                                       "deployment_artifact_id")),

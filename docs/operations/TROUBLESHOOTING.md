@@ -101,7 +101,7 @@ ids, and collision-world revision when available.
 - Stale pose source after a scene edit (Isaac lane especially).
   Confirm `pose_sources.<id>.apply_policy` in the deployment — Isaac
   scenes typically use `continuous_unattached` or `before_planning`
-  (see [`EXAMPLES_CATALOG.md`](EXAMPLES_CATALOG.md)).
+  (see [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md)).
 - Genuine collision the operator did not anticipate. Use
   `GET /api/scene/snapshot` to visualize the world at the rejection
   revision.

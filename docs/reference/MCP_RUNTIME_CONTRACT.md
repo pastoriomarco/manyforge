@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-09-17 22:57:05 UTC
+  Last regenerated: 2026-09-23 05:34:51 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -1410,53 +1410,16 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
-          "requestId": {
+          "expectedWorkspaceEpoch": {
             "maxLength": 256,
             "minLength": 1,
-            "title": "Requestid",
+            "title": "Expectedworkspaceepoch",
             "type": "string"
           },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
-            "type": "string"
-          }
-        },
-        "required": [
-          "draftId",
-          "expectedDraftRevision",
-          "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId"
-        ],
-        "title": "ApplyDraftRequest",
-        "type": "object"
-      },
-      "LoadScenarioRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "confirmDiscard": {
-            "default": false,
-            "title": "Confirmdiscard",
-            "type": "boolean"
-          },
-          "draftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Draftid",
-            "type": "string"
-          },
-          "expectedAdmissionGeneration": {
+          "expectedWorkspaceRevision": {
             "maximum": 9007199254740991.0,
             "minimum": 1.0,
-            "title": "Expectedadmissiongeneration",
-            "type": "integer"
-          },
-          "expectedDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expecteddraftrevision",
+            "title": "Expectedworkspacerevision",
             "type": "integer"
           },
           "requestId": {
@@ -1469,18 +1432,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "maxLength": 256,
             "minLength": 1,
             "title": "Requestownerepoch",
-            "type": "string"
-          },
-          "scenarioCatalogRevision": {
-            "pattern": "^sha256:[0-9a-f]{64}$",
-            "title": "Scenariocatalogrevision",
-            "type": "string"
-          },
-          "scenarioId": {
-            "maxLength": 128,
-            "minLength": 1,
-            "pattern": "^[a-z][a-z0-9_.-]*$",
-            "title": "Scenarioid",
             "type": "string"
           }
         },
@@ -1490,10 +1441,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
           "requestId",
-          "scenarioId",
-          "scenarioCatalogRevision"
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision"
         ],
-        "title": "LoadScenarioRequest",
+        "title": "ApplyDraftRequest",
         "type": "object"
       },
       "NewDraftRequest": {
@@ -1522,6 +1473,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "requestId": {
             "maxLength": 256,
             "minLength": 1,
@@ -1540,7 +1503,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
-          "requestId"
+          "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision"
         ],
         "title": "NewDraftRequest",
         "type": "object"
@@ -1571,6 +1536,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "path": {
             "maxLength": 4096,
             "minLength": 1,
@@ -1596,6 +1573,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
           "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision",
           "path"
         ],
         "title": "OpenDraftRequest",
@@ -1631,24 +1610,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           },
           "body": {
             "$ref": "#/$defs/NewDraftRequest"
-          }
-        },
-        "required": [
-          "action",
-          "body"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
-        "description": "POST /api/scenarios/load",
-        "properties": {
-          "action": {
-            "const": "load_scenario",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/LoadScenarioRequest"
           }
         },
         "required": [
@@ -1723,6 +1684,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "mutation": {
             "maxLength": 128,
             "minLength": 1,
@@ -1748,6 +1721,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
           "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision",
           "mutation",
           "arguments"
         ],
@@ -2759,6 +2734,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "programRunId": {
             "maxLength": 256,
             "minLength": 1,
@@ -2789,6 +2776,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
           "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision",
           "programRunId",
           "proposalId"
         ],
@@ -4873,6 +4862,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "path": {
             "maxLength": 4096,
             "minLength": 1,
@@ -4898,6 +4899,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
           "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision",
           "path"
         ],
         "title": "SaveDraftAsRequest",
@@ -4924,6 +4927,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "requestId": {
             "maxLength": 256,
             "minLength": 1,
@@ -4942,7 +4957,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
-          "requestId"
+          "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision"
         ],
         "title": "SaveDraftRequest",
         "type": "object"
@@ -5103,6 +5120,44 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
+          "preparationRequestId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preparationrequestid"
+          },
+          "preparationRequestOwnerEpoch": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preparationrequestownerepoch"
+          },
           "requestId": {
             "maxLength": 256,
             "minLength": 1,
@@ -5121,7 +5176,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
-          "requestId"
+          "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision"
         ],
         "title": "ApplyDeploymentCandidateRequest",
         "type": "object"
@@ -5473,6 +5530,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "requestId": {
             "maxLength": 256,
             "minLength": 1,
@@ -5491,7 +5560,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
-          "requestId"
+          "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision"
         ],
         "title": "DiscardDeploymentRequest",
         "type": "object"
@@ -5522,6 +5593,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "path": {
             "maxLength": 4096,
             "minLength": 1,
@@ -5547,6 +5630,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
           "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision",
           "path"
         ],
         "title": "OpenDeploymentRequest",
@@ -5573,6 +5658,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "requestId": {
             "maxLength": 256,
             "minLength": 1,
@@ -5591,7 +5688,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
-          "requestId"
+          "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision"
         ],
         "title": "PreviewDeploymentCandidateRequest",
         "type": "object"
@@ -5665,6 +5764,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "requestId": {
             "maxLength": 256,
             "minLength": 1,
@@ -5683,7 +5794,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
-          "requestId"
+          "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision"
         ],
         "title": "RevertDeploymentRequest",
         "type": "object"
@@ -5777,6 +5890,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "path": {
             "maxLength": 4096,
             "minLength": 1,
@@ -5802,6 +5927,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
           "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision",
           "path"
         ],
         "title": "SaveDeploymentAsRequest",
@@ -5828,6 +5955,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "requestId": {
             "maxLength": 256,
             "minLength": 1,
@@ -5846,7 +5985,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
-          "requestId"
+          "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision"
         ],
         "title": "SaveDeploymentRequest",
         "type": "object"
@@ -5854,16 +5995,16 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "UpdateControlledStopRequest": {
         "additionalProperties": false,
         "properties": {
-          "control_binding_id": {
+          "command_target_id": {
             "maxLength": 256,
             "minLength": 1,
-            "title": "Control Binding Id",
+            "title": "Command Target Id",
             "type": "string"
           },
-          "control_binding_revision": {
+          "controllable_component_id": {
             "maxLength": 256,
             "minLength": 1,
-            "title": "Control Binding Revision",
+            "title": "Controllable Component Id",
             "type": "string"
           },
           "draftId": {
@@ -5882,6 +6023,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "maximum": 9007199254740991.0,
             "minimum": 0.0,
             "title": "Expecteddraftrevision",
+            "type": "integer"
+          },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
             "type": "integer"
           },
           "profile": {
@@ -5927,8 +6080,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
           "requestId",
-          "control_binding_id",
-          "control_binding_revision",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision",
+          "controllable_component_id",
+          "command_target_id",
           "profile",
           "timing"
         ],
@@ -5954,6 +6109,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "maximum": 9007199254740991.0,
             "minimum": 0.0,
             "title": "Expecteddraftrevision",
+            "type": "integer"
+          },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
             "type": "integer"
           },
           "operation": {
@@ -6004,6 +6171,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
           "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision",
           "path"
         ],
         "title": "UpdateDeploymentRequest",
@@ -6042,6 +6211,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "maximum_tcp_linear_speed_mps": {
             "exclusiveMinimum": 0.0,
             "maximum": 1000.0,
@@ -6067,6 +6248,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
           "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision",
           "controllable_component_id",
           "command_target_id",
           "maximum_tcp_linear_speed_mps"
@@ -8235,6 +8418,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "requestId": {
             "maxLength": 256,
             "minLength": 1,
@@ -8253,7 +8448,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
-          "requestId"
+          "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision"
         ],
         "title": "DiscardDraftRequest",
         "type": "object"
@@ -8279,6 +8476,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expecteddraftrevision",
             "type": "integer"
           },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
           "requestId": {
             "maxLength": 256,
             "minLength": 1,
@@ -8297,7 +8506,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
           "requestOwnerEpoch",
-          "requestId"
+          "requestId",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision"
         ],
         "title": "RevertDraftRequest",
         "type": "object"

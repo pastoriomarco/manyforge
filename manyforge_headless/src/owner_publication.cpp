@@ -118,9 +118,6 @@ CanonicalValue PublicationTransaction(
                         "apply_generation", true)},
               {"apply_id", CanonicalValue(transaction.apply_id.value())},
               {"kind", CanonicalValue("named_apply")},
-              {"projection_stage_generation",
-               Unsigned(transaction.projection_stage_generation.value(),
-                        "projection_stage_generation", true)},
           });
         } else {
           return CanonicalValue(CanonicalValue::Object{
@@ -317,29 +314,11 @@ std::string_view ApplyPhase(
   if (value.fence_release_intent.has_value()) {
     return "fence_release_pending";
   }
-  if (value.scene_finalized.has_value()) {
-    return "scene_finalized";
-  }
   if (value.publication_receipt.has_value()) {
     return "active_bundle_published";
   }
-  if (value.retired_command_surfaces.has_value()) {
-    return "command_surfaces_retired";
-  }
   if (value.private_materialization.has_value()) {
     return "private_materialized";
-  }
-  if (value.scene_activated.has_value()) {
-    return "scene_activated";
-  }
-  if (value.activation_selection.has_value()) {
-    return "activation_selected";
-  }
-  if (value.scene_staged.has_value()) {
-    return "scene_staged";
-  }
-  if (value.scene_stage_intent.has_value()) {
-    return "scene_stage_pending";
   }
   if (value.latest_runtime_staged_ready.has_value()) {
     return "runtime_staged_ready";
@@ -408,6 +387,16 @@ ApplyFence(const component_manager::PersistedManagerApplyStatus &value) {
 CanonicalValue
 ApplyStatus(const component_manager::PersistedManagerApplyStatus &value) {
   const auto &intent = value.intent.intent;
+  CanonicalValue prepared_activation;
+  try {
+    prepared_activation = content_identity::parse_canonical_json(
+        intent.prepared_activation.canonical_receipt_json,
+        {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
+         4096U});
+  } catch (const std::exception &error) {
+    throw std::runtime_error("stored Apply preparation receipt is invalid: " +
+                             std::string(error.what()));
+  }
   const auto terminal_state =
       value.terminal_outcome.has_value()
           ? CanonicalValue(std::string(component_manager::ToString(
@@ -428,6 +417,7 @@ ApplyStatus(const component_manager::PersistedManagerApplyStatus &value) {
       {"incomplete", CanonicalValue(!value.terminal_outcome.has_value())},
       {"intent_digest", CanonicalValue(value.intent.intent_digest.value())},
       {"phase", CanonicalValue(std::string(ApplyPhase(value)))},
+      {"prepared_activation", std::move(prepared_activation)},
       {"request",
        CanonicalValue(CanonicalValue::Object{
            {"correlation_id",

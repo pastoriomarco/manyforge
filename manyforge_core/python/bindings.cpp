@@ -43,7 +43,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
   manyforge::core::python::register_command_schema_bindings(m);
   manyforge::core::python::register_deployment_candidate_bindings(m);
   manyforge::core::python::register_model_compiler_bindings(m);
-  manyforge::core::python::register_scenario_catalog_bindings(m);
 
   // ========================================================================
   // Enums

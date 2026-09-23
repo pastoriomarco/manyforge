@@ -656,10 +656,10 @@ TEST(ManagedKernelRouteFenceOwner,
   CopyDirectory(fixture.retained_root, trusted_root);
   CopyDirectory(fixture.retained_root, candidate_root);
 
-  // During a managed Apply the child is started from the candidate package
+  // During a managed Apply the child is started from the activation root
   // before the durable active-publication pointer is advanced.  The trusted
   // package therefore intentionally lacks the predecessor bundle; the
-  // candidate package still contains it and must be accepted as the bounded
+  // activation root still contains it and must be accepted as the bounded
   // exact-identity fallback.
   const auto predecessor_path =
       trusted_root / "retained-bundles" / "sha256" /

@@ -4466,6 +4466,27 @@ svg.viewer-camera-icon {
   white-space: nowrap;
 }
 
+/* Keep operation feedback in the fixed document-control rail so long-running
+   Apply/Load/Revert work cannot move the canvas or overlap transient notices. */
+.document-operation-status {
+  display: inline-flex;
+  max-width: min(22rem, 32vw);
+  min-height: 1.9rem;
+  align-items: center;
+  padding: 0.24rem 0.48rem;
+  border-left: 1px solid #426171;
+  color: #a9c4ce;
+  font-size: 0.66rem;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-operation-status.error {
+  color: #ffb0a8;
+}
+
 .workspace-switcher button.active {
   border-color: #436373;
   color: #e5f7fb;

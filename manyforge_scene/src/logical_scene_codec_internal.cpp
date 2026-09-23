@@ -1679,57 +1679,6 @@ core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes) {
 }
 
 std::string
-EncodeManagedWithdrawal(const core::ManagedRuntimeWithdrawalDTO &receipt) {
-  if (!receipt.valid())
-    Fail("invalid managed withdrawal");
-  return ci::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"apply_id", CanonicalValue(receipt.apply_id.value())},
-      {"apply_generation",
-       Unsigned(receipt.apply_generation.value(), "Apply generation")},
-      {"runtime_convergence_intent_digest",
-       CanonicalValue(receipt.runtime_convergence_intent_digest.value())},
-      {"runtime_unit_id", CanonicalValue(receipt.runtime_unit_id.value())},
-      {"runtime_epoch", CanonicalValue(receipt.runtime_epoch.value())},
-      {"product_identity", CanonicalValue(receipt.product_identity.value())},
-      {"configuration_identity",
-       CanonicalValue(receipt.configuration_identity.value())},
-      {"process_observer_instance_id",
-       CanonicalValue(receipt.process_observer_instance_id)},
-      {"process_observation_sequence",
-       Unsigned(receipt.process_observation_sequence,
-                "process observation sequence")}}));
-}
-
-core::ManagedRuntimeWithdrawalDTO
-DecodeManagedWithdrawal(std::string_view bytes) {
-  if (bytes.size() > 4096U)
-    Fail("managed withdrawal exceeds its byte bound");
-  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
-  const auto &root = parsed.root();
-  ExactObject(root, 9U, "managed withdrawal");
-  core::ManagedRuntimeWithdrawalDTO receipt{
-      core::ApplyId(String(Member(root, "apply_id"), "apply_id")),
-      core::ApplyGeneration(
-          DecodeUnsigned(Member(root, "apply_generation"), "apply_generation")),
-      core::ContentDigest(String(
-          Member(root, "runtime_convergence_intent_digest"), "intent digest")),
-      core::RuntimeUnitId(
-          String(Member(root, "runtime_unit_id"), "runtime_unit_id")),
-      core::RuntimeEpoch(
-          String(Member(root, "runtime_epoch"), "runtime_epoch")),
-      core::ContentDigest(
-          String(Member(root, "product_identity"), "product_identity")),
-      core::ContentDigest(String(Member(root, "configuration_identity"),
-                                 "configuration_identity")),
-      String(Member(root, "process_observer_instance_id"), "observer"),
-      DecodeUnsigned(Member(root, "process_observation_sequence"),
-                     "process sequence")};
-  if (!receipt.valid() || EncodeManagedWithdrawal(receipt) != bytes)
-    Fail("stored managed withdrawal is not exact canonical evidence");
-  return receipt;
-}
-
-std::string
 EncodeErrorDetails(const std::map<std::string, std::string> &details) {
   CanonicalValue::Object object;
   object.reserve(details.size());

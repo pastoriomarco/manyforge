@@ -111,20 +111,17 @@ docker compose run --rm dev bash
 development workbench:
 
 ```bash
-MANYFORGE_DEV_QUALIFIED_BUILD_ROOT=/path/to/qualified/build \
-  ./scripts/compose-dev.sh start --scenario lite6_pick_and_place
+./scripts/compose-dev.sh start \
+  --project examples/lite6_pick_and_place.scenario
 ```
 
-The build-root setting is needed only when importing a compatible
-`maintained-package/` into a fresh image-keyed cache. Obtain that artifact with
-its matching source revision from the maintainer/distributor; building the image
-alone does not provide it. Later starts use `./scripts/compose-dev.sh start
---scenario lite6_pick_and_place`; `status` and `stop` are separate commands. The launcher
-incrementally builds stale Manager/Headless, native execution/candidate-worker
-and Deployment authoring compiler targets with their dependencies, starts owners in order,
-establishes the exact active Deployment and Applied Program/Binding, and serves
-Vite HMR at `http://localhost:3000`. It does not run tests, sanitizers,
-qualification, package generation, or proof generation. The
+Omit `--project` to start with an empty authoring workspace. The launcher builds
+the repository-owned empty bootstrap, current Manager/Headless, native
+execution/candidate-worker and Deployment authoring targets with their
+dependencies. A selected project is activated through the ordinary application
+path. `status` and `stop` are separate commands. Vite HMR is served at
+`http://localhost:3000`. The launcher does not run tests, sanitizers,
+qualification or proof generation. The
 selected workbench lane is simulated and cannot authorize physical execution.
 See the
 [`development workbench runbook`](docs/operations/DEVELOPMENT_WORKBENCH.md).

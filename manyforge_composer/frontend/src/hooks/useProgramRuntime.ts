@@ -14,7 +14,6 @@ import type {
   RuntimeOverrideRecord,
   ProgramRunStatus,
   ProgramWorkspaceResponse,
-  ScenarioCatalogResponse,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import {
@@ -147,12 +146,10 @@ export interface ProgramSelectionPending {
 }
 
 interface ProgramRuntimeState {
-  catalog: ScenarioCatalogResponse | null;
   applied: AppliedProgramSelection | null;
   currentScenario: CurrentScenarioResponse | null;
   run: ProgramRunStatus | null;
   controls: ProgramRuntimeControlProjection | null;
-  selectedScenarioId: string | null;
   runnerAvailable: boolean;
   loading: boolean;
   observationError: string | null;
@@ -163,12 +160,10 @@ interface ProgramRuntimeState {
 }
 
 const INITIAL_STATE: ProgramRuntimeState = {
-  catalog: null,
   applied: null,
   currentScenario: null,
   run: null,
   controls: null,
-  selectedScenarioId: null,
   runnerAvailable: false,
   loading: true,
   observationError: null,
@@ -186,7 +181,7 @@ function currentScenarioKey(value: CurrentScenarioResponse | null): string {
       ? 'none'
       : [
         scenario.scenarioId,
-        scenario.scenarioCatalogRevision,
+        scenario.sourceDocumentDigest,
         scenario.deploymentRevision,
         scenario.retainedBundleId,
         scenario.graphRevision,
@@ -330,7 +325,7 @@ export function buildProgramStartRequest(
     source_label: 'operator_ui',
     correlation_id: requestId,
     scenario_id: applied.scenarioId,
-    scenario_catalog_revision: applied.scenarioCatalogRevision,
+    source_document_digest: applied.sourceDocumentDigest,
     expected_applied_record_digest: applied.recordDigest,
     draft_program_revision: workspace.draft.programRevision,
     expected_admission_generation: snapshot.authoringAdmission.admissionGeneration,
@@ -389,29 +384,6 @@ export function buildProgramStopRequest(
     expected_owner_epoch: cycle.programRunnerOwnerEpoch,
     reason: 'ordinary operator Program Stop',
   };
-}
-
-export function retainedScenarioSelection(
-  selectedScenarioId: string | null,
-  catalog: ScenarioCatalogResponse | null,
-): string | null {
-  if (selectedScenarioId === null || catalog === null) return null;
-  return catalog.scenarios.some((row) => row.scenarioId === selectedScenarioId)
-    ? selectedScenarioId
-    : null;
-}
-
-export function scenarioSelectionAfterRequest(
-  selectedScenarioId: string | null,
-  catalog: ScenarioCatalogResponse | null,
-  requestedScenarioId: string | null,
-): string | null {
-  if (requestedScenarioId === null) return null;
-  return catalog?.scenarios.some(
-    (row) => row.scenarioId === requestedScenarioId,
-  )
-    ? requestedScenarioId
-    : selectedScenarioId;
 }
 
 function controlsMatchRun(
@@ -539,7 +511,6 @@ export function useProgramRuntime(
   const refreshQueued = useRef(false);
   const observationRetryAttempt = useRef(0);
   const [observationRetrySequence, setObservationRetrySequence] = useState(0);
-  const catalogCache = useRef<ScenarioCatalogResponse | null>(null);
   const [groupRuntimeScales, setGroupRuntimeScales] = useState<
     Record<string, ProgramGroupRuntimeScaleState>
   >({});
@@ -602,22 +573,6 @@ export function useProgramRuntime(
         ));
       }
 
-      const observedCatalogRevision = currentScenario?.currentScenario
-        ?.scenarioCatalogRevision ?? null;
-      let catalog = catalogCache.current;
-      if (
-        catalog === null
-        || (observedCatalogRevision !== null
-          && catalog.scenarioCatalogRevision !== observedCatalogRevision)
-      ) {
-        try {
-          catalog = await api.programs.scenarios();
-          catalogCache.current = catalog;
-        } catch (reason) {
-          errors.push(errorMessage(reason, 'Scenario catalog unavailable.'));
-        }
-      }
-
       let applied: AppliedProgramSelection | null = null;
       if (appliedResult.status === 'fulfilled') {
         applied = appliedResult.value;
@@ -638,18 +593,10 @@ export function useProgramRuntime(
       }
 
       setState((current) => {
-        const nextCatalog = catalog ?? current.catalog;
         const next = {
           ...current,
-          catalog: nextCatalog,
           currentScenario,
           applied,
-          // Owner-issued Applied state is a projection, not operator intent.
-          // Refresh may retain an explicit selection but must never create one.
-          selectedScenarioId: retainedScenarioSelection(
-            current.selectedScenarioId,
-            nextCatalog,
-          ),
           runnerAvailable: true,
           loading: false,
           observationError,
@@ -657,14 +604,11 @@ export function useProgramRuntime(
           // the operator can see it. The next explicit command clears it.
           error: current.error,
         };
-        return current.catalog?.scenarioCatalogRevision
-            === next.catalog?.scenarioCatalogRevision
-          && currentScenarioKey(current.currentScenario)
+        return currentScenarioKey(current.currentScenario)
             === currentScenarioKey(next.currentScenario)
           && appliedKey(current.applied) === appliedKey(next.applied)
           && programRunProjectionKey(current.run) === programRunProjectionKey(next.run)
           && controlsKey(current.controls) === controlsKey(next.controls)
-          && current.selectedScenarioId === next.selectedScenarioId
           && current.runnerAvailable === next.runnerAvailable
           && current.loading === next.loading
           && current.observationError === next.observationError
@@ -779,7 +723,6 @@ export function useProgramRuntime(
   useEffect(() => {
     if (!enabled) {
       setState(INITIAL_STATE);
-      catalogCache.current = null;
       requestedWakeKey.current = null;
       observationRetryAttempt.current = 0;
       return;
@@ -843,28 +786,6 @@ export function useProgramRuntime(
       .map((group) => group.groupId));
   }, [groupScaleRows, state.run?.state, state.selectionPending]);
   groupScaleStopActiveRef.current = groupScaleStopActive;
-
-  const selectScenario = useCallback((scenarioId: string) => {
-    setState((current) => ({
-      ...current,
-      selectedScenarioId: scenarioSelectionAfterRequest(
-        current.selectedScenarioId,
-        current.catalog,
-        scenarioId,
-      ),
-    }));
-  }, []);
-
-  const clearScenarioSelection = useCallback(() => {
-    setState((current) => ({
-      ...current,
-      selectedScenarioId: scenarioSelectionAfterRequest(
-        current.selectedScenarioId,
-        current.catalog,
-        null,
-      ),
-    }));
-  }, []);
 
   const dismissError = useCallback(() => {
     setState((current) => current.error === null
@@ -1763,8 +1684,6 @@ export function useProgramRuntime(
     commandAllowed,
     active,
     refresh,
-    selectScenario,
-    clearScenarioSelection,
     dismissError,
     run,
     startMotion,
@@ -1795,7 +1714,6 @@ export function useProgramRuntime(
   }), [
     active,
     applyRecoveryAction,
-    clearScenarioSelection,
     dismissError,
     cycleFailure,
     cycleState,
@@ -1811,7 +1729,6 @@ export function useProgramRuntime(
     commitGroupRuntimeScale,
     fullStop,
     resumeFullStop,
-    selectScenario,
     stageManualResult,
     stageObservationOverride,
     state,

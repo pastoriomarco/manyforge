@@ -390,8 +390,10 @@ def test_recovery_stays_closed_while_the_local_claim_is_unsettled(
     with pytest.raises(HTTPException):
         _run_local(coordinator, workspace, program, headless)
 
-    coordinator.recover()
+    with pytest.raises(HTTPException) as raised:
+        coordinator.recover()
 
+    assert raised.value.detail["code"] == "composer_authoring_release_uncertain"
     assert coordinator.local_claim_pending is True
     assert coordinator.mutation_ready is False
 
@@ -499,14 +501,14 @@ def test_uncertain_acquire_retains_exact_request_and_recovers_no_effect(
 ) -> None:
     workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
     headless.acquire_error = HeadlessClientError(
-        "admission_transport_failed", "the exact claim was not issued"
+        "headless_transport_error", "the exact claim outcome is unknown"
     )
 
     with pytest.raises(HTTPException) as raised:
         _run_local(coordinator, workspace, program, headless)
 
     assert raised.value.status_code == 503
-    assert raised.value.detail["code"] == "admission_transport_failed"
+    assert raised.value.detail["code"] == "headless_transport_error"
     assert coordinator.mutation_ready is False
     assert coordinator.local_claim_pending is True
     assert workspace.revision == 1

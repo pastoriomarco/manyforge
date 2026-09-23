@@ -675,7 +675,6 @@ add_library(manyforge_deployment_verification_core
   src/runtime_profile_codec.cpp
   src/runtime_policy_codec.cpp
   src/retained_runtime_policy.cpp
-  src/scenario_apply_candidate_source.cpp
   src/stop_evidence_policy_codec.cpp
   src/verified_retained_bundle.cpp
   src/verified_retained_bundle_store.cpp
@@ -872,7 +871,7 @@ add_library(manyforge_deployment
   src/retained_bundle_materializer.cpp
   src/retained_bundle_store.cpp
   src/retention_qualified_deployment.cpp
-  src/scenario_catalog.cpp
+  src/scenario_program_admission.cpp
   src/site_overlay_resolution.cpp
   src/structural_model_preparation.cpp
 )
@@ -1255,15 +1254,6 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_program_binding
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  add_executable(test_scenario_catalog
-    test/test_scenario_catalog.cpp)
-  target_include_directories(test_scenario_catalog PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src")
-  target_link_libraries(test_scenario_catalog PRIVATE
-    manyforge_deployment GTest::gtest_main)
-  gtest_discover_tests(test_scenario_catalog
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
   add_executable(test_program_contract
     test/test_program_contract.cpp)
   target_compile_definitions(test_program_contract PRIVATE
@@ -1521,10 +1511,10 @@ if(BUILD_TESTING)
     "${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}"
     MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT)
 
-  # UI6-I T3 consumes the exact maintained Scenario closure through the real
-  # Manager/Composer/Runner process stack.  Materialize that package with the
-  # production occurrence compiler instead of maintaining a second test-only
-  # Deployment or Program compiler.
+  # UI6-I process qualification needs the exact cell-scoped empty predecessor
+  # before it can exercise ordinary project-folder activation. This generated
+  # tree is used only as Manager bootstrap input; Composer discovers the
+  # repository Scenario projects directly and never treats it as a catalog.
   set(MANYFORGE_UI6I_DUAL_SCENARIO_FIXTURE_ROOT
     "${CMAKE_CURRENT_BINARY_DIR}/ui6i-dual-scenario-fixture")
   set(MANYFORGE_UI6I_DUAL_SCENARIO_PACKAGE_ROOT
@@ -1568,7 +1558,7 @@ if(BUILD_TESTING)
       "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
       "${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
     VERBATIM)
-  add_custom_target(manyforge_ui6i_dual_scenario_package
+  add_custom_target(manyforge_ui6i_cell_bootstrap
     DEPENDS "${MANYFORGE_UI6I_DUAL_SCENARIO_STAMP}")
 
   target_compile_definitions(test_cell_structure PRIVATE

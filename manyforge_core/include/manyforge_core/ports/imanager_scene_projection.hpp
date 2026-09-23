@@ -1,19 +1,16 @@
 #pragma once
 
-#include <manyforge_core/types/native_projection_handoff.hpp>
-#include <manyforge_core/types/projection_apply.hpp>
 #include <manyforge_core/types/projection_bootstrap.hpp>
+#include <manyforge_core/types/projection_maintenance.hpp>
 
 namespace manyforge::core {
 
-/// Named-Apply handoff from Component Manager to the logical-scene owner.
-///
-/// This port does not expose logical-scene mutation or native planner
-/// adapters. The scene owner owns quiesce, immutable capture, stage generation,
-/// and the complete predecessor/candidate native transition.
-class IManagerSceneProjectionHandoffPort {
+/// Focused maintenance-initialization boundary from Component Manager to the
+/// logical-scene owner. Scene owns quiescence, snapshot selection, native
+/// initialization and completion evidence. Reads are observation-only.
+class IManagerSceneProjectionMaintenancePort {
  public:
-  virtual ~IManagerSceneProjectionHandoffPort() = default;
+  virtual ~IManagerSceneProjectionMaintenancePort() = default;
 
   /// Returns the exact logical-scene composite that a new named Apply must
   /// freeze as its predecessor.  The active bundle publication deliberately
@@ -22,32 +19,21 @@ class IManagerSceneProjectionHandoffPort {
   [[nodiscard]] virtual ProjectionRevisionDTO
   CurrentProjectionRevision() const = 0;
 
-  [[nodiscard]] virtual ProjectionApplyStageResultDTO
-  StageCandidateProjection(const ProjectionApplyStageDTO& request) = 0;
+  [[nodiscard]] virtual ProjectionMaintenanceInitializationStatusDTO
+  BeginMaintenanceInitialization(
+      const ProjectionMaintenanceInitializationRequestDTO &request) = 0;
 
-  [[nodiscard]] virtual ProjectionApplyActivationResultDTO
-  ActivateStagedProjection(const ProjectionApplyActivationDTO& request) = 0;
+  [[nodiscard]] virtual ProjectionMaintenanceInitializationStatusDTO
+  CompleteMaintenanceInitialization(
+      const ProjectionMaintenanceCompletionDTO &completion) = 0;
 
-  [[nodiscard]] virtual ProjectionApplyDiscardResultDTO
-  DiscardStagedProjection(const ProjectionApplyDiscardDTO& request) = 0;
+  [[nodiscard]] virtual std::optional<
+      ProjectionMaintenanceInitializationStatusDTO>
+  ReadMaintenanceInitialization(
+      const ProjectionMaintenanceInitializationQueryDTO &query) const = 0;
 
-  [[nodiscard]] virtual ProjectionApplyFinalizeResultDTO
-  FinalizeProjectionTransition(const ProjectionApplyFinalizeDTO& request) = 0;
-
-  [[nodiscard]] virtual ProjectionApplyStatusDTO ProjectionApplyStatus(
-      const ProjectionApplyStatusQueryDTO& query) const = 0;
-
-  /// Reconciles only the exact Manager-observed process incarnations for the
-  /// already-active structural deployment. The scene owner remains the sole
-  /// owner of snapshot selection, native rebuild effects, and durable binding
-  /// replacement evidence.
-  [[nodiscard]] virtual ActiveProjectionRuntimeRecoveryResultDTO
-  ReconcileActiveProjectionRuntimes(
-      const ActiveProjectionRuntimeSetDTO& runtime_set) = 0;
-
-  /// Observes the exact current native set after applying any completed
-  /// process-replacement recovery. Historical Apply transition evidence is not
-  /// rewritten when a host epoch changes.
+  /// Observes the exact current native set. It never creates or replaces a
+  /// missing runtime or projection.
   [[nodiscard]] virtual ProjectionAggregateHealthDTO
   ActiveProjectionHealth() const = 0;
 };

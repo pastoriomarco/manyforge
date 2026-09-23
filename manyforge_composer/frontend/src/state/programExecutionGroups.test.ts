@@ -8,9 +8,9 @@ const digest = (character: string) => `sha256:${character.repeat(64)}`;
 
 function appliedProgram(): AppliedProgramSelection {
   return {
-    schemaVersion: 'manyforge.applied_program_selection.v1',
+    schemaVersion: 'manyforge.applied_program_selection.v2',
     scenarioId: 'two-robots',
-    scenarioCatalogRevision: digest('a'),
+    sourceDocumentDigest: digest('a'),
     programId: 'two-robots',
     programRevision: digest('b'),
     programBindingId: digest('c'),
@@ -21,6 +21,12 @@ function appliedProgram(): AppliedProgramSelection {
     sourceOwnerId: 'applied-owner',
     sourceOwnerEpoch: 'applied-owner.epoch.1',
     sourceGeneration: 1,
+    assistantProjection: null,
+    ownerIdentities: [{
+      ownerRole: 'headless_projection',
+      ownerId: 'applied-owner',
+      ownerEpoch: 'applied-owner.epoch.1',
+    }],
     program: {
       api_version: 'manyforge.program.v2',
       program_id: 'two-robots',

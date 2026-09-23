@@ -491,9 +491,9 @@ CanonicalValue TargetValue(const deployment::VerifiedRetainedModelMap& model_map
 
 ActiveSourceModelProjection::ActiveSourceModelProjection(
     std::filesystem::path package_root,
-    std::optional<std::filesystem::path> candidate_package_root)
+    std::optional<std::filesystem::path> activation_root)
     : model_maps_(std::move(package_root),
-                  std::move(candidate_package_root)) {}
+                  std::move(activation_root)) {}
 
 CanonicalValue ActiveSourceModelProjection::Project(
     const deployment::RetainedBundle& active_bundle) const {

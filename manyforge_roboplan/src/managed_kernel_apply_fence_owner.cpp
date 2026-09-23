@@ -2521,7 +2521,7 @@ private:
       RequireDisjointDirectories(
           config.retained_package_root,
           config.candidate_retained_package_root,
-          "retained/candidate package roots");
+          "retained/activation roots");
     }
     Require(!config.cell_id.empty() && !config.runtime_unit_id.empty() &&
                 !config.runtime_epoch.empty() &&

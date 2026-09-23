@@ -74,6 +74,7 @@ def _request(
         )
     )
     captured = {
+        "scenario_id": document["scenario_id"],
         "source_document_digest": digest,
         "deployment": document["deployment_draft"],
         "model_source_closure": capture_deployment_model_sources(
@@ -134,12 +135,15 @@ def _run(
     expect_error: str | None = None,
 ) -> dict[str, object] | None:
     root.mkdir()
+    activation_root = root / "activation"
+    activation_root.mkdir()
     request_path = root / "request.json"
     request_path.write_bytes(canonical_json_bytes(request))
     command = [
         str(args.tool),
         "--input", str(request_path),
         "--capability-root", str(args.workspace),
+        "--activation-root", str(activation_root),
     ]
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if expect_error is not None:
@@ -171,8 +175,8 @@ def _run(
         raise AssertionError("preparer returned an incomplete direct payload")
     if not payload["raw_artifacts"] or not payload["catalog_artifacts"]:
         raise AssertionError("preparer omitted its exact artifact closure")
-    if any(path.name != "request.json" for path in root.iterdir()):
-        raise AssertionError("preparer wrote a candidate artifact")
+    if not any(activation_root.iterdir()):
+        raise AssertionError("preparer omitted the activation closure")
     return value
 
 
@@ -180,6 +184,8 @@ def _require_oversized_request_rejection(
     args: argparse.Namespace, root: Path
 ) -> None:
     root.mkdir()
+    activation_root = root / "activation"
+    activation_root.mkdir()
     request_path = root / "request.json"
     with request_path.open("wb") as stream:
         stream.truncate(MAX_ACTIVATION_PREPARATION_REQUEST_BYTES + 1)
@@ -189,6 +195,8 @@ def _require_oversized_request_rejection(
         str(request_path),
         "--capability-root",
         str(args.workspace),
+        "--activation-root",
+        str(activation_root),
     ]
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if (
@@ -360,7 +368,10 @@ def main() -> int:
                 args,
                 missing_component,
                 temporary / "missing-component",
-                expect_error="model_source_closure has an invalid component count",
+                expect_error=(
+                    "Deployment intent component count differs from the captured "
+                    "source closure"
+                ),
             )
             return 0
 

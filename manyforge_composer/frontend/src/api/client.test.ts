@@ -371,6 +371,38 @@ function workspaceFixture(): Record<string, unknown> {
   };
 }
 
+function authoringWorkspaceFixture(): Record<string, unknown> {
+  const workspace = workspaceFixture();
+  const draft = workspace.draft as Record<string, unknown>;
+  const saved = workspace.saved as Record<string, unknown>;
+  return {
+    schemaVersion: 'manyforge.composer_authoring_workspace_snapshot.v1',
+    workspaceEpoch: 'workspace.epoch.1',
+    workspaceRevision: 3,
+    program: { ...draft, saved },
+    deployment: {
+      draftId: 'deployment-draft-1',
+      draftRevision: 3,
+      document: null,
+      savedPath: null,
+      savedDocument: null,
+      differsFromSaved: false,
+    },
+    project: {
+      document_path: '/workspace/examples/cell',
+      document_id: 'cell',
+      document_name: 'Cell',
+      document_description: '',
+      source_diagnostics: [],
+      source_document_digest: null,
+      program_role_assignment: null,
+      typed_parameter_overrides: {},
+      source_program_digest: null,
+      source_deployment_digest: null,
+    },
+  };
+}
+
 function appliedResultFixture(): Record<string, unknown> {
   const digestA = `sha256:${'a'.repeat(64)}`;
   const digestB = `sha256:${'b'.repeat(64)}`;
@@ -388,11 +420,17 @@ function appliedResultFixture(): Record<string, unknown> {
     preparation: {},
     applied: {
       assistant_mode: 'forbidden',
+      assistant_projection: null,
       baseline_program_binding_id: digestA,
       deployment_artifact_id: 'cell-a',
       deployment_revision: digestB,
       graph_revision: digestC,
       node_environment_digest: digestA,
+      owner_identities: [{
+        owner_role: 'headless_projection',
+        owner_id: 'headless.program-apply',
+        owner_epoch: 'headless.epoch.1',
+      }],
       preparation_digest: digestB,
       program: (workspaceFixture().draft as Record<string, unknown>).program,
       program_binding: binding,
@@ -400,9 +438,9 @@ function appliedResultFixture(): Record<string, unknown> {
       program_id: 'fixture',
       program_revision: digestA,
       retained_bundle_id: digestB,
-      scenario_catalog_revision: digestA,
+      source_document_digest: digestA,
       scenario_id: 'cell-pick',
-      schema_version: 'manyforge.applied_program_selection.v1',
+      schema_version: 'manyforge.applied_program_selection.v2',
       source: {
         record_digest: digestC,
         semantic_content_digest: digestB,
@@ -412,41 +450,6 @@ function appliedResultFixture(): Record<string, unknown> {
       },
       typed_parameter_overrides: {},
     },
-  };
-}
-
-function managerSourceFixture(): Record<string, unknown> {
-  return {
-    available: true,
-    freshness: 'fresh',
-    known_gaps: [],
-    projection_generation: 4,
-    projection_owner_epoch: 'projection.epoch.1',
-    receiver_age_ns: 10,
-    source_content_digest: 'sha256:' + 'a'.repeat(64),
-    source_generation: 2,
-    source_owner_epoch: 'manager.epoch.1',
-    source_owner_id: 'component-manager.cell-a',
-  };
-}
-
-function managerGraphFixture(): Record<string, unknown> {
-  return {
-    schema_version: 'manyforge.manager_graph_projection.v1',
-    source: managerSourceFixture(),
-    graph_revision: 'graph.9',
-    retained_bundle_id: 'bundle.9',
-    cell_graph: { cell_id: 'cell-a', components: [] },
-  };
-}
-
-function managerDiffFixture(): Record<string, unknown> {
-  return {
-    schema_version: 'manyforge.manager_diff_projection.v1',
-    source: managerSourceFixture(),
-    converged: true,
-    desired_units: [],
-    observed_units: [],
   };
 }
 
@@ -729,6 +732,7 @@ describe('structural API client', () => {
         diagnostics: [],
         source_diagnostics: [],
         workspace: workspaceFixture(),
+        authoringWorkspace: authoringWorkspaceFixture(),
       }))
       .mockResolvedValueOnce(response({
         status: 'converted',

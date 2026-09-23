@@ -67,7 +67,7 @@ class ProgramRunPortContext:
     program_run_id: str
     applied_record_digest: str
     scenario_id: str
-    scenario_catalog_revision: str
+    source_document_digest: str
     program_id: str
     program_revision: str
     program_binding_id: str
@@ -87,7 +87,7 @@ class ProgramRunPortContext:
                 raise ValueError(f"{field_name} exceeds the client-port bound")
         for field_name in (
             "applied_record_digest",
-            "scenario_catalog_revision",
+            "source_document_digest",
             "program_revision",
             "program_binding_id",
             "retained_bundle_id",

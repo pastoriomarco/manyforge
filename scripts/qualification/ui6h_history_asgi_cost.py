@@ -173,7 +173,6 @@ def main():
             projection_root=paths["projections"],
             install_root=args.install_root,
             artifact_root=paths["artifacts"],
-            program_selection_state_root=paths["selection"],
             node_catalog_path=Path("/workspace/manyforge_behavior/resources/node_catalog.yaml"),
             node_environment_manifest_path=Path(
                 "/workspace/manyforge_behavior/resources/node_environment_manifest.yaml"

@@ -135,21 +135,6 @@ bool ManagerApplyRuntimeConvergenceIntentDTO::valid() const noexcept {
 }
 
 bool RuntimeUnitConvergenceQueryDTO::valid() const noexcept {
-  if (replacement) {
-    const auto *apply =
-        std::get_if<RuntimeUnitConvergenceApplyOwnerDTO>(&owner);
-    if (!apply || !replacement->valid() ||
-        replacement->expected_old_retained_bundle_id ==
-            candidate_retained_bundle_id ||
-        replacement->expected_new_retained_bundle_id !=
-            candidate_retained_bundle_id ||
-        replacement->expected_new_graph_revision != candidate_graph_revision ||
-        replacement->apply_id != apply->apply_id ||
-        replacement->apply_generation != apply->apply_generation ||
-        plan.lifecycle_control !=
-            manyforge::core::RuntimeLifecycleControl::kManagerManaged)
-      return false;
-  }
   return std::visit([](const auto &value) { return value.valid(); }, owner) &&
          !candidate_retained_bundle_id.empty() &&
          !candidate_graph_revision.empty() &&
@@ -157,15 +142,6 @@ bool RuntimeUnitConvergenceQueryDTO::valid() const noexcept {
 }
 
 bool RuntimeUnitStagedReadyEvidenceDTO::valid() const noexcept {
-  if (predecessor_withdrawal &&
-      (!predecessor_withdrawal->valid() ||
-       lifecycle_control !=
-           manyforge::core::RuntimeLifecycleControl::kManagerManaged ||
-       candidate_disposition !=
-           RuntimeUnitCandidateDisposition::kRetainedExact ||
-       predecessor_withdrawal->runtime_unit_id != runtime_unit_id ||
-       predecessor_withdrawal->runtime_epoch == runtime_epoch))
-    return false;
   return !runtime_unit_id.empty() && !runtime_epoch.empty() &&
          PrintableIdentifier(process_observer_instance_id) &&
          process_observation_sequence > 0U && source_report_sequence > 0U &&
@@ -200,16 +176,7 @@ bool ManagerApplyRuntimeStagedReadyDTO::valid() const noexcept {
          runtime_units.size() <= kMaximumRuntimeUnits &&
          std::all_of(
              runtime_units.begin(), runtime_units.end(),
-             [this](const auto &row) {
-               return row.valid() &&
-                      (!row.predecessor_withdrawal ||
-                       (row.predecessor_withdrawal->apply_id == apply_id &&
-                        row.predecessor_withdrawal->apply_generation ==
-                            apply_generation &&
-                        row.predecessor_withdrawal
-                                ->runtime_convergence_intent_digest ==
-                            runtime_convergence_intent_digest));
-             }) &&
+             [](const auto &row) { return row.valid(); }) &&
          std::adjacent_find(runtime_units.begin(), runtime_units.end(),
                             [](const auto &left, const auto &right) {
                               return !(left.runtime_unit_id <

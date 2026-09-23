@@ -55,7 +55,6 @@ def qualify(install_root: Path, volume: Path) -> dict:
             projection_root=paths["projections"],
             install_root=install_root,
             artifact_root=paths["artifacts"],
-            program_selection_state_root=paths["selection"],
             node_catalog_path=Path(
                 "/workspace/manyforge_behavior/resources/node_catalog.yaml"
             ),

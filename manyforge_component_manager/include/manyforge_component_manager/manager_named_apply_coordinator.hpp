@@ -5,13 +5,13 @@
 #include <manyforge_component_manager/manager_apply_fence_release_coordinator.hpp>
 #include <manyforge_component_manager/manager_planned_maintenance_coordinator.hpp>
 #include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
-#include <manyforge_component_manager/manager_scene_activation_coordinator.hpp>
-#include <manyforge_component_manager/manager_scene_stage_coordinator.hpp>
+#include <manyforge_component_manager/manager_scene_initialization_coordinator.hpp>
 #include <manyforge_component_manager/manager_selected_bundle_transition_coordinator.hpp>
 #include <manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -36,7 +36,7 @@ public:
 
 /// Exact public selection normalized by the Manager after ingress.
 /// `candidate_retained_bundle_id` comes from one independently verified,
-/// bounded catalog lookup; the caller never authors that internal identity.
+/// bounded prepared activation; the caller never authors that internal identity.
 struct ManagerNamedApplyRequestDTO final {
   manyforge::core::PublicRequestContextDTO request_context;
   manyforge::core::DeploymentArtifactId deployment_artifact_id;
@@ -77,8 +77,10 @@ struct ManagerNamedApplyResult final {
 /// to the already qualified I4 coordinator that owns it. A new request first
 /// resolves the exact current publication and sealed bundles. It samples the
 /// Kernel admission state once before the first Acquire; Acquire then performs
-/// the atomic reject-if-busy compare-and-swap. Recovery resumes from durable
-/// phase evidence and never repeats an already completed external effect.
+/// the atomic reject-if-busy compare-and-swap. Same-process progression reuses
+/// one captured pair of verified bundles and never repeats a completed external
+/// effect. A restarted Manager cannot reconstruct that capture and records the
+/// interrupted operation as unknown rather than resuming it automatically.
 class ManagerNamedApplyCoordinator final {
 public:
   using ApplyIdFactory = std::function<manyforge::core::ApplyId()>;
@@ -93,7 +95,7 @@ public:
       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
           &artifact_source,
       manyforge::core::IActiveBundlePublicationStore &publication_store,
-      manyforge::core::IManagerSceneProjectionHandoffPort &scene_owner,
+      manyforge::core::IManagerSceneProjectionMaintenancePort &scene_owner,
       manyforge::core::IManagerSceneProjectionBootstrapPort
           *bootstrap_scene_owner,
       manyforge::core::IManagerKernelApplyFencePort &kernel_fence,
@@ -127,6 +129,13 @@ public:
   operator=(const ManagerNamedApplyCoordinator &) = delete;
 
 private:
+  struct CapturedApplyInputs final {
+    manyforge::core::ApplyId apply_id;
+    manyforge::core::ApplyGeneration apply_generation;
+    std::shared_ptr<const manyforge::deployment::RetainedBundle> predecessor;
+    std::shared_ptr<const manyforge::deployment::RetainedBundle> candidate;
+  };
+
   [[nodiscard]] ManagerNamedApplyResult
   Continue(const ManagerApplyIntentDTO &intent, bool request_replayed);
   [[nodiscard]] manyforge::core::ApplyId MintApplyId();
@@ -135,7 +144,7 @@ private:
   IManagerActiveRuntimePlanSource &active_plan_source_;
   const manyforge::deployment::IVerifiedRetainedBundleSource
       &retained_bundle_source_;
-  manyforge::core::IManagerSceneProjectionHandoffPort &scene_owner_;
+  manyforge::core::IManagerSceneProjectionMaintenancePort &scene_owner_;
   manyforge::core::IManagerKernelApplyFencePort &kernel_fence_;
   manyforge::core::IKernelCellAdmissionPort &cell_admission_;
   manyforge::core::RuntimeEpoch manager_runtime_epoch_;
@@ -143,12 +152,13 @@ private:
   ApplyProgressObserver apply_progress_observer_;
   ManagerApplyFenceCoordinator fence_coordinator_;
   ManagerPlannedMaintenanceCoordinator &planned_maintenance_;
+  ManagerActiveRuntimeCoordinator active_runtime_coordinator_;
   ManagerApplyRuntimeConvergenceCoordinator runtime_coordinator_;
-  ManagerSceneStageCoordinator scene_stage_coordinator_;
-  ManagerSceneActivationCoordinator scene_activation_coordinator_;
+  ManagerSceneInitializationCoordinator scene_initialization_coordinator_;
   ManagerSelectedRuntimeCompositionCoordinator runtime_composition_coordinator_;
   ManagerSelectedBundleTransitionCoordinator selected_bundle_coordinator_;
   ManagerApplyFenceReleaseCoordinator fence_release_coordinator_;
+  std::optional<CapturedApplyInputs> captured_apply_inputs_;
   std::mutex operation_mutex_;
 };
 

@@ -450,7 +450,6 @@ def _start_topic_sample(
 
 def _wait_for_api(
     base_url: str,
-    scenario_id: str,
     processes: Sequence[ManagedProcess],
     *,
     timeout_s: float,
@@ -463,12 +462,7 @@ def _wait_for_api(
         try:
             with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:
                 runtime = client.runtime()
-                catalog = client.scenarios()
-            if runtime.get("complete") is True and scenario_id in {
-                row.get("scenario_id")
-                for row in catalog.get("scenarios", [])
-                if isinstance(row, dict)
-            }:
+            if runtime.get("complete") is True:
                 return runtime
         except Exception as error:
             last_error = error
@@ -488,10 +482,10 @@ def _wait_for_composer(
         process.require_alive()
         try:
             with urlopen(  # noqa: S310
-                f"{base_url}/api/scenarios", timeout=1.0
+                f"{base_url}/api/health", timeout=1.0
             ) as response:
                 value = json.loads(response.read())
-            if value.get("api_version") == "manyforge.scenario_catalog.v1":
+            if isinstance(value, dict) and isinstance(value.get("status"), str):
                 return
         except Exception as error:
             last_error = error
@@ -827,28 +821,25 @@ def _simulation_snapshot(
             rclpy.shutdown()
 
 
-def _apply_program(
+def _require_applied_program(
     client: HeadlessHttpClient,
     spec: ScenarioSpec,
     program: Mapping[str, Any],
-    catalog: Mapping[str, Any],
     *,
     timeout_s: float,
 ) -> dict[str, Any]:
-    body: dict[str, Any] = {
-        "expected_applied_record_digest": None,
-        "program": program,
-        "scenario_catalog_revision": catalog["scenario_catalog_revision"],
-        "scenario_id": spec.scenario_id,
-    }
     deadline = time.monotonic() + timeout_s
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        last = client.program_apply(body)
-        if last.get("status") == "applied" and isinstance(last.get("applied"), dict):
-            return last["applied"]
+        try:
+            last = client.program_applied()
+        except Exception:
+            time.sleep(0.05)
+            continue
+        if last.get("scenario_id") == spec.scenario_id and last.get("program") == program:
+            return last
         time.sleep(0.05)
-    raise LiveRowError(f"Program Apply did not converge: {last}")
+    raise LiveRowError(f"project Program did not become active: {last}")
 
 
 def _expected_active_configuration(
@@ -1459,7 +1450,6 @@ def _prepare_and_select_cclc_routes(
 def _run_program(
     client: HeadlessHttpClient,
     spec: ScenarioSpec,
-    catalog: Mapping[str, Any],
     applied: Mapping[str, Any],
     evidence: RunEvidence,
     *,
@@ -1475,7 +1465,7 @@ def _run_program(
             "expected_applied_record_digest": source["record_digest"],
             "request_id": f"i9.start.{spec.scenario_id}",
             "request_owner_epoch": "i9-isaac-matrix",
-            "scenario_catalog_revision": catalog["scenario_catalog_revision"],
+            "source_document_digest": applied["source_document_digest"],
             "scenario_id": spec.scenario_id,
             "source_label": "i9_isaac_matrix",
         }
@@ -2542,7 +2532,6 @@ def _process_commands(
     execution_state_root = layout.owner_state_root("execution-host")
     execution_run_root = layout.run_root / "execution-host"
     program_runner_state_root = layout.owner_state_root("program-runner")
-    program_selection_state_root = layout.owner_state_root("program-selection")
     program_cycle_journal = program_runner_state_root / "program-cycle.sqlite3"
     program_runner_liveness_socket = (
         manager_run_root / "program-runner-liveness.sock"
@@ -2616,8 +2605,6 @@ def _process_commands(
             str(config.package_root),
             "--artifact-root",
             str(layout.artifact_root),
-            "--program-selection-state-root",
-            str(program_selection_state_root),
             "--node-catalog-path",
             str(config.node_catalog),
             "--alarm-catalog-path",
@@ -2671,6 +2658,9 @@ def _process_commands(
     for resource_id in config.spec.runtime_resource_ids:
         commands["headless"].extend(("--resource-id", resource_id))
     if composer_port is not None:
+        project_path = (
+            config.source_root / "examples" / f"{config.spec.scenario_id}.scenario"
+        )
         commands["composer"] = [
             sys.executable,
             "-m",
@@ -2679,8 +2669,8 @@ def _process_commands(
             "127.0.0.1",
             "--port",
             str(composer_port),
-            "--program-path",
-            str(config.package_root / config.spec.program_filename),
+            "--startup-scenario-document",
+            str(project_path),
             "--static-dir",
             str(config.static_dir),
             "--headless-api-url",
@@ -2908,7 +2898,9 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
     environment = dict(os.environ)
     environment["ROS2CLI_NO_DAEMON"] = "1"
     environment["MANYFORGE_API_TOKEN"] = "i9-local-fixture"
-    environment["MANYFORGE_FS_ROOTS"] = str(config.package_root)
+    environment["MANYFORGE_FS_ROOTS"] = os.pathsep.join(
+        (str(config.package_root), str(config.source_root))
+    )
     processes: list[ManagedProcess] = []
     samples: list[TopicSample] = []
     simulation_services_ready = False
@@ -2938,7 +2930,6 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
         api_url = f"http://127.0.0.1:{api_port}"
         runtime_initial = _wait_for_api(
             api_url,
-            config.spec.scenario_id,
             processes,
             timeout_s=config.startup_timeout_s,
         )
@@ -2999,7 +2990,6 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
         )
         tf_probe: dict[str, Any] | None = None
         with HeadlessHttpClient(api_url, timeout_seconds=15.0) as client:
-            catalog = client.scenarios()
             scene_before = client.scene()
             _record_scene_evidence(run_evidence, scene_before)
             # The retained Lite6 gripper publishes feedback on playback ticks.
@@ -3037,11 +3027,10 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
                 _start_topic_sample(topic, environment=environment)
                 for topic in sorted(topic_names)
             ]
-            applied = _apply_program(
+            applied = _require_applied_program(
                 client,
                 config.spec,
                 program_definition,
-                catalog,
                 timeout_s=config.startup_timeout_s,
             )
             cclc_startup = _prepare_and_select_cclc_routes(
@@ -3052,7 +3041,6 @@ def run_live_row(config: LiveConfig) -> dict[str, Any]:
             program_snapshot = _run_program(
                 client,
                 config.spec,
-                catalog,
                 applied,
                 run_evidence,
                 timeout_s=config.run_timeout_s,

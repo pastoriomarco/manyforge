@@ -17,6 +17,7 @@
 #include <iterator>
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_deployment/artifact_codec.hpp>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -60,14 +61,13 @@ void Require(const bool condition, const std::string &code,
 HeadlessApiCoreConfig ValidateConfig(HeadlessApiCoreConfig config) {
   Require(!config.projection_root.empty() && !config.install_root.empty() &&
               !config.artifact_root.empty() &&
-              !config.program_selection_state_root.empty() &&
               !config.node_catalog_path.empty() &&
               !config.node_environment_manifest_path.empty() &&
               !config.alarm_catalog_path.empty() &&
               !config.historian_database_path.empty(),
           "headless_api_configuration_invalid",
-          "projection, install, artifact, Program-selection state, node-"
-          "catalog, node-environment manifest, alarm-catalog, and historian "
+          "projection, install, artifact, node-catalog, node-environment "
+          "manifest, alarm-catalog, and historian "
           "paths are required");
   Require(!config.cell_id.empty() && !config.owner_id.empty() &&
               !config.owner_epoch.empty(),
@@ -166,42 +166,18 @@ CanonicalValue OptionalStringValue(const std::optional<std::string> &value) {
   return value.has_value() ? CanonicalValue(*value) : CanonicalValue(nullptr);
 }
 
-CanonicalValue ScenarioSelectionProjection(
-    const deployment::ScenarioProgramSelection &selection,
-    CanonicalValue owner_identities) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"assistant_projection", selection.normalized_assistant_projection},
-      {"assistant_mode",
-       CanonicalValue(selection.assistant_mode ==
-                              deployment::ScenarioAssistantMode::kRequired
-                          ? "required"
-                      : selection.assistant_mode ==
-                              deployment::ScenarioAssistantMode::kOptional
-                          ? "optional"
-                          : "forbidden")},
-      {"deployment_artifact_id",
-       CanonicalValue(selection.deployment_artifact_id.value())},
-      {"deployment_revision",
-       CanonicalValue(selection.deployment_revision.value())},
-      {"graph_revision", CanonicalValue(selection.graph_revision.value())},
-      {"node_environment_digest",
-       CanonicalValue(selection.node_environment_digest.value())},
-      {"owner_identities", std::move(owner_identities)},
-      {"program", selection.normalized_program_root},
-      {"program_binding", selection.normalized_program_binding_root},
-      {"program_binding_id",
-       CanonicalValue(selection.program_binding_id.value())},
-      {"program_id", CanonicalValue(selection.program_id.value())},
-      {"program_revision", CanonicalValue(selection.program_revision.value())},
-      {"retained_bundle_id",
-       CanonicalValue(selection.retained_bundle_id.value())},
-      {"scenario_catalog_revision",
-       CanonicalValue(selection.scenario_catalog_revision.value())},
-      {"scenario_id", CanonicalValue(selection.scenario_id)},
-      {"schema_version",
-       CanonicalValue(std::string(kScenarioProgramSelectionSchemaVersion))},
-      {"typed_parameter_overrides", selection.typed_parameter_overrides},
-  });
+deployment::VerifiedRetainedModelMap LoadActiveProgramModelMap(
+    const deployment::RetainedBundle &bundle,
+    const deployment::FilesystemVerifiedRetainedModelMapSource &source) {
+  Require(bundle.value().compiled_products.symbol_role_maps.size() == 1U,
+          "program_applied_selection_invalid",
+          "active retained bundle must select one exact model map");
+  auto model_map = source.get_verified(deployment::RetainedModelMapQuery{
+      bundle.retained_bundle_id(),
+      bundle.value().compiled_products.symbol_role_maps.front().product_id});
+  Require(model_map.has_value(), "program_applied_selection_invalid",
+          "active retained model map is absent or unverifiable");
+  return std::move(*model_map);
 }
 
 CanonicalValue Number(const std::uint64_t value, const std::string_view label) {
@@ -566,12 +542,9 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
           std::make_unique<PackageRootDescriptor>(config_.install_root)),
       retained_bundle_source_(package_root_descriptor_->root(),
                               config_.artifact_root),
-      scenario_catalog_source_(package_root_descriptor_->root(), "maintained",
-                               config_.artifact_root),
-      program_selection_owner_(
-          package_root_descriptor_->root(), config_.artifact_root,
-          config_.program_selection_state_root,
-          config_.owner_id + ".program-selection", config_.owner_epoch),
+      program_repository_(config_.artifact_root),
+      binding_repository_(config_.artifact_root),
+      retained_model_map_source_(config_.artifact_root),
       // This reader validates the final path component with symlink_status;
       // "." keeps that component directory-valued while traversal remains
       // anchored through the retained procfd root.
@@ -683,95 +656,102 @@ HeadlessApiCore::AssistantModeContext(const std::string_view mode_id) {
   });
 }
 
-CanonicalValue HeadlessApiCore::ScenarioCatalogProjection() {
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  try {
-    return scenario_catalog_source_.LoadVerifiedCatalog();
-  } catch (const deployment::ScenarioApplyCandidateError &error) {
-    CoreFail("scenario_catalog_unavailable", error.what());
-  } catch (const deployment::ScenarioCatalogError &error) {
-    CoreFail("scenario_catalog_unavailable", error.what());
-  }
-}
-
-CanonicalValue
-HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  const auto runtime = RefreshLocked();
-  Require(RequiredBool(runtime.root, "complete"),
-          "scenario_program_selection_unavailable",
-          "scenario Program selection requires fresh Manager and scene owners");
+CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
+    const HeadlessRuntimeSnapshot &runtime) {
   const auto &manager_section = RequiredSection(runtime.root, "manager");
-  const auto &logical_scene_section =
-      RequiredSection(runtime.root, "logical_scene");
-  const auto &scene_runtime_section =
-      RequiredSection(runtime.root, "scene_runtime");
+  Require(SectionFresh(manager_section), "program_applied_selection_unavailable",
+          "Applied Program requires a fresh Manager owner");
   const auto &manager_payload = RequiredMember(manager_section, "payload");
-  Require(manager_payload.is_object(), "scenario_program_selection_invalid",
-          "Manager has no active selection");
+  Require(manager_payload.is_object(), "program_applied_selection_unavailable",
+          "Applied Program requires an active Manager selection");
   const auto &active = RequiredMember(manager_payload, "active");
+  Require(RequiredBool(manager_payload, "manager_ready") &&
+              RequiredBool(RequiredMember(manager_payload, "runtime"),
+                           "converged"),
+          "program_applied_selection_not_active",
+          "Applied Program requires one converged active configuration");
+  const auto &transaction = RequiredMember(
+      RequiredMember(active, "publication"), "transaction");
+  Require(RequiredString(transaction, "kind") == "apply",
+          "program_applied_selection_not_found",
+          "the active configuration was not installed from a Scenario");
+  const auto apply_id = RequiredString(transaction, "apply_id");
+  const auto apply_generation =
+      RequiredCounter(transaction, "apply_generation", 1U);
+  const auto &records = RequiredArray(RequiredMember(manager_payload, "apply"),
+                                      "records");
+  const CanonicalValue *record = nullptr;
+  for (const auto &candidate : records) {
+    if (RequiredString(candidate, "apply_id") == apply_id &&
+        RequiredCounter(candidate, "apply_generation", 1U) ==
+            apply_generation) {
+      Require(record == nullptr, "program_applied_selection_invalid",
+              "Manager published duplicate active Apply records");
+      record = &candidate;
+    }
+  }
+  Require(record != nullptr && RequiredString(*record, "terminal_state") ==
+                                   "succeeded",
+          "program_applied_selection_not_active",
+          "the active Apply has no successful terminal evidence");
+  const auto &prepared = RequiredMember(*record, "prepared_activation");
   const auto active_bundle_id = RequiredString(active, "retained_bundle_id");
   const auto active_graph_revision = RequiredString(active, "graph_revision");
-  Require(
-      RequiredBool(manager_payload, "manager_ready") &&
-          RequiredBool(RequiredMember(manager_payload, "runtime"), "converged"),
-      "scenario_program_selection_unavailable",
-      "Manager has not converged the active retained bundle");
+  Require(RequiredString(prepared, "retained_bundle_id") == active_bundle_id &&
+              RequiredString(prepared, "graph_revision") ==
+                  active_graph_revision,
+          "program_applied_selection_invalid",
+          "active Manager publication and prepared activation disagree");
 
-  const auto selected =
-      [&]() -> std::optional<deployment::ScenarioProgramSelection> {
+  const auto bundle = retained_bundle_source_.get_verified(
+      core::RetainedBundleId(active_bundle_id));
+  Require(bundle != nullptr, "program_applied_selection_invalid",
+          "active retained bundle is unavailable");
+  auto model_map = LoadActiveProgramModelMap(*bundle, retained_model_map_source_);
+  const auto program_id = core::ProgramId(RequiredString(prepared, "program_id"));
+  const auto program_revision =
+      core::ProgramRevision(RequiredString(prepared, "program_revision"));
+  const auto binding_id = core::ProgramBindingId(
+      RequiredString(prepared, "program_binding_id"));
+  const auto program =
+      program_repository_.get_verified(program_id, program_revision, *bundle);
+  const auto binding =
+      binding_repository_.get_verified(binding_id, *bundle, model_map);
+  Require(program != nullptr && binding != nullptr &&
+              binding->value().program_id == program_id &&
+              binding->value().program_revision == program_revision,
+          "program_applied_selection_invalid",
+          "active Program or binding is unavailable or divergent");
+
+  CanonicalValue assistant_projection(nullptr);
+  if (bundle->value().assistant.has_value()) {
     try {
-      std::optional<CanonicalValue> applied;
-      try {
-        applied = program_selection_owner_.ReadApplied();
-      } catch (const ProgramApplyError &error) {
-        if (error.code() != "program_applied_selection_not_found") {
-          throw;
-        }
-      }
-      if (applied.has_value() &&
-          RequiredString(*applied, "scenario_id") == scenario_id &&
-          RequiredString(*applied, "retained_bundle_id") == active_bundle_id &&
-          RequiredString(*applied, "graph_revision") == active_graph_revision) {
-        auto selection =
-            scenario_catalog_source_.LoadExactProgramSelectionForCatalog(
-                scenario_id, core::ScenarioCatalogRevision(RequiredString(
-                                 *applied, "scenario_catalog_revision")));
-        if (selection.retained_bundle_id.value() != active_bundle_id ||
-            selection.graph_revision.value() != active_graph_revision) {
-          throw deployment::ScenarioApplyCandidateError(
-              "Applied Scenario catalog names another active deployment");
-        }
-        return selection;
-      }
-      return scenario_catalog_source_.TryLoadExactProgramSelectionForActive(
-          scenario_id, core::RetainedBundleId(active_bundle_id),
-          core::GraphRevision(active_graph_revision));
-    } catch (const deployment::ScenarioApplyCandidateError &error) {
-      CoreFail("scenario_program_selection_unavailable", error.what());
-    } catch (const deployment::ScenarioCatalogError &error) {
-      CoreFail("scenario_program_selection_unavailable", error.what());
+      assistant_projection = deployment::parse_strict_json_model_yaml(
+                                 bundle->value().assistant->canonical_json)
+                                 .root();
     } catch (const std::exception &error) {
-      CoreFail("scenario_program_selection_invalid", error.what());
+      CoreFail("program_applied_selection_invalid",
+               "active assistant projection is invalid: " +
+                   std::string(error.what()));
     }
-  }();
-  Require(selected.has_value(), "scenario_program_selection_not_applied",
-          "scenario Program selection names another active deployment");
-  const auto &selection = *selected;
+  }
+
   const auto environment = NodeEnvironmentProjectionLocked(runtime);
   const auto &package_environment =
       RequiredMember(environment, "package_environment");
   Require(RequiredString(package_environment, "environment_digest") ==
-                  selection.node_environment_digest.value() &&
+              RequiredString(prepared, "node_environment_digest") &&
               RequiredString(environment, "retained_bundle_id") ==
-                  selection.retained_bundle_id.value() &&
+                  active_bundle_id &&
               RequiredString(environment, "graph_revision") ==
-                  selection.graph_revision.value(),
-          "scenario_program_selection_invalid",
-          "scenario Program selection and retained node environment disagree");
+                  active_graph_revision,
+          "program_applied_selection_invalid",
+          "active Program and node environment disagree");
 
+  const auto &logical_scene_section =
+      RequiredSection(runtime.root, "logical_scene");
+  const auto &scene_runtime_section =
+      RequiredSection(runtime.root, "scene_runtime");
   const auto owner_identity = [](const std::string_view role,
                                  const CanonicalValue &section) {
     return CanonicalValue(CanonicalValue::Object{
@@ -780,124 +760,62 @@ HeadlessApiCore::ScenarioProgramSelection(const std::string_view scenario_id) {
         {"owner_role", CanonicalValue(std::string(role))},
     });
   };
-  return ScenarioSelectionProjection(
-      selection,
-      CanonicalValue(CanonicalValue::Array{
-          CanonicalValue(CanonicalValue::Object{
-              {"owner_epoch", CanonicalValue(config_.owner_epoch)},
-              {"owner_id", CanonicalValue(config_.owner_id)},
-              {"owner_role", CanonicalValue("headless_projection")},
-          }),
-          owner_identity("manager", manager_section),
-          owner_identity("scene_runtime", scene_runtime_section),
-          owner_identity("scene_transactions", logical_scene_section),
-      }));
-}
 
-CanonicalValue HeadlessApiCore::PrepareProgramApply(
-    const std::string_view scenario_id,
-    const std::string_view expected_scenario_catalog_revision,
-    const std::string_view canonical_program_bytes) {
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  const auto runtime = RefreshLocked();
-  const auto &manager_section = RequiredSection(runtime.root, "manager");
-  Require(SectionFresh(manager_section), "program_apply_deployment_not_active",
-          "Program Apply preparation requires a fresh Manager owner");
-  const auto &manager_payload = RequiredMember(manager_section, "payload");
-  Require(manager_payload.is_object(), "program_apply_deployment_not_active",
-          "Program Apply preparation requires an active Manager selection");
-  const auto &active = RequiredMember(manager_payload, "active");
-  Require(
-      RequiredBool(manager_payload, "manager_ready") &&
-          RequiredBool(RequiredMember(manager_payload, "runtime"), "converged"),
-      "program_apply_deployment_not_active",
-      "Program Apply preparation requires one converged Manager selection");
-  return program_selection_owner_.Prepare(
-      scenario_id, expected_scenario_catalog_revision, canonical_program_bytes,
-      RequiredString(active, "retained_bundle_id"),
-      RequiredString(active, "graph_revision"));
-}
-
-CanonicalValue HeadlessApiCore::CommitProgramApply(
-    const std::string_view canonical_preparation_bytes,
-    const std::optional<std::string> &expected_applied_record_digest,
-    const std::string_view request_owner_epoch,
-    const std::string_view request_id) {
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  if (auto replay = program_selection_owner_.Replay(
-          canonical_preparation_bytes, expected_applied_record_digest,
-          request_owner_epoch, request_id);
-      replay.has_value()) {
-    return *replay;
-  }
-  const auto runtime = RefreshLocked();
-  const auto &manager_section = RequiredSection(runtime.root, "manager");
-  Require(SectionFresh(manager_section), "program_apply_deployment_not_active",
-          "Program Apply commit requires a fresh Manager owner");
-  const auto &manager_payload = RequiredMember(manager_section, "payload");
-  Require(manager_payload.is_object(), "program_apply_deployment_not_active",
-          "Program Apply commit requires an active Manager selection");
-  const auto &active = RequiredMember(manager_payload, "active");
-  Require(
-      RequiredBool(manager_payload, "manager_ready") &&
-          RequiredBool(RequiredMember(manager_payload, "runtime"), "converged"),
-      "program_apply_deployment_not_active",
-      "Program Apply commit requires one converged Manager selection");
-  return program_selection_owner_.Commit(
-      canonical_preparation_bytes, expected_applied_record_digest,
-      request_owner_epoch, request_id,
-      RequiredString(active, "retained_bundle_id"),
-      RequiredString(active, "graph_revision"), clocks_.monotonic_time_ns());
-}
-
-CanonicalValue HeadlessApiCore::ReplayProgramApply(
-    const std::string_view scenario_id,
-    const std::string_view scenario_catalog_revision,
-    const std::string_view program_id, const std::string_view program_revision,
-    const std::optional<std::string> &expected_applied_record_digest,
-    const std::string_view request_owner_epoch,
-    const std::string_view request_id) {
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  auto replay = program_selection_owner_.ReplayRequest(
-      scenario_id, scenario_catalog_revision, program_id, program_revision,
-      expected_applied_record_digest, request_owner_epoch, request_id);
-  return replay.has_value() ? std::move(*replay) : CanonicalValue(nullptr);
+  return CanonicalValue(CanonicalValue::Object{
+      {"assistant_mode", RequiredMember(prepared, "assistant_mode")},
+      {"assistant_projection", std::move(assistant_projection)},
+      {"baseline_program_binding_id", CanonicalValue(binding_id.value())},
+      {"deployment_artifact_id",
+       RequiredMember(prepared, "deployment_artifact_id")},
+      {"deployment_revision", RequiredMember(prepared, "deployment_revision")},
+      {"graph_revision", CanonicalValue(active_graph_revision)},
+      {"node_environment_digest",
+       RequiredMember(prepared, "node_environment_digest")},
+      {"owner_identities",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(CanonicalValue::Object{
+               {"owner_epoch", CanonicalValue(config_.owner_epoch)},
+               {"owner_id", CanonicalValue(config_.owner_id)},
+               {"owner_role", CanonicalValue("headless_projection")},
+           }),
+           owner_identity("manager", manager_section),
+           owner_identity("scene_runtime", scene_runtime_section),
+           owner_identity("scene_transactions", logical_scene_section),
+       })},
+      {"preparation_digest",
+       RequiredMember(prepared, "prepared_activation_id")},
+      {"program", program->normalized_program_root()},
+      {"program_binding", binding->normalized_root()},
+      {"program_binding_id", CanonicalValue(binding_id.value())},
+      {"program_id", CanonicalValue(program_id.value())},
+      {"program_revision", CanonicalValue(program_revision.value())},
+      {"retained_bundle_id", CanonicalValue(active_bundle_id)},
+      {"source_document_digest",
+       RequiredMember(prepared, "source_document_digest")},
+      {"scenario_id", RequiredMember(prepared, "scenario_id")},
+      {"schema_version",
+       CanonicalValue(std::string(kAppliedProgramSelectionSchemaVersion))},
+      {"source",
+       CanonicalValue(CanonicalValue::Object{
+           {"record_digest", RequiredMember(*record, "intent_digest")},
+           {"semantic_content_digest",
+            RequiredMember(prepared, "prepared_activation_id")},
+           {"source_generation",
+            CanonicalValue(static_cast<double>(apply_generation))},
+           {"source_owner_epoch",
+            RequiredMember(manager_section, "source_owner_epoch")},
+           {"source_owner_id",
+            RequiredMember(manager_section, "source_owner_id")},
+       })},
+      {"typed_parameter_overrides",
+       RequiredMember(prepared, "typed_parameter_overrides")},
+  });
 }
 
 CanonicalValue HeadlessApiCore::AppliedProgramSelection() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  const auto selection = program_selection_owner_.ReadApplied();
-  const auto runtime = RefreshLocked();
-  const auto &manager_section = RequiredSection(runtime.root, "manager");
-  Require(SectionFresh(manager_section),
-          "program_applied_selection_unavailable",
-          "Applied Program requires a fresh Manager owner");
-  const auto &manager_payload = RequiredMember(manager_section, "payload");
-  Require(manager_payload.is_object(), "program_applied_selection_unavailable",
-          "Applied Program requires an active Manager selection");
-  const auto &active = RequiredMember(manager_payload, "active");
-  Require(RequiredBool(manager_payload, "manager_ready") &&
-              RequiredBool(RequiredMember(manager_payload, "runtime"),
-                           "converged") &&
-              RequiredString(active, "retained_bundle_id") ==
-                  RequiredString(selection, "retained_bundle_id") &&
-              RequiredString(active, "graph_revision") ==
-                  RequiredString(selection, "graph_revision"),
-          "program_applied_selection_not_active",
-          "the last Applied Program does not belong to the fresh active "
-          "Manager selection");
-  const auto environment = NodeEnvironmentProjectionLocked(runtime);
-  const auto &package_environment =
-      RequiredMember(environment, "package_environment");
-  Require(RequiredString(package_environment, "environment_digest") ==
-              RequiredString(selection, "node_environment_digest"),
-          "program_applied_selection_invalid",
-          "Applied Program and active node environment disagree");
-  return selection;
+  return ActiveProgramSelectionLocked(RefreshLocked());
 }
 
 ViewerModelAsset HeadlessApiCore::ViewerModelUrdf() {

@@ -221,7 +221,7 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
             "program_run_id": "program-run.1",
             "applied_record_digest": digest_c,
             "scenario_id": "cell-pick",
-            "scenario_catalog_revision": digest_a,
+            "source_document_digest": digest_a,
             "program_id": "pick",
             "program_revision": digest_b,
             "program_binding_id": digest_c,
@@ -533,12 +533,6 @@ def headless_client() -> (
             payload = source_model
         elif path == "/api/source-model-context":
             payload = source_model_context
-        elif path == "/api/scenarios":
-            payload = {
-                "api_version": "manyforge.scenario_catalog.v1",
-                "scenario_catalog_revision": "sha256:" + "a" * 64,
-                "scenarios": [],
-            }
         elif path == "/api/program/runs" and request.method == "GET":
             active_only = request.url.params.get("active_only") == "true"
             payload = {
@@ -586,12 +580,6 @@ def headless_client() -> (
                     request=request,
                 )
             payload = applied_program
-        elif path.startswith("/api/scenarios/") and path.endswith("/program-selection"):
-            scenario_id = path.split("/")[-2]
-            selection = scenario_selections.get(scenario_id)
-            if selection is None:
-                return httpx.Response(404, json={"detail": "unknown"}, request=request)
-            payload = copy.deepcopy(selection)
         elif path == "/api/program/apply":
             assert isinstance(body, dict)
             cas_attempt = scenario_cas_apply_counts.get(body["scenario_id"], 0)
@@ -652,6 +640,7 @@ def headless_client() -> (
                         "preparation": {},
                         "applied": {
                             "assistant_mode": "forbidden",
+                            "assistant_projection": None,
                             "baseline_program_binding_id": scenario_selections[
                                 body["scenario_id"]
                             ]["program_binding_id"],
@@ -661,6 +650,11 @@ def headless_client() -> (
                             "node_environment_digest": malformed_binding[
                                 "node_environment"
                             ]["environment_digest"],
+                            "owner_identities": [{
+                                "owner_role": "headless_projection",
+                                "owner_id": "program-owner.cell-a",
+                                "owner_epoch": "program-owner.epoch.1",
+                            }],
                             "preparation_digest": "sha256:" + "4" * 64,
                             "program": malformed_program,
                             "program_binding": malformed_binding,
@@ -672,12 +666,12 @@ def headless_client() -> (
                             "retained_bundle_id": malformed_binding[
                                 "retained_bundle_id"
                             ],
-                            "scenario_catalog_revision": body[
-                                "scenario_catalog_revision"
+                            "source_document_digest": body[
+                                "source_document_digest"
                             ],
                             "scenario_id": body["scenario_id"],
                             "schema_version": (
-                                "manyforge.applied_program_selection.v1"
+                                "manyforge.applied_program_selection.v2"
                             ),
                             "source": {
                                 "record_digest": "sha256:" + "6" * 64,
@@ -712,14 +706,15 @@ def headless_client() -> (
                     "program_id": program["program_id"],
                     "program_revision": program["program_revision"],
                     "retained_bundle_id": "sha256:" + "4" * 64,
-                    "scenario_catalog_revision": body["scenario_catalog_revision"],
+                    "source_document_digest": body["source_document_digest"],
                     "scenario_id": body["scenario_id"],
-                    "schema_version": "manyforge.scenario_program_selection.v2",
+                    "schema_version": "manyforge.program_run_input.v1",
                     "typed_parameter_overrides": {},
                 }
                 scenario_selections[body["scenario_id"]] = baseline
             committed_program = {
                 "assistant_mode": "forbidden",
+                "assistant_projection": None,
                 "baseline_program_binding_id": baseline["program_binding_id"],
                 "deployment_artifact_id": "cell_a",
                 "deployment_revision": "sha256:" + "1" * 64,
@@ -727,6 +722,11 @@ def headless_client() -> (
                 "node_environment_digest": binding["node_environment"][
                     "environment_digest"
                 ],
+                "owner_identities": [{
+                    "owner_role": "headless_projection",
+                    "owner_id": "program-owner.cell-a",
+                    "owner_epoch": "program-owner.epoch.1",
+                }],
                 "preparation_digest": "sha256:" + "4" * 64,
                 "program": program,
                 "program_binding": binding,
@@ -734,9 +734,9 @@ def headless_client() -> (
                 "program_id": program["program_id"],
                 "program_revision": program["program_revision"],
                 "retained_bundle_id": "sha256:" + "4" * 64,
-                "scenario_catalog_revision": body["scenario_catalog_revision"],
+                "source_document_digest": body["source_document_digest"],
                 "scenario_id": body["scenario_id"],
-                "schema_version": "manyforge.applied_program_selection.v1",
+                "schema_version": "manyforge.applied_program_selection.v2",
                 "source": {
                     "record_digest": "sha256:" + "6" * 64,
                     "semantic_content_digest": "sha256:" + "7" * 64,
@@ -970,11 +970,10 @@ class _ComposerTestClient(TestClient):
                 "requestOwnerEpoch": "test-browser.epoch.1",
                 "requestId": f"test-browser.request.{self._authoring_sequence}",
             }
-            if url not in {"/api/program/apply", "/api/program/revert"}:
-                json.setdefault("expectedWorkspaceEpoch", workspace.workspace_epoch)
-                json.setdefault(
-                    "expectedWorkspaceRevision", workspace.workspace_revision
-                )
+            json.setdefault("expectedWorkspaceEpoch", workspace.workspace_epoch)
+            json.setdefault(
+                "expectedWorkspaceRevision", workspace.workspace_revision
+            )
         return super().post(url, json=json, **kwargs)
 
 
@@ -1067,7 +1066,7 @@ def _seed_applied_program(
     return client.program_apply(
         {
             "scenario_id": scenario_id,
-            "scenario_catalog_revision": "sha256:" + "7" * 64,
+            "source_document_digest": "sha256:" + "7" * 64,
             "program": program,
             "expected_applied_record_digest": None,
             "authoring_claim": {},
@@ -1143,11 +1142,17 @@ def test_headless_http_client_maps_non_string_provenance_kind_to_stable_apply_er
     )
     applied = {
         "assistant_mode": "forbidden",
+        "assistant_projection": None,
         "baseline_program_binding_id": "sha256:" + "b" * 64,
         "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "c" * 64,
         "graph_revision": binding["graph_revision"],
         "node_environment_digest": binding["node_environment"]["environment_digest"],
+        "owner_identities": [{
+            "owner_role": "headless_projection",
+            "owner_id": "owner.cell-a",
+            "owner_epoch": "owner.epoch.1",
+        }],
         "preparation_digest": "sha256:" + "d" * 64,
         "program": program,
         "program_binding": binding,
@@ -1155,9 +1160,9 @@ def test_headless_http_client_maps_non_string_provenance_kind_to_stable_apply_er
         "program_id": program["program_id"],
         "program_revision": program["program_revision"],
         "retained_bundle_id": binding["retained_bundle_id"],
-        "scenario_catalog_revision": "sha256:" + "e" * 64,
+        "source_document_digest": "sha256:" + "e" * 64,
         "scenario_id": "cell-pick",
-        "schema_version": "manyforge.applied_program_selection.v1",
+        "schema_version": "manyforge.applied_program_selection.v2",
         "source": {
             "record_digest": "sha256:" + "f" * 64,
             "semantic_content_digest": "sha256:" + "1" * 64,
@@ -1205,11 +1210,17 @@ def test_headless_http_client_rejects_rehashed_malformed_apply_binding() -> None
     )
     applied = {
         "assistant_mode": "forbidden",
+        "assistant_projection": None,
         "baseline_program_binding_id": "sha256:" + "b" * 64,
         "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "c" * 64,
         "graph_revision": binding["graph_revision"],
         "node_environment_digest": binding["node_environment"]["environment_digest"],
+        "owner_identities": [{
+            "owner_role": "headless_projection",
+            "owner_id": "owner.cell-a",
+            "owner_epoch": "owner.epoch.1",
+        }],
         "preparation_digest": "sha256:" + "d" * 64,
         "program": program,
         "program_binding": binding,
@@ -1217,9 +1228,9 @@ def test_headless_http_client_rejects_rehashed_malformed_apply_binding() -> None
         "program_id": program["program_id"],
         "program_revision": program["program_revision"],
         "retained_bundle_id": binding["retained_bundle_id"],
-        "scenario_catalog_revision": "sha256:" + "e" * 64,
+        "source_document_digest": "sha256:" + "e" * 64,
         "scenario_id": "cell-pick",
-        "schema_version": "manyforge.applied_program_selection.v1",
+        "schema_version": "manyforge.applied_program_selection.v2",
         "source": {
             "record_digest": "sha256:" + "f" * 64,
             "semantic_content_digest": "sha256:" + "1" * 64,
@@ -1374,7 +1385,7 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
         "source_label": "operator_ui",
         "correlation_id": None,
         "scenario_id": "cell-pick",
-        "scenario_catalog_revision": digest_a,
+        "source_document_digest": digest_a,
         "expected_applied_record_digest": "sha256:" + "b" * 64,
         "expected_admission_generation": 7,
     }
@@ -1391,7 +1402,6 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
     with _composer_with_program(client) as composer:
         workspace = composer.get("/api/program/workspace").json()
         start["draft_program_revision"] = workspace["draft"]["programRevision"]
-        assert composer.get("/api/scenarios").status_code == 200
         assert (
             composer.get("/api/program/runs?active_only=true&limit=1").json()["runs"]
             == []
@@ -2090,7 +2100,8 @@ def test_composer_program_apply_advances_only_headless_applied_identity(
             },
         )
 
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "accepted"
     workspace = response.json()["workspace"]
     assert workspace["draft"] == dirty["draft"]
     assert workspace["saved"] == dirty["saved"]
@@ -2203,30 +2214,6 @@ def test_new_program_dirty_confirmation_precedes_owner_and_catalog_reads(
         "composer_draft_discard_confirmation_required"
     )
     assert requests[request_offset:] == []
-
-
-def test_program_only_load_route_is_removed(headless_client) -> None:
-    client, _requests, _node_environment = headless_client
-    with _composer_with_program(client) as composer:
-        before = composer.get("/api/program/workspace").json()
-        rejected = composer.post(
-            "/api/program/load",
-            json={
-                "draftId": before["draft"]["draftId"],
-                "expectedDraftRevision": before["draft"]["draftRevision"],
-                "scenarioId": "cell-pick",
-                "scenarioCatalogRevision": "sha256:" + "7" * 64,
-                "path": str(_LOAD_PROGRAM_PATH),
-                "confirmDiscard": True,
-            },
-        )
-        after = composer.get("/api/program/workspace").json()
-
-    assert rejected.status_code == 410
-    assert rejected.json()["detail"]["code"] == (
-        "program_load_removed_use_scenario_load"
-    )
-    assert after == before
 
 
 def test_program_discard_reads_owner_truth_without_runtime_mutation(
@@ -2393,7 +2380,7 @@ def test_program_revert_failure_preserves_draft_saved_and_active_run(
                 "draftId": dirty["draft"]["draftId"],
                 "expectedDraftRevision": dirty["draft"]["draftRevision"],
                 "scenarioId": "foreign",
-                "scenarioCatalogRevision": "sha256:" + "f" * 64,
+                "sourceDocumentDigest": "sha256:" + "f" * 64,
             },
         )
         assert caller_selected.status_code == 422
@@ -2438,7 +2425,7 @@ def test_program_revert_failure_preserves_draft_saved_and_active_run(
     assert len(apply_requests) == 1
     assert apply_requests[0]["body"]["program"] == before["draft"]["program"]
     assert apply_requests[0]["body"]["scenario_id"] == scenario_id
-    assert apply_requests[0]["body"]["scenario_catalog_revision"] == (
+    assert apply_requests[0]["body"]["source_document_digest"] == (
         "sha256:" + "7" * 64
     )
     assert apply_requests[0]["body"]["expected_applied_record_digest"] == (
@@ -2564,13 +2551,13 @@ def test_program_revert_applies_exact_saved_content_and_preserves_run_capture(
             "capture"
         ]
 
-    assert reverted.status_code == 200, reverted.text
-    assert reverted.json()["status"] == "reverted"
+    assert reverted.status_code == 202, reverted.text
+    assert reverted.json()["status"] == "accepted"
     assert reverted.json()["workspace"]["draft"]["program"] == saved["draft"]["program"]
     assert reverted.json()["workspace"]["saved"] == saved["saved"]
-    assert no_op.status_code == 200
-    assert no_op.json()["status"] == "reverted"
-    assert no_op.json()["headless"] is None
+    assert no_op.status_code == 202
+    assert no_op.json()["status"] == "accepted"
+    assert no_op.json()["headless"]["status"] == "applied"
     assert no_op.json()["workspace"]["draft"]["draftRevision"] == (
         reverted.json()["workspace"]["draft"]["draftRevision"]
     )
@@ -2761,8 +2748,11 @@ def test_composer_does_not_fall_back_when_the_headless_environment_is_lost() -> 
     )
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        with _composer(client) as composer:
-            response = composer.get("/api/catalog")
+        state = ComposerState(headless_client=client)
+        # This test covers the read adapter. Authoring-owner startup has its own
+        # focused contract and must not obscure this unavailable read.
+        state.authoring_admission = None
+        response = TestClient(create_app(state)).get("/api/catalog")
     finally:
         raw.close()
     assert response.status_code == 503

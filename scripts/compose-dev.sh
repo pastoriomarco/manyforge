@@ -8,8 +8,7 @@ repo_root=$(cd "$(dirname "$0")/.." && pwd)
 container_name=${MANYFORGE_DEV_CONTAINER_NAME:-manyforge-development-workbench}
 image=${MANYFORGE_DEV_IMAGE:-manyforge-dev:latest}
 cache_base=${MANYFORGE_DEV_CACHE_BASE:-"$repo_root/.manyforge-dev"}
-qualified_build_root=${MANYFORGE_DEV_QUALIFIED_BUILD_ROOT:-}
-scenario=
+project=
 started_container=false
 
 frontend_ready() {
@@ -29,7 +28,7 @@ cleanup_failed_start() {
 trap cleanup_failed_start EXIT
 
 usage() {
-  echo "Usage: $0 start --scenario <id> | status | stop" >&2
+  echo "Usage: $0 start [--project <scenario-project-folder>] | status | stop" >&2
 }
 
 command=${1:-}
@@ -40,18 +39,21 @@ case "$command" in
   start)
     while (($#)); do
       case "$1" in
-        --scenario)
+        --project)
           [[ $# -ge 2 ]] || { usage; exit 64; }
-          scenario=$2
+          project=$2
           shift 2
           ;;
         *) usage; exit 64 ;;
       esac
     done
-    [[ -n "$scenario" ]] || { usage; exit 64; }
     if docker inspect "$container_name" >/dev/null 2>&1; then
       if [[ $(docker inspect -f '{{.State.Running}}' "$container_name") == true ]]; then
-        if frontend_ready && current=$(docker exec "$container_name" python3 scripts/dev-workbench.py status --scenario "$scenario" 2>/dev/null); then
+        status_args=(status)
+        if [[ -n "$project" ]]; then
+          status_args+=(--project "$project")
+        fi
+        if frontend_ready && current=$(docker exec "$container_name" python3 scripts/dev-workbench.py "${status_args[@]}" 2>/dev/null); then
           echo "$current"
           echo "Development workbench is already running at http://localhost:3000"
           exit 0
@@ -70,13 +72,9 @@ case "$command" in
     image_key=${image_id#sha256:}
     cache_root="$cache_base/images/$image_key"
     mkdir -p "$cache_root/build" "$cache_root/node_modules"
-    qualified_mount=()
-    if [[ -n "$qualified_build_root" ]]; then
-      [[ -d "$qualified_build_root" ]] || {
-        echo "Qualified build root does not exist: $qualified_build_root" >&2
-        exit 69
-      }
-      qualified_mount=(-v "$qualified_build_root:/manyforge-qualified:ro")
+    serve_args=(serve)
+    if [[ -n "$project" ]]; then
+      serve_args+=(--project "$project")
     fi
     docker run -d \
       --name "$container_name" \
@@ -88,10 +86,9 @@ case "$command" in
       -v "$repo_root:/workspace" \
       -v "$cache_root:/runner" \
       -v "$cache_root/node_modules:/workspace/manyforge_composer/frontend/node_modules" \
-      "${qualified_mount[@]}" \
       -w /workspace \
       "$image_id" \
-      python3 scripts/dev-workbench.py serve --scenario "$scenario" >/dev/null
+      python3 scripts/dev-workbench.py "${serve_args[@]}" >/dev/null
     started_container=true
     deadline=$((SECONDS + ${MANYFORGE_DEV_START_TIMEOUT_SECONDS:-900}))
     while ((SECONDS < deadline)); do
@@ -99,7 +96,11 @@ case "$command" in
         docker logs --tail 200 "$container_name" >&2
         exit 69
       fi
-      if frontend_ready && current=$(docker exec "$container_name" python3 scripts/dev-workbench.py status --scenario "$scenario" 2>/dev/null); then
+      status_args=(status)
+      if [[ -n "$project" ]]; then
+        status_args+=(--project "$project")
+      fi
+      if frontend_ready && current=$(docker exec "$container_name" python3 scripts/dev-workbench.py "${status_args[@]}" 2>/dev/null); then
         echo "$current"
         echo "Development workbench: http://localhost:3000"
         started_container=false

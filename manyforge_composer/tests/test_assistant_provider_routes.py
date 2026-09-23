@@ -58,6 +58,9 @@ class AdmissionHeadless:
             }
         }
 
+    def reconcile_authoring_owner(self, _body: dict[str, Any]) -> dict[str, Any]:
+        return {"admission": {"authoring_allowed": True, "admission_generation": 7}}
+
 
 def _mode() -> dict[str, Any]:
     return {

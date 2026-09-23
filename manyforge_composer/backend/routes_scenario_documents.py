@@ -479,6 +479,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 captured_digest = raw_sha256_digest(
                     canonical_json_bytes(
                         {
+                            "scenario_id": scenario_document["scenario_id"],
                             "source_document_digest": source_digest,
                             "deployment": deployment,
                             "model_source_closure": source_closure,
@@ -492,6 +493,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     state.headless_client.manager_status()
                 )
                 activation_intent = {
+                    "scenario_id": scenario_document["scenario_id"],
                     "source_document_digest": source_digest,
                     "captured_input_digest": captured_digest,
                     "deployment": deepcopy(deployment),

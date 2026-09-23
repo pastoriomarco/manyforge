@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import importlib.util
 import json
 from pathlib import Path
@@ -21,38 +20,73 @@ dev_workbench = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dev_workbench)
 
 
-def test_compiler_profile_follows_bundle_reference_not_package_file_count(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(dev_workbench, "PACKAGE_ROOT", tmp_path)
-    directory = tmp_path / "build-manifests/compiler_build"
-    directory.mkdir(parents=True)
-    for digit, profile in [("1", "Debug"), ("2", "Release")]:
-        (directory / f"{digit * 64}.json").write_text(
-            json.dumps(
-                {
-                    "compiler_build_digest": "sha256:" + digit * 64,
-                    "build_profile": profile,
-                }
-            )
-        )
-    bundle = {"provenance": {"compiler_build_digest": "sha256:" + "2" * 64}}
-    assert dev_workbench._compiler_build_profile(bundle) == "Release"
-    (directory / f"{'2' * 64}.json").write_text(
-        json.dumps(
-            {
-                "compiler_build_digest": "sha256:" + "1" * 64,
-                "build_profile": "Release",
-            }
-        )
-    )
-    with pytest.raises(ValueError, match="exact reference"):
-        dev_workbench._compiler_build_profile(bundle)
-    with pytest.raises(ValueError, match="digest is invalid"):
-        dev_workbench._compiler_build_profile(
-            {"provenance": {"compiler_build_digest": "../../outside"}}
-        )
+def test_repository_bootstrap_uses_the_exact_source_owned_generator(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    generator = tmp_path / "manyforge_generate_canonical_empty_package"
+    generator.write_text("generator", encoding="utf-8")
+    generator.chmod(0o755)
+    bootstrap = tmp_path / "bootstrap"
+    observed: list[tuple[str, ...]] = []
 
+    def run(command: tuple[str, ...], **_kwargs: Any) -> None:
+        observed.append(command)
+        bootstrap.mkdir(parents=True, exist_ok=True)
+        (bootstrap / "canonical-empty-admission.json").write_text("{}")
+
+    monkeypatch.setattr(dev_workbench, "CANONICAL_EMPTY_GENERATOR", generator)
+    monkeypatch.setattr(dev_workbench, "BOOTSTRAP_ROOT", bootstrap)
+    monkeypatch.setattr(dev_workbench, "_run", run)
+
+    assert dev_workbench._ensure_repository_bootstrap_package() == bootstrap
+    assert observed == [
+        (str(generator), "--output-root", str(bootstrap)),
+    ]
+
+
+def test_selected_project_bootstrap_uses_the_project_cell_identity(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from manyforge_composer.backend.scenario_artifacts import (
+        capture_scenario_artifact,
+    )
+    from manyforge_headless_api.activation_preparer import ActivationPreparer
+
+    project_path = REPOSITORY_ROOT / "examples/ur5e_lite6_wall_grouped.scenario"
+    document, resolved, source_digest = capture_scenario_artifact(
+        str(project_path), allowed_roots=[str(REPOSITORY_ROOT)]
+    )
+    observed: dict[str, Any] = {}
+
+    def prepare(self: ActivationPreparer, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        filename = (
+            "canonical-empty-admission.ui6i_ur5e_lite6_wall_cell.json"
+        )
+        self._activation_root.mkdir(parents=True, exist_ok=True)
+        (self._activation_root / filename).write_text("{}", encoding="utf-8")
+        return {"prepared_activation_id": "sha256:" + ("1" * 64)}
+
+    monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
+    monkeypatch.setattr(dev_workbench, "NODE_CATALOG", (
+        REPOSITORY_ROOT / "manyforge_behavior/resources/node_catalog.yaml"
+    ))
+    monkeypatch.setattr(dev_workbench, "BOOTSTRAP_ROOT", tmp_path / "bootstrap")
+    monkeypatch.setattr(ActivationPreparer, "prepare", prepare)
+
+    root, admission, cell_id = dev_workbench._ensure_project_bootstrap_package(
+        document=document,
+        project_path=resolved,
+        source_document_digest=source_digest,
+    )
+
+    assert root.parent == tmp_path / "bootstrap"
+    assert admission == (
+        "canonical-empty-admission.ui6i_ur5e_lite6_wall_cell.json"
+    )
+    assert cell_id == "ui6i_ur5e_lite6_wall_cell"
+    assert observed["scenario_id"] == "ur5e_lite6_wall_grouped"
+    assert observed["deployment"]["cell_id"] == cell_id
 
 def test_status_reads_the_backend_derived_scenario_without_reducing_it_again(
     monkeypatch: Any,
@@ -74,6 +108,9 @@ def test_status_reads_the_backend_derived_scenario_without_reducing_it_again(
         def __exit__(self, *_args: Any) -> None:
             pass
 
+        def health(self) -> dict[str, Any]:
+            return {"status": "ok"}
+
         def request(self, method: str, path: str) -> dict[str, Any]:
             assert (method, path) == ("GET", "/api/scenarios/current")
             return response
@@ -87,7 +124,7 @@ def test_status_reads_the_backend_derived_scenario_without_reducing_it_again(
     assert status["current_scenario"] == response["current_scenario"]
     assert status["classification"] == {
         "kind": "development_workbench",
-        "package_kind": "maintained_qualified",
+        "package_kind": "repository_source",
         "physical_execution_authorized": False,
     }
 
@@ -102,6 +139,9 @@ def test_status_rejects_a_different_requested_scenario(monkeypatch: Any) -> None
 
         def __exit__(self, *_args: Any) -> None:
             pass
+
+        def health(self) -> dict[str, Any]:
+            return {"status": "ok"}
 
         def request(self, _method: str, _path: str) -> dict[str, Any]:
             return {
@@ -122,7 +162,7 @@ def test_status_rejects_a_different_requested_scenario(monkeypatch: Any) -> None
     assert status["unavailable_reasons"] == ["requested_scenario_mismatch"]
 
 
-def test_status_command_reads_the_current_scenario_without_package_mutation(
+def test_status_command_accepts_an_empty_authoring_workbench(
     monkeypatch: Any,
     capsys: Any,
 ) -> None:
@@ -139,11 +179,6 @@ def test_status_command_reads_the_current_scenario_without_package_mutation(
         }
 
     monkeypatch.setattr(dev_workbench, "query_status", query_status)
-
-    def unexpected_import() -> None:
-        raise AssertionError("status mutated package cache")
-
-    monkeypatch.setattr(dev_workbench, "_import_package", unexpected_import)
 
     assert dev_workbench.main(["status"]) == 0
 
@@ -168,110 +203,6 @@ def test_startup_rejects_an_uncontained_program_cycle() -> None:
         match="Program cycle is not contained at startup",
     ):
         dev_workbench._startup_cycle_state(client)
-
-
-def test_package_cache_contains_scenario_content_only(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
-    scenario_root = tmp_path / "maintained-scenario-package"
-    package_root = scenario_root / "retained-package"
-    qualified_root = tmp_path / "qualified"
-    qualified_package = qualified_root / "maintained-package"
-    qualified_package.mkdir(parents=True)
-    (qualified_package / "scenario.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(dev_workbench, "SCENARIO_ROOT", scenario_root)
-    monkeypatch.setattr(dev_workbench, "PACKAGE_ROOT", package_root)
-    monkeypatch.setattr(dev_workbench, "CACHE_ROOT", tmp_path)
-    monkeypatch.setattr(dev_workbench, "_qualified_root", lambda: qualified_root)
-
-    dev_workbench._import_package()
-
-    assert (package_root / "scenario.json").read_text(encoding="utf-8") == "{}"
-    assert not (scenario_root / "manyforge_manager_daemon").exists()
-    assert not (scenario_root / "headless-python").exists()
-    assert not (scenario_root / "manyforge_native_execution_host").exists()
-    assert not (scenario_root / "manyforge_roboplan_candidate_worker").exists()
-
-
-def test_scenario_load_rejects_a_stale_workspace_deployment(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
-    workspace = tmp_path / "workspace"
-    deployment = workspace / "examples/example.deployment.yaml"
-    deployment.parent.mkdir(parents=True)
-    deployment.write_text(
-        '{"deployment_artifact_id":"example",'
-        '"deployment_revision":"sha256:' + ("1" * 64) + '"}',
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(dev_workbench, "WORKSPACE", workspace)
-
-    with pytest.raises(
-        dev_workbench.WorkbenchError,
-        match="package is stale relative to its workspace Deployment",
-    ):
-        dev_workbench._require_current_workspace_deployment(
-            {
-                "deployment_artifact_id": "example",
-                "deployment_revision": "sha256:" + ("2" * 64),
-            }
-        )
-
-
-def test_scenario_load_rejects_a_stale_workspace_node_environment(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
-    manifest = tmp_path / "node_environment_manifest.yaml"
-    manifest.write_text(
-        '{"catalog":{"catalog_digest":"sha256:'
-        + ("1" * 64)
-        + '","catalog_id":"manyforge_builtin","content_version":"1.1.0"},'
-        '"environment_digest":"sha256:' + ("2" * 64) + '"}',
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(dev_workbench, "NODE_ENVIRONMENT_MANIFEST", manifest)
-
-    with pytest.raises(
-        dev_workbench.WorkbenchError,
-        match="package is stale relative to its workspace node environment",
-    ):
-        dev_workbench._require_current_workspace_node_environment(
-            {
-                "node_environment": {
-                    "catalog_digest": "sha256:" + ("1" * 64),
-                    "catalog_id": "manyforge_builtin",
-                    "content_version": "1.1.0",
-                    "environment_digest": "sha256:" + ("3" * 64),
-                }
-            }
-        )
-
-
-def test_scenario_load_accepts_the_exact_workspace_node_environment(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
-    manifest = tmp_path / "node_environment_manifest.yaml"
-    expected = {
-        "catalog_digest": "sha256:" + ("1" * 64),
-        "catalog_id": "manyforge_builtin",
-        "content_version": "1.1.0",
-        "environment_digest": "sha256:" + ("2" * 64),
-    }
-    manifest.write_text(
-        '{"catalog":{"catalog_digest":"'
-        + expected["catalog_digest"]
-        + '","catalog_id":"manyforge_builtin","content_version":"1.1.0"},'
-        '"environment_digest":"' + expected["environment_digest"] + '"}',
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(dev_workbench, "NODE_ENVIRONMENT_MANIFEST", manifest)
-
-    assert (
-        dev_workbench._require_current_workspace_node_environment(
-            {"node_environment": expected}
-        )
-        == manifest
-    )
 
 
 def test_backend_build_uses_current_source_and_only_production_targets(
@@ -394,201 +325,6 @@ def test_startup_requires_the_existing_manager_baseline_to_be_fully_converged() 
     )
 
 
-class _LifecycleClient:
-    def __init__(self) -> None:
-        self.state = "declared"
-        self.generation = 1
-        self.active: dict[str, Any] | None = None
-        self.lifecycle_requests: list[dict[str, Any]] = []
-        self.route_requests: list[dict[str, Any]] = []
-
-    @staticmethod
-    def _bindings() -> list[dict[str, str]]:
-        return [
-            {
-                "control_binding_id": "binding.arm",
-                "control_binding_revision": "binding.revision.1",
-                "control_route_id": "route.arm",
-            }
-        ]
-
-    def _desired(self) -> dict[str, Any]:
-        return {
-            "control_domain_id": "domain.arm",
-            "control_domain_revision": "domain.revision.1",
-            "controller_topology_id": "topology.arm",
-            "topology_revision": "topology.revision.1",
-            "activation_set_id": "arm_direct",
-            "binding_routes": self._bindings(),
-        }
-
-    def cclc_component(self, component_id: str) -> dict[str, Any]:
-        assert component_id == "component.arm"
-        return {
-            "controllable_component_id": component_id,
-            "component_lifecycle_state": self.state,
-            "component_lifecycle_generation": self.generation,
-            "graph_revision": "graph.1",
-            "domains": [
-                {
-                    "control_domain_id": "domain.arm",
-                    "control_domain_revision": "domain.revision.1",
-                    "controller_topology_id": "topology.arm",
-                    "topology_revision": "topology.revision.1",
-                    "current_control_bindings": self._bindings(),
-                    "active_control_configuration": deepcopy(self.active),
-                }
-            ],
-        }
-
-    def cclc_owner_identity(self) -> dict[str, Any]:
-        return {"request_owner_epoch": "cclc-owner.1"}
-
-    def authoring_admission(self) -> dict[str, Any]:
-        return {"authoring_allowed": False, "admission_generation": 7}
-
-    def submit_component_lifecycle(self, request: dict[str, Any]) -> dict[str, Any]:
-        self.lifecycle_requests.append(deepcopy(request))
-        return {
-            "acceptance": {"lifecycle_transaction_id": f"lifecycle.{request['intent']}"}
-        }
-
-    def component_lifecycle_status(self, transaction_id: str) -> dict[str, Any]:
-        intent = transaction_id.removeprefix("lifecycle.")
-        self.state = "prepared" if intent == "prepare" else "active"
-        self.generation += 1
-        return {"status": {"terminal_result": "succeeded"}}
-
-    def cclc_route_templates(self, component_id: str) -> dict[str, Any]:
-        assert component_id == "component.arm"
-        return {
-            "retained_bundle_id": "bundle.1",
-            "graph_revision": "graph.1",
-            "templates": [
-                {
-                    "desired_configuration": self._desired(),
-                    "expected_active_control_configuration": (
-                        dev_workbench._expected_active_configuration(self.active)
-                    ),
-                    "component_expectations": [
-                        {
-                            "controllable_component_id": component_id,
-                            "expected_component_lifecycle_generation": (
-                                self.generation
-                            ),
-                            "expected_component_lifecycle_state": "active",
-                        }
-                    ],
-                }
-            ],
-        }
-
-    def submit_route_selection(self, request: dict[str, Any]) -> dict[str, Any]:
-        self.route_requests.append(deepcopy(request))
-        return {"acceptance": {"route_selection_transaction_id": "route-selection.1"}}
-
-    def route_selection_status(self, transaction_id: str) -> dict[str, Any]:
-        assert transaction_id == "route-selection.1"
-        self.active = {
-            **self._desired(),
-            "active_control_configuration_id": "active-configuration.1",
-            "active_control_configuration_generation": 1,
-            "state": "reconciled",
-        }
-        return {"status": {"terminal_result": "succeeded"}}
-
-
-def test_simulated_scenario_start_converges_only_missing_lifecycle_and_routes() -> None:
-    client = _LifecycleClient()
-
-    dev_workbench._converge_component(
-        client,  # type: ignore[arg-type]
-        "component.arm",
-        scenario_id="scenario.1",
-        processes=[],
-    )
-
-    assert client.state == "active"
-    assert [row["intent"] for row in client.lifecycle_requests] == [
-        "prepare",
-        "enable",
-    ]
-    assert len(client.route_requests) == 1
-    assert client.route_requests[0]["desired_configuration"] == client._desired()
-    assert client.route_requests[0]["expected_admission_generation"] == 7
-
-    dev_workbench._converge_component(
-        client,  # type: ignore[arg-type]
-        "component.arm",
-        scenario_id="scenario.1",
-        processes=[],
-    )
-
-    assert len(client.lifecycle_requests) == 2
-    assert len(client.route_requests) == 1
-
-    first_request_id = client.route_requests[0]["request_context"]["request_id"]
-    client.active = {
-        **client.active,
-        "active_control_configuration_id": "active-configuration.2",
-        "active_control_configuration_generation": 2,
-        "activation_set_id": "different-route",
-    }
-
-    dev_workbench._converge_component(
-        client,  # type: ignore[arg-type]
-        "component.arm",
-        scenario_id="scenario.1",
-        processes=[],
-    )
-
-    assert len(client.lifecycle_requests) == 2
-    assert len(client.route_requests) == 2
-    assert client.route_requests[1]["request_context"]["request_id"] != first_request_id
-
-
-class _ControlManagementClient(_LifecycleClient):
-    def __init__(self, mode: str) -> None:
-        super().__init__()
-        self.mode = mode
-
-    def execution_identity(self) -> dict[str, object]:
-        return {"identity": {"control_management_mode": self.mode}}
-
-
-def test_direct_control_scenario_does_not_require_cclc() -> None:
-    client = _ControlManagementClient("direct")
-
-    mode = dev_workbench._converge_control_management(
-        client,  # type: ignore[arg-type]
-        ["component.arm"],
-        scenario_id="scenario.1",
-        processes=[],
-    )
-
-    assert mode == "direct"
-    assert client.lifecycle_requests == []
-    assert client.route_requests == []
-
-
-def test_lifecycle_control_scenario_converges_cclc() -> None:
-    client = _ControlManagementClient("component_lifecycle")
-
-    mode = dev_workbench._converge_control_management(
-        client,  # type: ignore[arg-type]
-        ["component.arm"],
-        scenario_id="scenario.1",
-        processes=[],
-    )
-
-    assert mode == "component_lifecycle"
-    assert [row["intent"] for row in client.lifecycle_requests] == [
-        "prepare",
-        "enable",
-    ]
-    assert len(client.route_requests) == 1
-
-
 def test_stale_socket_cleanup_removes_only_the_named_socket(tmp_path: Path) -> None:
     socket_path = tmp_path / "manager-command.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -622,11 +358,67 @@ def test_launcher_pins_the_image_and_separates_its_cache() -> None:
     assert "docker image inspect -f '{{.Id}}'" in launcher
     assert 'cache_root="$cache_base/images/$image_key"' in launcher
     assert '"$image_id" \\' in launcher
+    assert "MANYFORGE_DEV_QUALIFIED_BUILD_ROOT" not in launcher
+    assert "/manyforge-qualified" not in launcher
+
+
+def test_launcher_uses_optional_project_selection_not_catalog_ids() -> None:
+    launcher = (REPOSITORY_ROOT / "scripts/compose-dev.sh").read_text(encoding="utf-8")
+
+    assert "--project" in launcher
+    assert "--scenario" not in launcher
+
+
+def test_workbench_parser_allows_empty_or_project_startup() -> None:
+    empty = dev_workbench._parser().parse_args(["serve"])
+    selected = dev_workbench._parser().parse_args(
+        ["serve", "--project", "examples/lite6_pick_and_place.scenario"]
+    )
+
+    assert empty.project is None
+    assert selected.project == "examples/lite6_pick_and_place.scenario"
+
+
+def test_project_status_reads_only_the_bounded_manifest_identity(tmp_path: Path) -> None:
+    project = tmp_path / "cell.scenario"
+    project.mkdir()
+    (project / "scenario.yaml").write_text(
+        '{"api_version":"manyforge.scenario.project.v1",'
+        '"scenario_id":"cell"}',
+        encoding="utf-8",
+    )
+
+    assert dev_workbench._project_scenario_id(
+        str(project), allowed_root=tmp_path
+    ) == "cell"
+
+
+def test_workbench_selects_a_project_only_through_the_composer_loader() -> None:
+    empty = dev_workbench.Workbench(
+        project_path=None,
+        headless_port=1,
+        runner_port=2,
+        composer_port=3,
+        frontend_port=4,
+    )
+    selected = dev_workbench.Workbench(
+        project_path="/workspace/examples/lite6_pick_and_place.scenario",
+        headless_port=1,
+        runner_port=2,
+        composer_port=3,
+        frontend_port=4,
+    )
+
+    assert "--startup-scenario-document" not in empty._composer_command("headless")
+    command = selected._composer_command("headless")
+    option = command.index("--startup-scenario-document")
+    assert command[option + 1] == selected.project_path
+    assert "--program-path" not in command
 
 
 def test_cleanup_uses_bounded_reverse_owner_order(monkeypatch: Any) -> None:
     workbench = dev_workbench.Workbench(
-        scenario_id="lite6_pick_and_place",
+        project_path=None,
         headless_port=1,
         runner_port=2,
         composer_port=3,

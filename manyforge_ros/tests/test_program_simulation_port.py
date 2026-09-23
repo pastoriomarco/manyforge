@@ -52,7 +52,7 @@ def _context(
         program_run_id=program_run_id,
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="isaac-cell",
-        scenario_catalog_revision=_DIGEST_A,
+        source_document_digest=_DIGEST_A,
         program_id="simulation_program",
         program_revision=_DIGEST_B,
         program_binding_id=_DIGEST_C,

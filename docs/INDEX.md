@@ -41,7 +41,7 @@ scenario package; standalone packaged installation is not yet available.
 
 | Task                                          | Start here                                                                                                                                                                                                                            |
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Start the current development workbench       | [`operations/DEVELOPMENT_WORKBENCH.md`](operations/DEVELOPMENT_WORKBENCH.md); maintained qualified package, simulated native execution, HMR-enabled frontend                                                                         |
+| Start the current development workbench       | [`operations/DEVELOPMENT_WORKBENCH.md`](operations/DEVELOPMENT_WORKBENCH.md); repository Scenario project or empty startup, simulated native execution, HMR-enabled frontend                                                           |
 | Study former stack workflows                  | [`operations/LAUNCHER_QUICKSTART.md`](operations/LAUNCHER_QUICKSTART.md), marked historical                                                                                                                                           |
 | Study historical runtime diagnosis            | [`operations/TROUBLESHOOTING.md`](operations/TROUBLESHOOTING.md) and [`operations/OBSERVABILITY.md`](operations/OBSERVABILITY.md)                                                                                                     |
 | Study historical stop/recovery controls       | [`operations/STOP_PROFILES.md`](operations/STOP_PROFILES.md)                                                                                                                                                                          |
@@ -144,7 +144,7 @@ commands must not be run or cited as current lane evidence.
     URDF/SRDF requirements, arm/gripper intent, adapter selection, and smoke
     acceptance cases. It is not the current artifact schema or runnable path.
 
-- [`operations/EXAMPLES_CATALOG.md`](operations/EXAMPLES_CATALOG.md)
+- [`operations/DEVELOPMENT_WORKBENCH.md`](operations/DEVELOPMENT_WORKBENCH.md)
 
   - Migration and acceptance inventory of every captured
     `examples/*.program.yaml` × `*.deployment.yaml` pair, mapped to its

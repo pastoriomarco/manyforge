@@ -42,17 +42,14 @@ STATE_ROOT = Path(os.environ.get("MANYFORGE_DEV_STATE_ROOT", "/tmp/manyforge-sta
 HEADLESS_BUILD = BUILD_ROOT / "headless"
 ROBOPLAN_BUILD = BUILD_ROOT / "roboplan"
 DEPLOYMENT_AUTHORING_BUILD = BUILD_ROOT / "deployment-authoring"
-SCENARIO_ROOT = Path(
-    os.environ.get(
-        "MANYFORGE_DEV_SCENARIO_ROOT",
-        str(CACHE_ROOT / "maintained-scenario-package"),
-    )
-)
-PACKAGE_ROOT = SCENARIO_ROOT / "retained-package"
+BOOTSTRAP_ROOT = CACHE_ROOT / "repository-bootstrap-package"
 NATIVE_EXECUTION_HOST = ROBOPLAN_BUILD / "manyforge_native_execution_host"
 NATIVE_CANDIDATE_WORKER = ROBOPLAN_BUILD / "manyforge_roboplan_candidate_worker"
 ACTIVATION_PREPARER = (
     DEPLOYMENT_AUTHORING_BUILD / "manyforge_prepare_activation"
+)
+CANONICAL_EMPTY_GENERATOR = (
+    DEPLOYMENT_AUTHORING_BUILD / "manyforge_generate_canonical_empty_package"
 )
 MANAGER_BINARY = HEADLESS_BUILD / "manyforge_manager_daemon"
 NODE_CATALOG = WORKSPACE / "manyforge_behavior/resources/node_catalog.yaml"
@@ -69,6 +66,44 @@ class WorkbenchError(RuntimeError):
     """One precise orchestration failure."""
 
 
+def _project_scenario_id(raw_path: str, *, allowed_root: Path) -> str:
+    """Read only the bounded project identity needed by launcher status."""
+
+    from manyforge_behavior.canonical_artifact import (
+        StrictArtifactError,
+        load_strict_json_yaml,
+    )
+
+    root = allowed_root.resolve(strict=True)
+    candidate = Path(raw_path).expanduser()
+    project = candidate.resolve(strict=True)
+    if (
+        candidate.is_symlink()
+        or not project.is_dir()
+        or not project.is_relative_to(root)
+    ):
+        raise WorkbenchError("Scenario project is outside the workbench project root")
+    manifest = project / "scenario.yaml"
+    if (
+        manifest.is_symlink()
+        or not manifest.is_file()
+        or manifest.stat().st_size > 64 * 1024
+    ):
+        raise WorkbenchError("Scenario project manifest is unavailable or oversized")
+    try:
+        value = load_strict_json_yaml(manifest)
+    except StrictArtifactError as error:
+        raise WorkbenchError(str(error)) from error
+    scenario_id = value.get("scenario_id")
+    if (
+        value.get("api_version") != "manyforge.scenario.project.v1"
+        or not isinstance(scenario_id, str)
+        or re.fullmatch(r"[a-z][a-z0-9._-]{0,127}", scenario_id) is None
+    ):
+        raise WorkbenchError("Scenario project manifest identity is invalid")
+    return scenario_id
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, allow_nan=False, indent=2, sort_keys=True)
 
@@ -80,37 +115,6 @@ def _run(command: Sequence[str], *, cwd: Path | None = None) -> None:
         raise WorkbenchError(
             f"command failed with exit {completed.returncode}: {' '.join(command)}"
         )
-
-
-def _qualified_root() -> Path:
-    return Path(os.environ.get("MANYFORGE_DEV_QUALIFIED_ROOT", "/manyforge-qualified"))
-
-
-def _import_package() -> None:
-    """Import immutable Scenario content without caching backend executables."""
-
-    if PACKAGE_ROOT.is_dir():
-        return
-    qualified = _qualified_root()
-    source_package = qualified / "maintained-package"
-    if not source_package.is_dir():
-        raise WorkbenchError(
-            "the maintained package is unavailable; set "
-            "MANYFORGE_DEV_QUALIFIED_ROOT to an existing qualified package root"
-        )
-    if SCENARIO_ROOT.exists():
-        raise WorkbenchError(
-            "maintained package cache is incomplete; inspect or remove "
-            f"{SCENARIO_ROOT}"
-        )
-    temporary = CACHE_ROOT / f"maintained-scenario.import-{os.getpid()}"
-    temporary.mkdir(parents=True)
-    try:
-        shutil.copytree(source_package, temporary / "retained-package")
-        temporary.replace(SCENARIO_ROOT)
-    except Exception:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
 
 
 def _build_jobs() -> str:
@@ -223,8 +227,8 @@ def _ensure_current_native_backend() -> tuple[Path, Path]:
     return NATIVE_EXECUTION_HOST, NATIVE_CANDIDATE_WORKER
 
 
-def _ensure_activation_preparer() -> tuple[Path, tuple[tuple[str, Path], ...]]:
-    """Build the exact activation preparer and normalized model inputs."""
+def _ensure_activation_preparer() -> Path:
+    """Build repository-owned activation and empty-bootstrap tools."""
 
     if not (DEPLOYMENT_AUTHORING_BUILD / "CMakeCache.txt").is_file():
         _run(
@@ -237,7 +241,7 @@ def _ensure_activation_preparer() -> tuple[Path, tuple[tuple[str, Path], ...]]:
                 "-B",
                 str(DEPLOYMENT_AUTHORING_BUILD),
                 "-DCMAKE_BUILD_TYPE=Release",
-                "-DBUILD_TESTING=ON",
+                "-DBUILD_TESTING=OFF",
             )
         )
     _run(
@@ -249,31 +253,136 @@ def _ensure_activation_preparer() -> tuple[Path, tuple[tuple[str, Path], ...]]:
             _build_jobs(),
             "--target",
             "manyforge_prepare_activation",
+            "manyforge_generate_canonical_empty_package",
             "--",
             "-k",
             "0",
         )
     )
     _regular_file(ACTIVATION_PREPARER, "activation preparer", executable=True)
-    prepared = tuple(
+    _regular_file(
+        CANONICAL_EMPTY_GENERATOR,
+        "canonical-empty generator",
+        executable=True,
+    )
+    return ACTIVATION_PREPARER
+
+
+def _ensure_repository_bootstrap_package() -> Path:
+    """Materialize the source-owned empty Manager baseline idempotently."""
+
+    BOOTSTRAP_ROOT.mkdir(parents=True, exist_ok=True)
+    _run(
         (
-            family_id,
-            DEPLOYMENT_AUTHORING_BUILD / "generated" / directory,
-        )
-        for family_id, directory in (
-            ("lite6_lite_gripper", "lite6_lite_gripper_structural"),
-            ("uf850_xarm_gripper", "uf850_xarm_gripper_structural"),
-            ("ur10e_robotiq_2f_140", "ur10e_robotiq_2f_140_structural"),
-            ("ur5_roboplan", "ur5_roboplan_structural"),
-            ("ur5e_robotiq_2f_85", "ur5e_robotiq_2f_85_structural"),
+            str(CANONICAL_EMPTY_GENERATOR),
+            "--output-root",
+            str(BOOTSTRAP_ROOT),
         )
     )
-    for family_id, root in prepared:
-        if not root.is_dir() or root.is_symlink():
-            raise WorkbenchError(
-                f"prepared Deployment model is unavailable for {family_id}: {root}"
-            )
-    return ACTIVATION_PREPARER, prepared
+    _regular_file(
+        BOOTSTRAP_ROOT / "canonical-empty-admission.json",
+        "repository canonical-empty admission",
+    )
+    return BOOTSTRAP_ROOT
+
+
+def _ensure_project_bootstrap_package(
+    *,
+    document: dict[str, Any],
+    project_path: str,
+    source_document_digest: str,
+) -> tuple[Path, str, str]:
+    """Prepare one project and publish its exact cell-scoped empty baseline."""
+
+    from manyforge_behavior.canonical_artifact import (
+        canonical_json_bytes,
+        raw_sha256_digest,
+    )
+    from manyforge_behavior.catalog import NodeCatalog
+    from manyforge_behavior.model_source_capture import (
+        ModelSourceCaptureError,
+        capture_deployment_model_sources,
+    )
+    from manyforge_composer.backend.authoring_forest import (
+        AuthoringForestError,
+        derive_candidate,
+        validate_invariants,
+    )
+    from manyforge_headless_api.activation_preparer import ActivationPreparer
+    from manyforge_headless_api.native import HeadlessApiError
+
+    deployment = document.get("deployment_draft")
+    authoring = document.get("program_draft")
+    assignment = document.get("program_role_assignment")
+    overrides = document.get("typed_parameter_overrides")
+    scenario_id = document.get("scenario_id")
+    if (
+        not isinstance(deployment, dict)
+        or not isinstance(authoring, dict)
+        or not isinstance(assignment, dict)
+        or not isinstance(overrides, dict)
+        or not isinstance(scenario_id, str)
+    ):
+        raise WorkbenchError(
+            "selected startup project must contain Program, Deployment, "
+            "assignment, and overrides"
+        )
+    cell_id = deployment.get("cell_id")
+    if not isinstance(cell_id, str) or not cell_id:
+        raise WorkbenchError("selected startup project has no cell identity")
+    try:
+        catalog = NodeCatalog(NODE_CATALOG)
+        validate_invariants(authoring, catalog)
+        program, _diagnostics = derive_candidate(authoring, catalog)
+        source_closure = capture_deployment_model_sources(
+            deployment, project_root=Path(project_path)
+        )
+    except (AuthoringForestError, ModelSourceCaptureError) as error:
+        raise WorkbenchError(str(error)) from error
+    captured_input_digest = raw_sha256_digest(
+        canonical_json_bytes(
+            {
+                "scenario_id": scenario_id,
+                "source_document_digest": source_document_digest,
+                "deployment": deployment,
+                "model_source_closure": source_closure,
+                "program": program.to_dict(),
+                "program_role_assignment": assignment,
+                "typed_parameter_overrides": overrides,
+            }
+        )
+    )
+    project_bootstrap_root = BOOTSTRAP_ROOT / source_document_digest.removeprefix(
+        "sha256:"
+    )
+    project_bootstrap_root.mkdir(parents=True, exist_ok=True)
+    try:
+        ActivationPreparer(
+            executable=ACTIVATION_PREPARER,
+            capability_root=WORKSPACE,
+            activation_root=project_bootstrap_root,
+            timeout_seconds=None,
+            publish_canonical_empty=True,
+        ).prepare(
+            source_document_digest=source_document_digest,
+            scenario_id=scenario_id,
+            captured_input_digest=captured_input_digest,
+            deployment=deployment,
+            model_source_closure=source_closure,
+            program=program.to_dict(),
+            program_role_assignment=assignment,
+            typed_parameter_overrides=overrides,
+        )
+    except HeadlessApiError as error:
+        raise WorkbenchError(
+            f"selected startup project could not be prepared: {error}"
+        ) from error
+    admission_filename = f"canonical-empty-admission.{cell_id}.json"
+    _regular_file(
+        project_bootstrap_root / admission_filename,
+        "selected project canonical-empty admission",
+    )
+    return project_bootstrap_root, admission_filename, cell_id
 
 
 def _regular_file(path: Path, label: str, *, executable: bool = False) -> None:
@@ -293,186 +402,6 @@ def _remove_stale_socket(path: Path, label: str) -> None:
     if not stat.S_ISSOCK(mode):
         raise WorkbenchError(f"{label} is not a socket: {path}")
     path.unlink()
-
-
-def _require_current_workspace_deployment(
-    scenario: dict[str, Any],
-    deployment_path: Path | None = None,
-) -> Path:
-    """Reject an imported package that predates its current source contract."""
-
-    deployment_path = deployment_path or (
-        WORKSPACE / "examples" / f"{scenario['deployment_artifact_id']}.deployment.yaml"
-    )
-    _regular_file(deployment_path, "matching workspace Deployment")
-    try:
-        deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise WorkbenchError(
-            "matching workspace Deployment is invalid: " f"{deployment_path}: {error}"
-        ) from error
-    if (
-        deployment.get("deployment_artifact_id") != scenario["deployment_artifact_id"]
-        or deployment.get("deployment_revision") != scenario["deployment_revision"]
-    ):
-        raise WorkbenchError(
-            "imported maintained Scenario package is stale relative to its "
-            "workspace Deployment; refresh the qualified package cache"
-        )
-    return deployment_path
-
-
-def _require_current_workspace_node_environment(
-    binding: dict[str, Any],
-) -> Path:
-    """Reject a package compiled against stale executable node source."""
-
-    _regular_file(NODE_ENVIRONMENT_MANIFEST, "workspace node environment")
-    try:
-        manifest = json.loads(NODE_ENVIRONMENT_MANIFEST.read_text(encoding="utf-8"))
-        catalog = manifest["catalog"]
-        expected = {
-            "catalog_digest": catalog["catalog_digest"],
-            "catalog_id": catalog["catalog_id"],
-            "content_version": catalog["content_version"],
-            "environment_digest": manifest["environment_digest"],
-        }
-    except (KeyError, OSError, UnicodeError, TypeError, json.JSONDecodeError) as error:
-        raise WorkbenchError(
-            "workspace node environment manifest is invalid: "
-            f"{NODE_ENVIRONMENT_MANIFEST}: {error}"
-        ) from error
-    if binding.get("node_environment") != expected:
-        raise WorkbenchError(
-            "imported maintained Scenario package is stale relative to its "
-            "workspace node environment; refresh the qualified package cache"
-        )
-    return NODE_ENVIRONMENT_MANIFEST
-
-
-def _compiler_build_profile(bundle: dict[str, Any]) -> str:
-    digest = bundle["provenance"]["compiler_build_digest"]
-    if (
-        not isinstance(digest, str)
-        or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
-    ):
-        raise ValueError("Scenario compiler build digest is invalid")
-    path = PACKAGE_ROOT / "build-manifests/compiler_build" / f"{digest[7:]}.json"
-    _regular_file(path, "Scenario compiler build manifest")
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("compiler_build_digest") != digest:
-        raise ValueError(
-            "Scenario compiler manifest does not match its exact reference"
-        )
-    profile = manifest["build_profile"]
-    if not isinstance(profile, str):
-        raise ValueError("compiler build profile must be text")
-    return profile
-
-
-def _load_scenario(scenario_id: str) -> dict[str, Any]:
-    catalog_path = PACKAGE_ROOT / "maintained.scenario-catalog.yaml"
-    _regular_file(catalog_path, "maintained Scenario catalog")
-    try:
-        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-        rows = [
-            row
-            for row in catalog["scenarios"]
-            if row["scenario_id"] == scenario_id
-            or scenario_id in row.get("aliases", [])
-        ]
-        if len(rows) != 1:
-            raise ValueError("Scenario is absent or ambiguous")
-        row = rows[0]
-        if row["deployment_compatibility"]["lane"] != "manyforge-only":
-            raise ValueError("Scenario is not a native ManyForge lane")
-        binding_path = (
-            PACKAGE_ROOT
-            / "program-bindings/sha256"
-            / f"{row['program_binding_id'].removeprefix('sha256:')}.json"
-        )
-        bundle_path = (
-            PACKAGE_ROOT
-            / "retained-bundles/sha256"
-            / f"{row['retained_bundle_id'].removeprefix('sha256:')}.json"
-        )
-        _regular_file(binding_path, "Scenario Program Binding")
-        _regular_file(bundle_path, "Scenario retained bundle")
-        binding = json.loads(binding_path.read_text(encoding="utf-8"))
-        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
-        build_profile = _compiler_build_profile(bundle)
-        program_path = (
-            PACKAGE_ROOT
-            / "programs/sha256"
-            / f"{binding['program_revision'].removeprefix('sha256:')}.json"
-        )
-        _regular_file(program_path, "Scenario Program")
-        program = json.loads(program_path.read_text(encoding="utf-8"))
-        graph = bundle["cell_graph"]
-        runtime_units = graph["runtime_units"]
-        controllable_components = graph["controllable_components"]
-    except (KeyError, OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-        raise WorkbenchError(
-            f"maintained Scenario {scenario_id!r} is invalid: {error}"
-        ) from error
-    if (
-        binding.get("program_binding_id") != row["program_binding_id"]
-        or binding.get("retained_bundle_id") != row["retained_bundle_id"]
-        or binding.get("graph_revision") != graph.get("graph_revision")
-        or bundle.get("deployment_artifact_id") != row["deployment_artifact_id"]
-        or bundle.get("deployment_revision") != row["deployment_revision"]
-        or program.get("program_id") != binding.get("program_id")
-        or program.get("program_revision") != binding.get("program_revision")
-        or not isinstance(runtime_units, list)
-        or len(runtime_units) != 1
-        or runtime_units[0].get("configuration", {}).get("mode") != "simulated"
-        or not isinstance(controllable_components, list)
-        or not controllable_components
-    ):
-        raise WorkbenchError(
-            "maintained Scenario artifacts do not form one exact simulated tuple"
-        )
-    admission_filename = f"canonical-empty-admission.{graph['cell_id']}.json"
-    _regular_file(PACKAGE_ROOT / admission_filename, "canonical-empty admission")
-    workspace_program = WORKSPACE / "examples" / f"{program['program_id']}.program.yaml"
-    _regular_file(workspace_program, "matching workspace Program")
-    _require_current_workspace_deployment(row)
-    _require_current_workspace_node_environment(binding)
-    # Composer parses this artifact and the backend Load Scenario command
-    # compares its semantic Program revision with the retained selection.  Do
-    # not add a stricter byte-format identity in the process launcher.
-    component_ids = [
-        (
-            component.get("controllable_component_id")
-            if isinstance(component, dict)
-            else None
-        )
-        for component in controllable_components
-    ]
-    if (
-        any(not isinstance(item, str) or not item for item in component_ids)
-        or component_ids != sorted(component_ids)
-        or len(set(component_ids)) != len(component_ids)
-    ):
-        raise WorkbenchError(
-            "maintained Scenario controllable components are not canonical"
-        )
-    return {
-        "admission_filename": admission_filename,
-        "build_profile": build_profile,
-        "cell_id": graph["cell_id"],
-        "component_ids": component_ids,
-        "deployment_artifact_id": row["deployment_artifact_id"],
-        "deployment_revision": row["deployment_revision"],
-        "graph_revision": graph["graph_revision"],
-        "program_binding_id": row["program_binding_id"],
-        "program_id": program["program_id"],
-        "program_path": str(workspace_program),
-        "program_revision": program["program_revision"],
-        "retained_bundle_id": row["retained_bundle_id"],
-        "scenario_catalog_revision": catalog["scenario_catalog_revision"],
-        "scenario_id": row["scenario_id"],
-    }
 
 
 def _ensure_frontend_dependencies() -> None:
@@ -548,331 +477,22 @@ def _manager_projection_ready(status: dict[str, Any], diff: dict[str, Any]) -> b
     )
 
 
-def _active_configuration_matches(active: object, desired: object) -> bool:
-    """Compare only the retained route fields; owner facts remain projections."""
-
-    if not isinstance(active, dict) or not isinstance(desired, dict):
-        return False
-    return active.get("state") == "reconciled" and all(
-        active.get(field) == desired.get(field)
-        for field in (
-            "control_domain_id",
-            "control_domain_revision",
-            "controller_topology_id",
-            "topology_revision",
-            "activation_set_id",
-            "binding_routes",
-        )
-    )
-
-
-def _expected_active_configuration(active: object) -> dict[str, Any]:
-    if active is None:
-        return {"presence": "absent"}
-    if not isinstance(active, dict):
-        raise WorkbenchError("CCLC active route is not an object")
-    identity = active.get("active_control_configuration_id")
-    generation = active.get("active_control_configuration_generation")
-    if not isinstance(identity, str) or not identity or type(generation) is not int:
-        raise WorkbenchError("CCLC active route identity is incomplete")
-    return {
-        "presence": "present",
-        "active_control_configuration_id": identity,
-        "active_control_configuration_generation": generation,
-    }
-
-
-def _lifecycle_expected_domains(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
-    domains = snapshot.get("domains")
-    if not isinstance(domains, list) or not domains:
-        raise WorkbenchError("CCLC component has no control domains")
-    expected: list[dict[str, Any]] = []
-    for domain in domains:
-        if not isinstance(domain, dict):
-            raise WorkbenchError("CCLC component contains an invalid control domain")
-        row = {
-            "control_domain_id": domain.get("control_domain_id"),
-            "control_domain_revision": domain.get("control_domain_revision"),
-            "controller_topology_id": domain.get("controller_topology_id"),
-            "topology_revision": domain.get("topology_revision"),
-            "expected_active_control_configuration": (
-                _expected_active_configuration(
-                    domain.get("active_control_configuration")
-                )
-            ),
-            "expected_control_bindings": domain.get("current_control_bindings"),
-        }
-        if any(
-            not isinstance(row[field], str) or not row[field]
-            for field in (
-                "control_domain_id",
-                "control_domain_revision",
-                "controller_topology_id",
-                "topology_revision",
-            )
-        ) or not isinstance(row["expected_control_bindings"], list):
-            raise WorkbenchError("CCLC control-domain identity is incomplete")
-        expected.append(row)
-    domain_ids = [row["control_domain_id"] for row in expected]
-    if domain_ids != sorted(domain_ids) or len(set(domain_ids)) != len(domain_ids):
-        raise WorkbenchError("CCLC control domains are not canonical")
-    return expected
-
-
-def _request_id(*parts: object) -> str:
-    digest = hashlib.sha256(
-        json.dumps(parts, separators=(",", ":"), ensure_ascii=True).encode()
-    ).hexdigest()[:32]
-    return f"development-scenario-start.{digest}"
-
-
-def _wait_for_cclc_terminal(
-    read_status: Callable[[str], dict[str, Any]],
-    transaction_id: object,
-    *,
-    label: str,
-    processes: Sequence[tuple[str, subprocess.Popen[bytes]]],
-) -> dict[str, Any]:
-    if not isinstance(transaction_id, str) or not transaction_id:
-        raise WorkbenchError(f"CCLC {label} omitted its transaction identity")
-    deadline = time.monotonic() + 20.0
-    while time.monotonic() < deadline:
-        for name, process in processes:
-            if process.poll() is not None:
-                raise WorkbenchError(
-                    f"{name} exited with status {process.returncode} while "
-                    f"waiting for CCLC {label}"
-                )
-        response = read_status(transaction_id)
-        status = response.get("status")
-        if status is None:
-            time.sleep(0.05)
-            continue
-        if not isinstance(status, dict):
-            raise WorkbenchError(f"CCLC {label} status is invalid")
-        result = status.get("terminal_result")
-        if result is None:
-            time.sleep(0.05)
-            continue
-        if result != "succeeded":
-            raise WorkbenchError(f"CCLC {label} failed: {result}")
-        return status
-    raise WorkbenchError(f"timed out waiting for CCLC {label}")
-
-
-def _converge_component(
-    client: HeadlessHttpClient,
-    component_id: str,
-    *,
-    scenario_id: str,
-    processes: Sequence[tuple[str, subprocess.Popen[bytes]]],
-) -> None:
-    """Bring one simulated Scenario component to its retained active route."""
-
-    snapshot = _wait_until(
-        f"CCLC component {component_id}",
-        lambda: client.cclc_component(component_id),
-        processes,
-        timeout_seconds=20.0,
-    )
-    owner = client.cclc_owner_identity().get("request_owner_epoch")
-    if not isinstance(owner, str) or not owner:
-        raise WorkbenchError("CCLC owner identity is unavailable")
-    for intent, expected_state in (("prepare", "prepared"), ("enable", "active")):
-        state = snapshot.get("component_lifecycle_state")
-        if state == "active" or state == expected_state:
-            continue
-        if state != ("declared" if intent == "prepare" else "prepared"):
-            raise WorkbenchError(
-                f"component {component_id} cannot start from lifecycle state {state!r}"
-            )
-        generation = snapshot.get("component_lifecycle_generation")
-        graph_revision = snapshot.get("graph_revision")
-        if type(generation) is not int or not isinstance(graph_revision, str):
-            raise WorkbenchError("CCLC component lifecycle fence is incomplete")
-        admission = client.authoring_admission().get("admission_generation")
-        if type(admission) is not int:
-            raise WorkbenchError("authoring admission generation is unavailable")
-        request_id = _request_id(
-            scenario_id, component_id, intent, graph_revision, generation
-        )
-        result = client.submit_component_lifecycle(
-            {
-                "request_context": {
-                    "request_id": request_id,
-                    "request_owner_epoch": owner,
-                    "source_label": "development_scenario_start",
-                    "correlation_id": scenario_id,
-                },
-                "controllable_component_id": component_id,
-                "intent": intent,
-                "expected_graph_revision": graph_revision,
-                "expected_component_lifecycle_generation": generation,
-                "expected_control_domains": _lifecycle_expected_domains(snapshot),
-                "reason": "start selected simulated development Scenario",
-                "confirmed": True,
-                "expected_admission_generation": admission,
-            }
-        )
-        acceptance = result.get("acceptance")
-        if not isinstance(acceptance, dict):
-            raise WorkbenchError(f"CCLC {intent} was not accepted")
-        _wait_for_cclc_terminal(
-            client.component_lifecycle_status,
-            acceptance.get("lifecycle_transaction_id"),
-            label=f"{component_id} {intent}",
-            processes=processes,
-        )
-        snapshot = client.cclc_component(component_id)
-        if snapshot.get("component_lifecycle_state") != expected_state:
-            raise WorkbenchError(f"CCLC {component_id} did not become {expected_state}")
-
-    if snapshot.get("component_lifecycle_state") != "active":
-        raise WorkbenchError(f"CCLC component {component_id} is not active")
-    templates = client.cclc_route_templates(component_id)
-    rows = templates.get("templates")
-    if not isinstance(rows, list) or not rows:
-        raise WorkbenchError(f"CCLC component {component_id} has no route templates")
-    rows = sorted(
-        rows,
-        key=lambda row: (
-            row.get("desired_configuration", {}).get("control_domain_id", "")
-            if isinstance(row, dict)
-            else ""
-        ),
-    )
-    snapshot_domains = {
-        domain.get("control_domain_id"): domain
-        for domain in snapshot.get("domains", [])
-        if isinstance(domain, dict)
-    }
-    desired_rows = [
-        (
-            row,
-            row.get("desired_configuration") if isinstance(row, dict) else None,
-        )
-        for row in rows
-    ]
-    desired_domain_ids = [
-        desired.get("control_domain_id") if isinstance(desired, dict) else None
-        for _row, desired in desired_rows
-    ]
-    if desired_domain_ids != sorted(snapshot_domains):
-        raise WorkbenchError(
-            f"CCLC routes do not exactly cover component {component_id}"
-        )
-    for row, desired in desired_rows:
-        if not isinstance(row, dict) or not isinstance(desired, dict):
-            raise WorkbenchError(f"CCLC route for {component_id} is invalid")
-        domain_id = desired["control_domain_id"]
-        if _active_configuration_matches(
-            snapshot_domains[domain_id].get("active_control_configuration"),
-            desired,
-        ):
-            continue
-        admission = client.authoring_admission().get("admission_generation")
-        if type(admission) is not int:
-            raise WorkbenchError("authoring admission generation is unavailable")
-        request_id = _request_id(
-            scenario_id,
-            component_id,
-            domain_id,
-            templates.get("retained_bundle_id"),
-            templates.get("graph_revision"),
-            desired,
-            row.get("expected_active_control_configuration"),
-            row.get("component_expectations"),
-        )
-        result = client.submit_route_selection(
-            {
-                "request_context": {
-                    "request_id": request_id,
-                    "request_owner_epoch": owner,
-                    "source_label": "development_scenario_start",
-                    "correlation_id": scenario_id,
-                },
-                "expected_admission_generation": admission,
-                "expected_retained_bundle_id": templates.get("retained_bundle_id"),
-                "expected_graph_revision": templates.get("graph_revision"),
-                "desired_configuration": desired,
-                "expected_active_control_configuration": row.get(
-                    "expected_active_control_configuration"
-                ),
-                "component_expectations": row.get("component_expectations"),
-                "confirmed": True,
-            }
-        )
-        acceptance = result.get("acceptance")
-        if not isinstance(acceptance, dict):
-            raise WorkbenchError(f"CCLC route {domain_id} was not accepted")
-        _wait_for_cclc_terminal(
-            client.route_selection_status,
-            acceptance.get("route_selection_transaction_id"),
-            label=f"route {domain_id}",
-            processes=processes,
-        )
-        snapshot = client.cclc_component(component_id)
-        snapshot_domains = {
-            domain.get("control_domain_id"): domain
-            for domain in snapshot.get("domains", [])
-            if isinstance(domain, dict)
-        }
-        if not _active_configuration_matches(
-            snapshot_domains.get(domain_id, {}).get("active_control_configuration"),
-            desired,
-        ):
-            raise WorkbenchError(f"CCLC route {domain_id} did not reconcile")
-
-
-def _converge_control_management(
-    client: HeadlessHttpClient,
-    component_ids: Sequence[str],
-    *,
-    scenario_id: str,
-    processes: Sequence[tuple[str, subprocess.Popen[bytes]]],
-) -> str:
-    """Converge only products that explicitly use component lifecycle control."""
-
-    def current_mode() -> str | None:
-        response = client.execution_identity()
-        identity = response.get("identity")
-        if not isinstance(identity, dict):
-            raise WorkbenchError("execution identity is unavailable")
-        mode = identity.get("control_management_mode")
-        if mode == "pending":
-            return None
-        if mode not in {"direct", "component_lifecycle"}:
-            raise WorkbenchError("execution control-management mode is invalid")
-        return mode
-
-    mode = _wait_until(
-        "execution control management",
-        current_mode,
-        processes,
-        # Native product materialization is asynchronous and host-load
-        # dependent. The wait already fails immediately if an owning process
-        # exits, while repeated identity reads expose terminal progress.
-        timeout_seconds=None,
-    )
-    if mode == "direct":
-        return mode
-    for component_id in component_ids:
-        _converge_component(
-            client,
-            component_id,
-            scenario_id=scenario_id,
-            processes=processes,
-        )
-    return mode
-
-
 def query_status(*, scenario_id: str | None, composer_port: int) -> dict[str, Any]:
-    """Read Composer's owner-derived current Scenario; retain no launcher copy."""
+    """Read Composer readiness and, when selected, the exact active project."""
 
     with HeadlessHttpClient(
         f"http://127.0.0.1:{composer_port}", timeout_seconds=1.0
     ) as client:
+        health = client.health()
         result = client.request("GET", "/api/scenarios/current")
+    if scenario_id is None:
+        result = {
+            **result,
+            "ready": bool(health),
+            "unavailable_reasons": (
+                [] if health else ["composer_unavailable"]
+            ),
+        }
     current = result.get("current_scenario")
     if (
         scenario_id is not None
@@ -892,7 +512,7 @@ def query_status(*, scenario_id: str | None, composer_port: int) -> dict[str, An
         **result,
         "classification": {
             "kind": "development_workbench",
-            "package_kind": "maintained_qualified",
+            "package_kind": "repository_source",
             "physical_execution_authorized": False,
         },
     }
@@ -912,20 +532,20 @@ class Workbench:
     def __init__(
         self,
         *,
-        scenario_id: str,
+        project_path: str | None,
         headless_port: int,
         runner_port: int,
         composer_port: int,
         frontend_port: int,
         artifact_root: Path | None = None,
     ) -> None:
-        self.scenario_id = scenario_id
+        self.project_path = project_path
         self.headless_port = headless_port
         self.runner_port = runner_port
         self.composer_port = composer_port
         self.frontend_port = frontend_port
         self.artifact_root = artifact_root or WORKSPACE / "examples"
-        self.metadata: dict[str, Any] = {}
+        self.scenario_id: str | None = None
         self.processes: list[tuple[str, subprocess.Popen[bytes]]] = []
         self.stop_requested = False
 
@@ -948,12 +568,29 @@ class Workbench:
             "execution_run": STATE_ROOT / "execution-run",
             "publications": STATE_ROOT / "publications",
             "artifacts": STATE_ROOT / "artifacts",
-            "program_selection": STATE_ROOT / "program-selection-state",
             "composer_authoring": STATE_ROOT / "composer-authoring",
         }
         for path in paths.values():
             path.mkdir(parents=True, exist_ok=True)
         return paths
+
+    def _composer_command(self, base_url: str) -> list[str]:
+        command = [
+            sys.executable,
+            "-m",
+            "manyforge_composer",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.composer_port),
+            "--headless-api-url",
+            base_url,
+            "--headless-api-timeout-s",
+            "20",
+        ]
+        if self.project_path is not None:
+            command.extend(("--startup-scenario-document", self.project_path))
+        return command
 
     def start(self) -> None:
         for port in (
@@ -966,11 +603,36 @@ class Workbench:
                 raise WorkbenchError(
                     f"required development port {port} is already in use"
                 )
-        _import_package()
-        self.metadata = _load_scenario(self.scenario_id)
         current_headless_extension = _ensure_current_backend()
         current_native_targets = _ensure_current_native_backend()
-        activation_preparer, prepared_models = _ensure_activation_preparer()
+        activation_preparer = _ensure_activation_preparer()
+        bootstrap_root: Path
+        bootstrap_admission = "canonical-empty-admission.json"
+        cell_id = "c1_build_authority_cell"
+        if self.project_path is not None:
+            from manyforge_composer.backend.scenario_artifacts import (
+                ScenarioArtifactError,
+                capture_scenario_artifact,
+            )
+
+            try:
+                project, project_path, source_document_digest = capture_scenario_artifact(
+                    self.project_path,
+                    allowed_roots=[str(self.artifact_root)],
+                )
+            except ScenarioArtifactError as error:
+                raise WorkbenchError(str(error)) from error
+            self.project_path = project_path
+            self.scenario_id = project["scenario_id"]
+            bootstrap_root, bootstrap_admission, cell_id = (
+                _ensure_project_bootstrap_package(
+                    document=project,
+                    project_path=project_path,
+                    source_document_digest=source_document_digest,
+                )
+            )
+        else:
+            bootstrap_root = _ensure_repository_bootstrap_package()
         _regular_file(
             MANAGER_BINARY,
             "current Manager executable",
@@ -1022,7 +684,7 @@ class Workbench:
                 "--manager-liveness-socket",
                 str(runner_socket),
                 "--cell-id",
-                self.metadata["cell_id"],
+                cell_id,
                 "--owner-id",
                 "program-runner.development-workbench",
             ),
@@ -1041,11 +703,9 @@ class Workbench:
                 "--projection-root",
                 str(paths["publications"]),
                 "--install-root",
-                str(PACKAGE_ROOT),
+                str(bootstrap_root),
                 "--artifact-root",
                 str(paths["artifacts"]),
-                "--program-selection-state-root",
-                str(paths["program_selection"]),
                 "--node-catalog-path",
                 str(NODE_CATALOG),
                 "--node-environment-manifest-path",
@@ -1059,7 +719,7 @@ class Workbench:
                 "--execution-run-root",
                 str(paths["execution_run"]),
                 "--cell-id",
-                self.metadata["cell_id"],
+                cell_id,
                 "--owner-id",
                 "headless-api.development-workbench",
                 "--freshness-ms",
@@ -1072,6 +732,8 @@ class Workbench:
                 str(activation_preparer),
                 "--activation-preparer-capability-root",
                 str(WORKSPACE),
+                "--activation-preparer-activation-root",
+                str(paths["artifacts"]),
             ),
         )
         base_url = f"http://127.0.0.1:{self.headless_port}"
@@ -1095,8 +757,8 @@ class Workbench:
             (
                 str(manager),
                 "--install-root",
-                str(PACKAGE_ROOT),
-                "--candidate-package-root",
+                str(bootstrap_root),
+                "--activation-root",
                 str(paths["artifacts"]),
                 "--manager-state-root",
                 str(paths["manager_state"]),
@@ -1113,7 +775,7 @@ class Workbench:
                 "--projection-root",
                 str(paths["publications"]),
                 "--canonical-empty-admission-filename",
-                self.metadata["admission_filename"],
+                bootstrap_admission,
                 "--program-runner-liveness-socket",
                 str(runner_socket),
             ),
@@ -1157,7 +819,7 @@ class Workbench:
                     # never as permission to continue the old run.
                     return None
 
-        startup_cycle_state = _wait_until(
+        _wait_until(
             "contained Program-cycle startup reconciliation",
             contained_startup_cycle,
             self.processes,
@@ -1182,21 +844,7 @@ class Workbench:
         print("starting Composer backend", flush=True)
         # Composer owns only process-lifetime Draft state. Runtime transitions
         # are durable Manager operations and need no Composer state root.
-        composer_command = [
-            sys.executable,
-            "-m",
-            "manyforge_composer",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(self.composer_port),
-            "--program-path",
-            self.metadata["program_path"],
-            "--headless-api-url",
-            base_url,
-            "--headless-api-timeout-s",
-            "20",
-        ]
+        composer_command = self._composer_command(base_url)
         composer = subprocess.Popen(
             composer_command,
             env=composer_environment,
@@ -1216,49 +864,26 @@ class Workbench:
             timeout_seconds=None,
         )
 
-        def node_environment_ready() -> dict[str, Any] | None:
-            # Composer owns recovery of durable authoring effects. Start that
-            # owner before waiting for the joined Program environment; an
-            # interrupted Apply/Revert may otherwise hold the exact admission
-            # claim whose recovery makes this environment current.
-            with HeadlessHttpClient(base_url, timeout_seconds=0.5) as client:
-                environment = client.node_environment()
-                return environment if environment.get("schema_version") else None
-
-        _wait_until(
-            "active Program node environment",
-            node_environment_ready,
-            self.processes,
-            timeout_seconds=None,
-        )
-
-        def exact_status() -> dict[str, Any] | None:
-            result = query_status(
-                scenario_id=self.metadata["scenario_id"],
-                composer_port=self.composer_port,
-            )
-            return result if result["ready"] else None
-
-        _wait_until(
-            "exact current Scenario tuple",
-            exact_status,
-            self.processes,
-            timeout_seconds=None,
-        )
-        if startup_cycle_state == "idle_after_reset":
-            with HeadlessHttpClient(base_url, timeout_seconds=1.0) as client:
-                _converge_control_management(
-                    client,
-                    self.metadata["component_ids"],
-                    scenario_id=self.metadata["scenario_id"],
-                    processes=self.processes,
+        if self.scenario_id is not None:
+            def exact_status() -> dict[str, Any] | None:
+                result = query_status(
+                    scenario_id=self.scenario_id,
+                    composer_port=self.composer_port,
                 )
+                return result if result["ready"] else None
+
             _wait_until(
-                "idle authoring admission",
-                authoring_ready,
+                "exact current Scenario project",
+                exact_status,
                 self.processes,
                 timeout_seconds=None,
             )
+        _wait_until(
+            "idle authoring admission",
+            authoring_ready,
+            self.processes,
+            timeout_seconds=None,
+        )
         vite_environment = os.environ.copy()
         vite_environment["MANYFORGE_COMPOSER_PROXY_TARGET"] = (
             f"http://127.0.0.1:{self.composer_port}"
@@ -1291,8 +916,9 @@ class Workbench:
                     "ready": True,
                     "url": f"http://localhost:{self.frontend_port}",
                     "scenario_id": self.scenario_id,
+                    "project_path": self.project_path,
                     "classification": (
-                        "development workbench; maintained qualified package; "
+                        "development workbench; repository source; "
                         "simulated execution only"
                     ),
                 }
@@ -1431,7 +1057,7 @@ def _parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
     for name in ("serve", "status"):
         command = subcommands.add_parser(name)
-        command.add_argument("--scenario", required=name == "serve")
+        command.add_argument("--project")
         command.add_argument("--headless-port", type=int, default=9010)
         command.add_argument("--runner-port", type=int, default=9011)
         command.add_argument("--composer-port", type=int, default=9020)
@@ -1443,14 +1069,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "status":
+            scenario_id = None
+            if args.project is not None:
+                try:
+                    scenario_id = _project_scenario_id(
+                        args.project,
+                        allowed_root=WORKSPACE / "examples",
+                    )
+                except (OSError, ValueError) as error:
+                    raise WorkbenchError(str(error)) from error
             result = query_status(
-                scenario_id=args.scenario,
+                scenario_id=scenario_id,
                 composer_port=args.composer_port,
             )
             print(_json(result))
             return 0 if result["ready"] else 69
         Workbench(
-            scenario_id=args.scenario,
+            project_path=args.project,
             headless_port=args.headless_port,
             runner_port=args.runner_port,
             composer_port=args.composer_port,

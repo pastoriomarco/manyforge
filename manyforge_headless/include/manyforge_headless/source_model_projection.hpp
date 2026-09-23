@@ -28,7 +28,7 @@ class ActiveSourceModelProjection final {
  public:
   explicit ActiveSourceModelProjection(
       std::filesystem::path package_root,
-      std::optional<std::filesystem::path> candidate_package_root =
+      std::optional<std::filesystem::path> activation_root =
           std::nullopt);
 
   [[nodiscard]] manyforge::content_identity::CanonicalValue Project(

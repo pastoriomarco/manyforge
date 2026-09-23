@@ -161,7 +161,7 @@ def _context(
         program_run_id="program-run-1",
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="scenario-1",
-        scenario_catalog_revision=_DIGEST_A,
+        source_document_digest=_DIGEST_A,
         program_id=program.program_id,
         program_revision=program.program_revision,
         program_binding_id=_DIGEST_B,

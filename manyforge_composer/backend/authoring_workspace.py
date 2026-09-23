@@ -497,49 +497,6 @@ class AuthoringWorkspace:
 
         self._notify_once()
 
-    def migrate_project_facts(
-        self, overrides: Mapping[str, Any]
-    ) -> AuthoringWorkspaceSnapshot:
-        """TEMPORARY (UA2D.2) write-through shim for not-yet-migrated writers.
-
-        The Scenario project facts moved into this owner, but some writers still
-        assign single fields on ``ComposerState`` until their owning substep
-        migrates them (UA2D.5 for the Composer routes, UA3 for the external
-        Scenario-load publication). Each assignment arrives here as one
-        single-field commit so it still advances the composite revision exactly
-        once. This method is deleted with the last ``ComposerState`` shim
-        property that calls it; new callers use :meth:`remember_project` or
-        :meth:`replace`.
-        """
-
-        if type(overrides) is not dict or not overrides:
-            raise ValueError("migrated project fact override must name a field")
-        unknown = set(overrides) - set(_PROJECT_FACT_FIELDS)
-        if unknown:
-            raise ValueError(f"unknown Scenario project fact: {sorted(unknown)[0]}")
-        with self._lock:
-            self._require_usable_locked()
-            self._require_capacity_locked()
-            before = self._project_facts_locked()
-            facts = self._project_facts_locked()
-            facts.update(
-                {name: deepcopy(value) for name, value in overrides.items()}
-            )
-            self._remember_project_locked(
-                document=None,
-                document_path=None,
-                source_document_digest=None,
-                source_diagnostics=None,
-                explicit=facts,
-            )
-            advanced = self._finish_commit_locked(
-                self._project_facts_locked() != before
-            )
-            captured = self._snapshot_locked()
-        if advanced:
-            self._notify_once()
-        return captured
-
     def commit_program(
         self,
         *,

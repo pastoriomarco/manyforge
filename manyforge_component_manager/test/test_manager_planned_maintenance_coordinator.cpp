@@ -78,14 +78,12 @@ ManagedRow(const std::string &runtime_unit_id,
       ActiveBundlePublicationReceiptDTO{
           ActiveBundlePublicationRequestDTO{
               NamedApplyPublicationTransactionDTO{
-                  ApplyId("apply.active"), ApplyGeneration(1U),
-                  ProjectionStageGeneration(1U)},
+                  ApplyId("apply.active"), ApplyGeneration(1U)},
               projection,
               projection.retained_bundle_id,
               projection.graph_revision,
               ActiveBundlePublicationGeneration(1U),
               ContentDigest(std::string(kDigestTwo)),
-              ContentDigest(std::string(kDigestThree)),
           },
           ActiveBundlePublicationGeneration(2U),
           ContentDigest(std::string(kDigestOne)),
@@ -274,6 +272,7 @@ public:
           core::DeploymentRevision(std::string(kDigestTwo)),
           core::ProgramBindingId(std::string(kDigestThree)),
           ContentDigest(std::string(kDigestTwo)),
+          R"({"schema_version":"test.prepared_activation_receipt.v1"})",
       },
       core::AdmissionGeneration(7U),
       std::nullopt,

@@ -31,10 +31,9 @@ Despite its name, operating this workbench requires no private development docs.
 
 Use a Linux host with Docker Engine, Compose v2, BuildKit, Git and Python 3,
 network access for dependencies, and sufficient disk/RAM for native compilation.
-Obtain a compatible maintained package from the maintainer/distributor: a fresh
-cache needs a directory containing `maintained-package/`. An image alone is not
-a complete installation; if that package is missing, report the missing input
-rather than inventing a bootstrap or asking for private specifications.
+The workbench builds its runtime capabilities and canonical-empty bootstrap
+from this checkout. A selected Scenario is an ordinary project folder; startup
+without a selected project opens an empty authoring workspace.
 
 From a new checkout, after authorization to install/start:
 
@@ -43,24 +42,26 @@ git clone --branch dev https://github.com/pastoriomarco/manyforge.git
 cd manyforge
 ./scripts/setup-docker.sh --prepare-only
 docker compose build dev
-MANYFORGE_DEV_QUALIFIED_BUILD_ROOT=/absolute/path/to/provided-build-root \
-  ./scripts/compose-dev.sh start --scenario lite6_pick_and_place
+./scripts/compose-dev.sh start \
+  --project examples/lite6_pick_and_place.scenario
 ```
 
-Use the source revision and package supplied together. The setup command prepares
-pinned dependencies; it may recreate stale/modified dependency trees under `.docker/`.
-Do not run it over dependency edits you need to preserve. Startup imports scenario
-content, incrementally builds required native targets and starts one workbench;
+The setup command prepares pinned dependencies; it may recreate stale/modified
+dependency trees under `.docker/`.
+Do not run it over dependency edits you need to preserve. Startup incrementally
+builds required native targets and starts one workbench; an optional project is
+loaded through the ordinary application path;
 it does not run tests or qualify a release. Subsequent starts reuse the cache:
 
 ```bash
-./scripts/compose-dev.sh start --scenario lite6_pick_and_place
+./scripts/compose-dev.sh start
+./scripts/compose-dev.sh start --project examples/lite6_pick_and_place.scenario
 ./scripts/compose-dev.sh status
 ```
 
 Open **http://localhost:3000**. Check reported scenario, active configuration and
-convergence, not just whether the page loads. Use only scenario IDs offered by
-the supplied package. Do not start a second stack to work around an unhealthy one.
+convergence, not just whether the page loads. Do not start a second stack to
+work around an unhealthy one.
 
 ### Operate, diagnose and shut down
 
@@ -92,7 +93,7 @@ After explicit shutdown authorization:
 
 Closing the browser does not stop execution. Container shutdown is not a substitute
 for an operational Stop or a hardware emergency stop. Builds, npm dependencies and
-imported package caches survive shutdown. See the runbook for startup failures and
+repository bootstrap caches survive shutdown. See the runbook for startup failures and
 scenario switching; do not automatically restart/reapply to hide a fault.
 
 ### Authority and safety

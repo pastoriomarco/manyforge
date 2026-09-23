@@ -63,7 +63,6 @@ class ProcessStack:
         self.execution_run_root = root / "execution-run"
         self.publication_root = root / "publications"
         self.artifact_root = root / "artifacts"
-        self.program_selection_state_root = root / "program-selection-state"
         for path in (
             self.manager_root,
             self.manager_run_root,
@@ -71,7 +70,6 @@ class ProcessStack:
             self.execution_run_root,
             self.publication_root,
             self.artifact_root,
-            self.program_selection_state_root,
         ):
             path.mkdir()
         self.scene_database = root / "logical-scene.sqlite3"
@@ -149,7 +147,7 @@ class ProcessStack:
             str(self.manager_executable),
             "--install-root",
             str(self.manager_package_root),
-            "--candidate-package-root",
+            "--activation-root",
             str(self.artifact_root),
             "--manager-state-root",
             str(self.manager_root),
@@ -205,8 +203,6 @@ class ProcessStack:
             str(self.package_root),
             "--artifact-root",
             str(self.artifact_root),
-            "--program-selection-state-root",
-            str(self.program_selection_state_root),
             "--node-catalog-path",
             str(NODE_CATALOG),
             "--node-environment-manifest-path",
@@ -858,7 +854,6 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             assert stack.fixture_metadata is not None
             active_bundle = stack.fixture_metadata["physical_candidate_retained_bundle_id"]
             active_graph = stack.fixture_metadata["physical_graph_revision"]
-            scenarios = composer.scenarios()
 
             assert {row["model_instance_id"] for row in source_model["occurrences"]} == {
                 "lite6_fixture_instance"
@@ -872,13 +867,6 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             assert assistant_mode["graph_revision"] == active_graph
             assert manager_before["active"]["retained_bundle_id"] == active_bundle
             assert manager_before["active"]["graph_revision"] == active_graph
-            assert scenarios["scenarios"][0]["retained_bundle_id"] == active_bundle
-            assert scenarios["scenarios"][0]["program_binding_id"] == (
-                stack.fixture_metadata["program_binding_id"]
-            )
-            assert scenarios["scenario_catalog_revision"] == (
-                stack.fixture_metadata["scenario_catalog_revision"]
-            )
             assert {row["tool_id"] for row in assistant_mode["tools"]} == {
                 "program_read",
                 "scene_draft_add_object",
@@ -1137,272 +1125,6 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 == runtime_before["active_retained_bundle_id"]
             )
             assert runtime_after["active_graph_revision"] == runtime_before["active_graph_revision"]
-            assert _plain_package_files(stack.package_root) == package_before
-
-
-def test_real_program_apply_reuses_active_deployment_and_survives_api_restart(
-    tmp_path: Path,
-) -> None:
-    package_root = tmp_path / "read-only-package"
-    shutil.copytree(_required_path("MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT"), package_root)
-    package_before = _plain_package_files(package_root)
-    with _read_only_tree(package_root):
-        with _assistant_stack(tmp_path, package_root=package_root) as stack:
-            assert stack.wait_complete(True)["complete"] is True
-            with (
-                _composer_snapshot_stream(stack, client_id="process-test-browser") as next_snapshot,
-                HeadlessHttpClient(
-                    stack.composer_url,
-                    timeout_seconds=8.0,
-                ) as composer,
-                HeadlessHttpClient(stack.base_url) as client,
-            ):
-                scenarios = client.scenarios()
-                assert [row["scenario_id"] for row in scenarios["scenarios"]] == [
-                    "program_apply_fixture"
-                ]
-                with pytest.raises(HeadlessClientError) as absent:
-                    client.program_applied()
-                assert absent.value.code == "program_applied_selection_not_found"
-
-                unloaded_draft = composer.request("GET", "/api/program/draft")
-                for attempt in range(8):
-                    assert composer.request("GET", "/api/program/draft") == unloaded_draft
-                    load_snapshot = _matching_composer_snapshot(next_snapshot, unloaded_draft)
-                    try:
-                        loaded = composer.request(
-                            "POST",
-                            "/api/scenarios/load",
-                            body={
-                                **_composer_fence(
-                                    load_snapshot,
-                                    request_id=(f"program-apply.process.load.{attempt}"),
-                                ),
-                                "scenarioId": "program_apply_fixture",
-                                "scenarioCatalogRevision": scenarios["scenario_catalog_revision"],
-                                "confirmDiscard": False,
-                            },
-                        )
-                        break
-                    except HeadlessClientError as error:
-                        if (
-                            error.code
-                            not in {
-                                "authoring_not_ready",
-                                "stale_generation",
-                            }
-                            or attempt == 7
-                        ):
-                            raise
-                assert loaded["status"] == "loaded"
-                assert client.program_applied()["scenario_id"] == ("program_apply_fixture")
-
-                initial_draft = composer.request("GET", "/api/program/draft")
-                for attempt in range(8):
-                    assert composer.request("GET", "/api/program/draft") == initial_draft
-                    initial_snapshot = _matching_composer_snapshot(next_snapshot, initial_draft)
-                    try:
-                        composer.request(
-                            "POST",
-                            "/api/program/draft/mutations",
-                            body={
-                                **_composer_fence(
-                                    initial_snapshot,
-                                    request_id=(f"program-apply.process.edit.{attempt}"),
-                                ),
-                                "mutation": "tree_draft_update_node_params",
-                                "arguments": {
-                                    "instance_id": "assistant_native_timer",
-                                    "expected_node_id": "timer",
-                                    "parameters": {"duration_s": 0.002},
-                                },
-                            },
-                        )
-                        break
-                    except HeadlessClientError as error:
-                        if (
-                            error.code
-                            not in {
-                                "authoring_client_snapshot_stale",
-                                "authoring_not_ready",
-                                "stale_generation",
-                            }
-                            or attempt == 7
-                        ):
-                            raise
-                edited_draft = composer.request("GET", "/api/program/draft")
-                program = edited_draft["program"]
-                package_program_path = (
-                    stack.package_root
-                    / "programs"
-                    / "sha256"
-                    / f"{program['program_revision'][7:]}.json"
-                )
-                publication_program_path = (
-                    stack.artifact_root
-                    / "programs"
-                    / "sha256"
-                    / f"{program['program_revision'][7:]}.json"
-                )
-                publication_binding_path = stack.artifact_root / "program-bindings" / "sha256"
-                for attempt in range(8):
-                    assert composer.request("GET", "/api/program/draft") == edited_draft
-                    apply_snapshot = _matching_composer_snapshot(next_snapshot, edited_draft)
-                    try:
-                        applied_response = composer.request(
-                            "POST",
-                            "/api/program/apply",
-                            body={
-                                **_composer_fence(
-                                    apply_snapshot,
-                                    request_id=f"program-apply.process.1.{attempt}",
-                                )
-                            },
-                        )
-                        break
-                    except HeadlessClientError as error:
-                        if (
-                            error.code
-                            not in {
-                                "authoring_client_snapshot_stale",
-                                "authoring_not_ready",
-                                "stale_generation",
-                            }
-                            or attempt == 7
-                        ):
-                            raise
-                result = applied_response["headless"]
-                assert result["status"] == "applied"
-                assert set(result) == {
-                    "applied",
-                    "preparation",
-                    "schema_version",
-                    "status",
-                }
-                assert result["applied"]["program_revision"] == program["program_revision"]
-                first_applied = client.program_applied()
-                assert first_applied == result["applied"]
-                assert publication_program_path.is_file()
-                assert not package_program_path.exists()
-                candidate_binding_path = publication_binding_path / (
-                    f"{result['applied']['program_binding_id'][7:]}.json"
-                )
-                package_binding_path = (
-                    stack.package_root
-                    / "program-bindings"
-                    / "sha256"
-                    / f"{result['applied']['program_binding_id'][7:]}.json"
-                )
-                assert candidate_binding_path.is_file()
-                assert not package_binding_path.exists()
-
-                stack.kill_api()
-                stack.start_api()
-                stack.wait_complete(True)
-                reopened = client.program_applied()
-                assert reopened == first_applied
-                replay_draft = composer.request("GET", "/api/program/draft")
-                with _composer_snapshot_stream(
-                    stack, client_id="process-test-browser-restarted"
-                ) as restarted_snapshots:
-                    for attempt in range(8):
-                        assert composer.request("GET", "/api/program/draft") == replay_draft
-                        replay_snapshot = _matching_composer_snapshot(
-                            restarted_snapshots, replay_draft
-                        )
-                        try:
-                            replay_response = composer.request(
-                                "POST",
-                                "/api/program/apply",
-                                body={
-                                    **_composer_fence(
-                                        replay_snapshot,
-                                        request_id=(f"program-apply.process.2.{attempt}"),
-                                    )
-                                },
-                            )
-                            break
-                        except HeadlessClientError as error:
-                            if (
-                                error.code
-                                not in {
-                                    "authoring_client_snapshot_stale",
-                                    "authoring_not_ready",
-                                    "stale_generation",
-                                }
-                                or attempt == 7
-                            ):
-                                raise
-                replay = replay_response["headless"]
-                replay_applied = replay["applied"]
-                assert {key: value for key, value in replay_applied.items() if key != "source"} == {
-                    key: value for key, value in first_applied.items() if key != "source"
-                }
-                assert replay_applied["source"] == {
-                    **first_applied["source"],
-                    "source_owner_epoch": replay_applied["source"]["source_owner_epoch"],
-                }
-                assert replay_applied["source"]["source_owner_epoch"] != (
-                    first_applied["source"]["source_owner_epoch"]
-                )
-
-                for attempt in range(8):
-                    try:
-                        started = client.program_run_start(
-                            {
-                                "request_id": (f"program-apply.process.run.1.{attempt}"),
-                                "request_owner_epoch": ("process-test-browser-restarted"),
-                                "source_label": "program_apply_process_test",
-                                "correlation_id": "program-apply.process.run.1",
-                                "scenario_id": "program_apply_fixture",
-                                "scenario_catalog_revision": scenarios["scenario_catalog_revision"],
-                                "expected_applied_record_digest": replay_applied["source"][
-                                    "record_digest"
-                                ],
-                                "draft_program_revision": replay_applied["program_revision"],
-                                "expected_admission_generation": (
-                                    stack.wait_authoring_admission(expected_allowed=True)[
-                                        "admission_generation"
-                                    ]
-                                ),
-                            }
-                        )
-                        break
-                    except HeadlessClientError as error:
-                        if (
-                            error.code not in {"authoring_not_ready", "stale_generation"}
-                            or attempt == 7
-                        ):
-                            raise
-                program_run_id = started["capture"]["program_run_id"]
-                terminal = started
-                deadline = time.monotonic() + 10.0
-                while terminal["state"] in {"running", "stopping", "finalizing"}:
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError(f"Program run did not settle: {terminal!r}")
-                    time.sleep(0.01)
-                    terminal = client.program_run(program_run_id)
-                assert terminal["state"] == "succeeded"
-
-                cycle = client.program_cycle_status()
-                assert cycle["state"] == "terminal_awaiting_reset"
-                terminal_reference = cycle["terminal_or_settlement_reference"]
-                reset = client.program_cycle_reset(
-                    {
-                        "request_id": "program-apply.process.reset.1",
-                        "request_owner_epoch": "process-test-browser-restarted",
-                        "source_label": "program_apply_process_test",
-                        "correlation_id": "program-apply.process.run.1",
-                        "program_run_id": program_run_id,
-                        "expected_owner_epoch": cycle["program_runner_owner_epoch"],
-                        "expected_cycle_generation": cycle["cycle_generation"],
-                        "expected_claim_generation": cycle["cycle_claim_generation"],
-                        "terminal_reference": terminal_reference,
-                        "settlement_evidence_digest": terminal_reference,
-                    }
-                )
-                assert reset["program_run_id"] == program_run_id
-                assert client.program_cycle_status()["state"] == ("idle_after_reset")
             assert _plain_package_files(stack.package_root) == package_before
 
 

@@ -61,47 +61,40 @@ concept ExposesPublish = requires(T& value, const ActiveBundlePublicationRequest
 static_assert(!ExposesPublish<IActiveBundlePublicationReader>);
 static_assert(ExposesPublish<IActiveBundlePublicationStore>);
 
-using StageSignature = ProjectionApplyStageResultDTO (IManagerSceneProjectionHandoffPort::*)(
-    const ProjectionApplyStageDTO&);
 using CurrentProjectionRevisionSignature = ProjectionRevisionDTO (
-    IManagerSceneProjectionHandoffPort::*)() const;
-using ActivateSignature = ProjectionApplyActivationResultDTO (
-    IManagerSceneProjectionHandoffPort::*)(const ProjectionApplyActivationDTO&);
-using DiscardSignature = ProjectionApplyDiscardResultDTO (IManagerSceneProjectionHandoffPort::*)(
-    const ProjectionApplyDiscardDTO&);
-using FinalizeSignature = ProjectionApplyFinalizeResultDTO (IManagerSceneProjectionHandoffPort::*)(
-    const ProjectionApplyFinalizeDTO&);
-using ApplyStatusSignature = ProjectionApplyStatusDTO (IManagerSceneProjectionHandoffPort::*)(
-    const ProjectionApplyStatusQueryDTO&) const;
-using ReconcileActiveProjectionSignature =
-    ActiveProjectionRuntimeRecoveryResultDTO (
-        IManagerSceneProjectionHandoffPort::*)(
-        const ActiveProjectionRuntimeSetDTO&);
+    IManagerSceneProjectionMaintenancePort::*)() const;
+using BeginMaintenanceInitializationSignature =
+    ProjectionMaintenanceInitializationStatusDTO (
+        IManagerSceneProjectionMaintenancePort::*)(
+        const ProjectionMaintenanceInitializationRequestDTO&);
+using CompleteMaintenanceInitializationSignature =
+    ProjectionMaintenanceInitializationStatusDTO (
+        IManagerSceneProjectionMaintenancePort::*)(
+        const ProjectionMaintenanceCompletionDTO&);
+using ReadMaintenanceInitializationSignature =
+    std::optional<ProjectionMaintenanceInitializationStatusDTO> (
+        IManagerSceneProjectionMaintenancePort::*)(
+        const ProjectionMaintenanceInitializationQueryDTO&) const;
 using ActiveProjectionHealthSignature = ProjectionAggregateHealthDTO (
-    IManagerSceneProjectionHandoffPort::*)() const;
+    IManagerSceneProjectionMaintenancePort::*)() const;
 static_assert(
-    std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::
+    std::is_same_v<decltype(&IManagerSceneProjectionMaintenancePort::
                                 CurrentProjectionRevision),
                    CurrentProjectionRevisionSignature>);
 static_assert(
-    std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::StageCandidateProjection),
-                   StageSignature>);
+    std::is_same_v<decltype(&IManagerSceneProjectionMaintenancePort::
+                                BeginMaintenanceInitialization),
+                   BeginMaintenanceInitializationSignature>);
 static_assert(
-    std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::ActivateStagedProjection),
-                   ActivateSignature>);
-static_assert(std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::DiscardStagedProjection),
-                             DiscardSignature>);
+    std::is_same_v<decltype(&IManagerSceneProjectionMaintenancePort::
+                                CompleteMaintenanceInitialization),
+                   CompleteMaintenanceInitializationSignature>);
 static_assert(
-    std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::FinalizeProjectionTransition),
-                   FinalizeSignature>);
-static_assert(std::is_same_v<decltype(&IManagerSceneProjectionHandoffPort::ProjectionApplyStatus),
-                             ApplyStatusSignature>);
+    std::is_same_v<decltype(&IManagerSceneProjectionMaintenancePort::
+                                ReadMaintenanceInitialization),
+                   ReadMaintenanceInitializationSignature>);
 static_assert(std::is_same_v<
-              decltype(&IManagerSceneProjectionHandoffPort::
-                           ReconcileActiveProjectionRuntimes),
-              ReconcileActiveProjectionSignature>);
-static_assert(std::is_same_v<
-              decltype(&IManagerSceneProjectionHandoffPort::
+              decltype(&IManagerSceneProjectionMaintenancePort::
                            ActiveProjectionHealth),
               ActiveProjectionHealthSignature>);
 
@@ -187,87 +180,17 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
     ProjectionNativeRuntimeBindingDTO binding = NativeBinding()) {
   return ProjectionHealthDTO{
       std::move(binding), 1U, ProjectionHealthState::kHealthy, projection,
-      std::nullopt,       1U, ContentDigest{kDigest},          std::nullopt,
+      1U, ContentDigest{kDigest}, std::nullopt,
   };
 }
 
-[[nodiscard]] ProjectionTransitionEvidenceDTO TransitionEvidence(
-    ProjectionTransitionEvidenceState state = ProjectionTransitionEvidenceState::kStaged) {
-  const auto predecessor = Projection();
-  const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
-  return ProjectionTransitionEvidenceDTO{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      ProjectionStageGeneration{1U},
-      predecessor,
-      candidate,
-      state,
-      {},
-      state == ProjectionTransitionEvidenceState::kUncertain
-          ? std::optional<ErrorDTO>{ErrorDTO{"projection_failed", "test uncertainty", {}}}
-          : std::nullopt,
-  };
-}
-
-[[nodiscard]] ProjectionTransitionEvidenceDTO FinalizedTransitionEvidence() {
-  auto evidence = TransitionEvidence(ProjectionTransitionEvidenceState::kFinalized);
-  const auto predecessor = evidence.predecessor_projection_revision;
-  const auto candidate = evidence.candidate_projection_revision;
-  evidence.transition_rows.push_back(ProjectionTransitionRowEvidenceDTO{
-      ProjectionTransitionRowDTO{
-          NativeBinding("provider-binding.a", "runtime.a"),
-          ProjectionTransitionDisposition::kRetained,
-          predecessor,
-      },
-      ProjectionTransitionRowEvidenceState::kCandidateActive,
-      candidate,
-      candidate,
-      HealthyProjection(candidate, NativeBinding("provider-binding.a", "runtime.a")),
-      std::nullopt,
-  });
-  evidence.transition_rows.push_back(ProjectionTransitionRowEvidenceDTO{
-      ProjectionTransitionRowDTO{
-          NativeBinding("provider-binding.b", "runtime.b"),
-          ProjectionTransitionDisposition::kAdded,
-          std::nullopt,
-      },
-      ProjectionTransitionRowEvidenceState::kCandidateActive,
-      candidate,
-      candidate,
-      HealthyProjection(candidate, NativeBinding("provider-binding.b", "runtime.b")),
-      std::nullopt,
-  });
-  evidence.transition_rows.push_back(ProjectionTransitionRowEvidenceDTO{
-      ProjectionTransitionRowDTO{
-          NativeBinding("provider-binding.c", "runtime.c"),
-          ProjectionTransitionDisposition::kRemoved,
-          predecessor,
-      },
-      ProjectionTransitionRowEvidenceState::kRemovedRetired,
-      std::nullopt,
-      std::nullopt,
-      ProjectionHealthDTO{
-          NativeBinding("provider-binding.c", "runtime.c"),
-          1U,
-          ProjectionHealthState::kUninitialized,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-      },
-      std::nullopt,
-  });
-  return evidence;
-}
 
 [[nodiscard]] ProjectionAggregateHealthDTO NamedAggregateHealth() {
   const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
   return ProjectionAggregateHealthDTO{
-      NamedApplyProjectionSetSourceDTO{
+      MaintenanceProjectionSetSourceDTO{
           ApplyId{"apply-1"},
           ApplyGeneration{1U},
-          ProjectionStageGeneration{1U},
           candidate,
       },
       ProjectionHealthState::kHealthy,
@@ -276,66 +199,6 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
           HealthyProjection(candidate, NativeBinding("provider-binding.b", "runtime.b")),
       },
       std::nullopt,
-  };
-}
-
-[[nodiscard]] RetainedBundleDTO RetainedBundle(const ProjectionRevisionDTO& projection) {
-  return RetainedBundleDTO{
-      std::string{kRetainedBundleApiVersion},
-      projection.retained_bundle_id,
-      DeploymentArtifactId{"deployment-1"},
-      DeploymentRevision{"deployment-revision-1"},
-      CellGraphDTO{
-          "manyforge.cell_graph.v1",
-          projection.graph_revision,
-          CellId{"cell-a"},
-          {},
-          {},
-          {},
-          {},
-          {},
-          {},
-      },
-      RetainedCatalogDTO{
-          "manyforge.catalog.v1",
-          ContentDigest{kDigest},
-          ContentDigest{kDigest},
-          {},
-          {},
-          RetainedNodeEnvironmentDTO{
-              "catalog-1",
-              "1",
-              ContentDigest{kDigest},
-              ContentDigest{kDigest},
-          },
-      },
-      {},
-      {},
-      {},
-      RetainedCompiledProductsDTO{
-          RetainedProductDTO{
-              ProductId{"planning-collision-model"},
-              RetainedProductKind::kPlanningCollisionModel,
-              ProductContractId{"planning-collision-contract"},
-              ProductContractRevision{"1"},
-              {},
-          },
-          std::nullopt,
-          {},
-          {},
-          {},
-      },
-      RetainedBundleProvenanceDTO{
-          ContentDigest{kDigest},
-          ContentDigest{kDigest},
-          {},
-          {},
-          {},
-      },
-      std::nullopt,
-      {},
-      std::nullopt,
-      {},
   };
 }
 
@@ -359,14 +222,12 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
       NamedApplyPublicationTransactionDTO{
           ApplyId{"apply-1"},
           ApplyGeneration{1U},
-          ProjectionStageGeneration{1U},
       },
       projection,
       projection.retained_bundle_id,
       projection.graph_revision,
       ActiveBundlePublicationGeneration{3U},
       ContentDigest{kDigest},
-      ContentDigest{kOtherDigest},
   };
 }
 
@@ -382,7 +243,6 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
       projection.graph_revision,
       std::nullopt,
       ContentDigest{kDigest},
-      ContentDigest{kOtherDigest},
   };
 }
 
@@ -635,9 +495,8 @@ TEST(ComponentManagerPortContracts, PublicationRejectsEmptyAndZeroTransactionIde
   ASSERT_TRUE(named.valid());
 
   named.transaction_ref = NamedApplyPublicationTransactionDTO{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      ProjectionStageGeneration{0U},
+      ApplyId{""},
+      ApplyGeneration{0U},
   };
   EXPECT_FALSE(named.valid());
 
@@ -670,7 +529,6 @@ TEST(ComponentManagerPortContracts, PublicationPresenceAndCompareAndSwapAreTrans
   stale.transaction_ref = NamedApplyPublicationTransactionDTO{
       ApplyId{"apply-2"},
       ApplyGeneration{1U},
-      ProjectionStageGeneration{1U},
   };
   stale.expected_previous_publication_generation = ActiveBundlePublicationGeneration{2U};
   EXPECT_THROW(store.PublishActiveBundle(stale), std::logic_error);
@@ -680,388 +538,6 @@ TEST(ComponentManagerPortContracts, PublicationPresenceAndCompareAndSwapAreTrans
   EXPECT_EQ(exact.value(), first);
 }
 
-TEST(ComponentManagerPortContracts, StagePresenceValidatorRejectsPartialPostCaptureTuple) {
-  const auto projection = Projection();
-  const ErrorDTO error{"projection_failed", "test failure", {}};
-
-  const ProjectionApplyStageResultDTO clean_rejection{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      projection,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      ProjectionApplyStageResultState::kRejected,
-      error,
-  };
-  EXPECT_TRUE(clean_rejection.presence_valid());
-
-  const ProjectionApplyStageResultDTO partial_capture{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      projection,
-      projection,
-      ProjectionStageGeneration{1U},
-      std::nullopt,
-      ProjectionApplyStageResultState::kFailedProjectionUncertain,
-      error,
-  };
-  EXPECT_FALSE(partial_capture.presence_valid());
-}
-
-TEST(ComponentManagerPortContracts, ApplyResultEvidencePhaseMustMatchClaimedPhase) {
-  const auto predecessor = Projection();
-  const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
-
-  ProjectionApplyActivationResultDTO activation{
-      ApplyId{"apply-1"}, ApplyGeneration{1U},
-      predecessor,        ProjectionStageGeneration{1U},
-      candidate,          ProjectionApplyActivationResultState::kActivated,
-      candidate,          TransitionEvidence(),
-      std::nullopt,
-  };
-  EXPECT_FALSE(activation.presence_valid());
-  activation.transition_evidence =
-      TransitionEvidence(ProjectionTransitionEvidenceState::kActivatedAndRetired);
-  EXPECT_TRUE(activation.presence_valid());
-
-  ProjectionApplyDiscardResultDTO discard{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      ProjectionStageGeneration{1U},
-      candidate,
-      predecessor,
-      ProjectionApplyDiscardResultState::kDiscarded,
-      TransitionEvidence(),
-      std::nullopt,
-  };
-  EXPECT_FALSE(discard.presence_valid());
-  discard.transition_evidence = TransitionEvidence(ProjectionTransitionEvidenceState::kAborted);
-  EXPECT_TRUE(discard.presence_valid());
-
-  ProjectionApplyFinalizeResultDTO finalize{
-      ApplyId{"apply-1"}, ApplyGeneration{1U},       ProjectionStageGeneration{1U},
-      candidate,          NamedPublicationReceipt(), ProjectionApplyFinalizeResultState::kFinalized,
-      candidate,          TransitionEvidence(),      NamedAggregateHealth(),
-      std::nullopt,
-  };
-  EXPECT_FALSE(finalize.presence_valid());
-  finalize.transition_evidence = FinalizedTransitionEvidence();
-  EXPECT_TRUE(finalize.presence_valid());
-
-  finalize.candidate_aggregate_health.native_projection_health.pop_back();
-  EXPECT_FALSE(finalize.presence_valid());
-  finalize.candidate_aggregate_health = NamedAggregateHealth();
-  finalize.candidate_aggregate_health.native_projection_health.push_back(
-      HealthyProjection(candidate, NativeBinding("provider-binding.z", "runtime.z")));
-  EXPECT_FALSE(finalize.presence_valid());
-  finalize.candidate_aggregate_health = NamedAggregateHealth();
-  finalize.candidate_aggregate_health.native_projection_health.front().native_runtime_binding =
-      NativeBinding("provider-binding.aa", "runtime.aa");
-  ASSERT_TRUE(finalize.candidate_aggregate_health.valid());
-  EXPECT_FALSE(finalize.presence_valid());
-  finalize.candidate_aggregate_health = NamedAggregateHealth();
-
-  finalize.transition_evidence.state = static_cast<ProjectionTransitionEvidenceState>(999);
-  EXPECT_FALSE(finalize.presence_valid());
-  finalize.state = static_cast<ProjectionApplyFinalizeResultState>(999);
-  EXPECT_FALSE(finalize.presence_valid());
-}
-
-TEST(ComponentManagerPortContracts, TransitionEvidenceRowsCannotContradictLocalPhase) {
-  const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
-  auto evidence = TransitionEvidence();
-  auto staged_health = HealthyProjection(candidate);
-  staged_health.active_projection_revision.reset();
-  staged_health.staged_candidate = ProjectionStagedCandidateDTO{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      ProjectionStageGeneration{1U},
-      candidate,
-  };
-  evidence.transition_rows.push_back(ProjectionTransitionRowEvidenceDTO{
-      ProjectionTransitionRowDTO{
-          NativeBinding(),
-          ProjectionTransitionDisposition::kAdded,
-          std::nullopt,
-      },
-      ProjectionTransitionRowEvidenceState::kCandidateActive,
-      candidate,
-      std::nullopt,
-      staged_health,
-      std::nullopt,
-  });
-
-  EXPECT_FALSE(evidence.phase_consistent(ProjectionTransitionEvidenceState::kStaged));
-  auto& staged_row = evidence.transition_rows.front();
-  staged_row.state = ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect;
-  EXPECT_TRUE(evidence.phase_consistent(ProjectionTransitionEvidenceState::kStaged));
-
-  staged_row.resulting_health->active_projection_revision = candidate;
-  EXPECT_FALSE(evidence.phase_consistent(ProjectionTransitionEvidenceState::kStaged));
-  staged_row.resulting_health->active_projection_revision.reset();
-  staged_row.resulting_health->state = ProjectionHealthState::kUnavailable;
-  EXPECT_FALSE(evidence.phase_consistent(ProjectionTransitionEvidenceState::kStaged));
-
-  const auto predecessor = Projection();
-  auto aborted = TransitionEvidence(ProjectionTransitionEvidenceState::kAborted);
-  aborted.transition_rows.push_back(ProjectionTransitionRowEvidenceDTO{
-      ProjectionTransitionRowDTO{
-          NativeBinding(),
-          ProjectionTransitionDisposition::kRemoved,
-          predecessor,
-      },
-      ProjectionTransitionRowEvidenceState::kPredecessorUnchanged,
-      candidate,
-      predecessor,
-      HealthyProjection(predecessor),
-      std::nullopt,
-  });
-  EXPECT_FALSE(aborted.phase_consistent(ProjectionTransitionEvidenceState::kAborted));
-  aborted.transition_rows.front().acknowledged_staged_candidate_revision.reset();
-  EXPECT_TRUE(aborted.phase_consistent(ProjectionTransitionEvidenceState::kAborted));
-
-  auto uncertain = TransitionEvidence(ProjectionTransitionEvidenceState::kUncertain);
-  ASSERT_TRUE(uncertain.valid());
-  uncertain.error.reset();
-  EXPECT_FALSE(uncertain.valid());
-
-  auto finalized = FinalizedTransitionEvidence();
-  ASSERT_TRUE(finalized.valid());
-  finalized.transition_rows.back().resulting_health->staged_candidate = ProjectionStagedCandidateDTO{
-      finalized.apply_id,
-      finalized.apply_generation,
-      finalized.projection_stage_generation,
-      finalized.candidate_projection_revision,
-  };
-  EXPECT_FALSE(finalized.valid());
-}
-
-TEST(ComponentManagerPortContracts, ManagedWithdrawalIsNotNativeHealthOrCleanAbort) {
-  auto evidence = TransitionEvidence();
-  const auto binding = NativeBinding();
-  const ManagedRuntimeWithdrawalDTO receipt{evidence.apply_id,
-                                            evidence.apply_generation,
-                                            ContentDigest(std::string(kDigest)),
-                                            binding.runtime_unit_id,
-                                            binding.runtime_epoch,
-                                            ContentDigest(std::string(kDigest)),
-                                            ContentDigest(std::string(kOtherDigest)),
-                                            "manager-supervisor",
-                                            7U};
-  evidence.transition_rows.push_back({{binding, ProjectionTransitionDisposition::kRemoved,
-                                       evidence.predecessor_projection_revision, receipt},
-                                      ProjectionTransitionRowEvidenceState::kRemovedRetired,
-                                      std::nullopt,
-                                      std::nullopt,
-                                      std::nullopt,
-                                      std::nullopt});
-  for (const auto phase : {ProjectionTransitionEvidenceState::kStaged,
-                           ProjectionTransitionEvidenceState::kActivatedAndRetired,
-                           ProjectionTransitionEvidenceState::kFinalized}) {
-    evidence.state = phase;
-    EXPECT_TRUE(evidence.valid());
-  }
-  evidence.state = ProjectionTransitionEvidenceState::kAborted;
-  EXPECT_FALSE(evidence.valid());
-  evidence.state = ProjectionTransitionEvidenceState::kStaged;
-  auto& row = evidence.transition_rows.front();
-  row.resulting_health = HealthyProjection(evidence.predecessor_projection_revision);
-  EXPECT_FALSE(evidence.valid());
-  row.resulting_health.reset();
-  row.transition_row.disposition = ProjectionTransitionDisposition::kRetained;
-  EXPECT_FALSE(evidence.valid());
-  row.transition_row.disposition = ProjectionTransitionDisposition::kRemoved;
-  row.transition_row.managed_withdrawal->apply_generation = ApplyGeneration(2U);
-  EXPECT_FALSE(evidence.valid());
-  row.transition_row.managed_withdrawal = receipt;
-  evidence.state = ProjectionTransitionEvidenceState::kUncertain;
-  evidence.error = ErrorDTO{"candidate_failed", "replacement failed", {}};
-  EXPECT_TRUE(evidence.valid());
-  row.transition_row.managed_withdrawal.reset();
-  EXPECT_FALSE(evidence.valid());
-}
-
-TEST(ComponentManagerPortContracts, TransitionInputAndEvidenceRowsRequireCanonicalUniqueBindings) {
-  const ProjectionTransitionRowDTO first{
-      NativeBinding("provider-binding.a", "runtime.a"),
-      ProjectionTransitionDisposition::kAdded,
-      std::nullopt,
-  };
-  const ProjectionTransitionRowDTO second{
-      NativeBinding("provider-binding.b", "runtime.b"),
-      ProjectionTransitionDisposition::kAdded,
-      std::nullopt,
-  };
-  std::vector<ProjectionTransitionRowDTO> input_rows{first, second};
-  EXPECT_TRUE(CanonicalProjectionTransitionRows(input_rows));
-  std::swap(input_rows[0], input_rows[1]);
-  EXPECT_FALSE(CanonicalProjectionTransitionRows(input_rows));
-  input_rows = {first, first};
-  EXPECT_FALSE(CanonicalProjectionTransitionRows(input_rows));
-
-  auto evidence = TransitionEvidence();
-  const ProjectionStagedCandidateDTO staged_candidate{
-      evidence.apply_id,
-      evidence.apply_generation,
-      evidence.projection_stage_generation,
-      evidence.candidate_projection_revision,
-  };
-  const auto evidence_row = [&evidence,
-                             &staged_candidate](const ProjectionTransitionRowDTO& transition_row) {
-    return ProjectionTransitionRowEvidenceDTO{
-        transition_row,
-        ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect,
-        evidence.candidate_projection_revision,
-        transition_row.expected_local_active,
-        ProjectionHealthDTO{
-            transition_row.native_runtime_binding,
-            1U,
-            ProjectionHealthState::kUninitialized,
-            transition_row.expected_local_active,
-            staged_candidate,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-        },
-        std::nullopt,
-    };
-  };
-  evidence.transition_rows = {
-      evidence_row(first),
-      evidence_row(second),
-  };
-  EXPECT_TRUE(evidence.valid());
-  std::swap(evidence.transition_rows[0], evidence.transition_rows[1]);
-  EXPECT_FALSE(evidence.valid());
-  evidence.transition_rows = {
-      evidence_row(first),
-      evidence_row(first),
-  };
-  EXPECT_FALSE(evidence.valid());
-}
-
-TEST(ComponentManagerPortContracts,
-     ActiveRuntimeRecoverySetIsCanonicalAndGenerationExact) {
-  const auto target = Projection();
-  const auto first = NativeBinding("provider-binding.a", "runtime.a");
-  const auto second = NativeBinding("provider-binding.b", "runtime.b");
-  ActiveProjectionRuntimeSetDTO runtime_set{target, {first, second}};
-  ASSERT_TRUE(runtime_set.valid());
-
-  std::swap(runtime_set.native_runtime_bindings[0],
-            runtime_set.native_runtime_bindings[1]);
-  EXPECT_FALSE(runtime_set.valid());
-  runtime_set.native_runtime_bindings = {first, first};
-  EXPECT_FALSE(runtime_set.valid());
-  auto replacement_epoch = first;
-  replacement_epoch.runtime_epoch = RuntimeEpoch("runtime-epoch-2");
-  runtime_set.native_runtime_bindings = {first, replacement_epoch};
-  EXPECT_FALSE(runtime_set.valid());
-  auto replacement_runtime = first;
-  replacement_runtime.runtime_unit_id = RuntimeUnitId("runtime.z");
-  runtime_set.native_runtime_bindings = {first, replacement_runtime};
-  EXPECT_FALSE(runtime_set.valid());
-
-  runtime_set.native_runtime_bindings = {first, second};
-  EXPECT_TRUE((ActiveProjectionRuntimeRecoveryResultDTO{
-                  runtime_set,
-                  ActiveProjectionRuntimeRecoveryState::kCurrent,
-                  std::nullopt,
-              }
-                   .valid()));
-  EXPECT_FALSE((ActiveProjectionRuntimeRecoveryResultDTO{
-                   runtime_set,
-                   ActiveProjectionRuntimeRecoveryState::kRecovered,
-                   std::nullopt,
-               }
-                    .valid()));
-  EXPECT_TRUE((ActiveProjectionRuntimeRecoveryResultDTO{
-                  runtime_set,
-                  ActiveProjectionRuntimeRecoveryState::kRecovered,
-                  NativeProjectionRecoveryGeneration(1U),
-              }
-                   .valid()));
-  EXPECT_FALSE((ActiveProjectionRuntimeRecoveryResultDTO{
-                   runtime_set,
-                   ActiveProjectionRuntimeRecoveryState::kCurrent,
-                   NativeProjectionRecoveryGeneration(0U),
-               }
-                    .valid()));
-}
-
-TEST(ComponentManagerPortContracts, TransitionDispositionRequiresTheExactPredecessor) {
-  const auto predecessor = Projection();
-  const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
-  const auto binding = NativeBinding();
-
-  ProjectionTransitionRowDTO row{
-      binding,
-      ProjectionTransitionDisposition::kAdded,
-      std::nullopt,
-  };
-  EXPECT_TRUE(row.valid());
-  EXPECT_TRUE(row.matches_predecessor(predecessor));
-  row.expected_local_active = predecessor;
-  EXPECT_FALSE(row.valid());
-
-  row = ProjectionTransitionRowDTO{
-      binding,
-      ProjectionTransitionDisposition::kRetained,
-      std::nullopt,
-  };
-  EXPECT_FALSE(row.valid());
-  row.expected_local_active = candidate;
-  EXPECT_TRUE(row.valid());
-  EXPECT_FALSE(row.matches_predecessor(predecessor));
-  row.expected_local_active = predecessor;
-  EXPECT_TRUE(row.matches_predecessor(predecessor));
-
-  row.disposition = ProjectionTransitionDisposition::kRemoved;
-  EXPECT_TRUE(row.matches_predecessor(predecessor));
-  row.expected_local_active.reset();
-  EXPECT_FALSE(row.valid());
-
-  ProjectionApplyStageDTO stage{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      predecessor,
-      RetainedBundle(predecessor),
-      RetainedBundle(candidate),
-      {{
-          binding,
-          ProjectionTransitionDisposition::kRetained,
-          predecessor,
-      }},
-  };
-  EXPECT_TRUE(stage.valid());
-  stage.native_transition_rows.front().expected_local_active = candidate;
-  EXPECT_FALSE(stage.valid());
-
-  auto evidence = TransitionEvidence();
-  auto health = HealthyProjection(predecessor);
-  health.staged_candidate = ProjectionStagedCandidateDTO{
-      evidence.apply_id,
-      evidence.apply_generation,
-      evidence.projection_stage_generation,
-      candidate,
-  };
-  evidence.transition_rows.push_back(ProjectionTransitionRowEvidenceDTO{
-      ProjectionTransitionRowDTO{
-          binding,
-          ProjectionTransitionDisposition::kRetained,
-          predecessor,
-      },
-      ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect,
-      candidate,
-      predecessor,
-      health,
-      std::nullopt,
-  });
-  EXPECT_TRUE(evidence.valid());
-  evidence.transition_rows.front().transition_row.expected_local_active = candidate;
-  EXPECT_FALSE(evidence.structurally_valid());
-}
 
 TEST(ComponentManagerPortContracts, AggregateHealthForTargetRejectsContradictionsAndBadOrder) {
   const auto target = Projection(kOtherDigest, kOtherDigest, 2U);
@@ -1085,15 +561,6 @@ TEST(ComponentManagerPortContracts, AggregateHealthForTargetRejectsContradiction
 
   aggregate = NamedAggregateHealth();
   aggregate.native_projection_health.front().active_projection_revision = Projection();
-  EXPECT_FALSE(aggregate.healthy_for_target(target));
-
-  aggregate = NamedAggregateHealth();
-  aggregate.native_projection_health.front().staged_candidate = ProjectionStagedCandidateDTO{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      ProjectionStageGeneration{1U},
-      target,
-  };
   EXPECT_FALSE(aggregate.healthy_for_target(target));
 
   aggregate = NamedAggregateHealth();
@@ -1137,95 +604,9 @@ TEST(ComponentManagerPortContracts, AggregateBindingEqualityRejectsOmissionExtra
   EXPECT_FALSE(EqualCanonicalProjectionHealthBindings(expected, observed));
 }
 
-TEST(ComponentManagerPortContracts, ApplyStatusPresenceIsClosedForPublishedFinalizedAndDiscarded) {
-  const auto predecessor = Projection();
-  const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
-  const auto receipt = NamedPublicationReceipt();
-
-  ProjectionApplyStatusDTO status{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      predecessor,
-      ProjectionStageGeneration{1U},
-      candidate,
-      ProjectionApplyStatusState::kPublished,
-      TransitionEvidence(),
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-  };
-  EXPECT_FALSE(status.presence_valid());
-
-  status.publication_receipt = receipt;
-  EXPECT_FALSE(status.presence_valid());
-  status.transition_evidence =
-      TransitionEvidence(ProjectionTransitionEvidenceState::kActivatedAndRetired);
-  EXPECT_TRUE(status.presence_valid());
-
-  status.state = ProjectionApplyStatusState::kFinalized;
-  EXPECT_FALSE(status.presence_valid());
-  status.transition_evidence = FinalizedTransitionEvidence();
-  EXPECT_FALSE(status.presence_valid());
-  status.candidate_aggregate_health = NamedAggregateHealth();
-  EXPECT_TRUE(status.presence_valid());
-  status.candidate_aggregate_health->native_projection_health.pop_back();
-  EXPECT_FALSE(status.presence_valid());
-  status.candidate_aggregate_health = NamedAggregateHealth();
-  status.candidate_aggregate_health->state = ProjectionHealthState::kUnavailable;
-  EXPECT_FALSE(status.presence_valid());
-
-  status.state = ProjectionApplyStatusState::kStaged;
-  EXPECT_FALSE(status.presence_valid());
-
-  status = ProjectionApplyStatusDTO{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      predecessor,
-      ProjectionStageGeneration{1U},
-      candidate,
-      ProjectionApplyStatusState::kStaged,
-      TransitionEvidence(),
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-  };
-  EXPECT_TRUE(status.presence_valid());
-  status.state = ProjectionApplyStatusState::kActivated;
-  EXPECT_FALSE(status.presence_valid());
-
-  status = ProjectionApplyStatusDTO{
-      ApplyId{"apply-1"}, ApplyGeneration{1U},
-      predecessor,        ProjectionStageGeneration{1U},
-      std::nullopt,       ProjectionApplyStatusState::kDiscarded,
-      std::nullopt,       std::nullopt,
-      std::nullopt,       std::nullopt,
-  };
-  EXPECT_FALSE(status.presence_valid());
-  status.candidate_projection_revision = candidate;
-  status.transition_evidence = TransitionEvidence(ProjectionTransitionEvidenceState::kAborted);
-  EXPECT_TRUE(status.presence_valid());
-}
-
-TEST(ComponentManagerPortContracts, ResultPresenceRejectsFabricatedSuccessEvidence) {
-  const auto predecessor = Projection();
-  const auto candidate = Projection(kOtherDigest, kOtherDigest, 2U);
+TEST(ComponentManagerPortContracts,
+     BootstrapResultPresenceRejectsFabricatedSuccessEvidence) {
   const ErrorDTO error{"projection_failed", "test failure", {}};
-
-  ProjectionApplyActivationResultDTO activation{
-      ApplyId{"apply-1"},
-      ApplyGeneration{1U},
-      predecessor,
-      ProjectionStageGeneration{1U},
-      candidate,
-      ProjectionApplyActivationResultState::kActivated,
-      candidate,
-      TransitionEvidence(ProjectionTransitionEvidenceState::kActivatedAndRetired),
-      std::nullopt,
-  };
-  EXPECT_TRUE(activation.presence_valid());
-  activation.state = ProjectionApplyActivationResultState::kStale;
-  activation.error = error;
-  EXPECT_FALSE(activation.presence_valid());
 
   ProjectionBootstrapRebuildResultDTO rebuild{
       BootstrapId{"bootstrap-1"},

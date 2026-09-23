@@ -4620,93 +4620,32 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(bootstrap_status.state,
             core::NativeProjectionBootstrapStatusState::kRebuilt);
 
-  const core::NativeProjectionRetireDTO retire_request{
-      core::ApplyId("remove-native-host"),
-      core::ApplyGeneration(4U),
-      core::ProjectionStageGeneration(1U),
-      core::ProjectionTransitionRowDTO{
-          native_binding, core::ProjectionTransitionDisposition::kRemoved,
-          candidate_revision},
-      candidate_revision,
-      candidate_revision};
-  const auto retire_pending = bootstrap_projection->ProjectionRetireStatus(
-      core::NativeProjectionRetireStatusQueryDTO{retire_request});
-  EXPECT_EQ(retire_pending.state,
-            core::NativeProjectionRetireStatusState::kPending);
-  const auto retired = bootstrap_projection->RetireProjection(retire_request);
-  ASSERT_TRUE(retired.presence_valid());
-  EXPECT_EQ(retired.state, core::NativeProjectionRetireResultState::kRetired);
-  EXPECT_EQ(bootstrap_projection->snapshot(), nullptr);
-  const auto retired_replay =
-      bootstrap_projection->RetireProjection(retire_request);
-  EXPECT_EQ(retired_replay.state,
-            core::NativeProjectionRetireResultState::kRetired);
-  const auto retired_status = bootstrap_projection->ProjectionRetireStatus(
-      core::NativeProjectionRetireStatusQueryDTO{retire_request});
-  EXPECT_EQ(retired_status.state,
-            core::NativeProjectionRetireStatusState::kRetired);
-
   const core::ProjectionNativeRuntimeBindingDTO added_binding{
       core::CapabilityProviderBindingId("lite6_added_planner_binding"),
       core::CapabilityProviderBindingRevision("added-binding-revision"),
       core::RuntimeUnitId("added-native-execution-host"),
       core::RuntimeEpoch("added-native-execution-host-epoch-1")};
-  std::int64_t stage_clock = 300;
+  std::int64_t added_clock = 300;
   auto added_projection_result =
       RetainedPlannerSceneProjection::CreateUninitialized(
           collision_projector, products.planning_collision_model, added_binding,
           RetainedPlannerSceneProjectionConfig{
               "retained-lite6-added-projection", 8U, 8U},
-          [&stage_clock] { return stage_clock++; });
+          [&added_clock] { return added_clock++; });
   ASSERT_TRUE(added_projection_result.ok())
       << added_projection_result.error().message;
   auto added_projection = added_projection_result.value();
-  const core::NativeProjectionStageDTO stage_request{
-      core::ApplyId("add-native-host"),
-      core::ApplyGeneration(5U),
-      core::ProjectionStageGeneration(2U),
-      core::ProjectionTransitionRowDTO{
-          added_binding, core::ProjectionTransitionDisposition::kAdded,
-          std::nullopt},
-      candidate_revision,
-      candidate_revision,
-      products.planning_collision_model,
-      core::LogicalSceneSnapshotRoot(
-          std::make_shared<const core::LogicalSceneSnapshotDTO>(
-              candidate_scene))};
-  const auto staged = added_projection->StageProjection(stage_request);
-  ASSERT_TRUE(staged.presence_valid());
-  EXPECT_EQ(staged.state, core::NativeProjectionStageResultState::kStaged);
-  EXPECT_EQ(added_projection->snapshot(), nullptr);
-  const core::NativeProjectionStatusQueryDTO stage_query{
-      stage_request.apply_id, stage_request.apply_generation,
-      stage_request.projection_stage_generation, stage_request.transition_row};
-  const auto staged_status =
-      added_projection->ProjectionStageStatus(stage_query);
-  EXPECT_EQ(staged_status.state, core::NativeProjectionStatusState::kStaged);
-  const core::NativeProjectionActivationDTO activation_request{
-      stage_request.apply_id,
-      stage_request.apply_generation,
-      stage_request.projection_stage_generation,
-      stage_request.transition_row,
-      stage_request.expected_predecessor_projection_revision,
-      stage_request.candidate_projection_revision};
-  const auto activated =
-      added_projection->ActivateStagedProjection(activation_request);
-  ASSERT_TRUE(activated.presence_valid());
-  EXPECT_EQ(activated.state,
-            core::NativeProjectionActivationResultState::kActivated);
+  const core::NativeProjectionRebuildDTO added_rebuild{
+      added_binding, candidate_revision, products.planning_collision_model,
+      std::make_shared<const core::LogicalSceneSnapshotDTO>(candidate_scene)};
+  const auto added = added_projection->RebuildProjection(added_rebuild);
+  ASSERT_TRUE(added.presence_valid());
   EXPECT_TRUE(added_projection->ProjectionHealth().healthy_for_target(
       candidate_revision));
   EXPECT_NE(added_projection->snapshot(), nullptr);
-  const auto activated_replay =
-      added_projection->ActivateStagedProjection(activation_request);
-  EXPECT_EQ(activated_replay.state,
-            core::NativeProjectionActivationResultState::kActivated);
-  const auto activated_status =
-      added_projection->ProjectionStageStatus(stage_query);
-  EXPECT_EQ(activated_status.state,
-            core::NativeProjectionStatusState::kActivated);
+  const auto added_replay = added_projection->RebuildProjection(added_rebuild);
+  EXPECT_EQ(added_replay.native_projection_generation,
+            added.native_projection_generation);
 }
 
 TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExactAlternatingKeys) {
@@ -5202,7 +5141,7 @@ TEST(RetainedProductCrossConsumer,
 
 TEST(
     RetainedProductCrossConsumer,
-    PlannerSceneProjectionStagesWithoutFabricatedFrameStateBeforeDirectInstall) {
+    PlannerSceneProjectionRebuildsWithoutFabricatedFrameState) {
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
       temporary.path() / "retained-package";
@@ -5303,22 +5242,13 @@ TEST(
   const auto predecessor_world = projection->snapshot();
   ASSERT_NE(predecessor_world, nullptr);
 
-  const core::NativeProjectionStageDTO request{
-      core::ApplyId("cross-bundle-apply"),
-      core::ApplyGeneration(8U),
-      core::ProjectionStageGeneration(3U),
-      core::ProjectionTransitionRowDTO{
-          binding, core::ProjectionTransitionDisposition::kRetained,
-          predecessor_revision},
-      predecessor_revision,
-      candidate_revision,
+  const core::NativeProjectionRebuildDTO request{
+      binding, candidate_revision,
       candidate.bundle->value().compiled_products.planning_collision_model,
-      core::LogicalSceneSnapshotRoot(
-          std::make_shared<const core::LogicalSceneSnapshotDTO>(
-              initial_scene))};
-  const auto unprepared = projection->StageProjection(request);
-  EXPECT_EQ(unprepared.state,
-            core::NativeProjectionStageResultState::kRejected);
+      std::make_shared<const core::LogicalSceneSnapshotDTO>(initial_scene)};
+  const auto unprepared = projection->RebuildProjection(request);
+  EXPECT_EQ(unprepared.result,
+            core::ProjectionCommitResultStateDTO::kRejectedRollbackProven);
   ASSERT_TRUE(unprepared.error.has_value());
   EXPECT_EQ(unprepared.error->details.at("reason"),
             "native_projection_candidate_model_not_prepared");
@@ -5327,26 +5257,8 @@ TEST(
   const auto prepared = projection->PrepareCandidateProjection(
       std::move(candidate_projector), request.planning_collision_model);
   ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-  const auto staged = projection->StageProjection(request);
-  ASSERT_TRUE(staged.presence_valid());
-  EXPECT_EQ(staged.state, core::NativeProjectionStageResultState::kStaged);
-  EXPECT_EQ(projection->snapshot(), predecessor_world);
-  const auto staged_health = projection->ProjectionHealth();
-  EXPECT_EQ(staged_health.state, core::ProjectionHealthState::kHealthy);
-  EXPECT_EQ(staged_health.active_projection_revision, predecessor_revision);
-  EXPECT_TRUE(staged_health.staged_candidate.has_value());
-
-  const core::NativeProjectionActivationDTO activation{
-      request.apply_id,
-      request.apply_generation,
-      request.projection_stage_generation,
-      request.transition_row,
-      request.expected_predecessor_projection_revision,
-      request.candidate_projection_revision};
-  const auto activated = projection->ActivateStagedProjection(activation);
-  ASSERT_TRUE(activated.presence_valid());
-  EXPECT_EQ(activated.state,
-            core::NativeProjectionActivationResultState::kActivated);
+  const auto rebuilt = projection->RebuildProjection(request);
+  ASSERT_TRUE(rebuilt.presence_valid());
   EXPECT_TRUE(
       projection->ProjectionHealth().healthy_for_target(candidate_revision));
   EXPECT_EQ(projection->collision_shared_model(), candidate_shared_model);

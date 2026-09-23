@@ -122,12 +122,16 @@ set(
 set(
   MANYFORGE_BOUNDED_HISTORY_MIGRATION
   "${CMAKE_CURRENT_SOURCE_DIR}/resources/004_bounded_history.sql")
+set(
+  MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/005_maintenance_initialization.sql")
 set_property(
   DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA}"
   "${MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION}"
   "${MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION}"
-  "${MANYFORGE_BOUNDED_HISTORY_MIGRATION}")
+  "${MANYFORGE_BOUNDED_HISTORY_MIGRATION}"
+  "${MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION}")
 file(READ
   "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA}"
   MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_SQL)
@@ -140,6 +144,9 @@ file(READ
 file(READ
   "${MANYFORGE_BOUNDED_HISTORY_MIGRATION}"
   MANYFORGE_BOUNDED_HISTORY_MIGRATION_SQL)
+file(READ
+  "${MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION}"
+  MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION_SQL)
 string(
   FIND
   "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_SQL}"
@@ -178,6 +185,16 @@ string(
 if(NOT MANYFORGE_BOUNDED_HISTORY_MIGRATION_DELIMITER_COLLISION EQUAL -1)
   message(FATAL_ERROR
     "bounded-history migration collides with its generated-header "
+    "raw-string delimiter")
+endif()
+string(
+  FIND
+  "${MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION_SQL}"
+  ")mf_mim\""
+  MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION_DELIMITER_COLLISION)
+if(NOT MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION_DELIMITER_COLLISION EQUAL -1)
+  message(FATAL_ERROR
+    "maintenance-initialization migration collides with its generated-header "
     "raw-string delimiter")
 endif()
 configure_file(
@@ -316,65 +333,4 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_canonical_empty_scene_owner
     PROPERTIES TIMEOUT ${MANYFORGE_SCENE_GTEST_TIMEOUT_SECONDS})
 
-  set(
-    MANYFORGE_COMPONENT_MANAGER_SOURCE_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_component_manager"
-    CACHE PATH
-    "Path to the manyforge_component_manager source tree for integration proof")
-  if(NOT TARGET manyforge::component_manager)
-    if(NOT EXISTS
-       "${MANYFORGE_COMPONENT_MANAGER_SOURCE_DIR}/include/manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp")
-      message(FATAL_ERROR
-        "manyforge_scene integration proof requires the Component Manager "
-        "canonical-empty coordinator")
-    endif()
-    set(_MANYFORGE_SCENE_MANAGER_BUILD_TESTING "${BUILD_TESTING}")
-    set(BUILD_TESTING OFF)
-    add_subdirectory(
-      "${MANYFORGE_COMPONENT_MANAGER_SOURCE_DIR}"
-      "${CMAKE_CURRENT_BINARY_DIR}/manyforge_component_manager"
-      EXCLUDE_FROM_ALL)
-    set(BUILD_TESTING "${_MANYFORGE_SCENE_MANAGER_BUILD_TESTING}")
-  endif()
-  if(NOT TARGET manyforge::component_manager)
-    message(FATAL_ERROR
-      "manyforge_scene could not resolve the Component Manager integration "
-      "target")
-  endif()
-
-  add_executable(test_canonical_empty_scene_manager_integration
-    test/test_canonical_empty_scene_manager_integration.cpp)
-  add_dependencies(
-    test_canonical_empty_scene_manager_integration
-    manyforge_scene_test_canonical_empty_package)
-  target_compile_definitions(
-    test_canonical_empty_scene_manager_integration PRIVATE
-    MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
-  target_link_libraries(
-    test_canonical_empty_scene_manager_integration PRIVATE
-    manyforge_scene
-    manyforge::component_manager
-    manyforge::deployment_admission
-    GTest::gtest_main)
-  gtest_discover_tests(test_canonical_empty_scene_manager_integration
-    PROPERTIES TIMEOUT ${MANYFORGE_SCENE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_component_manager_m0_process
-    test/test_component_manager_m0_process.cpp)
-  add_dependencies(
-    test_component_manager_m0_process
-    manyforge_scene_test_canonical_empty_package)
-  target_compile_definitions(
-    test_component_manager_m0_process PRIVATE
-    MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
-  target_include_directories(test_component_manager_m0_process PRIVATE
-    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
-    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
-  target_link_libraries(test_component_manager_m0_process PRIVATE
-    manyforge_scene
-    manyforge::component_manager
-    manyforge::deployment
-    GTest::gtest_main)
-  gtest_discover_tests(test_component_manager_m0_process
-    PROPERTIES TIMEOUT ${MANYFORGE_SCENE_GTEST_TIMEOUT_SECONDS})
 endif()

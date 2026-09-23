@@ -2,6 +2,7 @@
 
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
+#include <manyforge_core/ports/imanager_scene_projection.hpp>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -60,7 +61,8 @@ struct ManagerApplyFenceReleaseResult final {
   ManagerApplyFenceReleasePath path;
 };
 
-/// Releases one named-Apply Kernel fence only after scene Finalize is durable.
+/// Releases one named-Apply Kernel fence only after Scene reports the exact
+/// publication as completed.
 ///
 /// Every nonterminal invocation observes exact Kernel status before any
 /// Release call. The complete compare-and-swap request is journaled first.
@@ -69,6 +71,8 @@ class ManagerApplyFenceReleaseCoordinator final {
  public:
   ManagerApplyFenceReleaseCoordinator(SqliteManagerApplyJournal& apply_journal,
                                       manyforge::core::IManagerKernelApplyFencePort& kernel_fence,
+                                      manyforge::core::IManagerSceneProjectionMaintenancePort&
+                                          scene_owner,
                                       manyforge::core::RuntimeEpoch manager_runtime_epoch);
 
   [[nodiscard]] ManagerApplyFenceReleaseResult ReleaseOrRecover(
@@ -81,6 +85,7 @@ class ManagerApplyFenceReleaseCoordinator final {
  private:
   SqliteManagerApplyJournal& apply_journal_;
   manyforge::core::IManagerKernelApplyFencePort& kernel_fence_;
+  manyforge::core::IManagerSceneProjectionMaintenancePort& scene_owner_;
   manyforge::core::RuntimeEpoch manager_runtime_epoch_;
   std::mutex operation_mutex_;
 };

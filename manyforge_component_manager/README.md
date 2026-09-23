@@ -9,13 +9,13 @@ Composable Cell Component Manager. It currently owns these bounded mechanisms:
 - the separate durable `IActiveBundlePublicationStore` public-pointer owner;
 - a typed durable journal for immutable named-Apply intent, affected scope,
   Kernel-fence recovery, runtime-convergence intent, complete staged-ready
-  evidence, scene stage/activation, selected-bundle publication, Finalize,
+  evidence, Scene-owned maintenance initialization, selected-bundle publication,
   fence release, and terminal success;
 - the canonical-empty prerequisite/Begin coordinator that consumes the sealed
   I3 admission, durably records the scene-owner-accepted target, and advances
-  that exact zero-native target through Rebuild, publication, and Finalize;
+  that exact zero-native target through Rebuild, publication, and completion;
 - the whole-Apply affected-scope/fence coordinator, observe-first runtime
-  convergence coordinator, scene stage/activation and selected-bundle
+  convergence coordinator, Scene maintenance initialization and selected-bundle
   completion coordinators;
 - closed concrete Linux/POSIX adapters for the exact I3-qualified reference
   and native runtime products, including direct-child epoch observation and a
@@ -140,8 +140,8 @@ printable-ASCII bytes per identity, and a 64 MiB main database page image.
 The Apply journal stores the exact immutable named transaction and predecessor
 projection, canonical affected scope, complete Kernel-fence attempt and
 acceptance, aggregate runtime-convergence intent, bounded staged-ready
-generations, scene stage and activation records, selected private bundle and
-obsolete-surface disposition, publication and Finalize evidence, fence-release
+generations, selected private bundle and obsolete-surface disposition,
+publication, fence-release
 intent/receipt, and terminal success. Each record family is immutable,
 parent-linked, bounded, and replay-checked. The focused
 `ManagerApplyFenceCoordinator`
@@ -165,8 +165,8 @@ attempts, 64 domains, 256 bindings, and 1,024 resources per attempt, with at
 most 4,096 staged-ready sets globally and 16 per Apply, bounded text fields,
 and a 64 MiB main database page image.
 
-`ManagerApplyRuntimeConvergenceCoordinator` independently reloads the sealed
-predecessor/candidate products, derives the complete candidate runtime plan,
+`ManagerApplyRuntimeConvergenceCoordinator` receives the sole Apply-local
+verified predecessor/candidate capture, derives the complete candidate runtime plan,
 rehydrates the accepted Kernel fence, persists that aggregate before a process
 effect, observes every process before any managed start, and joins fresh direct
 status with Manager-local presence, dependency, and predecessor-publication
@@ -178,16 +178,19 @@ coordinator admits only the build-qualified retained POSIX reference product;
 unsupported external or replacement products fail before fence or process
 effects.
 
-`ManagerSceneStageCoordinator` and `ManagerSceneActivationCoordinator` bind
-the complete durable staged-ready set to the production scene owner's frozen
-revision, persist the irreversible selection decision before activation, and
-recover only from exact owner status. `ManagerSelectedBundleTransitionCoordinator`
-then verifies and privately binds the selected bundle, records the complete
-obsolete-command-surface disposition, compare-and-swap publishes the public
-pointer, and invokes Finalize only after an independent current-head reread.
+`ManagerSceneInitializationCoordinator` binds the complete durable
+staged-ready set to one Scene-owned maintenance initialization. Scene captures
+the authoritative logical snapshot, closes writes and leases, and performs
+fresh native initialization without exposing per-projection recovery progress.
+`ManagerSelectedBundleTransitionCoordinator` then verifies and privately binds
+the selected bundle, compare-and-swap publishes the public pointer, and asks
+Scene to complete the exact initialized operation. The admitted idle
+maintenance path has already stopped and proven absence of the previous
+Manager-owned runtime, so no live-to-live retirement phase remains.
 `ManagerApplyFenceReleaseCoordinator` persists the exact idle release request
-and Kernel receipt before terminal success. Lost responses replay from byte-
-equivalent owner evidence and a terminal replay performs no external effect.
+and Kernel receipt before terminal success; admission is released last.
+Interrupted nonterminal operations are retained failed/unknown and are never
+automatically resumed.
 
 `RetainedPosixRuntimeUnitAdapter` is the first concrete process/progress port,
 not a generic subprocess API. It independently reloads and verifies the exact
@@ -271,10 +274,9 @@ or projection uncertainty fails closed.
 performs at most one mutating scene-owner operation: it either invokes Rebuild,
 waits on an observed rebuild, or publishes the exact generation-1 receipt and
 invokes Finalize. For this canonical-empty zero case only,
-private-materialization and retired-command-surface evidence digests are
-deterministic, domain-separated proofs over the admitted package, bootstrap
-identity, exact scene target, and explicit zero counts; this is not a general
-materializer or command-surface retirement implementation. The scene-owner
+the private-materialization evidence digest is a deterministic,
+domain-separated proof over the admitted package, bootstrap identity, exact
+scene target, and explicit zero count. The scene-owner
 Finalize contract independently rereads the exact current durable receipt; the
 focused test owner exercises that obligation even when the coordinator has
 just published the receipt. Rebuild/Finalize lost responses reconcile only
@@ -295,7 +297,7 @@ The I5/H0 headless surface does not turn this private handoff into a second
 public command API. The current N5c checkpoint qualifies nonempty native
 projection transitions and finalized-host replacement, but does not yet
 qualify mid-transition host-loss recovery, the execution-facing lease path,
-nonempty obsolete-command-surface retirement, controller/robot lifecycle,
+controller/robot lifecycle,
 remote placement, motion effects, or the restored product lane.
 The lower-level journal still treats bundle and graph identities as opaque;
 only the external store composition root and coordinator require the sealed,
@@ -306,12 +308,8 @@ responsibility inside a successful Finalize or completed replacement recovery
 after its independent receipt, snapshot, and health checks.
 
 The journal itself has no effect surface; effects remain behind focused owner
-ports and observe-first coordinators. The qualified M0 fixture is the
-canonical-empty-to-one-runtime-only transition, so its native-transition and
-obsolete-command-surface sets are exactly empty and independently verified as
-such. This is not evidence for silently treating a future nonempty set as
-empty. Opening the external store set still creates no bootstrap intent and
-publishes nothing.
+ports and observe-first coordinators. Opening the external store set still
+creates no bootstrap intent and publishes nothing.
 
 The old generic raw persistence fixture and its `FoundationHead` compare-and-
 swap surface have been removed rather than retained as compatibility

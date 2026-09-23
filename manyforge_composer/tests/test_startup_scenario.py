@@ -51,7 +51,7 @@ def _fixture_deployment_compiler(source: str) -> CompiledDeploymentDocument:
 def _selection(program: dict[str, Any]) -> dict[str, Any]:
     return {
         "scenario_id": "lite6_pick_and_place",
-        "scenario_catalog_revision": "sha256:" + "2" * 64,
+        "source_document_digest": "sha256:" + "2" * 64,
         "assistant_mode": "forbidden",
         "assistant_projection": None,
         "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
@@ -164,8 +164,8 @@ class _Headless:
                 "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
                 "deployment_artifact_id": body["deployment_artifact_id"],
                 "deployment_revision": body["deployment_revision"],
-                "scenario_catalog_revision": self.selection[
-                    "scenario_catalog_revision"
+                "source_document_digest": self.selection[
+                    "source_document_digest"
                 ],
                 "candidate_retained_bundle_id": self.selection[
                     "retained_bundle_id"

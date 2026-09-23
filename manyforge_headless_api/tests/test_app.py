@@ -151,7 +151,7 @@ def _applied_projection(
     program: dict[str, Any],
     *,
     scenario_id: str = "cell-pick",
-    scenario_catalog_revision: str = "sha256:" + "6" * 64,
+    source_document_digest: str = "sha256:" + "6" * 64,
     record_digest: str = "sha256:" + "5" * 64,
     retained_bundle_id: str = "sha256:" + "8" * 64,
     graph_revision: str = "sha256:" + "9" * 64,
@@ -163,11 +163,17 @@ def _applied_projection(
     )
     return {
         "assistant_mode": "forbidden",
+        "assistant_projection": None,
         "baseline_program_binding_id": "sha256:" + "3" * 64,
         "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "1" * 64,
         "graph_revision": binding["graph_revision"],
         "node_environment_digest": binding["node_environment"]["environment_digest"],
+        "owner_identities": [{
+            "owner_role": "headless_projection",
+            "owner_id": "headless.program-apply",
+            "owner_epoch": "headless.epoch.1",
+        }],
         "preparation_digest": "sha256:" + "4" * 64,
         "program": copy.deepcopy(program),
         "program_binding": binding,
@@ -175,9 +181,9 @@ def _applied_projection(
         "program_id": program["program_id"],
         "program_revision": program["program_revision"],
         "retained_bundle_id": binding["retained_bundle_id"],
-        "scenario_catalog_revision": scenario_catalog_revision,
+        "source_document_digest": source_document_digest,
         "scenario_id": scenario_id,
-        "schema_version": "manyforge.applied_program_selection.v1",
+        "schema_version": "manyforge.applied_program_selection.v2",
         "source": {
             "record_digest": record_digest,
             "semantic_content_digest": "sha256:" + "7" * 64,
@@ -185,33 +191,6 @@ def _applied_projection(
             "source_owner_epoch": "program-owner.epoch.1",
             "source_owner_id": "program-owner.cell-a",
         },
-        "typed_parameter_overrides": {},
-    }
-
-
-def _scenario_selection(
-    *,
-    scenario_id: str = "cell-pick",
-) -> dict[str, Any]:
-    program = _program_document()
-    binding = _program_binding(program)
-    return {
-        "assistant_mode": "forbidden",
-        "assistant_projection": None,
-        "deployment_artifact_id": "cell_a",
-        "deployment_revision": "sha256:" + "1" * 64,
-        "graph_revision": binding["graph_revision"],
-        "node_environment_digest": binding["node_environment"]["environment_digest"],
-        "owner_identities": [],
-        "program": copy.deepcopy(program),
-        "program_binding": binding,
-        "program_binding_id": binding["program_binding_id"],
-        "program_id": program["program_id"],
-        "program_revision": program["program_revision"],
-        "retained_bundle_id": binding["retained_bundle_id"],
-        "scenario_catalog_revision": "sha256:" + "6" * 64,
-        "scenario_id": scenario_id,
-        "schema_version": "manyforge.scenario_program_selection.v2",
         "typed_parameter_overrides": {},
     }
 
@@ -249,7 +228,6 @@ def _malform_binding_frame_with_valid_identity(value: dict[str, Any]) -> None:
 
 def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("invalid_request") == 400
-    assert _error_status("program_apply_request_oversized") == 413
     assert _error_status("full_stack_restart_required") == 409
     assert _error_status("manual_handover_required") == 409
     assert _error_status("manual_operation_scope_stale") == 409
@@ -265,27 +243,6 @@ def test_full_native_applied_program_projection_is_accepted() -> None:
 
     assert response.status_code == 200
     assert response.json() == projection
-
-
-def test_scenario_program_selection_rejects_rehashed_malformed_binding() -> None:
-    core = FakeCore()
-    selection = _scenario_selection()
-    selection["program_binding"]["target_role_bindings"][0]["frame_role_bindings"][0][
-        "unknown"
-    ] = True
-    selection["program_binding"]["program_binding_id"] = compute_content_identity(
-        selection["program_binding"],
-        own_field="program_binding_id",
-        identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v1",
-    )
-    core.scenario_selection_override = selection
-    client = TestClient(create_app(service=_service(core, FakeManager())))
-
-    response = client.get("/api/scenarios/cell-pick/program-selection")
-
-    assert response.status_code == 502
-    assert response.json()["detail"]["code"] == "scenario_program_selection_invalid"
 
 
 @pytest.mark.parametrize(
@@ -340,7 +297,7 @@ def test_applied_program_projection_rejects_missing_or_divergent_closure(
         (("program_revision",), "program.1"),
         (("program_binding_id",), "binding.1"),
         (("retained_bundle_id",), "bundle.1"),
-        (("scenario_catalog_revision",), "catalog.1"),
+        (("source_document_digest",), "catalog.1"),
         (("source", "record_digest"), "record.1"),
         (("source", "semantic_content_digest"), "semantic.1"),
     ],
@@ -447,7 +404,6 @@ class FakeCore:
         self.program_target_graph = "graph.1"
         self.model_attempts: list[dict[str, Any]] = []
         self.source_model_context_override: dict[str, Any] | None = None
-        self.scenario_selection_override: dict[str, Any] | None = None
         self.node_environment_digest = (
             build_node_environment().manifest.environment_digest
         )
@@ -524,128 +480,6 @@ class FakeCore:
             "source_model": self.source_model_projection(),
         }
 
-    def scenario_catalog_projection(self) -> dict[str, Any]:
-        return {
-            "api_version": "manyforge.scenario_catalog.v1",
-            "scenario_catalog_revision": "sha256:" + "6" * 64,
-            "scenarios": [
-                {
-                    "scenario_id": "cell-pick",
-                    "deployment_artifact_id": "cell_a",
-                    "deployment_revision": "sha256:" + "1" * 64,
-                    "retained_bundle_id": "sha256:" + "2" * 64,
-                    "program_binding_id": "sha256:" + "3" * 64,
-                    "deployment_compatibility": {
-                        "lane": "manyforge-only",
-                        "provides": [],
-                    },
-                    "assistant_mode": "forbidden",
-                    "typed_parameter_overrides": {},
-                }
-            ],
-        }
-
-    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
-        if self.scenario_selection_override is not None:
-            return copy.deepcopy(self.scenario_selection_override)
-        return _scenario_selection(scenario_id=scenario_id)
-
-    def prepare_program_apply(
-        self,
-        scenario_id: str,
-        scenario_catalog_revision: str,
-        program: dict[str, Any],
-    ) -> dict[str, Any]:
-        active = self.manager_payload["active"]
-        if (
-            active["retained_bundle_id"] != self.program_target_bundle
-            or active["graph_revision"] != self.program_target_graph
-        ):
-            raise HeadlessApiError(
-                "program_apply_deployment_not_active",
-                "Program Apply target is not the active deployment",
-            )
-        self.program_preparations.append(copy.deepcopy(program))
-        return {
-            "schema_version": "manyforge.program_apply_preparation.v1",
-            "scenario_id": scenario_id,
-            "scenario_catalog_revision": scenario_catalog_revision,
-            "deployment_artifact_id": "cell_a",
-            "deployment_revision": "sha256:" + "1" * 64,
-            "retained_bundle_id": self.program_target_bundle,
-            "graph_revision": self.program_target_graph,
-            "node_environment_digest": "sha256:" + "2" * 64,
-            "baseline_program_binding_id": "sha256:" + "3" * 64,
-            "program_id": program["program_id"],
-            "program_revision": program["program_revision"],
-            "program_binding_id": "sha256:" + "3" * 64,
-            "assistant_mode": "forbidden",
-            "typed_parameter_overrides": {},
-            "preparation_digest": "sha256:" + "4" * 64,
-        }
-
-    def replay_program_apply(
-        self,
-        scenario_id: str,
-        scenario_catalog_revision: str,
-        program_id: str,
-        program_revision: str,
-        expected_applied_record_digest: str | None,
-        request_owner_epoch: str,
-        request_id: str,
-    ) -> dict[str, Any] | None:
-        retained = self.program_replays.get((request_owner_epoch, request_id))
-        if retained is None:
-            return None
-        semantic = (
-            scenario_id,
-            scenario_catalog_revision,
-            program_id,
-            program_revision,
-            expected_applied_record_digest,
-        )
-        if retained[0] != semantic:
-            raise HeadlessApiError(
-                "program_apply_request_conflict",
-                "Program Apply request identity was reused",
-            )
-        return copy.deepcopy(retained[1])
-
-    def commit_program_apply(
-        self,
-        preparation: dict[str, Any],
-        expected_applied_record_digest: str | None,
-        request_owner_epoch: str,
-        request_id: str,
-    ) -> dict[str, Any]:
-        assert request_owner_epoch
-        assert request_id
-        self.program_commits.append(
-            (copy.deepcopy(preparation), expected_applied_record_digest)
-        )
-        record_digest = "sha256:" + "5" * 64
-        self.applied_program = _applied_projection(
-            self.program_preparations[-1],
-            scenario_id=preparation["scenario_id"],
-            scenario_catalog_revision=preparation["scenario_catalog_revision"],
-            record_digest=record_digest,
-            retained_bundle_id=preparation["retained_bundle_id"],
-            graph_revision=preparation["graph_revision"],
-        )
-        semantic = (
-            preparation["scenario_id"],
-            preparation["scenario_catalog_revision"],
-            preparation["program_id"],
-            preparation["program_revision"],
-            expected_applied_record_digest,
-        )
-        self.program_replays[(request_owner_epoch, request_id)] = (
-            semantic,
-            {
-                "preparation": copy.deepcopy(preparation),
-                "applied": copy.deepcopy(self.applied_program),
-            },
-        )
         return copy.deepcopy(self.applied_program)
 
     def applied_program_selection(self) -> dict[str, Any]:
@@ -852,10 +686,20 @@ class FakeManager:
             "ok": True,
             "phase": "accepted",
             "prepared_activation": {
+                "schema_version": "manyforge.prepared_activation_input.v2",
+                "scenario_id": "scenario.1",
+                "source_document_digest": "sha256:" + "1" * 64,
                 "captured_input_digest": "sha256:" + "d" * 64,
                 "deployment_artifact_id": "deployment.1",
                 "deployment_revision": "sha256:" + "b" * 64,
+                "retained_bundle_id": "sha256:" + "2" * 64,
+                "graph_revision": "sha256:" + "3" * 64,
+                "program_id": "program.1",
+                "program_revision": "sha256:" + "4" * 64,
                 "program_binding_id": "sha256:" + "9" * 64,
+                "node_environment_digest": "sha256:" + "5" * 64,
+                "assistant_mode": "optional",
+                "typed_parameter_overrides": {},
                 "prepared_activation_id": "sha256:" + "e" * 64,
             },
             "request_id": "request.1",
@@ -1147,7 +991,7 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
             "program_run_id": "program-run.1",
             "applied_record_digest": "sha256:" + "5" * 64,
             "scenario_id": "cell-pick",
-            "scenario_catalog_revision": "sha256:" + "6" * 64,
+            "source_document_digest": "sha256:" + "6" * 64,
             "program_id": program["program_id"],
             "program_revision": program["program_revision"],
             "program_binding_id": binding["program_binding_id"],
@@ -1819,10 +1663,6 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert context["source_model"]["schema_version"] == (
             "manyforge.source_model_projection.v2"
         )
-        scenarios = client.get("/api/scenarios").json()
-        assert scenarios["api_version"] == "manyforge.scenario_catalog.v1"
-        assert [row["scenario_id"] for row in scenarios["scenarios"]] == ["cell-pick"]
-
         urdf = client.get("/api/viewer-model/urdf")
         assert urdf.status_code == 200
         assert urdf.content == b"<robot name='fixture'/>"
@@ -1974,7 +1814,6 @@ def test_node_environment_joins_only_the_exact_applied_runner_offer() -> None:
             "node_availability",
             {
                 "applied": applied,
-                "selection": core.scenario_program_selection(applied["scenario_id"]),
             },
         )
     ]
@@ -2033,233 +1872,6 @@ def test_manager_status_and_diff_preserve_offer_digest_fields() -> None:
     assert diff["observed_units"] == observed
 
 
-def test_program_apply_skips_unchanged_deployment_and_publishes_exact_program() -> None:
-    client, core, manager = _client()
-    core.program_target_bundle = "sha256:" + "b" * 64
-    core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["active"]["retained_bundle_id"] = core.program_target_bundle
-    core.manager_payload["active"]["graph_revision"] = core.program_target_graph
-    program = copy.deepcopy(_program_document())
-    body = {
-        "scenario_id": "cell-pick",
-        "scenario_catalog_revision": "sha256:" + "6" * 64,
-        "program": program,
-        "expected_applied_record_digest": None,
-        "authoring_claim": _authoring_claim(),
-    }
-    with client:
-        absent = client.get("/api/program/applied")
-        response = client.post("/api/program/apply", json=body)
-        core.manager_payload["manager_ready"] = False
-        replayed = client.post("/api/program/apply", json=body)
-        applied = client.get("/api/program/applied")
-
-    assert absent.status_code == 404
-    assert response.status_code == 200
-    assert replayed.status_code == 200
-    assert replayed.json() == response.json()
-    assert response.json()["status"] == "applied"
-    assert set(response.json()) == {
-        "applied",
-        "preparation",
-        "schema_version",
-        "status",
-    }
-    assert manager.requests == []
-    assert core.program_preparations == [program]
-    assert len(core.program_commits) == 1
-    assert applied.status_code == 200
-    assert applied.json() == response.json()["applied"]
-    assert applied.json()["program_revision"] == program["program_revision"]
-
-
-def test_program_apply_rejects_rehashed_malformed_applied_binding_result() -> None:
-    core = FakeCore()
-    core.program_target_bundle = "sha256:" + "b" * 64
-    core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["active"]["retained_bundle_id"] = core.program_target_bundle
-    core.manager_payload["active"]["graph_revision"] = core.program_target_graph
-    original_commit = core.commit_program_apply
-
-    def malformed_commit(
-        preparation: dict[str, Any],
-        expected_applied_record_digest: str | None,
-        request_owner_epoch: str,
-        request_id: str,
-    ) -> dict[str, Any]:
-        result = original_commit(
-            preparation,
-            expected_applied_record_digest,
-            request_owner_epoch,
-            request_id,
-        )
-        binding = result["program_binding"]
-        binding["target_role_bindings"][0]["frame_role_bindings"][0]["unknown"] = True
-        binding["program_binding_id"] = compute_content_identity(
-            binding,
-            own_field="program_binding_id",
-            identity_domain="program-binding-id",
-            api_version="manyforge.program_binding.v1",
-        )
-        result["program_binding_id"] = binding["program_binding_id"]
-        return result
-
-    core.commit_program_apply = malformed_commit  # type: ignore[method-assign]
-    client = TestClient(create_app(service=_service(core, FakeManager())))
-
-    response = client.post(
-        "/api/program/apply",
-        json={
-            "scenario_id": "cell-pick",
-            "scenario_catalog_revision": "sha256:" + "6" * 64,
-            "program": copy.deepcopy(_program_document()),
-            "expected_applied_record_digest": None,
-            "authoring_claim": _authoring_claim(),
-        },
-    )
-
-    assert response.status_code == 502
-    assert response.json()["detail"]["code"] == "program_apply_response_invalid"
-    assert "effect_disposition" not in response.json()["detail"]["details"]
-
-
-def test_program_apply_recovers_exact_commit_before_returning_failure() -> None:
-    core = FakeCore()
-    core.program_target_bundle = "sha256:" + "b" * 64
-    core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["active"]["retained_bundle_id"] = core.program_target_bundle
-    core.manager_payload["active"]["graph_revision"] = core.program_target_graph
-    original_commit = core.commit_program_apply
-
-    def commit_then_lose_result(*args, **kwargs):
-        original_commit(*args, **kwargs)
-        raise HeadlessApiError(
-            "program_apply_commit_failed",
-            "fixture lost the direct commit result",
-        )
-
-    core.commit_program_apply = commit_then_lose_result  # type: ignore[method-assign]
-    client = TestClient(create_app(service=_service(core, FakeManager())))
-
-    response = client.post(
-        "/api/program/apply",
-        json={
-            "scenario_id": "cell-pick",
-            "scenario_catalog_revision": "sha256:" + "6" * 64,
-            "program": copy.deepcopy(_program_document()),
-            "expected_applied_record_digest": None,
-            "authoring_claim": _authoring_claim(),
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json()["status"] == "applied"
-    assert len(core.program_commits) == 1
-
-
-def test_program_apply_commit_rejection_carries_owner_no_effect_proof() -> None:
-    core = FakeCore()
-    core.program_target_bundle = "sha256:" + "b" * 64
-    core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["active"]["retained_bundle_id"] = core.program_target_bundle
-    core.manager_payload["active"]["graph_revision"] = core.program_target_graph
-
-    def reject_commit(*_args, **_kwargs):
-        raise HeadlessApiError(
-            "program_apply_selection_stale",
-            "fixture rejected the selection before publication",
-        )
-
-    core.commit_program_apply = reject_commit  # type: ignore[method-assign]
-    client = TestClient(create_app(service=_service(core, FakeManager())))
-
-    response = client.post(
-        "/api/program/apply",
-        json={
-            "scenario_id": "cell-pick",
-            "scenario_catalog_revision": "sha256:" + "6" * 64,
-            "program": copy.deepcopy(_program_document()),
-            "expected_applied_record_digest": None,
-            "authoring_claim": _authoring_claim(),
-        },
-    )
-
-    assert response.status_code == 409
-    assert response.json()["detail"]["details"] == {
-        "effect_disposition": "proven_no_effect"
-    }
-    assert core.applied_program is None
-
-
-def test_program_apply_fences_published_full_stack_restart_before_prepare() -> None:
-    core = FakeCore()
-    core.manager_payload["apply"] = {
-        "mutation_available": False,
-        "records": [],
-        "unavailable_reason_code": "full_stack_restart_required",
-    }
-    manager = FakeManager()
-    client = TestClient(create_app(service=_service(core, manager)))
-
-    with client:
-        response = client.post(
-            "/api/program/apply",
-            json={
-                "scenario_id": "cell-pick",
-                "scenario_catalog_revision": "sha256:" + "6" * 64,
-                "program": _program_document(),
-                "expected_applied_record_digest": None,
-                "authoring_claim": _authoring_claim(),
-            },
-        )
-
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "full_stack_restart_required"
-    assert core.program_preparations == []
-    assert core.program_commits == []
-    assert manager.requests == []
-
-
-def test_program_apply_fences_full_stack_restart_raced_by_preparation() -> None:
-    core = FakeCore()
-    original_prepare = core.prepare_program_apply
-
-    def prepare_then_publish_restart(
-        scenario_id: str,
-        scenario_catalog_revision: str,
-        program: dict[str, Any],
-    ) -> dict[str, Any]:
-        preparation = original_prepare(scenario_id, scenario_catalog_revision, program)
-        core.manager_payload["apply"] = {
-            "mutation_available": False,
-            "records": [],
-            "unavailable_reason_code": "full_stack_restart_required",
-        }
-        return preparation
-
-    core.prepare_program_apply = prepare_then_publish_restart  # type: ignore[method-assign]
-    manager = FakeManager()
-    client = TestClient(create_app(service=_service(core, manager)))
-
-    with client:
-        response = client.post(
-            "/api/program/apply",
-            json={
-                "scenario_id": "cell-pick",
-                "scenario_catalog_revision": "sha256:" + "6" * 64,
-                "program": _program_document(),
-                "expected_applied_record_digest": None,
-                "authoring_claim": _authoring_claim(),
-            },
-        )
-
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "full_stack_restart_required"
-    assert len(core.program_preparations) == 1
-    assert core.program_commits == []
-    assert manager.requests == []
-
-
 def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
     runner = FakeProgramRunner()
     core = FakeCore()
@@ -2275,7 +1887,7 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
     start_body = {
         **_caller(),
         "scenario_id": "cell-pick",
-        "scenario_catalog_revision": "sha256:" + "6" * 64,
+        "source_document_digest": "sha256:" + "6" * 64,
         "expected_applied_record_digest": "sha256:" + "5" * 64,
         "draft_program_revision": core.applied_program["program_revision"],
         "expected_admission_generation": _ADMISSION_GENERATION,
@@ -2289,7 +1901,6 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
     }
 
     with client:
-        selection = client.get("/api/scenarios/cell-pick/program-selection")
         index = client.get(
             "/api/program/runs",
             params={"active_only": "true", "limit": 1},
@@ -2337,8 +1948,6 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
             json=stop_body,
         )
 
-        assert selection.status_code == 200
-        assert selection.json()["scenario_id"] == "cell-pick"
         assert index.status_code == 200
         assert index.json()["active_only"] is True
         assert started.status_code == 200, started.text
@@ -2374,7 +1983,7 @@ def test_program_run_captures_current_environment_not_package_provenance() -> No
     request = {
         **_caller(),
         "scenario_id": "cell-pick",
-        "scenario_catalog_revision": "sha256:" + "6" * 64,
+        "source_document_digest": "sha256:" + "6" * 64,
         "expected_applied_record_digest": source["record_digest"],
         "draft_program_revision": core.applied_program["program_revision"],
         "expected_admission_generation": _ADMISSION_GENERATION,
@@ -2405,7 +2014,7 @@ def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:
     body = {
         **_caller(),
         "scenario_id": "cell-pick",
-        "scenario_catalog_revision": "sha256:" + "6" * 64,
+        "source_document_digest": "sha256:" + "6" * 64,
         "expected_applied_record_digest": "sha256:" + "5" * 64,
         "draft_program_revision": core.applied_program["program_revision"],
         "expected_admission_generation": _ADMISSION_GENERATION,
@@ -2435,40 +2044,6 @@ def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:
     assert divergent_response.json()["detail"]["code"] == (
         "program_runner_response_invalid"
     )
-
-
-def test_program_only_apply_does_not_mutate_an_active_captured_run() -> None:
-    core = FakeCore()
-    core.program_target_bundle = "sha256:" + "b" * 64
-    core.program_target_graph = "sha256:" + "c" * 64
-    core.manager_payload["active"]["retained_bundle_id"] = core.program_target_bundle
-    core.manager_payload["active"]["graph_revision"] = core.program_target_graph
-    runner = FakeProgramRunner()
-    app = create_app(
-        service=_service(
-            core,
-            FakeManager(),
-            program_runner=runner,
-        )
-    )
-    client = TestClient(app)
-
-    with client:
-        response = client.post(
-            "/api/program/apply",
-            json={
-                "scenario_id": "cell-pick",
-                "scenario_catalog_revision": "sha256:" + "6" * 64,
-                "program": _program_document(),
-                "expected_applied_record_digest": None,
-                "authoring_claim": _authoring_claim(),
-            },
-        )
-
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "applied"
-    assert len(core.program_preparations) == 1
-    assert [call[0] for call in runner.calls] == []
 
 
 def test_program_model_attempt_is_validated_before_native_commit() -> None:
@@ -2530,92 +2105,6 @@ def test_program_model_attempt_is_validated_before_native_commit() -> None:
     assert accepted.json()["status"] == "stored"
     assert invalid.status_code == 422
     assert core.model_attempts == [body]
-
-
-def test_program_apply_rejects_inactive_target_without_artifacts_or_manager_apply() -> (
-    None
-):
-    core = FakeCore()
-    core.program_target_bundle = "sha256:" + "b" * 64
-    core.program_target_graph = "sha256:" + "c" * 64
-    manager = FakeManager()
-    client = TestClient(create_app(service=_service(core, manager)))
-    body = {
-        "scenario_id": "cell-pick",
-        "scenario_catalog_revision": "sha256:" + "6" * 64,
-        "program": copy.deepcopy(_program_document()),
-        "expected_applied_record_digest": None,
-        "authoring_claim": _authoring_claim(),
-    }
-
-    with client:
-        rejected = client.post("/api/program/apply", json=body)
-        assert client.get("/api/program/applied").status_code == 404
-
-    assert rejected.status_code == 409
-    assert rejected.json()["detail"]["code"] == ("program_apply_deployment_not_active")
-    assert rejected.json()["detail"]["details"] == {
-        "effect_disposition": "proven_no_effect"
-    }
-    assert core.program_preparations == []
-    assert core.program_commits == []
-    assert manager.requests == []
-
-
-def test_program_apply_inactive_target_preserves_prior_applied_selection() -> None:
-    core = FakeCore()
-    prior = _applied_projection(
-        _program_document(),
-        scenario_id="prior-scenario",
-        record_digest="sha256:" + "9" * 64,
-    )
-    core.applied_program = copy.deepcopy(prior)
-    core.program_target_bundle = "sha256:" + "b" * 64
-    core.program_target_graph = "sha256:" + "c" * 64
-    manager = FakeManager()
-    client = TestClient(create_app(service=_service(core, manager)))
-
-    with client:
-        rejected = client.post(
-            "/api/program/apply",
-            json={
-                "scenario_id": "cell-pick",
-                "scenario_catalog_revision": "sha256:" + "6" * 64,
-                "program": copy.deepcopy(_program_document()),
-                "expected_applied_record_digest": prior["source"]["record_digest"],
-                "authoring_claim": _authoring_claim(),
-            },
-        )
-        still_applied = client.get("/api/program/applied")
-
-    assert rejected.status_code == 409
-    assert rejected.json()["detail"]["code"] == ("program_apply_deployment_not_active")
-    assert manager.requests == []
-    assert core.program_preparations == []
-    assert core.program_commits == []
-    assert still_applied.status_code == 200
-    assert still_applied.json() == prior
-
-
-def test_program_apply_rejects_invalid_program_before_native_preparation() -> None:
-    client, core, _manager = _client()
-    with client:
-        response = client.post(
-            "/api/program/apply",
-            json={
-                "scenario_id": "cell-pick",
-                "scenario_catalog_revision": "sha256:" + "6" * 64,
-                "program": {"api_version": "manyforge.program.v2"},
-                "expected_applied_record_digest": None,
-                "authoring_claim": _authoring_claim(),
-            },
-        )
-    assert response.status_code == 400
-    assert response.json()["detail"]["code"] == "program_apply_program_invalid"
-    assert response.json()["detail"]["details"] == {
-        "effect_disposition": "proven_no_effect"
-    }
-    assert core.program_preparations == []
 
 
 def test_acknowledgement_stamps_open_transport_and_rejects_principal_body() -> None:
@@ -2760,10 +2249,20 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                 },
                 "reject_if_affected_busy": True,
                 "prepared_activation": {
+                    "schema_version": "manyforge.prepared_activation_input.v2",
+                    "scenario_id": "scenario.1",
+                    "source_document_digest": "sha256:" + "1" * 64,
                     "captured_input_digest": "sha256:" + "d" * 64,
                     "deployment_artifact_id": "deployment.1",
                     "deployment_revision": "sha256:" + "b" * 64,
+                    "retained_bundle_id": "sha256:" + "2" * 64,
+                    "graph_revision": "sha256:" + "3" * 64,
+                    "program_id": "program.1",
+                    "program_revision": "sha256:" + "4" * 64,
                     "program_binding_id": "sha256:" + "9" * 64,
+                    "node_environment_digest": "sha256:" + "5" * 64,
+                    "assistant_mode": "optional",
+                    "typed_parameter_overrides": {},
                     "prepared_activation_id": "sha256:" + "e" * 64,
                 },
                 "expected_admission_generation": 7,
@@ -2987,25 +2486,6 @@ def test_request_body_bound_is_enforced_before_model_decode() -> None:
         )
     assert response.status_code == 413, response.text
     assert response.json()["detail"]["code"] == "headless_request_body_oversized"
-
-
-def test_program_apply_large_artifact_envelope_does_not_widen_other_routes() -> None:
-    client, _core, _manager = _client()
-    body = b" " * (1024 * 1024) + b"{}"
-    with client:
-        program_response = client.post(
-            "/api/program/apply",
-            content=body,
-            headers={"content-type": "application/json"},
-        )
-        manager_response = client.post(
-            "/api/manager/apply",
-            content=body,
-            headers={"content-type": "application/json"},
-        )
-
-    assert program_response.status_code == 422, program_response.text
-    assert manager_response.status_code == 413, manager_response.text
 
 
 def test_streamed_request_body_bound_is_enforced_without_content_length() -> None:
@@ -3336,7 +2816,7 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert "/api/node-environment" in paths
     assert "/api/source-model" in paths
     assert "/api/source-model-context" in paths
-    assert "/api/scenarios" in paths
+    assert "/api/scenarios" not in paths
     assert "/api/viewer-model/urdf" in paths
     assert "/api/viewer-model/resource" in paths
     assert "/api/assistant/modes" in paths

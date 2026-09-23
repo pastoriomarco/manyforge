@@ -98,10 +98,9 @@ runtime logs — they aren't:
 
 - `log/` — `colcon build` output (ROS package compile logs). Only
   populated by `scripts/build.sh`. Build-only, not runtime.
-- `verification/` — qualification fixtures
-  (`matrices/*.yaml`, `scenarios/*.yaml`, `programs/*.yaml`,
-  `deployments/*.yaml`). Driven by `scripts/run-scenarios.py` and
-  `scripts/qualify-*.sh`. Qualification output goes to
+- `verification/` — qualification fixtures used by the focused
+  `scripts/qualification/` entrypoints and retained aggregate qualification.
+  Qualification output goes to
   `${MANYFORGE_QUALIFICATION_OUTPUT_DIR:-/tmp/manyforge-qualification}`
   and sibling temp dirs, not into `verification/`.
 
@@ -154,8 +153,9 @@ is a separate, non-moving action in the current cycle recovery offer.
 | `GET /api/scene/snapshot/status`              | Inspect bounded snapshot-capture admission, pending request, rejection, timeout, and upload counters.                                                                                                                                             |
 | `GET /api/scene/snapshots/{snapshot_id}`      | Serve a previously captured snapshot by stable id.                                                                                                                                                                                                |
 
-During program/deployment cutover, inspect `sceneInitialization` in program/load
-responses and the scene-initialization block in `GET /api/infra/heartbeat`.
+During Scenario activation, inspect `sceneInitialization` in the Scenario
+document operation response and the scene-initialization block in
+`GET /api/infra/heartbeat`.
 `waiting` means the generation-fenced reset/scene seed has not completed; it is
 not itself a pose-apply failure. A definitive failure is separately alarmed.
 

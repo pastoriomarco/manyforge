@@ -2246,21 +2246,19 @@ class ProgramRuntime:
                 "Applied Program changed before scene preparation",
             )
         scenario_id = applied.get("scenario_id")
-        scenario_catalog_revision = applied.get("scenario_catalog_revision")
+        source_document_digest = applied.get("source_document_digest")
         if not isinstance(scenario_id, str) or not isinstance(
-            scenario_catalog_revision, str
+            source_document_digest, str
         ):
             raise ProgramRunnerError(
                 "program_run_applied_selection_stale",
                 "Applied Program omitted its Scenario identity",
             )
-        live = self._headless.scenario_program_selection(scenario_id)
         try:
             run_admission = build_applied_program_run_admission(
                 applied,
-                live,
                 expected_scenario_id=scenario_id,
-                expected_scenario_catalog_revision=scenario_catalog_revision,
+                expected_source_document_digest=source_document_digest,
                 environment=self._environment,
                 owner_availability=self._owner_availability,
             )
@@ -2554,23 +2552,21 @@ class ProgramRuntime:
         try:
             applied = request.applied
             scenario_id = applied.get("scenario_id")
-            scenario_revision = applied.get("scenario_catalog_revision")
+            scenario_revision = applied.get("source_document_digest")
             if not isinstance(scenario_id, str) or not isinstance(
                 scenario_revision, str
             ):
                 raise ProgramRunOwnerError(
                     "Applied Program omitted its Scenario identity"
                 )
-            live = request.selection
             owner_availability = self._current_node_owner_availability(
                 applied,
                 admission_generation=admission_generation,
             )
             admitted = build_applied_program_run_admission(
                 applied,
-                live,
                 expected_scenario_id=scenario_id,
-                expected_scenario_catalog_revision=scenario_revision,
+                expected_source_document_digest=scenario_revision,
                 environment=self._environment,
                 owner_availability=owner_availability,
             )
@@ -2854,14 +2850,13 @@ class ProgramRuntime:
                     or source.get("record_digest")
                     != request.expected_applied_record_digest
                     or applied.get("scenario_id") != request.scenario_id
-                    or applied.get("scenario_catalog_revision")
-                    != request.scenario_catalog_revision
+                    or applied.get("source_document_digest")
+                    != request.source_document_digest
                 ):
                     raise ProgramRunnerError(
                         "program_run_applied_selection_stale",
                         "Applied Program changed before Run admission",
                     )
-                live = self._headless.scenario_program_selection(request.scenario_id)
                 if request.draft_program_revision != applied.get("program_revision"):
                     raise ProgramRunnerError(
                         "program_run_draft_applied_mismatch",
@@ -2869,10 +2864,9 @@ class ProgramRuntime:
                     )
                 run_admission = build_applied_program_run_admission(
                     applied,
-                    live,
                     expected_scenario_id=request.scenario_id,
-                    expected_scenario_catalog_revision=(
-                        request.scenario_catalog_revision
+                    expected_source_document_digest=(
+                        request.source_document_digest
                     ),
                     environment=self._environment,
                     owner_availability=self._owner_availability,
@@ -3046,7 +3040,7 @@ class ProgramRuntime:
                     "program_run_id",
                     "applied_record_digest",
                     "scenario_id",
-                    "scenario_catalog_revision",
+                    "source_document_digest",
                     "program_id",
                     "program_revision",
                     "program_binding_id",

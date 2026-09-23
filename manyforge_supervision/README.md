@@ -48,8 +48,7 @@ The retained owner/reference evidence is:
 - `manyforge_component_manager/test/test_runtime_observation.cpp` and
   `testdata/runtime_observation_parity_v1.txt`;
 - `manyforge_component_manager/test/test_manager_active_runtime_coordinator.cpp`,
-  `test_retained_posix_runtime_unit_adapter.cpp`, and
-  `manyforge_scene/test/test_component_manager_m0_process.cpp`;
+  and `test_retained_posix_runtime_unit_adapter.cpp`;
 - `verification/composable_cell_i4/{runtime_observation_fixture.py,process_fixture.py}`;
 - `tests/composable_cell_i4/{test_runtime_observation.py,test_process_fixture.py}`.
 

@@ -104,7 +104,6 @@ pybind11_add_module(manyforge_core_py NO_EXTRAS
   bindings_model_compiler.cpp
   bindings_operation_runtime.cpp
   bindings_runtime_contract_manifest.cpp
-  bindings_scenario_catalog.cpp
   bindings_strong_identity.cpp
 )
 

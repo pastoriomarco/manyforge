@@ -194,6 +194,41 @@ struct ProjectionBootstrapRebuildRequestDTO final {
   }
 };
 
+/// Exact native participant input for initial bootstrap.
+struct NativeProjectionBootstrapRebuildDTO final {
+  BootstrapId bootstrap_id;
+  BootstrapGeneration bootstrap_generation;
+  ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  ProjectionRevisionDTO canonical_empty_target;
+  RetainedProductDTO planning_collision_model;
+  LogicalSceneSnapshotRoot initialized_logical_scene;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return !bootstrap_id.empty() && bootstrap_generation.nonzero() &&
+           native_runtime_binding.valid() && canonical_empty_target.valid() &&
+           planning_collision_model.product_kind ==
+               RetainedProductKind::kPlanningCollisionModel &&
+           !planning_collision_model.product_id.empty() &&
+           !planning_collision_model.product_contract_id.empty() &&
+           !planning_collision_model.product_contract_revision.empty() &&
+           initialized_logical_scene.has_exact_identity(
+               {canonical_empty_target.scene_revision,
+                initialized_logical_scene.shared()->cell_id});
+  }
+};
+
+struct NativeProjectionBootstrapStatusQueryDTO final {
+  BootstrapId bootstrap_id;
+  BootstrapGeneration bootstrap_generation;
+  ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  ProjectionRevisionDTO canonical_empty_target;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return !bootstrap_id.empty() && bootstrap_generation.nonzero() &&
+           native_runtime_binding.valid() && canonical_empty_target.valid();
+  }
+};
+
 enum class NativeProjectionBootstrapRebuildState {
   kRebuilt,
   kAlreadyExact,
@@ -290,7 +325,6 @@ struct NativeProjectionBootstrapStatusDTO final {
                resulting_health.state ==
                    ProjectionHealthState::kUninitialized &&
                !resulting_health.active_projection_revision.has_value() &&
-               !resulting_health.staged_candidate.has_value() &&
                !resulting_health.error.has_value() &&
                !error.has_value();
       case NativeProjectionBootstrapStatusState::kRebuilding:
@@ -298,7 +332,6 @@ struct NativeProjectionBootstrapStatusDTO final {
                resulting_health.state ==
                    ProjectionHealthState::kRebuilding &&
                !resulting_health.active_projection_revision.has_value() &&
-               !resulting_health.staged_candidate.has_value() &&
                !resulting_health.error.has_value() &&
                !error.has_value();
       case NativeProjectionBootstrapStatusState::kRebuilt:

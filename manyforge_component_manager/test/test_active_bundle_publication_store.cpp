@@ -32,12 +32,10 @@ constexpr std::string_view kSceneIdDigest =
     "sha256:abababababababababababababababababababababababababababababababab";
 constexpr std::string_view kMaterializationDigest =
     "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-constexpr std::string_view kRetirementDigest =
-    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 constexpr std::string_view kOtherDigest =
     "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 constexpr std::string_view kBootstrapPointerGolden =
-    "sha256:0915805d1a1f92c31cc8281518b5c4732b174d2490c555b37d5342648250a00f";
+    "sha256:72c91b770116284cfe0fee2cd1c90478d445155806f228209794ae5036e20b9c";
 
 class TemporaryDirectory final {
  public:
@@ -92,7 +90,6 @@ ActiveBundlePublicationRequestDTO BootstrapRequest() {
       GraphRevision{std::string(kGraphDigest)},
       std::nullopt,
       ContentDigest{std::string(kMaterializationDigest)},
-      ContentDigest{std::string(kRetirementDigest)},
   };
 }
 
@@ -105,14 +102,12 @@ ActiveBundlePublicationRequestDTO ApplyRequest(
   return ActiveBundlePublicationRequestDTO{
       NamedApplyPublicationTransactionDTO{
           ApplyId{apply_id},
-          ApplyGeneration{1U},
-          ProjectionStageGeneration{1U}},
+          ApplyGeneration{1U}},
       projection,
       projection.retained_bundle_id,
       projection.graph_revision,
       ActiveBundlePublicationGeneration{expected_generation},
       ContentDigest{std::string(kMaterializationDigest)},
-      ContentDigest{std::string(kRetirementDigest)},
   };
 }
 

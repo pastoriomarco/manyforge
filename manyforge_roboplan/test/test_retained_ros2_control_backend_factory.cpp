@@ -205,8 +205,8 @@ active_component_snapshot() {
        revision.retained_bundle_id,
        revision.graph_revision,
        std::nullopt,
-       core::ContentDigest("private-materialization"),
-       core::ContentDigest("retired-command-surfaces")},
+       core::ContentDigest("private-materialization")
+      },
       core::ActiveBundlePublicationGeneration(1U),
       core::ContentDigest("active-public-pointer")};
   const core::ExpectedControlBindingRevisionDTO binding{

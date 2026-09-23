@@ -499,11 +499,6 @@ RequestEncoding ValidateAndEncodeRequest(
   ValidateDigest(
       request.private_materialization_content_digest.value(),
       "private_materialization_content_digest");
-  ValidateDigest(
-      request
-          .obsolete_managed_command_surfaces_retired_evidence_digest.value(),
-      "obsolete_managed_command_surfaces_retired_evidence_digest");
-
   RequestEncoding encoded{
       TransactionKind::kBootstrap,
       {},
@@ -524,9 +519,9 @@ RequestEncoding ValidateAndEncodeRequest(
           encoded.transaction_id = transaction.apply_id.value();
           encoded.transaction_generation = CheckedSigned(
               transaction.apply_generation.value(), "apply_generation");
-          encoded.projection_stage_generation = CheckedSigned(
-              transaction.projection_stage_generation.value(),
-              "projection_stage_generation");
+          // Version-1 storage used a per-Stage coordinate. Idle maintenance
+          // has one initialization, so the compatibility coordinate is fixed.
+          encoded.projection_stage_generation = 1;
         } else {
           encoded.kind = TransactionKind::kBootstrap;
           encoded.transaction_id = transaction.bootstrap_id.value();
@@ -548,7 +543,10 @@ RequestEncoding ValidateAndEncodeRequest(
 std::string PublicationRequestDigest(
     const core::CellId& cell_id,
     const ActiveBundlePublicationRequestDTO& request,
-    const RequestEncoding& encoded) {
+    const RequestEncoding& encoded,
+    const ContentDigest& compatibility_retirement_digest) {
+  ValidateDigest(compatibility_retirement_digest.value(),
+                 "stored compatibility retirement digest");
   return SemanticDigest(
       "publication-request",
       JsonObject({
@@ -574,9 +572,7 @@ std::string PublicationRequestDigest(
               encoded.expected_previous_generation),
           StringField(
               "obsolete_managed_command_surfaces_retired_evidence_digest",
-              request
-                  .obsolete_managed_command_surfaces_retired_evidence_digest
-                  .value()),
+              compatibility_retirement_digest.value()),
           StringField(
               "private_materialization_content_digest",
               request.private_materialization_content_digest.value()),
@@ -991,13 +987,12 @@ class SqliteActiveBundlePublicationStore::Impl final {
     const auto candidate_scene_revision_id = row.Integer(9);
     const auto candidate_scene_content_hash = row.Text(10);
     const auto private_materialization_digest = row.Text(11);
-    const auto obsolete_surfaces_digest = row.Text(12);
+    const auto compatibility_retirement_digest = row.Text(12);
     const auto request_digest = row.Text(13);
     const auto public_pointer_digest = row.Text(14);
     if (publication_generation <= 0 || transaction_generation <= 0 ||
         candidate_scene_revision_id <= 0 ||
-        expected_previous_generation < 0 ||
-        projection_stage_generation < 0) {
+        expected_previous_generation < 0 || projection_stage_generation < 0) {
       throw ActiveBundlePublicationIntegrityError(
           "stored publication contains an invalid generation");
     }
@@ -1013,10 +1008,7 @@ class SqliteActiveBundlePublicationStore::Impl final {
               NamedApplyPublicationTransactionDTO{
                   core::ApplyId{transaction_id},
                   core::ApplyGeneration{
-                      static_cast<std::uint64_t>(transaction_generation)},
-                  core::ProjectionStageGeneration{
-                      static_cast<std::uint64_t>(
-                          projection_stage_generation)}}};
+                      static_cast<std::uint64_t>(transaction_generation)}}};
     std::optional<ActiveBundlePublicationGeneration> expected_previous;
     if (expected_previous_generation != 0) {
       expected_previous = ActiveBundlePublicationGeneration{
@@ -1035,7 +1027,6 @@ class SqliteActiveBundlePublicationStore::Impl final {
         core::GraphRevision{candidate_graph_revision},
         expected_previous,
         ContentDigest{private_materialization_digest},
-        ContentDigest{obsolete_surfaces_digest},
     };
     RequestEncoding encoded;
     try {
@@ -1045,8 +1036,17 @@ class SqliteActiveBundlePublicationStore::Impl final {
           std::string("stored publication request is invalid: ") +
           error.what());
     }
+    if ((encoded.kind == TransactionKind::kBootstrap &&
+         projection_stage_generation != 0) ||
+        (encoded.kind == TransactionKind::kNamedApply &&
+         projection_stage_generation <= 0)) {
+      throw ActiveBundlePublicationIntegrityError(
+          "stored compatibility stage coordinate is invalid");
+    }
+    encoded.projection_stage_generation = projection_stage_generation;
     const auto expected_request_digest =
-        PublicationRequestDigest(cell_id_, request, encoded);
+        PublicationRequestDigest(cell_id_, request, encoded,
+                                 ContentDigest{compatibility_retirement_digest});
     const auto expected_pointer_digest = PublicPointerDigest(
         cell_id_, publication_generation, expected_request_digest);
     if (request_digest != expected_request_digest ||
@@ -1104,11 +1104,10 @@ class SqliteActiveBundlePublicationStore::Impl final {
         "request_digest,durable_public_pointer_content_digest "
         "FROM active_bundle_publication_receipts "
         "WHERE transaction_kind=? AND transaction_id=? "
-        "AND transaction_generation=? AND projection_stage_generation=?");
+        "AND transaction_generation=?");
     row.Bind(1, ToString(encoded.kind));
     row.Bind(2, encoded.transaction_id);
     row.Bind(3, encoded.transaction_generation);
-    row.Bind(4, encoded.projection_stage_generation);
     if (!row.Step()) {
       return std::nullopt;
     }
@@ -1259,8 +1258,14 @@ class SqliteActiveBundlePublicationStore::Impl final {
   [[nodiscard]] ActiveBundlePublicationReceiptDTO Publish(
       const ActiveBundlePublicationRequestDTO& request) {
     const auto encoded = ValidateAndEncodeRequest(request);
+    // Version-1 persisted receipts contain a retired-surface digest. New idle
+    // maintenance has no retirement phase, so the already-authoritative
+    // materialization digest is repeated in that compatibility-only column.
+    const auto compatibility_retirement_digest =
+        request.private_materialization_content_digest;
     const auto request_digest =
-        PublicationRequestDigest(cell_id_, request, encoded);
+        PublicationRequestDigest(
+            cell_id_, request, encoded, compatibility_retirement_digest);
     std::lock_guard lock(mutex_);
     RequireOpen();
     Transaction transaction(database_, "BEGIN IMMEDIATE");
@@ -1268,8 +1273,7 @@ class SqliteActiveBundlePublicationStore::Impl final {
 
     if (const auto existing = ReceiptByTransactionLocked(encoded);
         existing.has_value()) {
-      if (existing->receipt.request != request ||
-          existing->request_digest != request_digest) {
+      if (existing->receipt.request != request) {
         throw ActiveBundlePublicationConflictError(
             "publication transaction identity conflicts with its durable "
             "request");
@@ -1334,11 +1338,7 @@ class SqliteActiveBundlePublicationStore::Impl final {
             .value());
     insert.Bind(
         12, request.private_materialization_content_digest.value());
-    insert.Bind(
-        13,
-        request
-            .obsolete_managed_command_surfaces_retired_evidence_digest
-            .value());
+    insert.Bind(13, compatibility_retirement_digest.value());
     insert.Bind(14, request_digest);
     insert.Bind(15, pointer_digest);
     static_cast<void>(insert.Step());

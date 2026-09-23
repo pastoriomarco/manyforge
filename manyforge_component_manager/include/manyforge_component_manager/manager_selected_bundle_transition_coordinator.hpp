@@ -16,77 +16,69 @@ class ManagerSelectedBundleTransitionCoordinatorError : public std::runtime_erro
   using std::runtime_error::runtime_error;
 };
 
-/// Exact recovery context after publication or scene Finalize may have
-/// committed while their response, or Manager's subsequent journal write,
-/// was lost.
+/// Exact observation context when publication or Scene completion cannot be
+/// proven. The operation is terminally failed/unknown by its caller; this
+/// object never authorizes automatic replay after owner loss.
 class ManagerSelectedBundleTransitionEffectUncertainError final
     : public ManagerSelectedBundleTransitionCoordinatorError {
  public:
   ManagerSelectedBundleTransitionEffectUncertainError(
       std::string detail, manyforge::core::ActiveBundlePublicationRequestDTO publication_request,
-      manyforge::core::ProjectionApplyStatusQueryDTO scene_status_query,
+      manyforge::core::ProjectionMaintenanceInitializationQueryDTO scene_status_query,
       std::optional<manyforge::core::ActiveBundlePublicationReceiptDTO> observed_publication =
           std::nullopt,
-      std::optional<manyforge::core::ProjectionApplyStatusDTO> observed_scene_status = std::nullopt,
-      std::optional<manyforge::core::ProjectionApplyFinalizeResultDTO> observed_finalize_result =
-          std::nullopt);
+      std::optional<manyforge::core::ProjectionMaintenanceInitializationStatusDTO>
+          observed_scene_status = std::nullopt);
 
   [[nodiscard]] const manyforge::core::ActiveBundlePublicationRequestDTO& publication_request()
       const noexcept;
-  [[nodiscard]] const manyforge::core::ProjectionApplyStatusQueryDTO& scene_status_query()
+  [[nodiscard]] const manyforge::core::ProjectionMaintenanceInitializationQueryDTO& scene_status_query()
       const noexcept;
   [[nodiscard]] const std::optional<manyforge::core::ActiveBundlePublicationReceiptDTO>&
   observed_publication() const noexcept;
-  [[nodiscard]] const std::optional<manyforge::core::ProjectionApplyStatusDTO>&
+  [[nodiscard]] const std::optional<manyforge::core::ProjectionMaintenanceInitializationStatusDTO>&
   observed_scene_status() const noexcept;
-  [[nodiscard]] const std::optional<manyforge::core::ProjectionApplyFinalizeResultDTO>&
-  observed_finalize_result() const noexcept;
 
  private:
   manyforge::core::ActiveBundlePublicationRequestDTO publication_request_;
-  manyforge::core::ProjectionApplyStatusQueryDTO scene_status_query_;
+  manyforge::core::ProjectionMaintenanceInitializationQueryDTO scene_status_query_;
   std::optional<manyforge::core::ActiveBundlePublicationReceiptDTO> observed_publication_;
-  std::optional<manyforge::core::ProjectionApplyStatusDTO> observed_scene_status_;
-  std::optional<manyforge::core::ProjectionApplyFinalizeResultDTO> observed_finalize_result_;
+  std::optional<manyforge::core::ProjectionMaintenanceInitializationStatusDTO>
+      observed_scene_status_;
 };
 
 enum class ManagerSelectedBundleTransitionPath {
   kPublishedFromNewCall,
   kRecoveredPublicationHead,
-  kFinalizedFromNewCall,
-  kRecoveredFinalizedOwnerStatus,
-  kDurableFinalizedReplay,
+  kCompletedFromNewCall,
+  kRecoveredCompletedOwnerStatus,
 };
 
 struct ManagerSelectedBundleTransitionResult final {
   ManagerApplyPrivateMaterializationWriteResult durable_materialization;
-  ManagerApplyObsoleteCommandSurfacesRetiredWriteResult durable_retired_command_surfaces;
   ManagerApplyPublicationReceiptWriteResult durable_publication;
-  std::optional<ManagerApplySceneFinalizedWriteResult> durable_finalized;
+  bool scene_completed{};
   ManagerSelectedBundleTransitionPath path;
 };
 
-/// Completes the selected named-Apply transition from durable activation to
-/// public selection and scene Finalize.
+/// Completes the selected named-Apply transition from Scene-owned initialized
+/// state to public selection and Scene-owned completion.
 ///
-/// Private materialization and complete command-surface disposition are
-/// journaled before publication. One invocation performs at most one external
-/// mutating operation: Publish or Finalize. Every recovery path observes the
-/// authoritative durable head/scene status before retrying that exact effect.
+/// Private materialization is journaled before publication. One invocation performs at most one external
+/// mutating operation: Publish or Complete. Every in-process continuation
+/// observes the authoritative durable head and Scene status first.
 class ManagerSelectedBundleTransitionCoordinator final {
  public:
    ManagerSelectedBundleTransitionCoordinator(
        SqliteManagerApplyJournal &apply_journal,
-       const manyforge::deployment::IVerifiedRetainedBundleSource
-           &retained_bundle_source,
        manyforge::core::IActiveBundlePublicationStore &publication_store,
-       manyforge::core::IManagerSceneProjectionHandoffPort &scene_owner,
-       const manyforge::deployment::IVerifiedRetainedProductArtifactSource
-           *artifact_source = nullptr);
+       manyforge::core::IManagerSceneProjectionMaintenancePort &scene_owner);
 
    [[nodiscard]] ManagerSelectedBundleTransitionResult
    AdvanceOrRecover(const manyforge::core::ApplyId &apply_id,
-                    manyforge::core::ApplyGeneration apply_generation);
+                    manyforge::core::ApplyGeneration apply_generation,
+                    const manyforge::deployment::RetainedBundle &predecessor,
+                    const manyforge::deployment::RetainedBundle &candidate);
 
    ManagerSelectedBundleTransitionCoordinator(
        const ManagerSelectedBundleTransitionCoordinator &) = delete;
@@ -95,10 +87,8 @@ class ManagerSelectedBundleTransitionCoordinator final {
 
  private:
   SqliteManagerApplyJournal& apply_journal_;
-  const manyforge::deployment::IVerifiedRetainedBundleSource& retained_bundle_source_;
   manyforge::core::IActiveBundlePublicationStore& publication_store_;
-  manyforge::core::IManagerSceneProjectionHandoffPort& scene_owner_;
-  const manyforge::deployment::IVerifiedRetainedProductArtifactSource* artifact_source_;
+  manyforge::core::IManagerSceneProjectionMaintenancePort& scene_owner_;
   std::mutex operation_mutex_;
 };
 

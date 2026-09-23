@@ -1364,7 +1364,6 @@ def test_process_commands_bind_exact_component_world_and_pose_config(
         "--projection-root",
         "--install-root",
         "--artifact-root",
-        "--program-selection-state-root",
         "--manager-run-root",
         "--execution-run-root",
     ):

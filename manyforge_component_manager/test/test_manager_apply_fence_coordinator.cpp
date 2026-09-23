@@ -156,6 +156,7 @@ ApplyIntent(std::string apply_id = "apply-1",
               "sha256:1717171717171717171717171717171717171717171717171717171717171717"),
           core::ContentDigest(
               "sha256:1616161616161616161616161616161616161616161616161616161616161616"),
+          R"({"schema_version":"test.prepared_activation_receipt.v1"})",
       },
       core::AdmissionGeneration(7U),
       std::nullopt,

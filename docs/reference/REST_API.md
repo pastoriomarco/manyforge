@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-22 12:58:43 UTC
+  Last regenerated: 2026-09-23 05:34:47 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -84,9 +84,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/execution/targets` | headless-runtime-client | Execution Targets |
 | `GET` | `/api/files/browse` | files | Browse Filesystem |
 | `GET` | `/api/health` |  | Health |
-| `POST` | `/api/manager/apply` | headless-runtime-client | Manager Apply |
 | `GET` | `/api/manager/apply/status` | headless-runtime-client | Manager Apply Status |
-| `POST` | `/api/manager/deployment-candidates/preview` | headless-runtime-client | Manager Deployment Candidate Preview |
 | `GET` | `/api/manager/diff` | headless-runtime-client | Manager Diff |
 | `GET` | `/api/manager/graph` | headless-runtime-client | Manager Graph |
 | `GET` | `/api/manager/status` | headless-runtime-client | Manager Status |
@@ -102,7 +100,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/draft/runtime-override-promotions` | composer-draft | Materialize Runtime Override |
 | `GET` | `/api/program/draft/scene-meshes/resolve` | headless-scene-mesh-client | Resolve Program Draft Scene Mesh |
 | `GET` | `/api/program/draft/scene-meshes/{asset_hash}.glb` | headless-scene-mesh-client | Get Program Draft Scene Mesh |
-| `POST` | `/api/program/load` | composer-draft | Removed Program Load |
 | `POST` | `/api/program/new-draft` | composer-draft | New Draft |
 | `POST` | `/api/program/open-draft` | composer-draft | Open Draft |
 | `POST` | `/api/program/revert` | composer-draft | Revert Draft |
@@ -133,9 +130,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/scenario-documents/export` | composer-scenario-documents | Export Document |
 | `POST` | `/api/scenario-documents/load` | composer-scenario-documents | Load Document |
 | `POST` | `/api/scenario-documents/save` | composer-scenario-documents | Save Document |
-| `GET` | `/api/scenarios` | headless-runtime-client | Scenarios |
 | `GET` | `/api/scenarios/current` | headless-runtime-client | Current Scenario |
-| `POST` | `/api/scenarios/load` | composer-draft | Load Scenario |
 | `GET` | `/api/scene` | headless-runtime-client | Scene |
 | `GET` | `/api/scene/object-meshes/resolve` | headless-scene-mesh-client | Resolve Scene Object Mesh |
 | `GET` | `/api/scene/object-meshes/{asset_hash}.glb` | headless-scene-mesh-client | Get Scene Object Mesh |

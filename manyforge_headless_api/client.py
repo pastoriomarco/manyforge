@@ -26,8 +26,6 @@ from .native import (
 from .program_binding_transport import ProgramBindingTransportError
 from .program_binding_projection import (
     validate_applied_program_selection,
-    validate_program_apply_result,
-    validate_scenario_program_selection,
 )
 from .models import (
     MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES,
@@ -640,32 +638,6 @@ class HeadlessHttpClient:
     def source_model_context(self) -> dict[str, Any]:
         return self.request("GET", "/api/source-model-context")
 
-    def scenarios(self) -> dict[str, Any]:
-        return self.request("GET", "/api/scenarios")
-
-    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
-        if (
-            not isinstance(scenario_id, str)
-            or not scenario_id
-            or len(scenario_id.encode("utf-8")) > 128
-        ):
-            raise ValueError("scenario_id is invalid")
-        projection = self.request(
-            "GET",
-            f"/api/scenarios/{quote(scenario_id, safe='')}/program-selection",
-        )
-        try:
-            validate_scenario_program_selection(
-                projection,
-                scenario_id=scenario_id,
-            )
-        except (ProgramBindingTransportError, TypeError, ValueError) as error:
-            raise HeadlessClientError(
-                "scenario_program_selection_invalid",
-                "headless API returned an invalid scenario Program selection",
-            ) from error
-        return projection
-
     def program_applied(self) -> dict[str, Any]:
         projection = self.request("GET", "/api/program/applied")
         try:
@@ -676,18 +648,6 @@ class HeadlessHttpClient:
                 "headless API returned an invalid Applied Program projection",
             ) from error
         return projection
-
-    def program_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        result = self.request("POST", "/api/program/apply", body=body)
-        try:
-            validate_program_apply_result(result)
-        except (ProgramBindingTransportError, TypeError, ValueError) as error:
-            raise HeadlessClientError(
-                "program_apply_response_invalid",
-                "headless API returned an invalid Program Apply result",
-                status_code=502,
-            ) from error
-        return result
 
     def program_scene_prepare(self, body: Mapping[str, Any]) -> dict[str, Any]:
         result = self.request("POST", "/api/program/scene-preparations", body=body)

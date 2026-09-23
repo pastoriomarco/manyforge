@@ -108,7 +108,7 @@ class ProgramRunCapture:
     program_run_id: str
     applied_record_digest: str
     scenario_id: str
-    scenario_catalog_revision: str
+    source_document_digest: str
     program_id: str
     program_revision: str
     program_binding_id: str
@@ -130,7 +130,7 @@ class ProgramRunCapture:
         _require_text(self.program_id, field="program_id")
         for field_name in (
             "applied_record_digest",
-            "scenario_catalog_revision",
+            "source_document_digest",
             "program_revision",
             "program_binding_id",
             "retained_bundle_id",
@@ -203,7 +203,7 @@ class ProgramRunCapture:
             "program_run_id": self.program_run_id,
             "applied_record_digest": self.applied_record_digest,
             "scenario_id": self.scenario_id,
-            "scenario_catalog_revision": self.scenario_catalog_revision,
+            "source_document_digest": self.source_document_digest,
             "program_id": self.program_id,
             "program_revision": self.program_revision,
             "program_binding_id": self.program_binding_id,

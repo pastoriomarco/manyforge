@@ -610,24 +610,6 @@ def test_project_facts_commit_advances_once_and_a_repeat_does_not() -> None:
     assert cleared.workspace_revision == captured.workspace_revision + 1
 
 
-def test_migrated_project_fact_write_through_is_one_advance_per_field() -> None:
-    workspace, _program, _deployment = _workspace()
-    before = workspace.revision
-
-    workspace.migrate_project_facts({"document_path": "/tmp/cell-a"})
-    assert workspace.revision == before + 1
-    assert workspace.project_facts()["document_path"] == "/tmp/cell-a"
-
-    # An unchanged repeat is a validated no-op.
-    workspace.migrate_project_facts({"document_path": "/tmp/cell-a"})
-    assert workspace.revision == before + 1
-
-    with pytest.raises(ValueError):
-        workspace.migrate_project_facts({"not_a_fact": 1})
-    with pytest.raises(ValueError):
-        workspace.migrate_project_facts({})
-
-
 def test_snapshot_copies_are_isolated_from_later_commits() -> None:
     workspace, program, _deployment = _workspace()
     program.install_program("rev-1")

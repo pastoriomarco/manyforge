@@ -27,7 +27,6 @@ import {
   parseCurrentScenarioResponse,
   parseRuntimeOverrideMaterializationResponse,
   parseRuntimeScaleControlStatus,
-  parseScenarioCatalogResponse,
   parseScenarioDocumentIndexResponse,
   parseScenarioDocumentExportResponse,
   parseScenarioDocumentConversionResponse,
@@ -74,7 +73,6 @@ import type {
   ProgramWorkspaceTransitionResponse,
   CurrentScenarioResponse,
   RuntimeOverrideMaterializationResponse,
-  ScenarioCatalogResponse,
   ScenarioDocumentFenceRequest,
   ScenarioDocumentExportResponse,
   ScenarioDocumentConversionResponse,
@@ -808,9 +806,9 @@ export const api = {
     revert: (
       fence: DraftFenceRequest,
       signal?: AbortSignal,
-    ): Promise<DeploymentWorkspaceResponse> => requestJson(
+    ): Promise<DeploymentCandidateOperationResponse> => requestJson(
       '/api/deployment/revert',
-      parseDeploymentWorkspaceResponse,
+      parseDeploymentCandidateOperationResponse,
       signal,
       { method: 'POST', body: JSON.stringify(fence) },
     ),
@@ -839,8 +837,6 @@ export const api = {
     ),
   },
   programs: {
-    scenarios: (signal?: AbortSignal): Promise<ScenarioCatalogResponse> =>
-      requestJson('/api/scenarios', parseScenarioCatalogResponse, signal),
     currentScenario: (signal?: AbortSignal): Promise<CurrentScenarioResponse> =>
       requestJson('/api/scenarios/current', parseCurrentScenarioResponse, signal),
     applied: (signal?: AbortSignal): Promise<AppliedProgramSelection> =>

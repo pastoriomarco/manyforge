@@ -197,24 +197,10 @@ class RevertDraftRequest(_DraftFence):
     pass
 
 
-class LoadScenarioRequest(_DraftFence):
-    scenario_id: str = Field(
-        alias="scenarioId",
-        min_length=1,
-        max_length=128,
-        pattern=r"^[a-z][a-z0-9_.-]*$",
-    )
-    scenario_catalog_revision: str = Field(
-        alias="scenarioCatalogRevision",
-        pattern=r"^sha256:[0-9a-f]{64}$",
-    )
-    confirm_discard: bool = Field(default=False, alias="confirmDiscard")
-
-
 @dataclass(frozen=True, slots=True)
 class _AppliedContext:
     scenario_id: str
-    scenario_catalog_revision: str
+    source_document_digest: str
     program_revision: str
     record_digest: str
     program_document: dict[str, Any]
@@ -312,7 +298,7 @@ def _applied_context(
     return (
         _AppliedContext(
             scenario_id=applied["scenario_id"],
-            scenario_catalog_revision=applied["scenario_catalog_revision"],
+            source_document_digest=applied["source_document_digest"],
             program_revision=program_revision,
             record_digest=record_digest,
             program_document=program,
@@ -1007,11 +993,13 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         deployment = state.deployment_draft_session.retained_state().get("document")
         assignment = deepcopy(state.scenario_program_role_assignment)
         source_digest = state.scenario_source_document_digest
+        scenario_id = state.scenario_document_id
         project_path = state.scenario_document_path
         if (
             not isinstance(deployment, dict)
             or not isinstance(assignment, dict)
             or not isinstance(source_digest, str)
+            or not isinstance(scenario_id, str)
             or not isinstance(project_path, str)
         ):
             raise DraftSessionError(
@@ -1026,6 +1014,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         captured_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
+                    "scenario_id": scenario_id,
                     "source_document_digest": source_digest,
                     "deployment": deployment,
                     "model_source_closure": source_closure,
@@ -1039,6 +1028,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             state.headless_client.manager_status()
         )
         intent = {
+            "scenario_id": scenario_id,
             "source_document_digest": source_digest,
             "captured_input_digest": captured_digest,
             "deployment": deepcopy(deployment),
@@ -1458,34 +1448,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             )
         except Exception as error:
             _raise_workspace_error(error)
-
-    @router.post("/api/scenarios/load")
-    def load_scenario(_body: LoadScenarioRequest) -> None:
-        raise HTTPException(
-            status_code=410,
-            detail={
-                "code": "catalog_scenario_load_removed",
-                "message": (
-                    "Catalog Scenario activation was removed because it cannot "
-                    "provide the immutable source closure required by unified "
-                    "activation. Open a complete v2 Scenario document, then "
-                    "Apply its Deployment or Program."
-                ),
-            },
-        )
-
-    @router.post("/api/program/load")
-    def removed_program_load() -> None:
-        raise HTTPException(
-            status_code=410,
-            detail={
-                "code": "program_load_removed_use_scenario_load",
-                "message": (
-                    "Program-only Load was removed; use Open for editor-only "
-                    "documents or Load Scenario for Deployment and Program activation"
-                ),
-            },
-        )
 
     @router.post("/api/program/discard")
     def discard_draft(body: DiscardDraftRequest) -> dict[str, Any]:

@@ -986,14 +986,7 @@ def main() -> None:
             ("ur5_roboplan", "ur5_roboplan_structural"),
         )
     )
-    catalog = json.loads(
-        (args.package_root / "maintained.scenario-catalog.yaml").read_text()
-    )
-    scenario = next(
-        row
-        for row in catalog["scenarios"]
-        if "lite6_pick_and_place" in [row["scenario_id"], *row.get("aliases", [])]
-    )
+    scenario = {"scenario_id": "lite6_pick_and_place"}
     state = Path(tempfile.mkdtemp(prefix="h5q-"))
     package = state / "package"
     shutil.copytree(args.package_root, package)
@@ -1911,8 +1904,8 @@ HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
                 "request_owner_epoch": "query-only.client",
                 "source_label": "query_only_qualification",
                 "scenario_id": scenario["scenario_id"],
-                "scenario_catalog_revision": stack.metadata[
-                    "scenario_catalog_revision"
+                "source_document_digest": applied[
+                    "source_document_digest"
                 ],
                 "expected_applied_record_digest": applied["source"]["record_digest"],
                 "draft_program_revision": program["program_revision"],

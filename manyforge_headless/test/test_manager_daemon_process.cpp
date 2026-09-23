@@ -1016,28 +1016,28 @@ std::string ApplyRequest(
       {"graph_revision", CanonicalValue(resolved_graph_revision)},
       {"retained_bundle_id", CanonicalValue(resolved_retained_bundle_id)},
   });
-  std::ifstream catalog_stream(
-      directory.apply_package_root() / "maintained.scenario-catalog.yaml",
-      std::ios::binary);
-  if (!catalog_stream) {
-    throw std::runtime_error("Manager candidate catalog fixture is absent");
-  }
-  const std::string catalog_bytes{std::istreambuf_iterator<char>(catalog_stream),
-                                  std::istreambuf_iterator<char>()};
-  const auto catalog =
-      deployment::parse_strict_json_model_yaml(catalog_bytes).root();
   std::string candidate_bundle;
   std::string candidate_graph;
-  for (const auto &row : RequiredMember(catalog, "scenarios").as_array()) {
-    if (RequiredText(row, "deployment_artifact_id") == deployment_artifact_id &&
-        RequiredText(row, "deployment_revision") == deployment_revision) {
-      candidate_bundle = RequiredText(row, "retained_bundle_id");
-      candidate_graph = RequiredText(row, "graph_revision");
+  const deployment::FilesystemVerifiedRetainedBundleSource bundles(
+      directory.apply_package_root());
+  const auto retained_root =
+      directory.apply_package_root() / "retained-bundles" / "sha256";
+  for (const auto &entry : std::filesystem::directory_iterator(retained_root)) {
+    if (!entry.is_regular_file() || entry.path().extension() != ".json")
+      continue;
+    const auto bundle = bundles.get_verified(core::RetainedBundleId(
+        "sha256:" + entry.path().stem().string()));
+    if (bundle != nullptr &&
+        bundle->value().deployment_artifact_id.value() ==
+            deployment_artifact_id &&
+        bundle->value().deployment_revision.value() == deployment_revision) {
+      candidate_bundle = bundle->retained_bundle_id().value();
+      candidate_graph = bundle->value().cell_graph.graph_revision.value();
       break;
     }
   }
   if (candidate_bundle.empty() || candidate_graph.empty()) {
-    throw std::runtime_error("Manager candidate catalog fixture has no match");
+    throw std::runtime_error("Manager retained fixture has no matching candidate");
   }
   const auto preview_request =
       content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
@@ -1085,6 +1085,7 @@ std::string ApplyRequest(
       {"expected_current", expected},
       {"prepared_activation",
        CanonicalValue(CanonicalValue::Object{
+           {"assistant_mode", CanonicalValue("optional")},
            {"captured_input_digest",
             CanonicalValue("sha256:1414141414141414141414141414141414141414141414"
                            "1414141414141414")},
@@ -1092,12 +1093,29 @@ std::string ApplyRequest(
             CanonicalValue(std::string(deployment_artifact_id))},
            {"deployment_revision",
             CanonicalValue(std::string(deployment_revision))},
-           {"program_binding_id",
-            CanonicalValue("sha256:1717171717171717171717171717171717171717171717"
-                           "1717171717171717")},
+           {"graph_revision", CanonicalValue(candidate_graph)},
+           {"node_environment_digest",
+            CanonicalValue("sha256:1818181818181818181818181818181818181818181818"
+                           "1818181818181818")},
            {"prepared_activation_id",
             CanonicalValue("sha256:1616161616161616161616161616161616161616161616"
                            "1616161616161616")},
+           {"program_binding_id",
+            CanonicalValue("sha256:1717171717171717171717171717171717171717171717"
+                           "1717171717171717")},
+           {"program_id", CanonicalValue("program.test")},
+           {"program_revision",
+            CanonicalValue("sha256:1919191919191919191919191919191919191919191919"
+                           "1919191919191919")},
+           {"retained_bundle_id", CanonicalValue(candidate_bundle)},
+           {"scenario_id", CanonicalValue("scenario.test")},
+           {"schema_version",
+            CanonicalValue("manyforge.prepared_activation_input.v2")},
+           {"source_document_digest",
+            CanonicalValue("sha256:2020202020202020202020202020202020202020202020"
+                           "2020202020202020")},
+           {"typed_parameter_overrides",
+            CanonicalValue(CanonicalValue::Object{})},
        })},
       {"reject_if_affected_busy", CanonicalValue(true)},
       {"request_id", CanonicalValue(std::string(request_id))},
@@ -2359,8 +2377,10 @@ TEST(ManagerDaemonProcess,
         execution_status.find("\"details\":{\"owner_epoch\":\"kernel-owner-"),
         std::string::npos)
         << execution_status;
-    ASSERT_TRUE(std::filesystem::remove(directory.apply_package_root() /
-                                        "maintained.scenario-catalog.yaml"));
+    const auto candidate_path =
+        directory.apply_package_root() / "retained-bundles" / "sha256" /
+        (fixture.candidate_retained_bundle_id.substr(7U) + ".json");
+    ASSERT_TRUE(std::filesystem::remove(candidate_path));
     const auto replayed = SendCommand(directory.socket_path(), request);
     EXPECT_NE(replayed.find("\"replay_status\":\"replayed_exact\""),
               std::string::npos)

@@ -5,7 +5,6 @@
 #include "manyforge_headless/scene_runtime_state_owner.hpp"
 #include "manyforge_headless/source_snapshot.hpp"
 
-#include <manyforge_component_manager/active_native_projection_runtime_set.hpp>
 #include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
@@ -22,7 +21,6 @@
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
-#include <manyforge_deployment/scenario_apply_candidate_source.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_scene/canonical_empty_scene_owner.hpp>
 #include <manyforge_scene/logical_scene_value_codec.hpp>
@@ -390,7 +388,7 @@ private:
 
 struct DaemonConfig final {
   std::filesystem::path install_root;
-  std::filesystem::path candidate_package_root;
+  std::filesystem::path activation_root;
   std::filesystem::path canonical_empty_admission_filename{
       "canonical-empty-admission.json"};
   std::filesystem::path manager_state_root;
@@ -633,7 +631,10 @@ RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
 /// reconstruct the operation input.
 component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
     const CanonicalValue &value) {
-  RequireExactObjectSize(value, 5U, "Apply prepared activation");
+  RequireExactObjectSize(value, 14U, "Apply prepared activation");
+  Require(RequiredString(value, "schema_version") ==
+              "manyforge.prepared_activation_input.v2",
+          "Apply prepared activation schema is unsupported");
   const auto captured_input_digest =
       RequiredString(value, "captured_input_digest");
   const auto deployment_revision = RequiredString(value, "deployment_revision");
@@ -649,6 +650,21 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
   const auto program_binding_id = RequiredString(value, "program_binding_id");
   Require(core::IsExactLowercaseSha256Digest(program_binding_id),
           "Apply program_binding_id must be canonical SHA-256");
+  for (const auto field : {"source_document_digest", "retained_bundle_id",
+                           "graph_revision", "program_revision",
+                           "node_environment_digest"}) {
+    Require(core::IsExactLowercaseSha256Digest(RequiredString(value, field)),
+            "Apply prepared activation digest is not canonical");
+  }
+  const auto assistant_mode = RequiredString(value, "assistant_mode");
+  Require(assistant_mode == "required" || assistant_mode == "optional" ||
+              assistant_mode == "forbidden",
+          "Apply prepared activation assistant_mode is unsupported");
+  Require(RequiredMember(value, "typed_parameter_overrides").is_object(),
+          "Apply prepared activation typed_parameter_overrides must be an "
+          "object");
+  static_cast<void>(RequiredString(value, "scenario_id"));
+  static_cast<void>(RequiredString(value, "program_id"));
   return {
       core::ContentDigest(captured_input_digest),
       core::DeploymentArtifactId(
@@ -656,6 +672,7 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
       core::DeploymentRevision(deployment_revision),
       core::ProgramBindingId(program_binding_id),
       core::ContentDigest(prepared_activation_id),
+      content_identity::canonical_json(value),
   };
 }
 
@@ -1913,18 +1930,15 @@ ApplyResponse(const ManagerCommand &command,
 /// Exact UA2A prepared activation accepted by one named Apply.
 CanonicalValue ApplyPreparedActivationValue(
     const component_manager::ManagerApplyPreparedActivationDTO &activation) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"captured_input_digest",
-       CanonicalValue(activation.captured_input_digest.value())},
-      {"deployment_artifact_id",
-       CanonicalValue(activation.deployment_artifact_id.value())},
-      {"deployment_revision",
-       CanonicalValue(activation.deployment_revision.value())},
-      {"program_binding_id",
-       CanonicalValue(activation.program_binding_id.value())},
-      {"prepared_activation_id",
-       CanonicalValue(activation.prepared_activation_id.value())},
-  });
+  try {
+    return content_identity::parse_canonical_json(
+        activation.canonical_receipt_json,
+        {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
+         4096U});
+  } catch (const std::exception &error) {
+    Fail("stored Apply prepared activation is invalid: " +
+         std::string(error.what()));
+  }
 }
 
 /// One bounded lifecycle status for one durable Apply generation.
@@ -2100,11 +2114,11 @@ class ManagerVerifiedPackageView final
 public:
   explicit ManagerVerifiedPackageView(
       std::filesystem::path package_root,
-      std::optional<std::filesystem::path> candidate_package_root =
+      std::optional<std::filesystem::path> activation_root =
           std::nullopt)
-      : bundles_(package_root, candidate_package_root),
+      : bundles_(package_root, activation_root),
         artifacts_(std::move(package_root),
-                   std::move(candidate_package_root)) {}
+                   std::move(activation_root)) {}
 
   [[nodiscard]] std::shared_ptr<const deployment::RetainedBundle> get_verified(
       const core::RetainedBundleId &retained_bundle_id) const override {
@@ -2247,9 +2261,9 @@ public:
                        .load_verified()),
         verified_package_(
             package_generation_.descriptor_bound_root(),
-            config_.candidate_package_root.empty()
+            config_.activation_root.empty()
                 ? std::nullopt
-                : std::optional(config_.candidate_package_root)),
+                : std::optional(config_.activation_root)),
         native_runtime_adapter_(
             InstalledTargetRoot(), package_generation_.descriptor_bound_root(),
             config_.manager_state_root, config_.manager_run_root,
@@ -2262,7 +2276,7 @@ public:
                     deployment::ros2_control_execution_runtime_contract::
                         kLaunchEnvironmentContract)},
             config_.logical_scene_database, config_.program_cycle_journal,
-            config_.candidate_package_root),
+            config_.activation_root),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
                      stores_.active_bundle_publication_store(),
@@ -2430,19 +2444,19 @@ private:
         std::filesystem::canonical(config.install_root, install_root_error);
     Require(!install_root_error && config.install_root.is_absolute(),
             "install root could not be canonicalized");
-    if (!config.candidate_package_root.empty()) {
-      config.candidate_package_root = ExistingDirectory(
-          std::move(config.candidate_package_root),
-          "candidate package root");
-      std::error_code candidate_root_error;
-      config.candidate_package_root = std::filesystem::canonical(
-          config.candidate_package_root, candidate_root_error);
-      Require(!candidate_root_error &&
-                  config.candidate_package_root.is_absolute(),
-              "candidate package root could not be canonicalized");
+    if (!config.activation_root.empty()) {
+      config.activation_root = ExistingDirectory(
+          std::move(config.activation_root),
+          "activation root");
+      std::error_code activation_root_error;
+      config.activation_root = std::filesystem::canonical(
+          config.activation_root, activation_root_error);
+      Require(!activation_root_error &&
+                  config.activation_root.is_absolute(),
+              "activation root could not be canonicalized");
       RequireDisjointDirectories(config.install_root,
-                                 config.candidate_package_root,
-                                 "installed/candidate package capabilities");
+                                 config.activation_root,
+                                 "installed/activation capabilities");
     }
     config.manager_state_root = ExistingPrivateDirectory(
         std::move(config.manager_state_root), "Manager state root");
@@ -2464,8 +2478,8 @@ private:
     for (const auto *typed_root : typed_roots) {
       RequireDisjointDirectories(config.install_root, *typed_root,
                                  "install/runtime capabilities");
-      if (!config.candidate_package_root.empty()) {
-        RequireDisjointDirectories(config.candidate_package_root, *typed_root,
+      if (!config.activation_root.empty()) {
+        RequireDisjointDirectories(config.activation_root, *typed_root,
                                    "candidate/runtime capabilities");
       }
     }
@@ -2567,57 +2581,40 @@ private:
               active_publication.publication_generation};
     }
 
-    const auto finalized = stores_.apply_journal().ReadSceneFinalized(
-        named->apply_id, named->apply_generation);
-    if (finalized.has_value()) {
-      const auto &result = finalized->scene_finalized.finalized_result;
+    const auto maintenance = scene_owner_.ReadMaintenanceInitialization(
+        {named->apply_id, named->apply_generation});
+    Require(
+        maintenance.has_value() && maintenance->valid() &&
+            maintenance->target_projection_revision ==
+                active_publication.request.candidate_projection_revision &&
+            maintenance->target_projection_revision.retained_bundle_id ==
+                active_publication.request.candidate_retained_bundle_id &&
+            maintenance->target_projection_revision.graph_revision ==
+                active_publication.request.candidate_graph_revision &&
+            active_publication.request.expected_previous_publication_generation
+                .has_value(),
+        "scene-runtime publication lacks its exact Scene-owned operation");
+
+    if (maintenance->state ==
+        core::ProjectionMaintenanceInitializationState::kCompleted) {
       Require(
-          result.state ==
-                  core::ProjectionApplyFinalizeResultState::kFinalized &&
-              result.apply_id == named->apply_id &&
-              result.apply_generation == named->apply_generation &&
-              result.projection_stage_generation ==
-                  named->projection_stage_generation &&
-              result.candidate_projection_revision ==
-                  active_publication.request.candidate_projection_revision &&
-              result.publication_receipt == active_publication,
-          "scene-runtime finalized evidence differs from the active "
-          "publication");
-      return {active_publication.request.candidate_projection_revision,
+          maintenance->publication_receipt ==
+              std::optional<core::ActiveBundlePublicationReceiptDTO>{
+                  active_publication},
+          "Scene completion differs from the active publication");
+      return {maintenance->target_projection_revision,
               active_publication.publication_generation};
     }
 
-    const auto intent = stores_.apply_journal().ReadIntent(
-        named->apply_id, named->apply_generation);
-    const auto stage = stores_.apply_journal().ReadSceneStageIntent(
-        named->apply_id, named->apply_generation);
-    const auto activation = stores_.apply_journal().ReadActivationSelection(
-        named->apply_id, named->apply_generation);
     Require(
-        intent.has_value() && stage.has_value() && activation.has_value() &&
-            intent->intent.candidate_retained_bundle_id ==
-                active_publication.request.candidate_retained_bundle_id &&
-            intent->intent.candidate_graph_revision ==
-                active_publication.request.candidate_graph_revision &&
-            activation->activation_selection.projection_stage_generation ==
-                named->projection_stage_generation &&
-            activation->activation_selection.candidate_projection_revision ==
-                active_publication.request.candidate_projection_revision &&
-            stage->scene_stage_intent.candidate_retained_bundle_id ==
-                active_publication.request.candidate_retained_bundle_id &&
-            stage->scene_stage_intent.candidate_graph_revision ==
-                active_publication.request.candidate_graph_revision &&
-            active_publication.request
-                    .expected_previous_publication_generation ==
-                std::optional<core::ActiveBundlePublicationGeneration>{
-                    stage->scene_stage_intent
-                        .predecessor_publication_generation},
-        "unfinalized scene-runtime publication lacks its exact durable "
-        "predecessor evidence");
-    return {intent->intent.expected_active_projection_revision,
-            stage->scene_stage_intent.predecessor_publication_generation};
+        maintenance->state ==
+            core::ProjectionMaintenanceInitializationState::kInitialized,
+        "scene-runtime publication belongs to a failed or interrupted "
+        "initialization");
+    return {
+        maintenance->predecessor_projection_revision,
+        *active_publication.request.expected_previous_publication_generation};
   }
-
   /// Observation-only convergence and publication. Used by periodic runtime
   /// observation and the public `reconcile` command. The independent liveness
   /// lane consumes the resulting snapshot; it does not call this method. A
@@ -2665,40 +2662,10 @@ private:
                      component_manager::ProcessPresenceState::kPresent &&
                  !observation.runtime_epoch().empty();
         });
-    if (runtime.state ==
-            component_manager::ManagerActiveRuntimeConvergenceState::kConverged ||
-        all_runtime_processes_present) {
-      const auto current_bindings =
-          component_manager::DeriveActiveNativeProjectionRuntimeBindings(
-              active_bundle->value(), runtime.observations);
-      if (!last_reconciled_native_runtime_bindings_.has_value() ||
-          *last_reconciled_native_runtime_bindings_ != current_bindings) {
-        // Full native rebuild/recovery is a startup or process-incarnation
-        // transition effect. Unchanged observations perform no scene-store
-        // read and no native recovery work.
-        if (current_bindings.empty()) {
-          last_reconciled_native_runtime_bindings_ = current_bindings;
-        } else {
-          const auto scene_access = scene_owner_.ReadAccessStatus();
-          Require(scene_access.active_projection.has_value(),
-                  "active publication has no finalized logical-scene "
-                  "projection");
-          const auto runtime_set =
-              component_manager::DeriveActiveNativeProjectionRuntimeSet(
-                  active_bundle->value(), *scene_access.active_projection,
-                  runtime.observations);
-          const auto recovery =
-              scene_owner_.ReconcileActiveProjectionRuntimes(runtime_set);
-          Require(
-              recovery.valid() && recovery.runtime_set == runtime_set,
-              "active native projection recovery returned foreign evidence");
-          if (recovery.state !=
-              core::ActiveProjectionRuntimeRecoveryState::kProgressing) {
-            last_reconciled_native_runtime_bindings_ = current_bindings;
-          }
-        }
-      }
-    }
+    // Runtime observation is deliberately non-creative. A missing or replaced
+    // native owner is surfaced by Scene health; it never triggers projection
+    // rebuild/recovery outside an explicitly admitted maintenance operation.
+    static_cast<void>(all_runtime_processes_present);
     const auto observed_at = static_cast<std::int64_t>(ElapsedNs());
     const auto finalized_scene_runtime =
         SelectFinalizedSceneRuntime(runtime.plan.active_publication);
@@ -4014,19 +3981,13 @@ private:
             const auto active = plan_source_.ReadCurrentPlan();
             const auto &current_pointer = active.active_publication.request;
             // The accepted operation carries the exact candidate identity that
-            // the preview resolved. The Manager must not reopen a mutable
-            // Scenario/catalog selection here: the sealed package and the
-            // current public pointer are the only facts rechecked, and both
-            // are immutable or already versioned.
-            const auto candidate_bundle = verified_package_.get_verified(
-                candidate_receipt.candidate_retained_bundle_id);
+            // preview resolved. Recheck the versioned public pointer here; the
+            // named-Apply coordinator performs the one authoritative verified
+            // predecessor/candidate capture while accepting the operation.
             if (current_pointer.candidate_retained_bundle_id !=
                     candidate_receipt.expected_current_retained_bundle_id ||
                 current_pointer.candidate_graph_revision !=
-                    candidate_receipt.expected_current_graph_revision ||
-                candidate_bundle == nullptr ||
-                candidate_bundle->value().cell_graph.graph_revision !=
-                    candidate_receipt.candidate_graph_revision) {
+                    candidate_receipt.expected_current_graph_revision) {
               TrySendResponse(client.get(),
                               ApplyErrorResponse(
                                   command, "deployment_candidate_receipt_stale",
@@ -4582,8 +4543,6 @@ private:
   std::map<std::string, PoseObserverSession> pose_observer_sessions_;
   std::vector<DeploymentCandidateReceipt> deployment_candidate_receipts_;
   std::map<PoseObservationKey, PoseObservationReplay> pose_observation_replays_;
-  std::optional<std::vector<core::ProjectionNativeRuntimeBindingDTO>>
-      last_reconciled_native_runtime_bindings_;
 };
 
 std::uint64_t ParsePeriod(const std::string_view value) {
@@ -4603,7 +4562,7 @@ std::uint64_t ParsePeriod(const std::string_view value) {
 DaemonConfig ParseArguments(const int argc, char **argv) {
   DaemonConfig config;
   bool install = false;
-  bool candidate_package = false;
+  bool activation = false;
   bool admission = false;
   bool manager = false;
   bool manager_run = false;
@@ -4621,9 +4580,9 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     if (option == "--install-root" && !install) {
       config.install_root = value;
       install = true;
-    } else if (option == "--candidate-package-root" && !candidate_package) {
-      config.candidate_package_root = value;
-      candidate_package = true;
+    } else if (option == "--activation-root" && !activation) {
+      config.activation_root = value;
+      activation = true;
     } else if (option == "--canonical-empty-admission-filename" && !admission) {
       config.canonical_empty_admission_filename = value;
       admission = true;

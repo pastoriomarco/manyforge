@@ -55,7 +55,7 @@ silently dropping patches.
 
 ## Carried 0.7 patches
 
-`patches.sha256` is authoritative for order and content. Four small
+`patches.sha256` is authoritative for order and content. Five small
 dependency-internal fixes are carried:
 
 1. `0010-construct-roboplan-070-scene-scratch-without-assignment.patch`
@@ -89,6 +89,13 @@ dependency-internal fixes are carried:
    and the constrained/unconstrained RRT, sanitizer, binding, and conformance
    evidence passes without it. Historical dossier:
    `upstream/roboplan-060-pinocchio-scratch-direct-initialization.md`.
+5. `0014-describe-image-owned-native-dependencies.patch`
+   removes three wheel-level `cmeel` requirements whose native libraries are
+   deliberately supplied by the image's verified closure instead: system
+   Eigen/yaml-cpp and exact source-built TOPPRA 0.6.10. This keeps `pip check`
+   truthful without installing a second TOPPRA generation or placeholder
+   distribution metadata. The build requirements remain unchanged and the
+   dependency-stack verifier continues to prove the selected native linkage.
 
 Each dossier freezes the clean reproduction, impact, smallest patch,
 compatibility risk, focused evidence, intended upstream contract, and

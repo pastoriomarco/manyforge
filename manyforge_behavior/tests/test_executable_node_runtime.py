@@ -274,7 +274,7 @@ def _capture(program: Program, *, binding_id: str = _DIGEST_A) -> ProgramRunCapt
         program_run_id="run.test",
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="scenario.test",
-        scenario_catalog_revision=_DIGEST_A,
+        source_document_digest=_DIGEST_A,
         program_id=program.program_id,
         program_revision=program.program_revision,
         program_binding_id=binding_id,
@@ -1034,9 +1034,12 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner(
             path.relative_to(_ROOT).as_posix()
             for path in (_ROOT / "examples").glob("*.program.yaml")
             if not path.name.startswith("ur5e_lite6_wall_")
+            and path.read_text(encoding="utf-8").startswith(
+                "api_version: manyforge.program.v2\n"
+            )
         )
     )
-    assert len(sources) == 13
+    assert len(sources) == 11
     environment = build_node_environment()
     exercised: set[str] = set()
 

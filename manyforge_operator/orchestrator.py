@@ -286,10 +286,6 @@ class NativeLauncherConfig:
         return self.instance_root / "state" / "program-runner"
 
     @property
-    def program_selection_state_root(self) -> Path:
-        return self.instance_root / "state" / "program-selection"
-
-    @property
     def logical_scene_database(self) -> Path:
         return self.instance_root / "state" / "logical-scene" / "scene.sqlite3"
 
@@ -391,8 +387,6 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             str(config.install_root),
             "--artifact-root",
             str(config.artifact_root),
-            "--program-selection-state-root",
-            str(config.program_selection_state_root),
             "--node-catalog-path",
             str(config.node_catalog_path),
             "--node-environment-manifest-path",

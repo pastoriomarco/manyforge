@@ -2,7 +2,7 @@
 """Validate planner-neutral contracts and truthful adapter availability.
 
 This is an offline source/evidence checker.  It does not construct a planner,
-load a runtime adapter, or make the unavailable RoboPlan product operational.
+load a runtime adapter, or qualify the selected RoboPlan product.
 """
 
 from __future__ import annotations
@@ -54,8 +54,8 @@ REQUIRED_PROFILES = {
     "planning.profile.quality_bounded",
 }
 SELECTED_ROBOPLAN_SOURCE = (
-    "RoboPlan 0.6.0 d2e5162eda2f51f5599ecd60375b65346d0b2944 "
-    "plus the exact E1 four-patch manifest"
+    "RoboPlan 0.7.0 099dfa5ccd80b191eb3d6da9f4795f808a63913f "
+    "plus the exact UA1 patch manifest"
 )
 REQUIRED_EVIDENCE = {
     "neutral_harness_reference_backend",
@@ -886,7 +886,7 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
     adapters = require_mapping_fields(
         failures,
         document.get("adapters"),
-        {"deterministic_fake", "roboplan_0_6_0", "moveit2", "curobo"},
+        {"deterministic_fake", "roboplan_0_7_0", "moveit2", "curobo"},
         "adapters",
     )
     fake = _object(
@@ -899,8 +899,8 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
 
     roboplan = _object(
         failures,
-        adapters.get("roboplan_0_6_0"),
-        location="adapters.roboplan_0_6_0",
+        adapters.get("roboplan_0_7_0"),
+        location="adapters.roboplan_0_7_0",
     )
     if roboplan.get("status") != "temporarily_unavailable_composable_cell_rebuild":
         fail(failures, "RoboPlan runtime is not explicitly marked unavailable")
@@ -913,11 +913,11 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
             "RoboPlan overclaims more than retained-product consumer qualification",
         )
     if roboplan.get("source_identity") != SELECTED_ROBOPLAN_SOURCE:
-        fail(failures, "RoboPlan mapping does not name the selected E1 baseline")
+        fail(failures, "RoboPlan mapping does not name the selected UA1 baseline")
     capability_disposition = _string_value_mapping(
         failures,
         roboplan.get("capability_disposition"),
-        location="adapters.roboplan_0_6_0.capability_disposition",
+        location="adapters.roboplan_0_7_0.capability_disposition",
     )
     if set(capability_disposition) != REQUIRED_CAPABILITIES:
         fail(failures, "RoboPlan mapping does not cover every portable capability")
@@ -926,7 +926,7 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
     profile_disposition = _string_value_mapping(
         failures,
         roboplan.get("profile_disposition"),
-        location="adapters.roboplan_0_6_0.profile_disposition",
+        location="adapters.roboplan_0_7_0.profile_disposition",
     )
     if set(profile_disposition) != REQUIRED_PROFILES:
         fail(failures, "RoboPlan mapping does not cover every portable profile")

@@ -608,7 +608,7 @@ def test_dynamic_index_lists_only_project_documents(tmp_path: Path) -> None:
     class Headless:
         def scenarios(self) -> dict:
             return {
-                "scenario_catalog_revision": "sha256:" + "1" * 64,
+                "source_document_digest": "sha256:" + "1" * 64,
                 "scenarios": [
                     {
                         "scenario_id": "installed_cell",

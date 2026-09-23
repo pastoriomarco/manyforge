@@ -930,25 +930,10 @@ describe('Program authoring panels', () => {
     } satisfies ProgramWorkspaceController;
     const runtime = {
       state: {
-        catalog: {
-          apiVersion: 'manyforge.scenario_catalog.v1',
-          scenarioCatalogRevision: `sha256:${'c'.repeat(64)}`,
-          scenarios: [{
-            scenarioId: 'qualified',
-            description: null,
-            aliases: [],
-            deploymentArtifactId: 'deployment',
-            deploymentRevision: `sha256:${'d'.repeat(64)}`,
-            retainedBundleId: `sha256:${'e'.repeat(64)}`,
-            programBindingId: `sha256:${'f'.repeat(64)}`,
-            assistantMode: 'optional',
-          }],
-        },
         applied: null,
         currentScenario: null,
         run: null,
         controls: null,
-        selectedScenarioId: 'qualified',
         runnerAvailable: true,
         loading: false,
       observationError: null,
@@ -962,8 +947,6 @@ describe('Program authoring panels', () => {
       active: false,
       commandAllowed: vi.fn(() => false),
       refresh: vi.fn(),
-      selectScenario: vi.fn(),
-      clearScenarioSelection: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
       stopMotion: vi.fn(),

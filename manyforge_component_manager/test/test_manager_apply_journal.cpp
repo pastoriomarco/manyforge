@@ -49,20 +49,10 @@ using core::GraphRevision;
 using core::ProductContractId;
 using core::ProductContractRevision;
 using core::ProductId;
-using core::ProjectionApplyStageResultDTO;
-using core::ProjectionApplyStageResultState;
 using core::ProjectionHealthDTO;
 using core::ProjectionHealthState;
 using core::ProjectionNativeRuntimeBindingDTO;
 using core::ProjectionRevisionDTO;
-using core::ProjectionStagedCandidateDTO;
-using core::ProjectionStageGeneration;
-using core::ProjectionTransitionDisposition;
-using core::ProjectionTransitionEvidenceDTO;
-using core::ProjectionTransitionEvidenceState;
-using core::ProjectionTransitionRowDTO;
-using core::ProjectionTransitionRowEvidenceDTO;
-using core::ProjectionTransitionRowEvidenceState;
 using core::PublicRequestContextDTO;
 using core::RequestId;
 using core::RequestOwnerEpoch;
@@ -147,6 +137,7 @@ ManagerApplyIntentDTO Intent(std::string apply_id = "apply-1",
               "sha256:1515151515151515151515151515151515151515151515151515151515151515"),
           core::ProgramBindingId(kDigestTwo),
           ContentDigest("sha256:1616161616161616161616161616161616161616161616161616161616161616"),
+          R"({"schema_version":"test.prepared_activation_receipt.v1"})",
       },
       core::AdmissionGeneration(7U),
       std::nullopt,
@@ -390,211 +381,34 @@ ProjectionRevisionDTO CandidateProjection() {
   };
 }
 
-std::vector<ProjectionTransitionRowDTO> SceneTransitionRows() {
-  const auto predecessor = Intent().expected_active_projection_revision;
-  return {
-      {
-          ProjectionNativeRuntimeBindingDTO{
-              core::CapabilityProviderBindingId("provider-a"),
-              core::CapabilityProviderBindingRevision("provider-r1"),
-              RuntimeUnitId("runtime-1"),
-              RuntimeEpoch("runtime-epoch-1"),
-          },
-          ProjectionTransitionDisposition::kAdded,
-          std::nullopt,
-      },
-      {
-          ProjectionNativeRuntimeBindingDTO{
-              core::CapabilityProviderBindingId("provider-b"),
-              core::CapabilityProviderBindingRevision("provider-r1"),
-              RuntimeUnitId("runtime-1"),
-              RuntimeEpoch("runtime-epoch-1"),
-          },
-          ProjectionTransitionDisposition::kRetained,
-          predecessor,
-      },
-      {
-          ProjectionNativeRuntimeBindingDTO{
-              core::CapabilityProviderBindingId("provider-c"),
-              core::CapabilityProviderBindingRevision("provider-r1"),
-              RuntimeUnitId("runtime-1"),
-              RuntimeEpoch("runtime-epoch-1"),
-          },
-          ProjectionTransitionDisposition::kRemoved,
-          predecessor,
-      },
-  };
-}
-
-ManagerApplySceneStageIntentDTO
-SceneStageIntent(const ContentDigest &runtime_staged_ready_digest,
-                 const bool empty = false) {
-  return {
-      ApplyId("apply-1"),
-      ApplyGeneration(1U),
-      runtime_staged_ready_digest,
-      ActiveBundlePublicationGeneration(3U),
-      ContentDigest(std::string(kDigestOne)),
-      Intent().expected_active_projection_revision,
-      RetainedBundleId("candidate-bundle-1"),
-      GraphRevision("candidate-graph"),
-      empty ? std::vector<ProjectionTransitionRowDTO>{} : SceneTransitionRows(),
-  };
-}
-
-ManagerApplySceneStagedDTO
-SceneStaged(const ContentDigest &scene_stage_intent_digest,
-            const bool empty = false) {
-  const auto predecessor = Intent().expected_active_projection_revision;
-  const auto candidate = CandidateProjection();
-  const auto transition_rows =
-      empty ? std::vector<ProjectionTransitionRowDTO>{} : SceneTransitionRows();
-  std::vector<ProjectionTransitionRowEvidenceDTO> row_evidence;
-  row_evidence.reserve(transition_rows.size());
-  for (const auto &row : transition_rows) {
-    const bool removed =
-        row.disposition == ProjectionTransitionDisposition::kRemoved;
-    const auto observed = row.expected_local_active;
-    row_evidence.push_back({
-        row,
-        removed ? ProjectionTransitionRowEvidenceState::kPredecessorUnchanged
-                : ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect,
-        removed ? std::optional<ProjectionRevisionDTO>{}
-                : std::optional<ProjectionRevisionDTO>{candidate},
-        observed,
-        ProjectionHealthDTO{
-            row.native_runtime_binding,
-            17U,
-            observed.has_value() ? ProjectionHealthState::kHealthy
-                                 : ProjectionHealthState::kUninitialized,
-            observed,
-            removed
-                ? std::optional<ProjectionStagedCandidateDTO>{}
-                : std::optional<
-                      ProjectionStagedCandidateDTO>{ProjectionStagedCandidateDTO{
-                      ApplyId("apply-1"),
-                      ApplyGeneration(1U),
-                      ProjectionStageGeneration(9U),
-                      candidate,
-                  }},
-            23U,
-            ContentDigest(std::string(kDigestTwo)),
-            std::nullopt,
-        },
-        std::nullopt,
-    });
-  }
-  ProjectionTransitionEvidenceDTO evidence{
-      ApplyId("apply-1"),
-      ApplyGeneration(1U),
-      ProjectionStageGeneration(9U),
-      predecessor,
-      candidate,
-      ProjectionTransitionEvidenceState::kStaged,
-      std::move(row_evidence),
-      std::nullopt,
-  };
-  return {
-      scene_stage_intent_digest,
-      ProjectionApplyStageResultDTO{
-          ApplyId("apply-1"),
-          ApplyGeneration(1U),
-          predecessor,
-          candidate,
-          ProjectionStageGeneration(9U),
-          std::move(evidence),
-          ProjectionApplyStageResultState::kStaged,
-          std::nullopt,
-      },
-  };
-}
-
-ManagerApplyActivationSelectionDTO
-ActivationSelection(const PersistedManagerApplySceneStaged &staged) {
-  const auto &result = staged.scene_staged.staged_result;
-  return {
-      staged.scene_staged_digest,
-      result.apply_id,
-      result.apply_generation,
-      result.expected_active_projection_revision,
-      *result.projection_stage_generation,
-      *result.candidate_projection_revision,
-  };
-}
-
-ManagerApplySceneActivatedDTO
-SceneActivated(const PersistedManagerApplyActivationSelection &selection) {
-  const auto &selected = selection.activation_selection;
-  ProjectionTransitionEvidenceDTO evidence{
-      selected.apply_id,
-      selected.apply_generation,
-      selected.projection_stage_generation,
-      selected.predecessor_projection_revision,
-      selected.candidate_projection_revision,
-      ProjectionTransitionEvidenceState::kActivatedAndRetired,
-      {},
-      std::nullopt,
-  };
-  return {
-      selection.activation_selection_digest,
-      core::ProjectionApplyActivationResultDTO{
-          selected.apply_id,
-          selected.apply_generation,
-          selected.predecessor_projection_revision,
-          selected.projection_stage_generation,
-          selected.candidate_projection_revision,
-          core::ProjectionApplyActivationResultState::kActivated,
-          selected.candidate_projection_revision,
-          std::move(evidence),
-          std::nullopt,
-      },
-  };
-}
-
 ManagerApplyPrivateMaterializationDTO
-PrivateMaterialization(const PersistedManagerApplySceneActivated &activated) {
-  const auto &result = activated.scene_activated.activation_result;
+PrivateMaterialization() {
+  const auto candidate = CandidateProjection();
   return {
-      activated.scene_activated_digest,
-      result.apply_id,
-      result.apply_generation,
-      result.projection_stage_generation,
-      result.candidate_projection_revision,
+      candidate.scene_revision.content_hash,
+      ApplyId("apply-1"),
+      ApplyGeneration(1U),
+      candidate,
       ContentDigest(std::string(kDigestTwo)),
       512U,
   };
 }
-
-ManagerApplyObsoleteCommandSurfacesRetiredDTO RetiredCommandSurfaces(
-    const PersistedManagerApplyPrivateMaterialization &materialization) {
-  const auto &record = materialization.private_materialization;
-  return {
-      materialization.private_materialization_content_digest,
-      record.apply_id,
-      record.apply_generation,
-      {},
-  };
-}
-
 ManagerApplyPublicationReceiptDTO PublicationReceipt(
-    const PersistedManagerApplyPrivateMaterialization &materialization,
-    const PersistedManagerApplyObsoleteCommandSurfacesRetired &retired) {
+    const PersistedManagerApplyPrivateMaterialization &materialization) {
   const auto &record = materialization.private_materialization;
   core::ActiveBundlePublicationRequestDTO request{
       core::NamedApplyPublicationTransactionDTO{
           record.apply_id,
           record.apply_generation,
-          record.projection_stage_generation,
       },
       record.candidate_projection_revision,
       record.candidate_projection_revision.retained_bundle_id,
       record.candidate_projection_revision.graph_revision,
       ActiveBundlePublicationGeneration(3U),
       materialization.private_materialization_content_digest,
-      retired.obsolete_managed_command_surfaces_retired_evidence_digest,
   };
   return {
-      retired.obsolete_managed_command_surfaces_retired_evidence_digest,
+      materialization.private_materialization_content_digest,
       core::ActiveBundlePublicationReceiptDTO{
           std::move(request),
           ActiveBundlePublicationGeneration(4U),
@@ -603,52 +417,16 @@ ManagerApplyPublicationReceiptDTO PublicationReceipt(
   };
 }
 
-ManagerApplySceneFinalizedDTO
-SceneFinalized(const PersistedManagerApplySceneActivated &activated,
-               const PersistedManagerApplyPublicationReceipt &publication) {
-  const auto &active = activated.scene_activated.activation_result;
-  auto transition = active.transition_evidence;
-  transition.state = ProjectionTransitionEvidenceState::kFinalized;
-  return {
-      publication.publication_receipt_digest,
-      core::ProjectionApplyFinalizeResultDTO{
-          active.apply_id,
-          active.apply_generation,
-          active.projection_stage_generation,
-          active.candidate_projection_revision,
-          publication.publication.publication_receipt,
-          core::ProjectionApplyFinalizeResultState::kFinalized,
-          active.candidate_projection_revision,
-          std::move(transition),
-          core::ProjectionAggregateHealthDTO{
-              core::NamedApplyProjectionSetSourceDTO{
-                  active.apply_id,
-                  active.apply_generation,
-                  active.projection_stage_generation,
-                  active.candidate_projection_revision,
-              },
-              ProjectionHealthState::kHealthy,
-              {},
-              std::nullopt,
-          },
-          std::nullopt,
-      },
-  };
-}
-
 struct SelectedBundleTransitionRecords final {
-  PersistedManagerApplySceneActivated activated;
   PersistedManagerApplyPrivateMaterialization materialization;
-  PersistedManagerApplyObsoleteCommandSurfacesRetired retired;
   PersistedManagerApplyPublicationReceipt publication;
-  PersistedManagerApplySceneFinalized finalized;
 };
 
 ManagerApplyFenceReleaseIntentDTO
 FenceReleaseIntent(const SelectedBundleTransitionRecords &records,
                    const PersistedManagerApplyFenceAcceptance &acceptance) {
-  const auto &candidate = records.finalized.scene_finalized.finalized_result
-                              .candidate_projection_revision;
+  const auto &candidate =
+      records.materialization.private_materialization.candidate_projection_revision;
   core::ConfigurationFenceReconciliationEvidenceDTO evidence{
       core::ExecutionHostEpochDTO{
           RuntimeUnitId("kernel-runtime"),
@@ -676,7 +454,7 @@ FenceReleaseIntent(const SelectedBundleTransitionRecords &records,
       ContentDigest(std::string(kDigestOne)),
   };
   return {
-      records.finalized.scene_finalized_digest,
+      records.publication.publication_receipt_digest,
       acceptance.acceptance_digest,
       core::ConfigurationFenceReleaseDTO{std::move(evidence),
                                          RuntimeEpoch("manager-epoch-1")},
@@ -701,13 +479,13 @@ FenceReleased(const PersistedManagerApplyFenceReleaseIntent &intent) {
 ManagerApplyTerminalOutcomeDTO
 TerminalOutcome(const SelectedBundleTransitionRecords &records,
                 const PersistedManagerApplyFenceReleased &released) {
-  const auto &result = records.finalized.scene_finalized.finalized_result;
+  const auto &result = records.materialization.private_materialization;
   return {
       result.apply_id,
       result.apply_generation,
       result.candidate_projection_revision,
       records.publication.publication_receipt_digest,
-      records.finalized.scene_finalized_digest,
+      records.publication.publication_receipt_digest,
       released.fence_released_digest,
       ManagerApplyTerminalOutcomeState::kSucceeded,
   };
@@ -768,27 +546,12 @@ SceneParentRecords EnsureSceneParents(SqliteManagerApplyJournal &journal,
 
 SelectedBundleTransitionRecords
 EnsureSelectedBundleTransition(SqliteManagerApplyJournal &journal) {
-  const auto parents = EnsureSceneParents(journal, true);
-  const auto stage_intent = journal.EnsureSceneStageIntent(
-      SceneStageIntent(parents.staged_ready.staged_ready_digest, true));
-  const auto staged = journal.EnsureSceneStaged(
-      SceneStaged(stage_intent.record.scene_stage_intent_digest, true));
-  const auto selection =
-      journal.EnsureActivationSelection(ActivationSelection(staged.record));
-  const auto activated =
-      journal.EnsureSceneActivated(SceneActivated(selection.record));
-  const auto materialization = journal.EnsurePrivateMaterialization(
-      PrivateMaterialization(activated.record));
-  const auto retired = journal.EnsureObsoleteCommandSurfacesRetired(
-      RetiredCommandSurfaces(materialization.record));
+  static_cast<void>(EnsureSceneParents(journal, true));
+  const auto materialization =
+      journal.EnsurePrivateMaterialization(PrivateMaterialization());
   const auto publication = journal.EnsurePublicationReceipt(
-      PublicationReceipt(materialization.record, retired.record));
-  const auto finalized = journal.EnsureSceneFinalized(
-      SceneFinalized(activated.record, publication.record));
-  return {
-      activated.record,   materialization.record, retired.record,
-      publication.record, finalized.record,
-  };
+      PublicationReceipt(materialization.record));
+  return {materialization.record, publication.record};
 }
 
 bool SameFenceIntent(const ApplyConfigurationFenceIntentDTO &lhs,
@@ -885,6 +648,18 @@ TEST(ManagerApplyJournalIntegrity,
                ManagerApplyJournalConflictError);
   EXPECT_EQ(ReadFileBytes(cell_path), cell_before);
   ExpectNoSqliteSidecars(cell_path);
+}
+
+TEST(ManagerApplyJournalIntegrity, RejectsPreUa4JournalVersion) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "pre-ua4.sqlite3";
+  { SqliteManagerApplyJournal initialized(path, CellId("cell-1")); }
+  ExecSql(path, "PRAGMA user_version=12;");
+  const auto before = ReadFileBytes(path);
+  EXPECT_THROW(SqliteManagerApplyJournal(path, CellId("cell-1")),
+               ManagerApplyJournalIntegrityError);
+  EXPECT_EQ(ReadFileBytes(path), before);
+  ExpectNoSqliteSidecars(path);
 }
 
 TEST(ManagerApplyJournalIntegrity,
@@ -1067,7 +842,7 @@ TEST(ManagerApplyTerminalOutcome, RequiresExactlyOneCompleteDisposition) {
   partial.fence_released_digest.reset();
   EXPECT_FALSE(partial.valid());
   partial = full_success;
-  partial.scene_finalized_digest.reset();
+  partial.scene_completion_digest.reset();
   EXPECT_FALSE(partial.valid());
   partial = full_success;
   partial.publication_receipt_digest.reset();
@@ -1101,7 +876,7 @@ TEST(ManagerApplyTerminalOutcome, RequiresExactlyOneCompleteDisposition) {
   stray.fence_released_digest = ContentDigest(std::string(kDigestOne));
   EXPECT_FALSE(stray.valid());
   stray = failed;
-  stray.scene_finalized_digest = ContentDigest(std::string(kDigestOne));
+  stray.scene_completion_digest = ContentDigest(std::string(kDigestOne));
   EXPECT_FALSE(stray.valid());
   stray = failed;
   stray.publication_receipt_digest = ContentDigest(std::string(kDigestOne));
@@ -1782,14 +1557,8 @@ TEST(ManagerApplyJournal,
   EXPECT_FALSE(records[0].fence_acceptance.has_value());
   EXPECT_FALSE(records[0].runtime_convergence_intent.has_value());
   EXPECT_FALSE(records[0].latest_runtime_staged_ready.has_value());
-  EXPECT_FALSE(records[0].scene_stage_intent.has_value());
-  EXPECT_FALSE(records[0].scene_staged.has_value());
-  EXPECT_FALSE(records[0].activation_selection.has_value());
-  EXPECT_FALSE(records[0].scene_activated.has_value());
   EXPECT_FALSE(records[0].private_materialization.has_value());
-  EXPECT_FALSE(records[0].retired_command_surfaces.has_value());
   EXPECT_FALSE(records[0].publication_receipt.has_value());
-  EXPECT_FALSE(records[0].scene_finalized.has_value());
   EXPECT_FALSE(records[0].fence_release_intent.has_value());
   EXPECT_FALSE(records[0].fence_released.has_value());
   EXPECT_FALSE(records[0].terminal_outcome.has_value());
@@ -1845,6 +1614,7 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "candidate_retained_bundle_id,candidate_graph_revision,"
         "captured_input_digest,deployment_artifact_id,deployment_revision,"
         "program_binding_id,prepared_activation_id,"
+        "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,intent_digest"
         ") VALUES ("
         "'apply-uncommitted',1,'request-uncommitted','owner-epoch-1',"
@@ -1860,7 +1630,8 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "15151515','sha256:17171717171717171717171717171717171717171717171717171717"
         "17171717',"
         "'sha256:16161616161616161616161616161616161616161616161616161616"
-        "16161616',7,NULL,'sha256:"
+        "16161616','{\"schema_version\":\"test.prepared_activation_receipt.v1\"}',"
+        "7,NULL,'sha256:"
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
         ");";
     if (sqlite3_exec(database, sql.c_str(), nullptr, nullptr, nullptr) !=
@@ -2539,110 +2310,6 @@ TEST(ManagerApplyRuntimeJournal,
 }
 
 TEST(ManagerApplyRuntimeJournal,
-     RetainsExactPredecessorWithdrawalAcrossRestart) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "withdrawal.sqlite3";
-  std::optional<PersistedManagerApplyRuntimeStagedReady> expected;
-  std::optional<PersistedManagerApplySceneStaged> expected_scene;
-  {
-    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-    const auto accepted = EnsureAcceptedApply(journal);
-    auto intent = RuntimeIntent(accepted.acceptance.acceptance_digest);
-    intent.runtime_units.front().candidate_disposition =
-        RuntimeUnitCandidateDisposition::kRetainedExact;
-    const auto durable = journal.EnsureRuntimeConvergenceIntent(
-        accepted.intent.intent_digest, intent);
-    auto ready = RuntimeStagedReady(
-        durable.record.runtime_convergence_intent_digest, 1U);
-    auto &row = ready.runtime_units.front();
-    row.candidate_disposition = RuntimeUnitCandidateDisposition::kRetainedExact;
-    row.predecessor_withdrawal = core::ManagedRuntimeWithdrawalDTO{
-        ready.apply_id,
-        ready.apply_generation,
-        ready.runtime_convergence_intent_digest,
-        row.runtime_unit_id,
-        RuntimeEpoch("retired-native-epoch"),
-        ContentDigest(std::string(kDigestTwo)),
-        ContentDigest(std::string(kDigestOne)),
-        "supervisor-before-restart",
-        12U};
-    ASSERT_TRUE(ready.valid());
-    const auto reject = [&](const auto &mutate) {
-      auto bad = ready;
-      mutate(bad.runtime_units.front());
-      EXPECT_FALSE(bad.valid());
-      EXPECT_THROW(static_cast<void>(journal.EnsureRuntimeStagedReady(bad)),
-                   std::invalid_argument);
-    };
-    reject([](auto &bad) {
-      bad.predecessor_withdrawal->process_observation_sequence = 0U;
-    });
-    reject([](auto &bad) {
-      bad.predecessor_withdrawal->apply_id = ApplyId("other-apply");
-    });
-    reject([](auto &bad) {
-      bad.predecessor_withdrawal->apply_generation = ApplyGeneration(2U);
-    });
-    reject([](auto &bad) {
-      bad.predecessor_withdrawal->runtime_convergence_intent_digest =
-          ContentDigest(std::string(kDigestOne));
-    });
-    reject([](auto &bad) {
-      bad.predecessor_withdrawal->runtime_unit_id =
-          RuntimeUnitId("other-runtime");
-    });
-    reject([](auto &bad) {
-      bad.predecessor_withdrawal->runtime_epoch = bad.runtime_epoch;
-    });
-    reject([](auto &bad) {
-      bad.candidate_disposition = RuntimeUnitCandidateDisposition::kAdded;
-    });
-    reject([](auto &bad) {
-      bad.lifecycle_control = core::RuntimeLifecycleControl::kExternallyManaged;
-    });
-    expected = journal.EnsureRuntimeStagedReady(ready).record;
-    EXPECT_EQ(journal.EnsureRuntimeStagedReady(ready).record, expected);
-    auto scene_intent = SceneStageIntent(expected->staged_ready_digest);
-    auto &removed = scene_intent.native_transition_rows.back();
-    removed.native_runtime_binding.runtime_epoch =
-        row.predecessor_withdrawal->runtime_epoch;
-    removed.managed_withdrawal = row.predecessor_withdrawal;
-    auto foreign = scene_intent;
-    foreign.native_transition_rows.back()
-        .managed_withdrawal->process_observation_sequence++;
-    EXPECT_THROW(static_cast<void>(journal.EnsureSceneStageIntent(foreign)),
-                 ManagerApplyJournalConflictError);
-    const auto staged_intent = journal.EnsureSceneStageIntent(scene_intent);
-    auto scene = SceneStaged(staged_intent.record.scene_stage_intent_digest);
-    auto &retired =
-        scene.staged_result.transition_evidence->transition_rows.back();
-    retired.transition_row = removed;
-    retired.state = ProjectionTransitionRowEvidenceState::kRemovedRetired;
-    retired.observed_local_active.reset();
-    retired.resulting_health.reset();
-    ASSERT_TRUE(scene.valid());
-    expected_scene = journal.EnsureSceneStaged(scene).record;
-  }
-  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
-  EXPECT_EQ(reopened.ReadLatestRuntimeStagedReady(ApplyId("apply-1"),
-                                                  ApplyGeneration(1U)),
-            expected);
-  EXPECT_EQ(reopened.VerifyIntegrity().runtime_staged_ready_count, 1);
-  const auto scene =
-      reopened.ReadSceneStaged(ApplyId("apply-1"), ApplyGeneration(1U));
-  ASSERT_TRUE(scene);
-  EXPECT_EQ(scene->scene_staged_digest, expected_scene->scene_staged_digest);
-  const auto &retired = scene->scene_staged.staged_result.transition_evidence
-                            ->transition_rows.back();
-  EXPECT_EQ(
-      retired.transition_row.managed_withdrawal,
-      expected->staged_ready.runtime_units.front().predecessor_withdrawal);
-  EXPECT_FALSE(retired.resulting_health);
-  EXPECT_EQ(retired.state,
-            ProjectionTransitionRowEvidenceState::kRemovedRetired);
-}
-
-TEST(ManagerApplyRuntimeJournal,
      RequiresAcceptedParentAndRejectsConflictingReplay) {
   TemporaryDirectory directory;
   SqliteManagerApplyJournal journal(directory.path() / "runtime.sqlite3",
@@ -2756,223 +2423,6 @@ TEST(ManagerApplyRuntimeJournal,
                ManagerApplyJournalIntegrityError);
 }
 
-TEST(ManagerApplySceneJournal,
-     PersistsStageIntentAndCompleteStagedEvidenceAcrossRestart) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "scene-stage.sqlite3";
-  std::optional<PersistedManagerApplySceneStageIntent> expected_intent;
-  std::optional<PersistedManagerApplySceneStaged> expected_staged;
-  {
-    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-    const auto parents = EnsureSceneParents(journal);
-    const auto intent = journal.EnsureSceneStageIntent(
-        SceneStageIntent(parents.staged_ready.staged_ready_digest));
-    EXPECT_TRUE(intent.inserted);
-    EXPECT_TRUE(intent.record.scene_stage_intent.valid());
-    const auto intent_replay = journal.EnsureSceneStageIntent(
-        SceneStageIntent(parents.staged_ready.staged_ready_digest));
-    EXPECT_FALSE(intent_replay.inserted);
-    EXPECT_EQ(intent_replay.record, intent.record);
-    expected_intent = intent.record;
-
-    const auto staged = journal.EnsureSceneStaged(
-        SceneStaged(intent.record.scene_stage_intent_digest));
-    EXPECT_TRUE(staged.inserted);
-    EXPECT_TRUE(staged.record.scene_staged.valid());
-    const auto staged_replay = journal.EnsureSceneStaged(
-        SceneStaged(intent.record.scene_stage_intent_digest));
-    EXPECT_FALSE(staged_replay.inserted);
-    EXPECT_TRUE(SameManagerApplySceneStaged(staged_replay.record.scene_staged,
-                                            staged.record.scene_staged));
-    EXPECT_EQ(staged_replay.record.scene_staged_digest,
-              staged.record.scene_staged_digest);
-    expected_staged = staged.record;
-  }
-
-  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
-  ASSERT_TRUE(expected_intent.has_value());
-  EXPECT_EQ(
-      reopened.ReadSceneStageIntent(ApplyId("apply-1"), ApplyGeneration(1U)),
-      *expected_intent);
-  const auto staged =
-      reopened.ReadSceneStaged(ApplyId("apply-1"), ApplyGeneration(1U));
-  ASSERT_TRUE(staged.has_value());
-  ASSERT_TRUE(expected_staged.has_value());
-  EXPECT_TRUE(SameManagerApplySceneStaged(staged->scene_staged,
-                                          expected_staged->scene_staged));
-  EXPECT_EQ(staged->scene_staged_digest, expected_staged->scene_staged_digest);
-  const auto report = reopened.VerifyIntegrity();
-  EXPECT_EQ(report.scene_stage_intent_count, 1);
-  EXPECT_EQ(report.scene_staged_count, 1);
-}
-
-TEST(ManagerApplySceneJournal,
-     SceneStageIntentIsInsertOrExactReplayAndNeverReplaced) {
-  TemporaryDirectory directory;
-  SqliteManagerApplyJournal journal(directory.path() / "scene-stage.sqlite3",
-                                    CellId("cell-1"));
-  const auto parents = EnsureSceneParents(journal);
-
-  EXPECT_THROW(journal.EnsureSceneStageIntent(
-                   SceneStageIntent(ContentDigest(std::string(kDigestTwo)))),
-               ManagerApplyJournalConflictError);
-  const auto intent = journal.EnsureSceneStageIntent(
-      SceneStageIntent(parents.staged_ready.staged_ready_digest));
-  const auto replay = journal.EnsureSceneStageIntent(
-      intent.record.scene_stage_intent);
-  EXPECT_FALSE(replay.inserted);
-  EXPECT_EQ(replay.record, intent.record);
-
-  const auto runtime_intent = journal.ReadRuntimeConvergenceIntent(
-      ApplyId("apply-1"), ApplyGeneration(1U));
-  ASSERT_TRUE(runtime_intent.has_value());
-  EXPECT_THROW(journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
-                   runtime_intent->runtime_convergence_intent_digest, 2U)),
-               ManagerApplyJournalConflictError);
-  EXPECT_EQ(journal.ReadSceneStageIntent(ApplyId("apply-1"),
-                                         ApplyGeneration(1U)),
-            std::optional<PersistedManagerApplySceneStageIntent>{intent.record});
-
-  auto conflicting_replay = intent.record.scene_stage_intent;
-  conflicting_replay.candidate_graph_revision =
-      GraphRevision("candidate-graph-other");
-  EXPECT_THROW(
-      static_cast<void>(journal.EnsureSceneStageIntent(conflicting_replay)),
-      ManagerApplyJournalConflictError);
-
-  auto wrong_parent = SceneStaged(ContentDigest(std::string(kDigestTwo)));
-  EXPECT_THROW(journal.EnsureSceneStaged(wrong_parent),
-               ManagerApplyJournalConflictError);
-
-  auto wrong_candidate = SceneStaged(intent.record.scene_stage_intent_digest);
-  wrong_candidate.staged_result.candidate_projection_revision->graph_revision =
-      GraphRevision("candidate-graph-other");
-  wrong_candidate.staged_result.transition_evidence
-      ->candidate_projection_revision.graph_revision =
-      GraphRevision("candidate-graph-other");
-  for (auto &row :
-       wrong_candidate.staged_result.transition_evidence->transition_rows) {
-    if (row.acknowledged_staged_candidate_revision.has_value()) {
-      row.acknowledged_staged_candidate_revision->graph_revision =
-          GraphRevision("candidate-graph-other");
-    }
-    if (row.resulting_health->staged_candidate.has_value()) {
-      row.resulting_health->staged_candidate->candidate_projection_revision
-          .graph_revision = GraphRevision("candidate-graph-other");
-    }
-  }
-  EXPECT_TRUE(wrong_candidate.valid());
-  EXPECT_THROW(journal.EnsureSceneStaged(wrong_candidate),
-               ManagerApplyJournalConflictError);
-
-  auto missing_rows = SceneStaged(intent.record.scene_stage_intent_digest, true);
-  EXPECT_TRUE(missing_rows.valid());
-  EXPECT_THROW(journal.EnsureSceneStaged(missing_rows),
-               ManagerApplyJournalConflictError);
-  const auto report = journal.VerifyIntegrity();
-  EXPECT_EQ(report.scene_stage_intent_count, 1);
-  EXPECT_EQ(report.scene_staged_count, 0);
-}
-
-TEST(ManagerApplySceneJournal,
-     SupportsExplicitZeroNativeTransitionAndBoundsRows) {
-  TemporaryDirectory directory;
-  SqliteManagerApplyJournal journal(directory.path() / "scene-empty.sqlite3",
-                                    CellId("cell-1"));
-  const auto parents = EnsureSceneParents(journal, true);
-  const auto intent = journal.EnsureSceneStageIntent(
-      SceneStageIntent(parents.staged_ready.staged_ready_digest, true));
-  const auto staged = journal.EnsureSceneStaged(
-      SceneStaged(intent.record.scene_stage_intent_digest, true));
-  EXPECT_TRUE(staged.record.scene_staged.valid());
-  EXPECT_TRUE(staged.record.scene_staged.staged_result.transition_evidence
-                  ->transition_rows.empty());
-
-  auto oversized =
-      SceneStageIntent(parents.staged_ready.staged_ready_digest, true);
-  oversized.native_transition_rows.reserve(
-      kMaximumManagerApplySceneTransitionRows + 1U);
-  for (std::size_t index = 0U; index <= kMaximumManagerApplySceneTransitionRows;
-       ++index) {
-    oversized.native_transition_rows.push_back({
-        ProjectionNativeRuntimeBindingDTO{
-            core::CapabilityProviderBindingId("provider-" +
-                                              std::to_string(1000U + index)),
-            core::CapabilityProviderBindingRevision("provider-r1"),
-            RuntimeUnitId("runtime-1"),
-            RuntimeEpoch("runtime-epoch-1"),
-        },
-        ProjectionTransitionDisposition::kAdded,
-        std::nullopt,
-    });
-  }
-  EXPECT_THROW(journal.EnsureSceneStageIntent(oversized),
-               std::invalid_argument);
-}
-
-TEST(ManagerApplySceneJournal,
-     PersistsIrreversibleSelectionAndActivationAcrossRestart) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "scene-activation.sqlite3";
-  std::optional<PersistedManagerApplyActivationSelection> expected_selection;
-  std::optional<PersistedManagerApplySceneActivated> expected_activated;
-  {
-    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-    const auto parents = EnsureSceneParents(journal, true);
-    const auto stage_intent = journal.EnsureSceneStageIntent(
-        SceneStageIntent(parents.staged_ready.staged_ready_digest, true));
-    const auto staged = journal.EnsureSceneStaged(
-        SceneStaged(stage_intent.record.scene_stage_intent_digest, true));
-
-    const auto selection =
-        journal.EnsureActivationSelection(ActivationSelection(staged.record));
-    EXPECT_TRUE(selection.inserted);
-    EXPECT_TRUE(selection.record.activation_selection.valid());
-    const auto selection_replay =
-        journal.EnsureActivationSelection(ActivationSelection(staged.record));
-    EXPECT_FALSE(selection_replay.inserted);
-    EXPECT_EQ(selection_replay.record, selection.record);
-    expected_selection = selection.record;
-
-    const auto activated =
-        journal.EnsureSceneActivated(SceneActivated(selection.record));
-    EXPECT_TRUE(activated.inserted);
-    EXPECT_TRUE(activated.record.scene_activated.valid());
-    const auto activated_replay =
-        journal.EnsureSceneActivated(SceneActivated(selection.record));
-    EXPECT_FALSE(activated_replay.inserted);
-    EXPECT_TRUE(
-        SameManagerApplySceneActivated(activated_replay.record.scene_activated,
-                                       activated.record.scene_activated));
-    EXPECT_EQ(activated_replay.record.scene_activated_digest,
-              activated.record.scene_activated_digest);
-    expected_activated = activated.record;
-
-    auto conflicting = ActivationSelection(staged.record);
-    conflicting.candidate_projection_revision.graph_revision =
-        GraphRevision("different-candidate-graph");
-    EXPECT_THROW(journal.EnsureActivationSelection(conflicting),
-                 ManagerApplyJournalConflictError);
-    const auto report = journal.VerifyIntegrity();
-    EXPECT_EQ(report.activation_selection_count, 1);
-    EXPECT_EQ(report.scene_activated_count, 1);
-  }
-
-  ASSERT_TRUE(expected_selection.has_value());
-  ASSERT_TRUE(expected_activated.has_value());
-  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
-  EXPECT_EQ(
-      reopened.ReadActivationSelection(ApplyId("apply-1"), ApplyGeneration(1U)),
-      expected_selection);
-  const auto activated =
-      reopened.ReadSceneActivated(ApplyId("apply-1"), ApplyGeneration(1U));
-  ASSERT_TRUE(activated.has_value());
-  EXPECT_TRUE(SameManagerApplySceneActivated(
-      activated->scene_activated, expected_activated->scene_activated));
-  EXPECT_EQ(activated->scene_activated_digest,
-            expected_activated->scene_activated_digest);
-}
-
 TEST(ManagerApplySelectedBundleJournal,
      PersistsCompleteForwardChainAndExactReplayAcrossRestart) {
   TemporaryDirectory directory;
@@ -2982,31 +2432,17 @@ TEST(ManagerApplySelectedBundleJournal,
     SqliteManagerApplyJournal journal(path, CellId("cell-1"));
     expected = EnsureSelectedBundleTransition(journal);
 
-    const auto materialization = journal.EnsurePrivateMaterialization(
-        PrivateMaterialization(expected->activated));
+    const auto materialization =
+        journal.EnsurePrivateMaterialization(PrivateMaterialization());
     EXPECT_FALSE(materialization.inserted);
     EXPECT_EQ(materialization.record, expected->materialization);
-    const auto retired = journal.EnsureObsoleteCommandSurfacesRetired(
-        RetiredCommandSurfaces(expected->materialization));
-    EXPECT_FALSE(retired.inserted);
-    EXPECT_EQ(retired.record, expected->retired);
     const auto publication = journal.EnsurePublicationReceipt(
-        PublicationReceipt(expected->materialization, expected->retired));
+        PublicationReceipt(expected->materialization));
     EXPECT_FALSE(publication.inserted);
     EXPECT_EQ(publication.record, expected->publication);
-    const auto finalized = journal.EnsureSceneFinalized(
-        SceneFinalized(expected->activated, expected->publication));
-    EXPECT_FALSE(finalized.inserted);
-    EXPECT_TRUE(SameManagerApplySceneFinalized(
-        finalized.record.scene_finalized, expected->finalized.scene_finalized));
-    EXPECT_EQ(finalized.record.scene_finalized_digest,
-              expected->finalized.scene_finalized_digest);
-
     const auto report = journal.VerifyIntegrity();
     EXPECT_EQ(report.private_materialization_count, 1);
-    EXPECT_EQ(report.retired_command_surfaces_count, 1);
     EXPECT_EQ(report.publication_receipt_count, 1);
-    EXPECT_EQ(report.scene_finalized_count, 1);
   }
 
   ASSERT_TRUE(expected.has_value());
@@ -3014,19 +2450,9 @@ TEST(ManagerApplySelectedBundleJournal,
   EXPECT_EQ(reopened.ReadPrivateMaterialization(ApplyId("apply-1"),
                                                 ApplyGeneration(1U)),
             expected->materialization);
-  EXPECT_EQ(reopened.ReadObsoleteCommandSurfacesRetired(ApplyId("apply-1"),
-                                                        ApplyGeneration(1U)),
-            expected->retired);
   EXPECT_EQ(
       reopened.ReadPublicationReceipt(ApplyId("apply-1"), ApplyGeneration(1U)),
       expected->publication);
-  const auto finalized =
-      reopened.ReadSceneFinalized(ApplyId("apply-1"), ApplyGeneration(1U));
-  ASSERT_TRUE(finalized.has_value());
-  EXPECT_TRUE(SameManagerApplySceneFinalized(
-      finalized->scene_finalized, expected->finalized.scene_finalized));
-  EXPECT_EQ(finalized->scene_finalized_digest,
-            expected->finalized.scene_finalized_digest);
 }
 
 TEST(ManagerApplySelectedBundleJournal,
@@ -3036,37 +2462,17 @@ TEST(ManagerApplySelectedBundleJournal,
       directory.path() / "selected-bundle-conflict.sqlite3", CellId("cell-1"));
   const auto records = EnsureSelectedBundleTransition(journal);
 
-  auto materialization = PrivateMaterialization(records.activated);
+  auto materialization = PrivateMaterialization();
   materialization.retained_bundle_canonical_byte_size += 1U;
   EXPECT_THROW(journal.EnsurePrivateMaterialization(materialization),
                ManagerApplyJournalConflictError);
 
-  auto retired = RetiredCommandSurfaces(records.materialization);
-  retired.command_surfaces.push_back({
-      RuntimeUnitId("obsolete-runtime"),
-      RuntimeEpoch("obsolete-epoch"),
-      ContentDigest(std::string(kDigestOne)),
-      ContentDigest(std::string(kDigestTwo)),
-      1U,
-      ObsoleteManagedCommandSurfaceDisposition::kRetired,
-  });
-  EXPECT_THROW(journal.EnsureObsoleteCommandSurfacesRetired(retired),
-               ManagerApplyJournalConflictError);
-
-  auto publication =
-      PublicationReceipt(records.materialization, records.retired);
+  auto publication = PublicationReceipt(records.materialization);
   publication.publication_receipt.durable_public_pointer_content_digest =
       ContentDigest(std::string(kDigestTwo));
   EXPECT_THROW(journal.EnsurePublicationReceipt(publication),
                ManagerApplyJournalConflictError);
 
-  auto finalized = SceneFinalized(records.activated, records.publication);
-  finalized.finalized_result.publication_receipt
-      .durable_public_pointer_content_digest =
-      ContentDigest(std::string(kDigestTwo));
-  EXPECT_TRUE(finalized.valid());
-  EXPECT_THROW(journal.EnsureSceneFinalized(finalized),
-               ManagerApplyJournalConflictError);
 }
 
 TEST(ManagerApplySelectedBundleJournal,
@@ -3195,10 +2601,10 @@ TEST(ManagerApplyCompletionJournal,
   auto impossible_terminal = ManagerApplyTerminalOutcomeDTO{
       ApplyId("apply-1"),
       ApplyGeneration(1U),
-      transition.finalized.scene_finalized.finalized_result
+      transition.materialization.private_materialization
           .candidate_projection_revision,
       transition.publication.publication_receipt_digest,
-      transition.finalized.scene_finalized_digest,
+      transition.publication.publication_receipt_digest,
       ContentDigest(std::string(kDigestOne)),
       ManagerApplyTerminalOutcomeState::kSucceeded,
       std::nullopt,
@@ -3245,50 +2651,6 @@ TEST(ManagerApplyCompletionJournal,
                 "SELECT RAISE(ABORT, 'manager_apply_fence_release_intents is "
                 "immutable'); END;");
   EXPECT_THROW(SqliteManagerApplyJournal(path, CellId("cell-1")),
-               ManagerApplyJournalIntegrityError);
-}
-
-TEST(ManagerApplySceneJournal,
-     DetectsStageIntentAndStagedEvidenceCorruptionOnRestart) {
-  TemporaryDirectory directory;
-  const auto intent_path = directory.path() / "scene-intent.sqlite3";
-  {
-    SqliteManagerApplyJournal journal(intent_path, CellId("cell-1"));
-    const auto parents = EnsureSceneParents(journal);
-    static_cast<void>(journal.EnsureSceneStageIntent(
-        SceneStageIntent(parents.staged_ready.staged_ready_digest)));
-  }
-  ExecSql(
-      intent_path,
-      "DROP TRIGGER manager_apply_scene_stage_intents_no_update;"
-      "UPDATE manager_apply_scene_stage_intents "
-      "SET native_transition_rows_encoding='0;';"
-      "CREATE TRIGGER manager_apply_scene_stage_intents_no_update "
-      "BEFORE UPDATE ON manager_apply_scene_stage_intents BEGIN "
-      "SELECT RAISE(ABORT, 'manager_apply_scene_stage_intents is immutable'); "
-      "END;");
-  EXPECT_THROW(SqliteManagerApplyJournal(intent_path, CellId("cell-1")),
-               ManagerApplyJournalIntegrityError);
-
-  const auto staged_path = directory.path() / "scene-staged.sqlite3";
-  {
-    SqliteManagerApplyJournal journal(staged_path, CellId("cell-1"));
-    const auto parents = EnsureSceneParents(journal);
-    const auto intent = journal.EnsureSceneStageIntent(
-        SceneStageIntent(parents.staged_ready.staged_ready_digest));
-    static_cast<void>(journal.EnsureSceneStaged(
-        SceneStaged(intent.record.scene_stage_intent_digest)));
-  }
-  ExecSql(
-      staged_path,
-      "DROP TRIGGER manager_apply_scene_staged_records_no_update;"
-      "UPDATE manager_apply_scene_staged_records "
-      "SET transition_evidence_encoding='0;';"
-      "CREATE TRIGGER manager_apply_scene_staged_records_no_update "
-      "BEFORE UPDATE ON manager_apply_scene_staged_records BEGIN "
-      "SELECT RAISE(ABORT, 'manager_apply_scene_staged_records is immutable'); "
-      "END;");
-  EXPECT_THROW(SqliteManagerApplyJournal(staged_path, CellId("cell-1")),
                ManagerApplyJournalIntegrityError);
 }
 

@@ -518,31 +518,6 @@ public:
       const NativeProjectionBootstrapStatusQueryDTO &) const override {
     throw std::logic_error("fixture bootstrap status is unavailable");
   }
-  NativeProjectionStageResultDTO
-  StageProjection(const NativeProjectionStageDTO &) override {
-    throw std::logic_error("fixture projection stage is unavailable");
-  }
-  NativeProjectionActivationResultDTO
-  ActivateStagedProjection(const NativeProjectionActivationDTO &) override {
-    throw std::logic_error("fixture projection activation is unavailable");
-  }
-  NativeProjectionRetireResultDTO
-  RetireProjection(const NativeProjectionRetireDTO &) override {
-    throw std::logic_error("fixture projection retirement is unavailable");
-  }
-  NativeProjectionRetireStatusDTO ProjectionRetireStatus(
-      const NativeProjectionRetireStatusQueryDTO &) const override {
-    throw std::logic_error("fixture projection retire status is unavailable");
-  }
-  NativeProjectionDiscardResultDTO
-  DiscardStagedProjection(const NativeProjectionDiscardDTO &) override {
-    throw std::logic_error("fixture projection discard is unavailable");
-  }
-  NativeProjectionStatusDTO
-  ProjectionStageStatus(const NativeProjectionStatusQueryDTO &) const override {
-    throw std::logic_error("fixture projection stage status is unavailable");
-  }
-
   Result<SceneFrameResolutionReceiptDTO>
   ResolveSceneFrame(const SceneFrameResolutionQueryDTO &query) const override {
     if (!query.valid() ||

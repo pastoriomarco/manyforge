@@ -10,11 +10,9 @@ namespace manyforge::core {
 struct NamedApplyPublicationTransactionDTO final {
   ApplyId apply_id;
   ApplyGeneration apply_generation;
-  ProjectionStageGeneration projection_stage_generation;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero() &&
-           projection_stage_generation.nonzero();
+    return !apply_id.empty() && apply_generation.nonzero();
   }
 
   friend bool operator==(const NamedApplyPublicationTransactionDTO&,
@@ -45,8 +43,6 @@ struct ActiveBundlePublicationRequestDTO final {
   std::optional<ActiveBundlePublicationGeneration>
       expected_previous_publication_generation;
   ContentDigest private_materialization_content_digest;
-  ContentDigest
-      obsolete_managed_command_surfaces_retired_evidence_digest;
 
   [[nodiscard]] bool valid() const noexcept {
     const bool identities_match =
@@ -68,8 +64,7 @@ struct ActiveBundlePublicationRequestDTO final {
            previous_generation_valid &&
            is_named_apply ==
                expected_previous_publication_generation.has_value() &&
-           !private_materialization_content_digest.empty() &&
-           !obsolete_managed_command_surfaces_retired_evidence_digest.empty();
+           !private_materialization_content_digest.empty();
   }
 
   friend bool operator==(const ActiveBundlePublicationRequestDTO&,
@@ -88,7 +83,6 @@ struct ActiveBundlePublicationReceiptDTO final {
 
   [[nodiscard]] bool matches_named_apply(
       const ApplyId& apply_id, ApplyGeneration apply_generation,
-      ProjectionStageGeneration stage_generation,
       const ProjectionRevisionDTO& candidate_revision) const noexcept {
     const auto* transaction =
         std::get_if<NamedApplyPublicationTransactionDTO>(
@@ -96,7 +90,6 @@ struct ActiveBundlePublicationReceiptDTO final {
     return valid() && transaction != nullptr &&
            transaction->apply_id == apply_id &&
            transaction->apply_generation == apply_generation &&
-           transaction->projection_stage_generation == stage_generation &&
            request.candidate_projection_revision == candidate_revision;
   }
 

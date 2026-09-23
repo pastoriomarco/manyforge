@@ -445,26 +445,29 @@ def validate_package(package_root: Path, source_root: Path) -> dict[str, Any]:
 
     if not package_root.is_dir() or package_root.is_symlink():
         raise QualificationError("package root must be one real directory")
-    catalog = _object(
-        load_strict_json_yaml(package_root / "maintained.scenario-catalog.yaml"),
-        label="scenario catalog",
-    )
-    catalog_rows = _object_rows(catalog.get("scenarios"), label="catalog scenarios")
-    by_id = {
-        _text(row.get("scenario_id"), label="catalog scenario id"): row
-        for row in catalog_rows
-    }
-    if set(SCENARIO_BY_ID) - set(by_id):
-        raise QualificationError("materialized catalog omits an I9 scenario")
-
     validated: list[dict[str, str]] = []
+    projects: list[dict[str, str]] = []
     scene_mesh_assets: dict[str, str] = {}
     for spec in SCENARIOS:
-        row = by_id[spec.scenario_id]
-        if row.get("deployment_artifact_id") != spec.deployment_artifact_id:
+        project_root = source_root / "examples" / f"{spec.scenario_id}.scenario"
+        manifest_path = project_root / "scenario.yaml"
+        manifest = _object(
+            load_strict_json_yaml(manifest_path),
+            label=f"{spec.scenario_id} project manifest",
+        )
+        if (
+            manifest.get("api_version") != "manyforge.scenario.project.v1"
+            or manifest.get("scenario_id") != spec.scenario_id
+        ):
             raise QualificationError(
-                f"{spec.scenario_id} selected another deployment artifact"
+                f"{spec.scenario_id} project identity is invalid"
             )
+        projects.append(
+            {
+                "manifest_sha256": _sha256_file(manifest_path),
+                "scenario_id": spec.scenario_id,
+            }
+        )
         for filename in (spec.admission_filename, spec.program_filename):
             artifact = package_root / filename
             if not artifact.is_file() or artifact.is_symlink():
@@ -557,10 +560,7 @@ def validate_package(package_root: Path, source_root: Path) -> dict[str, Any]:
         raise QualificationError("simulation site row order/identity differs from I9")
 
     return {
-        "scenario_catalog_revision": _text(
-            catalog.get("scenario_catalog_revision"),
-            label="scenario catalog revision",
-        ),
+        "projects": projects,
         "scene_mesh_assets": [
             {"sha256": digest, "uri": uri}
             for uri, digest in sorted(scene_mesh_assets.items())

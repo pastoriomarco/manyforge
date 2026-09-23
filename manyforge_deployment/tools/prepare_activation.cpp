@@ -10,6 +10,7 @@
 
 #include <manyforge_deployment/activation_preparation_request.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/prepared_activation_input.hpp>
 #include <manyforge_deployment/program_binding.hpp>
@@ -17,9 +18,10 @@
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
-#include <manyforge_deployment/scenario_catalog.hpp>
+#include <manyforge_deployment/scenario_program_admission.hpp>
 
 #include "activation_component_profile_internal.hpp"
+#include "canonical_empty_admission_internal.hpp"
 #include "activation_deployment_intent_internal.hpp"
 #include "activation_model_source_closure_internal.hpp"
 #include "activation_prepared_model_closure_internal.hpp"
@@ -34,6 +36,8 @@ namespace deployment = manyforge::deployment;
 struct Options final {
   std::filesystem::path input;
   std::filesystem::path capability_root;
+  std::filesystem::path activation_root;
+  bool publish_canonical_empty{false};
 };
 
 class PreparedCatalogSource final
@@ -66,27 +70,87 @@ class PreparedCatalogSource final
 [[nodiscard]] Options parse_options(int argc, char **argv) {
   Options result;
   for (int index = 1; index < argc;) {
+    const std::string_view option(argv[index]);
+    if (option == "--publish-canonical-empty" &&
+        !result.publish_canonical_empty) {
+      result.publish_canonical_empty = true;
+      ++index;
+      continue;
+    }
     if (index + 1 >= argc) {
       throw std::invalid_argument("preparation option has no value");
     }
-    const std::string_view option(argv[index]);
     const std::string value(argv[index + 1]);
     if (option == "--input" && result.input.empty()) {
       result.input = value;
     } else if (option == "--capability-root" &&
                result.capability_root.empty()) {
       result.capability_root = value;
+    } else if (option == "--activation-root" &&
+               result.activation_root.empty()) {
+      result.activation_root = value;
     } else {
       throw std::invalid_argument("invalid or repeated preparation option");
     }
     index += 2;
   }
-  if (result.input.empty() || result.capability_root.empty()) {
+  if (result.input.empty() || result.capability_root.empty() ||
+      result.activation_root.empty()) {
     throw std::invalid_argument(
         "usage: manyforge_prepare_activation --input <request> "
-        "--capability-root <root>");
+        "--capability-root <root> --activation-root <root> "
+        "[--publish-canonical-empty]");
   }
   return result;
+}
+
+void materialize_activation(
+    const deployment::PreparedActivationInput &prepared,
+    const std::filesystem::path &activation_root) {
+  const auto &closure = prepared.closure();
+  {
+    deployment::FilesystemRawArtifactStore store(activation_root);
+    for (const auto &artifact : closure.raw_artifacts) {
+      const auto stored = store.put_if_absent(artifact.bytes);
+      if (stored.content_addressed_store_key !=
+              artifact.content_addressed_store_key ||
+          stored.content_digest != artifact.content_digest ||
+          stored.byte_size != artifact.bytes.size()) {
+        throw std::runtime_error(
+            "prepared raw artifact materialized with another identity");
+      }
+    }
+  }
+  {
+    deployment::FilesystemCatalogArtifactStore store(activation_root);
+    for (const auto &artifact : closure.catalog_artifacts) {
+      const auto stored = store.put_if_absent(
+          artifact.content_addressed_store_key, artifact.content_digest,
+          artifact.bytes);
+      if (stored.content_addressed_store_key !=
+              artifact.content_addressed_store_key ||
+          stored.content_digest != artifact.content_digest ||
+          stored.byte_size != artifact.bytes.size()) {
+        throw std::runtime_error(
+            "prepared catalog artifact materialized with another identity");
+      }
+    }
+  }
+  {
+    deployment::FilesystemRetainedBundleRepository store(activation_root);
+    static_cast<void>(store.put_if_absent(closure.retained_bundle));
+  }
+  {
+    deployment::FilesystemProgramRepository store(activation_root);
+    static_cast<void>(
+        store.put_if_absent(closure.program, *closure.retained_bundle));
+  }
+  {
+    deployment::FilesystemProgramBindingRepository store(activation_root);
+    static_cast<void>(store.put_if_absent(
+        closure.program_binding, *closure.retained_bundle,
+        closure.retained_model_map));
+  }
 }
 
 [[nodiscard]] std::string read_file(const std::filesystem::path &path) {
@@ -308,7 +372,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   const auto &root = request.root();
   require_exact_fields(root,
                        {"schema_version", "source_document_digest",
-                        "captured_input_digest", "deployment",
+                        "scenario_id", "captured_input_digest", "deployment",
                         "model_source_closure", "prepared_model_closure",
                         "program",
                         "program_role_assignment", "typed_parameter_overrides"},
@@ -323,6 +387,11 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   const auto &captured_digest =
       text(member(root, "captured_input_digest", "request"),
            "captured_input_digest");
+  const auto &scenario_id =
+      text(member(root, "scenario_id", "request"), "scenario_id");
+  if (scenario_id.size() > 256U) {
+    throw std::invalid_argument("scenario_id exceeds its byte bound");
+  }
   if (!deployment::is_sha256_digest(source_digest) ||
       !deployment::is_sha256_digest(captured_digest)) {
     throw std::invalid_argument(
@@ -347,6 +416,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       {"model_source_closure", model_source_closure},
       {"program", program_value},
       {"program_role_assignment", assignment_value},
+      {"scenario_id", deployment::CanonicalValue(scenario_id)},
       {"source_document_digest", deployment::CanonicalValue(source_digest)},
       {"typed_parameter_overrides", overrides},
   });
@@ -378,7 +448,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
 
   const auto materialized = deployment::detail::materialize_prepared_activation(
       options.capability_root, std::move(prepared_models),
-      deployment_intent, component_profiles);
+      deployment_intent, component_profiles, options.publish_canonical_empty);
   const auto program = deployment::verify_program_binding_contract(
       deployment::canonical_json(program_value), *materialized.bundle);
   const auto mode = assistant_mode(program_value);
@@ -435,6 +505,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       {"retained_bundle_id",
        deployment::CanonicalValue(
            materialized.bundle->retained_bundle_id().value())},
+      {"scenario_id", deployment::CanonicalValue(scenario_id)},
       {"schema_version",
        deployment::CanonicalValue("manyforge.prepared_activation_input.v2")},
       {"source_document_digest", deployment::CanonicalValue(source_digest)},
@@ -445,7 +516,27 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   identity.emplace_back("prepared_activation_id",
                         deployment::CanonicalValue(prepared_id));
   const deployment::CanonicalValue result(std::move(identity));
-  return deployment::parse_prepared_activation_input(result).normalized_root();
+  auto prepared = deployment::parse_prepared_activation_input(result);
+  materialize_activation(prepared, options.activation_root);
+  if (options.publish_canonical_empty) {
+    if (materialized.canonical_empty_bundle == nullptr) {
+      throw std::logic_error(
+          "prepared activation omitted its canonical empty predecessor");
+    }
+    const auto admission_filename =
+        deployment::cell_scoped_canonical_empty_admission_filename(
+            materialized.canonical_empty_bundle->value().cell_graph.cell_id);
+    const auto admission =
+        deployment::detail::publish_cell_scoped_canonical_empty_admission(
+            options.activation_root, admission_filename,
+            *materialized.canonical_empty_bundle);
+    if (admission.retained_bundle_id() !=
+        materialized.canonical_empty_bundle->retained_bundle_id()) {
+      throw std::logic_error(
+          "prepared canonical empty predecessor did not reload exactly");
+    }
+  }
+  return prepared.normalized_root();
 }
 
 } // namespace
@@ -456,6 +547,8 @@ int main(int argc, char **argv) {
     options.input = std::filesystem::canonical(options.input);
     options.capability_root =
         std::filesystem::canonical(options.capability_root);
+    options.activation_root =
+        std::filesystem::canonical(options.activation_root);
     std::cout << deployment::canonical_json(prepare(options)) << '\n';
     return 0;
   } catch (const std::exception &error) {

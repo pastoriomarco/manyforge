@@ -396,19 +396,19 @@ require_headless_native_packages() {
     return 0
 }
 
-prepare_ui6i_dual_scenario_package() {
+prepare_ui6i_cell_bootstrap() {
     local build="$BUILD_DIR/deployment"
     configure_manyforge_deployment "$build" ON
     set_build_keep_going_args "$build" || return 1
     if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" \
-        --target manyforge_ui6i_dual_scenario_package -- "${BUILD_KEEP_GOING_ARGS[@]}"; then
-        echo -e "${RED}  FAIL: UI6-I dual-robot retained package generation failed${NC}"
+        --target manyforge_ui6i_cell_bootstrap -- "${BUILD_KEEP_GOING_ARGS[@]}"; then
+        echo -e "${RED}  FAIL: UI6-I cell bootstrap generation failed${NC}"
         return 1
     fi
     local package="$build/ui6i-dual-scenario-fixture/retained-package"
     local admission="$package/canonical-empty-admission.ui6i_ur5e_lite6_wall_cell.json"
     if [[ ! -d "$package" || ! -f "$admission" ]]; then
-        echo -e "${RED}  FAIL: UI6-I dual-robot retained package is incomplete${NC}"
+        echo -e "${RED}  FAIL: UI6-I cell bootstrap is incomplete${NC}"
         return 1
     fi
 }
@@ -464,7 +464,7 @@ run_headless_cpp_tests() {
 run_headless_python_tests() {
     section "Python I5/H0 API, CLI, and process-boundary tests"
     local build="$BUILD_DIR/headless"
-    if ! prepare_ui6i_dual_scenario_package; then
+    if ! prepare_ui6i_cell_bootstrap; then
         FAIL=$((FAIL + 1))
         return
     fi
@@ -490,7 +490,8 @@ run_headless_python_tests() {
         MANYFORGE_GRIPPER_CONFIRMATION_METADATA="$build/gripper-confirmation-test-fixture/metadata.json" \
         MANYFORGE_MANAGER_APPLY_PACKAGE_ROOT="$build/manager-apply-test-fixture/retained-package" \
         MANYFORGE_MANAGER_APPLY_METADATA="$build/manager-apply-test-fixture/metadata.json" \
-        MANYFORGE_UI6I_DUAL_SCENARIO_PACKAGE_ROOT="$BUILD_DIR/deployment/ui6i-dual-scenario-fixture/retained-package" \
+        MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/ui6i-dual-scenario-fixture/retained-package" \
+        MANYFORGE_EXAMPLE_SCENARIO_ROOT="$WORKSPACE/examples" \
         MANYFORGE_NATIVE_EXECUTION_HOST="$BUILD_DIR/roboplan/manyforge_native_execution_host" \
         MANYFORGE_ROBOPLAN_CANDIDATE_WORKER="$BUILD_DIR/roboplan/manyforge_roboplan_candidate_worker" \
         pytest \

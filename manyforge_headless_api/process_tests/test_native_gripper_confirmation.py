@@ -72,7 +72,7 @@ def test_qualified_operator_confirmation_uses_current_native_command(tmp_path: P
                 "request_owner_epoch": "qualification.client",
                 "source_label": "native_confirmation_qualification",
                 "scenario_id": "program_apply_fixture",
-                "scenario_catalog_revision": stack.fixture_metadata["scenario_catalog_revision"],
+                "source_document_digest": stack.fixture_metadata["source_document_digest"],
                 "expected_applied_record_digest": applied["source"]["record_digest"],
                 "draft_program_revision": program["program_revision"],
                 "expected_admission_generation": admission["admission_generation"],

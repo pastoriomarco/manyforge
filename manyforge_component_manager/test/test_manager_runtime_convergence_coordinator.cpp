@@ -16,8 +16,6 @@
 #include "manyforge_component_manager/manager_apply_fence_release_coordinator.hpp"
 #include "manyforge_component_manager/manager_named_apply_coordinator.hpp"
 #include "manyforge_component_manager/manager_runtime_convergence_coordinator.hpp"
-#include "manyforge_component_manager/manager_scene_activation_coordinator.hpp"
-#include "manyforge_component_manager/manager_scene_stage_coordinator.hpp"
 #include "manyforge_component_manager/manager_selected_bundle_transition_coordinator.hpp"
 #include "manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp"
 #include "manyforge_component_manager/reference_runtime_unit_admission.hpp"
@@ -157,6 +155,14 @@ ApplyIntent(const deployment::RetainedBundle &bundle) {
       },
       bundle.retained_bundle_id(),
       graph.graph_revision,
+      ManagerApplyPreparedActivationDTO{
+          ContentDigest(std::string(kDigestOne)),
+          bundle.value().deployment_artifact_id,
+          bundle.value().deployment_revision,
+          ProgramBindingId(std::string(kDigestOne)),
+          ContentDigest(std::string(kDigestTwo)),
+          "{}",
+      },
       AdmissionGeneration(7U),
       std::nullopt,
   };
@@ -184,7 +190,6 @@ PredecessorPublication(const ManagerApplyIntentDTO &apply_intent) {
           apply_intent.expected_active_projection_revision.graph_revision,
           std::nullopt,
           ContentDigest(std::string(kDigestOne)),
-          ContentDigest(std::string(kDigestTwo)),
       },
       ActiveBundlePublicationGeneration(3U),
       ContentDigest(std::string(kDigestTwo)),
@@ -248,15 +253,10 @@ public:
       const auto materialization =
           independent_reader_->ReadPrivateMaterialization(
               named->apply_id, named->apply_generation);
-      const auto retired =
-          independent_reader_->ReadObsoleteCommandSurfacesRetired(
-              named->apply_id, named->apply_generation);
       saw_prerequisites_before_publish =
-          materialization.has_value() && retired.has_value() &&
+          materialization.has_value() &&
           materialization->private_materialization_content_digest ==
-              request.private_materialization_content_digest &&
-          retired->obsolete_managed_command_surfaces_retired_evidence_digest ==
-              request.obsolete_managed_command_surfaces_retired_evidence_digest;
+              request.private_materialization_content_digest;
     }
     current_ = {
         request,
@@ -435,18 +435,14 @@ public:
   [[nodiscard]] ConfigurationFenceStatusDTO
   QueryStatus(const ConfigurationFenceStatusQueryDTO &query) const override {
     ++status_calls;
-    const auto finalized = independent_reader_.ReadSceneFinalized(
-        query.owner_transaction.apply_id,
-        query.owner_transaction.apply_generation);
     const auto publication = independent_reader_.ReadPublicationReceipt(
         query.owner_transaction.apply_id,
         query.owner_transaction.apply_generation);
-    if (!finalized.has_value() || !publication.has_value()) {
-      throw std::runtime_error("release fixture lacks finalized publication");
+    if (!publication.has_value()) {
+      throw std::runtime_error("release fixture lacks completed publication");
     }
-    const auto &candidate = finalized->scene_finalized.finalized_result
-                                .candidate_projection_revision;
     const auto &receipt = publication->publication.publication_receipt;
+    const auto &candidate = receipt.request.candidate_projection_revision;
     ConfigurationFenceReconciliationEvidenceDTO evidence{
         ExecutionHostEpochDTO{
             RuntimeUnitId("runtime.kernel"),
@@ -616,19 +612,15 @@ public:
   [[nodiscard]] ConfigurationFenceStatusDTO
   QueryStatus(const ConfigurationFenceStatusQueryDTO &query) const override {
     ++status_calls;
-    const auto finalized = independent_reader_.ReadSceneFinalized(
-        query.owner_transaction.apply_id,
-        query.owner_transaction.apply_generation);
     const auto publication = independent_reader_.ReadPublicationReceipt(
         query.owner_transaction.apply_id,
         query.owner_transaction.apply_generation);
-    if (!finalized.has_value() || !publication.has_value()) {
+    if (!publication.has_value()) {
       throw std::runtime_error(
-          "aggregate fence status lacks finalized publication");
+          "aggregate fence status lacks completed publication");
     }
-    const auto &candidate = finalized->scene_finalized.finalized_result
-                                .candidate_projection_revision;
     const auto &receipt = publication->publication.publication_receipt;
+    const auto &candidate = receipt.request.candidate_projection_revision;
     ConfigurationFenceReconciliationEvidenceDTO evidence{
         ExecutionHostEpochDTO{
             RuntimeUnitId("runtime.kernel"),
@@ -914,401 +906,107 @@ private:
   std::optional<core::CellAdmissionClaimDTO> released_claim_;
 };
 
-class ScriptedSceneOwner final : public IManagerSceneProjectionHandoffPort {
+class MaintenanceSceneOwner final
+    : public core::IManagerSceneProjectionMaintenancePort {
 public:
-  explicit ScriptedSceneOwner(
-      SqliteManagerApplyJournal &independent_reader,
-      std::optional<ProjectionRevisionDTO> current_projection = std::nullopt)
-      : independent_reader_(independent_reader),
-        current_projection_(std::move(current_projection)) {}
+  explicit MaintenanceSceneOwner(core::ProjectionRevisionDTO current)
+      : current_(std::move(current)) {}
 
-  [[nodiscard]] ProjectionRevisionDTO
+  [[nodiscard]] core::ProjectionRevisionDTO
   CurrentProjectionRevision() const override {
-    if (current_projection_.has_value()) {
-      return *current_projection_;
-    }
-    if (finalization_result_.has_value()) {
-      return finalization_result_->candidate_projection_revision;
-    }
-    throw std::runtime_error(
-        "current projection is outside this focused scene fixture");
+    return current_;
   }
 
-  [[nodiscard]] ProjectionApplyStageResultDTO
-  StageCandidateProjection(const ProjectionApplyStageDTO &request) override {
-    ++stage_calls;
-    last_stage_request = request;
-    const auto durable = independent_reader_.ReadSceneStageIntent(
-        request.apply_id, request.apply_generation);
-    saw_durable_intent_before_stage =
-        durable.has_value() &&
-        durable->scene_stage_intent.native_transition_rows ==
-            request.native_transition_rows &&
-        durable->scene_stage_intent.expected_active_projection_revision ==
-            request.expected_active_projection_revision;
-    if (!request.valid() || !request.native_transition_rows.empty()) {
+  [[nodiscard]] core::ProjectionMaintenanceInitializationStatusDTO
+  BeginMaintenanceInitialization(
+      const core::ProjectionMaintenanceInitializationRequestDTO &request)
+      override {
+    ++begin_calls;
+    last_request = request;
+    if (!request.valid()) {
       throw std::runtime_error("scene fixture received an invalid request");
     }
-    if (throw_before_stage_effect) {
-      throw std::runtime_error("simulated lost Stage before owner effect");
-    }
-    if (reject_stage) {
-      quiescing = true;
-      rejected_candidate_ = ProjectionRevisionDTO{
-          request.candidate_retained_bundle.retained_bundle_id,
-          request.candidate_retained_bundle.cell_graph.graph_revision,
-          SceneRevision{
-              request.expected_active_projection_revision.scene_revision
-                  .scene_id,
-              request.expected_active_projection_revision.scene_revision
-                      .revision_id +
-                  1U,
-              ContentDigest(std::string(kDigestTwo)),
-          },
-      };
-      return {
-          request.apply_id,
-          request.apply_generation,
-          request.expected_active_projection_revision,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-          ProjectionApplyStageResultState::kRejected,
-          ErrorDTO{"native_projection_stage_rejected",
-                   "simulated definitive participant rejection",
-                   {}},
-      };
-    }
-    const ProjectionRevisionDTO candidate{
+    const core::ProjectionRevisionDTO target{
         request.candidate_retained_bundle.retained_bundle_id,
         request.candidate_retained_bundle.cell_graph.graph_revision,
-        SceneRevision{
-            request.expected_active_projection_revision.scene_revision.scene_id,
-            request.expected_active_projection_revision.scene_revision
-                    .revision_id +
-                1U,
-            ContentDigest(std::string(kDigestTwo)),
+        request.expected_active_projection_revision.scene_revision,
+    };
+    status_ = core::ProjectionMaintenanceInitializationStatusDTO{
+        request.apply_id,
+        request.apply_generation,
+        core::ProjectionMaintenanceInitializationState::kInitialized,
+        request.expected_active_projection_revision,
+        target,
+        core::LogicalSceneSnapshotIdentityDTO{
+            target.scene_revision,
+            request.candidate_retained_bundle.cell_graph.cell_id,
         },
-    };
-    const ProjectionStageGeneration stage_generation(9U);
-    ProjectionTransitionEvidenceDTO evidence{
-        request.apply_id,
-        request.apply_generation,
-        stage_generation,
-        request.expected_active_projection_revision,
-        candidate,
-        ProjectionTransitionEvidenceState::kStaged,
-        {},
+        request.native_runtime_bindings,
         std::nullopt,
-    };
-    staged_result_ = ProjectionApplyStageResultDTO{
-        request.apply_id,
-        request.apply_generation,
-        request.expected_active_projection_revision,
-        candidate,
-        stage_generation,
-        std::move(evidence),
-        ProjectionApplyStageResultState::kStaged,
         std::nullopt,
+        false,
     };
-    if (return_uncertain_stage_result) {
-      const ErrorDTO error{"native_projection_stage_uncertain",
-                           "native projection response timed out",
-                           {}};
-      staged_result_->state =
-          ProjectionApplyStageResultState::kFailedProjectionUncertain;
-      staged_result_->transition_evidence->state =
-          ProjectionTransitionEvidenceState::kUncertain;
-      staged_result_->transition_evidence->error = error;
-      staged_result_->error = error;
-    }
-    if (throw_after_stage_effect) {
-      throw std::runtime_error("simulated lost scene Stage response");
-    }
-    return *staged_result_;
+    return *status_;
   }
 
-  [[nodiscard]] ProjectionApplyActivationResultDTO ActivateStagedProjection(
-      const ProjectionApplyActivationDTO &request) override {
-    ++activation_calls;
-    last_activation_request = request;
-    const auto durable = independent_reader_.ReadActivationSelection(
-        request.apply_id, request.apply_generation);
-    saw_durable_selection_before_activation =
-        durable.has_value() &&
-        durable->activation_selection.apply_id == request.apply_id &&
-        durable->activation_selection.apply_generation ==
-            request.apply_generation &&
-        durable->activation_selection.projection_stage_generation ==
-            request.projection_stage_generation &&
-        durable->activation_selection.candidate_projection_revision ==
-            request.candidate_projection_revision;
-    if (!staged_result_.has_value() || !request.valid() ||
-        staged_result_->apply_id != request.apply_id ||
-        staged_result_->apply_generation != request.apply_generation ||
-        staged_result_->expected_active_projection_revision !=
-            request.expected_active_projection_revision ||
-        staged_result_->projection_stage_generation !=
-            std::optional<ProjectionStageGeneration>{
-                request.projection_stage_generation} ||
-        staged_result_->candidate_projection_revision !=
-            std::optional<ProjectionRevisionDTO>{
-                request.candidate_projection_revision} ||
-        !staged_result_->transition_evidence->transition_rows.empty()) {
+  [[nodiscard]] core::ProjectionMaintenanceInitializationStatusDTO
+  CompleteMaintenanceInitialization(
+      const core::ProjectionMaintenanceCompletionDTO &completion) override {
+    ++complete_calls;
+    if (!status_.has_value() || !completion.valid() ||
+        completion.apply_id != status_->apply_id ||
+        completion.apply_generation != status_->apply_generation ||
+        completion.target_projection_revision !=
+            status_->target_projection_revision ||
+        completion.authoritative_snapshot_identity !=
+            status_->authoritative_snapshot_identity) {
+      throw std::runtime_error("scene fixture received foreign completion");
+    }
+    status_->state =
+        core::ProjectionMaintenanceInitializationState::kCompleted;
+    status_->publication_receipt = completion.publication_receipt;
+    current_ = status_->target_projection_revision;
+    return *status_;
+  }
+
+  [[nodiscard]] std::optional<
+      core::ProjectionMaintenanceInitializationStatusDTO>
+  ReadMaintenanceInitialization(
+      const core::ProjectionMaintenanceInitializationQueryDTO &query) const
+      override {
+    ++read_calls;
+    if (!status_.has_value() || status_->apply_id != query.apply_id ||
+        status_->apply_generation != query.apply_generation) {
+      return std::nullopt;
+    }
+    return status_;
+  }
+
+  [[nodiscard]] core::ProjectionAggregateHealthDTO
+  ActiveProjectionHealth() const override {
+    if (!status_.has_value()) {
       throw std::runtime_error(
-          "activation fixture received a foreign or nonempty stage");
-    }
-    if (activation_pending) {
-      return {
-          request.apply_id,
-          request.apply_generation,
-          request.expected_active_projection_revision,
-          request.projection_stage_generation,
-          request.candidate_projection_revision,
-          ProjectionApplyActivationResultState::kAccepted,
-          std::nullopt,
-          *staged_result_->transition_evidence,
-          std::nullopt,
-      };
-    }
-    auto evidence = *staged_result_->transition_evidence;
-    evidence.state = ProjectionTransitionEvidenceState::kActivatedAndRetired;
-    activation_result_ = ProjectionApplyActivationResultDTO{
-        request.apply_id,
-        request.apply_generation,
-        request.expected_active_projection_revision,
-        request.projection_stage_generation,
-        request.candidate_projection_revision,
-        ProjectionApplyActivationResultState::kActivated,
-        request.candidate_projection_revision,
-        std::move(evidence),
-        std::nullopt,
-    };
-    if (throw_after_activation_effect) {
-      throw std::runtime_error("simulated lost activation response");
-    }
-    return *activation_result_;
-  }
-
-  [[nodiscard]] ProjectionApplyDiscardResultDTO
-  DiscardStagedProjection(const ProjectionApplyDiscardDTO &) override {
-    throw std::runtime_error("discard is outside the scene-stage fixture");
-  }
-
-  [[nodiscard]] ProjectionApplyFinalizeResultDTO FinalizeProjectionTransition(
-      const ProjectionApplyFinalizeDTO &request) override {
-    ++finalize_calls;
-    last_finalize_request = request;
-    const auto durable = independent_reader_.ReadPublicationReceipt(
-        request.apply_id, request.apply_generation);
-    saw_durable_publication_before_finalize =
-        durable.has_value() &&
-        durable->publication.publication_receipt == request.publication_receipt;
-    if (!activation_result_.has_value() || !request.valid() ||
-        request.apply_id != activation_result_->apply_id ||
-        request.apply_generation != activation_result_->apply_generation ||
-        request.projection_stage_generation !=
-            activation_result_->projection_stage_generation ||
-        request.candidate_projection_revision !=
-            activation_result_->candidate_projection_revision) {
-      throw std::runtime_error("finalize fixture received a foreign request");
-    }
-    auto evidence = activation_result_->transition_evidence;
-    evidence.state = ProjectionTransitionEvidenceState::kFinalized;
-    ProjectionAggregateHealthDTO health{
-        NamedApplyProjectionSetSourceDTO{
-            request.apply_id,
-            request.apply_generation,
-            request.projection_stage_generation,
-            request.candidate_projection_revision,
-        },
-        ProjectionHealthState::kHealthy,
-        {},
-        std::nullopt,
-    };
-    finalization_result_ = ProjectionApplyFinalizeResultDTO{
-        request.apply_id,
-        request.apply_generation,
-        request.projection_stage_generation,
-        request.candidate_projection_revision,
-        request.publication_receipt,
-        ProjectionApplyFinalizeResultState::kFinalized,
-        request.candidate_projection_revision,
-        std::move(evidence),
-        std::move(health),
-        std::nullopt,
-    };
-    if (throw_after_finalize_effect) {
-      throw std::runtime_error("simulated lost Finalize response");
-    }
-    return *finalization_result_;
-  }
-
-  [[nodiscard]] ProjectionApplyStatusDTO ProjectionApplyStatus(
-      const ProjectionApplyStatusQueryDTO &query) const override {
-    ++status_calls;
-    if (throw_status) {
-      throw std::runtime_error("simulated scene status transport failure");
-    }
-    if (foreign_status) {
-      return {
-          ApplyId("foreign-apply"),
-          query.apply_generation,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-          ProjectionApplyStatusState::kAbsent,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-      };
-    }
-    if (finalization_result_.has_value()) {
-      const auto &result = *finalization_result_;
-      return {
-          result.apply_id,
-          result.apply_generation,
-          activation_result_->expected_active_projection_revision,
-          result.projection_stage_generation,
-          result.candidate_projection_revision,
-          ProjectionApplyStatusState::kFinalized,
-          result.transition_evidence,
-          result.publication_receipt,
-          result.candidate_aggregate_health,
-          std::nullopt,
-      };
-    }
-    if (activation_result_.has_value()) {
-      const auto &result = *activation_result_;
-      return {
-          result.apply_id,
-          result.apply_generation,
-          result.expected_active_projection_revision,
-          result.projection_stage_generation,
-          result.candidate_projection_revision,
-          ProjectionApplyStatusState::kActivated,
-          result.transition_evidence,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-      };
-    }
-    if (staged_result_.has_value()) {
-      const auto &result = *staged_result_;
-      return {
-          result.apply_id,
-          result.apply_generation,
-          result.expected_active_projection_revision,
-          result.projection_stage_generation,
-          result.candidate_projection_revision,
-          ProjectionApplyStatusState::kStaged,
-          result.transition_evidence,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-      };
-    }
-    if (rejection_cleanup_complete && last_stage_request.has_value() &&
-        rejected_candidate_.has_value()) {
-      const auto &request = *last_stage_request;
-      ProjectionTransitionEvidenceDTO evidence{
-          request.apply_id,
-          request.apply_generation,
-          ProjectionStageGeneration(9U),
-          request.expected_active_projection_revision,
-          *rejected_candidate_,
-          ProjectionTransitionEvidenceState::kAborted,
-          {},
-          std::nullopt,
-      };
-      return {
-          request.apply_id,
-          request.apply_generation,
-          request.expected_active_projection_revision,
-          ProjectionStageGeneration(9U),
-          *rejected_candidate_,
-          ProjectionApplyStatusState::kDiscarded,
-          std::move(evidence),
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-      };
-    }
-    if (quiescing) {
-      const auto durable = independent_reader_.ReadSceneStageIntent(
-          query.apply_id, query.apply_generation);
-      if (!durable.has_value()) {
-        throw std::runtime_error(
-            "quiescing fixture requires an expected predecessor");
-      }
-      return {
-          query.apply_id,
-          query.apply_generation,
-          durable->scene_stage_intent.expected_active_projection_revision,
-          ProjectionStageGeneration(9U),
-          std::nullopt,
-          ProjectionApplyStatusState::kQuiescing,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-          std::nullopt,
-      };
+          "scene fixture has no maintenance projection health");
     }
     return {
-        query.apply_id, query.apply_generation,
-        std::nullopt,   std::nullopt,
-        std::nullopt,   ProjectionApplyStatusState::kAbsent,
-        std::nullopt,   std::nullopt,
-        std::nullopt,   std::nullopt,
+        core::MaintenanceProjectionSetSourceDTO{
+            status_->apply_id, status_->apply_generation,
+            status_->target_projection_revision},
+        core::ProjectionHealthState::kHealthy,
+        {},
+        std::nullopt,
     };
   }
 
-  [[nodiscard]] ActiveProjectionRuntimeRecoveryResultDTO
-  ReconcileActiveProjectionRuntimes(
-      const ActiveProjectionRuntimeSetDTO &runtime_set) override {
-    return {runtime_set, ActiveProjectionRuntimeRecoveryState::kCurrent,
-            std::nullopt};
-  }
-
-  [[nodiscard]] ProjectionAggregateHealthDTO
-  ActiveProjectionHealth() const override {
-    if (!finalization_result_.has_value()) {
-      throw std::runtime_error(
-          "active projection health is absent before finalization");
-    }
-    return finalization_result_->candidate_aggregate_health;
-  }
-
-  bool throw_before_stage_effect{false};
-  bool throw_after_stage_effect{false};
-  bool reject_stage{false};
-  bool return_uncertain_stage_result{false};
-  bool activation_pending{false};
-  bool throw_after_activation_effect{false};
-  bool throw_after_finalize_effect{false};
-  bool throw_status{false};
-  bool foreign_status{false};
-  bool quiescing{false};
-  bool rejection_cleanup_complete{false};
-  bool saw_durable_intent_before_stage{false};
-  bool saw_durable_selection_before_activation{false};
-  bool saw_durable_publication_before_finalize{false};
-  int stage_calls{0};
-  int activation_calls{0};
-  int finalize_calls{0};
-  mutable int status_calls{0};
-  std::optional<ProjectionApplyStageDTO> last_stage_request;
-  std::optional<ProjectionApplyActivationDTO> last_activation_request;
-  std::optional<ProjectionApplyFinalizeDTO> last_finalize_request;
+  int begin_calls{0};
+  int complete_calls{0};
+  mutable int read_calls{0};
+  std::optional<core::ProjectionMaintenanceInitializationRequestDTO>
+      last_request;
 
 private:
-  SqliteManagerApplyJournal &independent_reader_;
-  std::optional<ProjectionRevisionDTO> current_projection_;
-  std::optional<ProjectionRevisionDTO> rejected_candidate_;
-  std::optional<ProjectionApplyStageResultDTO> staged_result_;
-  std::optional<ProjectionApplyActivationResultDTO> activation_result_;
-  std::optional<ProjectionApplyFinalizeResultDTO> finalization_result_;
+  core::ProjectionRevisionDTO current_;
+  std::optional<core::ProjectionMaintenanceInitializationStatusDTO> status_;
 };
 
 struct CoordinatorFixture final {
@@ -1348,55 +1046,6 @@ struct CoordinatorFixture final {
   ManagerApplyRuntimeConvergenceCoordinator coordinator;
 };
 
-void ReachDurableSceneActivation(CoordinatorFixture &fixture,
-                                 ScriptedSceneOwner &scene_owner) {
-  ASSERT_EQ(fixture.Run().state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ManagerSceneStageCoordinator stage_coordinator(
-      fixture.journal, *fixture.package.bundle_source, fixture.publication,
-      scene_owner);
-  ASSERT_EQ(
-      stage_coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
-          .path,
-      ManagerSceneStagePath::kStagedFromNewCall);
-  ManagerSceneActivationCoordinator activation_coordinator(fixture.journal,
-                                                           scene_owner);
-  ASSERT_EQ(activation_coordinator
-                .ActivateOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
-                .path,
-            ManagerSceneActivationPath::kActivatedFromNewCall);
-}
-
-void ReachDurableRuntimeComposition(CoordinatorFixture &fixture,
-                                    ScriptedRuntimeCompositionPort &port) {
-  ManagerSelectedRuntimeCompositionCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, port,
-      RuntimeEpoch("manager-runtime-1"));
-  const auto installed =
-      coordinator.InstallOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  ASSERT_EQ(installed.state,
-            ManagerSelectedRuntimeCompositionResultState::kInstalled);
-  ASSERT_TRUE(installed.durable_materialization.has_value());
-}
-
-void ReachDurableSceneFinalize(CoordinatorFixture &fixture,
-                               ScriptedSceneOwner &scene_owner,
-                               ScriptedPublicationStore &publication_store) {
-  ReachDurableSceneActivation(fixture, scene_owner);
-  ScriptedRuntimeCompositionPort runtime_composition;
-  ReachDurableRuntimeComposition(fixture, runtime_composition);
-  ManagerSelectedBundleTransitionCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, publication_store,
-      scene_owner);
-  ASSERT_EQ(
-      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
-          .path,
-      ManagerSelectedBundleTransitionPath::kPublishedFromNewCall);
-  ASSERT_EQ(
-      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
-          .path,
-      ManagerSelectedBundleTransitionPath::kFinalizedFromNewCall);
-}
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
      PersistsBeforeStartStagesAndReplaysWithoutASecondEffect) {
@@ -1435,35 +1084,6 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
   EXPECT_EQ(fixture.kernel.acquire_calls, 1);
   EXPECT_EQ(fixture.kernel.rehydrate_calls, 2);
-}
-
-TEST(ManagerApplyRuntimeConvergenceCoordinator,
-     ReplacementQueryRequiresMatchingManagedApplyAndHeldFenceIdentity) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  const auto result = fixture.Run();
-  ASSERT_TRUE(fixture.runtime_ports.last_query);
-  auto query = *fixture.runtime_ports.last_query;
-  EXPECT_FALSE(query.replacement);
-  query.replacement = result.fence.rehydrate_request;
-  query.replacement->expected_old_retained_bundle_id =
-      RetainedBundleId(std::string(kDigestTwo));
-  ASSERT_TRUE(query.valid());
-  auto crossed = query;
-  crossed.replacement->apply_generation = ApplyGeneration(99U);
-  EXPECT_FALSE(crossed.valid());
-  crossed = query;
-  crossed.replacement->expected_old_retained_bundle_id =
-      query.candidate_retained_bundle_id;
-  EXPECT_FALSE(crossed.valid());
-  crossed = query;
-  crossed.owner = RuntimeUnitConvergenceBootstrapOwnerDTO{
-      BootstrapId("bootstrap"), BootstrapGeneration(1U)};
-  EXPECT_FALSE(crossed.valid());
-  crossed = query;
-  crossed.plan.lifecycle_control =
-      core::RuntimeLifecycleControl::kExternallyManaged;
-  EXPECT_FALSE(crossed.valid());
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
@@ -1817,731 +1437,17 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
             ProcessPresenceState::kAbsent);
 }
 
-TEST(ManagerSceneStageCoordinator,
-     PersistsBeforeStageAndReplaysWithoutAnotherOwnerCall) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ASSERT_EQ(fixture.Run().state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ManagerSceneStageCoordinator coordinator(fixture.journal,
-                                           *fixture.package.bundle_source,
-                                           fixture.publication, scene_owner);
-
-  const auto staged =
-      coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(staged.path, ManagerSceneStagePath::kStagedFromNewCall);
-  EXPECT_TRUE(staged.durable_scene_stage_intent.inserted);
-  EXPECT_TRUE(staged.durable_scene_staged.inserted);
-  EXPECT_TRUE(scene_owner.saw_durable_intent_before_stage);
-  EXPECT_EQ(scene_owner.status_calls, 1);
-  EXPECT_EQ(scene_owner.stage_calls, 1);
-  EXPECT_TRUE(staged.durable_scene_stage_intent.record.scene_stage_intent
-                  .native_transition_rows.empty());
-
-  const auto replay =
-      coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(replay.path, ManagerSceneStagePath::kDurableStagedReplay);
-  EXPECT_FALSE(replay.durable_scene_stage_intent.inserted);
-  EXPECT_FALSE(replay.durable_scene_staged.inserted);
-  EXPECT_EQ(replay.durable_scene_staged.record.scene_staged_digest,
-            staged.durable_scene_staged.record.scene_staged_digest);
-  EXPECT_EQ(scene_owner.status_calls, 1);
-  EXPECT_EQ(scene_owner.stage_calls, 1);
-  const auto report = fixture.journal.VerifyIntegrity();
-  EXPECT_EQ(report.scene_stage_intent_count, 1);
-  EXPECT_EQ(report.scene_staged_count, 1);
-}
-
-TEST(ManagerSceneStageCoordinator,
-     LostStageResponseRecoversFromOwnerStatusWithoutDuplicateStage) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ASSERT_EQ(fixture.Run().state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  scene_owner.throw_after_stage_effect = true;
-  ManagerSceneStageCoordinator coordinator(fixture.journal,
-                                           *fixture.package.bundle_source,
-                                           fixture.publication, scene_owner);
-
-  try {
-    static_cast<void>(
-        coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)));
-    FAIL() << "expected a lost Stage response";
-  } catch (const ManagerSceneStageEffectUncertainError &error) {
-    EXPECT_TRUE(error.recovery_query().valid());
-    EXPECT_EQ(error.recovery_query().apply_id, ApplyId("apply-1"));
-  }
-  EXPECT_TRUE(fixture.journal
-                  .ReadSceneStageIntent(ApplyId("apply-1"), ApplyGeneration(1U))
-                  .has_value());
-  EXPECT_FALSE(
-      fixture.journal.ReadSceneStaged(ApplyId("apply-1"), ApplyGeneration(1U))
-          .has_value());
-  EXPECT_EQ(scene_owner.stage_calls, 1);
-
-  scene_owner.throw_after_stage_effect = false;
-  const auto recovered =
-      coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(recovered.path, ManagerSceneStagePath::kRecoveredOwnerStatus);
-  EXPECT_TRUE(recovered.durable_scene_staged.inserted);
-  EXPECT_EQ(scene_owner.stage_calls, 1);
-  EXPECT_EQ(scene_owner.status_calls, 2);
-}
-
-TEST(ManagerSceneStageCoordinator,
-     LostBeforeStageEffectReplaysTheSameExactRequestAfterAbsence) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ASSERT_EQ(fixture.Run().state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  scene_owner.throw_before_stage_effect = true;
-  ManagerSceneStageCoordinator coordinator(fixture.journal,
-                                           *fixture.package.bundle_source,
-                                           fixture.publication, scene_owner);
-
-  EXPECT_THROW(static_cast<void>(coordinator.StageOrRecover(
-                   ApplyId("apply-1"), ApplyGeneration(1U))),
-               ManagerSceneStageEffectUncertainError);
-  const auto exact = fixture.journal.ReadSceneStageIntent(ApplyId("apply-1"),
-                                                          ApplyGeneration(1U));
-  ASSERT_TRUE(exact.has_value());
-  scene_owner.throw_before_stage_effect = false;
-
-  const auto recovered =
-      coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(recovered.path, ManagerSceneStagePath::kStagedFromNewCall);
-  EXPECT_FALSE(recovered.durable_scene_stage_intent.inserted);
-  EXPECT_EQ(recovered.durable_scene_stage_intent.record, *exact);
-  EXPECT_EQ(scene_owner.stage_calls, 2);
-  EXPECT_EQ(scene_owner.status_calls, 2);
-  EXPECT_EQ(fixture.journal.VerifyIntegrity().scene_stage_intent_count, 1);
-}
-
-TEST(ManagerSceneStageCoordinator,
-     RejectedAddedCandidateWaitsForSceneCleanupBeforeStoppingExactProcess) {
-  ScopedPackageRoot root;
-  std::filesystem::create_directories(root.path() / "predecessor");
-  std::filesystem::create_directories(root.path() / "candidate");
-  auto predecessor =
-      MaterializeRuntimePackage(root.path() / "predecessor", true);
-  auto candidate = MaterializeRuntimePackage(root.path() / "candidate");
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      root.path() / "predecessor", root.path() / "candidate");
-  const auto apply_intent = ApplyIntent(*predecessor.bundle, *candidate.bundle);
-  SqliteManagerApplyJournal journal(
-      root.path() / "added-candidate-apply.sqlite3",
-      predecessor.bundle->value().cell_graph.cell_id);
-  SqliteManagerApplyJournal independent_reader(
-      root.path() / "added-candidate-apply.sqlite3",
-      predecessor.bundle->value().cell_graph.cell_id);
-  CurrentPublicationReader publication(PredecessorPublication(apply_intent));
-  ExactFencePort kernel;
-  ScriptedRuntimePorts runtime_ports(independent_reader);
-  ManagerApplyFenceCoordinator fence_coordinator(
-      journal, kernel, RuntimeEpoch("manager-runtime-1"));
-  ManagerApplyRuntimeConvergenceCoordinator runtime_coordinator(
-      fence_coordinator, journal, publication, *candidate.artifact_source,
-      runtime_ports, runtime_ports, "linux", "posix.1-2017",
-      [] { return 1'000U; });
-  const auto ready = runtime_coordinator.ConvergeOrRecover(
-      apply_intent, *predecessor.bundle, *candidate.bundle,
-      ManagerApplyFenceExpectationDTO{
-          0U,
-          ConfigurationFenceGeneration(0U),
-          {},
-      },
-      ActiveBundlePublicationGeneration(3U));
-  ASSERT_EQ(ready.state, ManagerRuntimeConvergenceResultState::kStagedReady);
-  ASSERT_EQ(ready.durable_runtime_intent.record.runtime_convergence_intent
-                .runtime_units.size(),
-            1U);
-  EXPECT_EQ(ready.durable_runtime_intent.record.runtime_convergence_intent
-                .runtime_units.front()
-                .candidate_disposition,
-            RuntimeUnitCandidateDisposition::kAdded);
-
-  ScriptedSceneOwner scene_owner(independent_reader);
-  scene_owner.reject_stage = true;
-  ManagerSceneStageCoordinator stage_coordinator(journal, bundle_source,
-                                                 publication, scene_owner,
-                                                 nullptr, &runtime_ports);
-  const auto observations_before_cleanup = runtime_ports.observe_calls;
-  EXPECT_THROW(static_cast<void>(stage_coordinator.StageOrRecover(
-                   ApplyId("apply-1"), ApplyGeneration(1U))),
-               ManagerSceneStagePending);
-  EXPECT_EQ(runtime_ports.stop_calls, 0);
-
-  scene_owner.quiescing = false;
-  scene_owner.rejection_cleanup_complete = true;
-  EXPECT_THROW(static_cast<void>(stage_coordinator.StageOrRecover(
-                   ApplyId("apply-1"), ApplyGeneration(1U))),
-               ManagerSceneStageCoordinatorError);
-  EXPECT_EQ(runtime_ports.stop_calls, 1);
-  EXPECT_EQ(runtime_ports.observe_calls, observations_before_cleanup + 2);
-  EXPECT_EQ(runtime_ports.ensure_calls, 1);
-  EXPECT_EQ(runtime_ports.start_effect_calls, 1);
-  EXPECT_EQ(journal.VerifyIntegrity().scene_stage_intent_count, 1);
-  EXPECT_EQ(journal.VerifyIntegrity().scene_staged_count, 0);
-}
-
-TEST(ManagerSceneStageCoordinator,
-     RejectedRetainedExactCandidateKeepsHealthyPredecessorRunning) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ASSERT_EQ(fixture.Run().state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  scene_owner.reject_stage = true;
-  ManagerSceneStageCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, fixture.publication,
-      scene_owner, nullptr, &fixture.runtime_ports);
-
-  EXPECT_THROW(static_cast<void>(coordinator.StageOrRecover(
-                   ApplyId("apply-1"), ApplyGeneration(1U))),
-               ManagerSceneStageCoordinatorError);
-  EXPECT_EQ(fixture.runtime_ports.stop_calls, 0);
-  EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
-  EXPECT_EQ(fixture.journal.VerifyIntegrity().scene_stage_intent_count, 1);
-  EXPECT_EQ(fixture.journal.VerifyIntegrity().scene_staged_count, 0);
-}
-
-TEST(ManagerApplyRuntimeConvergenceCoordinator,
-     FreshObservationReusesTheRetainedComponentEpochSet) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  const auto first_ready = fixture.Run();
-  ASSERT_EQ(first_ready.state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ManagerSceneStageCoordinator stage_coordinator(
-      fixture.journal, *fixture.package.bundle_source, fixture.publication,
-      scene_owner);
-  ASSERT_EQ(
-      stage_coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
-          .path,
-      ManagerSceneStagePath::kStagedFromNewCall);
-
-  fixture.runtime_ports.RefreshCurrentProcessObservation();
-  const auto current_ready = fixture.Run();
-  ASSERT_EQ(current_ready.state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ASSERT_TRUE(current_ready.durable_staged_ready.has_value());
-  EXPECT_FALSE(current_ready.durable_staged_ready->inserted);
-  EXPECT_EQ(current_ready.durable_staged_ready->record.staged_ready
-                .staged_ready_generation,
-            1U);
-  ASSERT_EQ(current_ready.durable_staged_ready->record.staged_ready
-                .runtime_units.size(),
-            1U);
-  EXPECT_EQ(
-      current_ready.durable_staged_ready->record.staged_ready.runtime_units
-          .front()
-          .runtime_epoch,
-      RuntimeEpoch("process-epoch-1"));
-  EXPECT_EQ(fixture.journal.VerifyIntegrity().runtime_staged_ready_count, 1);
-}
-
-TEST(ManagerSceneStageCoordinator,
-     UncertainStagePreservesTheOwnerDiagnosticForRecovery) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ASSERT_EQ(fixture.Run().state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  scene_owner.return_uncertain_stage_result = true;
-  ManagerSceneStageCoordinator coordinator(fixture.journal,
-                                           *fixture.package.bundle_source,
-                                           fixture.publication, scene_owner);
-
-  try {
-    static_cast<void>(
-        coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)));
-    FAIL() << "expected uncertain Stage evidence";
-  } catch (const ManagerSceneStageEffectUncertainError &error) {
-    EXPECT_NE(
-        std::string(error.what()).find("native_projection_stage_uncertain"),
-        std::string::npos);
-    EXPECT_NE(std::string(error.what()).find("response timed out"),
-              std::string::npos);
-    ASSERT_TRUE(error.observed_stage_result().has_value());
-  }
-}
-
-TEST(ManagerSceneStageCoordinator,
-     QuiescingStatusReplaysTheExactOwnerRequestForSettlement) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ASSERT_EQ(fixture.Run().state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  scene_owner.quiescing = true;
-  ManagerSceneStageCoordinator coordinator(fixture.journal,
-                                           *fixture.package.bundle_source,
-                                           fixture.publication, scene_owner);
-
-  const auto settled =
-      coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(settled.path, ManagerSceneStagePath::kStagedFromNewCall);
-  EXPECT_EQ(scene_owner.stage_calls, 1);
-  EXPECT_EQ(fixture.journal.VerifyIntegrity().scene_stage_intent_count, 1);
-}
-
-TEST(ManagerSceneStageCoordinator,
-     MalformedStatusRemainsExplicitlyRecoverable) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ASSERT_EQ(fixture.Run().state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  scene_owner.foreign_status = true;
-  ManagerSceneStageCoordinator coordinator(fixture.journal,
-                                           *fixture.package.bundle_source,
-                                           fixture.publication, scene_owner);
-
-  EXPECT_THROW(static_cast<void>(coordinator.StageOrRecover(
-                   ApplyId("apply-1"), ApplyGeneration(1U))),
-               ManagerSceneStageEffectUncertainError);
-  EXPECT_EQ(scene_owner.stage_calls, 0);
-
-  scene_owner.foreign_status = false;
-  const auto recovered =
-      coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(recovered.path, ManagerSceneStagePath::kStagedFromNewCall);
-  EXPECT_EQ(scene_owner.stage_calls, 1);
-}
-
-TEST(ManagerSceneStageCoordinator,
-     PublicationDriftStopsBeforeOwnerObservationOrStage) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ASSERT_EQ(fixture.Run().state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ManagerSceneStageCoordinator coordinator(fixture.journal,
-                                           *fixture.package.bundle_source,
-                                           fixture.publication, scene_owner);
-  fixture.publication.fail_on_call = fixture.publication.read_calls + 1;
-
-  EXPECT_THROW(static_cast<void>(coordinator.StageOrRecover(
-                   ApplyId("apply-1"), ApplyGeneration(1U))),
-               ManagerSceneStageCoordinatorError);
-  EXPECT_EQ(scene_owner.status_calls, 0);
-  EXPECT_EQ(scene_owner.stage_calls, 0);
-  EXPECT_TRUE(fixture.journal
-                  .ReadSceneStageIntent(ApplyId("apply-1"), ApplyGeneration(1U))
-                  .has_value());
-  EXPECT_FALSE(
-      fixture.journal.ReadSceneStaged(ApplyId("apply-1"), ApplyGeneration(1U))
-          .has_value());
-}
-
-TEST(ManagerSceneActivationCoordinator,
-     PersistsSelectionBeforeActivationAndReplaysWithoutAnotherOwnerCall) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ASSERT_EQ(fixture.Run().state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ManagerSceneStageCoordinator stage_coordinator(
-      fixture.journal, *fixture.package.bundle_source, fixture.publication,
-      scene_owner);
-  ASSERT_EQ(
-      stage_coordinator.StageOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
-          .path,
-      ManagerSceneStagePath::kStagedFromNewCall);
-  ManagerSceneActivationCoordinator activation_coordinator(fixture.journal,
-                                                           scene_owner);
-
-  const auto activated = activation_coordinator.ActivateOrRecover(
-      ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(activated.path, ManagerSceneActivationPath::kActivatedFromNewCall);
-  EXPECT_TRUE(activated.durable_selection.inserted);
-  EXPECT_TRUE(activated.durable_scene_activated.inserted);
-  EXPECT_TRUE(scene_owner.saw_durable_selection_before_activation);
-  EXPECT_EQ(scene_owner.activation_calls, 1);
-
-  const auto replay = activation_coordinator.ActivateOrRecover(
-      ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(replay.path, ManagerSceneActivationPath::kDurableActivatedReplay);
-  EXPECT_FALSE(replay.durable_selection.inserted);
-  EXPECT_FALSE(replay.durable_scene_activated.inserted);
-  EXPECT_EQ(replay.durable_scene_activated.record.scene_activated_digest,
-            activated.durable_scene_activated.record.scene_activated_digest);
-  EXPECT_EQ(scene_owner.activation_calls, 1);
-  const auto report = fixture.journal.VerifyIntegrity();
-  EXPECT_EQ(report.activation_selection_count, 1);
-  EXPECT_EQ(report.scene_activated_count, 1);
-}
-
-TEST(ManagerSceneActivationCoordinator,
-     LostActivationResponseRecoversFromOwnerStatusWithoutDuplicateEffect) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ASSERT_EQ(fixture.Run().state,
-            ManagerRuntimeConvergenceResultState::kStagedReady);
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ManagerSceneStageCoordinator stage_coordinator(
-      fixture.journal, *fixture.package.bundle_source, fixture.publication,
-      scene_owner);
-  static_cast<void>(stage_coordinator.StageOrRecover(ApplyId("apply-1"),
-                                                     ApplyGeneration(1U)));
-  scene_owner.throw_after_activation_effect = true;
-  ManagerSceneActivationCoordinator activation_coordinator(fixture.journal,
-                                                           scene_owner);
-
-  try {
-    static_cast<void>(activation_coordinator.ActivateOrRecover(
-        ApplyId("apply-1"), ApplyGeneration(1U)));
-    FAIL() << "expected a lost activation response";
-  } catch (const ManagerSceneActivationEffectUncertainError &error) {
-    EXPECT_TRUE(error.recovery_query().valid());
-    EXPECT_EQ(error.recovery_query().apply_id, ApplyId("apply-1"));
-  }
-  EXPECT_TRUE(
-      fixture.journal
-          .ReadActivationSelection(ApplyId("apply-1"), ApplyGeneration(1U))
-          .has_value());
-  EXPECT_FALSE(fixture.journal
-                   .ReadSceneActivated(ApplyId("apply-1"), ApplyGeneration(1U))
-                   .has_value());
-  EXPECT_EQ(scene_owner.activation_calls, 1);
-
-  scene_owner.throw_after_activation_effect = false;
-  const auto recovered = activation_coordinator.ActivateOrRecover(
-      ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(recovered.path, ManagerSceneActivationPath::kRecoveredOwnerStatus);
-  EXPECT_TRUE(recovered.durable_scene_activated.inserted);
-  EXPECT_EQ(scene_owner.activation_calls, 1);
-}
-
-TEST(ManagerSelectedRuntimeCompositionCoordinator,
-     PersistsOnlyAfterInstallAndReobservesTheCurrentChildOnReplay) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ReachDurableSceneActivation(fixture, scene_owner);
-  ScriptedRuntimeCompositionPort runtime_composition;
-  runtime_composition.prepare_once = true;
-  ManagerSelectedRuntimeCompositionCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, runtime_composition,
-      RuntimeEpoch("manager-runtime-1"));
-
-  const auto preparing =
-      coordinator.InstallOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(preparing.state,
-            ManagerSelectedRuntimeCompositionResultState::kPending);
-  EXPECT_FALSE(preparing.durable_materialization.has_value());
-  EXPECT_FALSE(
-      fixture.journal
-          .ReadPrivateMaterialization(ApplyId("apply-1"), ApplyGeneration(1U))
-          .has_value());
-
-  const auto installed =
-      coordinator.InstallOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(installed.state,
-            ManagerSelectedRuntimeCompositionResultState::kInstalled);
-  ASSERT_TRUE(installed.durable_materialization.has_value());
-  EXPECT_TRUE(installed.durable_materialization->inserted);
-  ASSERT_TRUE(runtime_composition.last_request.has_value());
-  EXPECT_EQ(runtime_composition.last_request->manager_runtime_epoch,
-            RuntimeEpoch("manager-runtime-1"));
-  EXPECT_EQ(runtime_composition.calls, 2);
-
-  const auto replay =
-      coordinator.InstallOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(replay.state,
-            ManagerSelectedRuntimeCompositionResultState::kInstalled);
-  ASSERT_TRUE(replay.durable_materialization.has_value());
-  EXPECT_FALSE(replay.durable_materialization->inserted);
-  EXPECT_EQ(replay.durable_materialization->record,
-            installed.durable_materialization->record);
-  EXPECT_EQ(runtime_composition.calls, 3);
-}
-
-TEST(ManagerSelectedRuntimeCompositionCoordinator,
-     RejectsForeignOwnerEvidenceBeforeDurableMaterialization) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ReachDurableSceneActivation(fixture, scene_owner);
-  ScriptedRuntimeCompositionPort runtime_composition;
-  runtime_composition.foreign_response = true;
-  ManagerSelectedRuntimeCompositionCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, runtime_composition,
-      RuntimeEpoch("manager-runtime-1"));
-
-  EXPECT_THROW(static_cast<void>(coordinator.InstallOrRecover(
-                   ApplyId("apply-1"), ApplyGeneration(1U))),
-               ManagerSelectedRuntimeCompositionCoordinatorError);
-  EXPECT_FALSE(
-      fixture.journal
-          .ReadPrivateMaterialization(ApplyId("apply-1"), ApplyGeneration(1U))
-          .has_value());
-}
-
-TEST(ManagerSelectedBundleTransitionCoordinator,
-     PublishesThenFinalizesWithOneExternalEffectPerAdvance) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ReachDurableSceneActivation(fixture, scene_owner);
-  ScriptedRuntimeCompositionPort runtime_composition;
-  ReachDurableRuntimeComposition(fixture, runtime_composition);
-  ScriptedPublicationStore publication_store(
-      PredecessorPublication(fixture.apply_intent),
-      &fixture.independent_reader);
-  ManagerSelectedBundleTransitionCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, publication_store,
-      scene_owner);
-
-  const auto published =
-      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(published.path,
-            ManagerSelectedBundleTransitionPath::kPublishedFromNewCall);
-  EXPECT_FALSE(published.durable_materialization.inserted);
-  EXPECT_TRUE(published.durable_retired_command_surfaces.inserted);
-  EXPECT_TRUE(published.durable_publication.inserted);
-  EXPECT_FALSE(published.durable_finalized.has_value());
-  EXPECT_EQ(publication_store.publish_calls, 1);
-  EXPECT_TRUE(publication_store.saw_prerequisites_before_publish);
-  EXPECT_EQ(scene_owner.finalize_calls, 0);
-
-  const auto finalized =
-      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(finalized.path,
-            ManagerSelectedBundleTransitionPath::kFinalizedFromNewCall);
-  ASSERT_TRUE(finalized.durable_finalized.has_value());
-  EXPECT_TRUE(finalized.durable_finalized->inserted);
-  EXPECT_TRUE(scene_owner.saw_durable_publication_before_finalize);
-  EXPECT_EQ(publication_store.publish_calls, 1);
-  EXPECT_EQ(scene_owner.finalize_calls, 1);
-
-  const auto replay =
-      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(replay.path,
-            ManagerSelectedBundleTransitionPath::kDurableFinalizedReplay);
-  ASSERT_TRUE(replay.durable_finalized.has_value());
-  EXPECT_FALSE(replay.durable_finalized->inserted);
-  EXPECT_EQ(publication_store.publish_calls, 1);
-  EXPECT_EQ(scene_owner.finalize_calls, 1);
-  const auto report = fixture.journal.VerifyIntegrity();
-  EXPECT_EQ(report.private_materialization_count, 1);
-  EXPECT_EQ(report.retired_command_surfaces_count, 1);
-  EXPECT_EQ(report.publication_receipt_count, 1);
-  EXPECT_EQ(report.scene_finalized_count, 1);
-}
-
-TEST(ManagerSelectedBundleTransitionCoordinator,
-     LostPublicationResponseRecoversCurrentHeadWithoutDuplicatePublish) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ReachDurableSceneActivation(fixture, scene_owner);
-  ScriptedRuntimeCompositionPort runtime_composition;
-  ReachDurableRuntimeComposition(fixture, runtime_composition);
-  ScriptedPublicationStore publication_store(
-      PredecessorPublication(fixture.apply_intent),
-      &fixture.independent_reader);
-  publication_store.throw_after_publish_effect = true;
-  ManagerSelectedBundleTransitionCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, publication_store,
-      scene_owner);
-
-  try {
-    static_cast<void>(
-        coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)));
-    FAIL() << "expected uncertain lost publication response";
-  } catch (const ManagerSelectedBundleTransitionEffectUncertainError &error) {
-    EXPECT_TRUE(error.publication_request().valid());
-    EXPECT_EQ(error.scene_status_query().apply_id, ApplyId("apply-1"));
-  }
-  EXPECT_EQ(publication_store.publish_calls, 1);
-  EXPECT_FALSE(
-      fixture.journal
-          .ReadPublicationReceipt(ApplyId("apply-1"), ApplyGeneration(1U))
-          .has_value());
-
-  const auto recovered =
-      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(recovered.path,
-            ManagerSelectedBundleTransitionPath::kRecoveredPublicationHead);
-  EXPECT_TRUE(recovered.durable_publication.inserted);
-  EXPECT_EQ(publication_store.publish_calls, 1);
-  EXPECT_EQ(scene_owner.finalize_calls, 0);
-}
-
-TEST(ManagerSelectedBundleTransitionCoordinator,
-     LostFinalizeResponseRecoversOwnerStatusWithoutDuplicateFinalize) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ReachDurableSceneActivation(fixture, scene_owner);
-  ScriptedRuntimeCompositionPort runtime_composition;
-  ReachDurableRuntimeComposition(fixture, runtime_composition);
-  ScriptedPublicationStore publication_store(
-      PredecessorPublication(fixture.apply_intent),
-      &fixture.independent_reader);
-  ManagerSelectedBundleTransitionCoordinator coordinator(
-      fixture.journal, *fixture.package.bundle_source, publication_store,
-      scene_owner);
-  ASSERT_EQ(
-      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U))
-          .path,
-      ManagerSelectedBundleTransitionPath::kPublishedFromNewCall);
-
-  scene_owner.throw_after_finalize_effect = true;
-  EXPECT_THROW(static_cast<void>(coordinator.AdvanceOrRecover(
-                   ApplyId("apply-1"), ApplyGeneration(1U))),
-               ManagerSelectedBundleTransitionEffectUncertainError);
-  EXPECT_EQ(scene_owner.finalize_calls, 1);
-  EXPECT_FALSE(fixture.journal
-                   .ReadSceneFinalized(ApplyId("apply-1"), ApplyGeneration(1U))
-                   .has_value());
-
-  const auto recovered =
-      coordinator.AdvanceOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(
-      recovered.path,
-      ManagerSelectedBundleTransitionPath::kRecoveredFinalizedOwnerStatus);
-  ASSERT_TRUE(recovered.durable_finalized.has_value());
-  EXPECT_TRUE(recovered.durable_finalized->inserted);
-  EXPECT_EQ(scene_owner.finalize_calls, 1);
-  EXPECT_EQ(publication_store.publish_calls, 1);
-}
-
-TEST(ManagerApplyFenceReleaseCoordinator,
-     PersistsIntentBeforeReleaseAndTerminalReplaysWithoutKernelCalls) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ScriptedPublicationStore publication_store(
-      PredecessorPublication(fixture.apply_intent),
-      &fixture.independent_reader);
-  ReachDurableSceneFinalize(fixture, scene_owner, publication_store);
-  ScriptedFenceReleasePort release_port(fixture.independent_reader);
-  ManagerApplyFenceReleaseCoordinator coordinator(
-      fixture.journal, release_port, RuntimeEpoch("manager-runtime-1"));
-
-  const auto released =
-      coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(released.path, ManagerApplyFenceReleasePath::kReleasedFromNewCall);
-  EXPECT_TRUE(released.durable_release_intent.inserted);
-  EXPECT_TRUE(released.durable_release.inserted);
-  EXPECT_TRUE(released.durable_terminal_outcome.inserted);
-  EXPECT_TRUE(release_port.saw_durable_intent_before_release);
-  EXPECT_EQ(release_port.status_calls, 1);
-  EXPECT_EQ(release_port.release_calls, 1);
-
-  const auto replay =
-      coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(replay.path, ManagerApplyFenceReleasePath::kDurableTerminalReplay);
-  EXPECT_FALSE(replay.durable_release_intent.inserted);
-  EXPECT_FALSE(replay.durable_release.inserted);
-  EXPECT_FALSE(replay.durable_terminal_outcome.inserted);
-  EXPECT_EQ(release_port.status_calls, 1);
-  EXPECT_EQ(release_port.release_calls, 1);
-  const auto report = fixture.journal.VerifyIntegrity();
-  EXPECT_EQ(report.fence_release_intent_count, 1);
-  EXPECT_EQ(report.fence_released_count, 1);
-  EXPECT_EQ(report.terminal_outcome_count, 1);
-}
-
-TEST(ManagerApplyFenceReleaseCoordinator,
-     LostReleaseResponseRecoversExactStatusWithoutDuplicateRelease) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ScriptedPublicationStore publication_store(
-      PredecessorPublication(fixture.apply_intent),
-      &fixture.independent_reader);
-  ReachDurableSceneFinalize(fixture, scene_owner, publication_store);
-  ScriptedFenceReleasePort release_port(fixture.independent_reader);
-  release_port.throw_after_release_effect = true;
-  ManagerApplyFenceReleaseCoordinator coordinator(
-      fixture.journal, release_port, RuntimeEpoch("manager-runtime-1"));
-
-  try {
-    static_cast<void>(
-        coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U)));
-    FAIL() << "expected a lost Kernel Release response";
-  } catch (const ManagerApplyFenceReleaseEffectUncertainError &error) {
-    EXPECT_TRUE(error.release_invoked_in_this_call());
-    EXPECT_TRUE(error.status_query().valid());
-    EXPECT_TRUE(error.durable_release_request().has_value());
-  }
-  EXPECT_TRUE(
-      fixture.journal
-          .ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U))
-          .has_value());
-  EXPECT_FALSE(
-      fixture.journal.ReadFenceReleased(ApplyId("apply-1"), ApplyGeneration(1U))
-          .has_value());
-  EXPECT_FALSE(fixture.journal
-                   .ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U))
-                   .has_value());
-  EXPECT_EQ(release_port.release_calls, 1);
-
-  release_port.throw_after_release_effect = false;
-  const auto recovered =
-      coordinator.ReleaseOrRecover(ApplyId("apply-1"), ApplyGeneration(1U));
-  EXPECT_EQ(recovered.path,
-            ManagerApplyFenceReleasePath::kRecoveredReleasedStatus);
-  EXPECT_TRUE(recovered.durable_release.inserted);
-  EXPECT_TRUE(recovered.durable_terminal_outcome.inserted);
-  EXPECT_EQ(release_port.status_calls, 2);
-  EXPECT_EQ(release_port.release_calls, 1);
-}
-
-TEST(ManagerApplyFenceReleaseCoordinator,
-     PendingOrForeignStatusNeverPersistsIntentOrInvokesRelease) {
-  ScopedPackageRoot root;
-  CoordinatorFixture fixture(root.path());
-  ScriptedSceneOwner scene_owner(fixture.independent_reader);
-  ScriptedPublicationStore publication_store(
-      PredecessorPublication(fixture.apply_intent),
-      &fixture.independent_reader);
-  ReachDurableSceneFinalize(fixture, scene_owner, publication_store);
-  ScriptedFenceReleasePort release_port(fixture.independent_reader);
-  release_port.state = ConfigurationFenceState::kReleasePending;
-  ManagerApplyFenceReleaseCoordinator coordinator(
-      fixture.journal, release_port, RuntimeEpoch("manager-runtime-1"));
-
-  EXPECT_THROW(static_cast<void>(coordinator.ReleaseOrRecover(
-                   ApplyId("apply-1"), ApplyGeneration(1U))),
-               ManagerApplyFenceReleaseEffectUncertainError);
-  EXPECT_EQ(release_port.release_calls, 0);
-  EXPECT_FALSE(
-      fixture.journal
-          .ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U))
-          .has_value());
-
-  release_port.state = ConfigurationFenceState::kHeld;
-  release_port.foreign_public_pointer = true;
-  EXPECT_THROW(static_cast<void>(coordinator.ReleaseOrRecover(
-                   ApplyId("apply-1"), ApplyGeneration(1U))),
-               ManagerApplyFenceReleaseEffectUncertainError);
-  EXPECT_EQ(release_port.release_calls, 0);
-  EXPECT_FALSE(
-      fixture.journal
-          .ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U))
-          .has_value());
-}
-
 TEST(ManagerNamedApplyCoordinator,
-     ComposesTheDurableI4PhasesAndReplaysWithoutDuplicateEffects) {
+     CapturesOnceProgressesAfterSourceRemovalAndReplaysWithoutEffects) {
   ScopedPackageRoot package_root;
   ScopedPackageRoot state_root;
   auto package = MaterializeRuntimePackage(package_root.path());
   const auto intent_template = ApplyIntent(*package.bundle);
   const auto predecessor = PredecessorPublication(intent_template);
-  SqliteManagerApplyJournal journal(state_root.path() /
-                                        "aggregate-apply.sqlite3",
+  SqliteManagerApplyJournal journal(state_root.path() / "named-apply.sqlite3",
                                     package.bundle->value().cell_graph.cell_id);
   SqliteManagerApplyJournal independent_reader(
-      state_root.path() / "aggregate-apply.sqlite3",
+      state_root.path() / "named-apply.sqlite3",
       package.bundle->value().cell_graph.cell_id);
   ScriptedPublicationStore publication_store(predecessor, &independent_reader);
   FixedActiveRuntimePlanSource active_plan_source(
@@ -2549,19 +1455,8 @@ TEST(ManagerNamedApplyCoordinator,
                        *package.bundle, *package.artifact_source, "linux",
                        {"posix.1-2017"}));
   ScriptedRuntimePorts runtime_ports(independent_reader);
-  ScriptedSceneOwner scene_owner(
-      independent_reader,
-      ProjectionRevisionDTO{
-          predecessor.request.candidate_retained_bundle_id,
-          predecessor.request.candidate_graph_revision,
-          SceneRevision{
-              predecessor.request.candidate_projection_revision.scene_revision
-                  .scene_id,
-              predecessor.request.candidate_projection_revision.scene_revision
-                      .revision_id +
-                  2U,
-              ContentDigest(std::string(kDigestTwo)),
-          }});
+  MaintenanceSceneOwner scene_owner(
+      predecessor.request.candidate_projection_revision);
   AggregateFencePort kernel_fence(independent_reader, predecessor);
   ScriptedRuntimeCompositionPort runtime_composition;
   ScriptedCellAdmissionPort cell_admission;
@@ -2590,84 +1485,114 @@ TEST(ManagerNamedApplyCoordinator,
       std::nullopt,
   };
 
-  scene_owner.activation_pending = true;
   const auto accepted = coordinator.AcceptOrReplay(request);
   EXPECT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
   EXPECT_FALSE(accepted.request_replayed);
-  EXPECT_EQ(scene_owner.stage_calls, 0);
-  EXPECT_EQ(scene_owner.activation_calls, 0);
+  EXPECT_EQ(runtime_ports.ensure_calls, 0);
+  EXPECT_EQ(scene_owner.begin_calls, 0);
 
-  const auto activation_pending = coordinator.RecoverIncompleteApply();
-  ASSERT_TRUE(activation_pending.has_value());
-  EXPECT_EQ(activation_pending->state, ManagerNamedApplyResultState::kPending);
-  EXPECT_TRUE(activation_pending->request_replayed);
-  EXPECT_EQ(scene_owner.stage_calls, 1);
-  EXPECT_EQ(scene_owner.activation_calls, 1);
-  EXPECT_FALSE(
-      journal
-          .ReadSceneActivated(ApplyId("apply.aggregate.1"), ApplyGeneration(1U))
-          .has_value());
-
-  scene_owner.activation_pending = false;
-  const auto applied = coordinator.RecoverIncompleteApply();
-  ASSERT_TRUE(applied.has_value());
-  EXPECT_EQ(applied->state, ManagerNamedApplyResultState::kSucceeded);
-  EXPECT_TRUE(applied->request_replayed);
-  ASSERT_TRUE(applied->terminal_outcome.has_value());
-  EXPECT_EQ(applied->apply_id, ApplyId("apply.aggregate.1"));
-  const auto captured_intent =
-      journal.ReadIntent(ApplyId("apply.aggregate.1"), ApplyGeneration(1U));
-  ASSERT_TRUE(captured_intent.has_value());
-  EXPECT_EQ(captured_intent->intent.expected_active_projection_revision
-                .scene_revision.revision_id,
-            predecessor.request.candidate_projection_revision.scene_revision
-                    .revision_id +
-                2U);
-  EXPECT_EQ(kernel_fence.observe_admission_calls, 1);
-  EXPECT_EQ(kernel_fence.acquire_calls, 1);
-  EXPECT_EQ(kernel_fence.release_calls, 1);
-  ASSERT_TRUE(cell_admission.last_release.has_value());
-  EXPECT_EQ(cell_admission.last_release->settlement.settlement_kind,
-            core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled);
-  const auto durable_terminal = journal.ReadTerminalOutcome(
-      ApplyId("apply.aggregate.1"), ApplyGeneration(1U));
-  ASSERT_TRUE(durable_terminal.has_value());
-  EXPECT_EQ(cell_admission.last_release->settlement.evidence_digest,
-            durable_terminal->terminal_outcome_digest);
+  // Progress must use the sealed values captured at acceptance, not reopen the
+  // package repository. Removing the backing files before Continue makes that
+  // boundary explicit.
+  ASSERT_GT(std::filesystem::remove_all(package_root.path()), 0U);
+  const auto completed = coordinator.RecoverIncompleteApply();
+  ASSERT_TRUE(completed.has_value());
+  EXPECT_EQ(completed->state, ManagerNamedApplyResultState::kSucceeded);
+  EXPECT_TRUE(completed->request_replayed);
+  ASSERT_TRUE(completed->terminal_outcome.has_value());
   EXPECT_EQ(runtime_ports.ensure_calls, 1);
-  EXPECT_EQ(scene_owner.stage_calls, 1);
-  EXPECT_EQ(scene_owner.activation_calls, 2);
+  EXPECT_EQ(scene_owner.begin_calls, 1);
+  EXPECT_EQ(scene_owner.complete_calls, 1);
   EXPECT_EQ(runtime_composition.calls, 1);
   EXPECT_EQ(publication_store.publish_calls, 1);
-  EXPECT_EQ(scene_owner.finalize_calls, 1);
+  EXPECT_EQ(kernel_fence.acquire_calls, 1);
+  EXPECT_EQ(kernel_fence.release_calls, 1);
 
-  ASSERT_GT(std::filesystem::remove_all(package_root.path()), 0U);
   const auto replayed = coordinator.AcceptOrReplay(request);
   EXPECT_EQ(replayed.state, ManagerNamedApplyResultState::kSucceeded);
   EXPECT_TRUE(replayed.request_replayed);
-  EXPECT_EQ(replayed.terminal_outcome, applied->terminal_outcome);
-  EXPECT_EQ(kernel_fence.observe_admission_calls, 1);
-  EXPECT_EQ(kernel_fence.acquire_calls, 1);
-  EXPECT_EQ(kernel_fence.release_calls, 1);
+  EXPECT_EQ(replayed.terminal_outcome, completed->terminal_outcome);
   EXPECT_EQ(runtime_ports.ensure_calls, 1);
-  EXPECT_EQ(scene_owner.stage_calls, 1);
-  EXPECT_EQ(scene_owner.activation_calls, 2);
+  EXPECT_EQ(scene_owner.begin_calls, 1);
+  EXPECT_EQ(scene_owner.complete_calls, 1);
   EXPECT_EQ(runtime_composition.calls, 1);
   EXPECT_EQ(publication_store.publish_calls, 1);
-  EXPECT_EQ(scene_owner.finalize_calls, 1);
+  EXPECT_EQ(kernel_fence.acquire_calls, 1);
+  EXPECT_EQ(kernel_fence.release_calls, 1);
   EXPECT_FALSE(coordinator.RecoverIncompleteApply().has_value());
-
-  const auto report = journal.VerifyIntegrity();
-  EXPECT_EQ(report.apply_intent_count, 1);
-  EXPECT_EQ(report.fence_acceptance_count, 1);
-  EXPECT_EQ(report.runtime_staged_ready_count, 1);
-  EXPECT_EQ(report.scene_staged_count, 1);
-  EXPECT_EQ(report.scene_activated_count, 1);
-  EXPECT_EQ(report.publication_receipt_count, 1);
-  EXPECT_EQ(report.scene_finalized_count, 1);
-  EXPECT_EQ(report.fence_released_count, 1);
-  EXPECT_EQ(report.terminal_outcome_count, 1);
 }
+
+TEST(ManagerNamedApplyCoordinator,
+     ReopenedManagerMarksNonterminalCaptureInterruptedWithoutEffects) {
+  ScopedPackageRoot package_root;
+  ScopedPackageRoot state_root;
+  auto package = MaterializeRuntimePackage(package_root.path());
+  const auto intent_template = ApplyIntent(*package.bundle);
+  const auto predecessor = PredecessorPublication(intent_template);
+  const auto database = state_root.path() / "reopened-apply.sqlite3";
+  SqliteManagerApplyJournal journal(database,
+                                    package.bundle->value().cell_graph.cell_id);
+  SqliteManagerApplyJournal independent_reader(
+      database, package.bundle->value().cell_graph.cell_id);
+  ScriptedPublicationStore publication_store(predecessor, &independent_reader);
+  FixedActiveRuntimePlanSource active_plan_source(
+      predecessor, BuildVerifiedRuntimeConvergencePlan(
+                       *package.bundle, *package.artifact_source, "linux",
+                       {"posix.1-2017"}));
+  ScriptedRuntimePorts runtime_ports(independent_reader);
+  MaintenanceSceneOwner scene_owner(
+      predecessor.request.candidate_projection_revision);
+  AggregateFencePort kernel_fence(independent_reader, predecessor);
+  ScriptedRuntimeCompositionPort runtime_composition;
+  ScriptedCellAdmissionPort cell_admission;
+  ManagerActiveRuntimeCoordinator active_runtime(
+      active_plan_source, runtime_ports, runtime_ports, [] { return 1'000U; });
+  AlwaysIdleMaintenanceGate maintenance_gate;
+  ManagerPlannedMaintenanceCoordinator planned_maintenance(
+      active_plan_source, active_runtime, maintenance_gate);
+  const ManagerNamedApplyRequestDTO request{
+      intent_template.request_context,
+      package.bundle->value().deployment_artifact_id,
+      package.bundle->value().deployment_revision,
+      predecessor.request.candidate_retained_bundle_id,
+      predecessor.request.candidate_graph_revision,
+      package.bundle->retained_bundle_id(),
+      intent_template.prepared_activation,
+      core::AdmissionGeneration(7U),
+      std::nullopt,
+  };
+  {
+    ManagerNamedApplyCoordinator first(
+        journal, active_plan_source, *package.bundle_source,
+        *package.artifact_source, publication_store, scene_owner, nullptr,
+        kernel_fence, cell_admission, runtime_composition, runtime_ports,
+        runtime_ports, planned_maintenance,
+        RuntimeEpoch("manager-runtime.aggregate.1"), "linux",
+        {"posix.1-2017"}, [] { return 1'000U; },
+        [] { return ApplyId("apply.reopened.1"); });
+    EXPECT_EQ(first.AcceptOrReplay(request).state,
+              ManagerNamedApplyResultState::kPending);
+  }
+
+  ManagerNamedApplyCoordinator reopened(
+      journal, active_plan_source, *package.bundle_source,
+      *package.artifact_source, publication_store, scene_owner, nullptr,
+      kernel_fence, cell_admission, runtime_composition, runtime_ports,
+      runtime_ports, planned_maintenance,
+      RuntimeEpoch("manager-runtime.aggregate.2"), "linux",
+      {"posix.1-2017"}, [] { return 2'000U; },
+      [] { return ApplyId("must-not-be-minted"); });
+  const auto interrupted = reopened.RecoverIncompleteApply();
+  ASSERT_TRUE(interrupted.has_value());
+  EXPECT_EQ(interrupted->state, ManagerNamedApplyResultState::kUnknownEffect);
+  EXPECT_EQ(runtime_ports.ensure_calls, 0);
+  EXPECT_EQ(scene_owner.begin_calls, 0);
+  EXPECT_EQ(runtime_composition.calls, 0);
+  EXPECT_EQ(publication_store.publish_calls, 0);
+  EXPECT_EQ(kernel_fence.acquire_calls, 0);
+  EXPECT_EQ(kernel_fence.release_calls, 0);
+}
+
 
 } // namespace
 } // namespace manyforge::component_manager

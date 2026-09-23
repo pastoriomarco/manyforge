@@ -139,7 +139,6 @@ def _publication_receipt():
         projection.graph_revision,
         None,
         core.ContentDigest("private-materialization-1"),
-        core.ContentDigest("retired-surfaces-1"),
     )
     return core.ActiveBundlePublicationReceiptDTO(
         request,
@@ -162,14 +161,12 @@ def _named_apply_publication_request():
         core.NamedApplyPublicationTransactionDTO(
             core.ApplyId("apply-1"),
             core.ApplyGeneration(2),
-            core.ProjectionStageGeneration(3),
         ),
         projection,
         projection.retained_bundle_id,
         projection.graph_revision,
         core.ActiveBundlePublicationGeneration(1),
         core.ContentDigest("private-materialization-2"),
-        core.ContentDigest("retired-surfaces-2"),
     )
 
 

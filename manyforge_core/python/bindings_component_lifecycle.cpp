@@ -153,12 +153,10 @@ void register_component_lifecycle_bindings(py::module_& module) {
 
   py::class_<NamedApplyPublicationTransactionDTO>(module, "NamedApplyPublicationTransactionDTO",
                                                   py::is_final())
-      .def(py::init<ApplyId, ApplyGeneration, ProjectionStageGeneration>(), py::arg("apply_id"),
-           py::arg("apply_generation"), py::arg("projection_stage_generation"))
+      .def(py::init<ApplyId, ApplyGeneration>(), py::arg("apply_id"),
+           py::arg("apply_generation"))
       .def_readonly("apply_id", &NamedApplyPublicationTransactionDTO::apply_id)
       .def_readonly("apply_generation", &NamedApplyPublicationTransactionDTO::apply_generation)
-      .def_readonly("projection_stage_generation",
-                    &NamedApplyPublicationTransactionDTO::projection_stage_generation)
       .def("valid", &NamedApplyPublicationTransactionDTO::valid)
       .def(py::self == py::self)
       .def(py::self != py::self);
@@ -182,44 +180,38 @@ void register_component_lifecycle_bindings(py::module_& module) {
                        GraphRevision candidate_graph_revision,
                        std::optional<ActiveBundlePublicationGeneration>
                            expected_previous_publication_generation,
-                       ContentDigest private_materialization_content_digest,
-                       ContentDigest obsolete_managed_command_surfaces_retired_evidence_digest) {
+                       ContentDigest private_materialization_content_digest) {
              return ActiveBundlePublicationRequestDTO{
                  ActiveBundlePublicationTransactionRefDTO(std::move(transaction)),
                  std::move(candidate_projection_revision),
                  std::move(candidate_retained_bundle_id),
                  std::move(candidate_graph_revision),
                  expected_previous_publication_generation,
-                 std::move(private_materialization_content_digest),
-                 std::move(obsolete_managed_command_surfaces_retired_evidence_digest)};
+                 std::move(private_materialization_content_digest)};
            }),
            py::arg("transaction_ref"), py::arg("candidate_projection_revision"),
            py::arg("candidate_retained_bundle_id"), py::arg("candidate_graph_revision"),
            py::arg("expected_previous_publication_generation"),
-           py::arg("private_materialization_content_digest"),
-           py::arg("obsolete_managed_command_surfaces_retired_evidence_digest"))
+           py::arg("private_materialization_content_digest"))
       .def(py::init([](BootstrapPublicationTransactionDTO transaction,
                        ProjectionRevisionDTO candidate_projection_revision,
                        RetainedBundleId candidate_retained_bundle_id,
                        GraphRevision candidate_graph_revision,
                        std::optional<ActiveBundlePublicationGeneration>
                            expected_previous_publication_generation,
-                       ContentDigest private_materialization_content_digest,
-                       ContentDigest obsolete_managed_command_surfaces_retired_evidence_digest) {
+                       ContentDigest private_materialization_content_digest) {
              return ActiveBundlePublicationRequestDTO{
                  ActiveBundlePublicationTransactionRefDTO(std::move(transaction)),
                  std::move(candidate_projection_revision),
                  std::move(candidate_retained_bundle_id),
                  std::move(candidate_graph_revision),
                  expected_previous_publication_generation,
-                 std::move(private_materialization_content_digest),
-                 std::move(obsolete_managed_command_surfaces_retired_evidence_digest)};
+                 std::move(private_materialization_content_digest)};
            }),
            py::arg("transaction_ref"), py::arg("candidate_projection_revision"),
            py::arg("candidate_retained_bundle_id"), py::arg("candidate_graph_revision"),
            py::arg("expected_previous_publication_generation"),
-           py::arg("private_materialization_content_digest"),
-           py::arg("obsolete_managed_command_surfaces_retired_evidence_digest"))
+           py::arg("private_materialization_content_digest"))
       .def_property_readonly("transaction_ref",
                              [](const ActiveBundlePublicationRequestDTO& value) {
                                return std::visit(
@@ -236,9 +228,6 @@ void register_component_lifecycle_bindings(py::module_& module) {
                     &ActiveBundlePublicationRequestDTO::expected_previous_publication_generation)
       .def_readonly("private_materialization_content_digest",
                     &ActiveBundlePublicationRequestDTO::private_materialization_content_digest)
-      .def_readonly("obsolete_managed_command_surfaces_retired_evidence_digest",
-                    &ActiveBundlePublicationRequestDTO::
-                        obsolete_managed_command_surfaces_retired_evidence_digest)
       .def("valid", &ActiveBundlePublicationRequestDTO::valid)
       .def(py::self == py::self)
       .def(py::self != py::self);

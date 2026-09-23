@@ -30,6 +30,14 @@ def _security(tmp_path: Path) -> SecurityConfig:
     return SecurityConfig(allowed_fs_roots=[str(tmp_path)], mcp_allowed_hosts=["testserver"])
 
 
+def _mcp_state(headless) -> ComposerState:
+    """Build a transport-focused state without exercising authoring startup."""
+
+    state = ComposerState(headless_client=headless)
+    state.authoring_admission = None
+    return state
+
+
 def _call(client: TestClient, name: str, arguments: dict, *, request_id: int = 1):
     return client.post(
         "/mcp/",
@@ -55,7 +63,7 @@ def test_optional_off_does_not_construct_mcp(tmp_path, monkeypatch):
 
 
 def test_all_19_tools_derive_action_schemas_from_real_routes(tmp_path):
-    state = ComposerState(headless_client=object())
+    state = _mcp_state(object())
     app = create_app(state, security=_security(tmp_path))
     contracts = tool_contracts(app)
     assert len(contracts) == len(TOOL_ROUTES) == 19
@@ -114,10 +122,9 @@ def test_real_mcp_skill_expansion_uses_existing_headless_http_client(tmp_path):
         base_url="http://headless.test", transport=httpx.MockTransport(owner)
     ) as transport:
         headless = HeadlessHttpClient("http://headless.test", client=transport)
-        state = ComposerState(headless_client=headless)
+        state = _mcp_state(headless)
         before = state.draft_session.snapshot()
         with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
-            calls.clear()  # exclude the application's independent startup recovery probe
             result = _call(client, "manyforge_skills", {"action": "expand", "body": body}).json()[
                 "result"
             ]
@@ -230,7 +237,7 @@ def test_runtime_failure_and_malformed_stop_keep_real_route_semantics(tmp_path, 
             return {"accepted": True, "reason": "recognized_malformed_stop"}
 
     owner = Owner()
-    state = ComposerState(headless_client=owner)
+    state = _mcp_state(owner)
     with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         invalid = _call(
             client, "manyforge_cycle_control", {"action": "command", "body": {}}
@@ -302,7 +309,7 @@ def test_real_mcp_stop_bypasses_a_saturated_ordinary_worker_pool(tmp_path):
             return {"accepted": True, "path": path}
 
     app = create_app(
-        ComposerState(headless_client=Owner()),
+        _mcp_state(Owner()),
         security=_security(tmp_path),
         enable_mcp=True,
     )
@@ -433,7 +440,7 @@ def test_nonfinite_recognized_stop_body_reaches_the_owner(tmp_path):
         def recognized_malformed_stop(self, path):
             return {"accepted": True, "path": path}
 
-    state = ComposerState(headless_client=Owner())
+    state = _mcp_state(Owner())
     with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",
@@ -464,7 +471,7 @@ def test_raw_duplicate_stop_selectors_reach_malformed_containment(tmp_path, acti
             return {"accepted": True, "malformed": True}
 
     owner = Owner()
-    state = ComposerState(headless_client=owner)
+    state = _mcp_state(owner)
     with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",
@@ -497,7 +504,7 @@ def test_raw_duplicate_stop_selectors_reach_malformed_containment(tmp_path, acti
 )
 def test_raw_duplicate_routing_or_ordinary_bodies_are_rejected(tmp_path, params):
     # A sentinel owner has no effect methods: rejection must precede dispatch.
-    state = ComposerState(headless_client=object())
+    state = _mcp_state(object())
     with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",
@@ -551,7 +558,7 @@ def test_lossy_duplicate_decoding_must_not_turn_malformed_stop_into_scoped_stop(
             return {"accepted": True}
 
     owner = Owner()
-    state = ComposerState(headless_client=owner)
+    state = _mcp_state(owner)
     with TestClient(create_app(state, security=_security(tmp_path), enable_mcp=True)) as client:
         response = client.post(
             "/mcp/",

@@ -7,7 +7,6 @@ import type {
   ProgramRuntimeControlProjection,
   ProgramRunStatus,
   ProgramWorkspaceResponse,
-  ScenarioCatalogResponse,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import {
@@ -21,8 +20,6 @@ import {
   programMotionStopSettled,
   programRuntimeWakeKey,
   programTerminalFailureMessage,
-  retainedScenarioSelection,
-  scenarioSelectionAfterRequest,
 } from './useProgramRuntime';
 
 afterEach(() => {
@@ -34,7 +31,7 @@ const digest = (character: string) => `sha256:${character.repeat(64)}`;
 function admissionFixtures() {
   const applied = {
     scenarioId: 'applied',
-    scenarioCatalogRevision: digest('a'),
+    sourceDocumentDigest: digest('a'),
     programRevision: digest('b'),
     recordDigest: digest('c'),
   } as AppliedProgramSelection;
@@ -69,33 +66,6 @@ function admissionFixtures() {
   } as unknown as ComposerHeadlessState;
   return { applied, workspace, snapshot };
 }
-
-const catalog = {
-  apiVersion: 'manyforge.scenario_catalog.v1',
-  scenarioCatalogRevision: `sha256:${'a'.repeat(64)}`,
-  scenarios: [
-    {
-      scenarioId: 'first',
-      description: 'First scenario',
-      aliases: [],
-      deploymentArtifactId: 'deployment.first',
-      deploymentRevision: `sha256:${'b'.repeat(64)}`,
-      retainedBundleId: `sha256:${'c'.repeat(64)}`,
-      programBindingId: `sha256:${'d'.repeat(64)}`,
-      assistantMode: 'optional',
-    },
-    {
-      scenarioId: 'applied',
-      description: 'Applied scenario',
-      aliases: [],
-      deploymentArtifactId: 'deployment.applied',
-      deploymentRevision: `sha256:${'e'.repeat(64)}`,
-      retainedBundleId: `sha256:${'f'.repeat(64)}`,
-      programBindingId: `sha256:${'1'.repeat(64)}`,
-      assistantMode: 'forbidden',
-    },
-  ],
-} as ScenarioCatalogResponse;
 
 describe('Program runtime idle selection', () => {
   it('uses semantic owner revisions instead of a fixed browser poll', () => {
@@ -196,9 +166,7 @@ describe('Program runtime idle selection', () => {
     })).toBe(programRuntimeWakeKey(snapshot));
   });
 
-  it('does not derive operator selection from the catalog or Applied projection', () => {
-    expect(retainedScenarioSelection(null, catalog)).toBeNull();
-
+  it('does not derive effects while refreshing the Applied projection', () => {
     const source = readFileSync(new URL('./useProgramRuntime.ts', import.meta.url), 'utf8');
     const refresh = source.slice(
       source.indexOf('const refresh = useCallback'),
@@ -213,16 +181,6 @@ describe('Program runtime idle selection', () => {
     expect(source).toContain('const pending = programPendingAfterProjection(');
   });
 
-  it('retains only a still-available explicit operator selection', () => {
-    expect(retainedScenarioSelection('applied', catalog)).toBe('applied');
-    expect(retainedScenarioSelection('removed', catalog)).toBeNull();
-  });
-
-  it('selects and then explicitly clears without substituting another scenario', () => {
-    const selected = scenarioSelectionAfterRequest(null, catalog, 'applied');
-    expect(selected).toBe('applied');
-    expect(scenarioSelectionAfterRequest(selected, catalog, null)).toBeNull();
-  });
 });
 
 describe('Program command settlement', () => {
@@ -558,7 +516,7 @@ describe('Program runtime authority requests', () => {
       source_label: 'operator_ui',
       correlation_id: 'program-run-start.fixture',
       scenario_id: 'applied',
-      scenario_catalog_revision: digest('a'),
+      source_document_digest: digest('a'),
       expected_applied_record_digest: digest('c'),
       draft_program_revision: digest('b'),
       expected_admission_generation: 9,

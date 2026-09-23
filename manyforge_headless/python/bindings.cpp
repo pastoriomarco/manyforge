@@ -187,7 +187,6 @@ class HeadlessApiBridge final {
 public:
   HeadlessApiBridge(std::string projection_root, std::string install_root,
                     std::string artifact_root,
-                    std::string program_selection_state_root,
                     std::string node_catalog_path,
                     std::string node_environment_manifest_path,
                     std::string alarm_catalog_path,
@@ -201,7 +200,6 @@ public:
             std::move(projection_root),
             std::move(install_root),
             std::move(artifact_root),
-            std::move(program_selection_state_root),
             std::move(node_catalog_path),
             std::move(node_environment_manifest_path),
             std::move(alarm_catalog_path),
@@ -245,71 +243,6 @@ public:
     return Invoke([this, mode_id = std::move(mode_id)]() {
       return core_->AssistantModeContext(mode_id);
     });
-  }
-
-  std::string ScenarioCatalogProjection() {
-    py::gil_scoped_release release;
-    return Invoke([this]() { return core_->ScenarioCatalogProjection(); });
-  }
-
-  std::string ScenarioProgramSelection(std::string scenario_id) {
-    py::gil_scoped_release release;
-    return Invoke([this, scenario_id = std::move(scenario_id)]() {
-      return core_->ScenarioProgramSelection(scenario_id);
-    });
-  }
-
-  std::string PrepareProgramApply(std::string scenario_id,
-                                  std::string scenario_catalog_revision,
-                                  std::string canonical_program_json) {
-    py::gil_scoped_release release;
-    return Invoke(
-        [this, scenario_id = std::move(scenario_id),
-         scenario_catalog_revision = std::move(scenario_catalog_revision),
-         canonical_program_json = std::move(canonical_program_json)]() {
-          return core_->PrepareProgramApply(
-              scenario_id, scenario_catalog_revision, canonical_program_json);
-        });
-  }
-
-  std::string
-  ReplayProgramApply(std::string scenario_id,
-                     std::string scenario_catalog_revision,
-                     std::string program_id, std::string program_revision,
-                     std::optional<std::string> expected_applied_record_digest,
-                     std::string request_owner_epoch, std::string request_id) {
-    py::gil_scoped_release release;
-    return Invoke([this, scenario_id = std::move(scenario_id),
-                   scenario_catalog_revision =
-                       std::move(scenario_catalog_revision),
-                   program_id = std::move(program_id),
-                   program_revision = std::move(program_revision),
-                   expected_applied_record_digest =
-                       std::move(expected_applied_record_digest),
-                   request_owner_epoch = std::move(request_owner_epoch),
-                   request_id = std::move(request_id)]() {
-      return core_->ReplayProgramApply(
-          scenario_id, scenario_catalog_revision, program_id, program_revision,
-          expected_applied_record_digest, request_owner_epoch, request_id);
-    });
-  }
-
-  std::string
-  CommitProgramApply(std::string canonical_preparation_json,
-                     std::optional<std::string> expected_applied_record_digest,
-                     std::string request_owner_epoch, std::string request_id) {
-    py::gil_scoped_release release;
-    return Invoke(
-        [this,
-         canonical_preparation_json = std::move(canonical_preparation_json),
-         expected_applied_record_digest =
-             std::move(expected_applied_record_digest),
-         request_owner_epoch = std::move(request_owner_epoch),
-         request_id = std::move(request_id)]() {
-          return core_->CommitProgramApply(canonical_preparation_json,
-                                           expected_applied_record_digest,
-                                           request_owner_epoch, request_id);
-        });
   }
 
   std::string AppliedProgramSelection() {
@@ -714,14 +647,13 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       },
       py::arg("path"), py::call_guard<py::gil_scoped_release>());
   py::class_<HeadlessApiBridge>(module, "HeadlessApiCore")
-      .def(py::init<std::string, std::string, std::string, std::string,
+      .def(py::init<std::string, std::string, std::string,
                     std::string, std::string, std::string, std::string,
                     std::string, std::vector<std::string>, std::string,
                     std::optional<std::string>, std::uint64_t, std::size_t,
                     std::size_t>(),
            py::arg("projection_root"), py::arg("install_root"),
-           py::arg("artifact_root"), py::arg("program_selection_state_root"),
-           py::arg("node_catalog_path"),
+           py::arg("artifact_root"), py::arg("node_catalog_path"),
            py::arg("node_environment_manifest_path"),
            py::arg("alarm_catalog_path"), py::arg("historian_database_path"),
            py::arg("cell_id"), py::arg("resource_ids"), py::arg("owner_id"),
@@ -736,22 +668,6 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("source_model_context", &HeadlessApiBridge::SourceModelContext)
       .def("assistant_mode_context", &HeadlessApiBridge::AssistantModeContext,
            py::arg("mode_id"))
-      .def("scenario_catalog_projection",
-           &HeadlessApiBridge::ScenarioCatalogProjection)
-      .def("scenario_program_selection",
-           &HeadlessApiBridge::ScenarioProgramSelection, py::arg("scenario_id"))
-      .def("prepare_program_apply", &HeadlessApiBridge::PrepareProgramApply,
-           py::arg("scenario_id"), py::arg("scenario_catalog_revision"),
-           py::arg("canonical_program_json"))
-      .def("replay_program_apply", &HeadlessApiBridge::ReplayProgramApply,
-           py::arg("scenario_id"), py::arg("scenario_catalog_revision"),
-           py::arg("program_id"), py::arg("program_revision"),
-           py::arg("expected_applied_record_digest"),
-           py::arg("request_owner_epoch"), py::arg("request_id"))
-      .def("commit_program_apply", &HeadlessApiBridge::CommitProgramApply,
-           py::arg("canonical_preparation_json"),
-           py::arg("expected_applied_record_digest"),
-           py::arg("request_owner_epoch"), py::arg("request_id"))
       .def("applied_program_selection",
            &HeadlessApiBridge::AppliedProgramSelection)
       .def("viewer_model_urdf", &HeadlessApiBridge::ViewerModelUrdf)

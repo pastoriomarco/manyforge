@@ -82,7 +82,12 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).toContain("'revert'");
     expect(source).toContain('api.programWorkspace.discard(requestFence)');
     expect(source).toContain('api.programWorkspace.revert(requestFence)');
-    expect(source).toContain('snapshot.programCycle.state !== \'idle_after_reset\'');
+    expect(source).toContain('authoring.unavailableReason');
+    const admissionSource = readFileSync(
+      new URL('../state/authoringWorkspace.ts', import.meta.url),
+      'utf8',
+    );
+    expect(admissionSource).toContain("snapshot.programCycle.state !== 'idle_after_reset'");
     expect(source).not.toContain('const revert = useCallback((\\n    scenarioId');
     expect(source).toContain("type: 'request_failed'");
     expect(source).toContain(
@@ -140,14 +145,14 @@ describe('Program workspace lifecycle controls', () => {
     expect(result.message).toContain('Apply completed');
   });
 
-  it('keeps Program Apply separate while Load activates a complete Scenario', () => {
+  it('keeps Program Apply separate while Load remains editor-only', () => {
     const source = readFileSync(
       new URL('./ProgramDocumentControls.tsx', import.meta.url),
       'utf8',
     );
     expect(source).toContain('Apply this Program Draft to');
     expect(source).toContain('Its Deployment will not change.');
-    expect(source).toContain('A complete setup is activated atomically');
+    expect(source).toContain('Runtime state is not changed.');
     expect(source).toContain('loadScenarioDocument(');
     expect(source).not.toContain('loadScenario(');
     expect(source).toContain('currentScenarioProjection?.currentScenario');

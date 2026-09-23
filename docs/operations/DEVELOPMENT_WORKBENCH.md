@@ -3,9 +3,10 @@
 Status: current development-only entrypoint. This is not an installed product
 launcher and does not authorize physical execution.
 
-The workbench starts the current frontend with Vite hot reload and one exact
-simulated native backend scenario. One command owns file placement, ports,
-process order, readiness checks, scenario activation, diagnostics, and cleanup.
+The workbench starts the current frontend with Vite hot reload and an empty
+simulated native backend. It may activate one exact Scenario project folder.
+One command owns file placement, ports, process order, readiness checks,
+optional project activation, diagnostics, and cleanup.
 Browser mount, reload, and disconnect are read-only reconstruction events.
 
 ## Prerequisites
@@ -23,33 +24,26 @@ Prepare only the required image once, from the repository root:
 docker compose build dev
 ```
 
-A fresh workbench cache also needs a compatible build root containing
-`maintained-package/`, supplied by the maintainer/distributor with the matching
-source revision. The image alone does not supply this package; if unavailable,
-report the missing artifact. Do not substitute legacy examples or generate a
-package with guessed inputs. `native-install/` is not imported: the launcher
-builds current native owners from this checkout. It does not regenerate the
-scenario package or run tests/proofs.
+The launcher builds current native owners, the activation preparer and a small
+canonical-empty bootstrap from this checkout. It does not import a maintained
+package or installed Scenario catalog, and it does not run tests or proofs.
 The setup script may recreate stale or modified dependency directories under
 `.docker/`; preserve wanted local dependency edits before running it.
-The selected package must contain the same Deployment revision as the matching
-workspace example. If retained scenario contracts change, refresh the qualified
-package cache; the launcher rejects the stale package instead of silently
-combining it with current execution owners.
+Selected projects are read through the ordinary Scenario-project loader and
+validated before activation.
 
 ## Start, inspect, and stop
 
-On the first start for a fresh cache:
+Start an empty authoring workbench:
 
 ```bash
-MANYFORGE_DEV_QUALIFIED_BUILD_ROOT=/path/to/qualified/build \
-  ./scripts/compose-dev.sh start --scenario lite6_pick_and_place
+./scripts/compose-dev.sh start
 ```
 
-Later starts reuse the imported package, runtime, and npm caches:
+Or select one repository project folder:
 
 ```bash
-./scripts/compose-dev.sh start --scenario lite6_pick_and_place
+./scripts/compose-dev.sh start --project examples/lite6_pick_and_place.scenario
 ```
 
 Open `http://localhost:3000`. Frontend source edits update through HMR. Backend
@@ -71,10 +65,10 @@ Each resolved immutable workbench image gets a separate cache under
 reuse native readers or npm dependencies from an incompatible runtime. Override
 the cache parent, when needed, with `MANYFORGE_DEV_CACHE_BASE`.
 
-Repeating the same `start` is idempotent. Selecting a different scenario while
+Repeating the same `start` is idempotent. Selecting a different project while
 the workbench is running is refused; stop it before switching. A failed new
 start removes only the container it created. `stop` removes runtime state while
-retaining build, npm, and imported-package caches under `.manyforge-dev/`.
+retaining build, npm, and repository-bootstrap caches under `.manyforge-dev/`.
 
 The current fixed ports are frontend `3000`, Headless API `9010`, Program
 runner `9011`, and internal Composer API `9020`. If one is occupied, startup
@@ -122,7 +116,7 @@ container it created, so retain the startup terminal output too.
 | Symptom | Action |
 | --- | --- |
 | Image missing | Prepare dependencies and build `dev` using the commands above. |
-| Package missing, incomplete or revision mismatch | Obtain matching scenario products; preserve the diagnostic and inspect the named cache. Do not bypass identity checks or delete caches blindly. |
+| Project source missing, invalid or changed | Preserve the diagnostic, inspect the named project/source path, and review changes before retrying. Do not bypass identity checks or delete caches blindly. |
 | Port occupied | Identify the listener on 3000/9010/9011/9020; do not kill an unrelated process. |
 | Different or unhealthy workbench already running | Read status/logs first. Stop only with authorization before switching scenarios; do not spawn another stack to hide the failure. |
 | Slow first start | Inspect build output. Lower `MANYFORGE_DEV_BUILD_JOBS` if compilation exhausts memory; avoid repeated startup attempts. |
@@ -139,9 +133,8 @@ or appropriate firewall/access controls; do not expose this workbench publicly.
 
 ## Classification and limits
 
-`status` must report the exact catalog, Deployment, retained bundle, graph,
-Program, and Binding identities and active convergence. It reports a
-`development_workbench` using a `maintained_qualified` package, while
+When a project is active, `status` reports its owner-issued current identity and
+convergence. It reports a `development_workbench` using repository source, while
 `physical_execution_authorized` remains false because this entrypoint accepts
 only a single simulated native runtime unit. Installed delivery and official
 AMD64/ARM64 packages are separate release/distribution work.

@@ -648,6 +648,7 @@ struct ScenarioProduct final {
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   deployment::VerifiedRetainedModelMap model_map;
   std::filesystem::path canonical_empty_admission_filename;
+  std::shared_ptr<const deployment::RetainedBundle> canonical_empty_bundle;
 };
 
 void verify_gripper_resource_semantics(
@@ -993,6 +994,7 @@ materialize_scenarios(const std::filesystem::path &root,
     }
 
     std::filesystem::path admission_filename;
+    std::shared_ptr<const deployment::RetainedBundle> canonical_empty_bundle;
     if (publish_canonical_empty) {
       const auto empty_deployment =
           deployment::detail::derive_cell_scoped_canonical_empty_deployment(
@@ -1035,14 +1037,17 @@ materialize_scenarios(const std::filesystem::path &root,
       admission_filename =
           deployment::cell_scoped_canonical_empty_admission_filename(
               verified.cell_id());
-      const auto admission =
-          deployment::detail::publish_cell_scoped_canonical_empty_admission(
-              package_root, admission_filename, *empty_bundle);
-      if (admission.cell_id() != verified.cell_id() ||
-          admission.retained_bundle_id() !=
-              empty_bundle->retained_bundle_id()) {
-        throw std::logic_error(
-            "cell-scoped canonical predecessor did not reload exactly");
+      canonical_empty_bundle = empty_bundle;
+      if (memory_stores == nullptr) {
+        const auto admission =
+            deployment::detail::publish_cell_scoped_canonical_empty_admission(
+                package_root, admission_filename, *empty_bundle);
+        if (admission.cell_id() != verified.cell_id() ||
+            admission.retained_bundle_id() !=
+                empty_bundle->retained_bundle_id()) {
+          throw std::logic_error(
+              "cell-scoped canonical predecessor did not reload exactly");
+        }
       }
     }
     verify_gripper_resource_semantics(scenario, verified.graph().graph(),
@@ -1054,7 +1059,8 @@ materialize_scenarios(const std::filesystem::path &root,
                      verified.deployment_artifact_id(),
                      verified.deployment_revision(),
                      deployment::scenario_deployment_compatibility(verified),
-                     bundle, std::move(*model_map), admission_filename})
+                     bundle, std::move(*model_map), admission_filename,
+                     std::move(canonical_empty_bundle)})
              .second) {
       throw std::logic_error("scenario product source is duplicated");
     }
@@ -2269,7 +2275,8 @@ PreparedActivationMaterialization materialize_prepared_activation(
     const std::filesystem::path &capability_root,
     std::vector<ActivationPreparedModel> prepared_models,
     const ActivationDeploymentIntent &intent,
-    const std::vector<ActivationComponentProfile> &component_profiles) {
+    const std::vector<ActivationComponentProfile> &component_profiles,
+    const bool prepare_canonical_empty) {
   Options options;
   options.workspace_root = std::filesystem::canonical(capability_root);
 
@@ -2330,7 +2337,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
   try {
     products = materialize_scenarios(
         options.workspace_root, catalog, input_source,
-        {}, selected, &compiled, false, &stores);
+        {}, selected, &compiled, prepare_canonical_empty, &stores);
   } catch (const std::bad_alloc &) {
     throw std::runtime_error(
         "activation Deployment materialization exhausted memory");
@@ -2361,6 +2368,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
       found->second.deployment_compatibility,
       found->second.bundle,
       found->second.model_map,
+      found->second.canonical_empty_bundle,
       std::move(raw_artifacts),
       std::move(catalog_artifacts),
   };

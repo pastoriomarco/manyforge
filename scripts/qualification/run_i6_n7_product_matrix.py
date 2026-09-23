@@ -28,7 +28,6 @@ from manyforge_headless_api.client import HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.models import TargetObservationQuery
 from manyforge_operator.cell_layout import CellInstanceLayout
-from scripts.qualification.control_client_fixture import composer_snapshot_stream
 
 WORKSPACE = Path(os.environ.get("MANYFORGE_ROOT", "/workspace")).resolve()
 PACKAGE = Path(os.environ["N7_MATRIX_PACKAGE"]).resolve()
@@ -209,7 +208,7 @@ def wait_for_api(base_url: str, processes: tuple[subprocess.Popen[bytes], ...]) 
 def wait_for_composer(
     base_url: str,
     processes: tuple[subprocess.Popen[bytes], ...],
-) -> dict[str, object]:
+) -> None:
     deadline = time.monotonic() + 20.0
     last_error: Exception | None = None
     while time.monotonic() < deadline:
@@ -217,9 +216,9 @@ def wait_for_composer(
             if process.poll() is not None:
                 raise RuntimeError(f"process exited during Composer startup: {process.returncode}")
         try:
-            catalog = composer_json(base_url, "GET", "/api/scenarios")
-            if catalog.get("api_version") == "manyforge.scenario_catalog.v1":
-                return catalog
+            health = composer_json(base_url, "GET", "/api/health")
+            if isinstance(health.get("status"), str):
+                return
         except Exception as error:
             last_error = error
         time.sleep(0.02)
@@ -321,8 +320,6 @@ def _process_commands(
             str(PACKAGE),
             "--artifact-root",
             str(layout.artifact_root),
-            "--program-selection-state-root",
-            str(layout.owner_state_root("program-selection")),
             "--node-catalog-path",
             str(NODE_CATALOG),
             "--node-environment-manifest-path",
@@ -356,52 +353,14 @@ def _process_commands(
             "127.0.0.1",
             "--port",
             str(composer_port),
-            "--program-path",
-            str(PACKAGE / PROGRAM_FILES[scenario_id]),
+            "--startup-scenario-document",
+            str(WORKSPACE / "examples" / f"{scenario_id}.scenario"),
             "--headless-api-url",
             api_url,
             "--headless-api-timeout-s",
             "15",
         ],
-    }
-
-
-def _scenario_load_body(
-    *,
-    workspace: dict[str, object],
-    snapshot: dict[str, object],
-    scenario_id: str,
-    scenario_catalog_revision: str,
-) -> dict[str, object]:
-    draft = workspace.get("draft")
-    admission = snapshot.get("authoring_admission")
-    cycle = snapshot.get("program_cycle")
-    snapshot_draft = snapshot.get("draft_identity")
-    if (
-        workspace.get("schemaVersion") != "manyforge.composer_program_workspace.v2"
-        or snapshot.get("schema_version") != "manyforge.composer_headless_state.v2"
-        or not isinstance(draft, dict)
-        or not isinstance(admission, dict)
-        or not isinstance(cycle, dict)
-        or not isinstance(snapshot_draft, dict)
-        or snapshot.get("complete") is not True
-        or admission.get("authoring_allowed") is not True
-        or cycle.get("state") != "idle_after_reset"
-        or snapshot_draft.get("draft_id") != draft.get("draftId")
-        or snapshot_draft.get("draft_revision") != draft.get("draftRevision")
-        or type(admission.get("admission_generation")) is not int
-        or admission["admission_generation"] < 1
-    ):
-        raise RuntimeError("Composer did not publish one Load-ready snapshot")
-    return {
-        "draftId": draft["draftId"],
-        "expectedDraftRevision": draft["draftRevision"],
-        "expectedAdmissionGeneration": admission["admission_generation"],
-        "requestOwnerEpoch": "n7-product-matrix.authoring",
-        "requestId": f"n7.load.{scenario_id}",
-        "scenarioCatalogRevision": scenario_catalog_revision,
-        "scenarioId": scenario_id,
-    }
+}
 
 
 def qualify_scenario(
@@ -462,57 +421,27 @@ def qualify_scenario(
             wait_for_api(api_url, (manager, runner, api))
             composer_environment = environment.copy()
             composer_environment["MANYFORGE_API_TOKEN"] = "ignored-legacy-token"
-            composer_environment["MANYFORGE_FS_ROOTS"] = str(PACKAGE)
+            composer_environment["MANYFORGE_FS_ROOTS"] = os.pathsep.join(
+                (str(PACKAGE), str(WORKSPACE))
+            )
             composer = subprocess.Popen(
                 commands["composer"],
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 env=composer_environment,
             )
-            composer_catalog = wait_for_composer(
+            wait_for_composer(
                 composer_url,
                 (manager, runner, api, composer),
             )
             with HeadlessHttpClient(api_url, timeout_seconds=15.0) as client:
-                catalog = client.scenarios()
-                if composer_catalog != catalog:
-                    raise RuntimeError("Composer projected another scenario catalog")
                 program = load_strict_json_yaml(PACKAGE / PROGRAM_FILES[scenario_id])
-                workspace = composer_json(
-                    composer_url,
-                    "GET",
-                    "/api/program/workspace",
-                )
-                browser_client_id = f"n7-product-matrix.{scenario_id}"
-                with composer_snapshot_stream(
-                    composer_url,
-                    client_id=browser_client_id,
-                ) as next_snapshot:
-                    headless_snapshot = next_snapshot()
-                    load_body = _scenario_load_body(
-                        workspace=workspace,
-                        snapshot=headless_snapshot,
-                        scenario_id=scenario_id,
-                        scenario_catalog_revision=catalog["scenario_catalog_revision"],
-                    )
-                    composer_load = composer_json(
-                        composer_url,
-                        "POST",
-                        "/api/scenarios/load",
-                        load_body,
-                    )
-                load_result = composer_load.get("headless")
-                if (
-                    composer_load.get("status") != "loaded"
-                    or not isinstance(load_result, dict)
-                    or load_result.get("scenario", {}).get("scenario_id") != scenario_id
-                ):
-                    raise RuntimeError(
-                        f"Composer Load returned a divergent result: {composer_load}"
-                    )
                 applied = client.program_applied()
-                selection = client.scenario_program_selection(scenario_id)
-                if selection["program"] != program:
+                if applied.get("scenario_id") != scenario_id:
+                    raise RuntimeError(
+                        f"project startup activated another scenario: {applied}"
+                    )
+                if applied["program"] != program:
                     raise RuntimeError("applied scenario selected another Program")
                 # Use the maintained operator's exact CCLC convergence, not a
                 # second lifecycle implementation or diagnostics-as-readiness.
@@ -573,7 +502,9 @@ def qualify_scenario(
                         "expected_admission_generation": admission["admission_generation"],
                         "request_id": f"n7.start.{scenario_id}",
                         "request_owner_epoch": "n7-product-matrix",
-                        "scenario_catalog_revision": catalog["scenario_catalog_revision"],
+                        "source_document_digest": applied[
+                            "source_document_digest"
+                        ],
                         "scenario_id": scenario_id,
                         "source_label": "n7_product_matrix",
                     },

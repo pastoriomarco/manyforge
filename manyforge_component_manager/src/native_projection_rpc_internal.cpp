@@ -22,7 +22,7 @@ namespace core = manyforge::core;
 namespace scene = manyforge::scene;
 
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'P',
-                                              'R', 'P', 'C', '1'};
+                                              'R', 'P', 'C', '2'};
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
 
 [[noreturn]] void Fail(const std::string &detail) {
@@ -691,27 +691,6 @@ void WriteProduct(Writer &writer, const core::RetainedProductDTO &product) {
           ReadVector<core::RetainedArtifactRefDTO>(reader, ReadArtifact)};
 }
 
-void WriteStagedCandidate(Writer &writer,
-                          const core::ProjectionStagedCandidateDTO &value) {
-  WriteStrong(writer, value.apply_id);
-  WriteGeneration(writer, value.apply_generation);
-  WriteGeneration(writer, value.projection_stage_generation);
-  WriteProjectionRevision(writer, value.candidate_projection_revision);
-}
-
-[[nodiscard]] core::ProjectionStagedCandidateDTO
-ReadStagedCandidate(Reader &reader) {
-  core::ProjectionStagedCandidateDTO value{
-      ReadStrong<core::ApplyId>(reader),
-      ReadGeneration<core::ApplyGeneration>(reader),
-      ReadGeneration<core::ProjectionStageGeneration>(reader),
-      ReadProjectionRevision(reader)};
-  if (!value.valid()) {
-    Fail("staged-candidate health value is invalid");
-  }
-  return value;
-}
-
 void WriteHealthState(Writer &writer, const core::ProjectionHealthState state) {
   switch (state) {
   case core::ProjectionHealthState::kUninitialized:
@@ -759,7 +738,6 @@ void WriteHealth(Writer &writer, const core::ProjectionHealthDTO &health) {
   WriteHealthState(writer, health.state);
   WriteOptional(writer, health.active_projection_revision,
                 WriteProjectionRevision);
-  WriteOptional(writer, health.staged_candidate, WriteStagedCandidate);
   WriteOptional(
       writer, health.native_projection_generation,
       [](Writer &output, const std::uint64_t value) { output.U64(value); });
@@ -776,8 +754,6 @@ void WriteHealth(Writer &writer, const core::ProjectionHealthDTO &health) {
       reader.U64(),
       ReadHealthState(reader),
       ReadOptional<core::ProjectionRevisionDTO>(reader, ReadProjectionRevision),
-      ReadOptional<core::ProjectionStagedCandidateDTO>(reader,
-                                                       ReadStagedCandidate),
       ReadOptional<std::uint64_t>(reader,
                                   [](Reader &input) { return input.U64(); }),
       ReadOptional<core::ContentDigest>(
@@ -788,58 +764,6 @@ void WriteHealth(Writer &writer, const core::ProjectionHealthDTO &health) {
     Fail("decoded projection health is invalid");
   }
   return health;
-}
-
-void WriteDisposition(Writer &writer,
-                      const core::ProjectionTransitionDisposition value) {
-  switch (value) {
-  case core::ProjectionTransitionDisposition::kRetained:
-    writer.Byte(0U);
-    return;
-  case core::ProjectionTransitionDisposition::kAdded:
-    writer.Byte(1U);
-    return;
-  case core::ProjectionTransitionDisposition::kRemoved:
-    writer.Byte(2U);
-    return;
-  }
-  Fail("projection transition disposition is unknown");
-}
-
-[[nodiscard]] core::ProjectionTransitionDisposition
-ReadDisposition(Reader &reader) {
-  switch (reader.Byte()) {
-  case 0U:
-    return core::ProjectionTransitionDisposition::kRetained;
-  case 1U:
-    return core::ProjectionTransitionDisposition::kAdded;
-  case 2U:
-    return core::ProjectionTransitionDisposition::kRemoved;
-  default:
-    Fail("projection transition disposition is unknown");
-  }
-}
-
-void WriteTransitionRow(Writer &writer,
-                        const core::ProjectionTransitionRowDTO &row) {
-  if (!row.valid()) {
-    Fail("cannot encode invalid projection transition row");
-  }
-  WriteBinding(writer, row.native_runtime_binding);
-  WriteDisposition(writer, row.disposition);
-  WriteOptional(writer, row.expected_local_active, WriteProjectionRevision);
-}
-
-[[nodiscard]] core::ProjectionTransitionRowDTO
-ReadTransitionRow(Reader &reader) {
-  core::ProjectionTransitionRowDTO row{
-      ReadBinding(reader), ReadDisposition(reader),
-      ReadOptional<core::ProjectionRevisionDTO>(reader,
-                                                ReadProjectionRevision)};
-  if (!row.valid()) {
-    Fail("decoded projection transition row is invalid");
-  }
-  return row;
 }
 
 void WritePrepare(Writer &writer,
@@ -936,145 +860,6 @@ ReadBootstrapQuery(Reader &reader) {
       ReadProjectionRevision(reader)};
   if (!query.valid()) {
     Fail("decoded bootstrap status query is invalid");
-  }
-  return query;
-}
-
-void WriteStage(Writer &writer, const core::NativeProjectionStageDTO &request) {
-  if (!request.valid()) {
-    Fail("cannot encode invalid projection stage request");
-  }
-  WriteStrong(writer, request.apply_id);
-  WriteGeneration(writer, request.apply_generation);
-  WriteGeneration(writer, request.projection_stage_generation);
-  WriteTransitionRow(writer, request.transition_row);
-  WriteProjectionRevision(writer,
-                          request.expected_predecessor_projection_revision);
-  WriteProjectionRevision(writer, request.candidate_projection_revision);
-  WriteProduct(writer, request.planning_collision_model);
-  writer.String(scene::EncodeLogicalSceneSnapshot(
-      *request.frozen_logical_scene.shared()));
-}
-
-[[nodiscard]] core::NativeProjectionStageDTO ReadStage(Reader &reader) {
-  core::NativeProjectionStageDTO request{
-      ReadStrong<core::ApplyId>(reader),
-      ReadGeneration<core::ApplyGeneration>(reader),
-      ReadGeneration<core::ProjectionStageGeneration>(reader),
-      ReadTransitionRow(reader),
-      ReadProjectionRevision(reader),
-      ReadProjectionRevision(reader),
-      ReadProduct(reader),
-      core::LogicalSceneSnapshotRoot(
-          std::make_shared<const core::LogicalSceneSnapshotDTO>(
-              scene::DecodeLogicalSceneSnapshot(reader.String())))};
-  if (!request.valid()) {
-    Fail("decoded projection stage request is invalid");
-  }
-  return request;
-}
-
-void WriteActivation(Writer &writer,
-                     const core::NativeProjectionActivationDTO &request) {
-  if (!request.valid()) {
-    Fail("cannot encode invalid projection activation request");
-  }
-  WriteStrong(writer, request.apply_id);
-  WriteGeneration(writer, request.apply_generation);
-  WriteGeneration(writer, request.projection_stage_generation);
-  WriteTransitionRow(writer, request.transition_row);
-  WriteProjectionRevision(writer,
-                          request.expected_predecessor_projection_revision);
-  WriteProjectionRevision(writer, request.candidate_projection_revision);
-}
-
-[[nodiscard]] core::NativeProjectionActivationDTO
-ReadActivation(Reader &reader) {
-  core::NativeProjectionActivationDTO request{
-      ReadStrong<core::ApplyId>(reader),
-      ReadGeneration<core::ApplyGeneration>(reader),
-      ReadGeneration<core::ProjectionStageGeneration>(reader),
-      ReadTransitionRow(reader),
-      ReadProjectionRevision(reader),
-      ReadProjectionRevision(reader)};
-  if (!request.valid()) {
-    Fail("decoded projection activation request is invalid");
-  }
-  return request;
-}
-
-void WriteRetire(Writer &writer,
-                 const core::NativeProjectionRetireDTO &request) {
-  if (!request.valid()) {
-    Fail("cannot encode invalid projection retirement request");
-  }
-  WriteStrong(writer, request.apply_id);
-  WriteGeneration(writer, request.apply_generation);
-  WriteGeneration(writer, request.projection_stage_generation);
-  WriteTransitionRow(writer, request.transition_row);
-  WriteProjectionRevision(writer,
-                          request.expected_predecessor_projection_revision);
-  WriteProjectionRevision(writer, request.candidate_projection_revision);
-}
-
-[[nodiscard]] core::NativeProjectionRetireDTO ReadRetire(Reader &reader) {
-  core::NativeProjectionRetireDTO request{
-      ReadStrong<core::ApplyId>(reader),
-      ReadGeneration<core::ApplyGeneration>(reader),
-      ReadGeneration<core::ProjectionStageGeneration>(reader),
-      ReadTransitionRow(reader),
-      ReadProjectionRevision(reader),
-      ReadProjectionRevision(reader)};
-  if (!request.valid()) {
-    Fail("decoded projection retirement request is invalid");
-  }
-  return request;
-}
-
-void WriteDiscard(Writer &writer,
-                  const core::NativeProjectionDiscardDTO &request) {
-  if (!request.valid()) {
-    Fail("cannot encode invalid projection discard request");
-  }
-  WriteStrong(writer, request.apply_id);
-  WriteGeneration(writer, request.apply_generation);
-  WriteGeneration(writer, request.projection_stage_generation);
-  WriteTransitionRow(writer, request.transition_row);
-  WriteProjectionRevision(writer, request.candidate_projection_revision);
-}
-
-[[nodiscard]] core::NativeProjectionDiscardDTO ReadDiscard(Reader &reader) {
-  core::NativeProjectionDiscardDTO request{
-      ReadStrong<core::ApplyId>(reader),
-      ReadGeneration<core::ApplyGeneration>(reader),
-      ReadGeneration<core::ProjectionStageGeneration>(reader),
-      ReadTransitionRow(reader), ReadProjectionRevision(reader)};
-  if (!request.valid()) {
-    Fail("decoded projection discard request is invalid");
-  }
-  return request;
-}
-
-void WriteStatusQuery(Writer &writer,
-                      const core::NativeProjectionStatusQueryDTO &query) {
-  if (!query.valid()) {
-    Fail("cannot encode invalid projection status query");
-  }
-  WriteStrong(writer, query.apply_id);
-  WriteGeneration(writer, query.apply_generation);
-  WriteGeneration(writer, query.projection_stage_generation);
-  WriteTransitionRow(writer, query.transition_row);
-}
-
-[[nodiscard]] core::NativeProjectionStatusQueryDTO
-ReadStatusQuery(Reader &reader) {
-  core::NativeProjectionStatusQueryDTO query{
-      ReadStrong<core::ApplyId>(reader),
-      ReadGeneration<core::ApplyGeneration>(reader),
-      ReadGeneration<core::ProjectionStageGeneration>(reader),
-      ReadTransitionRow(reader)};
-  if (!query.valid()) {
-    Fail("decoded projection status query is invalid");
   }
   return query;
 }
@@ -1262,330 +1047,6 @@ ReadBootstrapStatus(Reader &reader) {
   return status;
 }
 
-void WriteStageResult(Writer &writer,
-                      const core::NativeProjectionStageResultDTO &result) {
-  if (!result.presence_valid()) {
-    Fail("cannot encode invalid projection stage result");
-  }
-  WriteStrong(writer, result.apply_id);
-  WriteGeneration(writer, result.apply_generation);
-  WriteGeneration(writer, result.projection_stage_generation);
-  WriteTransitionRow(writer, result.transition_row);
-  WriteProjectionRevision(writer,
-                          result.expected_predecessor_projection_revision);
-  WriteProjectionRevision(writer, result.candidate_projection_revision);
-  writer.Byte(static_cast<std::uint8_t>(result.state));
-  WriteOptional(writer, result.acknowledged_staged_candidate_revision,
-                WriteProjectionRevision);
-  WriteOptional(writer, result.observed_local_active, WriteProjectionRevision);
-  WriteOptional(
-      writer, result.native_projection_generation,
-      [](Writer &output, const std::uint64_t value) { output.U64(value); });
-  WriteOptional(writer, result.projection_content_digest,
-                [](Writer &output, const core::ContentDigest &value) {
-                  WriteStrong(output, value);
-                });
-  WriteHealth(writer, result.resulting_health);
-  WriteOptional(writer, result.error, WriteError);
-}
-
-[[nodiscard]] core::NativeProjectionStageResultState
-ReadStageResultState(Reader &reader) {
-  switch (reader.Byte()) {
-  case 0U:
-    return core::NativeProjectionStageResultState::kAccepted;
-  case 1U:
-    return core::NativeProjectionStageResultState::kStaged;
-  case 2U:
-    return core::NativeProjectionStageResultState::kRejected;
-  case 3U:
-    return core::NativeProjectionStageResultState::kFailedProjectionUncertain;
-  default:
-    Fail("projection stage result state is unknown");
-  }
-}
-
-[[nodiscard]] core::NativeProjectionStageResultDTO
-ReadStageResult(Reader &reader) {
-  core::NativeProjectionStageResultDTO result{
-      ReadStrong<core::ApplyId>(reader),
-      ReadGeneration<core::ApplyGeneration>(reader),
-      ReadGeneration<core::ProjectionStageGeneration>(reader),
-      ReadTransitionRow(reader),
-      ReadProjectionRevision(reader),
-      ReadProjectionRevision(reader),
-      ReadStageResultState(reader),
-      ReadOptional<core::ProjectionRevisionDTO>(reader, ReadProjectionRevision),
-      ReadOptional<core::ProjectionRevisionDTO>(reader, ReadProjectionRevision),
-      ReadOptional<std::uint64_t>(reader,
-                                  [](Reader &input) { return input.U64(); }),
-      ReadOptional<core::ContentDigest>(
-          reader,
-          [](Reader &input) { return ReadStrong<core::ContentDigest>(input); }),
-      ReadHealth(reader),
-      ReadOptional<core::ErrorDTO>(reader, ReadError)};
-  if (!result.presence_valid()) {
-    Fail("decoded projection stage result is invalid");
-  }
-  return result;
-}
-
-void WriteActivationResult(
-    Writer &writer, const core::NativeProjectionActivationResultDTO &result) {
-  if (!result.presence_valid()) {
-    Fail("cannot encode invalid projection activation result");
-  }
-  WriteActivation(writer, result.request);
-  writer.Byte(static_cast<std::uint8_t>(result.state));
-  WriteOptional(writer, result.acknowledged_candidate_projection_revision,
-                WriteProjectionRevision);
-  WriteOptional(
-      writer, result.native_projection_generation,
-      [](Writer &output, const std::uint64_t value) { output.U64(value); });
-  WriteOptional(writer, result.projection_content_digest,
-                [](Writer &output, const core::ContentDigest &value) {
-                  WriteStrong(output, value);
-                });
-  WriteHealth(writer, result.resulting_health);
-  WriteOptional(writer, result.error, WriteError);
-}
-
-[[nodiscard]] core::NativeProjectionActivationResultState
-ReadActivationResultState(Reader &reader) {
-  switch (reader.Byte()) {
-  case 0U:
-    return core::NativeProjectionActivationResultState::kAccepted;
-  case 1U:
-    return core::NativeProjectionActivationResultState::kActivated;
-  case 2U:
-    return core::NativeProjectionActivationResultState::kStale;
-  case 3U:
-    return core::NativeProjectionActivationResultState::
-        kFailedProjectionUncertain;
-  default:
-    Fail("projection activation result state is unknown");
-  }
-}
-
-[[nodiscard]] core::NativeProjectionActivationResultDTO
-ReadActivationResult(Reader &reader) {
-  core::NativeProjectionActivationResultDTO result{
-      ReadActivation(reader),
-      ReadActivationResultState(reader),
-      ReadOptional<core::ProjectionRevisionDTO>(reader, ReadProjectionRevision),
-      ReadOptional<std::uint64_t>(reader,
-                                  [](Reader &input) { return input.U64(); }),
-      ReadOptional<core::ContentDigest>(
-          reader,
-          [](Reader &input) { return ReadStrong<core::ContentDigest>(input); }),
-      ReadHealth(reader),
-      ReadOptional<core::ErrorDTO>(reader, ReadError)};
-  if (!result.presence_valid()) {
-    Fail("decoded projection activation result is invalid");
-  }
-  return result;
-}
-
-template <typename Result, typename State>
-void WriteRetireLike(Writer &writer, const Result &result, const State state) {
-  WriteRetire(writer, result.request);
-  writer.Byte(static_cast<std::uint8_t>(state));
-  WriteOptional(writer, result.observed_local_active, WriteProjectionRevision);
-  WriteOptional(
-      writer, result.native_projection_generation,
-      [](Writer &output, const std::uint64_t value) { output.U64(value); });
-  WriteOptional(writer, result.projection_content_digest,
-                [](Writer &output, const core::ContentDigest &value) {
-                  WriteStrong(output, value);
-                });
-  WriteHealth(writer, result.resulting_health);
-  WriteOptional(writer, result.error, WriteError);
-}
-
-[[nodiscard]] core::NativeProjectionRetireResultState
-ReadRetireResultState(Reader &reader) {
-  switch (reader.Byte()) {
-  case 0U:
-    return core::NativeProjectionRetireResultState::kRetired;
-  case 1U:
-    return core::NativeProjectionRetireResultState::kAlreadyAbsent;
-  case 2U:
-    return core::NativeProjectionRetireResultState::kStale;
-  case 3U:
-    return core::NativeProjectionRetireResultState::kFailedProjectionUncertain;
-  default:
-    Fail("projection retirement result state is unknown");
-  }
-}
-
-[[nodiscard]] core::NativeProjectionRetireResultDTO
-ReadRetireResult(Reader &reader) {
-  core::NativeProjectionRetireResultDTO result{
-      ReadRetire(reader),
-      ReadRetireResultState(reader),
-      ReadOptional<core::ProjectionRevisionDTO>(reader, ReadProjectionRevision),
-      ReadOptional<std::uint64_t>(reader,
-                                  [](Reader &input) { return input.U64(); }),
-      ReadOptional<core::ContentDigest>(
-          reader,
-          [](Reader &input) { return ReadStrong<core::ContentDigest>(input); }),
-      ReadHealth(reader),
-      ReadOptional<core::ErrorDTO>(reader, ReadError)};
-  if (!result.presence_valid()) {
-    Fail("decoded projection retirement result is invalid");
-  }
-  return result;
-}
-
-[[nodiscard]] core::NativeProjectionRetireStatusState
-ReadRetireStatusState(Reader &reader) {
-  switch (reader.Byte()) {
-  case 0U:
-    return core::NativeProjectionRetireStatusState::kPending;
-  case 1U:
-    return core::NativeProjectionRetireStatusState::kRetired;
-  case 2U:
-    return core::NativeProjectionRetireStatusState::kAlreadyAbsent;
-  case 3U:
-    return core::NativeProjectionRetireStatusState::kStale;
-  case 4U:
-    return core::NativeProjectionRetireStatusState::kFailedProjectionUncertain;
-  default:
-    Fail("projection retirement status state is unknown");
-  }
-}
-
-[[nodiscard]] core::NativeProjectionRetireStatusDTO
-ReadRetireStatus(Reader &reader) {
-  core::NativeProjectionRetireStatusDTO result{
-      ReadRetire(reader),
-      ReadRetireStatusState(reader),
-      ReadOptional<core::ProjectionRevisionDTO>(reader, ReadProjectionRevision),
-      ReadOptional<std::uint64_t>(reader,
-                                  [](Reader &input) { return input.U64(); }),
-      ReadOptional<core::ContentDigest>(
-          reader,
-          [](Reader &input) { return ReadStrong<core::ContentDigest>(input); }),
-      ReadHealth(reader),
-      ReadOptional<core::ErrorDTO>(reader, ReadError)};
-  if (!result.presence_valid()) {
-    Fail("decoded projection retirement status is invalid");
-  }
-  return result;
-}
-
-void WriteDiscardResult(Writer &writer,
-                        const core::NativeProjectionDiscardResultDTO &result) {
-  if (!result.presence_valid()) {
-    Fail("cannot encode invalid projection discard result");
-  }
-  WriteDiscard(writer, result.request);
-  writer.Byte(static_cast<std::uint8_t>(result.state));
-  WriteOptional(writer, result.observed_local_active, WriteProjectionRevision);
-  WriteOptional(
-      writer, result.native_projection_generation,
-      [](Writer &output, const std::uint64_t value) { output.U64(value); });
-  WriteOptional(writer, result.projection_content_digest,
-                [](Writer &output, const core::ContentDigest &value) {
-                  WriteStrong(output, value);
-                });
-  WriteHealth(writer, result.resulting_health);
-  WriteOptional(writer, result.error, WriteError);
-}
-
-[[nodiscard]] core::NativeProjectionDiscardResultState
-ReadDiscardResultState(Reader &reader) {
-  switch (reader.Byte()) {
-  case 0U:
-    return core::NativeProjectionDiscardResultState::kDiscarded;
-  case 1U:
-    return core::NativeProjectionDiscardResultState::kAlreadyAbsent;
-  case 2U:
-    return core::NativeProjectionDiscardResultState::kFailedProjectionUncertain;
-  default:
-    Fail("projection discard result state is unknown");
-  }
-}
-
-[[nodiscard]] core::NativeProjectionDiscardResultDTO
-ReadDiscardResult(Reader &reader) {
-  core::NativeProjectionDiscardResultDTO result{
-      ReadDiscard(reader),
-      ReadDiscardResultState(reader),
-      ReadOptional<core::ProjectionRevisionDTO>(reader, ReadProjectionRevision),
-      ReadOptional<std::uint64_t>(reader,
-                                  [](Reader &input) { return input.U64(); }),
-      ReadOptional<core::ContentDigest>(
-          reader,
-          [](Reader &input) { return ReadStrong<core::ContentDigest>(input); }),
-      ReadHealth(reader),
-      ReadOptional<core::ErrorDTO>(reader, ReadError)};
-  if (!result.presence_valid()) {
-    Fail("decoded projection discard result is invalid");
-  }
-  return result;
-}
-
-void WriteStatus(Writer &writer,
-                 const core::NativeProjectionStatusDTO &status) {
-  if (!status.presence_valid()) {
-    Fail("cannot encode invalid projection status");
-  }
-  WriteStatusQuery(writer, status.query);
-  writer.Byte(static_cast<std::uint8_t>(status.state));
-  WriteOptional(writer, status.staged_or_active_candidate_revision,
-                WriteProjectionRevision);
-  WriteOptional(writer, status.observed_local_active, WriteProjectionRevision);
-  WriteOptional(
-      writer, status.native_projection_generation,
-      [](Writer &output, const std::uint64_t value) { output.U64(value); });
-  WriteOptional(writer, status.projection_content_digest,
-                [](Writer &output, const core::ContentDigest &value) {
-                  WriteStrong(output, value);
-                });
-  WriteHealth(writer, status.resulting_health);
-  WriteOptional(writer, status.error, WriteError);
-}
-
-[[nodiscard]] core::NativeProjectionStatusState
-ReadStatusState(Reader &reader) {
-  switch (reader.Byte()) {
-  case 0U:
-    return core::NativeProjectionStatusState::kAbsent;
-  case 1U:
-    return core::NativeProjectionStatusState::kProgressing;
-  case 2U:
-    return core::NativeProjectionStatusState::kStaged;
-  case 3U:
-    return core::NativeProjectionStatusState::kActivated;
-  case 4U:
-    return core::NativeProjectionStatusState::kDiscarded;
-  case 5U:
-    return core::NativeProjectionStatusState::kFailedProjectionUncertain;
-  default:
-    Fail("projection status state is unknown");
-  }
-}
-
-[[nodiscard]] core::NativeProjectionStatusDTO ReadStatus(Reader &reader) {
-  core::NativeProjectionStatusDTO status{
-      ReadStatusQuery(reader),
-      ReadStatusState(reader),
-      ReadOptional<core::ProjectionRevisionDTO>(reader, ReadProjectionRevision),
-      ReadOptional<core::ProjectionRevisionDTO>(reader, ReadProjectionRevision),
-      ReadOptional<std::uint64_t>(reader,
-                                  [](Reader &input) { return input.U64(); }),
-      ReadOptional<core::ContentDigest>(
-          reader,
-          [](Reader &input) { return ReadStrong<core::ContentDigest>(input); }),
-      ReadHealth(reader),
-      ReadOptional<core::ErrorDTO>(reader, ReadError)};
-  if (!status.presence_valid()) {
-    Fail("decoded projection status is invalid");
-  }
-  return status;
-}
-
 enum class RequestKind : std::uint8_t {
   kPrepare = 1U,
   kHealth = 2U,
@@ -1593,12 +1054,6 @@ enum class RequestKind : std::uint8_t {
   kRebuild = 4U,
   kBootstrapRebuild = 5U,
   kBootstrapStatus = 6U,
-  kStage = 7U,
-  kActivate = 8U,
-  kRetire = 9U,
-  kRetireStatus = 10U,
-  kDiscard = 11U,
-  kStageStatus = 12U,
   kRetain = 13U,
   kRelease = 14U,
   kSceneFrame = 15U,
@@ -1612,12 +1067,6 @@ enum class ResponseKind : std::uint8_t {
   kCommit = 4U,
   kBootstrapRebuild = 5U,
   kBootstrapStatus = 6U,
-  kStage = 7U,
-  kActivation = 8U,
-  kRetire = 9U,
-  kRetireStatus = 10U,
-  kDiscard = 11U,
-  kStageStatus = 12U,
   kRetained = 13U,
   kReleased = 14U,
   kSceneFrame = 15U,
@@ -1663,31 +1112,6 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
             std::is_same_v<T, core::NativeProjectionBootstrapStatusQueryDTO>) {
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kBootstrapStatus));
           WriteBootstrapQuery(writer, value);
-        } else if constexpr (std::is_same_v<T,
-                                            core::NativeProjectionStageDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(RequestKind::kStage));
-          WriteStage(writer, value);
-        } else if constexpr (std::is_same_v<
-                                 T, core::NativeProjectionActivationDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(RequestKind::kActivate));
-          WriteActivation(writer, value);
-        } else if constexpr (std::is_same_v<T,
-                                            core::NativeProjectionRetireDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(RequestKind::kRetire));
-          WriteRetire(writer, value);
-        } else if constexpr (std::is_same_v<
-                                 T,
-                                 core::NativeProjectionRetireStatusQueryDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(RequestKind::kRetireStatus));
-          WriteRetire(writer, value.request);
-        } else if constexpr (std::is_same_v<T,
-                                            core::NativeProjectionDiscardDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(RequestKind::kDiscard));
-          WriteDiscard(writer, value);
-        } else if constexpr (std::is_same_v<
-                                 T, core::NativeProjectionStatusQueryDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(RequestKind::kStageStatus));
-          WriteStatusQuery(writer, value);
         } else if constexpr (std::is_same_v<
                                  T, NativeProjectionRetainRequest>) {
           if (!value.valid()) {
@@ -1747,18 +1171,6 @@ DecodeNativeProjectionRpcRequest(const std::string_view bytes) {
       return ReadBootstrapRebuild(reader);
     case RequestKind::kBootstrapStatus:
       return ReadBootstrapQuery(reader);
-    case RequestKind::kStage:
-      return ReadStage(reader);
-    case RequestKind::kActivate:
-      return ReadActivation(reader);
-    case RequestKind::kRetire:
-      return ReadRetire(reader);
-    case RequestKind::kRetireStatus:
-      return core::NativeProjectionRetireStatusQueryDTO{ReadRetire(reader)};
-    case RequestKind::kDiscard:
-      return ReadDiscard(reader);
-    case RequestKind::kStageStatus:
-      return ReadStatusQuery(reader);
     case RequestKind::kRetain:
       return NativeProjectionRetainRequest{
           ReadBinding(reader), ReadProjectionRevision(reader),
@@ -1811,37 +1223,6 @@ EncodeNativeProjectionRpcResponse(const NativeProjectionRpcResponse &response) {
               static_cast<std::uint8_t>(ResponseKind::kBootstrapStatus));
           WriteBootstrapStatus(writer, value);
         } else if constexpr (std::is_same_v<
-                                 T, core::NativeProjectionStageResultDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(ResponseKind::kStage));
-          WriteStageResult(writer, value);
-        } else if constexpr (std::is_same_v<
-                                 T,
-                                 core::NativeProjectionActivationResultDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(ResponseKind::kActivation));
-          WriteActivationResult(writer, value);
-        } else if constexpr (std::is_same_v<
-                                 T, core::NativeProjectionRetireResultDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(ResponseKind::kRetire));
-          if (!value.presence_valid()) {
-            Fail("cannot encode invalid projection retirement result");
-          }
-          WriteRetireLike(writer, value, value.state);
-        } else if constexpr (std::is_same_v<
-                                 T, core::NativeProjectionRetireStatusDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(ResponseKind::kRetireStatus));
-          if (!value.presence_valid()) {
-            Fail("cannot encode invalid projection retirement status");
-          }
-          WriteRetireLike(writer, value, value.state);
-        } else if constexpr (std::is_same_v<
-                                 T, core::NativeProjectionDiscardResultDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(ResponseKind::kDiscard));
-          WriteDiscardResult(writer, value);
-        } else if constexpr (std::is_same_v<
-                                 T, core::NativeProjectionStatusDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(ResponseKind::kStageStatus));
-          WriteStatus(writer, value);
-        } else if constexpr (std::is_same_v<
                                  T, NativeProjectionRetainResult>) {
           writer.Byte(static_cast<std::uint8_t>(ResponseKind::kRetained));
           WriteLeaseBinding(writer, value.projection_binding);
@@ -1883,18 +1264,6 @@ DecodeNativeProjectionRpcResponse(const std::string_view bytes) {
       return ReadBootstrapRebuildResult(reader);
     case ResponseKind::kBootstrapStatus:
       return ReadBootstrapStatus(reader);
-    case ResponseKind::kStage:
-      return ReadStageResult(reader);
-    case ResponseKind::kActivation:
-      return ReadActivationResult(reader);
-    case ResponseKind::kRetire:
-      return ReadRetireResult(reader);
-    case ResponseKind::kRetireStatus:
-      return ReadRetireStatus(reader);
-    case ResponseKind::kDiscard:
-      return ReadDiscardResult(reader);
-    case ResponseKind::kStageStatus:
-      return ReadStatus(reader);
     case ResponseKind::kRetained:
       return NativeProjectionRetainResult{ReadLeaseBinding(reader)};
     case ResponseKind::kReleased:

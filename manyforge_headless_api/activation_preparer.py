@@ -40,6 +40,7 @@ _RECEIPT_FIELDS = {
     "program_id",
     "program_revision",
     "retained_bundle_id",
+    "scenario_id",
     "schema_version",
     "source_document_digest",
     "typed_parameter_overrides",
@@ -226,17 +227,21 @@ class ActivationPreparer:
         *,
         executable: Path,
         capability_root: Path,
-        timeout_seconds: float,
+        activation_root: Path,
+        timeout_seconds: float | None,
+        publish_canonical_empty: bool = False,
     ) -> None:
         self._executable = executable
         self._capability_root = capability_root
+        self._activation_root = activation_root
         self._profiles = _model_preparation_profiles(capability_root)
         self._timeout_seconds = timeout_seconds
+        self._publish_canonical_empty = publish_canonical_empty
         self._lock = threading.Lock()
         self._prepared: dict[str, dict[str, Any]] = {}
 
     def prepared_value(self, prepared_activation_id: str) -> dict[str, Any] | None:
-        """Return the capacity-one immutable value for its future UA3 consumer."""
+        """Return the capacity-one immutable activation receipt."""
 
         with self._lock:
             value = self._prepared.get(prepared_activation_id)
@@ -252,6 +257,7 @@ class ActivationPreparer:
         self,
         *,
         source_document_digest: str,
+        scenario_id: str,
         captured_input_digest: str,
         deployment: Mapping[str, Any],
         model_source_closure: Mapping[str, Any],
@@ -274,6 +280,7 @@ class ActivationPreparer:
             request = {
                 "schema_version": "manyforge.activation_preparation_request.v1",
                 "source_document_digest": source_document_digest,
+                "scenario_id": scenario_id,
                 "captured_input_digest": captured_input_digest,
                 "deployment": dict(deployment),
                 "model_source_closure": dict(model_source_closure),
@@ -303,7 +310,11 @@ class ActivationPreparer:
                 str(input_path),
                 "--capability-root",
                 str(self._capability_root),
+                "--activation-root",
+                str(self._activation_root),
             ]
+            if self._publish_canonical_empty:
+                command.append("--publish-canonical-empty")
             with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
                 try:
                     completed = subprocess.run(
@@ -376,8 +387,9 @@ class ActivationPreparer:
                     "activation_preparer_response_invalid",
                     "Activation preparer returned an invalid direct payload",
                 )
-            self._prepared = {prepared_activation_id: value}
-            return {field: value[field] for field in _RECEIPT_FIELDS}
+            receipt = {field: value[field] for field in _RECEIPT_FIELDS}
+            self._prepared = {prepared_activation_id: receipt}
+            return deepcopy(receipt)
         finally:
             if input_path is not None:
                 input_path.unlink(missing_ok=True)

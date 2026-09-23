@@ -27,6 +27,7 @@ import type {
   AppliedProgramSelection,
   ManagerActiveProjection,
   ManagerApplyAvailability,
+  ManagerApplyFailure,
   ManagerApplyLifecyclePhase,
   ManagerApplyPhase,
   ManagerApplyRecord,
@@ -81,7 +82,6 @@ import type {
   ScenarioDocumentIndexResponse,
   ScenarioDocumentLoadResponse,
   ScenarioDocumentSaveResponse,
-  ScenarioCatalogResponse,
   CarriedObjectAttachment,
   LogicalSceneObject,
   LogicalScenePlacement,
@@ -2011,7 +2011,7 @@ function parseManagerApplyRecord(
       ),
       sourceLabel: stringAt(request.source_label, path + '.request.source_label'),
     },
-    terminalState,
+    terminalState: terminalState as ManagerApplyRecord['terminalState'],
   };
 }
 
@@ -2522,7 +2522,7 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
           1024,
         ),
         phase: failurePhase,
-        effectDisposition,
+        effectDisposition: effectDisposition as ManagerApplyFailure['effectDisposition'],
       };
     })();
   if ((state === 'succeeded') !== (candidate !== null)) {
@@ -3135,18 +3135,21 @@ export function parseScenarioDocumentLoadResponse(
   const record = objectAt(value, path);
   exactKeysAt(
     record,
-    ['activation', 'diagnostics', 'incomplete', 'path', 'scenario_id', 'source_diagnostics', 'status', 'workspace'],
+    ['activation', 'authoringWorkspace', 'diagnostics', 'incomplete', 'path', 'scenario_id', 'source_diagnostics', 'status', 'workspace'],
     path,
   );
   const status = stringAt(record.status, `${path}.status`);
-  if (status !== 'opened') {
-    return fail(`${path}.status`, 'opened');
+  if (status !== 'opened' && status !== 'accepted') {
+    return fail(`${path}.status`, 'opened or accepted');
   }
   const activation = record.activation === null
     ? null
     : jsonRecordAt(record.activation, `${path}.activation`);
-  if (activation !== null) {
-    return fail(`${path}.activation`, 'null');
+  if ((status === 'accepted') !== (activation !== null)) {
+    return fail(
+      `${path}.activation`,
+      'an operation exactly when activation was accepted',
+    );
   }
   return {
     status,
@@ -3177,6 +3180,9 @@ export function parseScenarioDocumentLoadResponse(
       },
     ),
     workspace: parseProgramWorkspaceResponse(record.workspace),
+    authoringWorkspace: parseAuthoringWorkspaceSnapshot(
+      record.authoringWorkspace,
+    ),
   };
 }
 
@@ -3330,15 +3336,15 @@ export function parseDeploymentWorkspaceResponse(
     const candidatePath = `${path}.${field}[${index}]`;
     const row = objectAt(candidate, candidatePath);
     exactKeysAt(row, [
-      'scenarioId', 'scenarioCatalogRevision', 'deploymentArtifactId',
+      'scenarioId', 'sourceDocumentDigest', 'deploymentArtifactId',
       'deploymentRevision', 'retainedBundleId', 'programId',
       'programRevision', 'programBindingId', 'description',
     ], candidatePath);
     return {
       scenarioId: stringAt(row.scenarioId, `${candidatePath}.scenarioId`),
-      scenarioCatalogRevision: digestAt(
-        row.scenarioCatalogRevision,
-        `${candidatePath}.scenarioCatalogRevision`,
+      sourceDocumentDigest: digestAt(
+        row.sourceDocumentDigest,
+        `${candidatePath}.sourceDocumentDigest`,
       ),
       deploymentArtifactId: stringAt(
         row.deploymentArtifactId,
@@ -3518,17 +3524,18 @@ export function parseDeploymentCandidateOperationResponse(
   const resultRecord = objectAt(record.result, `${path}.result`);
   allowedKeysAt(resultRecord, [
     'status', 'confirmation_token', 'prepared_activation', 'candidate_preview',
-    'manager_apply', 'selection',
+    'manager_apply',
   ], ['preparation', 'phases_ms', 'apply_id'], `${path}.result`);
   const status = stringAt(resultRecord.status, `${path}.result.status`);
   if (
     status !== 'previewed'
     && status !== 'confirmation_required'
+    && status !== 'accepted'
     && status !== 'applied'
   ) {
     return fail(
       `${path}.result.status`,
-      'previewed, confirmation_required, or applied',
+      'previewed, confirmation_required, accepted, or applied',
     );
   }
   const confirmationToken = resultRecord.confirmation_token === null
@@ -3581,9 +3588,6 @@ export function parseDeploymentCandidateOperationResponse(
     resultRecord.prepared_activation,
     `${path}.result.prepared_activation`,
   );
-  if (resultRecord.selection !== null) {
-    return fail(`${path}.result.selection`, 'null before the UA3 transition');
-  }
   if (
     workspace.draft.deploymentArtifactId !== preparedActivation.deploymentArtifactId
     || workspace.draft.deploymentRevision !== preparedActivation.deploymentRevision
@@ -3651,105 +3655,9 @@ export function parseDeploymentCandidateOperationResponse(
       preparedActivation,
       candidatePreview,
       managerApply,
-      selection: null,
       phasesMs,
       applyId,
     },
-  };
-}
-
-export function parseScenarioCatalogResponse(value: unknown): ScenarioCatalogResponse {
-  const record = objectAt(value, 'scenarioCatalog');
-  exactKeysAt(
-    record,
-    ['api_version', 'scenario_catalog_revision', 'scenarios'],
-    'scenarioCatalog',
-  );
-  const apiVersion = stringAt(record.api_version, 'scenarioCatalog.api_version');
-  if (apiVersion !== 'manyforge.scenario_catalog.v1') {
-    return fail('scenarioCatalog.api_version', 'manyforge.scenario_catalog.v1');
-  }
-  const scenarios = boundedArrayAt(
-    record.scenarios,
-    'scenarioCatalog.scenarios',
-    4096,
-  ).map((value, index) => {
-    const path = `scenarioCatalog.scenarios[${index}]`;
-    const row = objectAt(value, path);
-    allowedKeysAt(
-      row,
-      [
-        'assistant_mode',
-        'deployment_artifact_id',
-        'deployment_compatibility',
-        'deployment_revision',
-        'program_binding_id',
-        'retained_bundle_id',
-        'scenario_id',
-        'typed_parameter_overrides',
-      ],
-      ['aliases', 'description'],
-      path,
-    );
-    const compatibility = objectAt(
-      row.deployment_compatibility,
-      `${path}.deployment_compatibility`,
-    );
-    exactKeysAt(
-      compatibility,
-      ['lane', 'provides'],
-      `${path}.deployment_compatibility`,
-    );
-    stringAt(compatibility.lane, `${path}.deployment_compatibility.lane`);
-    stringArrayAt(
-      compatibility.provides,
-      `${path}.deployment_compatibility.provides`,
-    );
-    jsonRecordAt(row.typed_parameter_overrides, `${path}.typed_parameter_overrides`);
-    const assistantMode = stringAt(row.assistant_mode, `${path}.assistant_mode`);
-    if (!['required', 'optional', 'forbidden'].includes(assistantMode)) {
-      return fail(`${path}.assistant_mode`, 'required, optional, or forbidden');
-    }
-    return {
-      scenarioId: stringAt(row.scenario_id, `${path}.scenario_id`),
-      description: row.description === undefined
-        ? null
-        : stringAt(row.description, `${path}.description`),
-      aliases: row.aliases === undefined
-        ? []
-        : stringArrayAt(row.aliases, `${path}.aliases`),
-      deploymentArtifactId: stringAt(
-        row.deployment_artifact_id,
-        `${path}.deployment_artifact_id`,
-      ),
-      deploymentRevision: digestAt(
-        row.deployment_revision,
-        `${path}.deployment_revision`,
-      ),
-      retainedBundleId: digestAt(
-        row.retained_bundle_id,
-        `${path}.retained_bundle_id`,
-      ),
-      programBindingId: digestAt(
-        row.program_binding_id,
-        `${path}.program_binding_id`,
-      ),
-      assistantMode: assistantMode as 'required' | 'optional' | 'forbidden',
-    };
-  });
-  const scenarioIds = scenarios.map((row) => row.scenarioId);
-  if (
-    scenarioIds.some((id, index) => index > 0 && id <= scenarioIds[index - 1])
-  ) {
-    return fail('scenarioCatalog.scenarios', 'strictly scenario-ID sorted and unique');
-  }
-  return {
-    apiVersion,
-    scenarioCatalogRevision: digestAt(
-      record.scenario_catalog_revision,
-      'scenarioCatalog.scenario_catalog_revision',
-    ),
-    scenarios,
   };
 }
 
@@ -3789,7 +3697,7 @@ export function parseCurrentScenarioResponse(value: unknown): CurrentScenarioRes
   }
   exactKeysAt(current, [
     'scenario_id',
-    'scenario_catalog_revision',
+    'source_document_digest',
     'deployment_artifact_id',
     'deployment_revision',
     'retained_bundle_id',
@@ -3803,9 +3711,9 @@ export function parseCurrentScenarioResponse(value: unknown): CurrentScenarioRes
     ready,
     currentScenario: {
       scenarioId: stringAt(current.scenario_id, `${path}.current_scenario.scenario_id`),
-      scenarioCatalogRevision: digestAt(
-        current.scenario_catalog_revision,
-        `${path}.current_scenario.scenario_catalog_revision`,
+      sourceDocumentDigest: digestAt(
+        current.source_document_digest,
+        `${path}.current_scenario.source_document_digest`,
       ),
       deploymentArtifactId: stringAt(
         current.deployment_artifact_id,
@@ -3844,11 +3752,13 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     record,
     [
       'assistant_mode',
+      'assistant_projection',
       'baseline_program_binding_id',
       'deployment_artifact_id',
       'deployment_revision',
       'graph_revision',
       'node_environment_digest',
+      'owner_identities',
       'preparation_digest',
       'program',
       'program_binding',
@@ -3856,7 +3766,7 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       'program_id',
       'program_revision',
       'retained_bundle_id',
-      'scenario_catalog_revision',
+      'source_document_digest',
       'scenario_id',
       'schema_version',
       'source',
@@ -3865,12 +3775,39 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     path,
   );
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.applied_program_selection.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.applied_program_selection.v1');
+  if (schemaVersion !== 'manyforge.applied_program_selection.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.applied_program_selection.v2');
   }
   const assistantMode = stringAt(record.assistant_mode, `${path}.assistant_mode`);
   if (!['required', 'optional', 'forbidden'].includes(assistantMode)) {
     return fail(`${path}.assistant_mode`, 'required, optional, or forbidden');
+  }
+  const assistantProjection = record.assistant_projection === null
+    ? null
+    : jsonRecordAt(record.assistant_projection, `${path}.assistant_projection`);
+  const ownerIdentities = boundedArrayAt(
+    record.owner_identities,
+    `${path}.owner_identities`,
+    4096,
+  ).map((value, index) => {
+    const ownerPath = `${path}.owner_identities[${index}]`;
+    const owner = objectAt(value, ownerPath);
+    exactKeysAt(owner, ['owner_epoch', 'owner_id', 'owner_role'], ownerPath);
+    return {
+      ownerRole: stringAt(owner.owner_role, `${ownerPath}.owner_role`),
+      ownerId: stringAt(owner.owner_id, `${ownerPath}.owner_id`),
+      ownerEpoch: stringAt(owner.owner_epoch, `${ownerPath}.owner_epoch`),
+    };
+  });
+  const ownerRoles = ownerIdentities.map((owner) => owner.ownerRole);
+  if (
+    ownerRoles.length === 0
+    || ownerRoles.some((role, index) => index > 0 && role <= ownerRoles[index - 1])
+  ) {
+    return fail(
+      `${path}.owner_identities`,
+      'strictly role-sorted unique owner identities',
+    );
   }
   digestAt(
     record.baseline_program_binding_id,
@@ -3943,9 +3880,9 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
   return {
     schemaVersion,
     scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
-    scenarioCatalogRevision: digestAt(
-      record.scenario_catalog_revision,
-      `${path}.scenario_catalog_revision`,
+    sourceDocumentDigest: digestAt(
+      record.source_document_digest,
+      `${path}.source_document_digest`,
     ),
     programId,
     programRevision,
@@ -3963,6 +3900,8 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       source.source_generation,
       `${path}.source.source_generation`,
     ),
+    assistantProjection,
+    ownerIdentities,
     program,
     programBinding,
   };
@@ -4024,7 +3963,7 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
       'program_revision',
       'program_run_id',
       'retained_bundle_id',
-      'scenario_catalog_revision',
+      'source_document_digest',
       'scenario_id',
       'schema_version',
     ],
@@ -4125,9 +4064,9 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
         `${path}.capture.applied_record_digest`,
       ),
       scenarioId: stringAt(capture.scenario_id, `${path}.capture.scenario_id`),
-      scenarioCatalogRevision: digestAt(
-        capture.scenario_catalog_revision,
-        `${path}.capture.scenario_catalog_revision`,
+      sourceDocumentDigest: digestAt(
+        capture.source_document_digest,
+        `${path}.capture.source_document_digest`,
       ),
       programId: stringAt(capture.program_id, `${path}.capture.program_id`),
       programRevision: digestAt(
@@ -4872,7 +4811,7 @@ function parseScenarioLoadResult(
       'program_id',
       'program_revision',
       'retained_bundle_id',
-      'scenario_catalog_revision',
+      'source_document_digest',
       'scenario_id',
     ],
     `${path}.scenario`,
@@ -4886,7 +4825,7 @@ function parseScenarioLoadResult(
     'program_binding_id',
     'program_revision',
     'retained_bundle_id',
-    'scenario_catalog_revision',
+    'source_document_digest',
   ]) {
     digestAt(scenario[field], `${path}.scenario.${field}`);
   }
@@ -7061,7 +7000,7 @@ export function parseComponentOverviewProjection(
           operation.affected_runtime_unit_ids,
           `${operationPath}.affected_runtime_unit_ids`,
         ),
-        reasonCode,
+        reasonCode: 'planned_maintenance_in_progress' as const,
       };
     })();
   return {

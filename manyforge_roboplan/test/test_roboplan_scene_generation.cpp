@@ -1,12 +1,16 @@
 #include <gtest/gtest.h>
 
+#include <roboplan/core/scene_context.hpp>
+
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -256,6 +260,91 @@ TEST(RoboPlanSceneGenerationTest,
   EXPECT_FALSE(failed.load(std::memory_order_acquire));
   EXPECT_TRUE(
       retained->getCurrentJointPositions().isApprox(retained_query));
+}
+
+TEST(RoboPlanSceneGenerationTest,
+     SceneContextsKeepPrivateScratchAndBorrowOneStableScene) {
+  static_assert(!std::is_copy_constructible_v<roboplan::SceneContext>);
+  static_assert(!std::is_move_constructible_v<roboplan::SceneContext>);
+  auto scene = make_scene("private_collision_contexts");
+  ASSERT_TRUE(scene);
+  const Eigen::VectorXd query = scene->getCurrentJointPositions();
+
+  // RoboPlan 0.7 SceneContext is deliberately nonmovable: its broadphase
+  // manager retains pointers into its own scratch.  Heap ownership keeps each
+  // context at one address, while this shared Scene outlives both borrowed
+  // model references.
+  auto first = std::make_unique<roboplan::SceneContext>(*scene);
+  auto second = std::make_unique<roboplan::SceneContext>(*scene);
+  first->setRngSeed(11U);
+  second->setRngSeed(29U);
+  const bool expected = first->hasCollisions(query);
+
+  std::atomic<bool> start{false};
+  std::atomic<bool> failed{false};
+  const auto query_context = [&](roboplan::SceneContext &context) {
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    for (int iteration = 0; iteration < 128; ++iteration) {
+      if (context.hasCollisions(query) != expected) {
+        failed.store(true, std::memory_order_release);
+        return;
+      }
+    }
+  };
+  std::jthread first_worker(query_context, std::ref(*first));
+  std::jthread second_worker(query_context, std::ref(*second));
+  start.store(true, std::memory_order_release);
+  first_worker.join();
+  second_worker.join();
+
+  EXPECT_FALSE(failed.load(std::memory_order_acquire));
+  EXPECT_TRUE(scene->getCurrentJointPositions().isApprox(query));
+}
+
+TEST(RoboPlanSceneGenerationTest,
+     TopologyChangeRejectsStaleManyForgeSceneContext) {
+  auto scene = make_scene("collision_context_rebuild");
+  ASSERT_TRUE(scene);
+
+  auto context = std::make_unique<roboplan::SceneContext>(*scene);
+  const auto query = scene->getCurrentJointPositions();
+  ASSERT_TRUE(context->isGeometryCurrent());
+  Eigen::Matrix4d far_pose = Eigen::Matrix4d::Identity();
+  far_pose(2, 3) = 100.0;
+  const auto added = scene->addSphereGeometry(
+      "new_context_sphere", "universe", roboplan::Sphere(0.05), far_pose,
+      Eigen::Vector4d(0.4, 0.2, 0.8, 1.0));
+  ASSERT_TRUE(added.has_value()) << added.error();
+
+  EXPECT_FALSE(context->isGeometryCurrent());
+  EXPECT_THROW((void)context->hasCollisions(query), std::runtime_error);
+  auto replacement = std::make_unique<roboplan::SceneContext>(*scene);
+  EXPECT_TRUE(replacement->isGeometryCurrent());
+  EXPECT_NO_THROW((void)replacement->hasCollisions(query));
+}
+
+TEST(RoboPlanSceneGenerationTest,
+     PlacementOnlyChangeRetainsManyForgeSceneContext) {
+  auto scene = make_scene("scene_context_placement");
+  ASSERT_TRUE(scene);
+  const auto added = scene->addSphereGeometry(
+      "moving_context_sphere", "universe", roboplan::Sphere(0.05),
+      Eigen::Matrix4d::Identity(), Eigen::Vector4d(0.4, 0.2, 0.8, 1.0));
+  ASSERT_TRUE(added.has_value()) << added.error();
+
+  auto context = std::make_unique<roboplan::SceneContext>(*scene);
+  const auto query = scene->getCurrentJointPositions();
+  Eigen::Matrix4d moved = Eigen::Matrix4d::Identity();
+  moved(2, 3) = 100.0;
+  const auto updated = scene->updateGeometryPlacement(
+      "moving_context_sphere", "universe", moved);
+  ASSERT_TRUE(updated.has_value()) << updated.error();
+
+  EXPECT_TRUE(context->isGeometryCurrent());
+  EXPECT_NO_THROW((void)context->hasCollisions(query));
+  EXPECT_EQ(context->hasCollisions(query), scene->hasCollisions(query));
 }
 
 }  // namespace

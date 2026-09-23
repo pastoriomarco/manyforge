@@ -3,7 +3,7 @@
 namespace manyforge::component_manager {
 
 bool ManagerApplyFenceReleaseIntentDTO::valid() const noexcept {
-  return !scene_finalized_digest.empty() && !fence_acceptance_digest.empty() &&
+  return !scene_completion_digest.empty() && !fence_acceptance_digest.empty() &&
          release_request.valid();
 }
 
@@ -28,14 +28,14 @@ bool ManagerApplyTerminalOutcomeDTO::valid() const noexcept {
   const bool has_any_success_evidence =
       candidate_projection_revision.has_value() ||
       publication_receipt_digest.has_value() ||
-      scene_finalized_digest.has_value() ||
+      scene_completion_digest.has_value() ||
       fence_released_digest.has_value();
   const bool has_complete_success_evidence =
       candidate_projection_revision.has_value() &&
       candidate_projection_revision->valid() &&
       publication_receipt_digest.has_value() &&
-      !publication_receipt_digest->empty() && scene_finalized_digest.has_value() &&
-      !scene_finalized_digest->empty() && fence_released_digest.has_value() &&
+      !publication_receipt_digest->empty() && scene_completion_digest.has_value() &&
+      !scene_completion_digest->empty() && fence_released_digest.has_value() &&
       !fence_released_digest->empty();
   if (state == ManagerApplyTerminalOutcomeState::kSucceeded) {
     // A success is published exactly once: it carries the Finalize, publication

@@ -294,10 +294,6 @@ def create_headless_router(
                 detail={"code": error.code, "message": str(error)},
             ) from error
 
-    @router.get("/api/scenarios")
-    def scenarios() -> dict[str, Any]:
-        return _call(client.scenarios)
-
     @router.get("/api/scenarios/current")
     def current_scenario() -> dict[str, Any]:
         try:

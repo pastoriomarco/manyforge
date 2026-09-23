@@ -431,7 +431,7 @@ def load_strict_json_yaml_bytes(raw: bytes, *, source: str) -> dict[str, Any]:
             for token in yaml.scan(text, Loader=_StrictJsonLoader)
         ):
             raise StrictArtifactError(
-                f"{artifact_path}: YAML directives are forbidden"
+                f"{source}: YAML directives are forbidden"
             )
         value = yaml.load(text, Loader=_StrictJsonLoader)
     except StrictArtifactError:

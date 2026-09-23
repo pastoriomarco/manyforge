@@ -26,6 +26,7 @@ function componentOverview(): ComposerHeadlessState['componentOverview'] {
     userMessage: 'Current.',
     capabilities: ['Observe / Render', 'Plan / Preview', 'Execute / Control'],
     components: [],
+    maintenanceOperation: null,
     basis: {
       runtimeProjectionOwnerEpoch: null,
       runtimeProjectionGeneration: null,

@@ -146,30 +146,11 @@ to_string(ProjectionHealthState state) noexcept {
   return false;
 }
 
-/// The staged fields are one atomic optional tuple. Keeping them in one value
-/// prevents partial presence from being representable.
-struct ProjectionStagedCandidateDTO final {
-  ApplyId apply_id;
-  ApplyGeneration apply_generation;
-  ProjectionStageGeneration projection_stage_generation;
-  ProjectionRevisionDTO candidate_projection_revision;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero() &&
-           projection_stage_generation.nonzero() &&
-           candidate_projection_revision.valid();
-  }
-
-  friend bool operator==(const ProjectionStagedCandidateDTO&,
-                         const ProjectionStagedCandidateDTO&) = default;
-};
-
 struct ProjectionHealthDTO final {
   ProjectionNativeRuntimeBindingDTO native_runtime_binding;
   std::uint64_t source_sequence;
   ProjectionHealthState state;
   std::optional<ProjectionRevisionDTO> active_projection_revision;
-  std::optional<ProjectionStagedCandidateDTO> staged_candidate;
   std::optional<std::uint64_t> native_projection_generation;
   std::optional<ContentDigest> projection_content_digest;
   std::optional<ErrorDTO> error;
@@ -179,7 +160,6 @@ struct ProjectionHealthDTO final {
            IsKnownProjectionHealthState(state) &&
            (!active_projection_revision.has_value() ||
             active_projection_revision->valid()) &&
-           (!staged_candidate.has_value() || staged_candidate->valid()) &&
            (!native_projection_generation.has_value() ||
             *native_projection_generation != 0U) &&
            (!projection_content_digest.has_value() ||
@@ -195,25 +175,8 @@ struct ProjectionHealthDTO final {
     return valid() && target.valid() &&
            state == ProjectionHealthState::kHealthy && !error.has_value() &&
            active_projection_revision.has_value() &&
-           *active_projection_revision == target &&
-           !staged_candidate.has_value();
+           *active_projection_revision == target;
   }
-};
-
-struct NamedApplyProjectionSetSourceDTO final {
-  ApplyId apply_id;
-  ApplyGeneration apply_generation;
-  ProjectionStageGeneration projection_stage_generation;
-  ProjectionRevisionDTO candidate_projection_revision;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero() &&
-           projection_stage_generation.nonzero() &&
-           candidate_projection_revision.valid();
-  }
-
-  friend bool operator==(const NamedApplyProjectionSetSourceDTO&,
-                         const NamedApplyProjectionSetSourceDTO&) = default;
 };
 
 struct BootstrapProjectionSetSourceDTO final {
@@ -230,9 +193,23 @@ struct BootstrapProjectionSetSourceDTO final {
                          const BootstrapProjectionSetSourceDTO&) = default;
 };
 
+struct MaintenanceProjectionSetSourceDTO final {
+  ApplyId apply_id;
+  ApplyGeneration apply_generation;
+  ProjectionRevisionDTO target_projection_revision;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return !apply_id.empty() && apply_generation.nonzero() &&
+           target_projection_revision.valid();
+  }
+
+  friend bool operator==(const MaintenanceProjectionSetSourceDTO &,
+                         const MaintenanceProjectionSetSourceDTO &) = default;
+};
+
 using RequiredNativeProjectionSetSourceDTO =
-    std::variant<NamedApplyProjectionSetSourceDTO,
-                 BootstrapProjectionSetSourceDTO>;
+    std::variant<BootstrapProjectionSetSourceDTO,
+                 MaintenanceProjectionSetSourceDTO>;
 
 struct ProjectionAggregateHealthDTO final {
   RequiredNativeProjectionSetSourceDTO required_native_set_source;
@@ -282,19 +259,6 @@ struct ProjectionAggregateHealthDTO final {
     return true;
   }
 
-  [[nodiscard]] bool matches_named_apply(
-      const ApplyId& apply_id, ApplyGeneration apply_generation,
-      ProjectionStageGeneration stage_generation,
-      const ProjectionRevisionDTO& candidate_revision) const noexcept {
-    const auto* source =
-        std::get_if<NamedApplyProjectionSetSourceDTO>(
-            &required_native_set_source);
-    return valid() && source != nullptr && source->apply_id == apply_id &&
-           source->apply_generation == apply_generation &&
-           source->projection_stage_generation == stage_generation &&
-           source->candidate_projection_revision == candidate_revision;
-  }
-
   [[nodiscard]] bool matches_bootstrap(
       const BootstrapId& bootstrap_id,
       BootstrapGeneration bootstrap_generation,
@@ -306,6 +270,17 @@ struct ProjectionAggregateHealthDTO final {
            source->bootstrap_id == bootstrap_id &&
            source->bootstrap_generation == bootstrap_generation &&
            source->canonical_empty_target == target;
+  }
+
+  [[nodiscard]] bool matches_maintenance(
+      const ApplyId &apply_id, ApplyGeneration apply_generation,
+      const ProjectionRevisionDTO &target) const noexcept {
+    const auto *source =
+        std::get_if<MaintenanceProjectionSetSourceDTO>(
+            &required_native_set_source);
+    return valid() && source != nullptr && source->apply_id == apply_id &&
+           source->apply_generation == apply_generation &&
+           source->target_projection_revision == target;
   }
 };
 

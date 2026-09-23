@@ -44,9 +44,6 @@ inline constexpr std::string_view kBootstrapIdPrefix = "bootstrap-";
 inline constexpr std::string_view kMaterializationDigestDomain =
     "manyforge.component-manager.canonical-empty."
     "private-materialization.v1";
-inline constexpr std::string_view kRetiredSurfacesDigestDomain =
-    "manyforge.component-manager.canonical-empty."
-    "retired-managed-command-surfaces.v1";
 
 [[noreturn]] void Fail(const std::string& detail) {
   throw CanonicalEmptyBootstrapCoordinatorError(detail);
@@ -289,12 +286,6 @@ ActiveBundlePublicationRequestDTO PublicationRequest(
           intent,
           target.canonical_empty_target,
           "native_materialization_count"),
-      BootstrapSemanticDigest(
-          kRetiredSurfacesDigestDomain,
-          admission,
-          intent,
-          target.canonical_empty_target,
-          "retired_managed_command_surface_count"),
   };
   if (!request.valid()) {
     Fail("canonical-empty publication request is invalid");

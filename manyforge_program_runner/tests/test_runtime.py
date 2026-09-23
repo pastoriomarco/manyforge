@@ -141,25 +141,19 @@ class _Headless:
 
     def __init__(self) -> None:
         self.applied_reads = 0
-        self.selection_reads = 0
         self.registered_captures: list[dict[str, Any]] = []
 
     def program_applied(self) -> dict[str, Any]:
         self.applied_reads += 1
         return {
             "scenario_id": "cell-pick",
-            "scenario_catalog_revision": _DIGEST_A,
+            "source_document_digest": _DIGEST_A,
             "program_revision": _DIGEST_A,
             "source": {
                 "record_digest": _DIGEST_B,
                 "source_generation": 1,
             },
         }
-
-    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
-        self.selection_reads += 1
-        assert scenario_id == "cell-pick"
-        return {"scenario_id": scenario_id, "program_revision": _DIGEST_A}
 
     def identity(self) -> dict[str, Any]:
         return {
@@ -213,7 +207,7 @@ class _Snapshot:
             "program_run_id": program_run_id,
             "applied_record_digest": _DIGEST_B,
             "scenario_id": "scenario.1",
-            "scenario_catalog_revision": _DIGEST_A,
+            "source_document_digest": _DIGEST_A,
             "program_id": "program.1",
             "program_revision": _DIGEST_A,
             "program_binding_id": _DIGEST_B,
@@ -1471,7 +1465,7 @@ def _start_request(*, request_id: str = "request.start.1") -> ProgramRunStartReq
             "source_label": "operator_ui",
             "correlation_id": None,
             "scenario_id": "cell-pick",
-            "scenario_catalog_revision": _DIGEST_A,
+            "source_document_digest": _DIGEST_A,
             "expected_applied_record_digest": _DIGEST_B,
             "draft_program_revision": _DIGEST_A,
             "expected_admission_generation": 1,
@@ -2419,7 +2413,6 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     assert host.start_admissions == [admitted]
     assert host.scheduled == [started["capture"]["program_run_id"]]
     assert headless.applied_reads == 2
-    assert headless.selection_reads == 1
     assert len(joins) == 1
     assert len(headless.registered_captures) == 1
     assert "table" not in headless.registered_captures[0]
@@ -2436,7 +2429,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             ProgramRunStartRequest.model_validate(
                 {
                     **request.model_dump(mode="json"),
-                    "scenario_catalog_revision": "sha256:" + "c" * 64,
+                    "source_document_digest": "sha256:" + "c" * 64,
                 }
             )
         )
@@ -4931,19 +4924,10 @@ def test_draft_applied_mismatch_is_rechecked_without_retained_receipts(
     admission = InterleavedAdmission()
 
     class InterleavedHeadless(_Headless):
-        draft_revision = _DIGEST_B
-
         def program_applied(self) -> dict[str, Any]:
             events.append("applied")
-            return super().program_applied()
-
-        def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
-            events.append("draft")
             admission.generation = 2
-            return {
-                "scenario_id": scenario_id,
-                "program_revision": self.draft_revision,
-            }
+            return super().program_applied()
 
     headless = InterleavedHeadless()
     monkeypatch.setattr(
@@ -4979,11 +4963,10 @@ def test_draft_applied_mismatch_is_rechecked_without_retained_receipts(
     with pytest.raises(ProgramRunnerError) as rechecked:
         runtime.start_run(request)
     assert rechecked.value.code == "stale_generation"
-    headless.draft_revision = _DIGEST_A
     with pytest.raises(ProgramRunnerError) as still_stale:
         runtime.start_run(_start_request(request_id="request.start.capacity"))
     assert still_stale.value.code == "stale_generation"
-    assert events == ["generation", "applied", "draft", "generation", "generation"]
+    assert events == ["generation", "applied", "generation", "generation"]
     assert admission.claims == []
     assert journal._database.execute(  # noqa: SLF001
         "SELECT COUNT(*) FROM program_cycle_inflight_commands"
@@ -5200,7 +5183,7 @@ def test_runtime_rejects_a_stale_applied_selection_before_tree_admission(
         "program_applied",
         lambda: {
             "scenario_id": "another-scenario",
-            "scenario_catalog_revision": _DIGEST_A,
+            "source_document_digest": _DIGEST_A,
             "source": {"record_digest": _DIGEST_B},
         },
     )
@@ -5210,7 +5193,6 @@ def test_runtime_rejects_a_stale_applied_selection_before_tree_admission(
         runtime.start_run(_start_request())
     assert stale.value.code == "program_run_applied_selection_stale"
     assert host.start_admissions == []
-    assert headless.selection_reads == 0
     runtime.shutdown()
 
 
@@ -5248,10 +5230,9 @@ def test_node_availability_uses_supplied_exact_facts_without_headless_callback(
         ),
     )
 
-    def admit(applied: object, selection: object, **kwargs: object) -> object:
+    def admit(applied: object, **kwargs: object) -> object:
         captured.update(
             applied=applied,
-            selection=selection,
             kwargs=kwargs,
         )
         return admitted
@@ -5278,17 +5259,13 @@ def test_node_availability_uses_supplied_exact_facts_without_headless_callback(
         {
             "applied": {
                 "scenario_id": "cell-pick",
-                "scenario_catalog_revision": _DIGEST_A,
+                "source_document_digest": _DIGEST_A,
                 "retained_bundle_id": _DIGEST_A,
                 "graph_revision": _DIGEST_A,
                 "source": {
                     "record_digest": _DIGEST_B,
                     "source_generation": 7,
                 },
-            },
-            "selection": {
-                "scenario_id": "cell-pick",
-                "program_revision": _DIGEST_A,
             },
         }
     )
@@ -5310,17 +5287,15 @@ def test_node_availability_uses_supplied_exact_facts_without_headless_callback(
     result = runtime.node_availability(request)
 
     assert captured["applied"] is request.applied
-    assert captured["selection"] is request.selection
     assert captured["kwargs"] == {
         "expected_scenario_id": "cell-pick",
-        "expected_scenario_catalog_revision": _DIGEST_A,
+        "expected_source_document_digest": _DIGEST_A,
         "environment": runtime._environment,  # noqa: SLF001
         "owner_availability": runtime._owner_availability,  # noqa: SLF001
     }
     assert result["availability"] == availability
     assert result["source"]["program_revision"] == _DIGEST_A
     assert headless.applied_reads == 0
-    assert headless.selection_reads == 0
     runtime.shutdown()
 
 

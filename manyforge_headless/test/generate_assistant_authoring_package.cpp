@@ -4,7 +4,6 @@
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
-#include <manyforge_deployment/scenario_catalog.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <stdexcept>
 #include <string>
@@ -199,29 +198,6 @@ void PublishProgramScenario(
   deployment::FilesystemProgramBindingRepository bindings(package_root);
   static_cast<void>(programs.put_if_absent(program, *bundle));
   static_cast<void>(bindings.put_if_absent(binding, *bundle, *model_map));
-  const auto catalog = deployment::build_scenario_catalog({
-      deployment::ScenarioCatalogRowDTO{
-          .scenario_id = "program_apply_fixture",
-          .description = "Native Program Apply fixture",
-          .aliases = {},
-          .deployment_artifact_id = bundle->value().deployment_artifact_id,
-          .deployment_revision = bundle->value().deployment_revision,
-          .retained_bundle_id = bundle->retained_bundle_id(),
-          .program_binding_id = binding->program_binding_id(),
-          .deployment_compatibility =
-              deployment::ScenarioDeploymentCompatibilityDTO{"manyforge-only",
-                                                             {}},
-          .assistant_mode = deployment::ScenarioAssistantMode::kRequired,
-          .typed_parameter_overrides =
-              deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
-      },
-  });
-  deployment::FilesystemScenarioCatalogRepository scenarios(package_root,
-                                                            "maintained");
-  if (scenarios.compare_and_set(std::nullopt, catalog) !=
-      deployment::ScenarioCatalogPublishResult::kPublished) {
-    throw std::logic_error("Program Apply fixture catalog was not published");
-  }
 }
 
 } // namespace

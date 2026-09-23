@@ -9,6 +9,7 @@
 #include <manyforge_core/ports/iscene_authority.hpp>
 #include <manyforge_core/ports/iscene_candidate_preview.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
+#include <manyforge_core/types/projection_bootstrap.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -27,8 +28,8 @@ inline constexpr std::string_view kCanonicalEmptySceneStoreSchemaId =
     "manyforge.internal.logical-scene.i4.v2";
 inline constexpr std::int64_t kCanonicalEmptySceneStoreSchemaVersion = 2;
 inline constexpr std::string_view kLogicalSceneStoreSchemaId =
-    "manyforge.internal.logical-scene.ui6i.v7";
-inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 7;
+    "manyforge.internal.logical-scene.ua4.v8";
+inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 8;
 inline constexpr std::int64_t kCanonicalEmptySceneSqliteApplicationId =
     1296454467; // "MFSC"
 inline constexpr std::size_t kMaximumSceneStoreIdentifierBytes = 256U;
@@ -36,10 +37,9 @@ inline constexpr std::int64_t kMaximumSceneStoreDatabasePageImageBytes =
     64LL * 1024LL * 1024LL;
 inline constexpr std::int64_t kMaximumSceneStoreWalBytes =
     16LL * 1024LL * 1024LL;
-inline constexpr std::size_t kMaximumNamedApplySceneStages = 256U;
-inline constexpr std::size_t kMaximumNativeProjectionTransitionRows = 256U;
-inline constexpr std::size_t kMaximumNativeProjectionRecoveries = 256U;
-inline constexpr std::size_t kMaximumRetainedNativeProjectionRecoveries = 2U;
+inline constexpr std::size_t kMaximumMigratedStructuralCompletions = 256U;
+inline constexpr std::size_t kMaximumNativeProjectionBindings = 256U;
+inline constexpr std::size_t kMaximumMaintenanceInitializations = 256U;
 inline constexpr std::size_t kMaximumLogicalSceneTransactions = 256U;
 inline constexpr std::size_t kMaximumLogicalSceneTransactionBytes =
     128U * 1024U;
@@ -84,10 +84,8 @@ enum class CanonicalEmptySceneBootstrapPhase {
   kAccepted,
   kReadyToPublish,
   kFinalized,
-  kNamedApplyStaged,
-  kNamedApplyActivated,
-  kNamedApplyDiscarded,
-  kNamedApplyFinalized,
+  kMaintenanceInitializing,
+  kMaintenanceCompleted,
 };
 
 [[nodiscard]] std::string_view
@@ -116,14 +114,7 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
   std::int64_t acceptance_row_count;
   std::int64_t rebuild_row_count;
   std::int64_t finalization_row_count;
-  std::int64_t named_apply_stage_count;
-  std::int64_t named_apply_activation_count;
-  std::int64_t named_apply_discard_count;
-  std::int64_t named_apply_finalization_count;
-  std::int64_t native_recovery_intent_count;
-  std::int64_t native_recovery_completion_count;
-  std::int64_t native_recovery_binding_count;
-  std::int64_t native_recovery_result_count;
+  std::int64_t migrated_structural_completion_count;
   std::int64_t transaction_intent_count;
   std::int64_t request_outcome_count;
   std::int64_t projection_attempt_count;
@@ -151,28 +142,23 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
 /// The publication-head read and this package's scene-database commit remain
 /// deliberately separate durable boundaries. Their ordering relies on the
 /// Manager port contract: Manager is the sole publication writer, and a later
-/// publication cannot begin until the scene owner has admitted and quiesced
-/// its corresponding transition. During initial bootstrap no successor can be
-/// admitted before this Finalize completes.
+/// publication cannot begin until the scene owner has admitted and completed
+/// its corresponding maintenance initialization. During initial bootstrap no
+/// successor can be admitted before this Finalize completes.
 ///
 /// With an independently verified retained-bundle source and an injected
-/// projection resolver, the same owner admits zero- or nonzero-native named
-/// Apply transitions, owns their immutable capture and forward-only native
-/// handoff, and appends current-binding recovery evidence when a finalized
-/// Manager-managed host is replaced. N5b supplies durable compare-and-commit
-/// logical-scene transactions, immutable reads, exact replay, and projection
-/// acknowledgement. N5c-c3 activates retained component/passive-frame
-/// resolution, owner-normalized carried-object attachment/detachment, focused
-/// immutable projection leases, and configured-versus-derived collision
-/// policy projection. N5c-d adds bounded sustained scene transactions and
-/// runtime-replacement recovery without transferring an old host's immutable
-/// leases to its replacement. Remote/ROS adapters and broader Program
-/// workflows remain gated to their named later slices. This owner implements
-/// no compatibility wrapper, robot command, authorization layer, or legacy
-/// SceneAuthority fallback.
+/// projection resolver, the same owner initializes the candidate-only native
+/// set during an admitted maintenance window. It also owns durable
+/// compare-and-commit logical-scene transactions, immutable reads, exact
+/// replay, projection acknowledgement, retained component/passive-frame
+/// resolution, carried-object attachment/detachment, immutable projection
+/// leases, and collision-policy projection. It does not retain or resume the
+/// removed predecessor/candidate Stage/Activate/Finalize protocol. This owner
+/// implements no compatibility wrapper, robot command, authorization layer,
+/// or legacy SceneAuthority fallback.
 class CanonicalEmptySceneOwner final
     : public manyforge::core::IManagerSceneProjectionBootstrapPort,
-      public manyforge::core::IManagerSceneProjectionHandoffPort,
+      public manyforge::core::IManagerSceneProjectionMaintenancePort,
       public manyforge::core::ISceneAuthority,
       public manyforge::core::ISceneCandidatePreview {
 public:
@@ -249,25 +235,21 @@ public:
   FinalizeProjectionBootstrap(
       const manyforge::core::ProjectionBootstrapFinalizeDTO &request) override;
 
-  [[nodiscard]] manyforge::core::ProjectionApplyStageResultDTO
-  StageCandidateProjection(
-      const manyforge::core::ProjectionApplyStageDTO &request) override;
-  [[nodiscard]] manyforge::core::ProjectionApplyActivationResultDTO
-  ActivateStagedProjection(
-      const manyforge::core::ProjectionApplyActivationDTO &request) override;
-  [[nodiscard]] manyforge::core::ProjectionApplyDiscardResultDTO
-  DiscardStagedProjection(
-      const manyforge::core::ProjectionApplyDiscardDTO &request) override;
-  [[nodiscard]] manyforge::core::ProjectionApplyFinalizeResultDTO
-  FinalizeProjectionTransition(
-      const manyforge::core::ProjectionApplyFinalizeDTO &request) override;
-  [[nodiscard]] manyforge::core::ProjectionApplyStatusDTO ProjectionApplyStatus(
-      const manyforge::core::ProjectionApplyStatusQueryDTO &query)
-      const override;
-  [[nodiscard]] manyforge::core::ActiveProjectionRuntimeRecoveryResultDTO
-  ReconcileActiveProjectionRuntimes(
-      const manyforge::core::ActiveProjectionRuntimeSetDTO &runtime_set)
+  [[nodiscard]]
+  manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  BeginMaintenanceInitialization(
+      const manyforge::core::ProjectionMaintenanceInitializationRequestDTO
+          &request) override;
+  [[nodiscard]]
+  manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  CompleteMaintenanceInitialization(
+      const manyforge::core::ProjectionMaintenanceCompletionDTO &completion)
       override;
+  [[nodiscard]] std::optional<
+      manyforge::core::ProjectionMaintenanceInitializationStatusDTO>
+  ReadMaintenanceInitialization(
+      const manyforge::core::ProjectionMaintenanceInitializationQueryDTO
+          &query) const override;
   [[nodiscard]] manyforge::core::ProjectionAggregateHealthDTO
   ActiveProjectionHealth() const override;
 
@@ -301,10 +283,10 @@ public:
   GetObjectPose(
       const manyforge::core::SceneResourceId &scene_resource_id) const override;
   /// Returns the current immutable logical-scene snapshot after bootstrap has
-  /// established a real active projection. During a named Apply transition
-  /// this remains the frozen predecessor snapshot until Finalize selects the
-  /// candidate projection. Before bootstrap Finalize there is no public
-  /// logical-scene truth and the result is empty.
+  /// established a real active projection. During maintenance initialization
+  /// the snapshot remains immutable and admission stays closed until the
+  /// completion record is durable. Before bootstrap Finalize there is no
+  /// public logical-scene truth and the result is empty.
   [[nodiscard]] std::optional<manyforge::core::LogicalSceneSnapshotRoot>
   ReadActiveSnapshot() const;
   [[nodiscard]] CanonicalEmptySceneStoreIntegrityReport VerifyIntegrity() const;

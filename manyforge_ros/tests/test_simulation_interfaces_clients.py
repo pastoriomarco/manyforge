@@ -152,7 +152,7 @@ def _program_context() -> ProgramRunPortContext:
         program_run_id="run.simulation.transport",
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="isaac-cell",
-        scenario_catalog_revision=_DIGEST_A,
+        source_document_digest=_DIGEST_A,
         program_id="simulation_transport",
         program_revision=_DIGEST_B,
         program_binding_id=_DIGEST_C,

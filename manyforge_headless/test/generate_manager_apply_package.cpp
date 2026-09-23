@@ -4,7 +4,6 @@
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
-#include <manyforge_deployment/scenario_catalog.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <manyforge_lite6_product/lifecycle_profile.hpp>
 
@@ -166,7 +165,7 @@ void WriteMetadata(
 
 struct ProgramPublication final {
   core::ProgramBindingId binding_id;
-  core::ScenarioCatalogRevision catalog_revision;
+  core::ProgramRevision program_revision;
 };
 
 [[nodiscard]] std::string ProgramBytes(const deployment::RetainedBundle &bundle,
@@ -350,32 +349,7 @@ struct ProgramPublication final {
   deployment::FilesystemProgramBindingRepository bindings(package_root);
   static_cast<void>(programs.put_if_absent(program, *bundle));
   static_cast<void>(bindings.put_if_absent(binding, *bundle, *model_map));
-  const auto catalog = deployment::build_scenario_catalog({
-      deployment::ScenarioCatalogRowDTO{
-          .scenario_id = "program_apply_fixture",
-          .description = "Assistant and native Program Apply fixture",
-          .aliases = {},
-          .deployment_artifact_id = bundle->value().deployment_artifact_id,
-          .deployment_revision = bundle->value().deployment_revision,
-          .retained_bundle_id = bundle->retained_bundle_id(),
-          .program_binding_id = binding->program_binding_id(),
-          .deployment_compatibility =
-              deployment::ScenarioDeploymentCompatibilityDTO{"manyforge-only",
-                                                             {}},
-          .assistant_mode = operator_confirmation
-                                ? deployment::ScenarioAssistantMode::kForbidden
-                                : deployment::ScenarioAssistantMode::kRequired,
-          .typed_parameter_overrides =
-              deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
-      },
-  });
-  deployment::FilesystemScenarioCatalogRepository scenarios(package_root,
-                                                            "maintained");
-  if (scenarios.compare_and_set(std::nullopt, catalog) !=
-      deployment::ScenarioCatalogPublishResult::kPublished) {
-    throw std::logic_error("assistant-native scenario catalog not published");
-  }
-  return {binding->program_binding_id(), catalog->revision()};
+  return {binding->program_binding_id(), program->value().program_revision};
 }
 
 void WriteAssistantNativeMetadata(
@@ -406,8 +380,8 @@ void WriteAssistantNativeMetadata(
                physical.value().cell_graph.graph_revision.value())},
           {"program_binding_id",
            deployment::CanonicalValue(program.binding_id.value())},
-          {"scenario_catalog_revision",
-           deployment::CanonicalValue(program.catalog_revision.value())},
+          {"program_revision",
+           deployment::CanonicalValue(program.program_revision.value())},
       }));
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);
   if (!stream) {
@@ -516,50 +490,6 @@ int main(int argc, char **argv) {
       return 0;
     }
 
-    const auto catalog = deployment::build_scenario_catalog({
-        deployment::ScenarioCatalogRowDTO{
-            .scenario_id = "manager_apply_physical_recovery",
-            .description =
-                std::string("Physical managed composition recovery proof"),
-            .aliases = {},
-            .deployment_artifact_id =
-                physical_candidate->value().deployment_artifact_id,
-            .deployment_revision =
-                physical_candidate->value().deployment_revision,
-            .retained_bundle_id = physical_candidate->retained_bundle_id(),
-            .program_binding_id = core::ProgramBindingId(
-                physical_candidate->retained_bundle_id().value()),
-            .deployment_compatibility =
-                deployment::ScenarioDeploymentCompatibilityDTO{"manyforge-only",
-                                                               {}},
-            .assistant_mode = deployment::ScenarioAssistantMode::kForbidden,
-            .typed_parameter_overrides = deployment::CanonicalValue(
-                deployment::CanonicalValue::Object{}),
-        },
-        deployment::ScenarioCatalogRowDTO{
-            .scenario_id = "manager_apply_runtime_only",
-            .description = std::string("Runtime-only production Apply proof"),
-            .aliases = {},
-            .deployment_artifact_id = candidate->value().deployment_artifact_id,
-            .deployment_revision = candidate->value().deployment_revision,
-            .retained_bundle_id = candidate->retained_bundle_id(),
-            .program_binding_id =
-                core::ProgramBindingId(candidate->retained_bundle_id().value()),
-            .deployment_compatibility =
-                deployment::ScenarioDeploymentCompatibilityDTO{"manyforge-only",
-                                                               {}},
-            .assistant_mode = deployment::ScenarioAssistantMode::kForbidden,
-            .typed_parameter_overrides = deployment::CanonicalValue(
-                deployment::CanonicalValue::Object{}),
-        },
-    });
-    deployment::FilesystemScenarioCatalogRepository scenario_catalog(
-        arguments.package_root, "maintained");
-    if (scenario_catalog.compare_and_set(std::nullopt, catalog) !=
-        deployment::ScenarioCatalogPublishResult::kPublished) {
-      throw std::logic_error(
-          "Manager Apply fixture scenario catalog was not published");
-    }
     WriteMetadata(arguments.metadata_path, admission, *candidate,
                   *physical_candidate, admission_filename);
     return 0;

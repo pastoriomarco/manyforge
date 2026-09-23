@@ -28,9 +28,9 @@ from manyforge_composer.backend.program_artifacts import (
 from manyforge_composer.backend import routes_draft
 from manyforge_composer.backend.authoring_admission import LocalAuthoringCommit
 from manyforge_composer.backend.routes_draft import (
-    _apply_program,
     _assistant_proposal_operations,
     _observed_scene_arguments,
+    _require_apply_ready,
 )
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
@@ -942,14 +942,7 @@ def test_node_policy_success_with_imported_node_a_skills_is_closed_and_headless_
     assert headless.calls == []
 
     with pytest.raises(DraftSessionError) as direct_apply:
-        _apply_program(
-            state,
-            program=program,
-            scenario_id="cell-pick",
-            scenario_catalog_revision="sha256:" + "7" * 64,
-            expected_applied_record_digest=None,
-            authoring_claim={},
-        )
+        _require_apply_ready(program)
     assert direct_apply.value.status_code == 409
     assert direct_apply.value.code == "composer_policy_skill_referent_unavailable"
     assert headless.calls == []
@@ -1164,11 +1157,6 @@ def test_routes_reject_unsupported_mutation_malformed_body_and_unavailable_load(
         },
     )
     assert malformed.status_code == 422
-    legacy_load = client.post("/api/program/load", json={})
-    assert legacy_load.status_code == 410
-    assert legacy_load.json()["detail"]["code"] == (
-        "program_load_removed_use_scenario_load"
-    )
     invalid_save_as = client.post(
         "/api/program/save-as",
         json={**_fence(workspace), "path": "/", "confirmOverwrite": False},

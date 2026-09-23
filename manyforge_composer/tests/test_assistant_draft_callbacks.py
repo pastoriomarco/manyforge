@@ -378,7 +378,7 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
     assert state.draft_session.snapshot()["saved"] is False
     assert state.authoring_admission is not None
     assert not hasattr(state.authoring_admission, "_snapshots")
-    assert state.authoring_admission._journal.retained_workspace() is None
+    assert not hasattr(state.authoring_admission, "_journal")
 
     second_body = deepcopy(body)
     second_body["expectedDraftRevision"] = 2

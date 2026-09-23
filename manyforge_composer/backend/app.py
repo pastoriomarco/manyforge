@@ -259,7 +259,6 @@ def create_app(
         "/api/program/runs",
         "/api/program/save",
         "/api/program/validate",
-        "/api/scenarios/load",
         "/api/scenario-documents/",
     ):
         app.add_middleware(

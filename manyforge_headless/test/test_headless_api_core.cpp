@@ -7,7 +7,6 @@
 #include <filesystem>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
-#include <manyforge_deployment/scenario_catalog.hpp>
 #include <memory>
 #include <optional>
 #include <set>
@@ -48,7 +47,6 @@ public:
     path_ = created;
     std::filesystem::create_directory(publications());
     std::filesystem::create_directory(artifacts());
-    std::filesystem::create_directory(program_selection_state());
   }
 
   ~TemporaryDirectory() {
@@ -64,9 +62,6 @@ public:
   }
   [[nodiscard]] std::filesystem::path artifacts() const {
     return path_ / "artifacts";
-  }
-  [[nodiscard]] std::filesystem::path program_selection_state() const {
-    return path_ / "program-selection-state";
   }
   [[nodiscard]] std::filesystem::path history() const {
     return path_ / "history.sqlite3";
@@ -125,7 +120,6 @@ Config(const TemporaryDirectory &directory, std::string owner_epoch,
       directory.publications(),
       std::move(package_root),
       directory.artifacts(),
-      directory.program_selection_state(),
       MANYFORGE_HEADLESS_TEST_NODE_CATALOG,
       MANYFORGE_HEADLESS_TEST_NODE_ENVIRONMENT_MANIFEST,
       MANYFORGE_HEADLESS_TEST_ALARM_CATALOG,
@@ -1115,287 +1109,6 @@ TEST(HeadlessApiCore,
   }
   EXPECT_TRUE(Array(source_model, "occurrences").empty());
   EXPECT_TRUE(Array(source_model, "targets").empty());
-}
-
-TEST(HeadlessApiCore,
-     ServesTheExactVerifiedScenarioCatalogWithoutRuntimeSelection) {
-  TemporaryDirectory directory;
-  directory.CreateRetentionSkeleton();
-  const auto catalog = deployment::build_scenario_catalog({
-      deployment::ScenarioCatalogRowDTO{
-          .scenario_id = "cell-pick",
-          .description = "Exact maintained scenario",
-          .aliases = {"pick"},
-          .deployment_artifact_id = core::DeploymentArtifactId("cell_a"),
-          .deployment_revision = core::DeploymentRevision(Digest('1')),
-          .retained_bundle_id = core::RetainedBundleId(Digest('2')),
-          .program_binding_id = core::ProgramBindingId(Digest('3')),
-          .deployment_compatibility =
-              deployment::ScenarioDeploymentCompatibilityDTO{"manyforge-only",
-                                                             {}},
-          .assistant_mode = deployment::ScenarioAssistantMode::kForbidden,
-          .typed_parameter_overrides = CanonicalValue(CanonicalValue::Object{}),
-      },
-  });
-  {
-    deployment::FilesystemScenarioCatalogRepository repository(directory.path(),
-                                                               "maintained");
-    ASSERT_EQ(repository.compare_and_set(std::nullopt, catalog),
-              deployment::ScenarioCatalogPublishResult::kPublished);
-  }
-  PublishHealthySources(directory, "open");
-  HeadlessApiCore core(Config(directory, "api.epoch.1", directory.path()),
-                       Clocks());
-
-  const auto projection = core.ScenarioCatalogProjection();
-  EXPECT_EQ(Text(projection, "api_version"),
-            deployment::kScenarioCatalogApiVersion);
-  EXPECT_EQ(Text(projection, "scenario_catalog_revision"),
-            catalog->revision().value());
-  const auto &scenarios = Array(projection, "scenarios");
-  ASSERT_EQ(scenarios.size(), 1U);
-  EXPECT_EQ(Text(scenarios.front(), "scenario_id"), "cell-pick");
-  EXPECT_EQ(Text(scenarios.front(), "program_binding_id"), Digest('3'));
-
-  try {
-    static_cast<void>(core.ScenarioProgramSelection("pick"));
-    FAIL() << "presentation alias selected a Program closure";
-  } catch (const OperatorAlarmError &error) {
-    EXPECT_EQ(error.code(), "scenario_program_selection_unavailable");
-    EXPECT_NE(std::string(error.what()).find("exact canonical"),
-              std::string::npos);
-  }
-}
-
-TEST(HeadlessApiCore, PackageReadsRemainPinnedToTheStartupDirectoryDescriptor) {
-  TemporaryDirectory directory;
-  const auto package = directory.path() / "selected-package";
-  const auto retained_package = directory.path() / "retained-package";
-  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT, package,
-                        std::filesystem::copy_options::recursive);
-
-  const deployment::FilesystemScenarioApplyCandidateSource scenarios(
-      package, "maintained");
-  const auto selection =
-      scenarios.LoadExactProgramSelection("program_apply_fixture");
-  const deployment::FilesystemVerifiedRetainedBundleSource bundles(package);
-  const auto bundle = bundles.get_verified(selection.retained_bundle_id);
-  ASSERT_NE(bundle, nullptr);
-  const auto cell_id = bundle->value().cell_graph.cell_id.value();
-
-  AtomicSourceSnapshotChannel manager(directory.publications(),
-                                      "manager-source.json");
-  static_cast<void>(
-      manager.Publish("component_manager", "component-manager." + cell_id,
-                      "manager.epoch.1", 1, ManagerPayloadFor(*bundle)));
-  auto config = Config(directory, "api.epoch.1", package);
-  config.cell_id = cell_id;
-  HeadlessApiCore core(std::move(config), Clocks());
-  std::filesystem::rename(package, retained_package);
-  std::filesystem::create_directory(package);
-
-  // First use verifies the Manager-selected retained bundle through the
-  // descriptor and exercises the node-environment reader's anchored "/."
-  // spelling.
-  const auto environment = core.NodeEnvironmentProjection();
-  EXPECT_EQ(Text(environment, "retained_bundle_id"),
-            selection.retained_bundle_id.value());
-  EXPECT_EQ(Text(environment, "graph_revision"),
-            selection.graph_revision.value());
-  EXPECT_EQ(Text(environment, "environment_digest"),
-            selection.node_environment_digest.value());
-
-  const auto catalog = core.ScenarioCatalogProjection();
-  EXPECT_EQ(Text(catalog, "scenario_catalog_revision"),
-            selection.scenario_catalog_revision.value());
-  const auto &catalog_scenarios = Array(catalog, "scenarios");
-  ASSERT_EQ(catalog_scenarios.size(), 1U);
-  EXPECT_EQ(Text(catalog_scenarios.front(), "scenario_id"),
-            selection.scenario_id);
-  EXPECT_EQ(Text(catalog_scenarios.front(), "retained_bundle_id"),
-            selection.retained_bundle_id.value());
-  EXPECT_EQ(Text(catalog_scenarios.front(), "program_binding_id"),
-            selection.program_binding_id.value());
-
-  const auto prepared = core.PrepareProgramApply(
-      selection.scenario_id, selection.scenario_catalog_revision.value(),
-      content_identity::canonical_json(selection.normalized_program_root));
-  EXPECT_EQ(Text(prepared, "retained_bundle_id"),
-            selection.retained_bundle_id.value());
-  EXPECT_EQ(Text(prepared, "graph_revision"), selection.graph_revision.value());
-  EXPECT_EQ(Text(prepared, "baseline_program_binding_id"),
-            selection.program_binding_id.value());
-  EXPECT_EQ(Text(prepared, "node_environment_digest"),
-            selection.node_environment_digest.value());
-
-  const auto source_model = core.SourceModelProjection();
-  EXPECT_EQ(Text(source_model, "retained_bundle_id"),
-            selection.retained_bundle_id.value());
-  EXPECT_EQ(Text(source_model, "graph_revision"),
-            selection.graph_revision.value());
-  const auto source_model_bytes =
-      content_identity::canonical_json(source_model);
-  EXPECT_NE(source_model_bytes.find(
-                "\"model_instance_id\":\"lite6_fixture_instance\""),
-            std::string::npos);
-  EXPECT_NE(source_model_bytes.find("\"component_id\":\"lite6_arm\""),
-            std::string::npos);
-
-  const auto viewer = core.ViewerModelUrdf();
-  EXPECT_EQ(viewer.retained_bundle_id().value(),
-            selection.retained_bundle_id.value());
-  EXPECT_EQ(viewer.graph_revision(), selection.graph_revision.value());
-  EXPECT_EQ(viewer.cell_id(), cell_id);
-  EXPECT_EQ(viewer.product_id().value(), "cell_viewer_model");
-  EXPECT_FALSE(viewer.bytes().empty());
-
-  EXPECT_TRUE(std::filesystem::is_directory(retained_package));
-  EXPECT_TRUE(std::filesystem::is_empty(package));
-}
-
-TEST(HeadlessApiCore,
-     SparseCandidateOverlayDoesNotShadowInstalledScenarioClosure) {
-  TemporaryDirectory directory;
-  const auto package = directory.path() / "installed-package";
-  const auto candidate = directory.path() / "candidate-package";
-  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT, package,
-                        std::filesystem::copy_options::recursive);
-  std::filesystem::create_directories(candidate / "retained-bundles" /
-                                      "sha256");
-
-  const deployment::FilesystemScenarioApplyCandidateSource installed(
-      package, "maintained");
-  const auto expected =
-      installed.LoadExactProgramSelection("program_apply_fixture");
-  std::filesystem::copy_file(package / "maintained.scenario-catalog.yaml",
-                             candidate / "maintained.scenario-catalog.yaml");
-  const auto bundle_name =
-      expected.retained_bundle_id.value().substr(7U) + ".json";
-  std::filesystem::copy_file(
-      package / "retained-bundles" / "sha256" / bundle_name,
-      candidate / "retained-bundles" / "sha256" / bundle_name);
-
-  // A generated candidate is a sparse overlay.  Reusing the installed bundle
-  // does not make the overlay the owner of an unchanged scenario's Program
-  // Binding and Program.
-  const deployment::FilesystemScenarioApplyCandidateSource overlaid(
-      package, "maintained", candidate);
-  const auto selected =
-      overlaid.LoadExactProgramSelection("program_apply_fixture");
-  EXPECT_EQ(selected.program_binding_id, expected.program_binding_id);
-  EXPECT_EQ(selected.program_revision, expected.program_revision);
-  EXPECT_EQ(selected.retained_bundle_id, expected.retained_bundle_id);
-  EXPECT_FALSE(std::filesystem::exists(candidate / "program-bindings"));
-
-  const auto active = overlaid.TryLoadExactProgramSelectionForActive(
-      "program_apply_fixture", expected.retained_bundle_id,
-      expected.graph_revision);
-  ASSERT_TRUE(active.has_value());
-  EXPECT_EQ(active->scenario_catalog_revision,
-            expected.scenario_catalog_revision);
-}
-
-TEST(HeadlessApiCore,
-     ProgramApplyDependsOnFreshManagerButNotUnrelatedSceneAvailability) {
-  TemporaryDirectory directory;
-  const auto package = directory.path() / "program-apply-package";
-  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT, package,
-                        std::filesystem::copy_options::recursive);
-  const deployment::FilesystemScenarioApplyCandidateSource scenarios(
-      package, "maintained");
-  const auto selection =
-      scenarios.LoadExactProgramSelection("program_apply_fixture");
-  const deployment::FilesystemVerifiedRetainedBundleSource bundles(package);
-  const auto bundle = bundles.get_verified(selection.retained_bundle_id);
-  ASSERT_NE(bundle, nullptr);
-
-  AtomicSourceSnapshotChannel manager(directory.publications(),
-                                      "manager-source.json");
-  const auto cell_id = bundle->value().cell_graph.cell_id.value();
-  static_cast<void>(
-      manager.Publish("component_manager", "component-manager." + cell_id,
-                      "manager.epoch.1", 1, ManagerPayloadFor(*bundle)));
-
-  auto config = Config(directory, "api.epoch.1", package);
-  config.cell_id = cell_id;
-  HeadlessApiCore core(std::move(config), Clocks());
-  EXPECT_FALSE(
-      std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
-
-  const auto prepared = core.PrepareProgramApply(
-      selection.scenario_id, selection.scenario_catalog_revision.value(),
-      content_identity::canonical_json(selection.normalized_program_root));
-  const auto applied =
-      core.CommitProgramApply(content_identity::canonical_json(prepared),
-                              std::nullopt, "authoring.epoch.1", "request.1");
-  EXPECT_EQ(Text(applied, "program_revision"),
-            selection.program_revision.value());
-
-  const auto manager_source = directory.publications() / "manager-source.json";
-  const auto withheld_manager =
-      directory.publications() / "manager-source.withheld";
-  std::filesystem::rename(manager_source, withheld_manager);
-  const auto replay = core.ReplayProgramApply(
-      selection.scenario_id, selection.scenario_catalog_revision.value(),
-      selection.program_id.value(), selection.program_revision.value(),
-      std::nullopt, "authoring.epoch.1", "request.1");
-  EXPECT_EQ(Member(replay, "preparation"), prepared);
-  EXPECT_EQ(Member(replay, "applied"), applied);
-  EXPECT_EQ(core.CommitProgramApply(content_identity::canonical_json(prepared),
-                                    std::nullopt, "authoring.epoch.1",
-                                    "request.1"),
-            applied);
-  try {
-    static_cast<void>(core.CommitProgramApply(
-        content_identity::canonical_json(prepared),
-        Text(Member(applied, "source"), "record_digest"), "authoring.epoch.1",
-        "request.2"));
-    FAIL() << "a new Program Apply committed without a fresh Manager";
-  } catch (const OperatorAlarmError &error) {
-    EXPECT_EQ(error.code(), "program_apply_deployment_not_active");
-  }
-  std::filesystem::rename(withheld_manager, manager_source);
-  EXPECT_EQ(core.AppliedProgramSelection(), applied);
-
-  AtomicSourceSnapshotChannel scene(directory.publications(),
-                                    "logical-scene-source.json");
-  AtomicSourceSnapshotChannel runtime(directory.publications(),
-                                      "scene-runtime-source.json");
-  static_cast<void>(scene.Publish("logical_scene", "logical-scene." + cell_id,
-                                  "scene.epoch.1", 1, LogicalScenePayload()));
-  static_cast<void>(runtime.Publish("scene_runtime", "scene-runtime." + cell_id,
-                                    "scene-runtime.epoch.1", 1,
-                                    SceneRuntimePayload("open", 1, cell_id)));
-  const auto scenario = core.ScenarioProgramSelection(selection.scenario_id);
-  EXPECT_EQ(Text(scenario, "schema_version"),
-            kScenarioProgramSelectionSchemaVersion);
-  EXPECT_EQ(content_identity::canonical_json(
-                Member(scenario, "assistant_projection")),
-            content_identity::canonical_json(
-                selection.normalized_assistant_projection));
-
-  // A later Preview publishes a new catalog without moving Applied Program
-  // or Manager. Current Scenario must keep its exact Applied catalog revision.
-  deployment::FilesystemScenarioCatalogRepository repository(package,
-                                                             "maintained");
-  auto preview_rows = repository.get_verified()->rows();
-  preview_rows.front().description = "Later preview";
-  const auto preview = deployment::build_scenario_catalog(preview_rows);
-  ASSERT_EQ(
-      repository.compare_and_set(selection.scenario_catalog_revision, preview),
-      deployment::ScenarioCatalogPublishResult::kPublished);
-  EXPECT_EQ(core.ScenarioProgramSelection(selection.scenario_id), scenario);
-  EXPECT_EQ(core.AppliedProgramSelection(), applied);
-
-  // Losing that exact referent must not silently adopt a matching newer head.
-  std::filesystem::remove(
-      scenarios.catalog_path_for_revision(selection.scenario_catalog_revision));
-  try {
-    static_cast<void>(core.ScenarioProgramSelection(selection.scenario_id));
-    FAIL() << "missing Applied catalog was replaced by Preview";
-  } catch (const OperatorAlarmError &error) {
-    EXPECT_EQ(error.code(), "scenario_program_selection_unavailable");
-  }
 }
 
 TEST(HeadlessApiCore, ServesOnlyTheExactVerifiedActiveRetainedViewerProduct) {

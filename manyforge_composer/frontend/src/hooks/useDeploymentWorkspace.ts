@@ -203,7 +203,11 @@ export function useDeploymentWorkspace(
           setFeedback(null);
         } else {
           setPendingApplyConfirmation(null);
-          setFeedback(message);
+          setFeedback(
+            response.result.status === 'accepted'
+              ? 'Deployment activation accepted; progress is shown in runtime status.'
+              : message,
+          );
         }
       }
       return response;
@@ -280,9 +284,9 @@ export function useDeploymentWorkspace(
       (requestFence) => api.deploymentWorkspace.discard(requestFence),
       'Deployment Draft changes discarded; Manager Applied was unchanged.',
     ),
-    revert: () => run(
+    revert: () => runApply(
       (requestFence) => api.deploymentWorkspace.revert(requestFence),
-      'Saved Deployment restored to Draft and applied by Manager.',
+      'Saved Deployment was already current in Manager.',
     ),
     applyDraft: () => {
       setPendingApplyConfirmation(null);

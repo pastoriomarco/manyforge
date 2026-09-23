@@ -15,7 +15,7 @@ namespace {
 namespace core = manyforge::core;
 
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'S',
-                                              'R', 'C', '1', 0};
+                                              'R', 'C', '2', 0};
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
 constexpr std::uint8_t kRequestTag = 1U;
 constexpr std::uint8_t kPreparingTag = 2U;
@@ -274,10 +274,9 @@ void WriteScope(Writer &writer, const core::ConfigurationFenceScopeDTO &scope) {
 
 void WriteRequest(Writer &writer,
                   const ManagerSelectedRuntimeCompositionRequestDTO &request) {
-  WriteStrong(writer, request.scene_activated_digest);
+  WriteStrong(writer, request.authoritative_scene_snapshot_digest);
   WriteStrong(writer, request.apply_id);
   WriteGeneration(writer, request.apply_generation);
-  WriteGeneration(writer, request.projection_stage_generation);
   WriteProjectionRevision(writer, request.candidate_projection_revision);
   WriteGeneration(writer, request.expected_predecessor_publication_generation);
   WriteStrong(writer, request.expected_predecessor_public_pointer_digest);
@@ -297,7 +296,6 @@ ReadRequest(Reader &reader) {
       ReadStrong<core::ContentDigest>(reader),
       ReadStrong<core::ApplyId>(reader),
       ReadGeneration<core::ApplyGeneration>(reader),
-      ReadGeneration<core::ProjectionStageGeneration>(reader),
       ReadProjectionRevision(reader),
       ReadGeneration<core::ActiveBundlePublicationGeneration>(reader),
       ReadStrong<core::ContentDigest>(reader),

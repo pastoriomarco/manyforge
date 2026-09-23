@@ -43,21 +43,20 @@ namespace core = manyforge::core;
   return query;
 }
 
-[[nodiscard]] std::string FinalizedActiveStateMismatch(
+[[nodiscard]] std::string CompletedActiveStateMismatch(
     const core::ConfigurationFenceStatusDTO &status,
     const core::ConfigurationFenceStatusQueryDTO &query,
-    const PersistedManagerApplySceneFinalized &finalized,
+    const core::ProjectionMaintenanceInitializationStatusDTO &completed,
     const PersistedManagerApplyPublicationReceipt &publication) {
   const auto &evidence = status.reconciliation_evidence;
-  const auto &finalized_result = finalized.scene_finalized.finalized_result;
   const auto &publication_receipt = publication.publication.publication_receipt;
   if (!status.matches(query))
     return "fence identity/scope";
   if (evidence.active_projection_revision !=
-      finalized_result.candidate_projection_revision)
+      completed.target_projection_revision)
     return "active projection";
   if (evidence.active_graph_revision !=
-      finalized_result.candidate_projection_revision.graph_revision)
+      completed.target_projection_revision.graph_revision)
     return "active graph";
   if (evidence.active_publication_generation !=
       publication_receipt.publication_generation)
@@ -73,16 +72,15 @@ namespace core = manyforge::core;
 
 [[nodiscard]] ManagerApplyTerminalOutcomeWriteResult
 PersistTerminal(SqliteManagerApplyJournal &journal,
-                const PersistedManagerApplySceneFinalized &finalized,
+                const core::ProjectionMaintenanceInitializationStatusDTO &completed,
                 const PersistedManagerApplyPublicationReceipt &publication,
                 const PersistedManagerApplyFenceReleased &released) {
-  const auto &result = finalized.scene_finalized.finalized_result;
   return journal.EnsureTerminalOutcome({
-      result.apply_id,
-      result.apply_generation,
-      result.candidate_projection_revision,
+      completed.apply_id,
+      completed.apply_generation,
+      completed.target_projection_revision,
       publication.publication_receipt_digest,
-      finalized.scene_finalized_digest,
+      publication.publication_receipt_digest,
       released.fence_released_digest,
       ManagerApplyTerminalOutcomeState::kSucceeded,
       std::nullopt,
@@ -92,10 +90,10 @@ PersistTerminal(SqliteManagerApplyJournal &journal,
 [[nodiscard]] ManagerApplyFenceReleaseResult FinishFromDurableRelease(
     SqliteManagerApplyJournal& journal, PersistedManagerApplyFenceReleaseIntent release_intent,
     PersistedManagerApplyFenceReleased released,
-    const PersistedManagerApplySceneFinalized& finalized,
+    const core::ProjectionMaintenanceInitializationStatusDTO& completed,
     const PersistedManagerApplyPublicationReceipt& publication,
     const ManagerApplyFenceReleasePath path) {
-  auto terminal = PersistTerminal(journal, finalized, publication, released);
+  auto terminal = PersistTerminal(journal, completed, publication, released);
   return {
       ManagerApplyFenceReleaseIntentWriteResult{std::move(release_intent), false},
       ManagerApplyFenceReleasedWriteResult{std::move(released), false},
@@ -145,9 +143,11 @@ ManagerApplyFenceReleaseEffectUncertainError::observed_release() const noexcept 
 
 ManagerApplyFenceReleaseCoordinator::ManagerApplyFenceReleaseCoordinator(
     SqliteManagerApplyJournal& apply_journal, core::IManagerKernelApplyFencePort& kernel_fence,
+    core::IManagerSceneProjectionMaintenancePort& scene_owner,
     core::RuntimeEpoch manager_runtime_epoch)
     : apply_journal_(apply_journal),
       kernel_fence_(kernel_fence),
+      scene_owner_(scene_owner),
       manager_runtime_epoch_(std::move(manager_runtime_epoch)) {
   if (manager_runtime_epoch_.empty()) {
     Fail("Manager runtime epoch is empty");
@@ -158,13 +158,20 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
     const core::ApplyId& apply_id, const core::ApplyGeneration apply_generation) {
   std::lock_guard lock(operation_mutex_);
 
-  const auto finalized = apply_journal_.ReadSceneFinalized(apply_id, apply_generation);
+  const auto completed = scene_owner_.ReadMaintenanceInitialization(
+      {apply_id, apply_generation});
   const auto publication = apply_journal_.ReadPublicationReceipt(apply_id, apply_generation);
   const auto acceptance = apply_journal_.ReadFenceAcceptance(apply_id, apply_generation);
-  if (!finalized.has_value() || !publication.has_value() || !acceptance.has_value()) {
+  if (!completed.has_value() || !completed->valid() ||
+      completed->state !=
+          core::ProjectionMaintenanceInitializationState::kCompleted ||
+      !publication.has_value() || !acceptance.has_value() ||
+      completed->publication_receipt !=
+          std::optional<core::ActiveBundlePublicationReceiptDTO>{
+              publication->publication.publication_receipt}) {
     Fail(
         "fence release requires exact durable acceptance, publication, and "
-        "scene Finalize evidence");
+        "Scene completion evidence");
   }
   const auto query = MakeStatusQuery(*acceptance, manager_runtime_epoch_);
 
@@ -173,8 +180,9 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
   const auto existing_terminal = apply_journal_.ReadTerminalOutcome(apply_id, apply_generation);
   if (existing_terminal.has_value()) {
     if (!existing_intent.has_value() || !existing_release.has_value() ||
-        existing_terminal->terminal_outcome.scene_finalized_digest !=
-            finalized->scene_finalized_digest ||
+        existing_terminal->terminal_outcome.scene_completion_digest !=
+            std::optional<core::ContentDigest>{
+                publication->publication_receipt_digest} ||
         existing_terminal->terminal_outcome.publication_receipt_digest !=
             publication->publication_receipt_digest ||
         existing_terminal->terminal_outcome.fence_released_digest !=
@@ -192,7 +200,7 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
     if (!existing_intent.has_value()) {
       Fail("durable fence release receipt lacks its exact intent");
     }
-    return FinishFromDurableRelease(apply_journal_, *existing_intent, *existing_release, *finalized,
+    return FinishFromDurableRelease(apply_journal_, *existing_intent, *existing_release, *completed,
                                     *publication,
                                     ManagerApplyFenceReleasePath::kCompletedFromDurableRelease);
   }
@@ -217,10 +225,10 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
   }
 
   const auto mismatch =
-      FinalizedActiveStateMismatch(*status, query, *finalized, *publication);
+      CompletedActiveStateMismatch(*status, query, *completed, *publication);
   if (!mismatch.empty()) {
     FailUncertain(
-        "Kernel status does not prove the exact finalized active projection "
+        "Kernel status does not prove the exact completed active projection "
         "with zero affected operations: " +
             mismatch,
         false, query,
@@ -254,7 +262,7 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
                     *status->release_receipt);
     }
     auto terminal =
-        PersistTerminal(apply_journal_, *finalized, *publication, durable_release->record);
+        PersistTerminal(apply_journal_, *completed, *publication, durable_release->record);
     return {
         ManagerApplyFenceReleaseIntentWriteResult{*existing_intent, false},
         std::move(*durable_release),
@@ -296,7 +304,7 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
                     std::nullopt, *status);
     }
     durable_intent.emplace(apply_journal_.EnsureFenceReleaseIntent({
-        finalized->scene_finalized_digest,
+        publication->publication_receipt_digest,
         acceptance->acceptance_digest,
         request,
     }));
@@ -333,7 +341,7 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
         *released);
   }
   auto terminal =
-      PersistTerminal(apply_journal_, *finalized, *publication, durable_release->record);
+      PersistTerminal(apply_journal_, *completed, *publication, durable_release->record);
   return {
       std::move(*durable_intent),
       std::move(*durable_release),

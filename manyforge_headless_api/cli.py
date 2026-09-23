@@ -50,9 +50,6 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--projection-root", type=Path, required=True)
     serve.add_argument("--install-root", type=Path, required=True)
     serve.add_argument("--artifact-root", type=Path, required=True)
-    serve.add_argument(
-        "--program-selection-state-root", type=Path, required=True
-    )
     serve.add_argument("--node-catalog-path", type=Path, required=True)
     serve.add_argument(
         "--node-environment-manifest-path", type=Path, required=True
@@ -75,6 +72,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--program-runner-timeout-s", type=float, default=30.0)
     serve.add_argument("--activation-preparer", type=Path)
     serve.add_argument("--activation-preparer-capability-root", type=Path)
+    serve.add_argument("--activation-preparer-activation-root", type=Path)
     serve.add_argument(
         "--activation-preparer-timeout-s", type=float, default=120.0
     )
@@ -185,7 +183,6 @@ def _serve(args: argparse.Namespace) -> int:
         projection_root=args.projection_root,
         install_root=args.install_root,
         artifact_root=args.artifact_root,
-        program_selection_state_root=args.program_selection_state_root,
         node_catalog_path=args.node_catalog_path,
         node_environment_manifest_path=args.node_environment_manifest_path,
         alarm_catalog_path=args.alarm_catalog_path,
@@ -203,6 +200,9 @@ def _serve(args: argparse.Namespace) -> int:
         activation_preparer_path=args.activation_preparer,
         activation_preparer_capability_root=(
             args.activation_preparer_capability_root
+        ),
+        activation_preparer_activation_root=(
+            args.activation_preparer_activation_root
         ),
         activation_preparer_timeout_seconds=(
             args.activation_preparer_timeout_s

@@ -546,18 +546,6 @@ TEST(CanonicalEmptyBootstrapAdvance, RebuildPublishFinalizeAndReplay) {
           admission,
           seeded.intent,
           seeded.accepted_target));
-  EXPECT_EQ(
-      request.obsolete_managed_command_surfaces_retired_evidence_digest,
-      ExpectedZeroCaseDigest(
-          "manyforge.component-manager.canonical-empty."
-          "retired-managed-command-surfaces.v1",
-          "retired_managed_command_surface_count",
-          admission,
-          seeded.intent,
-          seeded.accepted_target));
-  EXPECT_NE(
-      request.private_materialization_content_digest,
-      request.obsolete_managed_command_surfaces_retired_evidence_digest);
   EXPECT_EQ(owner.finalize_calls(), 1U);
   EXPECT_EQ(owner.finalize_effects(), 1U);
 

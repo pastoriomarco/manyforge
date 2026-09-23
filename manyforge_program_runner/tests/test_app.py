@@ -46,7 +46,7 @@ def _snapshot(*, state: str = "running") -> dict[str, Any]:
             "program_run_id": "program-run.1",
             "applied_record_digest": _DIGEST_C,
             "scenario_id": "cell-pick",
-            "scenario_catalog_revision": _DIGEST_A,
+            "source_document_digest": _DIGEST_A,
             "program_id": "pick",
             "program_revision": _DIGEST_B,
             "program_binding_id": _DIGEST_C,
@@ -289,7 +289,6 @@ def test_node_availability_is_a_read_only_runner_projection() -> None:
     runtime = FakeRuntime()
     body = {
         "applied": {"program_id": "program_a"},
-        "selection": {"scenario_id": "cell_a"},
     }
     with TestClient(create_app(runtime)) as client:
         response = client.post("/api/program/node-availability", json=body)
@@ -461,7 +460,7 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
             json={
                 **_caller(),
                 "scenario_id": "cell-pick",
-                "scenario_catalog_revision": _DIGEST_A,
+                "source_document_digest": _DIGEST_A,
                 "expected_applied_record_digest": _DIGEST_B,
                 "draft_program_revision": _DIGEST_B,
                 "expected_admission_generation": 7,
@@ -615,7 +614,7 @@ def test_stop_route_progresses_while_both_ordinary_workers_are_occupied() -> Non
         {
             **_caller(),
             "scenario_id": "cell-pick",
-            "scenario_catalog_revision": _DIGEST_A,
+            "source_document_digest": _DIGEST_A,
             "expected_applied_record_digest": _DIGEST_B,
             "draft_program_revision": _DIGEST_B,
             "expected_admission_generation": 7,
@@ -675,7 +674,7 @@ def test_private_surface_rejects_unknown_fields_and_path_body_mismatch() -> None
             json={
                 **_caller(),
                 "scenario_id": "cell-pick",
-                "scenario_catalog_revision": _DIGEST_A,
+                "source_document_digest": _DIGEST_A,
                 "expected_applied_record_digest": _DIGEST_B,
                 "draft_program_revision": _DIGEST_B,
                 "expected_admission_generation": 7,
@@ -732,7 +731,7 @@ def test_program_start_preconditions_map_to_client_conflict(code: str) -> None:
             json={
                 **_caller(),
                 "scenario_id": "cell-pick",
-                "scenario_catalog_revision": _DIGEST_A,
+                "source_document_digest": _DIGEST_A,
                 "expected_applied_record_digest": _DIGEST_B,
                 "draft_program_revision": _DIGEST_B,
                 "expected_admission_generation": 7,

@@ -94,7 +94,6 @@ core::ActiveBundlePublicationReceiptDTO Publication(
           projection.graph_revision,
           std::nullopt,
           core::ContentDigest(std::string(kDigestOne)),
-          core::ContentDigest(std::string(kDigestTwo)),
       },
       core::ActiveBundlePublicationGeneration(1U),
       core::ContentDigest(std::string(kDigestTwo)),

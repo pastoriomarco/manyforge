@@ -386,14 +386,15 @@ export interface ScenarioDocumentSaveResponse {
 }
 
 export interface ScenarioDocumentLoadResponse {
-  status: 'opened';
+  status: 'opened' | 'accepted';
   path: string;
   scenarioId: string;
-  activation: null;
+  activation: Record<string, JsonValue> | null;
   incomplete: boolean;
   diagnostics: ProgramAuthoringDiagnostic[];
   sourceDiagnostics: ScenarioSourceDiagnostic[];
   workspace: ProgramWorkspaceResponse;
+  authoringWorkspace: AuthoringWorkspaceSnapshot;
 }
 
 /**
@@ -474,7 +475,7 @@ export interface ScenarioDocumentConversionResponse {
 
 export interface DeploymentScenarioCandidate {
   scenarioId: string;
-  scenarioCatalogRevision: string;
+  sourceDocumentDigest: string;
   deploymentArtifactId: string;
   deploymentRevision: string;
   retainedBundleId: string;
@@ -539,7 +540,7 @@ export interface DeploymentCandidateOperationResponse {
   schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1';
   workspace: DeploymentWorkspaceResponse;
   result: {
-    status: 'previewed' | 'confirmation_required' | 'applied';
+    status: 'previewed' | 'confirmation_required' | 'accepted' | 'applied';
     confirmationToken: string | null;
     /** Authoritative identity of the journalized preparation, echoed on
      * confirmation_required so the confirmation can reference it. */
@@ -547,7 +548,6 @@ export interface DeploymentCandidateOperationResponse {
     preparedActivation: PreparedActivationInput;
     candidatePreview: ManagerDeploymentCandidatePreviewResponse | null;
     managerApply: ManagerApplyResponse | null;
-    selection: null;
     /** Monotonic backend durations for the phases actually traversed. */
     phasesMs: Record<string, number>;
     applyId: string | null;
@@ -588,26 +588,9 @@ export interface DeploymentControlledStopUpdate {
   timing: DeploymentStopTiming | null;
 }
 
-export interface ScenarioCatalogEntry {
-  scenarioId: string;
-  description: string | null;
-  aliases: string[];
-  deploymentArtifactId: string;
-  deploymentRevision: string;
-  retainedBundleId: string;
-  programBindingId: string;
-  assistantMode: 'required' | 'optional' | 'forbidden';
-}
-
-export interface ScenarioCatalogResponse {
-  apiVersion: 'manyforge.scenario_catalog.v1';
-  scenarioCatalogRevision: string;
-  scenarios: ScenarioCatalogEntry[];
-}
-
 export interface CurrentScenarioSelection {
   scenarioId: string;
-  scenarioCatalogRevision: string;
+  sourceDocumentDigest: string;
   deploymentArtifactId: string;
   deploymentRevision: string;
   retainedBundleId: string;
@@ -625,9 +608,9 @@ export interface CurrentScenarioResponse {
 }
 
 export interface AppliedProgramSelection {
-  schemaVersion: 'manyforge.applied_program_selection.v1';
+  schemaVersion: 'manyforge.applied_program_selection.v2';
   scenarioId: string;
-  scenarioCatalogRevision: string;
+  sourceDocumentDigest: string;
   programId: string;
   programRevision: string;
   programBindingId: string;
@@ -638,6 +621,8 @@ export interface AppliedProgramSelection {
   sourceOwnerId: string;
   sourceOwnerEpoch: string;
   sourceGeneration: number;
+  assistantProjection: Record<string, JsonValue> | null;
+  ownerIdentities: ProgramRunOwnerIdentity[];
   program: ProgramDocument;
   programBinding: ProgramBindingDocument;
 }
@@ -663,7 +648,7 @@ export interface ProgramRunCapture {
   programRunId: string;
   appliedRecordDigest: string;
   scenarioId: string;
-  scenarioCatalogRevision: string;
+  sourceDocumentDigest: string;
   programId: string;
   programRevision: string;
   programBindingId: string;

@@ -35,7 +35,6 @@ import {
   parseProgramRunStatus,
   parseProgramCycleStatus,
   parseProgramRuntimeControlProjection,
-  parseScenarioCatalogResponse,
   parseScenarioDocumentIndexResponse,
   parseScenarioDocumentConversionResponse,
   parseScenarioDocumentExportResponse,
@@ -128,7 +127,7 @@ describe('editable Scenario document transport', () => {
     expect(parsed.entries[0]?.displayStatus).toBe('changed');
   });
 
-  it('parses Save and editor-only Load outcomes without inventing activation', () => {
+  it('parses editor-only and explicitly activated Scenario Load outcomes', () => {
     const saved = parseScenarioDocumentSaveResponse({
       status: 'saved',
       path: '/workspace/cell',
@@ -145,11 +144,26 @@ describe('editable Scenario document transport', () => {
       diagnostics: [],
       source_diagnostics: [],
       workspace: workspaceFixture(),
+      authoringWorkspace: authoringWorkspaceFixture(),
     });
 
     expect(saved.lastKnownStatus).toBe('unknown');
     expect(opened.path).toBe('/workspace/cell');
     expect(opened.activation).toBeNull();
+    const accepted = parseScenarioDocumentLoadResponse({
+      status: 'accepted',
+      path: '/workspace/cell',
+      scenario_id: 'cell',
+      activation: { status: 'accepted', apply_id: 'apply.1', apply_generation: 1 },
+      incomplete: false,
+      diagnostics: [],
+      source_diagnostics: [],
+      workspace: workspaceFixture(),
+      authoringWorkspace: authoringWorkspaceFixture(),
+    });
+    expect(accepted.activation).toEqual({
+      status: 'accepted', apply_id: 'apply.1', apply_generation: 1,
+    });
     expect(() => parseScenarioDocumentLoadResponse({
       status: 'loaded',
       path: '/workspace/cell',
@@ -159,6 +173,7 @@ describe('editable Scenario document transport', () => {
       diagnostics: [],
       source_diagnostics: [],
       workspace: workspaceFixture(),
+      authoringWorkspace: authoringWorkspaceFixture(),
     })).toThrow('status');
   });
 
@@ -304,7 +319,7 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
     binding: programBindingFixture('fixture-program', digestB, digestA),
     scenarioCandidates: [{
       scenarioId: 'fixture',
-      scenarioCatalogRevision: digestB,
+      sourceDocumentDigest: digestB,
       deploymentArtifactId: 'deployment.fixture',
       deploymentRevision: digestA,
       retainedBundleId: digestB,
@@ -315,7 +330,7 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
     }],
     savedScenarioCandidates: [{
       scenarioId: 'fixture',
-      scenarioCatalogRevision: digestB,
+      sourceDocumentDigest: digestB,
       deploymentArtifactId: 'deployment.fixture',
       deploymentRevision: digestA,
       retainedBundleId: digestB,
@@ -717,7 +732,7 @@ describe('Program product projections', () => {
         program_run_id: 'program-run.1',
         applied_record_digest: digestC,
         scenario_id: 'cell-pick',
-        scenario_catalog_revision: digestA,
+        source_document_digest: digestA,
         program_id: 'pick',
         program_revision: digestB,
         program_binding_id: digestC,
@@ -798,30 +813,20 @@ describe('Program product projections', () => {
     };
   }
 
-  it('parses bounded scenarios and the exact Applied owner identity', () => {
-    const catalog = parseScenarioCatalogResponse({
-      api_version: 'manyforge.scenario_catalog.v1',
-      scenario_catalog_revision: digestA,
-      scenarios: [{
-        scenario_id: 'cell-pick',
-        description: 'Pick one object',
-        aliases: ['pick'],
-        deployment_artifact_id: 'cell-a',
-        deployment_revision: digestB,
-        retained_bundle_id: digestC,
-        program_binding_id: digestA,
-        deployment_compatibility: { lane: 'manyforge-only', provides: [] },
-        assistant_mode: 'forbidden',
-        typed_parameter_overrides: {},
-      }],
-    });
+  it('parses the exact Applied owner identity', () => {
     const appliedInput = {
       assistant_mode: 'forbidden',
+      assistant_projection: null,
       baseline_program_binding_id: digestA,
       deployment_artifact_id: 'cell-a',
       deployment_revision: digestB,
       graph_revision: digestC,
       node_environment_digest: digestA,
+      owner_identities: [{
+        owner_role: 'headless_projection',
+        owner_id: 'headless.program-apply',
+        owner_epoch: 'headless.epoch.1',
+      }],
       preparation_digest: digestB,
       program: programFixture(),
       program_binding: programBindingFixture('fixture', digestA, digestC),
@@ -829,9 +834,9 @@ describe('Program product projections', () => {
       program_id: 'fixture',
       program_revision: digestA,
       retained_bundle_id: digestB,
-      scenario_catalog_revision: digestA,
+      source_document_digest: digestA,
       scenario_id: 'cell-pick',
-      schema_version: 'manyforge.applied_program_selection.v1',
+      schema_version: 'manyforge.applied_program_selection.v2',
       source: {
         record_digest: digestC,
         semantic_content_digest: digestB,
@@ -843,13 +848,12 @@ describe('Program product projections', () => {
     };
     const applied = parseAppliedProgramSelection(appliedInput);
 
-    expect(catalog.scenarios[0].description).toBe('Pick one object');
     const current = parseCurrentScenarioResponse({
       schema_version: 'manyforge.current_scenario.v1',
       ready: true,
       current_scenario: {
         scenario_id: 'cell-pick',
-        scenario_catalog_revision: digestA,
+        source_document_digest: digestA,
         deployment_artifact_id: 'cell-a',
         deployment_revision: digestB,
         retained_bundle_id: digestC,
@@ -1052,11 +1056,17 @@ describe('Program product projections', () => {
     const digestC = `sha256:${'c'.repeat(64)}`;
     const applied = {
       assistant_mode: 'forbidden',
+      assistant_projection: null,
       baseline_program_binding_id: digestA,
       deployment_artifact_id: 'cell-a',
       deployment_revision: digestB,
       graph_revision: digestC,
       node_environment_digest: digestA,
+      owner_identities: [{
+        owner_role: 'headless_projection',
+        owner_id: 'headless.program-apply',
+        owner_epoch: 'headless.epoch.1',
+      }],
       preparation_digest: digestB,
       program: programFixture(),
       program_binding: programBindingFixture('fixture', digestA, digestC),
@@ -1064,9 +1074,9 @@ describe('Program product projections', () => {
       program_id: 'fixture',
       program_revision: digestA,
       retained_bundle_id: digestB,
-      scenario_catalog_revision: digestA,
+      source_document_digest: digestA,
       scenario_id: 'cell-pick',
-      schema_version: 'manyforge.applied_program_selection.v1',
+      schema_version: 'manyforge.applied_program_selection.v2',
       source: {
         record_digest: digestC,
         semantic_content_digest: digestB,
@@ -1166,7 +1176,7 @@ describe('Deployment workspace parser', () => {
     delete (stale.candidate_receipt as Record<string, unknown>)
       .prepared_activation_id;
     expect(() => parseManagerDeploymentCandidatePreviewResponse(stale))
-      .toThrow(/closed record/);
+      .toThrow(/exactly/);
   });
 
   it('retains bounded Apply phase timings and preparation identity', () => {
@@ -1198,7 +1208,6 @@ describe('Deployment workspace parser', () => {
         prepared_activation: preparedActivation,
         candidate_preview: null,
         manager_apply: null,
-        selection: null,
         preparation: null,
         phases_ms: { preparation_ms: 2.5, preview_ms: 8.25 },
         apply_id: 'apply-1',

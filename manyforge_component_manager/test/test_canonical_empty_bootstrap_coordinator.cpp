@@ -51,8 +51,6 @@ constexpr std::string_view kSceneIdDigest =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 constexpr std::string_view kMaterializationDigest =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
-constexpr std::string_view kRetirementDigest =
-    "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 
 using BeginOrRecoverSignature =
     PersistedManagerBootstrapAcceptedTarget (
@@ -494,7 +492,6 @@ core::ActiveBundlePublicationRequestDTO PublicationRequest(
       admission.graph_revision(),
       std::nullopt,
       ContentDigest(std::string(kMaterializationDigest)),
-      ContentDigest(std::string(kRetirementDigest)),
   };
 }
 

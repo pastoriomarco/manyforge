@@ -202,7 +202,7 @@ export function ProgramDocumentControls({
   }, [
     action,
     refreshScenarioIndex,
-    runtime.state.catalog?.scenarioCatalogRevision,
+    runtime.state.applied?.sourceDocumentDigest,
   ]);
 
   useEffect(() => {
@@ -334,6 +334,15 @@ export function ProgramDocumentControls({
           >
             Apply
           </button>
+          {(busy || state.error !== null || state.message !== null) && (
+            <span
+              className={`document-operation-status${state.error !== null ? ' error' : ''}`}
+              role={state.error !== null ? 'alert' : 'status'}
+              aria-live="polite"
+            >
+              {state.error ?? state.message ?? (busy ? 'Working…' : 'Operation accepted.')}
+            </span>
+          )}
         </div>
       </div>
 

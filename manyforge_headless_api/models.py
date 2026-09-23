@@ -444,6 +444,7 @@ class ManagerDeploymentCandidatePreviewRequest(StrictRequest):
 
 class ActivationPreparationRequest(StrictRequest):
     source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    scenario_id: str
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     deployment: dict[str, Any]
     model_source_closure: dict[str, Any]
@@ -453,6 +454,13 @@ class ActivationPreparationRequest(StrictRequest):
     expected_admission_generation: Annotated[
         int, Field(ge=1, le=9_007_199_254_740_991)
     ]
+
+    @field_validator("scenario_id")
+    @classmethod
+    def validate_scenario_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value, label="scenario_id", maximum_bytes=MAX_IDENTITY_BYTES
+        )
 
     @model_validator(mode="after")
     def require_complete_input(self) -> "ActivationPreparationRequest":
@@ -481,12 +489,22 @@ class ManagerApplyPreparedActivation(StrictRequest):
     """
 
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    schema_version: Literal["manyforge.prepared_activation_input.v2"]
+    scenario_id: str
+    source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    retained_bundle_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    graph_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    program_id: str
+    program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    node_environment_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    assistant_mode: Literal["required", "optional", "forbidden"]
+    typed_parameter_overrides: dict[str, Any]
     prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
-    @field_validator("deployment_artifact_id")
+    @field_validator("deployment_artifact_id", "scenario_id", "program_id")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -553,26 +571,6 @@ class ManagerApplyRequest(CallerAttributionRequest):
         return self
 
 
-class ProgramApplyRequest(StrictRequest):
-    scenario_id: Annotated[
-        str,
-        Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
-    ]
-    scenario_catalog_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    program: dict[str, Any]
-    expected_applied_record_digest: Annotated[
-        str | None,
-        Field(pattern=SHA256_PATTERN),
-    ] = None
-    authoring_claim: dict[str, Any]
-
-    @model_validator(mode="after")
-    def require_program_object(self) -> "ProgramApplyRequest":
-        if not self.program:
-            raise ValueError("program must be a non-empty object")
-        return self
-
-
 class ProgramRunStartRequest(ExecutionControlAttributionRequest):
     """Start exactly the Applied Program selected by these immutable facts."""
 
@@ -580,7 +578,7 @@ class ProgramRunStartRequest(ExecutionControlAttributionRequest):
         str,
         Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
     ]
-    scenario_catalog_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     expected_applied_record_digest: Annotated[
         str,
         Field(pattern=SHA256_PATTERN),

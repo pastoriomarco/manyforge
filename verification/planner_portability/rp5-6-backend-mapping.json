@@ -39,12 +39,12 @@
       "conformance_target": "test_planner_backend_conformance",
       "capability_disposition": "supported_and_explicit_rejection_variants"
     },
-    "roboplan_0_6_0": {
+    "roboplan_0_7_0": {
       "status": "temporarily_unavailable_composable_cell_rebuild",
       "package": "manyforge_roboplan",
       "available_surface": "retained_planning_product_consumer_qualification_only",
       "restoration_gate": "non-empty retained planning product plus target-scene adapter qualification",
-      "source_identity": "RoboPlan 0.6.0 d2e5162eda2f51f5599ecd60375b65346d0b2944 plus the exact E1 four-patch manifest",
+      "source_identity": "RoboPlan 0.7.0 099dfa5ccd80b191eb3d6da9f4795f808a63913f plus the exact UA1 patch manifest",
       "capability_disposition": {
         "planning.motion.joint_goal": "temporarily_unavailable",
         "planning.motion.pose_goal": "temporarily_unavailable",

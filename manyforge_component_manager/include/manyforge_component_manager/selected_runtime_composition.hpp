@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <manyforge_core/types/active_bundle_publication.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
-#include <manyforge_core/types/projection_apply.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 
 namespace manyforge::component_manager {
 
@@ -12,10 +12,9 @@ namespace manyforge::component_manager {
 /// This is a private Apply effect, not caller authorization or a command
 /// session.
 struct ManagerSelectedRuntimeCompositionRequestDTO final {
-  manyforge::core::ContentDigest scene_activated_digest;
+  manyforge::core::ContentDigest authoritative_scene_snapshot_digest;
   manyforge::core::ApplyId apply_id;
   manyforge::core::ApplyGeneration apply_generation;
-  manyforge::core::ProjectionStageGeneration projection_stage_generation;
   manyforge::core::ProjectionRevisionDTO candidate_projection_revision;
   manyforge::core::ActiveBundlePublicationGeneration
       expected_predecessor_publication_generation;

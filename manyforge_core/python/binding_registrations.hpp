@@ -16,6 +16,5 @@ void register_operation_runtime_bindings(pybind11::module_& module);
 void register_runtime_contract_manifest_bindings(pybind11::module_& module);
 void register_deployment_candidate_bindings(pybind11::module_& module);
 void register_model_compiler_bindings(pybind11::module_& module);
-void register_scenario_catalog_bindings(pybind11::module_& module);
 
 }  // namespace manyforge::core::python

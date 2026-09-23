@@ -6,7 +6,7 @@
 #include <vector>
 
 #include <manyforge_core/types/program_contract.hpp>
-#include <manyforge_deployment/scenario_catalog.hpp>
+#include <manyforge_deployment/scenario_program_admission.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include "activation_prepared_model_internal.hpp"
@@ -30,6 +30,7 @@ struct PreparedActivationMaterialization final {
   ScenarioDeploymentCompatibilityDTO deployment_compatibility;
   std::shared_ptr<const RetainedBundle> bundle;
   VerifiedRetainedModelMap model_map;
+  std::shared_ptr<const RetainedBundle> canonical_empty_bundle;
   std::vector<PreparedActivationArtifact> raw_artifacts;
   std::vector<PreparedActivationArtifact> catalog_artifacts;
 };
@@ -38,7 +39,8 @@ struct PreparedActivationMaterialization final {
     const std::filesystem::path &capability_root,
     std::vector<ActivationPreparedModel> prepared_models,
     const ActivationDeploymentIntent &intent,
-    const std::vector<ActivationComponentProfile> &component_profiles);
+    const std::vector<ActivationComponentProfile> &component_profiles,
+    bool prepare_canonical_empty = false);
 
 int run_maintained_example_qualification(int argc, char **argv);
 

@@ -13,10 +13,7 @@ from typing import Any, Callable, Sequence
 
 import rfc8785
 
-from manyforge_behavior.catalog import (
-    CatalogValidationError,
-    NodeCatalog,
-)
+from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.canonical_artifact import (
     StrictArtifactError,
     verify_content_identity,
@@ -42,7 +39,6 @@ from .models import (
     AuthoringMutationRecoveryRequest,
     AuthoringMutationSettlementRequest,
     AuthoringOwnerReconciliationRequest,
-    ProgramApplyRequest,
     ProgramModelAttemptRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
@@ -81,14 +77,11 @@ from .program_runner_client import ProgramRunnerClientError, ProgramRunnerPort
 from .program_binding_transport import ProgramBindingTransportError
 from .program_binding_projection import (
     validate_applied_program_selection,
-    validate_program_apply_result,
-    validate_scenario_program_selection,
 )
 
 
 RUNTIME_SNAPSHOT_VERSION = "manyforge.headless_runtime_snapshot.v1"
 MANAGER_SOURCE_VERSION = "manyforge.manager_source.v1"
-PROGRAM_APPLY_RESULT_VERSION = "manyforge.program_apply_result.v2"
 PROGRAM_RUN_INDEX_VERSION = "manyforge.program_run_index.v1"
 PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v2"
 PROGRAM_RUN_CAPTURE_VERSION = "manyforge.program_run_capture.v1"
@@ -880,7 +873,6 @@ class HeadlessService:
                     "program_applied_selection_invalid",
                     "Applied Program omitted its Scenario identity",
                 )
-            selection = self.scenario_program_selection(scenario_id)
         except HeadlessApiError as error:
             # Catalog authoring is independent of an Applied Program. Never
             # join a Runner offer when the local Applied identity is absent.
@@ -889,7 +881,7 @@ class HeadlessService:
             raise
         try:
             runner_projection = self.program_runner.node_availability(
-                {"applied": applied, "selection": selection}
+                {"applied": applied}
             )
         except ProgramRunnerClientError:
             # The immutable catalog remains authorable while the independent
@@ -1126,39 +1118,6 @@ class HeadlessService:
             )
         return context
 
-    def scenarios(self) -> dict[str, Any]:
-        projection = self.core.scenario_catalog_projection()
-        if (
-            set(projection) != {"api_version", "scenario_catalog_revision", "scenarios"}
-            or projection.get("api_version") != "manyforge.scenario_catalog.v1"
-            or not isinstance(projection.get("scenario_catalog_revision"), str)
-            or not isinstance(projection.get("scenarios"), list)
-        ):
-            raise HeadlessApiError(
-                "scenario_catalog_projection_invalid",
-                "native core returned an unsupported scenario catalog",
-            )
-        return projection
-
-    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
-        projection = self.core.scenario_program_selection(scenario_id)
-        if not isinstance(projection, dict):
-            raise HeadlessApiError(
-                "scenario_program_selection_invalid",
-                "native core returned an unsupported scenario Program selection",
-            )
-        try:
-            validate_scenario_program_selection(
-                projection,
-                scenario_id=scenario_id,
-            )
-        except (ProgramBindingTransportError, TypeError, ValueError) as error:
-            raise HeadlessApiError(
-                "scenario_program_selection_invalid",
-                "native core returned an unsupported scenario Program selection",
-            ) from error
-        return projection
-
     def program_applied(self) -> dict[str, Any]:
         projection = self.core.applied_program_selection()
         if not isinstance(projection, dict):
@@ -1241,7 +1200,7 @@ class HeadlessService:
             "program_revision",
             "program_run_id",
             "retained_bundle_id",
-            "scenario_catalog_revision",
+            "source_document_digest",
             "scenario_id",
             "schema_version",
         }
@@ -1305,7 +1264,7 @@ class HeadlessService:
                 not _sha256_identity(capture.get(field_name))
                 for field_name in (
                     "applied_record_digest",
-                    "scenario_catalog_revision",
+                    "source_document_digest",
                     "program_revision",
                     "program_binding_id",
                     "retained_bundle_id",
@@ -1444,8 +1403,8 @@ class HeadlessService:
             not isinstance(source, dict)
             or source.get("record_digest") != request.expected_applied_record_digest
             or applied.get("scenario_id") != request.scenario_id
-            or applied.get("scenario_catalog_revision")
-            != request.scenario_catalog_revision
+            or applied.get("source_document_digest")
+            != request.source_document_digest
         ):
             raise HeadlessApiError(
                 "program_run_applied_selection_stale",
@@ -1481,7 +1440,7 @@ class HeadlessService:
                 capture[capture_field] != applied.get(applied_field)
                 for capture_field, applied_field in (
                     ("scenario_id", "scenario_id"),
-                    ("scenario_catalog_revision", "scenario_catalog_revision"),
+                    ("source_document_digest", "source_document_digest"),
                     ("program_id", "program_id"),
                     ("program_revision", "program_revision"),
                     ("program_binding_id", "program_binding_id"),
@@ -1823,267 +1782,6 @@ class HeadlessService:
             request.model_dump(mode="json", exclude={"confirmed"}, exclude_none=True)
         )
 
-    def _program_apply_manager_selection(
-        self,
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-        status = self.manager_status()
-        source = status.get("source")
-        payload = status.get("status")
-        active = payload.get("active") if isinstance(payload, dict) else None
-        runtime = payload.get("runtime") if isinstance(payload, dict) else None
-        if (
-            not isinstance(source, dict)
-            or not isinstance(payload, dict)
-            or not isinstance(active, dict)
-            or not isinstance(runtime, dict)
-            or source.get("available") is not True
-            or source.get("freshness") != "fresh"
-            or source.get("known_gaps") != []
-            or not isinstance(active.get("retained_bundle_id"), str)
-            or not isinstance(active.get("graph_revision"), str)
-            or not isinstance(source.get("source_owner_epoch"), str)
-        ):
-            raise HeadlessApiError(
-                "manager_source_invalid",
-                "Manager source has no exact active Program Apply selection",
-            )
-        return source, payload, active
-
-    @staticmethod
-    def _fence_program_apply_for_package_restart(
-        payload: dict[str, Any],
-    ) -> None:
-        apply_state = payload.get("apply")
-        if (
-            isinstance(apply_state, dict)
-            and apply_state.get("unavailable_reason_code")
-            == "full_stack_restart_required"
-        ):
-            raise HeadlessApiError(
-                "full_stack_restart_required",
-                "Program Apply requires a full stack restart",
-            )
-
-    @staticmethod
-    def _program_apply_proven_no_effect(
-        error: HeadlessApiError,
-    ) -> HeadlessApiError:
-        """Attach owner-issued proof that this Apply did not select Program."""
-
-        return HeadlessApiError(
-            error.code,
-            str(error),
-            details={
-                **error.details,
-                "effect_disposition": "proven_no_effect",
-            },
-        )
-
-    def _program_apply_replay_result(self, replay: dict[str, Any]) -> dict[str, Any]:
-        preparation = replay.get("preparation")
-        applied = replay.get("applied")
-        if (
-            set(replay) != {"applied", "preparation"}
-            or not isinstance(preparation, dict)
-            or not isinstance(applied, dict)
-        ):
-            raise HeadlessApiError(
-                "program_apply_response_invalid",
-                "native Program Apply replay omitted its exact outcome",
-            )
-        return self._program_apply_result(preparation, applied)
-
-    def program_apply(self, request: ProgramApplyRequest) -> dict[str, Any]:
-        try:
-            claim = request.authoring_claim
-            intent = claim.get("intent") if isinstance(claim, dict) else None
-            if (
-                not isinstance(intent, dict)
-                or intent.get("claim_kind") != "authoring_mutation"
-                or intent.get("owner_role") != "authoring_owner"
-            ):
-                raise HeadlessApiError(
-                    "authoring_not_ready",
-                    "Program Apply requires an exact held authoring claim",
-                )
-            replay = self._cell_admission().acquire(intent)
-        except CellAdmissionError as error:
-            translated = self._admission_error(error)
-            raise self._program_apply_proven_no_effect(translated) from error
-        except (KeyError, TypeError, ValueError) as error:
-            translated = HeadlessApiError(
-                "authoring_claim_invalid",
-                "Program Apply authoring claim is malformed",
-            )
-            raise self._program_apply_proven_no_effect(translated) from error
-        except HeadlessApiError as error:
-            raise self._program_apply_proven_no_effect(error) from error
-        if replay != claim:
-            error = HeadlessApiError(
-                "stale_generation",
-                "Program Apply authoring claim is no longer exact",
-            )
-            raise self._program_apply_proven_no_effect(error)
-        return self._program_apply(request)
-
-    def _program_apply(self, request: ProgramApplyRequest) -> dict[str, Any]:
-        """Select a Program only for the already-converged deployment."""
-
-        try:
-            program = Program.from_dict(
-                deepcopy(request.program),
-                _program_catalog(),
-                path="<headless-program-apply>",
-            )
-        except (CatalogValidationError, ProgramValidationError) as error:
-            translated = HeadlessApiError(
-                "program_apply_program_invalid",
-                f"Program Apply candidate is invalid: {error}",
-            )
-            raise self._program_apply_proven_no_effect(translated) from error
-        program_document = program.to_dict()
-        claim_intent = request.authoring_claim.get("intent")
-        request_owner_epoch = (
-            claim_intent.get("owner_epoch") if isinstance(claim_intent, dict) else None
-        )
-        request_id = (
-            claim_intent.get("request_id") if isinstance(claim_intent, dict) else None
-        )
-        if (
-            not isinstance(request_owner_epoch, str)
-            or not request_owner_epoch
-            or not isinstance(request_id, str)
-            or not request_id
-        ):
-            error = HeadlessApiError(
-                "authoring_claim_invalid",
-                "Program Apply authoring claim has no request identity",
-            )
-            raise self._program_apply_proven_no_effect(error)
-        try:
-            replay = self.core.replay_program_apply(
-                request.scenario_id,
-                request.scenario_catalog_revision,
-                str(program_document["program_id"]),
-                str(program_document["program_revision"]),
-                request.expected_applied_record_digest,
-                request_owner_epoch,
-                request_id,
-            )
-        except HeadlessApiError as error:
-            if error.code == "program_apply_request_conflict":
-                raise self._program_apply_proven_no_effect(error) from error
-            raise
-        if replay is not None:
-            return self._program_apply_replay_result(replay)
-
-        try:
-            _source, payload, _active = self._program_apply_manager_selection()
-            self._fence_program_apply_for_package_restart(payload)
-            runtime = payload.get("runtime")
-            if (
-                payload.get("manager_ready") is not True
-                or not isinstance(runtime, dict)
-                or runtime.get("converged") is not True
-            ):
-                raise HeadlessApiError(
-                    "program_apply_deployment_not_active",
-                    "Program Apply requires one already-converged Manager selection",
-                )
-
-            preparation = self.core.prepare_program_apply(
-                request.scenario_id,
-                request.scenario_catalog_revision,
-                program_document,
-            )
-            target_bundle = preparation.get("retained_bundle_id")
-            target_graph = preparation.get("graph_revision")
-            if not all(
-                isinstance(value, str) and value
-                for value in (
-                    target_bundle,
-                    target_graph,
-                    preparation.get("preparation_digest"),
-                )
-            ):
-                raise HeadlessApiError(
-                    "program_apply_preparation_invalid",
-                    "native Program Apply preparation omitted exact identities",
-                )
-
-            _source, payload, active = self._program_apply_manager_selection()
-            self._fence_program_apply_for_package_restart(payload)
-            runtime = payload.get("runtime")
-            manager_matches = (
-                payload.get("manager_ready") is True
-                and isinstance(runtime, dict)
-                and runtime.get("converged") is True
-                and active["retained_bundle_id"] == target_bundle
-                and active["graph_revision"] == target_graph
-            )
-            if not manager_matches:
-                raise HeadlessApiError(
-                    "program_apply_deployment_not_active",
-                    "Program Apply target is no longer the converged Manager selection",
-                )
-        except HeadlessApiError as error:
-            raise self._program_apply_proven_no_effect(error) from error
-
-        try:
-            applied = self.core.commit_program_apply(
-                preparation,
-                request.expected_applied_record_digest,
-                request_owner_epoch,
-                request_id,
-            )
-        except HeadlessApiError as error:
-            try:
-                recovered = self.core.replay_program_apply(
-                    request.scenario_id,
-                    request.scenario_catalog_revision,
-                    str(program_document["program_id"]),
-                    str(program_document["program_revision"]),
-                    request.expected_applied_record_digest,
-                    request_owner_epoch,
-                    request_id,
-                )
-            except HeadlessApiError:
-                raise error
-            if recovered is not None:
-                return self._program_apply_replay_result(recovered)
-            raise self._program_apply_proven_no_effect(error) from error
-        return self._program_apply_result(preparation, applied)
-
-    def _program_apply_result(
-        self, preparation: dict[str, Any], applied: dict[str, Any]
-    ) -> dict[str, Any]:
-        result = {
-            "schema_version": PROGRAM_APPLY_RESULT_VERSION,
-            "status": "applied",
-            "preparation": preparation,
-            "applied": applied,
-        }
-        try:
-            validate_program_apply_result(result)
-            self._validate_applied_program_semantics(
-                applied,
-                error_code="program_apply_response_invalid",
-                message="native Program Apply returned an invalid Applied selection",
-            )
-        except (
-            ProgramBindingTransportError,
-            TypeError,
-            ValueError,
-            HeadlessApiError,
-        ) as error:
-            if isinstance(error, HeadlessApiError):
-                raise
-            raise HeadlessApiError(
-                "program_apply_response_invalid",
-                "native Program Apply returned an invalid result",
-            ) from error
-        return result
-
     @staticmethod
     def _validate_applied_program_semantics(
         applied: object,
@@ -2410,6 +2108,7 @@ class HeadlessService:
         return {
             "prepared_activation": self.activation_preparer.prepare(
                 source_document_digest=request.source_document_digest,
+                scenario_id=request.scenario_id,
                 captured_input_digest=request.captured_input_digest,
                 deployment=request.deployment,
                 model_source_closure=request.model_source_closure,

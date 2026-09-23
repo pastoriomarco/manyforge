@@ -54,7 +54,7 @@ public:
       std::string operating_system, std::string launch_environment_contract,
       std::filesystem::path logical_scene_database = {},
       std::filesystem::path program_cycle_journal = {},
-      std::filesystem::path candidate_package_root = {});
+      std::filesystem::path activation_root = {});
   RetainedNativeRuntimeUnitAdapter(
       std::filesystem::path trusted_installed_target_root,
       std::filesystem::path trusted_package_root,
@@ -69,7 +69,7 @@ public:
       std::vector<std::string> launch_environment_contracts,
       std::filesystem::path logical_scene_database = {},
       std::filesystem::path program_cycle_journal = {},
-      std::filesystem::path candidate_package_root = {});
+      std::filesystem::path activation_root = {});
   ~RetainedNativeRuntimeUnitAdapter() override;
 
   RetainedNativeRuntimeUnitAdapter(const RetainedNativeRuntimeUnitAdapter &) =
@@ -87,8 +87,6 @@ public:
   EnsureRunning(const RuntimeUnitConvergenceQueryDTO &query) override;
   [[nodiscard]] ProcessPresenceObservation
   EnsureStopped(const RuntimeUnitConvergenceQueryDTO &query) override;
-  [[nodiscard]] std::optional<manyforge::core::ManagedRuntimeWithdrawalDTO>
-  ReadPredecessorWithdrawal(const RuntimeUnitConvergenceQueryDTO &query) override;
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
   ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
                   const manyforge::core::RuntimeEpoch &runtime_epoch) override;

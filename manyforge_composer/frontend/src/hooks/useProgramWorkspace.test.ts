@@ -535,6 +535,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       sourceDiagnostics: [],
       incomplete: false,
       workspace: workspace(1),
+      authoringWorkspace: authoringSnapshot(workspace(1)),
     });
 
     await act(async () => {

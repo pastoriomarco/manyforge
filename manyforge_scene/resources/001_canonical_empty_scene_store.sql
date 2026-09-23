@@ -157,6 +157,8 @@ CREATE TABLE IF NOT EXISTS canonical_empty_scene_finalization (
         length(private_materialization_content_digest) = 71
         AND substr(private_materialization_content_digest, 1, 7) = 'sha256:'
     ),
+    -- Retained only for the historical v2 bootstrap-store shape. New writers
+    -- repeat the private-materialization digest; no retirement phase exists.
     retired_command_surfaces_evidence_digest TEXT NOT NULL CHECK (
         length(retired_command_surfaces_evidence_digest) = 71
         AND substr(retired_command_surfaces_evidence_digest, 1, 7) = 'sha256:'

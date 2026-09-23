@@ -25,7 +25,6 @@ constexpr std::string_view kDigestTwo =
       ContentDigest(std::string(kDigestOne)),
       ApplyId("apply-1"),
       ApplyGeneration(2U),
-      ProjectionStageGeneration(3U),
       ProjectionRevisionDTO{
           RetainedBundleId("bundle-1"),
           GraphRevision("graph-1"),

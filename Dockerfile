@@ -21,10 +21,17 @@
 
 # --- Stage 1: Build React frontend ---
 FROM node:22-slim AS frontend-builder
-WORKDIR /build
+WORKDIR /workspace/manyforge_composer/frontend
 COPY manyforge_composer/frontend/package.json manyforge_composer/frontend/package-lock.json* ./
 RUN npm ci --ignore-scripts
 COPY manyforge_composer/frontend/ ./
+# Frontend contract tests are compiled by `tsc -b` and intentionally consume
+# the owner-issued fixtures rather than maintaining browser-local copies. Keep
+# their repository-relative paths intact in this isolated build stage.
+COPY manyforge_deployment/resources/program_binding_lite6_native.fixture.json \
+     /workspace/manyforge_deployment/resources/program_binding_lite6_native.fixture.json
+COPY manyforge_headless_api/tests/fixtures/control-v2-local-delta.json \
+     /workspace/manyforge_headless_api/tests/fixtures/control-v2-local-delta.json
 RUN npm run build
 
 # --- Stage 2: Python/C++ runtime ---
@@ -93,6 +100,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
         yourdfpy==0.0.60 \
         nanobind==2.12.0 \
         scikit-build-core==0.12.2 \
+        wheel==0.48.0 \
         pin==4.1.0 \
         fastapi==0.135.3 \
         "uvicorn[standard]==0.44.0" \
@@ -114,7 +122,6 @@ COPY scripts/ci/build-roboplan-source-stack.sh /tmp/build-roboplan-source-stack.
 COPY scripts/ci/build-roboplan-source-closure.sh /tmp/build-roboplan-source-closure.sh
 COPY scripts/ci/verify-external-source-closure.py /tmp/verify-external-source-closure.py
 COPY verification/composable_cell_e1/external_delta_ledger.v1.json /tmp/external-delta-ledger.v1.json
-COPY scripts/ci/check-roboplan-dependency-stack.py /tmp/check-roboplan-dependency-stack.py
 RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1) \
     && PINOCCHIO_PREFIX=$(dirname $(dirname $(dirname $PINOCCHIO_CMAKE_DIR))) \
     && echo "Pinocchio prefix: ${PINOCCHIO_PREFIX}" \
@@ -163,17 +170,21 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
     && export CMAKE_ARGS="-DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_UPDATES_DISCONNECTED=ON" \
     && for py_pkg in roboplan_common roboplan_example_models roboplan_core roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt roboplan_cartesian_planning roboplan; do \
          cd "/tmp/roboplan/${py_pkg}"; \
-         pip install --no-build-isolation --no-deps --no-cache-dir -v .; \
+         pip install --no-build-isolation --no-deps --no-cache-dir -v . || exit 1; \
        done \
     && printf '%s\n' "${ROBOPLAN_SITE_PACKAGES}/lib" > /etc/ld.so.conf.d/manyforge-roboplan.conf \
     && ldconfig \
     && pip check \
-    && python3 /tmp/check-roboplan-dependency-stack.py \
     && rm -rf /tmp/roboplan /tmp/proxsuite /tmp/toppra /tmp/roboplan-manifest \
          /tmp/roboplan-build-closure /tmp/roboplan-install-closure \
          /tmp/build-roboplan-source-stack.sh /tmp/build-roboplan-source-closure.sh \
-         /tmp/verify-external-source-closure.py /tmp/external-delta-ledger.v1.json \
-         /tmp/check-roboplan-dependency-stack.py
+         /tmp/verify-external-source-closure.py /tmp/external-delta-ledger.v1.json
+
+# Keep the inexpensive installed-stack check separate so corrections to the
+# verifier do not invalidate the exact, source-built dependency layer.
+COPY scripts/ci/check-roboplan-dependency-stack.py /tmp/check-roboplan-dependency-stack.py
+RUN python3 /tmp/check-roboplan-dependency-stack.py \
+    && rm -f /tmp/check-roboplan-dependency-stack.py
 
 # The installed Python distributions are the sole RoboPlan runtime/CMake
 # prefix. The disconnected C++ closure above is qualification/build input and
@@ -199,7 +210,8 @@ RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 # Copy built frontend from Stage 1
-COPY --from=frontend-builder --chown=manyforge:manyforge /build/dist/ /opt/manyforge-frontend/dist/
+COPY --from=frontend-builder --chown=manyforge:manyforge \
+     /workspace/manyforge_composer/frontend/dist/ /opt/manyforge-frontend/dist/
 
 # The source-mounted behavior package is exposed through PYTHONPATH by the
 # entrypoint; /workspace/scripts/manyforge is its container CLI shim.

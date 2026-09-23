@@ -31,6 +31,7 @@ from manyforge_composer.backend.authoring_admission import (
 from manyforge_composer.backend.authoring_workspace import AuthoringWorkspace
 from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_composer.backend.state import ComposerState
+from manyforge_composer.backend.app import create_app
 
 
 _DIGEST = "sha256:" + "1" * 64
@@ -977,7 +978,6 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     source = project / "deployment.yaml"
     state.allowed_fs_roots.append(str(project.parents[1]))
     _replace_deployment_session(state, DeploymentDraftSession())
-    state.scenario_document_path = str(project)
     compiled = state.deployment_draft_session.preview_source(
         source.read_text(encoding="utf-8")
     )
@@ -1008,11 +1008,22 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     )
     program = program_model.to_dict()
     state.draft_session = ComposerDraftSession(program_model)
-    state.scenario_program_role_assignment = json.loads(
-        (project / "assignment.yaml").read_text(encoding="utf-8")
+    state.authoring_workspace = AuthoringWorkspace(
+        program_session=state.draft_session,
+        deployment_session=state.deployment_draft_session,
     )
-    state.scenario_source_document_digest = "sha256:" + "6" * 64
-    state.scenario_typed_parameter_overrides = {}
+    edited = client.get("/api/deployment/workspace").json()
+    state.authoring_workspace.remember_project(
+        document=None,
+        document_path=str(project),
+        source_document_digest="sha256:" + "6" * 64,
+        explicit={
+            "program_role_assignment": json.loads(
+                (project / "assignment.yaml").read_text(encoding="utf-8")
+            ),
+            "typed_parameter_overrides": {},
+        },
+    )
     capture_calls = 0
     capture_sources = routes_deployment_draft._capture_model_sources
 
@@ -1097,7 +1108,6 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
                     else None
                 ),
                 "manager_apply": None,
-                "selection": None,
                 "preparation": (
                     {
                         "request_owner_epoch": intent[
@@ -1165,13 +1175,13 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     )
     assert applied.status_code == 202, applied.text
     assert applied.json()["result"]["status"] == "applied"
-    # This UA2A regression proves preparation reuse only. The test double does
-    # not publish the candidate bundle as Manager current; UA3 owns that live
-    # transition, so assert the Manager-facing observation stayed unchanged.
+    # This regression proves preparation reuse only. The test double does not
+    # publish the candidate bundle through Manager's transition owner, so the
+    # Manager-facing observation stays unchanged.
     assert current["deployment_revision"] == base_revision
     # Confirmation performs the same bounded source capture again and rejects
     # a changed digest before Manager teardown; Composer retains no operation
-    # journal or hidden candidate package.
+    # journal or hidden candidate registry.
     assert capture_calls == capture_calls_after_preparation + 2
     assert applied.json()["result"]["prepared_activation"] == (
         confirmation.json()["result"]["prepared_activation"]
@@ -1189,6 +1199,8 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
         "candidate_graph_revision": "sha256:" + "5" * 64,
     }
     prepared_activation = {
+        "schema_version": "manyforge.prepared_activation_input.v2",
+        "scenario_id": "scenario-a",
         "prepared_activation_id": "sha256:" + "6" * 64,
         "source_document_digest": "sha256:" + "7" * 64,
         "captured_input_digest": "sha256:" + "8" * 64,
@@ -1237,16 +1249,7 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
                 "deployment_revision": "sha256:" + "9" * 64,
                 "expected_current": receipt["expected_current"],
                 "reject_if_affected_busy": True,
-                "prepared_activation": {
-                    key: prepared_activation[key]
-                    for key in (
-                        "captured_input_digest",
-                        "deployment_artifact_id",
-                        "deployment_revision",
-                        "program_binding_id",
-                        "prepared_activation_id",
-                    )
-                },
+                "prepared_activation": deepcopy(prepared_activation),
                 "expected_admission_generation": 7,
                 "candidate_receipt": receipt,
             },
@@ -1263,28 +1266,6 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
     )
     assert "expected_admission_generation" not in manager_requests[0]
     assert manager_requests[0]["parent_authoring_claim"] == parent_claim
-
-
-def test_legacy_catalog_scenario_load_is_explicitly_retired(tmp_path: Path) -> None:
-    client, _state = _client(tmp_path)
-    draft = _state.draft_session.retained_state()
-
-    response = client.post(
-        "/api/scenarios/load",
-        json={
-            "scenarioId": "legacy-catalog-scenario",
-            "scenarioCatalogRevision": "sha256:" + "1" * 64,
-            "confirmDiscard": False,
-            "draftId": draft["draft_id"],
-            "expectedDraftRevision": draft["draft_revision"],
-            "expectedAdmissionGeneration": 1,
-            "requestOwnerEpoch": "browser.epoch.1",
-            "requestId": "browser.request.1",
-        },
-    )
-
-    assert response.status_code == 410
-    assert response.json()["detail"]["code"] == "catalog_scenario_load_removed"
 
 
 def test_focused_motion_target_limit_updates_one_exact_target_atomically(
@@ -1586,7 +1567,7 @@ def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():
             "source_label": "test",
             "correlation_id": None,
             "scenario_id": "cell-a",
-            "scenario_catalog_revision": _DIGEST,
+            "source_document_digest": _DIGEST,
             "expected_applied_record_digest": _DIGEST,
             "draft_program_revision": _DIGEST,
             "expected_admission_generation": 1,
@@ -1634,7 +1615,7 @@ def test_run_uses_the_existing_transport_when_deployment_draft_matches_applied()
             "source_label": "test",
             "correlation_id": None,
             "scenario_id": "cell-a",
-            "scenario_catalog_revision": _DIGEST,
+            "source_document_digest": _DIGEST,
             "expected_applied_record_digest": _DIGEST,
             "draft_program_revision": _DIGEST,
             "expected_admission_generation": 1,

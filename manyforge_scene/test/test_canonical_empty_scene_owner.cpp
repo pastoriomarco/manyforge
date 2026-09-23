@@ -40,8 +40,6 @@ namespace {
 
 using namespace std::chrono_literals;
 
-using core::ActiveProjectionRuntimeRecoveryState;
-using core::ActiveProjectionRuntimeSetDTO;
 using core::ActiveBundlePublicationGeneration;
 using core::ActiveBundlePublicationReceiptDTO;
 using core::ActiveBundlePublicationRequestDTO;
@@ -56,16 +54,6 @@ using core::ErrorDTO;
 using core::GraphRevision;
 using core::IActiveBundlePublicationReader;
 using core::NamedApplyPublicationTransactionDTO;
-using core::ProjectionApplyActivationDTO;
-using core::ProjectionApplyActivationResultState;
-using core::ProjectionApplyDiscardDTO;
-using core::ProjectionApplyDiscardResultState;
-using core::ProjectionApplyFinalizeDTO;
-using core::ProjectionApplyFinalizeResultState;
-using core::ProjectionApplyStageDTO;
-using core::ProjectionApplyStageResultState;
-using core::ProjectionApplyStatusQueryDTO;
-using core::ProjectionApplyStatusState;
 using core::ProjectionBootstrapAcceptedDTO;
 using core::ProjectionBootstrapFinalizeDTO;
 using core::ProjectionBootstrapFinalizeResultState;
@@ -631,112 +619,6 @@ void ExecuteSql(const std::filesystem::path &database_path,
   }
 }
 
-std::string ReadSqlResource(const std::string_view name) {
-  std::ifstream input(
-      std::filesystem::path(MANYFORGE_SCENE_TEST_RESOURCE_ROOT) /
-          std::string(name),
-      std::ios::binary);
-  if (!input) {
-    throw std::runtime_error("cannot open scene SQL test resource");
-  }
-  std::ostringstream content;
-  content << input.rdbuf();
-  if (input.bad()) {
-    throw std::runtime_error("cannot read scene SQL test resource");
-  }
-  return content.str();
-}
-
-void DowngradeBoundedHistoryStoreToV5ForMigrationTest(
-    const std::filesystem::path &database_path) {
-  std::string sql = R"sql(
-PRAGMA foreign_keys=OFF;
-BEGIN IMMEDIATE;
-CREATE TEMP TABLE test_recovery_intents AS
-SELECT recovery_generation,structural_lineage_generation,
-       target_retained_bundle_id,target_graph_revision,target_scene_id,
-       target_scene_revision_id,target_scene_content_hash,native_binding_count
-FROM logical_scene_native_runtime_recovery_intents;
-CREATE TEMP TABLE test_recovery_bindings AS
-SELECT recovery_generation,binding_ordinal,provider_binding_id,
-       provider_binding_revision,runtime_unit_id,runtime_epoch
-FROM logical_scene_native_runtime_recovery_bindings;
-CREATE TEMP TABLE test_recovery_results AS
-SELECT recovery_generation,binding_ordinal,source_sequence,
-       native_projection_generation,projection_content_digest
-FROM logical_scene_native_runtime_recovery_results;
-CREATE TEMP TABLE test_recovery_completions AS
-SELECT recovery_generation,result_count
-FROM logical_scene_native_runtime_recovery_completions;
-
-DROP TRIGGER logical_scene_bounded_history_migrations_no_update;
-DROP TRIGGER logical_scene_bounded_history_migrations_no_delete;
-DROP TRIGGER logical_scene_history_state_no_delete;
-DROP TRIGGER logical_scene_transaction_intents_no_delete;
-DROP TRIGGER logical_scene_request_outcomes_no_delete;
-DROP TRIGGER logical_scene_projection_attempts_no_delete;
-DROP TRIGGER logical_scene_projection_results_no_delete;
-DROP TRIGGER logical_scene_owner_events_no_delete;
-DROP TRIGGER logical_scene_native_runtime_recovery_intents_no_update;
-DROP TRIGGER logical_scene_native_runtime_recovery_intents_no_delete;
-DROP TRIGGER logical_scene_native_runtime_recovery_bindings_no_update;
-DROP TRIGGER logical_scene_native_runtime_recovery_bindings_no_delete;
-DROP TRIGGER logical_scene_native_runtime_recovery_results_no_update;
-DROP TRIGGER logical_scene_native_runtime_recovery_results_no_delete;
-DROP TRIGGER logical_scene_native_runtime_recovery_completions_no_update;
-DROP TRIGGER logical_scene_native_runtime_recovery_completions_no_delete;
-DROP TABLE logical_scene_native_runtime_recovery_results;
-DROP TABLE logical_scene_native_runtime_recovery_completions;
-DROP TABLE logical_scene_native_runtime_recovery_bindings;
-DROP TABLE logical_scene_native_runtime_recovery_intents;
-DROP TABLE logical_scene_bounded_history_migrations;
-DROP TABLE logical_scene_history_state;
-
-CREATE TRIGGER logical_scene_transaction_intents_no_delete
-BEFORE DELETE ON logical_scene_transaction_intents
-BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_transaction_intents is immutable');
-END;
-CREATE TRIGGER logical_scene_request_outcomes_no_delete
-BEFORE DELETE ON logical_scene_request_outcomes
-BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_request_outcomes is immutable');
-END;
-CREATE TRIGGER logical_scene_projection_attempts_no_delete
-BEFORE DELETE ON logical_scene_projection_attempts
-BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_projection_attempts is immutable');
-END;
-CREATE TRIGGER logical_scene_projection_results_no_delete
-BEFORE DELETE ON logical_scene_projection_results
-BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_projection_results is immutable');
-END;
-CREATE TRIGGER logical_scene_owner_events_no_delete
-BEFORE DELETE ON logical_scene_owner_events
-BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_owner_events is immutable');
-END;
-)sql";
-  sql += ReadSqlResource("003_native_projection_handoff.sql");
-  sql += R"sql(
-INSERT INTO logical_scene_native_runtime_recovery_intents
-SELECT * FROM test_recovery_intents;
-INSERT INTO logical_scene_native_runtime_recovery_bindings
-SELECT * FROM test_recovery_bindings;
-INSERT INTO logical_scene_native_runtime_recovery_results
-SELECT * FROM test_recovery_results;
-INSERT INTO logical_scene_native_runtime_recovery_completions
-SELECT * FROM test_recovery_completions;
-DROP TABLE test_recovery_completions;
-DROP TABLE test_recovery_results;
-DROP TABLE test_recovery_bindings;
-DROP TABLE test_recovery_intents;
-COMMIT;
-)sql";
-  ExecuteSql(database_path, sql);
-}
-
 void Require(const bool condition, const std::string_view message) {
   if (!condition) {
     throw std::runtime_error(std::string(message));
@@ -756,90 +638,6 @@ ProjectionBootstrapAcceptedDTO FinalizeCanonicalBootstrap(
   Require(finalized.state == ProjectionBootstrapFinalizeResultState::kFinalized,
           "canonical bootstrap did not finalize");
   return accepted;
-}
-
-ProjectionApplyStageDTO NamedStageRequest(
-    const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
-    const ProjectionRevisionDTO &predecessor,
-    std::string apply_id = "apply-alpha") {
-  return {
-      ApplyId(std::move(apply_id)),
-      ApplyGeneration(1U),
-      predecessor,
-      admission.retained_bundle().value(),
-      admission.retained_bundle().value(),
-      {},
-  };
-}
-
-ProjectionApplyActivationDTO
-ActivationRequest(const core::ProjectionApplyStageResultDTO &staged) {
-  Require(staged.projection_stage_generation.has_value(), "stage has no ID");
-  Require(staged.candidate_projection_revision.has_value(),
-          "stage has no candidate");
-  return {
-      staged.apply_id,
-      staged.apply_generation,
-      staged.expected_active_projection_revision,
-      *staged.projection_stage_generation,
-      *staged.candidate_projection_revision,
-  };
-}
-
-ProjectionApplyDiscardDTO
-DiscardRequest(const core::ProjectionApplyStageResultDTO &staged) {
-  Require(staged.projection_stage_generation.has_value(), "stage has no ID");
-  Require(staged.candidate_projection_revision.has_value(),
-          "stage has no candidate");
-  return {
-      staged.apply_id,
-      staged.apply_generation,
-      *staged.projection_stage_generation,
-      *staged.candidate_projection_revision,
-      staged.expected_active_projection_revision,
-  };
-}
-
-ActiveBundlePublicationReceiptDTO
-NamedPublicationReceipt(const core::ProjectionApplyStageResultDTO &staged,
-                        const std::uint64_t expected_previous_generation = 1U,
-                        const std::uint64_t publication_generation = 2U) {
-  Require(staged.projection_stage_generation.has_value(), "stage has no ID");
-  Require(staged.candidate_projection_revision.has_value(),
-          "stage has no candidate");
-  ActiveBundlePublicationRequestDTO request{
-      NamedApplyPublicationTransactionDTO{
-          staged.apply_id,
-          staged.apply_generation,
-          *staged.projection_stage_generation,
-      },
-      *staged.candidate_projection_revision,
-      staged.candidate_projection_revision->retained_bundle_id,
-      staged.candidate_projection_revision->graph_revision,
-      ActiveBundlePublicationGeneration(expected_previous_generation),
-      Digest('d'),
-      Digest('e'),
-  };
-  return {
-      std::move(request),
-      ActiveBundlePublicationGeneration(publication_generation),
-      Digest('f'),
-  };
-}
-
-ProjectionApplyFinalizeDTO
-NamedFinalizeRequest(const core::ProjectionApplyStageResultDTO &staged,
-                     ActiveBundlePublicationReceiptDTO receipt) {
-  Require(staged.projection_stage_generation.has_value(), "stage has no ID");
-  Require(staged.candidate_projection_revision.has_value(),
-          "stage has no candidate");
-  return {
-      staged.apply_id,
-      staged.apply_generation,
-      *staged.projection_stage_generation,
-      *staged.candidate_projection_revision,
-      std::move(receipt),
-  };
 }
 
 void ExpectExactCanonicalEmptySnapshot(
@@ -1162,367 +960,6 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
   EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
   EXPECT_EQ(owner.VerifyIntegrity().finalization_row_count, 0);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     NamedApplyStageRequiresIndependentlyVerifiedBundleSource) {
-  TemporaryDirectory directory;
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader);
-  const auto predecessor =
-      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-          .canonical_empty_target;
-  const auto request = NamedStageRequest(admission, predecessor);
-
-  const auto result = owner.StageCandidateProjection(request);
-  ASSERT_TRUE(result.presence_valid());
-  EXPECT_EQ(result.state, ProjectionApplyStageResultState::kRejected);
-  ASSERT_TRUE(result.error.has_value());
-  EXPECT_EQ(result.error->code, "named_apply_retained_source_unavailable");
-  EXPECT_FALSE(result.projection_stage_generation.has_value());
-  EXPECT_FALSE(result.candidate_projection_revision.has_value());
-  EXPECT_FALSE(result.transition_evidence.has_value());
-  EXPECT_EQ(owner.VerifyIntegrity().named_apply_stage_count, 0);
-  EXPECT_TRUE(owner.ReadAccessStatus().scene_writes_open);
-  EXPECT_TRUE(owner.ReadAccessStatus().projection_leases_open);
-
-  const auto status = owner.ProjectionApplyStatus(ProjectionApplyStatusQueryDTO{
-      request.apply_id, request.apply_generation});
-  EXPECT_TRUE(status.presence_valid());
-  EXPECT_EQ(status.state, ProjectionApplyStatusState::kAbsent);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     ZeroNativeNamedApplyStageIsDurableReplayableAndClosesGates) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
-  ControlledPublicationReader publication_reader;
-  std::optional<ProjectionApplyStageDTO> request;
-  {
-    CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                   bundle_source);
-    const auto predecessor =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-            .canonical_empty_target;
-    auto value = NamedStageRequest(admission, predecessor);
-    request = value;
-
-    const auto absent = owner.ProjectionApplyStatus(
-        ProjectionApplyStatusQueryDTO{value.apply_id, value.apply_generation});
-    ASSERT_TRUE(absent.presence_valid());
-    EXPECT_EQ(absent.state, ProjectionApplyStatusState::kAbsent);
-
-    const auto staged = owner.StageCandidateProjection(value);
-    ASSERT_TRUE(staged.presence_valid());
-    EXPECT_EQ(staged.state, ProjectionApplyStageResultState::kStaged);
-    ASSERT_TRUE(staged.projection_stage_generation.has_value());
-    EXPECT_EQ(staged.projection_stage_generation->value(), 1U);
-    ASSERT_TRUE(staged.candidate_projection_revision.has_value());
-    EXPECT_EQ(*staged.candidate_projection_revision, predecessor);
-    ASSERT_TRUE(staged.transition_evidence.has_value());
-    EXPECT_TRUE(staged.transition_evidence->transition_rows.empty());
-    EXPECT_TRUE(staged.transition_evidence->matches_apply_phase(
-        value.apply_id, value.apply_generation,
-        *staged.projection_stage_generation, predecessor,
-        *staged.candidate_projection_revision,
-        core::ProjectionTransitionEvidenceState::kStaged));
-
-    const auto access = owner.ReadAccessStatus();
-    EXPECT_TRUE(access.valid());
-    EXPECT_EQ(access.phase,
-              CanonicalEmptySceneBootstrapPhase::kNamedApplyStaged);
-    EXPECT_FALSE(access.scene_writes_open);
-    EXPECT_FALSE(access.projection_leases_open);
-    ASSERT_TRUE(access.active_projection.has_value());
-    EXPECT_EQ(*access.active_projection, predecessor);
-    EXPECT_EQ(owner.VerifyIntegrity().named_apply_stage_count, 1);
-
-    const auto replay = owner.StageCandidateProjection(value);
-    ASSERT_TRUE(replay.presence_valid());
-    EXPECT_EQ(replay.state, ProjectionApplyStageResultState::kStaged);
-    EXPECT_EQ(replay.projection_stage_generation,
-              staged.projection_stage_generation);
-    EXPECT_EQ(replay.candidate_projection_revision,
-              staged.candidate_projection_revision);
-    const auto conflict = owner.StageCandidateProjection(
-        NamedStageRequest(admission, predecessor, "apply-beta"));
-    EXPECT_EQ(conflict.state, ProjectionApplyStageResultState::kRejected);
-    EXPECT_EQ(owner.VerifyIntegrity().named_apply_stage_count, 1);
-    owner.Close();
-  }
-
-  ASSERT_TRUE(request.has_value());
-  CanonicalEmptySceneOwner reopened(database_path, admission,
-                                    publication_reader, bundle_source);
-  const auto status =
-      reopened.ProjectionApplyStatus(ProjectionApplyStatusQueryDTO{
-          request->apply_id, request->apply_generation});
-  ASSERT_TRUE(status.presence_valid());
-  EXPECT_EQ(status.state, ProjectionApplyStatusState::kStaged);
-  ASSERT_TRUE(status.projection_stage_generation.has_value());
-  EXPECT_EQ(status.projection_stage_generation->value(), 1U);
-  ASSERT_TRUE(status.candidate_projection_revision.has_value());
-  ASSERT_TRUE(status.transition_evidence.has_value());
-  EXPECT_TRUE(status.transition_evidence->transition_rows.empty());
-  EXPECT_FALSE(reopened.ReadAccessStatus().scene_writes_open);
-  EXPECT_FALSE(reopened.ReadAccessStatus().projection_leases_open);
-  const auto replay = reopened.StageCandidateProjection(*request);
-  EXPECT_EQ(replay.state, ProjectionApplyStageResultState::kStaged);
-  EXPECT_EQ(replay.projection_stage_generation,
-            status.projection_stage_generation);
-  EXPECT_EQ(replay.candidate_projection_revision,
-            status.candidate_projection_revision);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     ZeroNativeNamedApplyActivationAndFinalizeAreForwardOnlyAndDurable) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
-  ControlledPublicationReader publication_reader;
-  std::optional<ProjectionApplyFinalizeDTO> finalize_request;
-  {
-    CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                   bundle_source);
-    const auto predecessor =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-            .canonical_empty_target;
-    const auto staged = owner.StageCandidateProjection(
-        NamedStageRequest(admission, predecessor));
-    ASSERT_EQ(staged.state, ProjectionApplyStageResultState::kStaged);
-    const auto activation_request = ActivationRequest(staged);
-    const auto activated = owner.ActivateStagedProjection(activation_request);
-    ASSERT_TRUE(activated.presence_valid());
-    EXPECT_EQ(activated.state,
-              ProjectionApplyActivationResultState::kActivated);
-    EXPECT_EQ(activated.acknowledged_candidate_projection_revision,
-              staged.candidate_projection_revision);
-    EXPECT_TRUE(activated.transition_evidence.transition_rows.empty());
-    EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-    EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
-    EXPECT_EQ(owner.ReadAccessStatus().phase,
-              CanonicalEmptySceneBootstrapPhase::kNamedApplyActivated);
-    const auto frozen_predecessor = owner.ReadActiveSnapshot();
-    ASSERT_TRUE(frozen_predecessor.has_value());
-    EXPECT_EQ(frozen_predecessor->shared()->revision,
-              predecessor.scene_revision);
-
-    const auto activation_replay =
-        owner.ActivateStagedProjection(activation_request);
-    EXPECT_EQ(activation_replay.state,
-              ProjectionApplyActivationResultState::kActivated);
-    const auto forbidden_discard =
-        owner.DiscardStagedProjection(DiscardRequest(staged));
-    ASSERT_TRUE(forbidden_discard.presence_valid());
-    EXPECT_EQ(forbidden_discard.state,
-              ProjectionApplyDiscardResultState::kFailedProjectionUncertain);
-    EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-
-    const auto receipt = NamedPublicationReceipt(staged);
-    finalize_request = NamedFinalizeRequest(staged, receipt);
-    const auto stale = owner.FinalizeProjectionTransition(*finalize_request);
-    ASSERT_TRUE(stale.presence_valid());
-    EXPECT_EQ(stale.state, ProjectionApplyFinalizeResultState::kStale);
-    EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-    EXPECT_EQ(owner.VerifyIntegrity().named_apply_finalization_count, 0);
-
-    publication_reader.SetCurrent(receipt);
-    const auto finalized =
-        owner.FinalizeProjectionTransition(*finalize_request);
-    ASSERT_TRUE(finalized.presence_valid());
-    EXPECT_EQ(finalized.state, ProjectionApplyFinalizeResultState::kFinalized);
-    EXPECT_EQ(finalized.publication_receipt, receipt);
-    EXPECT_TRUE(finalized.transition_evidence.transition_rows.empty());
-    EXPECT_TRUE(
-        finalized.candidate_aggregate_health.native_projection_health.empty());
-    const auto access = owner.ReadAccessStatus();
-    EXPECT_TRUE(access.scene_writes_open);
-    EXPECT_TRUE(access.projection_leases_open);
-    EXPECT_EQ(access.phase,
-              CanonicalEmptySceneBootstrapPhase::kNamedApplyFinalized);
-    ASSERT_TRUE(access.active_projection.has_value());
-    EXPECT_EQ(*access.active_projection, *staged.candidate_projection_revision);
-    const auto selected_snapshot = owner.ReadActiveSnapshot();
-    ASSERT_TRUE(selected_snapshot.has_value());
-    EXPECT_EQ(selected_snapshot->shared()->revision,
-              staged.candidate_projection_revision->scene_revision);
-    const auto integrity = owner.VerifyIntegrity();
-    EXPECT_EQ(integrity.named_apply_stage_count, 1);
-    EXPECT_EQ(integrity.named_apply_activation_count, 1);
-    EXPECT_EQ(integrity.named_apply_discard_count, 0);
-    EXPECT_EQ(integrity.named_apply_finalization_count, 1);
-    owner.Close();
-  }
-
-  ASSERT_TRUE(finalize_request.has_value());
-  const auto calls_before_reopen = publication_reader.calls();
-  CanonicalEmptySceneOwner reopened(database_path, admission,
-                                    publication_reader, bundle_source);
-  const auto status =
-      reopened.ProjectionApplyStatus(ProjectionApplyStatusQueryDTO{
-          finalize_request->apply_id, finalize_request->apply_generation});
-  ASSERT_TRUE(status.presence_valid());
-  EXPECT_EQ(status.state, ProjectionApplyStatusState::kFinalized);
-  EXPECT_EQ(status.publication_receipt, finalize_request->publication_receipt);
-  ASSERT_TRUE(status.candidate_aggregate_health.has_value());
-  EXPECT_TRUE(
-      status.candidate_aggregate_health->native_projection_health.empty());
-  const auto replay = reopened.FinalizeProjectionTransition(*finalize_request);
-  EXPECT_EQ(replay.state, ProjectionApplyFinalizeResultState::kFinalized);
-  EXPECT_EQ(publication_reader.calls(), calls_before_reopen);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     PreselectionDiscardRestoresPredecessorAndAllowsNextApply) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
-  ControlledPublicationReader publication_reader;
-  std::optional<ProjectionApplyStageDTO> second_request;
-  {
-    CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                   bundle_source);
-    const auto predecessor =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-            .canonical_empty_target;
-    const auto first = owner.StageCandidateProjection(
-        NamedStageRequest(admission, predecessor));
-    ASSERT_EQ(first.state, ProjectionApplyStageResultState::kStaged);
-    const auto discard_request = DiscardRequest(first);
-    const auto discarded = owner.DiscardStagedProjection(discard_request);
-    ASSERT_TRUE(discarded.presence_valid());
-    EXPECT_EQ(discarded.state, ProjectionApplyDiscardResultState::kDiscarded);
-    EXPECT_TRUE(discarded.transition_evidence.transition_rows.empty());
-    const auto discard_replay = owner.DiscardStagedProjection(discard_request);
-    EXPECT_EQ(discard_replay.state,
-              ProjectionApplyDiscardResultState::kDiscarded);
-    const auto stale_activation =
-        owner.ActivateStagedProjection(ActivationRequest(first));
-    ASSERT_TRUE(stale_activation.presence_valid());
-    EXPECT_EQ(stale_activation.state,
-              ProjectionApplyActivationResultState::kStale);
-
-    const auto access = owner.ReadAccessStatus();
-    EXPECT_TRUE(access.scene_writes_open);
-    EXPECT_TRUE(access.projection_leases_open);
-    EXPECT_EQ(access.phase,
-              CanonicalEmptySceneBootstrapPhase::kNamedApplyDiscarded);
-    ASSERT_TRUE(access.active_projection.has_value());
-    EXPECT_EQ(*access.active_projection, predecessor);
-
-    second_request = NamedStageRequest(admission, predecessor, "apply-beta");
-    const auto second = owner.StageCandidateProjection(*second_request);
-    EXPECT_EQ(second.state, ProjectionApplyStageResultState::kStaged);
-    EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-    const auto integrity = owner.VerifyIntegrity();
-    EXPECT_EQ(integrity.named_apply_stage_count, 2);
-    EXPECT_EQ(integrity.named_apply_activation_count, 0);
-    EXPECT_EQ(integrity.named_apply_discard_count, 1);
-    EXPECT_EQ(integrity.named_apply_finalization_count, 0);
-    owner.Close();
-  }
-
-  ASSERT_TRUE(second_request.has_value());
-  CanonicalEmptySceneOwner reopened(database_path, admission,
-                                    publication_reader, bundle_source);
-  const auto first_status = reopened.ProjectionApplyStatus(
-      {ApplyId("apply-alpha"), ApplyGeneration(1U)});
-  EXPECT_EQ(first_status.state, ProjectionApplyStatusState::kDiscarded);
-  const auto second_status = reopened.ProjectionApplyStatus(
-      {second_request->apply_id, second_request->apply_generation});
-  EXPECT_EQ(second_status.state, ProjectionApplyStatusState::kStaged);
-  EXPECT_FALSE(reopened.ReadAccessStatus().scene_writes_open);
-}
-
-TEST(CanonicalEmptySceneOwner, StartupRejectsOrphanedNamedApplyPhaseRow) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
-  ControlledPublicationReader publication_reader;
-  {
-    CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                   bundle_source);
-    const auto predecessor =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-            .canonical_empty_target;
-    static_cast<void>(owner.StageCandidateProjection(
-        NamedStageRequest(admission, predecessor)));
-    owner.Close();
-  }
-  ExecuteSql(database_path,
-             "INSERT INTO logical_scene_named_apply_activations("
-             "apply_id,apply_generation,projection_stage_generation,"
-             "transition_row_count,transition_evidence_state) "
-             "VALUES('orphan-apply',1,1,0,'activated_and_retired')");
-  EXPECT_THROW(CanonicalEmptySceneOwner(database_path, admission,
-                                        publication_reader, bundle_source),
-               CanonicalEmptySceneOwnerIntegrityError);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     LifecycleGateSerializesConstructionCloseAndDestruction) {
-  TemporaryDirectory directory;
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  const auto database = directory.path() / "logical-scene.sqlite3";
-  const auto make_owner = [&] {
-    return std::make_unique<CanonicalEmptySceneOwner>(database, admission,
-                                                      publication_reader);
-  };
-
-  ExpectActionAcquiresSceneLifecycleGate(
-      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent::
-          kStartupAttempt,
-      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent::
-          kStartupAcquired,
-      [&] {
-        auto owner = make_owner();
-        if (owner->VerifyIntegrity().acceptance_row_count != 0) {
-          throw std::runtime_error(
-              "fresh scene owner has an unexpected acceptance row");
-        }
-      });
-  ExpectNoSqliteSidecars(database);
-
-  auto explicitly_closed = make_owner();
-  ExpectActionAcquiresSceneLifecycleGate(
-      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent::
-          kCloseAttempt,
-      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent::
-          kCloseAcquired,
-      [owner = explicitly_closed.get()] { owner->Close(); });
-  ExpectNoSqliteSidecars(database);
-  {
-    auto reopened = make_owner();
-    EXPECT_EQ(reopened->VerifyIntegrity().acceptance_row_count, 0);
-  }
-
-  auto destructed = make_owner();
-  ExpectActionAcquiresSceneLifecycleGate(
-      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent::
-          kCloseAttempt,
-      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent::
-          kCloseAcquired,
-      [owner = std::move(destructed)]() mutable { owner.reset(); });
-  ExpectNoSqliteSidecars(database);
-  {
-    auto reopened = make_owner();
-    EXPECT_EQ(reopened->VerifyIntegrity().acceptance_row_count, 0);
-  }
-
-  auto final_reopen = make_owner();
-  EXPECT_EQ(final_reopen->VerifyIntegrity().acceptance_row_count, 0);
 }
 
 TEST(CanonicalEmptySceneOwnerLifecycleGate,
@@ -2400,119 +1837,6 @@ TEST(CanonicalEmptySceneOwner,
 }
 
 TEST(CanonicalEmptySceneOwner,
-     NamedApplyStatusUsesCurrentCacheAcrossStageAndActivation) {
-  TemporaryDirectory directory("scene-apply-status-cache");
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
-  CanonicalEmptySceneOwner first(database_path, admission, publication_reader,
-                                 bundle_source);
-  static_cast<void>(
-      FinalizeCanonicalBootstrap(first, publication_reader, admission));
-  CanonicalEmptySceneOwner second(database_path, admission, publication_reader,
-                                  bundle_source);
-  const auto predecessor = first.CurrentProjectionRevision();
-  const ProjectionApplyStatusQueryDTO query{ApplyId("apply-alpha"),
-                                            ApplyGeneration(1U)};
-
-  // Warm both process-local views before either connection creates the named
-  // Apply. The second stage must invalidate the first owner's absent cache,
-  // and the exact retry must replay the durable stage identity.
-  const auto first_absent = first.ProjectionApplyStatus(query);
-  const auto second_absent = second.ProjectionApplyStatus(query);
-  ASSERT_EQ(first_absent.state, ProjectionApplyStatusState::kAbsent);
-  ASSERT_EQ(second_absent.state, ProjectionApplyStatusState::kAbsent);
-  const auto stage_request = NamedStageRequest(admission, predecessor);
-  const auto staged = second.StageCandidateProjection(stage_request);
-  ASSERT_EQ(staged.state, ProjectionApplyStageResultState::kStaged);
-  const auto replayed_staged = first.StageCandidateProjection(stage_request);
-  ASSERT_EQ(replayed_staged.state, ProjectionApplyStageResultState::kStaged);
-  EXPECT_EQ(replayed_staged.projection_stage_generation,
-            staged.projection_stage_generation);
-  EXPECT_EQ(replayed_staged.candidate_projection_revision,
-            staged.candidate_projection_revision);
-
-  const auto first_staged = first.ProjectionApplyStatus(query);
-  const auto second_staged = second.ProjectionApplyStatus(query);
-  const auto repeated_staged = first.ProjectionApplyStatus(query);
-  ASSERT_EQ(first_staged.state, ProjectionApplyStatusState::kStaged);
-  EXPECT_EQ(second_staged.state, ProjectionApplyStatusState::kStaged);
-  EXPECT_EQ(repeated_staged.state, ProjectionApplyStatusState::kStaged);
-  EXPECT_EQ(repeated_staged.projection_stage_generation,
-            first_staged.projection_stage_generation);
-  EXPECT_EQ(repeated_staged.candidate_projection_revision,
-            first_staged.candidate_projection_revision);
-
-  const auto activation_request = ActivationRequest(staged);
-  const auto first_activated_result =
-      first.ActivateStagedProjection(activation_request);
-  ASSERT_EQ(first_activated_result.state,
-            ProjectionApplyActivationResultState::kActivated);
-  const auto second_activated_result =
-      second.ActivateStagedProjection(activation_request);
-  ASSERT_EQ(second_activated_result.state,
-            ProjectionApplyActivationResultState::kActivated);
-  EXPECT_EQ(second_activated_result.expected_active_projection_revision,
-            first_activated_result.expected_active_projection_revision);
-  EXPECT_EQ(second_activated_result.projection_stage_generation,
-            first_activated_result.projection_stage_generation);
-  EXPECT_EQ(second_activated_result.candidate_projection_revision,
-            first_activated_result.candidate_projection_revision);
-  EXPECT_EQ(second_activated_result.acknowledged_candidate_projection_revision,
-            first_activated_result.acknowledged_candidate_projection_revision);
-  const auto first_activated = first.ProjectionApplyStatus(query);
-  const auto second_activated = second.ProjectionApplyStatus(query);
-  const auto repeated_activated = first.ProjectionApplyStatus(query);
-  const auto repeated_second_activated = second.ProjectionApplyStatus(query);
-  EXPECT_EQ(first_activated.state, ProjectionApplyStatusState::kActivated);
-  EXPECT_EQ(second_activated.state, ProjectionApplyStatusState::kActivated);
-  EXPECT_EQ(repeated_activated.state, ProjectionApplyStatusState::kActivated);
-  EXPECT_EQ(repeated_second_activated.state,
-            ProjectionApplyStatusState::kActivated);
-  EXPECT_EQ(repeated_activated.candidate_projection_revision,
-            first_activated.candidate_projection_revision);
-  EXPECT_EQ(repeated_second_activated.candidate_projection_revision,
-            second_activated.candidate_projection_revision);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     NamedApplyStatusCacheRejectsSemanticallyTamperedDurableStage) {
-  TemporaryDirectory directory("scene-apply-status-tamper");
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
-  CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                 bundle_source);
-  const auto predecessor =
-      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-          .canonical_empty_target;
-  const auto staged =
-      owner.StageCandidateProjection(NamedStageRequest(admission, predecessor));
-  ASSERT_EQ(staged.state, ProjectionApplyStageResultState::kStaged);
-  const ProjectionApplyStatusQueryDTO query{staged.apply_id,
-                                            staged.apply_generation};
-  ASSERT_EQ(owner.ProjectionApplyStatus(query).state,
-            ProjectionApplyStatusState::kStaged);
-
-  ExecuteSql(
-      database_path,
-      "DROP TRIGGER logical_scene_named_apply_stages_no_update;"
-      "UPDATE logical_scene_named_apply_stages SET "
-      "candidate_scene_content_hash='sha256:"
-      "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';"
-      "CREATE TRIGGER logical_scene_named_apply_stages_no_update "
-      "BEFORE UPDATE ON logical_scene_named_apply_stages BEGIN "
-      "SELECT RAISE(ABORT, 'logical_scene_named_apply_stages is immutable');"
-      "END;");
-  EXPECT_THROW(owner.ProjectionApplyStatus(query),
-               CanonicalEmptySceneOwnerIntegrityError);
-}
-
-TEST(CanonicalEmptySceneOwner,
      PortableSupportDeclarationsNormalizePersistAndProtectReferences) {
   TemporaryDirectory directory("scene-support-declarations");
   const auto database_path = directory.path() / "logical-scene.sqlite3";
@@ -2710,7 +2034,6 @@ public:
                 1U,
                 core::ProjectionHealthState::kUninitialized,
                 std::nullopt,
-                std::nullopt,
                 1U,
                 Digest('8'),
                 std::nullopt} {
@@ -2723,21 +2046,11 @@ public:
     mode_ = mode;
     calls_ = 0U;
     rebuild_calls_ = 0U;
-    stage_calls_ = 0U;
-    activation_calls_ = 0U;
-    accept_stage_once_ = false;
-    accepted_stage_identity_ = AcceptedIdentity::kExact;
-    accept_activation_once_ = false;
-    accepted_activation_identity_ = AcceptedIdentity::kExact;
-    reject_stage_once_ = false;
-    keep_discard_pending_ = false;
-    staged_request_.reset();
-    staged_activated_ = false;
-    staged_discarded_ = false;
-    throw_next_activation_ = false;
     frame_resolution_calls_ = 0U;
     policy_projection_calls_ = 0U;
     throw_after_next_rebuild_effect_ = false;
+    rebuild_entered_ = nullptr;
+    rebuild_release_ = nullptr;
     accepted_rebuild_binding_.reset();
     frame_resolution_error_.reset();
     resolved_model_instance_override_.reset();
@@ -2746,7 +2059,7 @@ public:
     transactions_.clear();
     health_ = core::ProjectionHealthDTO{
         binding_,    1U,           core::ProjectionHealthState::kHealthy,
-        target,      std::nullopt, 1U,
+        target,      1U,
         Digest('8'), std::nullopt,
     };
   }
@@ -2754,12 +2067,6 @@ public:
   [[nodiscard]] std::size_t calls() const noexcept { return calls_; }
   [[nodiscard]] std::size_t rebuild_calls() const noexcept {
     return rebuild_calls_;
-  }
-  [[nodiscard]] std::size_t stage_calls() const noexcept {
-    return stage_calls_;
-  }
-  [[nodiscard]] std::size_t activation_calls() const noexcept {
-    return activation_calls_;
   }
   [[nodiscard]] const ProjectionNativeRuntimeBindingDTO &binding() const
       noexcept {
@@ -2814,26 +2121,10 @@ public:
     accepted_rebuild_binding_ = std::move(resulting_binding);
   }
 
-  enum class AcceptedIdentity { kExact, kForeign, kMalformed };
-
-  void AcceptNextStage(
-      const AcceptedIdentity identity = AcceptedIdentity::kExact) noexcept {
-    accept_stage_once_ = true;
-    accepted_stage_identity_ = identity;
+  void BlockNextRebuild(std::barrier<> &entered, std::barrier<> &release) {
+    rebuild_entered_ = &entered;
+    rebuild_release_ = &release;
   }
-
-  void RejectNextStage() noexcept { reject_stage_once_ = true; }
-
-  void KeepDiscardPending() noexcept { keep_discard_pending_ = true; }
-  void AllowDiscard() noexcept { keep_discard_pending_ = false; }
-
-  void AcceptNextActivation(
-      const AcceptedIdentity identity = AcceptedIdentity::kExact) noexcept {
-    accept_activation_once_ = true;
-    accepted_activation_identity_ = identity;
-  }
-
-  void ThrowNextActivation() noexcept { throw_next_activation_ = true; }
 
   core::ProjectionCommitResultDTO
   ApplyTransaction(const core::SceneTransactionDTO &transaction) override {
@@ -3040,12 +2331,17 @@ public:
           "test native projection rebuild request is foreign");
     }
     ++rebuild_calls_;
+    if (rebuild_entered_ != nullptr && rebuild_release_ != nullptr) {
+      auto *entered = std::exchange(rebuild_entered_, nullptr);
+      auto *release = std::exchange(rebuild_release_, nullptr);
+      entered->arrive_and_wait();
+      release->arrive_and_wait();
+    }
     if (accepted_rebuild_binding_.has_value()) {
       auto accepted_health = health_;
       accepted_health.native_runtime_binding = *accepted_rebuild_binding_;
       accepted_health.state = core::ProjectionHealthState::kRebuilding;
       accepted_health.active_projection_revision = std::nullopt;
-      accepted_health.staged_candidate = std::nullopt;
       accepted_health.error = std::nullopt;
       ++accepted_health.source_sequence;
       accepted_rebuild_binding_.reset();
@@ -3067,7 +2363,6 @@ public:
     ++health_.source_sequence;
     health_.state = core::ProjectionHealthState::kHealthy;
     health_.active_projection_revision = request.target_projection_revision;
-    health_.staged_candidate = std::nullopt;
     health_.native_projection_generation =
         *health_.native_projection_generation + 1U;
     health_.projection_content_digest = Digest('6');
@@ -3099,277 +2394,18 @@ public:
     throw std::logic_error("test projection bootstrap is not configured");
   }
 
-  core::NativeProjectionStageResultDTO
-  StageProjection(const core::NativeProjectionStageDTO &request) override {
-    if (!request.valid() ||
-        request.transition_row.native_runtime_binding != binding_) {
-      throw std::invalid_argument(
-          "test native projection stage request is foreign");
-    }
-    ++stage_calls_;
-    if (accept_stage_once_) {
-      const auto identity = accepted_stage_identity_;
-      accept_stage_once_ = false;
-      accepted_stage_identity_ = AcceptedIdentity::kExact;
-      core::NativeProjectionStageResultDTO accepted{
-          request.apply_id,
-          request.apply_generation,
-          request.projection_stage_generation,
-          request.transition_row,
-          request.expected_predecessor_projection_revision,
-          request.candidate_projection_revision,
-          core::NativeProjectionStageResultState::kAccepted,
-          std::nullopt,
-          health_.active_projection_revision,
-          health_.native_projection_generation,
-          health_.projection_content_digest,
-          health_,
-          std::nullopt,
-      };
-      DefectAcceptedIdentity(identity, accepted.apply_id,
-                             accepted.acknowledged_staged_candidate_revision,
-                             accepted.candidate_projection_revision);
-      // Accepted registers one exact asynchronous job.  A later status read
-      // observes that same job; the owner must never resubmit it merely
-      // because the first reply was pending.
-      staged_request_ = request;
-      staged_activated_ = false;
-      staged_discarded_ = false;
-      ++health_.source_sequence;
-      health_.staged_candidate = core::ProjectionStagedCandidateDTO{
-          request.apply_id, request.apply_generation,
-          request.projection_stage_generation,
-          request.candidate_projection_revision};
-      health_.error = std::nullopt;
-      return accepted;
-    }
-    if (reject_stage_once_) {
-      reject_stage_once_ = false;
-      return {
-          request.apply_id,
-          request.apply_generation,
-          request.projection_stage_generation,
-          request.transition_row,
-          request.expected_predecessor_projection_revision,
-          request.candidate_projection_revision,
-          core::NativeProjectionStageResultState::kRejected,
-          std::nullopt,
-          health_.active_projection_revision,
-          health_.native_projection_generation,
-          health_.projection_content_digest,
-          health_,
-          ErrorDTO{"test_native_stage_rejected",
-                   "injected native candidate stage rejection", {}},
-      };
-    }
-    staged_request_ = request;
-    staged_activated_ = false;
-    staged_discarded_ = false;
-    ++health_.source_sequence;
-    health_.staged_candidate = core::ProjectionStagedCandidateDTO{
-        request.apply_id, request.apply_generation,
-        request.projection_stage_generation,
-        request.candidate_projection_revision};
-    health_.error = std::nullopt;
-    return {
-        request.apply_id,
-        request.apply_generation,
-        request.projection_stage_generation,
-        request.transition_row,
-        request.expected_predecessor_projection_revision,
-        request.candidate_projection_revision,
-        core::NativeProjectionStageResultState::kStaged,
-        request.candidate_projection_revision,
-        health_.active_projection_revision,
-        health_.native_projection_generation,
-        Digest('7'),
-        health_,
-        std::nullopt,
-    };
-  }
-
-  core::NativeProjectionActivationResultDTO ActivateStagedProjection(
-      const core::NativeProjectionActivationDTO &request) override {
-    if (!request.valid() || !staged_request_.has_value() ||
-        staged_request_->apply_id != request.apply_id ||
-        staged_request_->apply_generation != request.apply_generation ||
-        staged_request_->projection_stage_generation !=
-            request.projection_stage_generation ||
-        staged_request_->transition_row != request.transition_row ||
-        staged_request_->candidate_projection_revision !=
-            request.candidate_projection_revision ||
-        staged_discarded_) {
-      throw std::invalid_argument(
-          "test native projection activation has no exact stage");
-    }
-    ++activation_calls_;
-    if (throw_next_activation_) {
-      throw_next_activation_ = false;
-      throw std::runtime_error("injected native projection activation failure");
-    }
-    if (accept_activation_once_) {
-      const auto identity = accepted_activation_identity_;
-      accept_activation_once_ = false;
-      accepted_activation_identity_ = AcceptedIdentity::kExact;
-      core::NativeProjectionActivationResultDTO accepted{
-          request,
-          core::NativeProjectionActivationResultState::kAccepted,
-          std::nullopt,
-          health_.native_projection_generation,
-          health_.projection_content_digest,
-          health_,
-          std::nullopt,
-      };
-      DefectAcceptedIdentity(identity, accepted.request.apply_id,
-                             accepted.acknowledged_candidate_projection_revision,
-                             accepted.request.candidate_projection_revision);
-      return accepted;
-    }
-    if (!staged_activated_) {
-      staged_activated_ = true;
-      ++health_.source_sequence;
-      health_.state = core::ProjectionHealthState::kHealthy;
-      health_.active_projection_revision =
-          request.candidate_projection_revision;
-      health_.staged_candidate = std::nullopt;
-      health_.native_projection_generation =
-          *health_.native_projection_generation + 1U;
-      health_.projection_content_digest = Digest('7');
-      health_.error = std::nullopt;
-    }
-    return {
-        request,
-        core::NativeProjectionActivationResultState::kActivated,
-        request.candidate_projection_revision,
-        health_.native_projection_generation,
-        health_.projection_content_digest,
-        health_,
-        std::nullopt,
-    };
-  }
-
-  core::NativeProjectionRetireResultDTO
-  RetireProjection(const core::NativeProjectionRetireDTO &) override {
-    throw std::logic_error("test projection retirement is not configured");
-  }
-
-  core::NativeProjectionRetireStatusDTO ProjectionRetireStatus(
-      const core::NativeProjectionRetireStatusQueryDTO &) const override {
-    throw std::logic_error("test projection retirement is not configured");
-  }
-
-  core::NativeProjectionDiscardResultDTO
-  DiscardStagedProjection(
-      const core::NativeProjectionDiscardDTO &request) override {
-    if (!request.valid() || !staged_request_.has_value() ||
-        staged_request_->apply_id != request.apply_id ||
-        staged_request_->apply_generation != request.apply_generation ||
-        staged_request_->projection_stage_generation !=
-            request.projection_stage_generation ||
-        staged_request_->transition_row != request.transition_row ||
-        staged_request_->candidate_projection_revision !=
-            request.candidate_projection_revision ||
-        staged_activated_) {
-      throw std::invalid_argument(
-          "test native projection discard has no exact inactive stage");
-    }
-    if (keep_discard_pending_) {
-      return {
-          request,
-          core::NativeProjectionDiscardResultState::kFailedProjectionUncertain,
-          health_.active_projection_revision,
-          health_.native_projection_generation,
-          health_.projection_content_digest,
-          health_,
-          ErrorDTO{"test_native_discard_pending",
-                   "injected pending native candidate cleanup", {}},
-      };
-    }
-    staged_discarded_ = true;
-    ++health_.source_sequence;
-    health_.staged_candidate = std::nullopt;
-    return {
-        request,
-        core::NativeProjectionDiscardResultState::kDiscarded,
-        health_.active_projection_revision,
-        health_.native_projection_generation,
-        health_.projection_content_digest,
-        health_,
-        std::nullopt,
-    };
-  }
-
-  core::NativeProjectionStatusDTO ProjectionStageStatus(
-      const core::NativeProjectionStatusQueryDTO &query) const override {
-    if (!query.valid() || query.transition_row.native_runtime_binding !=
-                              binding_) {
-      throw std::invalid_argument(
-          "test native projection status query is foreign");
-    }
-    auto state = core::NativeProjectionStatusState::kAbsent;
-    std::optional<ProjectionRevisionDTO> candidate;
-    if (staged_request_.has_value()) {
-      if (staged_request_->apply_id != query.apply_id ||
-          staged_request_->apply_generation != query.apply_generation ||
-          staged_request_->projection_stage_generation !=
-              query.projection_stage_generation ||
-          staged_request_->transition_row != query.transition_row) {
-        throw std::invalid_argument(
-            "test native projection status query names another stage");
-      }
-      if (staged_discarded_) {
-        state = core::NativeProjectionStatusState::kDiscarded;
-      } else {
-        candidate = staged_request_->candidate_projection_revision;
-        state = staged_activated_
-                    ? core::NativeProjectionStatusState::kActivated
-                    : core::NativeProjectionStatusState::kStaged;
-      }
-    }
-    return {
-        query,
-        state,
-        candidate,
-        health_.active_projection_revision,
-        health_.native_projection_generation,
-        health_.projection_content_digest,
-        health_,
-        std::nullopt,
-    };
-  }
 
 private:
-  static void DefectAcceptedIdentity(
-      const AcceptedIdentity identity, core::ApplyId &apply_id,
-      std::optional<core::ProjectionRevisionDTO> &acknowledged_revision,
-      const core::ProjectionRevisionDTO &candidate) {
-    if (identity == AcceptedIdentity::kForeign) {
-      apply_id = core::ApplyId("foreign-native-apply");
-    } else if (identity == AcceptedIdentity::kMalformed) {
-      acknowledged_revision = candidate;
-    }
-  }
-
   ProjectionNativeRuntimeBindingDTO binding_;
   Mode mode_{Mode::kCommit};
   core::ProjectionHealthDTO health_;
-  std::optional<core::NativeProjectionStageDTO> staged_request_;
-  bool staged_activated_{};
-  bool staged_discarded_{};
   bool throw_after_next_rebuild_effect_{};
+  std::barrier<> *rebuild_entered_{nullptr};
+  std::barrier<> *rebuild_release_{nullptr};
   std::optional<ProjectionNativeRuntimeBindingDTO>
       accepted_rebuild_binding_;
-  bool accept_stage_once_{};
-  AcceptedIdentity accepted_stage_identity_{AcceptedIdentity::kExact};
-  bool accept_activation_once_{};
-  AcceptedIdentity accepted_activation_identity_{AcceptedIdentity::kExact};
-  bool reject_stage_once_{};
-  bool keep_discard_pending_{};
-  bool throw_next_activation_{};
   std::size_t calls_{};
   std::size_t rebuild_calls_{};
-  std::size_t stage_calls_{};
-  std::size_t activation_calls_{};
   std::vector<core::SceneTransactionDTO> transactions_;
   core::Pose3DTO frame_pose_in_cell_{};
   std::vector<core::ComponentAttachmentRevision> attachment_revisions_;
@@ -3431,36 +2467,6 @@ public:
       const core::NativeProjectionBootstrapStatusQueryDTO &query) const
       override {
     return projection_.BootstrapProjectionStatus(query);
-  }
-
-  core::NativeProjectionStageResultDTO
-  StageProjection(const core::NativeProjectionStageDTO &request) override {
-    return projection_.StageProjection(request);
-  }
-
-  core::NativeProjectionActivationResultDTO ActivateStagedProjection(
-      const core::NativeProjectionActivationDTO &request) override {
-    return projection_.ActivateStagedProjection(request);
-  }
-
-  core::NativeProjectionRetireResultDTO
-  RetireProjection(const core::NativeProjectionRetireDTO &request) override {
-    return projection_.RetireProjection(request);
-  }
-
-  core::NativeProjectionRetireStatusDTO ProjectionRetireStatus(
-      const core::NativeProjectionRetireStatusQueryDTO &query) const override {
-    return projection_.ProjectionRetireStatus(query);
-  }
-
-  core::NativeProjectionDiscardResultDTO DiscardStagedProjection(
-      const core::NativeProjectionDiscardDTO &request) override {
-    return projection_.DiscardStagedProjection(request);
-  }
-
-  core::NativeProjectionStatusDTO ProjectionStageStatus(
-      const core::NativeProjectionStatusQueryDTO &query) const override {
-    return projection_.ProjectionStageStatus(query);
   }
 
   core::Result<core::SceneFrameResolutionReceiptDTO>
@@ -3639,1437 +2645,200 @@ RebindRuntimeEpochs(
     std::string apply_id = "apply-native-candidate") {
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
-  std::vector<core::ProjectionTransitionRowDTO> rows;
-  rows.reserve(native_bindings.size());
-  for (const auto &binding : native_bindings) {
-    rows.push_back({binding, core::ProjectionTransitionDisposition::kAdded,
-                    std::nullopt});
-  }
-  ProjectionApplyStageDTO request{
-      ApplyId(std::move(apply_id)),
+  const ApplyId operation_id(std::move(apply_id));
+  const auto initialized = owner.BeginMaintenanceInitialization({
+      operation_id,
       ApplyGeneration(1U),
       accepted.canonical_empty_target,
-      admission.retained_bundle().value(),
       candidate.value(),
-      std::move(rows),
-  };
-  const auto staged = owner.StageCandidateProjection(request);
-  Require(staged.state == ProjectionApplyStageResultState::kStaged,
-          "native candidate did not stage");
-  const auto activated =
-      owner.ActivateStagedProjection(ActivationRequest(staged));
-  Require(activated.state ==
-              ProjectionApplyActivationResultState::kActivated,
-          "native candidate did not activate");
-  const auto receipt = NamedPublicationReceipt(staged);
+      native_bindings,
+  });
+  Require(initialized.state ==
+              core::ProjectionMaintenanceInitializationState::kInitialized,
+          "native candidate did not initialize");
+  ActiveBundlePublicationReceiptDTO receipt{
+      ActiveBundlePublicationRequestDTO{
+          NamedApplyPublicationTransactionDTO{
+              operation_id, ApplyGeneration(1U)},
+          initialized.target_projection_revision,
+          initialized.target_projection_revision.retained_bundle_id,
+          initialized.target_projection_revision.graph_revision,
+          ActiveBundlePublicationGeneration(1U), Digest('d')},
+      ActiveBundlePublicationGeneration(2U), Digest('f')};
   publication_reader.SetCurrent(receipt);
-  const auto finalized = owner.FinalizeProjectionTransition(
-      NamedFinalizeRequest(staged, receipt));
-  Require(finalized.state == ProjectionApplyFinalizeResultState::kFinalized,
-          "native candidate did not finalize");
-  return finalized.candidate_projection_revision;
-}
-
-[[nodiscard]] ProjectionApplyStageDTO MakeAddedNativeStageRequest(
-    const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
-    const deployment::RetainedBundle &candidate,
-    const std::vector<ProjectionNativeRuntimeBindingDTO> &bindings,
-    const ProjectionRevisionDTO &predecessor, std::string apply_id) {
-  std::vector<core::ProjectionTransitionRowDTO> rows;
-  rows.reserve(bindings.size());
-  for (const auto &binding : bindings) {
-    rows.push_back({binding, core::ProjectionTransitionDisposition::kAdded,
-                    std::nullopt});
-  }
-  return {ApplyId(std::move(apply_id)), ApplyGeneration(1U), predecessor,
-          admission.retained_bundle().value(), candidate.value(),
-          std::move(rows)};
+  const auto completed = owner.CompleteMaintenanceInitialization({
+      operation_id, ApplyGeneration(1U),
+      initialized.target_projection_revision,
+      initialized.authoritative_snapshot_identity, receipt});
+  Require(completed.state ==
+              core::ProjectionMaintenanceInitializationState::kCompleted,
+          "native candidate did not complete");
+  return completed.target_projection_revision;
 }
 
 TEST(CanonicalEmptySceneOwner,
-     AcceptedStageStartsEveryIndependentNativeProjectionBeforeYielding) {
-  TemporaryDirectory directory("scene-parallel-native-stage");
+     MaintenanceDuplicateObservesOneFreshInitialization) {
+  TemporaryDirectory directory("scene-maintenance-duplicate");
   const auto package_root = directory.path() / "packages";
   CopyCanonicalEmptyPackage(package_root);
   const auto admission = LoadAdmission(package_root);
   const auto candidate = deployment::test::
-      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto bindings =
-      NativeRuntimeBindings(candidate.bundle->value(), "parallel-stage");
-  ASSERT_GT(bindings.size(), 1U);
-
+  const auto bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-epoch-maintenance-duplicate");
   auto projections = MakeFakeProjections(bindings);
-  for (auto &projection : projections) {
-    projection->AcceptNextStage();
-  }
-  FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
+  auto clients = ProjectionClients(projections);
+  FakePlannerSceneProjectionResolver resolver(clients);
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       package_root);
-  TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "scene.sqlite3", admission,
-                                 publication_reader, bundle_source, resolver,
-                                 cell_admission);
-  const auto predecessor =
-      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-          .canonical_empty_target;
-
-  std::vector<core::ProjectionTransitionRowDTO> rows;
-  rows.reserve(bindings.size());
-  for (const auto &binding : bindings) {
-    rows.push_back({binding, core::ProjectionTransitionDisposition::kAdded,
-                    std::nullopt});
-  }
-  const ProjectionApplyStageDTO request{
-      ApplyId("parallel-native-stage"), ApplyGeneration(1U), predecessor,
-      admission.retained_bundle().value(), candidate.bundle->value(), rows};
-
-  const auto accepted = owner.StageCandidateProjection(request);
-  ASSERT_EQ(accepted.state, ProjectionApplyStageResultState::kAccepted)
-      << (accepted.error ? accepted.error->message : "missing error");
-  for (const auto &projection : projections) {
-    EXPECT_EQ(projection->stage_calls(), 1U);
-  }
-  auto access = owner.ReadAccessStatus();
-  EXPECT_FALSE(access.scene_writes_open);
-  EXPECT_FALSE(access.projection_leases_open);
-  ASSERT_TRUE(access.active_projection.has_value());
-  EXPECT_EQ(*access.active_projection, predecessor);
-  auto status = owner.ProjectionApplyStatus(
-      {request.apply_id, request.apply_generation});
-  EXPECT_FALSE(status.publication_receipt.has_value());
-  EXPECT_FALSE(status.candidate_aggregate_health.has_value());
-
-  const auto staged = owner.StageCandidateProjection(request);
-  ASSERT_EQ(staged.state, ProjectionApplyStageResultState::kStaged)
-      << (staged.error ? staged.error->message : "missing error");
-  for (const auto &projection : projections) {
-    EXPECT_EQ(projection->stage_calls(), 1U);
-    projection->AcceptNextActivation();
-  }
-
-  const auto activation_pending =
-      owner.ActivateStagedProjection(ActivationRequest(staged));
-  ASSERT_EQ(activation_pending.state,
-            ProjectionApplyActivationResultState::kAccepted)
-      << (activation_pending.error ? activation_pending.error->message
-                                   : "missing error");
-  access = owner.ReadAccessStatus();
-  EXPECT_FALSE(access.scene_writes_open);
-  ASSERT_TRUE(access.active_projection.has_value());
-  EXPECT_EQ(*access.active_projection, predecessor);
-  status = owner.ProjectionApplyStatus(
-      {request.apply_id, request.apply_generation});
-  EXPECT_FALSE(status.publication_receipt.has_value());
-  EXPECT_FALSE(status.candidate_aggregate_health.has_value());
-
-  const auto activated =
-      owner.ActivateStagedProjection(ActivationRequest(staged));
-  EXPECT_EQ(activated.state, ProjectionApplyActivationResultState::kActivated)
-      << (activated.error ? activated.error->message : "missing error");
-  EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     DefinitiveStageRejectionWinsWhileSiblingCleanupRemainsPending) {
-  TemporaryDirectory directory("scene-mixed-native-stage-rejection");
-  const auto package_root = directory.path() / "packages";
-  CopyCanonicalEmptyPackage(package_root);
-  const auto admission = LoadAdmission(package_root);
-  const auto candidate = deployment::test::
-      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
-          package_root, admission.cell_id().value());
-  const auto bindings =
-      NativeRuntimeBindings(candidate.bundle->value(), "mixed-stage");
-  ASSERT_GT(bindings.size(), 1U);
-  auto projections = MakeFakeProjections(bindings);
-  projections.front()->AcceptNextStage();
-  projections.front()->KeepDiscardPending();
-  projections.back()->RejectNextStage();
-  FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      package_root);
-  TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "scene.sqlite3", admission,
-                                 publication_reader, bundle_source, resolver,
-                                 cell_admission);
-  const auto predecessor =
-      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-          .canonical_empty_target;
-  const auto request = MakeAddedNativeStageRequest(
-      admission, *candidate.bundle, bindings, predecessor,
-      "mixed-stage-rejection");
-
-  const auto rejected = owner.StageCandidateProjection(request);
-  ASSERT_EQ(rejected.state, ProjectionApplyStageResultState::kRejected)
-      << (rejected.error ? rejected.error->message : "missing error");
-  ASSERT_TRUE(rejected.transition_evidence.has_value());
-  EXPECT_EQ(rejected.transition_evidence->state,
-            ProjectionTransitionEvidenceState::kUncertain);
-  ASSERT_EQ(rejected.transition_evidence->transition_rows.size(),
-            bindings.size());
-  EXPECT_EQ(std::count_if(
-                rejected.transition_evidence->transition_rows.begin(),
-                rejected.transition_evidence->transition_rows.end(),
-                [](const auto &row) {
-                  return row.state ==
-                         core::ProjectionTransitionRowEvidenceState::kPending;
-                }),
-            1);
-  EXPECT_GE(std::count_if(
-                rejected.transition_evidence->transition_rows.begin(),
-                rejected.transition_evidence->transition_rows.end(),
-                [](const auto &row) {
-                  return row.state == core::
-                                          ProjectionTransitionRowEvidenceState::
-                                              kCandidateStageDiscarded;
-                }),
-            1);
-  const auto access = owner.ReadAccessStatus();
-  EXPECT_FALSE(access.scene_writes_open);
-  EXPECT_FALSE(access.projection_leases_open);
-  ASSERT_TRUE(access.active_projection.has_value());
-  EXPECT_EQ(*access.active_projection, predecessor);
-
-  std::vector<std::size_t> first_stage_calls;
-  first_stage_calls.reserve(projections.size());
-  for (const auto &projection : projections) {
-    first_stage_calls.push_back(projection->stage_calls());
-  }
-  projections.front()->AllowDiscard();
-  const auto settled = owner.StageCandidateProjection(request);
-  EXPECT_EQ(settled.state, ProjectionApplyStageResultState::kRejected);
-  ASSERT_TRUE(settled.transition_evidence.has_value());
-  EXPECT_EQ(settled.transition_evidence->state,
-            ProjectionTransitionEvidenceState::kAborted);
-  EXPECT_EQ(settled.transition_evidence->transition_rows.size(),
-            bindings.size());
-  for (std::size_t index = 0U; index < projections.size(); ++index) {
-    EXPECT_EQ(projections[index]->stage_calls(), first_stage_calls[index]);
-  }
-
-  const auto stable = owner.StageCandidateProjection(request);
-  EXPECT_EQ(stable.state, ProjectionApplyStageResultState::kRejected);
-  ASSERT_TRUE(stable.transition_evidence.has_value());
-  EXPECT_EQ(stable.transition_evidence->state,
-            ProjectionTransitionEvidenceState::kAborted);
-  EXPECT_EQ(stable.transition_evidence->transition_rows.size(),
-            bindings.size());
-  EXPECT_EQ(stable.error, settled.error);
-  EXPECT_EQ(stable.transition_evidence->error,
-            settled.transition_evidence->error);
-  for (std::size_t index = 0U; index < bindings.size(); ++index) {
-    EXPECT_EQ(stable.transition_evidence->transition_rows[index].transition_row,
-              settled.transition_evidence->transition_rows[index]
-                  .transition_row);
-    EXPECT_EQ(stable.transition_evidence->transition_rows[index].state,
-              settled.transition_evidence->transition_rows[index].state);
-    EXPECT_EQ(stable.transition_evidence->transition_rows[index].error,
-              settled.transition_evidence->transition_rows[index].error);
-  }
-  for (std::size_t index = 0U; index < projections.size(); ++index) {
-    EXPECT_EQ(projections[index]->stage_calls(), first_stage_calls[index]);
-  }
-}
-
-TEST(CanonicalEmptySceneOwner,
-     ForeignOrMalformedAcceptedNativeHandoffsFailClosed) {
-  for (const bool activation : {false, true}) {
-    for (const auto identity :
-         {FakePlannerSceneProjection::AcceptedIdentity::kForeign,
-          FakePlannerSceneProjection::AcceptedIdentity::kMalformed}) {
-      TemporaryDirectory directory("scene-defective-native-accepted");
-      const auto package_root = directory.path() / "packages";
-      CopyCanonicalEmptyPackage(package_root);
-      const auto admission = LoadAdmission(package_root);
-      const auto candidate = deployment::test::
-          materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
-              package_root, admission.cell_id().value());
-      const auto bindings = NativeRuntimeBindings(
-          candidate.bundle->value(), activation ? "activation-defect"
-                                                : "stage-defect");
-      ASSERT_GT(bindings.size(), 1U);
-      auto projections = MakeFakeProjections(bindings);
-      FakePlannerSceneProjectionResolver resolver(
-          ProjectionClients(projections));
-      ControlledPublicationReader publication_reader;
-      deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-          package_root);
-      TestCellAdmissionPort cell_admission;
-      CanonicalEmptySceneOwner owner(directory.path() / "scene.sqlite3",
-                                     admission, publication_reader,
-                                     bundle_source, resolver, cell_admission);
-      const auto predecessor =
-          FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-              .canonical_empty_target;
-      const auto request = MakeAddedNativeStageRequest(
-          admission, *candidate.bundle, bindings, predecessor,
-          activation ? "defective-activation" : "defective-stage");
-
-      if (!activation) {
-        projections.back()->AcceptNextStage(identity);
-        const auto result = owner.StageCandidateProjection(request);
-        EXPECT_EQ(result.state,
-                  ProjectionApplyStageResultState::kFailedProjectionUncertain)
-            << (result.error ? result.error->message : "missing error");
-        ASSERT_TRUE(result.transition_evidence.has_value());
-        ASSERT_EQ(result.transition_evidence->transition_rows.size(),
-                  bindings.size());
-        EXPECT_EQ(result.transition_evidence->transition_rows.front().state,
-                  core::ProjectionTransitionRowEvidenceState::
-                      kStagedNoActiveEffect);
-        EXPECT_EQ(result.transition_evidence->transition_rows.back().state,
-                  core::ProjectionTransitionRowEvidenceState::kUncertain);
-      } else {
-        const auto staged = owner.StageCandidateProjection(request);
-        ASSERT_EQ(staged.state, ProjectionApplyStageResultState::kStaged);
-        projections.back()->AcceptNextActivation(identity);
-        const auto result =
-            owner.ActivateStagedProjection(ActivationRequest(staged));
-        EXPECT_EQ(
-            result.state,
-            ProjectionApplyActivationResultState::kFailedProjectionUncertain)
-            << (result.error ? result.error->message : "missing error");
-        ASSERT_EQ(result.transition_evidence.transition_rows.size(),
-                  bindings.size());
-        EXPECT_EQ(result.transition_evidence.transition_rows.front().state,
-                  core::ProjectionTransitionRowEvidenceState::kCandidateActive);
-        EXPECT_EQ(result.transition_evidence.transition_rows.back().state,
-                  core::ProjectionTransitionRowEvidenceState::kUncertain);
-      }
-      for (const auto &projection : projections) {
-        EXPECT_LE(activation ? projection->activation_calls()
-                             : projection->stage_calls(),
-                  1U);
-      }
-      const auto access = owner.ReadAccessStatus();
-      EXPECT_FALSE(access.scene_writes_open);
-      ASSERT_TRUE(access.active_projection.has_value());
-      EXPECT_EQ(*access.active_projection, predecessor);
-      const auto status = owner.ProjectionApplyStatus(
-          {request.apply_id, request.apply_generation});
-      EXPECT_FALSE(status.publication_receipt.has_value());
-      EXPECT_FALSE(status.candidate_aggregate_health.has_value());
-    }
-  }
-}
-
-TEST(CanonicalEmptySceneOwner,
-     MixedPendingAndFailedActivationRetainsEveryParticipantRow) {
-  TemporaryDirectory directory("scene-mixed-native-activation");
-  const auto package_root = directory.path() / "packages";
-  CopyCanonicalEmptyPackage(package_root);
-  const auto admission = LoadAdmission(package_root);
-  const auto candidate = deployment::test::
-      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
-          package_root, admission.cell_id().value());
-  const auto bindings =
-      NativeRuntimeBindings(candidate.bundle->value(), "mixed-activation");
-  ASSERT_GT(bindings.size(), 1U);
-  auto projections = MakeFakeProjections(bindings);
-  FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
-  TestCellAdmissionPort cell_admission;
-  CanonicalEmptySceneOwner owner(directory.path() / "scene.sqlite3", admission,
-                                 publication_reader, bundle_source, resolver,
-                                 cell_admission);
-  const auto predecessor =
-      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-          .canonical_empty_target;
-  const auto request = MakeAddedNativeStageRequest(
-      admission, *candidate.bundle, bindings, predecessor, "mixed-activation");
-  const auto staged = owner.StageCandidateProjection(request);
-  ASSERT_EQ(staged.state, ProjectionApplyStageResultState::kStaged);
-
-  projections.front()->AcceptNextActivation();
-  projections.back()->ThrowNextActivation();
-  const auto result =
-      owner.ActivateStagedProjection(ActivationRequest(staged));
-  ASSERT_EQ(result.state,
-            ProjectionApplyActivationResultState::kFailedProjectionUncertain)
-      << (result.error ? result.error->message : "missing error");
-  ASSERT_EQ(result.transition_evidence.transition_rows.size(), bindings.size());
-  EXPECT_EQ(result.transition_evidence.transition_rows.front().state,
-            core::ProjectionTransitionRowEvidenceState::kPending);
-  EXPECT_EQ(result.transition_evidence.transition_rows.back().state,
-            core::ProjectionTransitionRowEvidenceState::kUncertain);
-  EXPECT_EQ(projections.front()->activation_calls(), 1U);
-  EXPECT_EQ(projections.back()->activation_calls(), 1U);
-  EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     ActivatedApplyRecoveryKeepsAcceptedStageAndActivationPending) {
-  TemporaryDirectory directory("scene-activated-recovery-pending");
-  const auto package_root = directory.path() / "packages";
-  CopyCanonicalEmptyPackage(package_root);
-  const auto admission = LoadAdmission(package_root);
-  const auto candidate = deployment::test::
-      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
-          package_root, admission.cell_id().value());
-  const auto bindings =
-      NativeRuntimeBindings(candidate.bundle->value(), "recovery-pending");
-  ASSERT_GT(bindings.size(), 1U);
-  auto originals = MakeFakeProjections(bindings);
-  auto replacements = MakeFakeProjections(bindings);
-  FakePlannerSceneProjectionResolver resolver(ProjectionClients(originals));
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
-  TestCellAdmissionPort cell_admission;
-  const auto database_path = directory.path() / "scene.sqlite3";
-  std::optional<core::ProjectionApplyStageResultDTO> staged;
-  ProjectionRevisionDTO predecessor;
-  {
-    CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                   bundle_source, resolver, cell_admission);
-    predecessor =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-            .canonical_empty_target;
-    const auto request = MakeAddedNativeStageRequest(
-        admission, *candidate.bundle, bindings, predecessor,
-        "activated-recovery-pending");
-    staged = owner.StageCandidateProjection(request);
-    ASSERT_EQ(staged->state, ProjectionApplyStageResultState::kStaged);
-    const auto activated =
-        owner.ActivateStagedProjection(ActivationRequest(*staged));
-    ASSERT_EQ(activated.state,
-              ProjectionApplyActivationResultState::kActivated);
-    owner.Close();
-  }
-
-  resolver.ReplaceWith(ProjectionClients(replacements));
-  CanonicalEmptySceneOwner reopened(database_path, admission,
-                                    publication_reader, bundle_source, resolver,
-                                    cell_admission);
-  for (auto &projection : replacements) {
-    projection->AcceptNextStage();
-  }
-  const auto stage_pending =
-      reopened.ActivateStagedProjection(ActivationRequest(*staged));
-  ASSERT_EQ(stage_pending.state,
-            ProjectionApplyActivationResultState::kAccepted);
-  for (const auto &projection : replacements) {
-    EXPECT_EQ(projection->stage_calls(), 1U);
-    EXPECT_EQ(projection->activation_calls(), 0U);
-    EXPECT_FALSE(
-        projection->ProjectionHealth().active_projection_revision.has_value());
-    EXPECT_TRUE(projection->ProjectionHealth().staged_candidate.has_value());
-  }
-  ASSERT_TRUE(staged->candidate_projection_revision.has_value());
-  for (const auto &stale_survivor : originals) {
-    ASSERT_TRUE(stale_survivor->ProjectionHealth()
-                    .active_projection_revision.has_value());
-    EXPECT_EQ(*stale_survivor->ProjectionHealth().active_projection_revision,
-              *staged->candidate_projection_revision);
-  }
-  auto access = reopened.ReadAccessStatus();
-  EXPECT_FALSE(access.scene_writes_open);
-  ASSERT_TRUE(access.active_projection.has_value());
-  EXPECT_EQ(*access.active_projection, predecessor);
-  auto status = reopened.ProjectionApplyStatus(
-      {staged->apply_id, staged->apply_generation});
-  EXPECT_FALSE(status.publication_receipt.has_value());
-
-  for (auto &projection : replacements) {
-    projection->AcceptNextActivation();
-  }
-  const auto activation_pending =
-      reopened.ActivateStagedProjection(ActivationRequest(*staged));
-  ASSERT_EQ(activation_pending.state,
-            ProjectionApplyActivationResultState::kAccepted);
-  access = reopened.ReadAccessStatus();
-  EXPECT_FALSE(access.scene_writes_open);
-  ASSERT_TRUE(access.active_projection.has_value());
-  EXPECT_EQ(*access.active_projection, predecessor);
-  status = reopened.ProjectionApplyStatus(
-      {staged->apply_id, staged->apply_generation});
-  EXPECT_FALSE(status.publication_receipt.has_value());
-
-  const auto activated =
-      reopened.ActivateStagedProjection(ActivationRequest(*staged));
-  EXPECT_EQ(activated.state, ProjectionApplyActivationResultState::kActivated)
-      << (activated.error ? activated.error->message : "missing error");
-  EXPECT_FALSE(reopened.ReadAccessStatus().scene_writes_open);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     ActivatedApplyRecoveryRejectsForeignOrMalformedAcceptedHandoffs) {
-  for (const bool activation : {false, true}) {
-    for (const auto identity :
-         {FakePlannerSceneProjection::AcceptedIdentity::kForeign,
-          FakePlannerSceneProjection::AcceptedIdentity::kMalformed}) {
-      TemporaryDirectory directory("scene-activated-recovery-defect");
-      const auto package_root = directory.path() / "packages";
-      CopyCanonicalEmptyPackage(package_root);
-      const auto admission = LoadAdmission(package_root);
-      const auto candidate = deployment::test::
-          materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
-              package_root, admission.cell_id().value());
-      const auto bindings = NativeRuntimeBindings(
-          candidate.bundle->value(), activation ? "recovery-activation-defect"
-                                                : "recovery-stage-defect");
-      ASSERT_GT(bindings.size(), 1U);
-      auto originals = MakeFakeProjections(bindings);
-      auto replacements = MakeFakeProjections(bindings);
-      FakePlannerSceneProjectionResolver resolver(ProjectionClients(originals));
-      ControlledPublicationReader publication_reader;
-      deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-          package_root);
-      TestCellAdmissionPort cell_admission;
-      const auto database_path = directory.path() / "scene.sqlite3";
-      std::optional<core::ProjectionApplyStageResultDTO> staged;
-      ProjectionRevisionDTO predecessor;
-      {
-        CanonicalEmptySceneOwner owner(
-            database_path, admission, publication_reader, bundle_source,
-            resolver, cell_admission);
-        predecessor =
-            FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-                .canonical_empty_target;
-        const auto request = MakeAddedNativeStageRequest(
-            admission, *candidate.bundle, bindings, predecessor,
-            activation ? "recovery-activation-defect"
-                       : "recovery-stage-defect");
-        staged = owner.StageCandidateProjection(request);
-        ASSERT_EQ(staged->state, ProjectionApplyStageResultState::kStaged);
-        ASSERT_EQ(owner.ActivateStagedProjection(ActivationRequest(*staged)).state,
-                  ProjectionApplyActivationResultState::kActivated);
-        owner.Close();
-      }
-
-      resolver.ReplaceWith(ProjectionClients(replacements));
-      if (activation) {
-        replacements.back()->AcceptNextActivation(identity);
-      } else {
-        replacements.back()->AcceptNextStage(identity);
-      }
-      CanonicalEmptySceneOwner reopened(
-          database_path, admission, publication_reader, bundle_source, resolver,
-          cell_admission);
-      const auto result =
-          reopened.ActivateStagedProjection(ActivationRequest(*staged));
-      EXPECT_EQ(
-          result.state,
-          ProjectionApplyActivationResultState::kFailedProjectionUncertain)
-          << (result.error ? result.error->message : "missing error");
-      ASSERT_EQ(result.transition_evidence.transition_rows.size(),
-                bindings.size());
-      for (const auto &row : result.transition_evidence.transition_rows) {
-        EXPECT_EQ(row.state,
-                  core::ProjectionTransitionRowEvidenceState::kUncertain);
-      }
-      const auto access = reopened.ReadAccessStatus();
-      EXPECT_FALSE(access.scene_writes_open);
-      ASSERT_TRUE(access.active_projection.has_value());
-      EXPECT_EQ(*access.active_projection, predecessor);
-      const auto status = reopened.ProjectionApplyStatus(
-          {staged->apply_id, staged->apply_generation});
-      EXPECT_FALSE(status.publication_receipt.has_value());
-      EXPECT_FALSE(status.candidate_aggregate_health.has_value());
-    }
-  }
-}
-
-TEST(CanonicalEmptySceneOwner,
-     ManagedWithdrawalSurvivesRestartWithoutAnOldClient) {
-  for (const bool discard : {false, true}) {
-    TemporaryDirectory directory("scene-managed-withdrawal");
-    const auto package_root = directory.path() / "packages";
-    CopyCanonicalEmptyPackage(package_root);
-    const auto admission = LoadAdmission(package_root);
-    const auto candidate = deployment::test::
-        materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
-            package_root, admission.cell_id().value());
-    const auto old_bindings =
-        NativeRuntimeBindings(candidate.bundle->value(), "old-runtime");
-    const auto new_bindings =
-        NativeRuntimeBindings(candidate.bundle->value(), "new-runtime");
-    auto old_projections = MakeFakeProjections(old_bindings);
-    auto new_projections = MakeFakeProjections(new_bindings);
-    FakePlannerSceneProjectionResolver resolver(
-        ProjectionClients(old_projections));
-    ControlledPublicationReader publication_reader;
-    deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-        package_root);
-    TestCellAdmissionPort cell_admission;
-    const auto path = directory.path() / "scene.sqlite3";
-    std::optional<core::ProjectionApplyStageResultDTO> staged;
-    {
-      CanonicalEmptySceneOwner owner(path, admission, publication_reader,
-                                     bundle_source, resolver, cell_admission);
-      const auto predecessor = FinalizeNativeCandidate(
-          owner, publication_reader, admission, *candidate.bundle, old_bindings,
-          "initial-native");
-      resolver.ReplaceWith(ProjectionClients(new_projections));
-      std::vector<core::ProjectionTransitionRowDTO> rows;
-      for (const auto &binding : old_bindings) {
-        rows.push_back(
-            {binding, core::ProjectionTransitionDisposition::kRemoved,
-             predecessor,
-             core::ManagedRuntimeWithdrawalDTO{
-                 ApplyId("replace-native"), ApplyGeneration(1U), Digest('7'),
-                 binding.runtime_unit_id, binding.runtime_epoch, Digest('8'),
-                 Digest('9'), "manager-supervisor", 12U}});
-      }
-      for (const auto &binding : new_bindings)
-        rows.push_back({binding, core::ProjectionTransitionDisposition::kAdded,
-                        std::nullopt});
-      std::sort(
-          rows.begin(), rows.end(), [](const auto &left, const auto &right) {
-            return core::CanonicalProjectionNativeBindingLess(
-                left.native_runtime_binding, right.native_runtime_binding);
-          });
-      ProjectionApplyStageDTO request{
-          ApplyId("replace-native"), ApplyGeneration(1U),       predecessor,
-          candidate.bundle->value(), candidate.bundle->value(), rows};
-      auto wrong_epoch = request;
-      for (auto &row : wrong_epoch.native_transition_rows) {
-        if (!row.managed_withdrawal)
-          continue;
-        row.native_runtime_binding.runtime_epoch =
-            core::RuntimeEpoch("foreign-runtime");
-        row.managed_withdrawal->runtime_epoch =
-            row.native_runtime_binding.runtime_epoch;
-      }
-      std::sort(wrong_epoch.native_transition_rows.begin(),
-                wrong_epoch.native_transition_rows.end(),
-                [](const auto &left, const auto &right) {
-                  return core::CanonicalProjectionNativeBindingLess(
-                      left.native_runtime_binding,
-                      right.native_runtime_binding);
-                });
-      EXPECT_EQ(owner.StageCandidateProjection(wrong_epoch).state,
-                ProjectionApplyStageResultState::kRejected);
-      auto no_proof = request;
-      for (auto &row : no_proof.native_transition_rows)
-        row.managed_withdrawal.reset();
-      EXPECT_NE(owner.StageCandidateProjection(no_proof).state,
-                ProjectionApplyStageResultState::kStaged);
-      staged = owner.StageCandidateProjection(request);
-      ASSERT_EQ(staged->state, ProjectionApplyStageResultState::kStaged)
-          << (staged->error ? staged->error->message : "missing error");
-      EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-      owner.Close();
-    }
-    CanonicalEmptySceneOwner owner(path, admission, publication_reader,
-                                   bundle_source, resolver, cell_admission);
-    const auto status = owner.ProjectionApplyStatus(
-        {ApplyId("replace-native"), ApplyGeneration(1U)});
-    ASSERT_EQ(status.state, ProjectionApplyStatusState::kStaged);
-    ASSERT_TRUE(status.transition_evidence);
-    for (const auto &row : status.transition_evidence->transition_rows)
-      if (row.transition_row.managed_withdrawal) {
-        EXPECT_FALSE(row.resulting_health);
-        EXPECT_EQ(row.state,
-                  core::ProjectionTransitionRowEvidenceState::kRemovedRetired);
-      }
-    if (discard) {
-      const auto result =
-          owner.DiscardStagedProjection(DiscardRequest(*staged));
-      EXPECT_EQ(
-          result.state,
-          core::ProjectionApplyDiscardResultState::kFailedProjectionUncertain);
-      EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-      EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
-    } else {
-      const auto activated =
-          owner.ActivateStagedProjection(ActivationRequest(*staged));
-      ASSERT_EQ(activated.state,
-                ProjectionApplyActivationResultState::kActivated);
-      const auto receipt = NamedPublicationReceipt(*staged, 2U, 3U);
-      publication_reader.SetCurrent(receipt);
-      const auto finalized = owner.FinalizeProjectionTransition(
-          NamedFinalizeRequest(*staged, receipt));
-      ASSERT_EQ(finalized.state,
-                ProjectionApplyFinalizeResultState::kFinalized);
-      EXPECT_TRUE(owner.ReadAccessStatus().scene_writes_open);
-      EXPECT_EQ(owner
-                    .ProjectionApplyStatus(
-                        {staged->apply_id, staged->apply_generation})
-                    .state,
-                ProjectionApplyStatusState::kFinalized);
-    }
-    EXPECT_NO_THROW(static_cast<void>(owner.VerifyIntegrity()));
-  }
-}
-
-TEST(CanonicalEmptySceneOwner,
-     SustainedSceneUpdatesCheckpointAndRotateOnlyTheRequestEpoch) {
-  TemporaryDirectory directory("scene-sustained-history");
-  const auto package_root = directory.path() / "packages";
-  CopyCanonicalEmptyPackage(package_root);
-  const auto admission = LoadAdmission(package_root);
-  const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
-          package_root, admission.cell_id().value());
-  const auto native_bindings = NativeRuntimeBindings(
-      candidate.bundle->value(), "runtime-epoch-sustained-history");
-
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      package_root);
-  auto native_projections = MakeFakeProjections(native_bindings);
-  FakePlannerSceneProjectionResolver resolver(
-      ProjectionClients(native_projections));
-  TestCellAdmissionPort cell_admission;
-  std::optional<ProjectionRevisionDTO> projection;
-  RequestOwnerEpoch original_epoch(std::string{});
-  RequestOwnerEpoch rotated_epoch(std::string{});
-  std::optional<core::SceneTransactionRequestDTO> most_recent_request;
-  std::vector<std::int64_t> steady_commit_duration_ns;
-  steady_commit_duration_ns.reserve(kMaximumLogicalSceneTransactions - 2U);
-  {
-    CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                   bundle_source, resolver, cell_admission);
-    projection = FinalizeNativeCandidate(
-        owner, publication_reader, admission, *candidate.bundle,
-        native_bindings, "apply-native-sustained-history");
-    const auto added = owner.Commit(AddBoxRequest(
-        *projection, admission.cell_id(), "scene-sustained-1"));
-    ASSERT_TRUE(added.success);
-    projection = *added.committed_projection_revision;
-    original_epoch = owner.CurrentRequestOwnerEpoch();
-    EXPECT_EQ(original_epoch.value(),
-              projection->scene_revision.scene_id.value());
-    const auto pose = owner.GetObjectPose(core::SceneResourceId("scene-box"));
-    ASSERT_TRUE(pose.ok());
-
-    for (std::size_t sequence = 2U;
-         sequence < kMaximumLogicalSceneTransactions; ++sequence) {
-      core::SceneTransactionRequestDTO request{
-          SceneRequestContext("scene-sustained-" + std::to_string(sequence),
-                              *projection),
-          {},
-          *projection,
-          core::UpdateObjectPoseRequestDTO{
-              core::SceneResourceId("scene-box"), pose.value(),
-              core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
-              false},
-          core::AdmissionGeneration(1U)};
-      const auto started = std::chrono::steady_clock::now();
-      const auto committed = owner.Commit(request);
-      steady_commit_duration_ns.push_back(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - started)
-              .count());
-      ASSERT_TRUE(committed.success)
-          << (committed.error.has_value() ? committed.error->message
-                                          : "missing error");
-      EXPECT_EQ(committed.transaction_sequence, sequence);
-      EXPECT_EQ(committed.update_status, core::SceneUpdateStatusDTO::kNoOp);
-      projection = *committed.committed_projection_revision;
-    }
-
-    SetProjectionMode(native_projections,
-                      FakePlannerSceneProjection::Mode::kRollbackProven);
-    core::SceneTransactionRequestDTO closed_failure{
-        SceneRequestContext("scene-sustained-256-rollback", *projection),
-        {},
-        *projection,
-        core::UpdateObjectPoseRequestDTO{
-            core::SceneResourceId("scene-box"), pose.value(),
-            core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
-            false},
-        core::AdmissionGeneration(1U)};
-    const auto failed = owner.Commit(closed_failure);
-    ASSERT_FALSE(failed.success);
-    EXPECT_EQ(failed.projection_status,
-              core::SceneProjectionCommitStatusDTO::kRejectedRollbackProven);
-    EXPECT_EQ(owner.LogicalSnapshot()->transaction_sequence,
-              kMaximumLogicalSceneTransactions - 1U);
-
-    most_recent_request = core::SceneTransactionRequestDTO{
-        SceneRequestContext("scene-sustained-after-compaction", *projection),
-        {},
-        *projection,
-        core::UpdateObjectPoseRequestDTO{
-            core::SceneResourceId("scene-box"), pose.value(),
-            core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
-            false},
-        core::AdmissionGeneration(1U)};
-    const auto rotated = owner.Commit(*most_recent_request);
-    ASSERT_FALSE(rotated.success);
-    EXPECT_EQ(rotated.replay_status,
-              core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch);
-    ASSERT_TRUE(rotated.error.has_value());
-    EXPECT_EQ(rotated.error->code, "stale_request_owner_epoch");
-    rotated_epoch = owner.CurrentRequestOwnerEpoch();
-    EXPECT_NE(rotated_epoch, original_epoch);
-    EXPECT_EQ(rotated.error->details.at("expected_request_owner_epoch"),
-              rotated_epoch.value());
-
-    SetProjectionMode(native_projections,
-                      FakePlannerSceneProjection::Mode::kCommit);
-    most_recent_request->request_context.request_owner_epoch = rotated_epoch;
-    const auto resumed = owner.Commit(*most_recent_request);
-    ASSERT_TRUE(resumed.success)
-        << (resumed.error.has_value() ? resumed.error->message
-                                     : "missing error");
-    EXPECT_EQ(resumed.transaction_sequence,
-              kMaximumLogicalSceneTransactions + 1U);
-    EXPECT_EQ(resumed.committed_projection_revision, projection);
-    const auto replay = owner.Commit(*most_recent_request);
-    ASSERT_TRUE(replay.success);
-    EXPECT_EQ(replay.replay_status,
-              core::RequestReplayStatusDTO::kReplayedExact);
-    EXPECT_EQ(replay.transaction_sequence, resumed.transaction_sequence);
-
-    auto old_epoch_request = *most_recent_request;
-    old_epoch_request.request_context.request_id =
-        core::RequestId("scene-sustained-old-epoch");
-    old_epoch_request.request_context.request_owner_epoch = original_epoch;
-    const auto stale = owner.Commit(old_epoch_request);
-    EXPECT_FALSE(stale.success);
-    EXPECT_EQ(stale.replay_status,
-              core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch);
-    const auto integrity = owner.VerifyIntegrity();
-    EXPECT_EQ(integrity.transaction_intent_count, 1);
-    EXPECT_EQ(integrity.request_outcome_count, 1);
-    EXPECT_EQ(integrity.owner_event_count, 1);
-  }
-
-  const auto p50_ns = NearestRankPercentileNs(steady_commit_duration_ns, 50U);
-  const auto p95_ns = NearestRankPercentileNs(steady_commit_duration_ns, 95U);
-  const auto p99_ns = NearestRankPercentileNs(steady_commit_duration_ns, 99U);
-  RecordProperty("steady_noop_commit_samples",
-                 std::to_string(steady_commit_duration_ns.size()));
-  RecordProperty("steady_noop_commit_p50_ns", std::to_string(p50_ns));
-  RecordProperty("steady_noop_commit_p95_ns", std::to_string(p95_ns));
-  RecordProperty("steady_noop_commit_p99_ns", std::to_string(p99_ns));
-  EXPECT_LT(p95_ns, kSustainedNoOpCommitP95BudgetNs);
-
-  CanonicalEmptySceneOwner reopened(database_path, admission,
-                                    publication_reader, bundle_source,
-                                    resolver);
-  EXPECT_EQ(reopened.CurrentRequestOwnerEpoch(), rotated_epoch);
-  EXPECT_EQ(reopened.LogicalSnapshot()->transaction_sequence,
-            kMaximumLogicalSceneTransactions + 1U);
-  ASSERT_TRUE(most_recent_request.has_value());
-  const auto replay = reopened.Commit(*most_recent_request);
-  ASSERT_TRUE(replay.success);
-  EXPECT_EQ(replay.replay_status, core::RequestReplayStatusDTO::kReplayedExact);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     ManagedNativeHostReplacementRebuildsAndPersistsTheCurrentEpochSet) {
-  TemporaryDirectory directory("scene-native-runtime-recovery");
-  const auto package_root = directory.path() / "packages";
-  CopyCanonicalEmptyPackage(package_root);
-  const auto admission = LoadAdmission(package_root);
-  const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
-          package_root, admission.cell_id().value());
-  const auto original_bindings = NativeRuntimeBindings(
-      candidate.bundle->value(), "runtime-epoch-original");
-
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
-  auto original = MakeFakeProjections(original_bindings);
-  FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
-  TestCellAdmissionPort cell_admission;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                 bundle_source, resolver, cell_admission);
-  const auto active = FinalizeNativeCandidate(
-      owner, publication_reader, admission, *candidate.bundle,
-      original_bindings, "apply-native-runtime-recovery");
-  ASSERT_TRUE(owner.ActiveProjectionHealth().healthy_for_target(active));
-
-  const auto replacement_bindings =
-      RebindRuntimeEpochs(original_bindings, "runtime-epoch-replacement");
-  auto replacement = MakeFakeProjections(replacement_bindings);
-  resolver.ReplaceWith(ProjectionClients(replacement));
-  EXPECT_FALSE(owner.ActiveProjectionHealth().healthy_for_target(active));
-
-  auto foreign_bindings = replacement_bindings;
-  foreign_bindings.front().runtime_unit_id =
-      core::RuntimeUnitId("runtime-foreign");
-  EXPECT_THROW(
-      owner.ReconcileActiveProjectionRuntimes(
-          ActiveProjectionRuntimeSetDTO{active, foreign_bindings}),
-      CanonicalEmptySceneOwnerConflictError);
-  for (const auto &projection : replacement) {
-    EXPECT_EQ(projection->rebuild_calls(), 0U);
-  }
-  EXPECT_EQ(owner.VerifyIntegrity().native_recovery_intent_count, 0);
-
-  const ActiveProjectionRuntimeSetDTO replacement_set{
-      active,
-      replacement_bindings,
-  };
-  const auto recovered =
-      owner.ReconcileActiveProjectionRuntimes(replacement_set);
-  ASSERT_TRUE(recovered.valid());
-  EXPECT_EQ(recovered.state,
-            ActiveProjectionRuntimeRecoveryState::kRecovered);
-  ASSERT_TRUE(recovered.recovery_generation.has_value());
-  EXPECT_EQ(recovered.recovery_generation->value(), 1U);
-  for (const auto &projection : replacement) {
-    EXPECT_EQ(projection->rebuild_calls(), 1U);
-  }
-  const auto recovered_health = owner.ActiveProjectionHealth();
-  ASSERT_TRUE(recovered_health.healthy_for_target(active));
-  ASSERT_EQ(recovered_health.native_projection_health.size(),
-            replacement_bindings.size());
-  for (std::size_t index = 0U; index < replacement_bindings.size(); ++index) {
-    EXPECT_EQ(recovered_health.native_projection_health[index]
-                  .native_runtime_binding,
-              replacement_bindings[index]);
-  }
-
-  const auto committed =
-      owner.Commit(AddBoxRequest(active, admission.cell_id(),
-                                 "scene-request-after-runtime-recovery"));
-  ASSERT_TRUE(committed.success)
-      << (committed.error.has_value() ? committed.error->message
-                                      : "missing error");
-  ASSERT_TRUE(committed.committed_projection_revision.has_value());
-  for (const auto &projection : replacement) {
-    EXPECT_EQ(projection->calls(), 1U);
-  }
-  const auto integrity = owner.VerifyIntegrity();
-  EXPECT_EQ(integrity.native_recovery_intent_count, 1);
-  EXPECT_EQ(integrity.native_recovery_completion_count, 1);
-  EXPECT_EQ(integrity.native_recovery_binding_count,
-            static_cast<std::int64_t>(replacement_bindings.size()));
-  EXPECT_EQ(integrity.native_recovery_result_count,
-            static_cast<std::int64_t>(replacement_bindings.size()));
-  owner.Close();
-
-  CanonicalEmptySceneOwner reopened(database_path, admission,
-                                    publication_reader, bundle_source,
-                                    resolver);
-  const ActiveProjectionRuntimeSetDTO replay_set{
-      *committed.committed_projection_revision,
-      replacement_bindings,
-  };
-  const auto replay = reopened.ReconcileActiveProjectionRuntimes(replay_set);
-  ASSERT_TRUE(replay.valid());
-  EXPECT_EQ(replay.state, ActiveProjectionRuntimeRecoveryState::kCurrent);
-  for (const auto &projection : replacement) {
-    EXPECT_EQ(projection->rebuild_calls(), 1U);
-  }
-  EXPECT_TRUE(reopened.ActiveProjectionHealth().healthy_for_target(
-      *committed.committed_projection_revision));
-}
-
-TEST(CanonicalEmptySceneOwner,
-     ManagedNativeRecoveryRejectsForeignProviderOrEpochAcceptedRebuild) {
-  for (const bool foreign_provider : {true, false}) {
-    TemporaryDirectory directory(
-        foreign_provider ? "scene-recovery-accepted-foreign-provider"
-                         : "scene-recovery-accepted-foreign-epoch");
-    const auto package_root = directory.path() / "packages";
-    CopyCanonicalEmptyPackage(package_root);
-    const auto admission = LoadAdmission(package_root);
-    const auto candidate = deployment::test::
-        materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
-            package_root, admission.cell_id().value());
-    const auto original_bindings = NativeRuntimeBindings(
-        candidate.bundle->value(), "accepted-recovery-original");
-
-    ControlledPublicationReader publication_reader;
-    deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-        package_root);
-    auto original = MakeFakeProjections(original_bindings);
-    FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
-    CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                   admission, publication_reader,
-                                   bundle_source, resolver);
-    const auto active = FinalizeNativeCandidate(
-        owner, publication_reader, admission, *candidate.bundle,
-        original_bindings, "apply-accepted-recovery-identity");
-
-    const auto replacement_bindings = RebindRuntimeEpochs(
-        original_bindings, "accepted-recovery-replacement");
-    auto replacements = MakeFakeProjections(replacement_bindings);
-    auto foreign = replacement_bindings.front();
-    if (foreign_provider) {
-      foreign.provider_binding_id =
-          core::CapabilityProviderBindingId("foreign-provider-binding");
-    } else {
-      foreign.runtime_epoch = core::RuntimeEpoch("foreign-runtime-epoch");
-    }
-    replacements.front()->AcceptNextRebuildAs(std::move(foreign));
-    resolver.ReplaceWith(ProjectionClients(replacements));
-
-    EXPECT_THROW(owner.ReconcileActiveProjectionRuntimes(
-                     ActiveProjectionRuntimeSetDTO{active,
-                                                   replacement_bindings}),
-                 CanonicalEmptySceneOwnerConflictError);
-    EXPECT_EQ(replacements.front()->rebuild_calls(), 1U);
-    const auto access = owner.ReadAccessStatus();
-    EXPECT_FALSE(access.scene_writes_open);
-    EXPECT_FALSE(access.projection_leases_open);
-    EXPECT_FALSE(owner.ActiveProjectionHealth().healthy_for_target(active));
-  }
-}
-
-TEST(CanonicalEmptySceneOwner,
-     ManagedNativeRecoveryResumesLostResponsesAndSupersedesDeadReplacements) {
-  TemporaryDirectory directory("scene-native-runtime-recovery-crash");
-  const auto package_root = directory.path() / "packages";
-  CopyCanonicalEmptyPackage(package_root);
-  const auto admission = LoadAdmission(package_root);
-  const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
-          package_root, admission.cell_id().value());
-  const auto original_bindings = NativeRuntimeBindings(
-      candidate.bundle->value(), "runtime-epoch-crash-original");
-
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
-  auto original = MakeFakeProjections(original_bindings);
-  FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                 bundle_source, resolver);
-  const auto active = FinalizeNativeCandidate(
-      owner, publication_reader, admission, *candidate.bundle,
-      original_bindings, "apply-native-runtime-recovery-crash");
-
-  const auto first_bindings =
-      RebindRuntimeEpochs(original_bindings, "runtime-epoch-crash-1");
-  auto first_replacement = MakeFakeProjections(first_bindings);
-  first_replacement.front()->ThrowAfterNextRebuildEffect();
-  resolver.ReplaceWith(ProjectionClients(first_replacement));
-  const ActiveProjectionRuntimeSetDTO first_set{active, first_bindings};
-  EXPECT_THROW(owner.ReconcileActiveProjectionRuntimes(first_set),
-               std::runtime_error);
-  EXPECT_EQ(first_replacement.front()->rebuild_calls(), 1U);
-  auto access = owner.ReadAccessStatus();
-  EXPECT_FALSE(access.scene_writes_open);
-  EXPECT_FALSE(access.projection_leases_open);
-  auto integrity = owner.VerifyIntegrity();
-  EXPECT_EQ(integrity.native_recovery_intent_count, 1);
-  EXPECT_EQ(integrity.native_recovery_completion_count, 0);
-  EXPECT_TRUE(integrity.projection_desynchronized);
-  owner.Close();
-
-  CanonicalEmptySceneOwner reopened(database_path, admission,
-                                    publication_reader, bundle_source,
-                                    resolver);
-  const auto resumed = reopened.ReconcileActiveProjectionRuntimes(first_set);
-  ASSERT_TRUE(resumed.valid());
-  EXPECT_EQ(resumed.state, ActiveProjectionRuntimeRecoveryState::kRecovered);
-  ASSERT_TRUE(resumed.recovery_generation.has_value());
-  EXPECT_EQ(resumed.recovery_generation->value(), 1U);
-  for (const auto &projection : first_replacement) {
-    EXPECT_EQ(projection->rebuild_calls(), 1U);
-  }
-  access = reopened.ReadAccessStatus();
-  EXPECT_TRUE(access.scene_writes_open);
-  EXPECT_TRUE(access.projection_leases_open);
-
-  const auto dead_bindings =
-      RebindRuntimeEpochs(original_bindings, "runtime-epoch-crash-2");
-  auto dead_replacement = MakeFakeProjections(dead_bindings);
-  dead_replacement.front()->ThrowAfterNextRebuildEffect();
-  resolver.ReplaceWith(ProjectionClients(dead_replacement));
-  EXPECT_THROW(reopened.ReconcileActiveProjectionRuntimes(
-                   ActiveProjectionRuntimeSetDTO{active, dead_bindings}),
-               std::runtime_error);
-  EXPECT_EQ(dead_replacement.front()->rebuild_calls(), 1U);
-  EXPECT_FALSE(reopened.ReadAccessStatus().scene_writes_open);
-
-  const auto final_bindings =
-      RebindRuntimeEpochs(original_bindings, "runtime-epoch-crash-3");
-  auto final_replacement = MakeFakeProjections(final_bindings);
-  resolver.ReplaceWith(ProjectionClients(final_replacement));
-  const auto superseded = reopened.ReconcileActiveProjectionRuntimes(
-      ActiveProjectionRuntimeSetDTO{active, final_bindings});
-  ASSERT_TRUE(superseded.valid());
-  EXPECT_EQ(superseded.state,
-            ActiveProjectionRuntimeRecoveryState::kRecovered);
-  ASSERT_TRUE(superseded.recovery_generation.has_value());
-  EXPECT_EQ(superseded.recovery_generation->value(), 3U);
-  for (const auto &projection : final_replacement) {
-    EXPECT_EQ(projection->rebuild_calls(), 1U);
-  }
-  const auto final_health = reopened.ActiveProjectionHealth();
-  ASSERT_TRUE(final_health.healthy_for_target(active));
-  ASSERT_EQ(final_health.native_projection_health.size(),
-            final_bindings.size());
-  for (std::size_t index = 0U; index < final_bindings.size(); ++index) {
-    EXPECT_EQ(final_health.native_projection_health[index]
-                  .native_runtime_binding,
-              final_bindings[index]);
-  }
-  integrity = reopened.VerifyIntegrity();
-  EXPECT_EQ(integrity.native_recovery_intent_count, 2);
-  EXPECT_EQ(integrity.native_recovery_completion_count, 2);
-  EXPECT_EQ(integrity.native_recovery_binding_count,
-            static_cast<std::int64_t>(2U * final_bindings.size()));
-  EXPECT_EQ(integrity.native_recovery_result_count,
-            static_cast<std::int64_t>(2U * final_bindings.size()));
-  EXPECT_FALSE(integrity.projection_desynchronized);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     RepeatedNativeHostReplacementKeepsOnlyBoundedCurrentRecoveryHistory) {
-  TemporaryDirectory directory("scene-native-runtime-recovery-bounded");
-  const auto package_root = directory.path() / "packages";
-  CopyCanonicalEmptyPackage(package_root);
-  const auto admission = LoadAdmission(package_root);
-  const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
-          package_root, admission.cell_id().value());
-  const auto original_bindings = NativeRuntimeBindings(
-      candidate.bundle->value(), "runtime-epoch-bounded-original");
-
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      package_root);
-  auto original = MakeFakeProjections(original_bindings);
-  FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                 bundle_source, resolver);
-  const auto active = FinalizeNativeCandidate(
-      owner, publication_reader, admission, *candidate.bundle,
-      original_bindings, "apply-native-runtime-recovery-bounded");
-
-  std::vector<OwnedFakePlannerSceneProjections> replacements;
-  replacements.reserve(8U);
-  std::vector<ProjectionNativeRuntimeBindingDTO> current_bindings;
-  for (std::uint64_t generation = 1U; generation <= 8U; ++generation) {
-    current_bindings = RebindRuntimeEpochs(
-        original_bindings,
-        "runtime-epoch-bounded-" + std::to_string(generation));
-    replacements.push_back(MakeFakeProjections(current_bindings));
-    resolver.ReplaceWith(ProjectionClients(replacements.back()));
-    const auto recovered = owner.ReconcileActiveProjectionRuntimes(
-        ActiveProjectionRuntimeSetDTO{active, current_bindings});
-    ASSERT_TRUE(recovered.valid());
-    ASSERT_TRUE(recovered.recovery_generation.has_value());
-    EXPECT_EQ(recovered.recovery_generation->value(), generation);
-    for (const auto &projection : replacements.back()) {
-      EXPECT_EQ(projection->rebuild_calls(), 1U);
-    }
-    const auto integrity = owner.VerifyIntegrity();
-    EXPECT_LE(
-        integrity.native_recovery_intent_count,
-        static_cast<std::int64_t>(kMaximumRetainedNativeProjectionRecoveries));
-    EXPECT_EQ(integrity.native_recovery_intent_count, generation == 1U ? 1 : 2);
-    EXPECT_EQ(integrity.native_recovery_completion_count,
-              integrity.native_recovery_intent_count);
-  }
-  owner.Close();
-
-  CanonicalEmptySceneOwner reopened(
-      database_path, admission, publication_reader, bundle_source, resolver);
-  EXPECT_TRUE(reopened.ActiveProjectionHealth().healthy_for_target(active));
-  const auto replay = reopened.ReconcileActiveProjectionRuntimes(
-      ActiveProjectionRuntimeSetDTO{active, current_bindings});
-  EXPECT_EQ(replay.state, ActiveProjectionRuntimeRecoveryState::kCurrent);
-  EXPECT_EQ(replay.recovery_generation->value(), 8U);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     V5RecoveryMigrationPrunesHistoryAndPreservesMonotonicGeneration) {
-  TemporaryDirectory directory("scene-native-runtime-recovery-v5-migration");
-  const auto package_root = directory.path() / "packages";
-  CopyCanonicalEmptyPackage(package_root);
-  const auto admission = LoadAdmission(package_root);
-  const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
-          package_root, admission.cell_id().value());
-  const auto original_bindings = NativeRuntimeBindings(
-      candidate.bundle->value(), "runtime-epoch-v5-original");
-
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      package_root);
-  auto original = MakeFakeProjections(original_bindings);
-  FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  ProjectionRevisionDTO active;
-  const auto migrated_bindings =
-      RebindRuntimeEpochs(original_bindings, "runtime-epoch-v5-1");
-  auto migrated_projections = MakeFakeProjections(migrated_bindings);
-  {
-    CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                   bundle_source, resolver);
-    active = FinalizeNativeCandidate(
-        owner, publication_reader, admission, *candidate.bundle,
-        original_bindings, "apply-native-runtime-recovery-v5-migration");
-    resolver.ReplaceWith(ProjectionClients(migrated_projections));
-    const auto recovered = owner.ReconcileActiveProjectionRuntimes(
-        ActiveProjectionRuntimeSetDTO{active, migrated_bindings});
-    ASSERT_EQ(recovered.recovery_generation->value(), 1U);
-  }
-
-  // Form a valid append-only v5 history with eight completed generations.
-  // The rows are intentionally equivalent: this test isolates migration,
-  // retention, and monotonic identity rather than native rebuild behavior.
-  ExecuteSql(database_path, R"sql(
-BEGIN IMMEDIATE;
-WITH RECURSIVE generations(value) AS (
-    SELECT 2 UNION ALL SELECT value + 1 FROM generations WHERE value < 8
-)
-INSERT INTO logical_scene_native_runtime_recovery_intents(
-    recovery_generation,structural_lineage_generation,
-    target_retained_bundle_id,target_graph_revision,target_scene_id,
-    target_scene_revision_id,target_scene_content_hash,native_binding_count,
-    recovered_transaction_sequence
-)
-SELECT generations.value,intents.structural_lineage_generation,
-       intents.target_retained_bundle_id,intents.target_graph_revision,
-       intents.target_scene_id,intents.target_scene_revision_id,
-       intents.target_scene_content_hash,intents.native_binding_count,NULL
-FROM generations
-CROSS JOIN logical_scene_native_runtime_recovery_intents AS intents
-WHERE intents.recovery_generation = 1;
-WITH RECURSIVE generations(value) AS (
-    SELECT 2 UNION ALL SELECT value + 1 FROM generations WHERE value < 8
-)
-INSERT INTO logical_scene_native_runtime_recovery_bindings
-SELECT generations.value,bindings.binding_ordinal,
-       bindings.provider_binding_id,bindings.provider_binding_revision,
-       bindings.runtime_unit_id,bindings.runtime_epoch
-FROM generations
-CROSS JOIN logical_scene_native_runtime_recovery_bindings AS bindings
-WHERE bindings.recovery_generation = 1;
-WITH RECURSIVE generations(value) AS (
-    SELECT 2 UNION ALL SELECT value + 1 FROM generations WHERE value < 8
-)
-INSERT INTO logical_scene_native_runtime_recovery_results
-SELECT generations.value,results.binding_ordinal,results.source_sequence,
-       results.native_projection_generation,results.projection_content_digest
-FROM generations
-CROSS JOIN logical_scene_native_runtime_recovery_results AS results
-WHERE results.recovery_generation = 1;
-WITH RECURSIVE generations(value) AS (
-    SELECT 2 UNION ALL SELECT value + 1 FROM generations WHERE value < 8
-)
-INSERT INTO logical_scene_native_runtime_recovery_completions
-SELECT generations.value,completions.result_count
-FROM generations
-CROSS JOIN logical_scene_native_runtime_recovery_completions AS completions
-WHERE completions.recovery_generation = 1;
-UPDATE logical_scene_history_state
-SET native_recovery_generation_watermark = 8
-WHERE singleton = 1;
-COMMIT;
-)sql");
-  DowngradeBoundedHistoryStoreToV5ForMigrationTest(database_path);
-
-  CanonicalEmptySceneOwner migrated(
-      database_path, admission, publication_reader, bundle_source, resolver);
-  auto integrity = migrated.VerifyIntegrity();
-  EXPECT_EQ(integrity.native_recovery_intent_count, 1);
-  EXPECT_EQ(integrity.native_recovery_completion_count, 1);
-  EXPECT_TRUE(migrated.ActiveProjectionHealth().healthy_for_target(active));
-
-  const auto next_bindings =
-      RebindRuntimeEpochs(original_bindings, "runtime-epoch-v5-9");
-  auto next_projections = MakeFakeProjections(next_bindings);
-  resolver.ReplaceWith(ProjectionClients(next_projections));
-  const auto recovered = migrated.ReconcileActiveProjectionRuntimes(
-      ActiveProjectionRuntimeSetDTO{active, next_bindings});
-  ASSERT_TRUE(recovered.recovery_generation.has_value());
-  EXPECT_EQ(recovered.recovery_generation->value(), 9U);
-  integrity = migrated.VerifyIntegrity();
-  EXPECT_EQ(integrity.native_recovery_intent_count, 2);
-  EXPECT_EQ(integrity.native_recovery_completion_count, 2);
-}
-
-TEST(
-    CanonicalEmptySceneOwner,
-    HostLossDuringSceneCommitRebuildsTheAuthoritativePredecessorWithOldLeasePinned) {
-  TemporaryDirectory directory("scene-native-transaction-host-loss");
-  const auto package_root = directory.path() / "packages";
-  CopyCanonicalEmptyPackage(package_root);
-  const auto admission = LoadAdmission(package_root);
-  const auto candidate = deployment::test::
-      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
-          package_root, admission.cell_id().value());
-  const auto original_bindings = NativeRuntimeBindings(
-      candidate.bundle->value(), "runtime-epoch-transaction-original");
-
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      package_root);
-  auto original = MakeFakeProjections(original_bindings);
-  FakePlannerSceneProjectionResolver resolver(ProjectionClients(original));
-  TestCellAdmissionPort cell_admission;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                 bundle_source, resolver, cell_admission);
-  const auto active = FinalizeNativeCandidate(
-      owner, publication_reader, admission, *candidate.bundle,
-      original_bindings, "apply-native-transaction-host-loss");
-
-  const core::ProjectionLeaseId old_lease("operation-before-host-loss");
-  for (auto &projection : original) {
-    const auto retained =
-        projection->RetainProjectionBinding(active, old_lease);
-    ASSERT_TRUE(retained.ok());
-    EXPECT_EQ(projection->retained_lease_count(), 1U);
-  }
-  SetProjectionMode(original, FakePlannerSceneProjection::Mode::kUncertain);
-  const auto failed_request = AddBoxRequest(
-      active, admission.cell_id(), "scene-request-interrupted-by-host-loss");
-  const auto failed = owner.Commit(failed_request);
-  ASSERT_FALSE(failed.success);
-  EXPECT_EQ(failed.projection_status,
-            core::SceneProjectionCommitStatusDTO::kFailedProjectionUncertain);
-  EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-  EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
-
-  const auto replacement_bindings = RebindRuntimeEpochs(
-      original_bindings, "runtime-epoch-transaction-replacement");
-  auto replacement = MakeFakeProjections(replacement_bindings);
-  resolver.ReplaceWith(ProjectionClients(replacement));
-  const auto recovered = owner.ReconcileActiveProjectionRuntimes(
-      ActiveProjectionRuntimeSetDTO{active, replacement_bindings});
-  ASSERT_TRUE(recovered.valid());
-  EXPECT_EQ(recovered.state, ActiveProjectionRuntimeRecoveryState::kRecovered);
-  for (const auto &projection : replacement) {
-    EXPECT_EQ(projection->rebuild_calls(), 1U);
-  }
-  EXPECT_TRUE(owner.ReadAccessStatus().scene_writes_open);
-  EXPECT_TRUE(owner.ReadAccessStatus().projection_leases_open);
-  EXPECT_EQ(owner.CurrentProjectionRevision(), active);
-  EXPECT_TRUE(owner.GetSceneObjects().empty());
-
-  // The lease belongs to the dead predecessor host and remains exact there;
-  // rebuilding the replacement neither adopts nor mutates it.
-  for (auto &projection : original) {
-    EXPECT_EQ(projection->retained_lease_count(), 1U);
-  }
-  for (const auto &projection : replacement) {
-    EXPECT_EQ(projection->retained_lease_count(), 0U);
-  }
-  for (auto &projection : original) {
-    projection->ReleaseProjection(old_lease);
-    EXPECT_EQ(projection->retained_lease_count(), 0U);
-  }
-
-  const auto failed_replay = owner.Commit(failed_request);
-  EXPECT_FALSE(failed_replay.success);
-  EXPECT_EQ(failed_replay.replay_status,
-            core::RequestReplayStatusDTO::kReplayedExact);
-  for (const auto &projection : replacement) {
-    EXPECT_EQ(projection->calls(), 0U);
-  }
-  cell_admission.ProveHeldClaimHadNoEffect();
-  auto retry = failed_request;
-  retry.request_context.request_id =
-      core::RequestId("scene-request-after-host-loss-recovery");
-  const auto committed = owner.Commit(retry);
-  ASSERT_TRUE(committed.success)
-      << (committed.error.has_value() ? committed.error->message
-                                      : "missing error");
-  for (const auto &projection : replacement) {
-    EXPECT_EQ(projection->calls(), 1U);
-  }
-  EXPECT_FALSE(owner.VerifyIntegrity().projection_desynchronized);
-  owner.Close();
-
-  CanonicalEmptySceneOwner reopened(
-      database_path, admission, publication_reader, bundle_source, resolver);
-  EXPECT_EQ(reopened.CurrentProjectionRevision(),
-            *committed.committed_projection_revision);
-  EXPECT_FALSE(reopened.VerifyIntegrity().projection_desynchronized);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     MissingResolutionAndCallerAuthoredDerivedPolicyFailBeforeEffects) {
-  TemporaryDirectory directory("scene-resolution-gate");
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
-  FakePlannerSceneProjection projection("resolution-gate");
-  FakePlannerSceneProjectionResolver projection_resolver(projection);
   TestCellAdmissionPort cell_admission;
   CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader, bundle_source,
-                                 projection_resolver, cell_admission);
+                                 resolver, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
-  projection.Reset(accepted.canonical_empty_target,
-                   FakePlannerSceneProjection::Mode::kCommit);
+  const core::ProjectionMaintenanceInitializationRequestDTO request{
+      ApplyId("maintenance-duplicate"), ApplyGeneration(1U),
+      accepted.canonical_empty_target, candidate.bundle->value(), bindings};
 
-  auto component_frame =
-      AddBoxRequest(accepted.canonical_empty_target, admission.cell_id(),
-                    "scene-request-component-frame");
-  std::get<core::AddObjectRequestDTO>(component_frame.operation).frame_ref =
-      core::ComponentSceneFrameRefDTO{
-          core::ControllableComponentId("component.1"),
-          core::ModelInstanceId("model.1"), core::FrameRoleId("tool_frame")};
-  const auto unresolved = owner.Commit(component_frame);
-  ASSERT_FALSE(unresolved.success);
-  ASSERT_TRUE(unresolved.error.has_value());
-  EXPECT_EQ(unresolved.error->code, "missing_reference");
-  EXPECT_EQ(unresolved.error->details.at("reason"),
-            "scene_frame_projection_unavailable");
+  const auto first = owner.BeginMaintenanceInitialization(request);
+  ASSERT_EQ(first.state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  for (const auto &projection : projections) {
+    EXPECT_EQ(projection->rebuild_calls(), 1U);
+  }
 
-  auto foreign_cell =
-      AddBoxRequest(accepted.canonical_empty_target, admission.cell_id(),
-                    "scene-request-foreign-cell");
-  std::get<core::AddObjectRequestDTO>(foreign_cell.operation).frame_ref =
-      core::CellSceneFrameRefDTO{core::CellId("cell.foreign")};
-  const auto missing = owner.Commit(foreign_cell);
-  ASSERT_FALSE(missing.success);
-  ASSERT_TRUE(missing.error.has_value());
-  EXPECT_EQ(missing.error->code, "missing_reference");
-  EXPECT_EQ(missing.error->details.at("reference_type"), "cell_frame");
-  EXPECT_EQ(missing.error->details.at("reference_id"), "cell.foreign");
+  const auto replay = owner.BeginMaintenanceInitialization(request);
+  EXPECT_EQ(replay.state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  EXPECT_EQ(replay.target_projection_revision,
+            first.target_projection_revision);
+  EXPECT_EQ(owner.ReadMaintenanceInitialization(
+                {request.apply_id, request.apply_generation}),
+            std::optional{first});
+  for (const auto &projection : projections) {
+    EXPECT_EQ(projection->rebuild_calls(), 1U);
+  }
+}
 
-  core::SceneTransactionRequestDTO attach{
-      SceneRequestContext("scene-request-attach",
-                          accepted.canonical_empty_target),
-      {},
-      accepted.canonical_empty_target,
-      core::AttachCarriedObjectRequestDTO{
-          core::CarriedObjectAttachmentId("attachment.1"),
-          core::SceneResourceId("scene-box"),
-          core::ControllableComponentId("component.1"),
-          core::CommandTargetId("arm"),
-          core::FrameRoleId("tool_frame"),
-          {},
-          {},
-      },
-      std::nullopt,
-  };
-  const auto attach_unavailable = owner.Commit(attach);
-  ASSERT_FALSE(attach_unavailable.success);
-  ASSERT_TRUE(attach_unavailable.error.has_value());
-  EXPECT_EQ(attach_unavailable.error->code, "missing_reference");
-  EXPECT_EQ(attach_unavailable.error->details.at("reason"),
-            "scene_frame_projection_unavailable");
+TEST(CanonicalEmptySceneOwner,
+     MaintenanceStatusRemainsReadableWhileNativeInitializationIsBlocked) {
+  TemporaryDirectory directory("scene-maintenance-responsive-status");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-epoch-maintenance-responsive");
+  auto projections = MakeFakeProjections(bindings);
+  auto clients = ProjectionClients(projections);
+  FakePlannerSceneProjectionResolver resolver(clients);
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      package_root);
+  TestCellAdmissionPort cell_admission;
+  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                                 admission, publication_reader, bundle_source,
+                                 resolver, cell_admission);
+  const auto accepted =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission);
+  const core::ProjectionMaintenanceInitializationRequestDTO request{
+      ApplyId("maintenance-responsive-status"), ApplyGeneration(1U),
+      accepted.canonical_empty_target, candidate.bundle->value(), bindings};
 
-  auto policy = owner.LogicalSnapshot()->configured_collision_policy;
-  policy.allowed_static_static_pairs.push_back(
-      {core::CollisionBodyId("body.a"), core::CollisionBodyId("body.b")});
-  core::SceneTransactionRequestDTO derived_policy{
-      SceneRequestContext("scene-request-derived-policy",
-                          accepted.canonical_empty_target),
-      {},
-      accepted.canonical_empty_target,
-      core::SetCollisionPolicyRequestDTO{
-          policy,
-          owner.LogicalSnapshot()->configured_collision_policy.revision},
-      core::AdmissionGeneration(1U),
-  };
-  const auto policy_unavailable = owner.Commit(derived_policy);
-  ASSERT_FALSE(policy_unavailable.success);
-  ASSERT_TRUE(policy_unavailable.error.has_value());
-  EXPECT_EQ(policy_unavailable.error->code, "invalid_request");
-  EXPECT_EQ(policy_unavailable.error->details.at("reason"),
-            "derived_collision_policy_fields_are_read_only");
+  std::barrier rebuild_entered(2);
+  std::barrier rebuild_release(2);
+  projections.front()->BlockNextRebuild(rebuild_entered, rebuild_release);
+  auto initialization = std::async(std::launch::async, [&] {
+    return owner.BeginMaintenanceInitialization(request);
+  });
+  rebuild_entered.arrive_and_wait();
 
-  EXPECT_EQ(projection.calls(), 0U);
-  const auto integrity = owner.VerifyIntegrity();
-  EXPECT_EQ(integrity.transaction_intent_count, 0);
-  EXPECT_EQ(integrity.request_outcome_count, 0);
-  EXPECT_EQ(integrity.projection_attempt_count, 0);
+  auto status_read = std::async(std::launch::async, [&] {
+    return owner.ReadMaintenanceInitialization(
+        {request.apply_id, request.apply_generation});
+  });
+  const auto status_readiness = status_read.wait_for(1s);
+  rebuild_release.arrive_and_wait();
+
+  const auto initialized = initialization.get();
+  const auto observed = status_read.get();
+  EXPECT_EQ(status_readiness, std::future_status::ready);
+  ASSERT_TRUE(observed.has_value());
+  EXPECT_EQ(observed->state,
+            core::ProjectionMaintenanceInitializationState::kInitializing);
+  EXPECT_EQ(initialized.state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     InterruptedMaintenanceReopensClosedWithoutAutomaticRetry) {
+  TemporaryDirectory directory("scene-maintenance-interrupted-reopen");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-epoch-maintenance-interrupted");
+  auto projections = MakeFakeProjections(bindings);
+  auto clients = ProjectionClients(projections);
+  FakePlannerSceneProjectionResolver resolver(clients);
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      package_root);
+  TestCellAdmissionPort cell_admission;
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  core::ProjectionMaintenanceInitializationRequestDTO interrupted_request;
+  {
+    CanonicalEmptySceneOwner owner(database_path, admission,
+                                   publication_reader, bundle_source, resolver,
+                                   cell_admission);
+    const auto accepted =
+        FinalizeCanonicalBootstrap(owner, publication_reader, admission);
+    interrupted_request = {
+        ApplyId("maintenance-interrupted"), ApplyGeneration(1U),
+        accepted.canonical_empty_target, candidate.bundle->value(), bindings};
+    ASSERT_EQ(owner.BeginMaintenanceInitialization(interrupted_request).state,
+              core::ProjectionMaintenanceInitializationState::kInitialized);
+    owner.Close();
+  }
+  std::vector<std::size_t> rebuild_calls;
+  for (const auto &projection : projections) {
+    rebuild_calls.push_back(projection->rebuild_calls());
+  }
+
+  CanonicalEmptySceneOwner reopened(database_path, admission,
+                                    publication_reader, bundle_source, resolver,
+                                    cell_admission);
+  const auto interrupted = reopened.ReadMaintenanceInitialization(
+      {interrupted_request.apply_id, interrupted_request.apply_generation});
+  ASSERT_TRUE(interrupted.has_value());
+  EXPECT_EQ(interrupted->state,
+            core::ProjectionMaintenanceInitializationState::kInterrupted);
+  EXPECT_TRUE(interrupted->effects_unknown);
+  EXPECT_FALSE(reopened.ReadAccessStatus().scene_writes_open);
+  EXPECT_FALSE(reopened.ReadAccessStatus().projection_leases_open);
+  EXPECT_EQ(reopened.BeginMaintenanceInitialization(interrupted_request),
+            *interrupted);
+  for (std::size_t index = 0U; index < projections.size(); ++index) {
+    EXPECT_EQ(projections[index]->rebuild_calls(), rebuild_calls[index]);
+  }
+
+  auto restoration_request = interrupted_request;
+  restoration_request.apply_id = ApplyId("maintenance-explicit-restoration");
+  const auto restored =
+      reopened.BeginMaintenanceInitialization(restoration_request);
+  EXPECT_EQ(restored.state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  for (std::size_t index = 0U; index < projections.size(); ++index) {
+    EXPECT_EQ(projections[index]->rebuild_calls(), rebuild_calls[index] + 1U);
+  }
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -6013,68 +3782,6 @@ TEST(CanonicalEmptySceneOwner,
   }
 }
 
-TEST(CanonicalEmptySceneOwner,
-     SceneTransactionsAndNamedApplyReplayOneCompositeOrder) {
-  TemporaryDirectory directory("scene-apply-interleave");
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
-      MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
-  FakePlannerSceneProjectionResolver projection_resolver(
-      std::vector<FakePlannerSceneProjection *>{});
-  TestCellAdmissionPort cell_admission;
-  ProjectionRevisionDTO final_projection;
-  {
-    CanonicalEmptySceneOwner owner(database_path, admission, publication_reader,
-                                   bundle_source, projection_resolver,
-                                   cell_admission);
-    const auto accepted =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission);
-    const auto added = owner.Commit(
-        AddBoxRequest(accepted.canonical_empty_target, admission.cell_id(),
-                      "scene-request-before-apply"));
-    ASSERT_TRUE(added.success);
-
-    const auto staged = owner.StageCandidateProjection(
-        NamedStageRequest(admission, *added.committed_projection_revision,
-                          "apply-after-scene-edit"));
-    ASSERT_EQ(staged.state, ProjectionApplyStageResultState::kStaged);
-    const auto activated =
-        owner.ActivateStagedProjection(ActivationRequest(staged));
-    ASSERT_EQ(activated.state,
-              ProjectionApplyActivationResultState::kActivated);
-    const auto receipt = NamedPublicationReceipt(staged);
-    publication_reader.SetCurrent(receipt);
-    const auto finalized = owner.FinalizeProjectionTransition(
-        NamedFinalizeRequest(staged, receipt));
-    ASSERT_EQ(finalized.state, ProjectionApplyFinalizeResultState::kFinalized);
-
-    core::SceneTransactionRequestDTO remove{
-        SceneRequestContext("scene-request-after-apply",
-                            finalized.candidate_projection_revision),
-        {},
-        finalized.candidate_projection_revision,
-        core::RemoveObjectRequestDTO{core::SceneResourceId("scene-box")},
-        core::AdmissionGeneration(1U),
-    };
-    const auto removed = owner.Commit(remove);
-    ASSERT_TRUE(removed.success);
-    final_projection = *removed.committed_projection_revision;
-    EXPECT_TRUE(owner.GetSceneObjects().empty());
-    const auto integrity = owner.VerifyIntegrity();
-    EXPECT_EQ(integrity.transaction_intent_count, 2);
-    EXPECT_EQ(integrity.owner_event_count, 3);
-    owner.Close();
-  }
-
-  CanonicalEmptySceneOwner reopened(database_path, admission,
-                                    publication_reader, bundle_source);
-  EXPECT_EQ(reopened.CurrentProjectionRevision(), final_projection);
-  EXPECT_TRUE(reopened.GetSceneObjects().empty());
-  EXPECT_EQ(reopened.LogicalSnapshot()->transaction_sequence, 2U);
-  EXPECT_EQ(reopened.VerifyIntegrity().owner_event_count, 3);
-}
 
 } // namespace
 } // namespace manyforge::scene

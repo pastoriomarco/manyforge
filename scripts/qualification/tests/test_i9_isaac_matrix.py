@@ -210,7 +210,7 @@ def test_world_manifest_is_exact_and_rejects_changed_content(
         runner.validate_world_manifest(manifest)
 
 
-def test_package_preflight_binds_catalog_program_pose_and_site(
+def test_package_preflight_binds_projects_program_pose_and_site(
     runner: ModuleType, tmp_path: Path
 ) -> None:
     package = tmp_path / "package"
@@ -218,16 +218,20 @@ def test_package_preflight_binds_catalog_program_pose_and_site(
     package.mkdir()
     config = source / "manyforge_ros_bringup/config"
     config.mkdir(parents=True)
-    catalog_rows = []
     site_rows = []
     for row in runner.SCENARIOS:
-        catalog_rows.append(
-            {
-                "scenario_id": row.scenario_id,
-                "deployment_artifact_id": row.deployment_artifact_id,
-            }
-        )
         site_rows.append({"scenario_id": row.scenario_id})
+        project = source / "examples" / f"{row.scenario_id}.scenario"
+        project.mkdir(parents=True)
+        (project / "scenario.yaml").write_text(
+            json.dumps(
+                {
+                    "api_version": "manyforge.scenario.project.v1",
+                    "scenario_id": row.scenario_id,
+                }
+            ),
+            encoding="utf-8",
+        )
         (package / row.admission_filename).write_text("{}", encoding="utf-8")
         (package / row.program_filename).write_text(
             "program_id: " + row.program_filename.removesuffix(".program.yaml") + "\n",
@@ -236,15 +240,6 @@ def test_package_preflight_binds_catalog_program_pose_and_site(
         (config / row.pose_observer_filename).write_text(
             json.dumps({"cell_id": row.cell_id}), encoding="utf-8"
         )
-    (package / "maintained.scenario-catalog.yaml").write_text(
-        json.dumps(
-            {
-                "scenario_catalog_revision": "sha256:" + "1" * 64,
-                "scenarios": catalog_rows,
-            }
-        ),
-        encoding="utf-8",
-    )
     (config / "isaac_program_simulation_site.json").write_text(
         json.dumps({"scenarios": site_rows}), encoding="utf-8"
     )
@@ -276,6 +271,7 @@ def test_package_preflight_binds_catalog_program_pose_and_site(
 
     result = runner.validate_package(package, source)
     assert len(result["scenarios"]) == 5
+    assert len(result["projects"]) == 5
     assert result["scene_mesh_assets"] == [
         {"sha256": runner._sha256_file(source / mesh_uri), "uri": mesh_uri}
     ]
@@ -285,19 +281,18 @@ def test_package_preflight_binds_catalog_program_pose_and_site(
         runner.validate_package(package, source)
     (package / mesh_uri).write_bytes(mesh_bytes)
 
-    catalog_rows[1]["deployment_artifact_id"] = catalog_rows[0][
-        "deployment_artifact_id"
-    ]
-    (package / "maintained.scenario-catalog.yaml").write_text(
+    first = runner.SCENARIOS[0]
+    manifest = source / "examples" / f"{first.scenario_id}.scenario/scenario.yaml"
+    manifest.write_text(
         json.dumps(
             {
-                "scenario_catalog_revision": "sha256:" + "1" * 64,
-                "scenarios": catalog_rows,
+                "api_version": "manyforge.scenario.project.v1",
+                "scenario_id": "wrong-scenario",
             }
         ),
         encoding="utf-8",
     )
-    with pytest.raises(runner.QualificationError, match="another deployment"):
+    with pytest.raises(runner.QualificationError, match="project identity"):
         runner.validate_package(package, source)
 
 

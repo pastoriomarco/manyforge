@@ -77,30 +77,12 @@ using core::ControlDomainRevision;
 using core::ControllableComponentId;
 using core::DomainActiveControlConfigurationDTO;
 using core::GraphRevision;
-using core::NamedApplyProjectionSetSourceDTO;
 using core::NamedApplyPublicationTransactionDTO;
 using core::ProductContractId;
 using core::ProductContractRevision;
 using core::ProductId;
-using core::ProjectionAggregateHealthDTO;
-using core::ProjectionApplyActivationResultDTO;
-using core::ProjectionApplyActivationResultState;
-using core::ProjectionApplyFinalizeResultDTO;
-using core::ProjectionApplyFinalizeResultState;
-using core::ProjectionApplyStageResultDTO;
-using core::ProjectionApplyStageResultState;
-using core::ProjectionHealthDTO;
-using core::ProjectionHealthState;
-using core::ProjectionNativeRuntimeBindingDTO;
 using core::ProjectionRevisionDTO;
-using core::ProjectionStagedCandidateDTO;
 using core::ProjectionStageGeneration;
-using core::ProjectionTransitionDisposition;
-using core::ProjectionTransitionEvidenceDTO;
-using core::ProjectionTransitionEvidenceState;
-using core::ProjectionTransitionRowDTO;
-using core::ProjectionTransitionRowEvidenceDTO;
-using core::ProjectionTransitionRowEvidenceState;
 using core::PublicRequestContextDTO;
 using core::RequestId;
 using core::RequestOwnerEpoch;
@@ -127,31 +109,19 @@ constexpr std::string_view kRuntimeConvergenceIntentDigestDomain =
     "manyforge.component-manager-runtime-convergence-intent.v2";
 constexpr std::string_view kRuntimeStagedReadyDigestDomain =
     "manyforge.component-manager-runtime-staged-ready.v3";
-constexpr std::string_view kSceneStageIntentDigestDomain =
-    "manyforge.component-manager-scene-stage-intent.v2";
-constexpr std::string_view kSceneStagedEvidenceDigestDomain =
-    "manyforge.component-manager-scene-staged-evidence.v2";
-constexpr std::string_view kActivationSelectionDigestDomain =
-    "manyforge.component-manager-activation-selection.v1";
-constexpr std::string_view kSceneActivatedEvidenceDigestDomain =
-    "manyforge.component-manager-scene-activated-evidence.v2";
 constexpr std::string_view kPrivateMaterializationDigestDomain =
-    "manyforge.component-manager-private-selected-bundle.v1";
-constexpr std::string_view kRetiredCommandSurfacesDigestDomain =
-    "manyforge.component-manager-obsolete-command-surfaces-retired.v1";
+    "manyforge.component-manager-private-selected-bundle.ua4.v2";
 constexpr std::string_view kPublicationReceiptDigestDomain =
     "manyforge.component-manager-apply-publication-receipt.v1";
-constexpr std::string_view kSceneFinalizedEvidenceDigestDomain =
-    "manyforge.component-manager-scene-finalized-evidence.v2";
 constexpr std::string_view kFenceReleaseIntentDigestDomain =
-    "manyforge.component-manager-fence-release-intent.v1";
+    "manyforge.component-manager-fence-release-intent.ua4.v2";
 constexpr std::string_view kFenceReleasedDigestDomain =
     "manyforge.component-manager-fence-released.v1";
 constexpr std::string_view kTerminalOutcomeDigestDomain =
-    "manyforge.component-manager-terminal-outcome.v2";
+    "manyforge.component-manager-terminal-outcome.ua4.v3";
 constexpr int kBusyTimeoutMilliseconds = 10000;
 constexpr std::int64_t kWalCheckpointTargetBytes = 16LL * 1024LL * 1024LL;
-constexpr std::int64_t kExpectedSchemaObjectCardinality = 54;
+constexpr std::int64_t kExpectedSchemaObjectCardinality = 39;
 
 [[noreturn]] void ThrowSqlite(sqlite3 *database, const int result,
                               const std::string_view context) {
@@ -602,6 +572,9 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
                  "program_binding_id");
   ValidateDigest(intent.prepared_activation.prepared_activation_id.value(),
                  "prepared_activation_id");
+  ValidateBoundedText(intent.prepared_activation.canonical_receipt_json,
+                      kMaximumManagerApplyPreparedReceiptBytes,
+                      "prepared_activation_receipt_json");
 
   const auto generation =
       CheckedSigned(intent.apply_generation.value(), "apply_generation");
@@ -661,6 +634,8 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
               intent.prepared_activation.program_binding_id.value());
   AppendField(record, "prepared_activation_id",
               intent.prepared_activation.prepared_activation_id.value());
+  AppendField(record, "prepared_activation_receipt_json",
+              intent.prepared_activation.canonical_receipt_json);
   AppendField(record, "admission_context_kind",
               expected_admission_generation.has_value()
                   ? "direct"
@@ -1231,8 +1206,8 @@ EncodeFenceReleaseIntent(const ManagerApplyFenceReleaseIntentDTO &intent) {
   if (!intent.valid()) {
     throw std::invalid_argument("Manager fence-release intent is invalid");
   }
-  ValidateDigest(intent.scene_finalized_digest.value(),
-                 "scene_finalized_digest");
+  ValidateDigest(intent.scene_completion_digest.value(),
+                 "scene_completion_digest");
   ValidateDigest(intent.fence_acceptance_digest.value(),
                  "fence_acceptance_digest");
   const auto &owner =
@@ -1244,8 +1219,8 @@ EncodeFenceReleaseIntent(const ManagerApplyFenceReleaseIntentDTO &intent) {
   };
   std::string record;
   AppendField(record, "domain", kFenceReleaseIntentDigestDomain);
-  AppendField(record, "scene_finalized_digest",
-              intent.scene_finalized_digest.value());
+  AppendField(record, "scene_completion_digest",
+              intent.scene_completion_digest.value());
   AppendField(record, "fence_acceptance_digest",
               intent.fence_acceptance_digest.value());
   AppendField(record, "apply_id", owner.apply_id.value());
@@ -1316,8 +1291,8 @@ EncodeTerminalOutcome(const ManagerApplyTerminalOutcomeDTO &outcome) {
   if (outcome.state == ManagerApplyTerminalOutcomeState::kSucceeded) {
     ValidateDigest(outcome.fence_released_digest->value(),
                    "fence_released_digest");
-    ValidateDigest(outcome.scene_finalized_digest->value(),
-                   "scene_finalized_digest");
+    ValidateDigest(outcome.scene_completion_digest->value(),
+                   "scene_completion_digest");
     ValidateDigest(outcome.publication_receipt_digest->value(),
                    "publication_receipt_digest");
     const auto &candidate = *outcome.candidate_projection_revision;
@@ -1325,8 +1300,8 @@ EncodeTerminalOutcome(const ManagerApplyTerminalOutcomeDTO &outcome) {
         candidate.scene_revision.revision_id, "candidate_scene_revision_id");
     AppendField(record, "fence_released_digest",
                 outcome.fence_released_digest->value());
-    AppendField(record, "scene_finalized_digest",
-                outcome.scene_finalized_digest->value());
+    AppendField(record, "scene_completion_digest",
+                outcome.scene_completion_digest->value());
     AppendField(record, "publication_receipt_digest",
                 outcome.publication_receipt_digest->value());
     AppendField(record, "candidate_retained_bundle_id",
@@ -1375,13 +1350,11 @@ EncodeTerminalOutcome(const ManagerApplyTerminalOutcomeDTO &outcome) {
 
 [[nodiscard]] ManagerApplyPhase ParseManagerApplyPhase(
     const std::string_view value) {
-  constexpr std::array<ManagerApplyPhase, 9U> kPhases{
+  constexpr std::array<ManagerApplyPhase, 7U> kPhases{
       ManagerApplyPhase::kAccepted,
       ManagerApplyPhase::kFenceAcquired,
       ManagerApplyPhase::kFenceAccepted,
       ManagerApplyPhase::kRuntimeConverged,
-      ManagerApplyPhase::kSceneStaged,
-      ManagerApplyPhase::kSceneActivated,
       ManagerApplyPhase::kComposed,
       ManagerApplyPhase::kPublished,
       ManagerApplyPhase::kSettled,
@@ -1846,53 +1819,10 @@ std::string EncodeDependencyEpochs(
   return EncodeTokens(tokens);
 }
 
-std::string EncodeManagedWithdrawal(
-    const std::optional<core::ManagedRuntimeWithdrawalDTO> &receipt) {
-  if (!receipt)
-    return {};
-  if (!receipt->valid())
-    throw std::invalid_argument("invalid managed withdrawal");
-  return EncodeTokens({receipt->apply_id.value(),
-                       std::to_string(receipt->apply_generation.value()),
-                       receipt->runtime_convergence_intent_digest.value(),
-                       receipt->runtime_unit_id.value(),
-                       receipt->runtime_epoch.value(),
-                       receipt->product_identity.value(),
-                       receipt->configuration_identity.value(),
-                       receipt->process_observer_instance_id,
-                       std::to_string(receipt->process_observation_sequence)});
-}
-
-std::optional<core::ManagedRuntimeWithdrawalDTO>
-DecodeManagedWithdrawal(const std::string &encoding) {
-  if (encoding.empty())
-    return std::nullopt;
-  const auto receipt =
-      DecodeTokens(encoding, 9U, "managed predecessor withdrawal");
-  if (receipt.size() != 9U)
-    throw ManagerApplyJournalIntegrityError(
-        "stored withdrawal cardinality is invalid");
-  core::ManagedRuntimeWithdrawalDTO result{
-      ApplyId(receipt[0]),
-      ApplyGeneration(
-          ParseCanonicalUnsigned(receipt[1], "withdrawal Apply generation")),
-      ContentDigest(receipt[2]),
-      RuntimeUnitId(receipt[3]),
-      RuntimeEpoch(receipt[4]),
-      ContentDigest(receipt[5]),
-      ContentDigest(receipt[6]),
-      receipt[7],
-      ParseCanonicalUnsigned(receipt[8], "withdrawal observation sequence")};
-  if (!result.valid())
-    throw ManagerApplyJournalIntegrityError(
-        "stored managed withdrawal is invalid");
-  return result;
-}
-
 std::string EncodeRuntimeStagedReadyRows(
     const std::vector<RuntimeUnitStagedReadyEvidenceDTO> &runtime_units) {
   std::vector<std::string> tokens;
-  tokens.reserve(runtime_units.size() * 20U);
+  tokens.reserve(runtime_units.size() * 19U);
   for (const auto &row : runtime_units) {
     if (!row.valid()) {
       throw std::invalid_argument("runtime staged-ready row is invalid");
@@ -1916,7 +1846,6 @@ std::string EncodeRuntimeStagedReadyRows(
     tokens.push_back(std::to_string(row.report_age_ns));
     tokens.push_back(std::to_string(row.progress_age_ns));
     tokens.push_back(row.observed_runtime_contract_offer_digest.value());
-    tokens.push_back(EncodeManagedWithdrawal(row.predecessor_withdrawal));
   }
   return EncodeTokens(tokens);
 }
@@ -1948,7 +1877,7 @@ DecodeRuntimeCommandSurface(const std::string_view value) {
 
 std::vector<RuntimeUnitStagedReadyEvidenceDTO>
 DecodeRuntimeStagedReadyRows(const std::string &encoding) {
-  constexpr std::size_t kFieldsPerRow = 20U;
+  constexpr std::size_t kFieldsPerRow = 19U;
   const auto tokens =
       DecodeTokens(encoding, kMaximumRuntimeUnits * kFieldsPerRow,
                    "runtime staged-ready evidence");
@@ -2003,7 +1932,6 @@ DecodeRuntimeStagedReadyRows(const std::string &encoding) {
         ParseCanonicalUnsigned(tokens[index + 17U], "progress age"),
         core::RuntimeContractOfferDigest(tokens[index + 18U]),
     };
-    row.predecessor_withdrawal = DecodeManagedWithdrawal(tokens[index + 19U]);
     if (!row.valid()) {
       throw ManagerApplyJournalIntegrityError(
           "stored runtime staged-ready row is invalid");
@@ -2099,724 +2027,8 @@ EncodedRuntimeStagedReady EncodeRuntimeStagedReady(
   return encoded;
 }
 
-void AppendProjectionTokens(std::vector<std::string> &tokens,
-                            const ProjectionRevisionDTO &projection) {
-  if (!projection.valid()) {
-    throw std::invalid_argument("scene-stage projection is invalid");
-  }
-  ValidateBoundedIdentity(projection.retained_bundle_id.value(),
-                          "projection retained_bundle_id");
-  ValidateBoundedIdentity(projection.graph_revision.value(),
-                          "projection graph_revision");
-  ValidateDigest(projection.scene_revision.scene_id.value(),
-                 "projection scene_id");
-  ValidateDigest(projection.scene_revision.content_hash.value(),
-                 "projection scene_content_hash");
-  tokens.push_back(projection.retained_bundle_id.value());
-  tokens.push_back(projection.graph_revision.value());
-  tokens.push_back(projection.scene_revision.scene_id.value());
-  tokens.push_back(std::to_string(projection.scene_revision.revision_id));
-  tokens.push_back(projection.scene_revision.content_hash.value());
-}
-
-void AppendOptionalProjectionTokens(
-    std::vector<std::string> &tokens,
-    const std::optional<ProjectionRevisionDTO> &projection) {
-  tokens.emplace_back(projection.has_value() ? "1" : "0");
-  if (projection.has_value()) {
-    AppendProjectionTokens(tokens, *projection);
-    return;
-  }
-  for (std::size_t index = 0U; index < 5U; ++index) {
-    tokens.emplace_back();
-  }
-}
-
-ProjectionRevisionDTO
-DecodeProjectionTokens(const std::vector<std::string> &tokens,
-                       const std::size_t begin, const std::string_view label) {
-  ProjectionRevisionDTO projection{
-      RetainedBundleId(tokens.at(begin)),
-      GraphRevision(tokens.at(begin + 1U)),
-      SceneRevision{
-          SceneId(tokens.at(begin + 2U)),
-          ParseCanonicalUnsigned(tokens.at(begin + 3U), label),
-          ContentDigest(tokens.at(begin + 4U)),
-      },
-  };
-  if (!projection.valid()) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored scene-stage projection is invalid");
-  }
-  return projection;
-}
-
-std::optional<ProjectionRevisionDTO>
-DecodeOptionalProjectionTokens(const std::vector<std::string> &tokens,
-                               const std::size_t presence,
-                               const std::string_view label) {
-  if (tokens.at(presence) == "1") {
-    return DecodeProjectionTokens(tokens, presence + 1U, label);
-  }
-  if (tokens.at(presence) != "0" ||
-      std::any_of(tokens.begin() + static_cast<std::ptrdiff_t>(presence + 1U),
-                  tokens.begin() + static_cast<std::ptrdiff_t>(presence + 6U),
-                  [](const std::string &value) { return !value.empty(); })) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored optional scene-stage projection has invalid presence");
-  }
-  return std::nullopt;
-}
-
-ProjectionTransitionDisposition
-DecodeTransitionDisposition(const std::string_view value) {
-  if (value == "retained") {
-    return ProjectionTransitionDisposition::kRetained;
-  }
-  if (value == "added") {
-    return ProjectionTransitionDisposition::kAdded;
-  }
-  if (value == "removed") {
-    return ProjectionTransitionDisposition::kRemoved;
-  }
-  throw ManagerApplyJournalIntegrityError(
-      "stored projection transition disposition is invalid");
-}
-
-void AppendTransitionRowTokens(std::vector<std::string> &tokens,
-                               const ProjectionTransitionRowDTO &row) {
-  if (!row.valid()) {
-    throw std::invalid_argument("scene transition row is invalid");
-  }
-  const auto &binding = row.native_runtime_binding;
-  ValidateBoundedIdentity(binding.provider_binding_id.value(),
-                          "projection provider_binding_id");
-  ValidateBoundedIdentity(binding.provider_binding_revision.value(),
-                          "projection provider_binding_revision");
-  ValidateBoundedIdentity(binding.runtime_unit_id.value(),
-                          "projection runtime_unit_id");
-  ValidateBoundedIdentity(binding.runtime_epoch.value(),
-                          "projection runtime_epoch");
-  tokens.push_back(binding.provider_binding_id.value());
-  tokens.push_back(binding.provider_binding_revision.value());
-  tokens.push_back(binding.runtime_unit_id.value());
-  tokens.push_back(binding.runtime_epoch.value());
-  tokens.emplace_back(core::to_string(row.disposition));
-  AppendOptionalProjectionTokens(tokens, row.expected_local_active);
-  tokens.push_back(EncodeManagedWithdrawal(row.managed_withdrawal));
-}
-
-ProjectionTransitionRowDTO
-DecodeTransitionRowTokens(const std::vector<std::string> &tokens,
-                          const std::size_t begin) {
-  ProjectionTransitionRowDTO row{
-      ProjectionNativeRuntimeBindingDTO{
-          core::CapabilityProviderBindingId(tokens.at(begin)),
-          core::CapabilityProviderBindingRevision(tokens.at(begin + 1U)),
-          RuntimeUnitId(tokens.at(begin + 2U)),
-          RuntimeEpoch(tokens.at(begin + 3U)),
-      },
-      DecodeTransitionDisposition(tokens.at(begin + 4U)),
-      DecodeOptionalProjectionTokens(tokens, begin + 5U,
-                                     "transition expected active revision"),
-      DecodeManagedWithdrawal(tokens.at(begin + 11U)),
-  };
-  if (!row.valid()) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored projection transition row is invalid");
-  }
-  return row;
-}
-
-std::string
-EncodeTransitionRows(const std::vector<ProjectionTransitionRowDTO> &rows) {
-  if (rows.size() > kMaximumManagerApplySceneTransitionRows ||
-      !core::CanonicalProjectionTransitionRows(rows)) {
-    throw std::invalid_argument(
-        "scene transition rows are noncanonical or exceed their bound");
-  }
-  std::vector<std::string> tokens;
-  tokens.reserve(rows.size() * 12U);
-  for (const auto &row : rows) {
-    AppendTransitionRowTokens(tokens, row);
-  }
-  return EncodeTokens(tokens);
-}
-
-std::vector<ProjectionTransitionRowDTO>
-DecodeTransitionRows(const std::string &encoding) {
-  constexpr std::size_t kFieldsPerRow = 12U;
-  const auto tokens = DecodeTokens(
-      encoding, kMaximumManagerApplySceneTransitionRows * kFieldsPerRow,
-      "scene transition rows");
-  if (tokens.size() % kFieldsPerRow != 0U) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored scene transition tuple cardinality is invalid");
-  }
-  std::vector<ProjectionTransitionRowDTO> rows;
-  rows.reserve(tokens.size() / kFieldsPerRow);
-  for (std::size_t index = 0U; index < tokens.size(); index += kFieldsPerRow) {
-    rows.push_back(DecodeTransitionRowTokens(tokens, index));
-  }
-  if (!core::CanonicalProjectionTransitionRows(rows)) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored scene transition rows are not canonical");
-  }
-  return rows;
-}
-
-ProjectionTransitionRowEvidenceState
-DecodeTransitionRowEvidenceState(const std::string_view value) {
-  if (value == "pending") {
-    return ProjectionTransitionRowEvidenceState::kPending;
-  }
-  if (value == "staged_no_active_effect") {
-    return ProjectionTransitionRowEvidenceState::kStagedNoActiveEffect;
-  }
-  if (value == "candidate_active") {
-    return ProjectionTransitionRowEvidenceState::kCandidateActive;
-  }
-  if (value == "removed_retired") {
-    return ProjectionTransitionRowEvidenceState::kRemovedRetired;
-  }
-  if (value == "candidate_stage_discarded") {
-    return ProjectionTransitionRowEvidenceState::kCandidateStageDiscarded;
-  }
-  if (value == "predecessor_unchanged") {
-    return ProjectionTransitionRowEvidenceState::kPredecessorUnchanged;
-  }
-  if (value == "uncertain") {
-    return ProjectionTransitionRowEvidenceState::kUncertain;
-  }
-  throw ManagerApplyJournalIntegrityError(
-      "stored transition-row evidence state is invalid");
-}
-
-ProjectionHealthState
-DecodeProjectionHealthState(const std::string_view value) {
-  if (value == "uninitialized") {
-    return ProjectionHealthState::kUninitialized;
-  }
-  if (value == "healthy") {
-    return ProjectionHealthState::kHealthy;
-  }
-  if (value == "desynchronized") {
-    return ProjectionHealthState::kDesynchronized;
-  }
-  if (value == "rebuilding") {
-    return ProjectionHealthState::kRebuilding;
-  }
-  if (value == "unavailable") {
-    return ProjectionHealthState::kUnavailable;
-  }
-  throw ManagerApplyJournalIntegrityError(
-      "stored projection health state is invalid");
-}
-
-void AppendOptionalStagedCandidateTokens(
-    std::vector<std::string> &tokens,
-    const std::optional<ProjectionStagedCandidateDTO> &staged) {
-  tokens.emplace_back(staged.has_value() ? "1" : "0");
-  if (!staged.has_value()) {
-    for (std::size_t index = 0U; index < 8U; ++index) {
-      tokens.emplace_back();
-    }
-    return;
-  }
-  if (!staged->valid()) {
-    throw std::invalid_argument("projection staged candidate is invalid");
-  }
-  tokens.push_back(staged->apply_id.value());
-  tokens.push_back(std::to_string(staged->apply_generation.value()));
-  tokens.push_back(std::to_string(staged->projection_stage_generation.value()));
-  AppendProjectionTokens(tokens, staged->candidate_projection_revision);
-}
-
-std::optional<ProjectionStagedCandidateDTO>
-DecodeOptionalStagedCandidateTokens(const std::vector<std::string> &tokens,
-                                    const std::size_t presence) {
-  if (tokens.at(presence) == "0") {
-    if (std::any_of(tokens.begin() + static_cast<std::ptrdiff_t>(presence + 1U),
-                    tokens.begin() + static_cast<std::ptrdiff_t>(presence + 9U),
-                    [](const std::string &value) { return !value.empty(); })) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored staged-candidate absence carries fields");
-    }
-    return std::nullopt;
-  }
-  if (tokens.at(presence) != "1") {
-    throw ManagerApplyJournalIntegrityError(
-        "stored staged-candidate presence is invalid");
-  }
-  ProjectionStagedCandidateDTO staged{
-      ApplyId(tokens.at(presence + 1U)),
-      ApplyGeneration(ParseCanonicalUnsigned(tokens.at(presence + 2U),
-                                             "staged Apply generation")),
-      ProjectionStageGeneration(ParseCanonicalUnsigned(
-          tokens.at(presence + 3U), "projection stage generation")),
-      DecodeProjectionTokens(tokens, presence + 4U,
-                             "staged candidate scene revision"),
-  };
-  if (!staged.valid()) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored staged candidate is invalid");
-  }
-  return staged;
-}
-
-void AppendOptionalUnsignedTokens(std::vector<std::string> &tokens,
-                                  const std::optional<std::uint64_t> value) {
-  tokens.emplace_back(value.has_value() ? "1" : "0");
-  tokens.push_back(value.has_value() ? std::to_string(*value) : std::string{});
-}
-
-std::optional<std::uint64_t>
-DecodeOptionalUnsignedTokens(const std::vector<std::string> &tokens,
-                             const std::size_t presence,
-                             const std::string_view label) {
-  if (tokens.at(presence) == "1") {
-    const auto value = ParseCanonicalUnsigned(tokens.at(presence + 1U), label);
-    if (value == 0U) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored optional unsigned value is zero");
-    }
-    return value;
-  }
-  if (tokens.at(presence) != "0" || !tokens.at(presence + 1U).empty()) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored optional unsigned presence is invalid");
-  }
-  return std::nullopt;
-}
-
-void AppendOptionalDigestTokens(std::vector<std::string> &tokens,
-                                const std::optional<ContentDigest> &digest) {
-  tokens.emplace_back(digest.has_value() ? "1" : "0");
-  tokens.push_back(digest.has_value() ? digest->value() : std::string{});
-}
-
-std::optional<ContentDigest>
-DecodeOptionalDigestTokens(const std::vector<std::string> &tokens,
-                           const std::size_t presence) {
-  if (tokens.at(presence) == "1") {
-    ValidateDigest(tokens.at(presence + 1U), "projection content digest");
-    return ContentDigest(tokens.at(presence + 1U));
-  }
-  if (tokens.at(presence) != "0" || !tokens.at(presence + 1U).empty()) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored optional digest presence is invalid");
-  }
-  return std::nullopt;
-}
-
-bool WithdrawalsMatchRuntimeStage(
-    const ManagerApplySceneStageIntentDTO &intent,
-    const ManagerApplyRuntimeStagedReadyDTO &ready) {
-  for (const auto &row : intent.native_transition_rows) {
-    if (!row.managed_withdrawal)
-      continue;
-    const auto found =
-        std::find_if(ready.runtime_units.begin(), ready.runtime_units.end(),
-                     [&](const auto &runtime) {
-                       return runtime.runtime_unit_id ==
-                              row.native_runtime_binding.runtime_unit_id;
-                     });
-    if (found == ready.runtime_units.end() ||
-        found->predecessor_withdrawal != row.managed_withdrawal)
-      return false;
-  }
-  return true;
-}
-
-std::string EncodeTransitionEvidenceRows(
-    const std::vector<ProjectionTransitionRowEvidenceDTO> &rows) {
-  if (rows.size() > kMaximumManagerApplySceneTransitionRows) {
-    throw ManagerApplyJournalLimitError(
-        "scene staged evidence exceeds its transition-row bound");
-  }
-  std::vector<std::string> tokens;
-  tokens.reserve(rows.size() * 46U);
-  for (const auto &row : rows) {
-    if (!row.valid() || row.error.has_value() ||
-        (row.resulting_health && row.resulting_health->error.has_value())) {
-      throw std::invalid_argument(
-          "successful scene staged row carries invalid or error evidence");
-    }
-    AppendTransitionRowTokens(tokens, row.transition_row);
-    tokens.emplace_back(core::to_string(row.state));
-    AppendOptionalProjectionTokens(tokens,
-                                   row.acknowledged_staged_candidate_revision);
-    AppendOptionalProjectionTokens(tokens, row.observed_local_active);
-    if (!row.resulting_health) {
-      tokens.insert(tokens.end(), 21U, std::string{});
-      continue;
-    }
-    tokens.push_back(std::to_string(row.resulting_health->source_sequence));
-    tokens.emplace_back(core::to_string(row.resulting_health->state));
-    AppendOptionalProjectionTokens(
-        tokens, row.resulting_health->active_projection_revision);
-    AppendOptionalStagedCandidateTokens(tokens,
-                                        row.resulting_health->staged_candidate);
-    AppendOptionalUnsignedTokens(
-        tokens, row.resulting_health->native_projection_generation);
-    AppendOptionalDigestTokens(tokens,
-                               row.resulting_health->projection_content_digest);
-  }
-  return EncodeTokens(tokens);
-}
-
-std::vector<ProjectionTransitionRowEvidenceDTO>
-DecodeTransitionEvidenceRows(const std::string &encoding) {
-  constexpr std::size_t kFieldsPerRow = 46U;
-  const auto tokens = DecodeTokens(
-      encoding, kMaximumManagerApplySceneTransitionRows * kFieldsPerRow,
-      "scene staged transition evidence");
-  if (tokens.size() % kFieldsPerRow != 0U) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored scene staged-evidence tuple cardinality is invalid");
-  }
-  std::vector<ProjectionTransitionRowEvidenceDTO> rows;
-  rows.reserve(tokens.size() / kFieldsPerRow);
-  for (std::size_t index = 0U; index < tokens.size(); index += kFieldsPerRow) {
-    auto transition_row = DecodeTransitionRowTokens(tokens, index);
-    std::optional<ProjectionHealthDTO> health;
-    if (tokens[index + 25U].empty()) {
-      if (std::any_of(tokens.begin() + index + 25U,
-                      tokens.begin() + index + kFieldsPerRow,
-                      [](const auto &value) { return !value.empty(); }))
-        throw ManagerApplyJournalIntegrityError(
-            "absent native health has payload");
-    } else {
-      health = ProjectionHealthDTO{
-          transition_row.native_runtime_binding,
-          ParseCanonicalUnsigned(tokens[index + 25U],
-                                 "projection health source sequence"),
-          DecodeProjectionHealthState(tokens[index + 26U]),
-          DecodeOptionalProjectionTokens(tokens, index + 27U,
-                                         "health active projection revision"),
-          DecodeOptionalStagedCandidateTokens(tokens, index + 33U),
-          DecodeOptionalUnsignedTokens(tokens, index + 42U,
-                                       "native projection generation"),
-          DecodeOptionalDigestTokens(tokens, index + 44U),
-          std::nullopt,
-      };
-    }
-    ProjectionTransitionRowEvidenceDTO row{
-        std::move(transition_row),
-        DecodeTransitionRowEvidenceState(tokens[index + 12U]),
-        DecodeOptionalProjectionTokens(tokens, index + 13U,
-                                       "staged candidate acknowledgement"),
-        DecodeOptionalProjectionTokens(tokens, index + 19U,
-                                       "observed local active projection"),
-        std::move(health),
-        std::nullopt,
-    };
-    if (!row.valid()) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored scene staged transition row is invalid");
-    }
-    rows.push_back(std::move(row));
-  }
-  return rows;
-}
-
-std::string EncodeTransitionEvidence(
-    const ProjectionTransitionEvidenceDTO &evidence,
-    const ProjectionTransitionEvidenceState expected_state) {
-  if (!evidence.phase_consistent(expected_state) ||
-      evidence.error.has_value() ||
-      evidence.transition_rows.size() >
-          kMaximumManagerApplySceneTransitionRows) {
-    throw std::invalid_argument("scene staged transition evidence is invalid");
-  }
-  std::vector<std::string> tokens;
-  tokens.reserve(15U);
-  tokens.push_back(evidence.apply_id.value());
-  tokens.push_back(std::to_string(evidence.apply_generation.value()));
-  tokens.push_back(
-      std::to_string(evidence.projection_stage_generation.value()));
-  AppendProjectionTokens(tokens, evidence.predecessor_projection_revision);
-  AppendProjectionTokens(tokens, evidence.candidate_projection_revision);
-  tokens.emplace_back(core::to_string(evidence.state));
-  tokens.push_back(EncodeTransitionEvidenceRows(evidence.transition_rows));
-  return EncodeTokens(tokens);
-}
-
-ProjectionTransitionEvidenceDTO DecodeTransitionEvidence(
-    const std::string &encoding,
-    const ProjectionTransitionEvidenceState expected_state) {
-  const auto tokens = DecodeTokens(encoding, 15U, "scene staged evidence");
-  if (tokens.size() != 15U || tokens[13U] != core::to_string(expected_state)) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored scene staged evidence header is invalid");
-  }
-  ProjectionTransitionEvidenceDTO evidence{
-      ApplyId(tokens[0]),
-      ApplyGeneration(
-          ParseCanonicalUnsigned(tokens[1], "scene staged Apply generation")),
-      ProjectionStageGeneration(ParseCanonicalUnsigned(
-          tokens[2], "scene staged projection generation")),
-      DecodeProjectionTokens(tokens, 3U, "scene staged predecessor revision"),
-      DecodeProjectionTokens(tokens, 8U, "scene staged candidate revision"),
-      expected_state,
-      DecodeTransitionEvidenceRows(tokens[14U]),
-      std::nullopt,
-  };
-  if (!evidence.phase_consistent(expected_state)) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored scene staged evidence is phase-inconsistent");
-  }
-  return evidence;
-}
-
-struct EncodedSceneStageIntent final {
-  std::int64_t apply_generation;
-  std::int64_t predecessor_publication_generation;
-  std::int64_t predecessor_scene_revision_id;
-  std::string transition_rows;
-  std::string digest;
-};
-
-EncodedSceneStageIntent
-EncodeSceneStageIntent(const ManagerApplySceneStageIntentDTO &intent) {
-  if (!intent.valid()) {
-    throw std::invalid_argument("scene-stage intent is invalid");
-  }
-  EncodedSceneStageIntent encoded{
-      CheckedSigned(intent.apply_generation.value(), "apply_generation"),
-      CheckedSigned(intent.predecessor_publication_generation.value(),
-                    "predecessor_publication_generation"),
-      CheckedSigned(
-          intent.expected_active_projection_revision.scene_revision.revision_id,
-          "predecessor_scene_revision_id"),
-      EncodeTransitionRows(intent.native_transition_rows),
-      {},
-  };
-  std::string record;
-  AppendField(record, "domain", kSceneStageIntentDigestDomain);
-  AppendField(record, "runtime_staged_ready_digest",
-              intent.runtime_staged_ready_digest.value());
-  AppendField(record, "apply_id", intent.apply_id.value());
-  AppendField(record, "apply_generation",
-              std::to_string(encoded.apply_generation));
-  AppendField(record, "predecessor_publication_generation",
-              std::to_string(encoded.predecessor_publication_generation));
-  AppendField(record, "predecessor_public_pointer_digest",
-              intent.predecessor_public_pointer_digest.value());
-  const auto &predecessor = intent.expected_active_projection_revision;
-  AppendField(record, "predecessor_retained_bundle_id",
-              predecessor.retained_bundle_id.value());
-  AppendField(record, "predecessor_graph_revision",
-              predecessor.graph_revision.value());
-  AppendField(record, "predecessor_scene_id",
-              predecessor.scene_revision.scene_id.value());
-  AppendField(record, "predecessor_scene_revision_id",
-              std::to_string(encoded.predecessor_scene_revision_id));
-  AppendField(record, "predecessor_scene_content_hash",
-              predecessor.scene_revision.content_hash.value());
-  AppendField(record, "candidate_retained_bundle_id",
-              intent.candidate_retained_bundle_id.value());
-  AppendField(record, "candidate_graph_revision",
-              intent.candidate_graph_revision.value());
-  AppendField(record, "native_transition_rows_encoding",
-              encoded.transition_rows);
-  encoded.digest = RawDigest(record);
-  return encoded;
-}
-
-struct EncodedSceneStaged final {
-  std::int64_t apply_generation;
-  std::int64_t predecessor_scene_revision_id;
-  std::int64_t projection_stage_generation;
-  std::int64_t candidate_scene_revision_id;
-  std::string transition_evidence;
-  std::string digest;
-};
-
-EncodedSceneStaged EncodeSceneStaged(const ManagerApplySceneStagedDTO &staged) {
-  if (!staged.valid()) {
-    throw std::invalid_argument("scene staged evidence is invalid");
-  }
-  const auto &result = staged.staged_result;
-  const auto &predecessor = result.expected_active_projection_revision;
-  const auto &candidate = *result.candidate_projection_revision;
-  EncodedSceneStaged encoded{
-      CheckedSigned(result.apply_generation.value(), "apply_generation"),
-      CheckedSigned(predecessor.scene_revision.revision_id,
-                    "predecessor_scene_revision_id"),
-      CheckedSigned(result.projection_stage_generation->value(),
-                    "projection_stage_generation"),
-      CheckedSigned(candidate.scene_revision.revision_id,
-                    "candidate_scene_revision_id"),
-      EncodeTransitionEvidence(*result.transition_evidence,
-                               ProjectionTransitionEvidenceState::kStaged),
-      {},
-  };
-  std::string record;
-  AppendField(record, "domain", kSceneStagedEvidenceDigestDomain);
-  AppendField(record, "scene_stage_intent_digest",
-              staged.scene_stage_intent_digest.value());
-  AppendField(record, "apply_id", result.apply_id.value());
-  AppendField(record, "apply_generation",
-              std::to_string(encoded.apply_generation));
-  AppendField(record, "predecessor_retained_bundle_id",
-              predecessor.retained_bundle_id.value());
-  AppendField(record, "predecessor_graph_revision",
-              predecessor.graph_revision.value());
-  AppendField(record, "predecessor_scene_id",
-              predecessor.scene_revision.scene_id.value());
-  AppendField(record, "predecessor_scene_revision_id",
-              std::to_string(encoded.predecessor_scene_revision_id));
-  AppendField(record, "predecessor_scene_content_hash",
-              predecessor.scene_revision.content_hash.value());
-  AppendField(record, "projection_stage_generation",
-              std::to_string(encoded.projection_stage_generation));
-  AppendField(record, "candidate_retained_bundle_id",
-              candidate.retained_bundle_id.value());
-  AppendField(record, "candidate_graph_revision",
-              candidate.graph_revision.value());
-  AppendField(record, "candidate_scene_id",
-              candidate.scene_revision.scene_id.value());
-  AppendField(record, "candidate_scene_revision_id",
-              std::to_string(encoded.candidate_scene_revision_id));
-  AppendField(record, "candidate_scene_content_hash",
-              candidate.scene_revision.content_hash.value());
-  AppendField(record, "result_state", "staged");
-  AppendField(record, "transition_evidence_encoding",
-              encoded.transition_evidence);
-  encoded.digest = RawDigest(record);
-  return encoded;
-}
-
-struct EncodedActivationSelection final {
-  std::int64_t apply_generation;
-  std::int64_t predecessor_scene_revision_id;
-  std::int64_t projection_stage_generation;
-  std::int64_t candidate_scene_revision_id;
-  std::string digest;
-};
-
-EncodedActivationSelection
-EncodeActivationSelection(const ManagerApplyActivationSelectionDTO &selection) {
-  if (!selection.valid()) {
-    throw std::invalid_argument("activation selection is invalid");
-  }
-  EncodedActivationSelection encoded{
-      CheckedSigned(selection.apply_generation.value(), "apply_generation"),
-      CheckedSigned(
-          selection.predecessor_projection_revision.scene_revision.revision_id,
-          "predecessor_scene_revision_id"),
-      CheckedSigned(selection.projection_stage_generation.value(),
-                    "projection_stage_generation"),
-      CheckedSigned(
-          selection.candidate_projection_revision.scene_revision.revision_id,
-          "candidate_scene_revision_id"),
-      {},
-  };
-  std::string record;
-  AppendField(record, "domain", kActivationSelectionDigestDomain);
-  AppendField(record, "scene_staged_digest",
-              selection.scene_staged_digest.value());
-  AppendField(record, "apply_id", selection.apply_id.value());
-  AppendField(record, "apply_generation",
-              std::to_string(encoded.apply_generation));
-  const auto &predecessor = selection.predecessor_projection_revision;
-  AppendField(record, "predecessor_retained_bundle_id",
-              predecessor.retained_bundle_id.value());
-  AppendField(record, "predecessor_graph_revision",
-              predecessor.graph_revision.value());
-  AppendField(record, "predecessor_scene_id",
-              predecessor.scene_revision.scene_id.value());
-  AppendField(record, "predecessor_scene_revision_id",
-              std::to_string(encoded.predecessor_scene_revision_id));
-  AppendField(record, "predecessor_scene_content_hash",
-              predecessor.scene_revision.content_hash.value());
-  AppendField(record, "projection_stage_generation",
-              std::to_string(encoded.projection_stage_generation));
-  const auto &candidate = selection.candidate_projection_revision;
-  AppendField(record, "candidate_retained_bundle_id",
-              candidate.retained_bundle_id.value());
-  AppendField(record, "candidate_graph_revision",
-              candidate.graph_revision.value());
-  AppendField(record, "candidate_scene_id",
-              candidate.scene_revision.scene_id.value());
-  AppendField(record, "candidate_scene_revision_id",
-              std::to_string(encoded.candidate_scene_revision_id));
-  AppendField(record, "candidate_scene_content_hash",
-              candidate.scene_revision.content_hash.value());
-  encoded.digest = RawDigest(record);
-  return encoded;
-}
-
-struct EncodedSceneActivated final {
-  std::int64_t apply_generation;
-  std::int64_t predecessor_scene_revision_id;
-  std::int64_t projection_stage_generation;
-  std::int64_t candidate_scene_revision_id;
-  std::string transition_evidence;
-  std::string digest;
-};
-
-EncodedSceneActivated
-EncodeSceneActivated(const ManagerApplySceneActivatedDTO &activated) {
-  if (!activated.valid()) {
-    throw std::invalid_argument("scene activated evidence is invalid");
-  }
-  const auto &result = activated.activation_result;
-  const auto &predecessor = result.expected_active_projection_revision;
-  const auto &candidate = result.candidate_projection_revision;
-  EncodedSceneActivated encoded{
-      CheckedSigned(result.apply_generation.value(), "apply_generation"),
-      CheckedSigned(predecessor.scene_revision.revision_id,
-                    "predecessor_scene_revision_id"),
-      CheckedSigned(result.projection_stage_generation.value(),
-                    "projection_stage_generation"),
-      CheckedSigned(candidate.scene_revision.revision_id,
-                    "candidate_scene_revision_id"),
-      EncodeTransitionEvidence(
-          result.transition_evidence,
-          ProjectionTransitionEvidenceState::kActivatedAndRetired),
-      {},
-  };
-  std::string record;
-  AppendField(record, "domain", kSceneActivatedEvidenceDigestDomain);
-  AppendField(record, "activation_selection_digest",
-              activated.activation_selection_digest.value());
-  AppendField(record, "apply_id", result.apply_id.value());
-  AppendField(record, "apply_generation",
-              std::to_string(encoded.apply_generation));
-  AppendField(record, "predecessor_retained_bundle_id",
-              predecessor.retained_bundle_id.value());
-  AppendField(record, "predecessor_graph_revision",
-              predecessor.graph_revision.value());
-  AppendField(record, "predecessor_scene_id",
-              predecessor.scene_revision.scene_id.value());
-  AppendField(record, "predecessor_scene_revision_id",
-              std::to_string(encoded.predecessor_scene_revision_id));
-  AppendField(record, "predecessor_scene_content_hash",
-              predecessor.scene_revision.content_hash.value());
-  AppendField(record, "projection_stage_generation",
-              std::to_string(encoded.projection_stage_generation));
-  AppendField(record, "candidate_retained_bundle_id",
-              candidate.retained_bundle_id.value());
-  AppendField(record, "candidate_graph_revision",
-              candidate.graph_revision.value());
-  AppendField(record, "candidate_scene_id",
-              candidate.scene_revision.scene_id.value());
-  AppendField(record, "candidate_scene_revision_id",
-              std::to_string(encoded.candidate_scene_revision_id));
-  AppendField(record, "candidate_scene_content_hash",
-              candidate.scene_revision.content_hash.value());
-  AppendField(record, "result_state", "activated");
-  AppendField(record, "transition_evidence_encoding",
-              encoded.transition_evidence);
-  encoded.digest = RawDigest(record);
-  return encoded;
-}
-
 struct EncodedPrivateMaterialization final {
   std::int64_t apply_generation;
-  std::int64_t projection_stage_generation;
   std::int64_t candidate_scene_revision_id;
   std::int64_t retained_bundle_canonical_byte_size;
   std::string digest;
@@ -2831,8 +2043,6 @@ EncodedPrivateMaterialization EncodePrivateMaterialization(
   EncodedPrivateMaterialization encoded{
       CheckedSigned(materialization.apply_generation.value(),
                     "apply_generation"),
-      CheckedSigned(materialization.projection_stage_generation.value(),
-                    "projection_stage_generation"),
       CheckedSigned(materialization.candidate_projection_revision.scene_revision
                         .revision_id,
                     "candidate_scene_revision_id"),
@@ -2842,13 +2052,11 @@ EncodedPrivateMaterialization EncodePrivateMaterialization(
   };
   std::string record;
   AppendField(record, "domain", kPrivateMaterializationDigestDomain);
-  AppendField(record, "scene_activated_digest",
-              materialization.scene_activated_digest.value());
+  AppendField(record, "authoritative_scene_snapshot_digest",
+              materialization.authoritative_scene_snapshot_digest.value());
   AppendField(record, "apply_id", materialization.apply_id.value());
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
-  AppendField(record, "projection_stage_generation",
-              std::to_string(encoded.projection_stage_generation));
   const auto &candidate = materialization.candidate_projection_revision;
   AppendField(record, "candidate_retained_bundle_id",
               candidate.retained_bundle_id.value());
@@ -2868,111 +2076,8 @@ EncodedPrivateMaterialization EncodePrivateMaterialization(
   return encoded;
 }
 
-ObsoleteManagedCommandSurfaceDisposition
-DecodeObsoleteCommandSurfaceDisposition(const std::string_view value) {
-  if (value == "retired") {
-    return ObsoleteManagedCommandSurfaceDisposition::kRetired;
-  }
-  if (value == "already_absent") {
-    return ObsoleteManagedCommandSurfaceDisposition::kAlreadyAbsent;
-  }
-  if (value == "nonselectable") {
-    return ObsoleteManagedCommandSurfaceDisposition::kNonselectable;
-  }
-  throw ManagerApplyJournalIntegrityError(
-      "stored obsolete command-surface disposition is invalid");
-}
-
-std::string EncodeObsoleteCommandSurfaces(
-    const std::vector<ObsoleteManagedCommandSurfaceEvidenceDTO> &rows) {
-  if (rows.size() > kMaximumObsoleteManagedCommandSurfaces) {
-    throw ManagerApplyJournalLimitError(
-        "obsolete command-surface evidence exceeds its fixed bound");
-  }
-  std::vector<std::string> tokens;
-  tokens.reserve(rows.size() * 6U);
-  for (const auto &row : rows) {
-    if (!row.valid()) {
-      throw std::invalid_argument(
-          "obsolete command-surface evidence row is invalid");
-    }
-    ValidateBoundedIdentity(row.runtime_unit_id.value(), "runtime_unit_id");
-    ValidateBoundedIdentity(row.runtime_epoch.value(), "runtime_epoch");
-    ValidateDigest(row.product_identity.value(), "product_identity");
-    ValidateDigest(row.configuration_identity.value(),
-                   "configuration_identity");
-    tokens.push_back(row.runtime_unit_id.value());
-    tokens.push_back(row.runtime_epoch.value());
-    tokens.push_back(row.product_identity.value());
-    tokens.push_back(row.configuration_identity.value());
-    tokens.push_back(std::to_string(row.source_report_sequence));
-    tokens.emplace_back(ToString(row.disposition));
-  }
-  return EncodeTokens(tokens);
-}
-
-std::vector<ObsoleteManagedCommandSurfaceEvidenceDTO>
-DecodeObsoleteCommandSurfaces(const std::string &encoding) {
-  constexpr std::size_t kFieldsPerRow = 6U;
-  const auto tokens = DecodeTokens(
-      encoding, kMaximumObsoleteManagedCommandSurfaces * kFieldsPerRow,
-      "obsolete command-surface evidence");
-  if (tokens.size() % kFieldsPerRow != 0U) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored obsolete command-surface tuple cardinality is invalid");
-  }
-  std::vector<ObsoleteManagedCommandSurfaceEvidenceDTO> rows;
-  rows.reserve(tokens.size() / kFieldsPerRow);
-  for (std::size_t index = 0U; index < tokens.size(); index += kFieldsPerRow) {
-    ObsoleteManagedCommandSurfaceEvidenceDTO row{
-        RuntimeUnitId(tokens[index]),
-        RuntimeEpoch(tokens[index + 1U]),
-        ContentDigest(tokens[index + 2U]),
-        ContentDigest(tokens[index + 3U]),
-        ParseCanonicalUnsigned(tokens[index + 4U], "source_report_sequence"),
-        DecodeObsoleteCommandSurfaceDisposition(tokens[index + 5U]),
-    };
-    if (!row.valid()) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored obsolete command-surface evidence row is invalid");
-    }
-    rows.push_back(std::move(row));
-  }
-  return rows;
-}
-
-struct EncodedRetiredCommandSurfaces final {
-  std::int64_t apply_generation;
-  std::string command_surfaces;
-  std::string digest;
-};
-
-EncodedRetiredCommandSurfaces EncodeRetiredCommandSurfaces(
-    const ManagerApplyObsoleteCommandSurfacesRetiredDTO &retired) {
-  if (!retired.valid()) {
-    throw std::invalid_argument(
-        "obsolete command-surface retirement evidence is invalid");
-  }
-  EncodedRetiredCommandSurfaces encoded{
-      CheckedSigned(retired.apply_generation.value(), "apply_generation"),
-      EncodeObsoleteCommandSurfaces(retired.command_surfaces),
-      {},
-  };
-  std::string record;
-  AppendField(record, "domain", kRetiredCommandSurfacesDigestDomain);
-  AppendField(record, "private_materialization_content_digest",
-              retired.private_materialization_content_digest.value());
-  AppendField(record, "apply_id", retired.apply_id.value());
-  AppendField(record, "apply_generation",
-              std::to_string(encoded.apply_generation));
-  AppendField(record, "command_surfaces_encoding", encoded.command_surfaces);
-  encoded.digest = RawDigest(record);
-  return encoded;
-}
-
 struct EncodedPublicationReceipt final {
   std::int64_t apply_generation;
-  std::int64_t projection_stage_generation;
   std::int64_t candidate_scene_revision_id;
   std::int64_t expected_previous_publication_generation;
   std::int64_t publication_generation;
@@ -2993,8 +2098,6 @@ EncodePublicationReceipt(const ManagerApplyPublicationReceiptDTO &publication) {
   }
   EncodedPublicationReceipt encoded{
       CheckedSigned(transaction->apply_generation.value(), "apply_generation"),
-      CheckedSigned(transaction->projection_stage_generation.value(),
-                    "projection_stage_generation"),
       CheckedSigned(receipt.request.candidate_projection_revision.scene_revision
                         .revision_id,
                     "candidate_scene_revision_id"),
@@ -3007,15 +2110,11 @@ EncodePublicationReceipt(const ManagerApplyPublicationReceiptDTO &publication) {
   };
   std::string record;
   AppendField(record, "domain", kPublicationReceiptDigestDomain);
-  AppendField(
-      record, "retired_command_surfaces_evidence_digest",
-      publication.obsolete_managed_command_surfaces_retired_evidence_digest
-          .value());
+  AppendField(record, "private_materialization_content_digest",
+              publication.private_materialization_content_digest.value());
   AppendField(record, "apply_id", transaction->apply_id.value());
   AppendField(record, "apply_generation",
               std::to_string(encoded.apply_generation));
-  AppendField(record, "projection_stage_generation",
-              std::to_string(encoded.projection_stage_generation));
   const auto &candidate = receipt.request.candidate_projection_revision;
   AppendField(record, "candidate_retained_bundle_id",
               candidate.retained_bundle_id.value());
@@ -3029,180 +2128,10 @@ EncodePublicationReceipt(const ManagerApplyPublicationReceiptDTO &publication) {
               candidate.scene_revision.content_hash.value());
   AppendField(record, "expected_previous_publication_generation",
               std::to_string(encoded.expected_previous_publication_generation));
-  AppendField(record, "private_materialization_content_digest",
-              receipt.request.private_materialization_content_digest.value());
   AppendField(record, "publication_generation",
               std::to_string(encoded.publication_generation));
   AppendField(record, "durable_public_pointer_content_digest",
               receipt.durable_public_pointer_content_digest.value());
-  encoded.digest = RawDigest(record);
-  return encoded;
-}
-
-std::string
-EncodeProjectionHealthRows(const std::vector<ProjectionHealthDTO> &rows) {
-  if (rows.size() > kMaximumManagerApplySceneTransitionRows) {
-    throw ManagerApplyJournalLimitError(
-        "candidate aggregate health exceeds its fixed bound");
-  }
-  std::vector<std::string> tokens;
-  tokens.reserve(rows.size() * 25U);
-  for (const auto &health : rows) {
-    if (!health.valid() || health.error.has_value()) {
-      throw std::invalid_argument("candidate projection health is invalid");
-    }
-    const auto &binding = health.native_runtime_binding;
-    tokens.push_back(binding.provider_binding_id.value());
-    tokens.push_back(binding.provider_binding_revision.value());
-    tokens.push_back(binding.runtime_unit_id.value());
-    tokens.push_back(binding.runtime_epoch.value());
-    tokens.push_back(std::to_string(health.source_sequence));
-    tokens.emplace_back(core::to_string(health.state));
-    AppendOptionalProjectionTokens(tokens, health.active_projection_revision);
-    AppendOptionalStagedCandidateTokens(tokens, health.staged_candidate);
-    AppendOptionalUnsignedTokens(tokens, health.native_projection_generation);
-    AppendOptionalDigestTokens(tokens, health.projection_content_digest);
-  }
-  return EncodeTokens(tokens);
-}
-
-std::vector<ProjectionHealthDTO>
-DecodeProjectionHealthRows(const std::string &encoding) {
-  constexpr std::size_t kFieldsPerRow = 25U;
-  const auto tokens = DecodeTokens(
-      encoding, kMaximumManagerApplySceneTransitionRows * kFieldsPerRow,
-      "candidate aggregate health");
-  if (tokens.size() % kFieldsPerRow != 0U) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored candidate-health tuple cardinality is invalid");
-  }
-  std::vector<ProjectionHealthDTO> rows;
-  rows.reserve(tokens.size() / kFieldsPerRow);
-  for (std::size_t index = 0U; index < tokens.size(); index += kFieldsPerRow) {
-    ProjectionHealthDTO health{
-        ProjectionNativeRuntimeBindingDTO{
-            core::CapabilityProviderBindingId(tokens[index]),
-            core::CapabilityProviderBindingRevision(tokens[index + 1U]),
-            RuntimeUnitId(tokens[index + 2U]),
-            RuntimeEpoch(tokens[index + 3U]),
-        },
-        ParseCanonicalUnsigned(tokens[index + 4U],
-                               "projection health source sequence"),
-        DecodeProjectionHealthState(tokens[index + 5U]),
-        DecodeOptionalProjectionTokens(tokens, index + 6U,
-                                       "health active projection revision"),
-        DecodeOptionalStagedCandidateTokens(tokens, index + 12U),
-        DecodeOptionalUnsignedTokens(tokens, index + 21U,
-                                     "native projection generation"),
-        DecodeOptionalDigestTokens(tokens, index + 23U),
-        std::nullopt,
-    };
-    if (!health.valid()) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored candidate projection health is invalid");
-    }
-    rows.push_back(std::move(health));
-  }
-  return rows;
-}
-
-std::string EncodeAggregateHealth(const ProjectionAggregateHealthDTO &health) {
-  const auto *source = std::get_if<NamedApplyProjectionSetSourceDTO>(
-      &health.required_native_set_source);
-  if (source == nullptr || !health.valid() || health.error.has_value()) {
-    throw std::invalid_argument(
-        "named-Apply candidate aggregate health is invalid");
-  }
-  std::vector<std::string> tokens;
-  tokens.reserve(10U);
-  tokens.push_back(source->apply_id.value());
-  tokens.push_back(std::to_string(source->apply_generation.value()));
-  tokens.push_back(std::to_string(source->projection_stage_generation.value()));
-  AppendProjectionTokens(tokens, source->candidate_projection_revision);
-  tokens.emplace_back(core::to_string(health.state));
-  tokens.push_back(EncodeProjectionHealthRows(health.native_projection_health));
-  return EncodeTokens(tokens);
-}
-
-ProjectionAggregateHealthDTO
-DecodeAggregateHealth(const std::string &encoding) {
-  const auto tokens = DecodeTokens(encoding, 10U, "candidate aggregate health");
-  if (tokens.size() != 10U) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored candidate aggregate-health header is invalid");
-  }
-  ProjectionAggregateHealthDTO health{
-      NamedApplyProjectionSetSourceDTO{
-          ApplyId(tokens[0]),
-          ApplyGeneration(
-              ParseCanonicalUnsigned(tokens[1], "health Apply generation")),
-          ProjectionStageGeneration(ParseCanonicalUnsigned(
-              tokens[2], "health projection stage generation")),
-          DecodeProjectionTokens(tokens, 3U, "health candidate revision"),
-      },
-      DecodeProjectionHealthState(tokens[8]),
-      DecodeProjectionHealthRows(tokens[9]),
-      std::nullopt,
-  };
-  if (!health.valid()) {
-    throw ManagerApplyJournalIntegrityError(
-        "stored candidate aggregate health is invalid");
-  }
-  return health;
-}
-
-struct EncodedSceneFinalized final {
-  std::int64_t apply_generation;
-  std::int64_t projection_stage_generation;
-  std::int64_t candidate_scene_revision_id;
-  std::string transition_evidence;
-  std::string aggregate_health;
-  std::string digest;
-};
-
-EncodedSceneFinalized
-EncodeSceneFinalized(const ManagerApplySceneFinalizedDTO &finalized) {
-  if (!finalized.valid()) {
-    throw std::invalid_argument("scene Finalize evidence is invalid");
-  }
-  const auto &result = finalized.finalized_result;
-  EncodedSceneFinalized encoded{
-      CheckedSigned(result.apply_generation.value(), "apply_generation"),
-      CheckedSigned(result.projection_stage_generation.value(),
-                    "projection_stage_generation"),
-      CheckedSigned(
-          result.candidate_projection_revision.scene_revision.revision_id,
-          "candidate_scene_revision_id"),
-      EncodeTransitionEvidence(result.transition_evidence,
-                               ProjectionTransitionEvidenceState::kFinalized),
-      EncodeAggregateHealth(result.candidate_aggregate_health),
-      {},
-  };
-  std::string record;
-  AppendField(record, "domain", kSceneFinalizedEvidenceDigestDomain);
-  AppendField(record, "publication_receipt_digest",
-              finalized.publication_receipt_digest.value());
-  AppendField(record, "apply_id", result.apply_id.value());
-  AppendField(record, "apply_generation",
-              std::to_string(encoded.apply_generation));
-  AppendField(record, "projection_stage_generation",
-              std::to_string(encoded.projection_stage_generation));
-  const auto &candidate = result.candidate_projection_revision;
-  AppendField(record, "candidate_retained_bundle_id",
-              candidate.retained_bundle_id.value());
-  AppendField(record, "candidate_graph_revision",
-              candidate.graph_revision.value());
-  AppendField(record, "candidate_scene_id",
-              candidate.scene_revision.scene_id.value());
-  AppendField(record, "candidate_scene_revision_id",
-              std::to_string(encoded.candidate_scene_revision_id));
-  AppendField(record, "candidate_scene_content_hash",
-              candidate.scene_revision.content_hash.value());
-  AppendField(record, "result_state", "finalized");
-  AppendField(record, "transition_evidence_encoding",
-              encoded.transition_evidence);
-  AppendField(record, "candidate_aggregate_health_encoding",
-              encoded.aggregate_health);
   encoded.digest = RawDigest(record);
   return encoded;
 }
@@ -3277,32 +2206,17 @@ void ValidateApplyJournalMetadata(sqlite3 *database, const CellId &cell_id) {
           static_cast<std::int64_t>(kMaximumManagerApplyIntents) ||
       row.Integer(13) !=
           static_cast<std::int64_t>(kMaximumRuntimeStagedReadySets) ||
-      row.Integer(14) !=
-          static_cast<std::int64_t>(kMaximumManagerApplySceneStageIntents) ||
-      row.Integer(15) !=
-          static_cast<std::int64_t>(kMaximumManagerApplySceneStagedRecords) ||
-      row.Integer(16) !=
-          static_cast<std::int64_t>(kMaximumManagerApplyActivationSelections) ||
-      row.Integer(17) != static_cast<std::int64_t>(
-                             kMaximumManagerApplySceneActivatedRecords) ||
-      row.Integer(18) != static_cast<std::int64_t>(
+      row.Integer(14) != static_cast<std::int64_t>(
                              kMaximumManagerApplyPrivateMaterializations) ||
-      row.Integer(19) !=
-          static_cast<std::int64_t>(
-              kMaximumManagerApplyRetiredCommandSurfaceRecords) ||
-      row.Integer(20) !=
+      row.Integer(15) !=
           static_cast<std::int64_t>(kMaximumManagerApplyPublicationReceipts) ||
-      row.Integer(21) != static_cast<std::int64_t>(
-                             kMaximumManagerApplySceneFinalizedRecords) ||
-      row.Integer(22) !=
+      row.Integer(16) !=
           static_cast<std::int64_t>(kMaximumManagerApplyFenceReleaseIntents) ||
-      row.Integer(23) !=
+      row.Integer(17) !=
           static_cast<std::int64_t>(kMaximumManagerApplyFenceReleasedRecords) ||
-      row.Integer(24) !=
+      row.Integer(18) !=
           static_cast<std::int64_t>(kMaximumManagerApplyTerminalOutcomes) ||
-      row.Integer(25) !=
-          static_cast<std::int64_t>(kMaximumManagerApplySceneTransitionRows) ||
-      row.Integer(26) != kMaximumManagerApplyJournalDatabasePageImageBytes) {
+      row.Integer(19) != kMaximumManagerApplyJournalDatabasePageImageBytes) {
     throw ManagerApplyJournalIntegrityError(
         "Apply-journal resource-limit metadata mismatch");
   }
@@ -3368,7 +2282,10 @@ bool ManagerApplyPreparedActivationDTO::valid() const noexcept {
          !deployment_artifact_id.empty() &&
          core::IsExactLowercaseSha256Digest(deployment_revision.value()) &&
          core::IsExactLowercaseSha256Digest(program_binding_id.value()) &&
-         core::IsExactLowercaseSha256Digest(prepared_activation_id.value());
+         core::IsExactLowercaseSha256Digest(prepared_activation_id.value()) &&
+         !canonical_receipt_json.empty() &&
+         canonical_receipt_json.size() <=
+             kMaximumManagerApplyPreparedReceiptBytes;
 }
 
 const char *ToString(const ManagerApplyPhase phase) noexcept {
@@ -3381,10 +2298,6 @@ const char *ToString(const ManagerApplyPhase phase) noexcept {
     return "fence_accepted";
   case ManagerApplyPhase::kRuntimeConverged:
     return "runtime_converged";
-  case ManagerApplyPhase::kSceneStaged:
-    return "scene_staged";
-  case ManagerApplyPhase::kSceneActivated:
-    return "scene_activated";
   case ManagerApplyPhase::kComposed:
     return "composed";
   case ManagerApplyPhase::kPublished:
@@ -3405,10 +2318,6 @@ ManagerApplyProgressDTO DeriveManagerApplyProgress(
     return {ManagerApplyPhase::kSettled,
             status.fence_released->fence_released_digest};
   }
-  if (status.scene_finalized.has_value()) {
-    return {ManagerApplyPhase::kPublished,
-            status.scene_finalized->scene_finalized_digest};
-  }
   if (status.publication_receipt.has_value()) {
     return {ManagerApplyPhase::kPublished,
             status.publication_receipt->publication_receipt_digest};
@@ -3417,14 +2326,6 @@ ManagerApplyProgressDTO DeriveManagerApplyProgress(
     return {ManagerApplyPhase::kComposed,
             status.private_materialization
                 ->private_materialization_content_digest};
-  }
-  if (status.scene_activated.has_value()) {
-    return {ManagerApplyPhase::kSceneActivated,
-            status.scene_activated->scene_activated_digest};
-  }
-  if (status.scene_staged.has_value()) {
-    return {ManagerApplyPhase::kSceneStaged,
-            status.scene_staged->scene_staged_digest};
   }
   if (status.latest_runtime_staged_ready.has_value()) {
     return {ManagerApplyPhase::kRuntimeConverged,
@@ -3644,16 +2545,12 @@ public:
           "maximum_fence_domains,maximum_fence_bindings,"
           "maximum_fence_resources,maximum_runtime_convergence_intents,"
           "maximum_runtime_staged_ready_sets,"
-          "maximum_scene_stage_intents,maximum_scene_staged_records,"
-          "maximum_activation_selections,maximum_scene_activated_records,"
           "maximum_private_materializations,"
-          "maximum_retired_command_surface_records,"
-          "maximum_publication_receipts,maximum_scene_finalized_records,"
+          "maximum_publication_receipts,"
           "maximum_fence_release_intents,maximum_fence_released_records,"
           "maximum_terminal_outcomes,"
-          "maximum_scene_transition_rows,"
           "maximum_main_database_page_image_bytes"
-          ") VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+          ") VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
       metadata.Bind(1, kManagerApplyJournalSchemaId);
       metadata.Bind(2, kManagerApplyJournalSchemaVersion);
       metadata.Bind(3, RawDigest(detail::kEmbeddedManagerApplyJournalSchema));
@@ -3674,31 +2571,17 @@ public:
       metadata.Bind(12, static_cast<std::int64_t>(kMaximumManagerApplyIntents));
       metadata.Bind(13,
                     static_cast<std::int64_t>(kMaximumRuntimeStagedReadySets));
-      metadata.Bind(
-          14, static_cast<std::int64_t>(kMaximumManagerApplySceneStageIntents));
-      metadata.Bind(15, static_cast<std::int64_t>(
-                            kMaximumManagerApplySceneStagedRecords));
-      metadata.Bind(16, static_cast<std::int64_t>(
-                            kMaximumManagerApplyActivationSelections));
-      metadata.Bind(17, static_cast<std::int64_t>(
-                            kMaximumManagerApplySceneActivatedRecords));
-      metadata.Bind(18, static_cast<std::int64_t>(
+      metadata.Bind(14, static_cast<std::int64_t>(
                             kMaximumManagerApplyPrivateMaterializations));
-      metadata.Bind(19, static_cast<std::int64_t>(
-                            kMaximumManagerApplyRetiredCommandSurfaceRecords));
-      metadata.Bind(20, static_cast<std::int64_t>(
+      metadata.Bind(15, static_cast<std::int64_t>(
                             kMaximumManagerApplyPublicationReceipts));
-      metadata.Bind(21, static_cast<std::int64_t>(
-                            kMaximumManagerApplySceneFinalizedRecords));
-      metadata.Bind(22, static_cast<std::int64_t>(
+      metadata.Bind(16, static_cast<std::int64_t>(
                             kMaximumManagerApplyFenceReleaseIntents));
-      metadata.Bind(23, static_cast<std::int64_t>(
+      metadata.Bind(17, static_cast<std::int64_t>(
                             kMaximumManagerApplyFenceReleasedRecords));
       metadata.Bind(
-          24, static_cast<std::int64_t>(kMaximumManagerApplyTerminalOutcomes));
-      metadata.Bind(25, static_cast<std::int64_t>(
-                            kMaximumManagerApplySceneTransitionRows));
-      metadata.Bind(26, kMaximumManagerApplyJournalDatabasePageImageBytes);
+          18, static_cast<std::int64_t>(kMaximumManagerApplyTerminalOutcomes));
+      metadata.Bind(19, kMaximumManagerApplyJournalDatabasePageImageBytes);
       static_cast<void>(metadata.Step());
     } else if (!existing.contains({"table", "apply_journal_metadata"})) {
       throw ManagerApplyJournalIntegrityError(
@@ -3753,14 +2636,9 @@ public:
       VerifiedRecordMap<PersistedManagerApplyFenceAcceptance>,
       VerifiedRecordMap<PersistedManagerApplyRuntimeConvergenceIntent>,
       VerifiedRecordMap<PersistedManagerApplyRuntimeStagedReady>,
-      VerifiedRecordMap<PersistedManagerApplySceneStageIntent>,
-      VerifiedRecordMap<PersistedManagerApplySceneStaged>,
-      VerifiedRecordMap<PersistedManagerApplyActivationSelection>,
-      VerifiedRecordMap<PersistedManagerApplySceneActivated>,
       VerifiedRecordMap<PersistedManagerApplyPrivateMaterialization>,
       VerifiedRecordMap<PersistedManagerApplyObsoleteCommandSurfacesRetired>,
       VerifiedRecordMap<PersistedManagerApplyPublicationReceipt>,
-      VerifiedRecordMap<PersistedManagerApplySceneFinalized>,
       VerifiedRecordMap<PersistedManagerApplyFenceReleaseIntent>,
       VerifiedRecordMap<PersistedManagerApplyFenceReleased>,
       VerifiedRecordMap<PersistedManagerApplyTerminalOutcome>>;
@@ -3814,14 +2692,8 @@ public:
         FenceAcceptanceLocked(apply_id, apply_generation),
         RuntimeConvergenceIntentLocked(apply_id, apply_generation),
         LatestRuntimeStagedReadyLocked(apply_id, apply_generation),
-        SceneStageIntentLocked(apply_id, apply_generation),
-        SceneStagedLocked(apply_id, apply_generation),
-        ActivationSelectionLocked(apply_id, apply_generation),
-        SceneActivatedLocked(apply_id, apply_generation),
         PrivateMaterializationLocked(apply_id, apply_generation),
-        RetiredCommandSurfacesLocked(apply_id, apply_generation),
         PublicationReceiptLocked(apply_id, apply_generation),
-        SceneFinalizedLocked(apply_id, apply_generation),
         FenceReleaseIntentLocked(apply_id, apply_generation),
         FenceReleasedLocked(apply_id, apply_generation),
         TerminalOutcomeLocked(apply_id, apply_generation),
@@ -3840,6 +2712,7 @@ public:
         "candidate_retained_bundle_id,candidate_graph_revision,"
         "captured_input_digest,deployment_artifact_id,deployment_revision,"
         "program_binding_id,prepared_activation_id,"
+        "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,intent_digest "
         "FROM manager_apply_intents "
         "WHERE apply_id=? AND apply_generation=?");
@@ -3866,9 +2739,10 @@ public:
     const auto deployment_revision = row.Text(15);
     const auto program_binding_id = row.Text(16);
     const auto prepared_activation_id = row.Text(17);
+    const auto prepared_activation_receipt_json = row.Text(18);
     std::optional<core::AdmissionGeneration> expected_admission_generation;
-    if (!row.IsNull(18)) {
-      const auto stored_admission_generation = row.Integer(18);
+    if (!row.IsNull(19)) {
+      const auto stored_admission_generation = row.Integer(19);
       if (stored_admission_generation <= 0) {
         throw ManagerApplyJournalIntegrityError(
             "stored Apply admission generation is invalid");
@@ -3876,8 +2750,8 @@ public:
       expected_admission_generation.emplace(
           static_cast<std::uint64_t>(stored_admission_generation));
     }
-    const auto parent_authoring_claim = row.OptionalBlob(19);
-    const auto stored_digest = row.Text(20);
+    const auto parent_authoring_claim = row.OptionalBlob(20);
+    const auto stored_digest = row.Text(21);
     if (row.Step()) {
       throw ManagerApplyJournalIntegrityError(
           "Apply intent identity is not unique");
@@ -3914,6 +2788,7 @@ public:
             core::DeploymentRevision(deployment_revision),
             core::ProgramBindingId(program_binding_id),
             ContentDigest(prepared_activation_id),
+            prepared_activation_receipt_json,
         },
         expected_admission_generation,
         parent_authoring_claim.has_value()
@@ -4457,432 +3332,6 @@ public:
     return RuntimeStagedReadyLocked(apply_id, apply_generation, generation);
   }
 
-  std::optional<PersistedManagerApplySceneStageIntent>
-  SceneStageIntentLocked(const ApplyId &apply_id,
-                         const std::int64_t apply_generation) const {
-    return ReadVerifiedRecord<PersistedManagerApplySceneStageIntent>(
-        {apply_id, apply_generation, 0}, [&] {
-          return SceneStageIntentUncachedLocked(apply_id, apply_generation);
-        });
-  }
-
-  std::optional<PersistedManagerApplySceneStageIntent>
-  SceneStageIntentUncachedLocked(const ApplyId &apply_id,
-                                 const std::int64_t apply_generation) const {
-    Statement row(database_,
-                  "SELECT runtime_staged_ready_digest,"
-                  "predecessor_publication_generation,"
-                  "predecessor_public_pointer_digest,"
-                  "predecessor_retained_bundle_id,predecessor_graph_revision,"
-                  "predecessor_scene_id,predecessor_scene_revision_id,"
-                  "predecessor_scene_content_hash,candidate_retained_bundle_id,"
-                  "candidate_graph_revision,native_transition_rows_encoding,"
-                  "scene_stage_intent_digest "
-                  "FROM manager_apply_scene_stage_intents "
-                  "WHERE apply_id=? AND apply_generation=?");
-    row.Bind(1, apply_id.value());
-    row.Bind(2, apply_generation);
-    if (!row.Step()) {
-      return std::nullopt;
-    }
-    const auto staged_ready_digest = row.Text(0);
-    const auto publication_generation = row.Integer(1);
-    const auto public_pointer_digest = row.Text(2);
-    const auto predecessor_bundle = row.Text(3);
-    const auto predecessor_graph = row.Text(4);
-    const auto predecessor_scene_id = row.Text(5);
-    const auto predecessor_scene_revision = row.Integer(6);
-    const auto predecessor_scene_digest = row.Text(7);
-    const auto candidate_bundle = row.Text(8);
-    const auto candidate_graph = row.Text(9);
-    const auto transition_rows = row.Text(10);
-    const auto stored_digest = row.Text(11);
-    if (row.Step() || apply_generation <= 0 || publication_generation <= 0 ||
-        predecessor_scene_revision <= 0) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored scene-stage intent is structurally invalid");
-    }
-    try {
-      ManagerApplySceneStageIntentDTO intent{
-          apply_id,
-          ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
-          ContentDigest(staged_ready_digest),
-          core::ActiveBundlePublicationGeneration(
-              static_cast<std::uint64_t>(publication_generation)),
-          ContentDigest(public_pointer_digest),
-          ProjectionRevisionDTO{
-              RetainedBundleId(predecessor_bundle),
-              GraphRevision(predecessor_graph),
-              SceneRevision{
-                  SceneId(predecessor_scene_id),
-                  static_cast<std::uint64_t>(predecessor_scene_revision),
-                  ContentDigest(predecessor_scene_digest),
-              },
-          },
-          RetainedBundleId(candidate_bundle),
-          GraphRevision(candidate_graph),
-          DecodeTransitionRows(transition_rows),
-      };
-      const auto encoded = EncodeSceneStageIntent(intent);
-      const auto staged = RuntimeStagedReadyByDigestLocked(
-          apply_id, apply_generation, intent.runtime_staged_ready_digest);
-      const auto parent = IntentLocked(apply_id, apply_generation);
-      if (encoded.digest != stored_digest || !staged.has_value() ||
-          !WithdrawalsMatchRuntimeStage(intent, staged->staged_ready) ||
-          staged->staged_ready.predecessor_publication_generation !=
-              intent.predecessor_publication_generation ||
-          staged->staged_ready.predecessor_public_pointer_digest !=
-              intent.predecessor_public_pointer_digest ||
-          !parent.has_value() ||
-          parent->intent.expected_active_projection_revision !=
-              intent.expected_active_projection_revision ||
-          parent->intent.candidate_retained_bundle_id !=
-              intent.candidate_retained_bundle_id ||
-          parent->intent.candidate_graph_revision !=
-              intent.candidate_graph_revision) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored scene-stage intent is not bound to its exact "
-            "staged-ready/Apply records");
-      }
-      return PersistedManagerApplySceneStageIntent{
-          std::move(intent), ContentDigest(stored_digest)};
-    } catch (const ManagerApplyJournalIntegrityError &) {
-      throw;
-    } catch (const std::exception &) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored scene-stage intent contains an invalid value");
-    }
-  }
-
-  std::optional<PersistedManagerApplySceneStaged>
-  SceneStagedLocked(const ApplyId &apply_id,
-                    const std::int64_t apply_generation) const {
-    return ReadVerifiedRecord<PersistedManagerApplySceneStaged>(
-        {apply_id, apply_generation, 0},
-        [&] { return SceneStagedUncachedLocked(apply_id, apply_generation); });
-  }
-
-  std::optional<PersistedManagerApplySceneStaged>
-  SceneStagedUncachedLocked(const ApplyId &apply_id,
-                            const std::int64_t apply_generation) const {
-    Statement row(database_,
-                  "SELECT scene_stage_intent_digest,"
-                  "predecessor_retained_bundle_id,predecessor_graph_revision,"
-                  "predecessor_scene_id,predecessor_scene_revision_id,"
-                  "predecessor_scene_content_hash,projection_stage_generation,"
-                  "candidate_retained_bundle_id,candidate_graph_revision,"
-                  "candidate_scene_id,candidate_scene_revision_id,"
-                  "candidate_scene_content_hash,result_state,"
-                  "transition_evidence_encoding,scene_staged_digest "
-                  "FROM manager_apply_scene_staged_records "
-                  "WHERE apply_id=? AND apply_generation=?");
-    row.Bind(1, apply_id.value());
-    row.Bind(2, apply_generation);
-    if (!row.Step()) {
-      return std::nullopt;
-    }
-    const auto stage_intent_digest = row.Text(0);
-    const auto predecessor_bundle = row.Text(1);
-    const auto predecessor_graph = row.Text(2);
-    const auto predecessor_scene_id = row.Text(3);
-    const auto predecessor_scene_revision = row.Integer(4);
-    const auto predecessor_scene_digest = row.Text(5);
-    const auto stage_generation = row.Integer(6);
-    const auto candidate_bundle = row.Text(7);
-    const auto candidate_graph = row.Text(8);
-    const auto candidate_scene_id = row.Text(9);
-    const auto candidate_scene_revision = row.Integer(10);
-    const auto candidate_scene_digest = row.Text(11);
-    const auto result_state = row.Text(12);
-    const auto transition_evidence = row.Text(13);
-    const auto stored_digest = row.Text(14);
-    if (row.Step() || apply_generation <= 0 ||
-        predecessor_scene_revision <= 0 || stage_generation <= 0 ||
-        candidate_scene_revision <= 0 || result_state != "staged") {
-      throw ManagerApplyJournalIntegrityError(
-          "stored scene staged evidence is structurally invalid");
-    }
-    try {
-      const ProjectionRevisionDTO predecessor{
-          RetainedBundleId(predecessor_bundle),
-          GraphRevision(predecessor_graph),
-          SceneRevision{
-              SceneId(predecessor_scene_id),
-              static_cast<std::uint64_t>(predecessor_scene_revision),
-              ContentDigest(predecessor_scene_digest),
-          },
-      };
-      const ProjectionRevisionDTO candidate{
-          RetainedBundleId(candidate_bundle),
-          GraphRevision(candidate_graph),
-          SceneRevision{
-              SceneId(candidate_scene_id),
-              static_cast<std::uint64_t>(candidate_scene_revision),
-              ContentDigest(candidate_scene_digest),
-          },
-      };
-      ManagerApplySceneStagedDTO staged{
-          ContentDigest(stage_intent_digest),
-          ProjectionApplyStageResultDTO{
-              apply_id,
-              ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
-              predecessor,
-              candidate,
-              ProjectionStageGeneration(
-                  static_cast<std::uint64_t>(stage_generation)),
-              DecodeTransitionEvidence(
-                  transition_evidence,
-                  ProjectionTransitionEvidenceState::kStaged),
-              ProjectionApplyStageResultState::kStaged,
-              std::nullopt,
-          },
-      };
-      const auto encoded = EncodeSceneStaged(staged);
-      const auto intent = SceneStageIntentLocked(apply_id, apply_generation);
-      if (encoded.digest != stored_digest || !intent.has_value() ||
-          intent->scene_stage_intent_digest !=
-              staged.scene_stage_intent_digest ||
-          staged.staged_result.expected_active_projection_revision !=
-              intent->scene_stage_intent.expected_active_projection_revision ||
-          candidate.retained_bundle_id !=
-              intent->scene_stage_intent.candidate_retained_bundle_id ||
-          candidate.graph_revision !=
-              intent->scene_stage_intent.candidate_graph_revision ||
-          staged.staged_result.transition_evidence->transition_rows.size() !=
-              intent->scene_stage_intent.native_transition_rows.size()) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored scene staged evidence is not bound to its exact "
-            "scene-stage intent");
-      }
-      for (std::size_t index = 0U;
-           index < intent->scene_stage_intent.native_transition_rows.size();
-           ++index) {
-        if (staged.staged_result.transition_evidence->transition_rows[index]
-                .transition_row !=
-            intent->scene_stage_intent.native_transition_rows[index]) {
-          throw ManagerApplyJournalIntegrityError(
-              "stored scene staged transition set differs from its intent");
-        }
-      }
-      return PersistedManagerApplySceneStaged{std::move(staged),
-                                              ContentDigest(stored_digest)};
-    } catch (const ManagerApplyJournalIntegrityError &) {
-      throw;
-    } catch (const std::exception &) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored scene staged evidence contains an invalid value");
-    }
-  }
-
-  std::optional<PersistedManagerApplyActivationSelection>
-  ActivationSelectionLocked(const ApplyId &apply_id,
-                            const std::int64_t apply_generation) const {
-    return ReadVerifiedRecord<PersistedManagerApplyActivationSelection>(
-        {apply_id, apply_generation, 0}, [&] {
-          return ActivationSelectionUncachedLocked(apply_id, apply_generation);
-        });
-  }
-
-  std::optional<PersistedManagerApplyActivationSelection>
-  ActivationSelectionUncachedLocked(const ApplyId &apply_id,
-                                    const std::int64_t apply_generation) const {
-    Statement row(
-        database_,
-        "SELECT scene_staged_digest,predecessor_retained_bundle_id,"
-        "predecessor_graph_revision,predecessor_scene_id,"
-        "predecessor_scene_revision_id,predecessor_scene_content_hash,"
-        "projection_stage_generation,candidate_retained_bundle_id,"
-        "candidate_graph_revision,candidate_scene_id,"
-        "candidate_scene_revision_id,candidate_scene_content_hash,"
-        "activation_selection_digest "
-        "FROM manager_apply_activation_selections "
-        "WHERE apply_id=? AND apply_generation=?");
-    row.Bind(1, apply_id.value());
-    row.Bind(2, apply_generation);
-    if (!row.Step()) {
-      return std::nullopt;
-    }
-    const auto scene_staged_digest = row.Text(0);
-    const auto predecessor_bundle = row.Text(1);
-    const auto predecessor_graph = row.Text(2);
-    const auto predecessor_scene_id = row.Text(3);
-    const auto predecessor_scene_revision = row.Integer(4);
-    const auto predecessor_scene_digest = row.Text(5);
-    const auto stage_generation = row.Integer(6);
-    const auto candidate_bundle = row.Text(7);
-    const auto candidate_graph = row.Text(8);
-    const auto candidate_scene_id = row.Text(9);
-    const auto candidate_scene_revision = row.Integer(10);
-    const auto candidate_scene_digest = row.Text(11);
-    const auto stored_digest = row.Text(12);
-    if (row.Step() || apply_generation <= 0 ||
-        predecessor_scene_revision <= 0 || stage_generation <= 0 ||
-        candidate_scene_revision <= 0) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored activation selection is structurally invalid");
-    }
-    try {
-      ManagerApplyActivationSelectionDTO selection{
-          ContentDigest(scene_staged_digest),
-          apply_id,
-          ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
-          ProjectionRevisionDTO{
-              RetainedBundleId(predecessor_bundle),
-              GraphRevision(predecessor_graph),
-              SceneRevision{
-                  SceneId(predecessor_scene_id),
-                  static_cast<std::uint64_t>(predecessor_scene_revision),
-                  ContentDigest(predecessor_scene_digest),
-              },
-          },
-          ProjectionStageGeneration(
-              static_cast<std::uint64_t>(stage_generation)),
-          ProjectionRevisionDTO{
-              RetainedBundleId(candidate_bundle),
-              GraphRevision(candidate_graph),
-              SceneRevision{
-                  SceneId(candidate_scene_id),
-                  static_cast<std::uint64_t>(candidate_scene_revision),
-                  ContentDigest(candidate_scene_digest),
-              },
-          },
-      };
-      const auto encoded = EncodeActivationSelection(selection);
-      const auto staged = SceneStagedLocked(apply_id, apply_generation);
-      if (encoded.digest != stored_digest || !staged.has_value() ||
-          staged->scene_staged_digest != selection.scene_staged_digest ||
-          staged->scene_staged.staged_result
-                  .expected_active_projection_revision !=
-              selection.predecessor_projection_revision ||
-          *staged->scene_staged.staged_result.projection_stage_generation !=
-              selection.projection_stage_generation ||
-          *staged->scene_staged.staged_result.candidate_projection_revision !=
-              selection.candidate_projection_revision) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored activation selection is not bound to exact staged "
-            "evidence");
-      }
-      return PersistedManagerApplyActivationSelection{
-          std::move(selection), ContentDigest(stored_digest)};
-    } catch (const ManagerApplyJournalIntegrityError &) {
-      throw;
-    } catch (const std::exception &) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored activation selection contains an invalid value");
-    }
-  }
-
-  std::optional<PersistedManagerApplySceneActivated>
-  SceneActivatedLocked(const ApplyId &apply_id,
-                       const std::int64_t apply_generation) const {
-    return ReadVerifiedRecord<PersistedManagerApplySceneActivated>(
-        {apply_id, apply_generation, 0}, [&] {
-          return SceneActivatedUncachedLocked(apply_id, apply_generation);
-        });
-  }
-
-  std::optional<PersistedManagerApplySceneActivated>
-  SceneActivatedUncachedLocked(const ApplyId &apply_id,
-                               const std::int64_t apply_generation) const {
-    Statement row(database_,
-                  "SELECT activation_selection_digest,"
-                  "predecessor_retained_bundle_id,predecessor_graph_revision,"
-                  "predecessor_scene_id,predecessor_scene_revision_id,"
-                  "predecessor_scene_content_hash,projection_stage_generation,"
-                  "candidate_retained_bundle_id,candidate_graph_revision,"
-                  "candidate_scene_id,candidate_scene_revision_id,"
-                  "candidate_scene_content_hash,result_state,"
-                  "transition_evidence_encoding,scene_activated_digest "
-                  "FROM manager_apply_scene_activated_records "
-                  "WHERE apply_id=? AND apply_generation=?");
-    row.Bind(1, apply_id.value());
-    row.Bind(2, apply_generation);
-    if (!row.Step()) {
-      return std::nullopt;
-    }
-    const auto selection_digest = row.Text(0);
-    const auto predecessor_bundle = row.Text(1);
-    const auto predecessor_graph = row.Text(2);
-    const auto predecessor_scene_id = row.Text(3);
-    const auto predecessor_scene_revision = row.Integer(4);
-    const auto predecessor_scene_digest = row.Text(5);
-    const auto stage_generation = row.Integer(6);
-    const auto candidate_bundle = row.Text(7);
-    const auto candidate_graph = row.Text(8);
-    const auto candidate_scene_id = row.Text(9);
-    const auto candidate_scene_revision = row.Integer(10);
-    const auto candidate_scene_digest = row.Text(11);
-    const auto result_state = row.Text(12);
-    const auto transition_evidence = row.Text(13);
-    const auto stored_digest = row.Text(14);
-    if (row.Step() || apply_generation <= 0 ||
-        predecessor_scene_revision <= 0 || stage_generation <= 0 ||
-        candidate_scene_revision <= 0 || result_state != "activated") {
-      throw ManagerApplyJournalIntegrityError(
-          "stored scene activation evidence is structurally invalid");
-    }
-    try {
-      const ProjectionRevisionDTO predecessor{
-          RetainedBundleId(predecessor_bundle),
-          GraphRevision(predecessor_graph),
-          SceneRevision{
-              SceneId(predecessor_scene_id),
-              static_cast<std::uint64_t>(predecessor_scene_revision),
-              ContentDigest(predecessor_scene_digest),
-          },
-      };
-      const ProjectionRevisionDTO candidate{
-          RetainedBundleId(candidate_bundle),
-          GraphRevision(candidate_graph),
-          SceneRevision{
-              SceneId(candidate_scene_id),
-              static_cast<std::uint64_t>(candidate_scene_revision),
-              ContentDigest(candidate_scene_digest),
-          },
-      };
-      ManagerApplySceneActivatedDTO activated{
-          ContentDigest(selection_digest),
-          ProjectionApplyActivationResultDTO{
-              apply_id,
-              ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
-              predecessor,
-              ProjectionStageGeneration(
-                  static_cast<std::uint64_t>(stage_generation)),
-              candidate,
-              ProjectionApplyActivationResultState::kActivated,
-              candidate,
-              DecodeTransitionEvidence(
-                  transition_evidence,
-                  ProjectionTransitionEvidenceState::kActivatedAndRetired),
-              std::nullopt,
-          },
-      };
-      const auto encoded = EncodeSceneActivated(activated);
-      const auto selection =
-          ActivationSelectionLocked(apply_id, apply_generation);
-      if (encoded.digest != stored_digest || !selection.has_value() ||
-          selection->activation_selection_digest !=
-              activated.activation_selection_digest ||
-          selection->activation_selection.predecessor_projection_revision !=
-              predecessor ||
-          selection->activation_selection.projection_stage_generation !=
-              activated.activation_result.projection_stage_generation ||
-          selection->activation_selection.candidate_projection_revision !=
-              candidate) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored scene activation is not bound to exact selection");
-      }
-      return PersistedManagerApplySceneActivated{std::move(activated),
-                                                 ContentDigest(stored_digest)};
-    } catch (const ManagerApplyJournalIntegrityError &) {
-      throw;
-    } catch (const std::exception &error) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored scene activation evidence contains an invalid value: " +
-          std::string(error.what()));
-    }
-  }
-
   std::optional<PersistedManagerApplyPrivateMaterialization>
   PrivateMaterializationLocked(const ApplyId &apply_id,
                                const std::int64_t apply_generation) const {
@@ -4897,7 +3346,7 @@ public:
   PrivateMaterializationUncachedLocked(
       const ApplyId &apply_id, const std::int64_t apply_generation) const {
     Statement row(database_,
-                  "SELECT scene_activated_digest,projection_stage_generation,"
+                  "SELECT authoritative_scene_snapshot_digest,"
                   "candidate_retained_bundle_id,candidate_graph_revision,"
                   "candidate_scene_id,candidate_scene_revision_id,"
                   "candidate_scene_content_hash,"
@@ -4911,28 +3360,25 @@ public:
     if (!row.Step()) {
       return std::nullopt;
     }
-    const auto activated_digest = row.Text(0);
-    const auto stage_generation = row.Integer(1);
-    const auto candidate_bundle = row.Text(2);
-    const auto candidate_graph = row.Text(3);
-    const auto candidate_scene_id = row.Text(4);
-    const auto candidate_scene_revision = row.Integer(5);
-    const auto candidate_scene_digest = row.Text(6);
-    const auto canonical_digest = row.Text(7);
-    const auto canonical_size = row.Integer(8);
-    const auto stored_digest = row.Text(9);
-    if (row.Step() || apply_generation <= 0 || stage_generation <= 0 ||
+    const auto snapshot_digest = row.Text(0);
+    const auto candidate_bundle = row.Text(1);
+    const auto candidate_graph = row.Text(2);
+    const auto candidate_scene_id = row.Text(3);
+    const auto candidate_scene_revision = row.Integer(4);
+    const auto candidate_scene_digest = row.Text(5);
+    const auto canonical_digest = row.Text(6);
+    const auto canonical_size = row.Integer(7);
+    const auto stored_digest = row.Text(8);
+    if (row.Step() || apply_generation <= 0 ||
         candidate_scene_revision <= 0 || canonical_size <= 0) {
       throw ManagerApplyJournalIntegrityError(
           "stored private materialization is structurally invalid");
     }
     try {
       ManagerApplyPrivateMaterializationDTO materialization{
-          ContentDigest(activated_digest),
+          ContentDigest(snapshot_digest),
           apply_id,
           ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
-          ProjectionStageGeneration(
-              static_cast<std::uint64_t>(stage_generation)),
           ProjectionRevisionDTO{
               RetainedBundleId(candidate_bundle),
               GraphRevision(candidate_graph),
@@ -4946,19 +3392,19 @@ public:
           static_cast<std::uint64_t>(canonical_size),
       };
       const auto encoded = EncodePrivateMaterialization(materialization);
-      const auto activated = SceneActivatedLocked(apply_id, apply_generation);
-      if (encoded.digest != stored_digest || !activated.has_value() ||
-          activated->scene_activated_digest !=
-              materialization.scene_activated_digest ||
-          activated->scene_activated.activation_result
-                  .projection_stage_generation !=
-              materialization.projection_stage_generation ||
-          activated->scene_activated.activation_result
-                  .candidate_projection_revision !=
-              materialization.candidate_projection_revision) {
+      const auto intent = IntentLocked(apply_id, apply_generation);
+      if (encoded.digest != stored_digest || !intent.has_value() ||
+          materialization.authoritative_scene_snapshot_digest !=
+              materialization.candidate_projection_revision.scene_revision
+                  .content_hash ||
+          intent->intent.candidate_retained_bundle_id !=
+              materialization.candidate_projection_revision
+                  .retained_bundle_id ||
+          intent->intent.candidate_graph_revision !=
+              materialization.candidate_projection_revision.graph_revision) {
         throw ManagerApplyJournalIntegrityError(
-            "stored private materialization is not bound to exact activated "
-            "evidence");
+            "stored private materialization is not bound to its exact Apply "
+            "and authoritative Scene snapshot");
       }
       return PersistedManagerApplyPrivateMaterialization{
           std::move(materialization), ContentDigest(stored_digest)};
@@ -4967,65 +3413,6 @@ public:
     } catch (const std::exception &) {
       throw ManagerApplyJournalIntegrityError(
           "stored private materialization contains an invalid value");
-    }
-  }
-
-  std::optional<PersistedManagerApplyObsoleteCommandSurfacesRetired>
-  RetiredCommandSurfacesLocked(const ApplyId &apply_id,
-                               const std::int64_t apply_generation) const {
-    return ReadVerifiedRecord<
-        PersistedManagerApplyObsoleteCommandSurfacesRetired>(
-        {apply_id, apply_generation, 0}, [&] {
-          return RetiredCommandSurfacesUncachedLocked(apply_id,
-                                                      apply_generation);
-        });
-  }
-
-  std::optional<PersistedManagerApplyObsoleteCommandSurfacesRetired>
-  RetiredCommandSurfacesUncachedLocked(
-      const ApplyId &apply_id, const std::int64_t apply_generation) const {
-    Statement row(
-        database_,
-        "SELECT private_materialization_content_digest,"
-        "command_surfaces_encoding,retired_command_surfaces_evidence_digest "
-        "FROM manager_apply_retired_command_surfaces "
-        "WHERE apply_id=? AND apply_generation=?");
-    row.Bind(1, apply_id.value());
-    row.Bind(2, apply_generation);
-    if (!row.Step()) {
-      return std::nullopt;
-    }
-    const auto materialization_digest = row.Text(0);
-    const auto command_surfaces = row.Text(1);
-    const auto stored_digest = row.Text(2);
-    if (row.Step() || apply_generation <= 0) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored retired command surfaces are structurally invalid");
-    }
-    try {
-      ManagerApplyObsoleteCommandSurfacesRetiredDTO retired{
-          ContentDigest(materialization_digest),
-          apply_id,
-          ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
-          DecodeObsoleteCommandSurfaces(command_surfaces),
-      };
-      const auto encoded = EncodeRetiredCommandSurfaces(retired);
-      const auto materialization =
-          PrivateMaterializationLocked(apply_id, apply_generation);
-      if (encoded.digest != stored_digest || !materialization.has_value() ||
-          materialization->private_materialization_content_digest !=
-              retired.private_materialization_content_digest) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored retired command surfaces are not bound to the exact "
-            "private materialization");
-      }
-      return PersistedManagerApplyObsoleteCommandSurfacesRetired{
-          std::move(retired), ContentDigest(stored_digest)};
-    } catch (const ManagerApplyJournalIntegrityError &) {
-      throw;
-    } catch (const std::exception &) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored retired command surfaces contain an invalid value");
     }
   }
 
@@ -5043,8 +3430,7 @@ public:
                                    const std::int64_t apply_generation) const {
     Statement row(
         database_,
-        "SELECT retired_command_surfaces_evidence_digest,"
-        "projection_stage_generation,candidate_retained_bundle_id,"
+        "SELECT candidate_retained_bundle_id,"
         "candidate_graph_revision,candidate_scene_id,"
         "candidate_scene_revision_id,candidate_scene_content_hash,"
         "expected_previous_publication_generation,"
@@ -5057,19 +3443,17 @@ public:
     if (!row.Step()) {
       return std::nullopt;
     }
-    const auto retired_digest = row.Text(0);
-    const auto stage_generation = row.Integer(1);
-    const auto candidate_bundle = row.Text(2);
-    const auto candidate_graph = row.Text(3);
-    const auto candidate_scene_id = row.Text(4);
-    const auto candidate_scene_revision = row.Integer(5);
-    const auto candidate_scene_digest = row.Text(6);
-    const auto previous_generation = row.Integer(7);
-    const auto materialization_digest = row.Text(8);
-    const auto publication_generation = row.Integer(9);
-    const auto public_pointer_digest = row.Text(10);
-    const auto stored_digest = row.Text(11);
-    if (row.Step() || apply_generation <= 0 || stage_generation <= 0 ||
+    const auto candidate_bundle = row.Text(0);
+    const auto candidate_graph = row.Text(1);
+    const auto candidate_scene_id = row.Text(2);
+    const auto candidate_scene_revision = row.Integer(3);
+    const auto candidate_scene_digest = row.Text(4);
+    const auto previous_generation = row.Integer(5);
+    const auto materialization_digest = row.Text(6);
+    const auto publication_generation = row.Integer(7);
+    const auto public_pointer_digest = row.Text(8);
+    const auto stored_digest = row.Text(9);
+    if (row.Step() || apply_generation <= 0 ||
         candidate_scene_revision <= 0 || previous_generation <= 0 ||
         previous_generation == std::numeric_limits<std::int64_t>::max() ||
         publication_generation <= 0 ||
@@ -5088,15 +3472,13 @@ public:
           },
       };
       ManagerApplyPublicationReceiptDTO publication{
-          ContentDigest(retired_digest),
+          ContentDigest(materialization_digest),
           ActiveBundlePublicationReceiptDTO{
               ActiveBundlePublicationRequestDTO{
                   NamedApplyPublicationTransactionDTO{
                       apply_id,
                       ApplyGeneration(
                           static_cast<std::uint64_t>(apply_generation)),
-                      ProjectionStageGeneration(
-                          static_cast<std::uint64_t>(stage_generation)),
                   },
                   candidate,
                   candidate.retained_bundle_id,
@@ -5104,7 +3486,6 @@ public:
                   ActiveBundlePublicationGeneration(
                       static_cast<std::uint64_t>(previous_generation)),
                   ContentDigest(materialization_digest),
-                  ContentDigest(retired_digest),
               },
               ActiveBundlePublicationGeneration(
                   static_cast<std::uint64_t>(publication_generation)),
@@ -5112,30 +3493,11 @@ public:
           },
       };
       const auto encoded = EncodePublicationReceipt(publication);
-      const auto retired =
-          RetiredCommandSurfacesLocked(apply_id, apply_generation);
-      const auto selection =
-          ActivationSelectionLocked(apply_id, apply_generation);
-      const auto stage_intent =
-          SceneStageIntentLocked(apply_id, apply_generation);
-      if (encoded.digest != stored_digest || !retired.has_value() ||
-          retired->obsolete_managed_command_surfaces_retired_evidence_digest !=
-              publication
-                  .obsolete_managed_command_surfaces_retired_evidence_digest ||
-          retired->retired_command_surfaces
-                  .private_materialization_content_digest !=
-              publication.publication_receipt.request
-                  .private_materialization_content_digest ||
-          !selection.has_value() ||
-          selection->activation_selection.projection_stage_generation !=
-              ProjectionStageGeneration(
-                  static_cast<std::uint64_t>(stage_generation)) ||
-          selection->activation_selection.candidate_projection_revision !=
-              candidate ||
-          !stage_intent.has_value() ||
-          stage_intent->scene_stage_intent.predecessor_publication_generation !=
-              ActiveBundlePublicationGeneration(
-                  static_cast<std::uint64_t>(previous_generation))) {
+      const auto materialization =
+          PrivateMaterializationLocked(apply_id, apply_generation);
+      if (encoded.digest != stored_digest || !materialization.has_value() ||
+          materialization->private_materialization_content_digest !=
+              publication.private_materialization_content_digest) {
         throw ManagerApplyJournalIntegrityError(
             "stored Apply publication is not bound to its exact predecessor "
             "records");
@@ -5147,121 +3509,6 @@ public:
     } catch (const std::exception &) {
       throw ManagerApplyJournalIntegrityError(
           "stored Apply publication contains an invalid value");
-    }
-  }
-
-  std::optional<PersistedManagerApplySceneFinalized>
-  SceneFinalizedLocked(const ApplyId &apply_id,
-                       const std::int64_t apply_generation) const {
-    return ReadVerifiedRecord<PersistedManagerApplySceneFinalized>(
-        {apply_id, apply_generation, 0}, [&] {
-          return SceneFinalizedUncachedLocked(apply_id, apply_generation);
-        });
-  }
-
-  std::optional<PersistedManagerApplySceneFinalized>
-  SceneFinalizedUncachedLocked(const ApplyId &apply_id,
-                               const std::int64_t apply_generation) const {
-    Statement row(
-        database_,
-        "SELECT publication_receipt_digest,projection_stage_generation,"
-        "candidate_retained_bundle_id,candidate_graph_revision,"
-        "candidate_scene_id,candidate_scene_revision_id,"
-        "candidate_scene_content_hash,transition_evidence_encoding,"
-        "candidate_aggregate_health_encoding,scene_finalized_digest "
-        "FROM manager_apply_scene_finalized_records "
-        "WHERE apply_id=? AND apply_generation=?");
-    row.Bind(1, apply_id.value());
-    row.Bind(2, apply_generation);
-    if (!row.Step()) {
-      return std::nullopt;
-    }
-    const auto publication_digest = row.Text(0);
-    const auto stage_generation = row.Integer(1);
-    const auto candidate_bundle = row.Text(2);
-    const auto candidate_graph = row.Text(3);
-    const auto candidate_scene_id = row.Text(4);
-    const auto candidate_scene_revision = row.Integer(5);
-    const auto candidate_scene_digest = row.Text(6);
-    const auto transition_evidence = row.Text(7);
-    const auto aggregate_health = row.Text(8);
-    const auto stored_digest = row.Text(9);
-    if (row.Step() || apply_generation <= 0 || stage_generation <= 0 ||
-        candidate_scene_revision <= 0) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored scene Finalize evidence is structurally invalid");
-    }
-    try {
-      const auto publication =
-          PublicationReceiptLocked(apply_id, apply_generation);
-      if (!publication.has_value() || publication->publication_receipt_digest !=
-                                          ContentDigest(publication_digest)) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored scene Finalize evidence lacks its exact publication");
-      }
-      const ProjectionRevisionDTO candidate{
-          RetainedBundleId(candidate_bundle),
-          GraphRevision(candidate_graph),
-          SceneRevision{
-              SceneId(candidate_scene_id),
-              static_cast<std::uint64_t>(candidate_scene_revision),
-              ContentDigest(candidate_scene_digest),
-          },
-      };
-      ManagerApplySceneFinalizedDTO finalized{
-          ContentDigest(publication_digest),
-          ProjectionApplyFinalizeResultDTO{
-              apply_id,
-              ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
-              ProjectionStageGeneration(
-                  static_cast<std::uint64_t>(stage_generation)),
-              candidate,
-              publication->publication.publication_receipt,
-              ProjectionApplyFinalizeResultState::kFinalized,
-              candidate,
-              DecodeTransitionEvidence(
-                  transition_evidence,
-                  ProjectionTransitionEvidenceState::kFinalized),
-              DecodeAggregateHealth(aggregate_health),
-              std::nullopt,
-          },
-      };
-      const auto encoded = EncodeSceneFinalized(finalized);
-      const auto activated = SceneActivatedLocked(apply_id, apply_generation);
-      if (encoded.digest != stored_digest || !activated.has_value() ||
-          activated->scene_activated.activation_result
-                  .projection_stage_generation !=
-              finalized.finalized_result.projection_stage_generation ||
-          activated->scene_activated.activation_result
-                  .candidate_projection_revision != candidate ||
-          activated->scene_activated.activation_result.transition_evidence
-                  .transition_rows.size() !=
-              finalized.finalized_result.transition_evidence.transition_rows
-                  .size()) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored scene Finalize evidence is not bound to exact activation");
-      }
-      for (std::size_t index = 0U;
-           index < finalized.finalized_result.transition_evidence
-                       .transition_rows.size();
-           ++index) {
-        if (activated->scene_activated.activation_result.transition_evidence
-                .transition_rows[index]
-                .transition_row !=
-            finalized.finalized_result.transition_evidence
-                .transition_rows[index]
-                .transition_row) {
-          throw ManagerApplyJournalIntegrityError(
-              "stored finalized transition set differs from activation");
-        }
-      }
-      return PersistedManagerApplySceneFinalized{std::move(finalized),
-                                                 ContentDigest(stored_digest)};
-    } catch (const ManagerApplyJournalIntegrityError &) {
-      throw;
-    } catch (const std::exception &) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored scene Finalize evidence contains an invalid value");
     }
   }
 
@@ -5278,7 +3525,7 @@ public:
   FenceReleaseIntentUncachedLocked(const ApplyId &apply_id,
                                    const std::int64_t apply_generation) const {
     Statement row(database_,
-                  "SELECT scene_finalized_digest,fence_acceptance_digest,"
+                  "SELECT scene_completion_digest,fence_acceptance_digest,"
                   "release_request_encoding,fence_release_intent_digest "
                   "FROM manager_apply_fence_release_intents "
                   "WHERE apply_id=? AND apply_generation=?");
@@ -5287,7 +3534,7 @@ public:
     if (!row.Step()) {
       return std::nullopt;
     }
-    const auto scene_finalized_digest = row.Text(0);
+    const auto scene_completion_digest = row.Text(0);
     const auto fence_acceptance_digest = row.Text(1);
     const auto request_encoding = row.Text(2);
     const auto stored_digest = row.Text(3);
@@ -5297,13 +3544,12 @@ public:
     }
     try {
       ManagerApplyFenceReleaseIntentDTO intent{
-          ContentDigest(scene_finalized_digest),
+          ContentDigest(scene_completion_digest),
           ContentDigest(fence_acceptance_digest),
           DecodeFenceReleaseRequest(request_encoding),
       };
       const auto encoded = EncodeFenceReleaseIntent(intent);
       const auto &evidence = intent.release_request.reconciliation_evidence;
-      const auto finalized = SceneFinalizedLocked(apply_id, apply_generation);
       const auto acceptance = FenceAcceptanceLocked(apply_id, apply_generation);
       const auto publication =
           PublicationReceiptLocked(apply_id, apply_generation);
@@ -5311,8 +3557,9 @@ public:
           evidence.owner_transaction.apply_id != apply_id ||
           evidence.owner_transaction.apply_generation.value() !=
               static_cast<std::uint64_t>(apply_generation) ||
-          !finalized.has_value() ||
-          finalized->scene_finalized_digest != intent.scene_finalized_digest ||
+          !publication.has_value() ||
+          publication->publication_receipt_digest !=
+              intent.scene_completion_digest ||
           !acceptance.has_value() ||
           acceptance->acceptance_digest != intent.fence_acceptance_digest ||
           acceptance->accepted_fence.configuration_fence_id !=
@@ -5321,17 +3568,16 @@ public:
               evidence.configuration_fence_generation ||
           acceptance->accepted_fence.captured_scope !=
               evidence.reconciled_scope ||
-          finalized->scene_finalized.finalized_result
+          publication->publication.publication_receipt.request
                   .candidate_projection_revision !=
               evidence.active_projection_revision ||
-          !publication.has_value() ||
           publication->publication.publication_receipt.publication_generation !=
               evidence.active_publication_generation ||
           publication->publication.publication_receipt
                   .durable_public_pointer_content_digest !=
               evidence.active_public_pointer_digest) {
         throw ManagerApplyJournalIntegrityError(
-            "stored fence-release intent is not bound to exact finalized, "
+            "stored fence-release intent is not bound to exact completed, "
             "fence, and publication evidence");
       }
       return PersistedManagerApplyFenceReleaseIntent{
@@ -5415,7 +3661,7 @@ public:
   TerminalOutcomeUncachedLocked(const ApplyId &apply_id,
                                 const std::int64_t apply_generation) const {
     Statement row(database_,
-                  "SELECT fence_released_digest,scene_finalized_digest,"
+                  "SELECT fence_released_digest,scene_completion_digest,"
                   "publication_receipt_digest,candidate_retained_bundle_id,"
                   "candidate_graph_revision,candidate_scene_id,"
                   "candidate_scene_revision_id,candidate_scene_content_hash,"
@@ -5461,7 +3707,7 @@ public:
             },
         };
         outcome.publication_receipt_digest = ContentDigest(row.Text(2));
-        outcome.scene_finalized_digest = ContentDigest(row.Text(1));
+        outcome.scene_completion_digest = ContentDigest(row.Text(1));
         outcome.fence_released_digest = ContentDigest(row.Text(0));
       } else {
         const auto disposition = ParseEffectDisposition(row.Text(12));
@@ -5489,18 +3735,16 @@ public:
       }
       if (outcome.state == ManagerApplyTerminalOutcomeState::kSucceeded) {
         const auto released = FenceReleasedLocked(apply_id, apply_generation);
-        const auto finalized = SceneFinalizedLocked(apply_id, apply_generation);
         const auto publication =
             PublicationReceiptLocked(apply_id, apply_generation);
         if (!released.has_value() ||
             released->fence_released_digest != outcome.fence_released_digest ||
-            !finalized.has_value() ||
-            finalized->scene_finalized_digest !=
-                outcome.scene_finalized_digest ||
-            finalized->scene_finalized.finalized_result
+            !publication.has_value() ||
+            publication->publication_receipt_digest !=
+                outcome.scene_completion_digest ||
+            publication->publication.publication_receipt.request
                     .candidate_projection_revision !=
                 outcome.candidate_projection_revision ||
-            !publication.has_value() ||
             publication->publication_receipt_digest !=
                 outcome.publication_receipt_digest) {
           throw ManagerApplyJournalIntegrityError(
@@ -5617,26 +3861,11 @@ public:
     const auto runtime_staged_ready_count = ScalarInteger(
         database_,
         "SELECT COUNT(*) FROM manager_apply_runtime_staged_ready_sets");
-    const auto scene_stage_intent_count = ScalarInteger(
-        database_, "SELECT COUNT(*) FROM manager_apply_scene_stage_intents");
-    const auto scene_staged_count = ScalarInteger(
-        database_, "SELECT COUNT(*) FROM manager_apply_scene_staged_records");
-    const auto activation_selection_count = ScalarInteger(
-        database_, "SELECT COUNT(*) FROM manager_apply_activation_selections");
-    const auto scene_activated_count = ScalarInteger(
-        database_,
-        "SELECT COUNT(*) FROM manager_apply_scene_activated_records");
     const auto private_materialization_count = ScalarInteger(
         database_,
         "SELECT COUNT(*) FROM manager_apply_private_materializations");
-    const auto retired_command_surfaces_count = ScalarInteger(
-        database_,
-        "SELECT COUNT(*) FROM manager_apply_retired_command_surfaces");
     const auto publication_receipt_count = ScalarInteger(
         database_, "SELECT COUNT(*) FROM manager_apply_publication_receipts");
-    const auto scene_finalized_count = ScalarInteger(
-        database_,
-        "SELECT COUNT(*) FROM manager_apply_scene_finalized_records");
     const auto fence_release_intent_count = ScalarInteger(
         database_, "SELECT COUNT(*) FROM manager_apply_fence_release_intents");
     const auto fence_released_count = ScalarInteger(
@@ -5645,11 +3874,8 @@ public:
         database_, "SELECT COUNT(*) FROM manager_apply_terminal_outcomes");
     if (affected_scope_count < 0 || attempt_count < 0 || acceptance_count < 0 ||
         runtime_intent_count < 0 || runtime_staged_ready_count < 0 ||
-        scene_stage_intent_count < 0 || scene_staged_count < 0 ||
-        activation_selection_count < 0 || scene_activated_count < 0 ||
-        private_materialization_count < 0 ||
-        retired_command_surfaces_count < 0 || publication_receipt_count < 0 ||
-        scene_finalized_count < 0 || fence_release_intent_count < 0 ||
+        private_materialization_count < 0 || publication_receipt_count < 0 ||
+        fence_release_intent_count < 0 ||
         fence_released_count < 0 || terminal_outcome_count < 0 ||
         affected_scope_count >
             static_cast<std::int64_t>(kMaximumManagerApplyAffectedScopes) ||
@@ -5661,28 +3887,12 @@ public:
             static_cast<std::int64_t>(kMaximumManagerApplyIntents) ||
         runtime_staged_ready_count >
             static_cast<std::int64_t>(kMaximumRuntimeStagedReadySets) ||
-        scene_stage_intent_count >
-            static_cast<std::int64_t>(kMaximumManagerApplySceneStageIntents) ||
-        scene_staged_count >
-            static_cast<std::int64_t>(kMaximumManagerApplySceneStagedRecords) ||
-        activation_selection_count >
-            static_cast<std::int64_t>(
-                kMaximumManagerApplyActivationSelections) ||
-        scene_activated_count >
-            static_cast<std::int64_t>(
-                kMaximumManagerApplySceneActivatedRecords) ||
         private_materialization_count >
             static_cast<std::int64_t>(
                 kMaximumManagerApplyPrivateMaterializations) ||
-        retired_command_surfaces_count >
-            static_cast<std::int64_t>(
-                kMaximumManagerApplyRetiredCommandSurfaceRecords) ||
         publication_receipt_count >
             static_cast<std::int64_t>(
                 kMaximumManagerApplyPublicationReceipts) ||
-        scene_finalized_count >
-            static_cast<std::int64_t>(
-                kMaximumManagerApplySceneFinalizedRecords) ||
         fence_release_intent_count >
             static_cast<std::int64_t>(
                 kMaximumManagerApplyFenceReleaseIntents) ||
@@ -5692,15 +3902,9 @@ public:
             static_cast<std::int64_t>(kMaximumManagerApplyTerminalOutcomes) ||
         terminal_outcome_count > intent_count ||
         fence_released_count > fence_release_intent_count ||
-        fence_release_intent_count > scene_finalized_count ||
-        scene_finalized_count > publication_receipt_count ||
-        publication_receipt_count > retired_command_surfaces_count ||
-        retired_command_surfaces_count > private_materialization_count ||
-        private_materialization_count > scene_activated_count ||
-        scene_activated_count > activation_selection_count ||
-        activation_selection_count > scene_staged_count ||
-        scene_staged_count > scene_stage_intent_count ||
-        scene_stage_intent_count > runtime_intent_count ||
+        fence_release_intent_count > publication_receipt_count ||
+        publication_receipt_count > private_materialization_count ||
+        private_materialization_count > runtime_staged_ready_count ||
         attempt_count > affected_scope_count ||
         affected_scope_count > intent_count) {
       throw ManagerApplyJournalIntegrityError(
@@ -5818,96 +4022,6 @@ public:
       throw ManagerApplyJournalIntegrityError(
           "stored runtime convergence inventory count is inconsistent");
     }
-    Statement scene_stage_intents(
-        database_,
-        "SELECT apply_id,apply_generation "
-        "FROM manager_apply_scene_stage_intents "
-        "ORDER BY apply_id,apply_generation LIMIT ?");
-    scene_stage_intents.Bind(
-        1,
-        static_cast<std::int64_t>(kMaximumManagerApplySceneStageIntents + 1U));
-    std::int64_t observed_scene_stage_intents = 0;
-    while (scene_stage_intents.Step()) {
-      ++observed_scene_stage_intents;
-      if (observed_scene_stage_intents >
-              static_cast<std::int64_t>(
-                  kMaximumManagerApplySceneStageIntents) ||
-          !SceneStageIntentLocked(ApplyId(scene_stage_intents.Text(0)),
-                                  scene_stage_intents.Integer(1))
-               .has_value()) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored scene-stage intent inventory is inconsistent");
-      }
-    }
-    Statement scene_staged_records(
-        database_, "SELECT apply_id,apply_generation "
-                   "FROM manager_apply_scene_staged_records "
-                   "ORDER BY apply_id,apply_generation LIMIT ?");
-    scene_staged_records.Bind(
-        1,
-        static_cast<std::int64_t>(kMaximumManagerApplySceneStagedRecords + 1U));
-    std::int64_t observed_scene_staged = 0;
-    while (scene_staged_records.Step()) {
-      ++observed_scene_staged;
-      if (observed_scene_staged > static_cast<std::int64_t>(
-                                      kMaximumManagerApplySceneStagedRecords) ||
-          !SceneStagedLocked(ApplyId(scene_staged_records.Text(0)),
-                             scene_staged_records.Integer(1))
-               .has_value()) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored scene staged-evidence inventory is inconsistent");
-      }
-    }
-    if (observed_scene_stage_intents != scene_stage_intent_count ||
-        observed_scene_staged != scene_staged_count) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored scene-stage inventory count is inconsistent");
-    }
-    Statement activation_selections(
-        database_, "SELECT apply_id,apply_generation "
-                   "FROM manager_apply_activation_selections "
-                   "ORDER BY apply_id,apply_generation LIMIT ?");
-    activation_selections.Bind(
-        1, static_cast<std::int64_t>(kMaximumManagerApplyActivationSelections +
-                                     1U));
-    std::int64_t observed_activation_selections = 0;
-    while (activation_selections.Step()) {
-      ++observed_activation_selections;
-      if (observed_activation_selections >
-              static_cast<std::int64_t>(
-                  kMaximumManagerApplyActivationSelections) ||
-          !ActivationSelectionLocked(ApplyId(activation_selections.Text(0)),
-                                     activation_selections.Integer(1))
-               .has_value()) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored activation-selection inventory is inconsistent");
-      }
-    }
-    Statement scene_activated_records(
-        database_, "SELECT apply_id,apply_generation "
-                   "FROM manager_apply_scene_activated_records "
-                   "ORDER BY apply_id,apply_generation LIMIT ?");
-    scene_activated_records.Bind(
-        1, static_cast<std::int64_t>(kMaximumManagerApplySceneActivatedRecords +
-                                     1U));
-    std::int64_t observed_scene_activated = 0;
-    while (scene_activated_records.Step()) {
-      ++observed_scene_activated;
-      if (observed_scene_activated >
-              static_cast<std::int64_t>(
-                  kMaximumManagerApplySceneActivatedRecords) ||
-          !SceneActivatedLocked(ApplyId(scene_activated_records.Text(0)),
-                                scene_activated_records.Integer(1))
-               .has_value()) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored scene-activation inventory is inconsistent");
-      }
-    }
-    if (observed_activation_selections != activation_selection_count ||
-        observed_scene_activated != scene_activated_count) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored activation inventory count is inconsistent");
-    }
     Statement private_materializations(
         database_, "SELECT apply_id,apply_generation "
                    "FROM manager_apply_private_materializations "
@@ -5927,27 +4041,6 @@ public:
                .has_value()) {
         throw ManagerApplyJournalIntegrityError(
             "stored private-materialization inventory is inconsistent");
-      }
-    }
-    Statement retired_command_surfaces(
-        database_, "SELECT apply_id,apply_generation "
-                   "FROM manager_apply_retired_command_surfaces "
-                   "ORDER BY apply_id,apply_generation LIMIT ?");
-    retired_command_surfaces.Bind(
-        1, static_cast<std::int64_t>(
-               kMaximumManagerApplyRetiredCommandSurfaceRecords + 1U));
-    std::int64_t observed_retired_command_surfaces = 0;
-    while (retired_command_surfaces.Step()) {
-      ++observed_retired_command_surfaces;
-      if (observed_retired_command_surfaces >
-              static_cast<std::int64_t>(
-                  kMaximumManagerApplyRetiredCommandSurfaceRecords) ||
-          !RetiredCommandSurfacesLocked(
-               ApplyId(retired_command_surfaces.Text(0)),
-               retired_command_surfaces.Integer(1))
-               .has_value()) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored command-surface retirement inventory is inconsistent");
       }
     }
     Statement publication_receipts(
@@ -5970,30 +4063,8 @@ public:
             "stored Apply-publication inventory is inconsistent");
       }
     }
-    Statement scene_finalized_records(
-        database_, "SELECT apply_id,apply_generation "
-                   "FROM manager_apply_scene_finalized_records "
-                   "ORDER BY apply_id,apply_generation LIMIT ?");
-    scene_finalized_records.Bind(
-        1, static_cast<std::int64_t>(kMaximumManagerApplySceneFinalizedRecords +
-                                     1U));
-    std::int64_t observed_scene_finalized = 0;
-    while (scene_finalized_records.Step()) {
-      ++observed_scene_finalized;
-      if (observed_scene_finalized >
-              static_cast<std::int64_t>(
-                  kMaximumManagerApplySceneFinalizedRecords) ||
-          !SceneFinalizedLocked(ApplyId(scene_finalized_records.Text(0)),
-                                scene_finalized_records.Integer(1))
-               .has_value()) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored scene-Finalize inventory is inconsistent");
-      }
-    }
     if (observed_private_materializations != private_materialization_count ||
-        observed_retired_command_surfaces != retired_command_surfaces_count ||
-        observed_publication_receipts != publication_receipt_count ||
-        observed_scene_finalized != scene_finalized_count) {
+        observed_publication_receipts != publication_receipt_count) {
       throw ManagerApplyJournalIntegrityError(
           "stored selected-bundle transition inventory is inconsistent");
     }
@@ -6074,14 +4145,8 @@ public:
         acceptance_count,
         runtime_intent_count,
         runtime_staged_ready_count,
-        scene_stage_intent_count,
-        scene_staged_count,
-        activation_selection_count,
-        scene_activated_count,
         private_materialization_count,
-        retired_command_surfaces_count,
         publication_receipt_count,
-        scene_finalized_count,
         fence_release_intent_count,
         fence_released_count,
         terminal_outcome_count,
@@ -6178,8 +4243,9 @@ SqliteManagerApplyJournal::EnsureIntent(const ManagerApplyIntentDTO &intent) {
       "candidate_retained_bundle_id,candidate_graph_revision,"
       "captured_input_digest,deployment_artifact_id,deployment_revision,"
       "program_binding_id,prepared_activation_id,"
+      "prepared_activation_receipt_json,"
       "expected_admission_generation,parent_authoring_claim,intent_digest"
-      ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+      ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
   insert.Bind(1, intent.apply_id.value());
   insert.Bind(2, encoded.apply_generation);
   insert.Bind(3, intent.request_context.request_id.value());
@@ -6206,17 +4272,18 @@ SqliteManagerApplyJournal::EnsureIntent(const ManagerApplyIntentDTO &intent) {
   insert.Bind(16, intent.prepared_activation.deployment_revision.value());
   insert.Bind(17, intent.prepared_activation.program_binding_id.value());
   insert.Bind(18, intent.prepared_activation.prepared_activation_id.value());
+  insert.Bind(19, intent.prepared_activation.canonical_receipt_json);
   if (encoded.expected_admission_generation.has_value()) {
-    insert.Bind(19, *encoded.expected_admission_generation);
-  } else {
-    insert.BindNull(19);
-  }
-  if (encoded.parent_authoring_claim.has_value()) {
-    insert.BindBlob(20, *encoded.parent_authoring_claim);
+    insert.Bind(20, *encoded.expected_admission_generation);
   } else {
     insert.BindNull(20);
   }
-  insert.Bind(21, encoded.intent_digest);
+  if (encoded.parent_authoring_claim.has_value()) {
+    insert.BindBlob(21, *encoded.parent_authoring_claim);
+  } else {
+    insert.BindNull(21);
+  }
+  insert.Bind(22, encoded.intent_digest);
   static_cast<void>(insert.Step());
 
   const auto stored =
@@ -6797,449 +4864,6 @@ SqliteManagerApplyJournal::ReadLatestRuntimeStagedReady(
   return result;
 }
 
-ManagerApplySceneStageIntentWriteResult
-SqliteManagerApplyJournal::EnsureSceneStageIntent(
-    const ManagerApplySceneStageIntentDTO &scene_stage_intent) {
-  const auto encoded = EncodeSceneStageIntent(scene_stage_intent);
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  if (const auto existing = impl_->SceneStageIntentLocked(
-          scene_stage_intent.apply_id, encoded.apply_generation);
-      existing.has_value()) {
-    if (existing->scene_stage_intent != scene_stage_intent ||
-        existing->scene_stage_intent_digest.value() != encoded.digest) {
-      throw ManagerApplyJournalConflictError(
-          "Apply generation already has a different immutable scene-stage "
-          "intent");
-    }
-    transaction.Commit();
-    return {*existing, false};
-  }
-  const auto staged = impl_->RuntimeStagedReadyByDigestLocked(
-      scene_stage_intent.apply_id, encoded.apply_generation,
-      scene_stage_intent.runtime_staged_ready_digest);
-  const auto latest_staged = impl_->LatestRuntimeStagedReadyLocked(
-      scene_stage_intent.apply_id, encoded.apply_generation);
-  const auto parent = impl_->IntentLocked(scene_stage_intent.apply_id,
-                                          encoded.apply_generation);
-  if (!staged.has_value() ||
-      !latest_staged.has_value() || *latest_staged != *staged ||
-      !WithdrawalsMatchRuntimeStage(scene_stage_intent, staged->staged_ready) ||
-      staged->staged_ready.predecessor_publication_generation !=
-          scene_stage_intent.predecessor_publication_generation ||
-      staged->staged_ready.predecessor_public_pointer_digest !=
-          scene_stage_intent.predecessor_public_pointer_digest ||
-      !parent.has_value() ||
-      parent->intent.expected_active_projection_revision !=
-          scene_stage_intent.expected_active_projection_revision ||
-      parent->intent.candidate_retained_bundle_id !=
-          scene_stage_intent.candidate_retained_bundle_id ||
-      parent->intent.candidate_graph_revision !=
-          scene_stage_intent.candidate_graph_revision) {
-    throw ManagerApplyJournalConflictError(
-        "scene-stage intent does not name its exact latest staged-ready/Apply "
-        "records");
-  }
-  const auto count =
-      ScalarInteger(impl_->database_,
-                    "SELECT COUNT(*) FROM manager_apply_scene_stage_intents");
-  if (count >=
-      static_cast<std::int64_t>(kMaximumManagerApplySceneStageIntents)) {
-    throw ManagerApplyJournalLimitError(
-        "scene-stage intent inventory reached its fixed limit");
-  }
-  const auto &predecessor =
-      scene_stage_intent.expected_active_projection_revision;
-  Statement insert(
-      impl_->database_,
-      "INSERT INTO manager_apply_scene_stage_intents ("
-      "apply_id,apply_generation,runtime_staged_ready_digest,"
-      "predecessor_publication_generation,"
-      "predecessor_public_pointer_digest,"
-      "predecessor_retained_bundle_id,predecessor_graph_revision,"
-      "predecessor_scene_id,predecessor_scene_revision_id,"
-      "predecessor_scene_content_hash,candidate_retained_bundle_id,"
-      "candidate_graph_revision,native_transition_rows_encoding,"
-      "scene_stage_intent_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, scene_stage_intent.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, scene_stage_intent.runtime_staged_ready_digest.value());
-  insert.Bind(4, encoded.predecessor_publication_generation);
-  insert.Bind(5, scene_stage_intent.predecessor_public_pointer_digest.value());
-  insert.Bind(6, predecessor.retained_bundle_id.value());
-  insert.Bind(7, predecessor.graph_revision.value());
-  insert.Bind(8, predecessor.scene_revision.scene_id.value());
-  insert.Bind(9, encoded.predecessor_scene_revision_id);
-  insert.Bind(10, predecessor.scene_revision.content_hash.value());
-  insert.Bind(11, scene_stage_intent.candidate_retained_bundle_id.value());
-  insert.Bind(12, scene_stage_intent.candidate_graph_revision.value());
-  insert.Bind(13, encoded.transition_rows);
-  insert.Bind(14, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored = impl_->SceneStageIntentLocked(
-      scene_stage_intent.apply_id, encoded.apply_generation);
-  if (!stored.has_value() || stored->scene_stage_intent != scene_stage_intent ||
-      stored->scene_stage_intent_digest.value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted scene-stage intent cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  transaction.Commit();
-  return {*stored, true};
-}
-
-std::optional<PersistedManagerApplySceneStageIntent>
-SqliteManagerApplyJournal::ReadSceneStageIntent(
-    const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
-  const auto generation =
-      CheckedSigned(apply_generation.value(), "apply_generation");
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto result = impl_->SceneStageIntentLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
-}
-
-ManagerApplySceneStagedWriteResult SqliteManagerApplyJournal::EnsureSceneStaged(
-    const ManagerApplySceneStagedDTO &scene_staged) {
-  const auto encoded = EncodeSceneStaged(scene_staged);
-  const auto &result = scene_staged.staged_result;
-  const auto &candidate = *result.candidate_projection_revision;
-  const auto &evidence = *result.transition_evidence;
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  const auto intent =
-      impl_->SceneStageIntentLocked(result.apply_id, encoded.apply_generation);
-  bool rows_match =
-      intent.has_value() &&
-      evidence.transition_rows.size() ==
-          intent->scene_stage_intent.native_transition_rows.size();
-  if (rows_match) {
-    for (std::size_t index = 0U; index < evidence.transition_rows.size();
-         ++index) {
-      if (evidence.transition_rows[index].transition_row !=
-          intent->scene_stage_intent.native_transition_rows[index]) {
-        rows_match = false;
-        break;
-      }
-    }
-  }
-  if (!intent.has_value() ||
-      intent->scene_stage_intent_digest !=
-          scene_staged.scene_stage_intent_digest ||
-      result.expected_active_projection_revision !=
-          intent->scene_stage_intent.expected_active_projection_revision ||
-      candidate.retained_bundle_id !=
-          intent->scene_stage_intent.candidate_retained_bundle_id ||
-      candidate.graph_revision !=
-          intent->scene_stage_intent.candidate_graph_revision ||
-      !rows_match) {
-    throw ManagerApplyJournalConflictError(
-        "scene staged evidence does not match its exact stage intent");
-  }
-  if (const auto existing =
-          impl_->SceneStagedLocked(result.apply_id, encoded.apply_generation);
-      existing.has_value()) {
-    if (!SameManagerApplySceneStaged(existing->scene_staged, scene_staged) ||
-        existing->scene_staged_digest.value() != encoded.digest) {
-      throw ManagerApplyJournalConflictError(
-          "Apply generation already has different scene staged evidence");
-    }
-    transaction.Commit();
-    return {*existing, false};
-  }
-  const auto count =
-      ScalarInteger(impl_->database_,
-                    "SELECT COUNT(*) FROM manager_apply_scene_staged_records");
-  if (count >=
-      static_cast<std::int64_t>(kMaximumManagerApplySceneStagedRecords)) {
-    throw ManagerApplyJournalLimitError(
-        "scene staged-evidence inventory reached its fixed limit");
-  }
-  const auto &predecessor = result.expected_active_projection_revision;
-  Statement insert(impl_->database_,
-                   "INSERT INTO manager_apply_scene_staged_records ("
-                   "apply_id,apply_generation,scene_stage_intent_digest,"
-                   "predecessor_retained_bundle_id,predecessor_graph_revision,"
-                   "predecessor_scene_id,predecessor_scene_revision_id,"
-                   "predecessor_scene_content_hash,projection_stage_generation,"
-                   "candidate_retained_bundle_id,candidate_graph_revision,"
-                   "candidate_scene_id,candidate_scene_revision_id,"
-                   "candidate_scene_content_hash,result_state,"
-                   "transition_evidence_encoding,scene_staged_digest) "
-                   "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, result.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, scene_staged.scene_stage_intent_digest.value());
-  insert.Bind(4, predecessor.retained_bundle_id.value());
-  insert.Bind(5, predecessor.graph_revision.value());
-  insert.Bind(6, predecessor.scene_revision.scene_id.value());
-  insert.Bind(7, encoded.predecessor_scene_revision_id);
-  insert.Bind(8, predecessor.scene_revision.content_hash.value());
-  insert.Bind(9, encoded.projection_stage_generation);
-  insert.Bind(10, candidate.retained_bundle_id.value());
-  insert.Bind(11, candidate.graph_revision.value());
-  insert.Bind(12, candidate.scene_revision.scene_id.value());
-  insert.Bind(13, encoded.candidate_scene_revision_id);
-  insert.Bind(14, candidate.scene_revision.content_hash.value());
-  insert.Bind(15, "staged");
-  insert.Bind(16, encoded.transition_evidence);
-  insert.Bind(17, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored =
-      impl_->SceneStagedLocked(result.apply_id, encoded.apply_generation);
-  if (!stored.has_value() ||
-      !SameManagerApplySceneStaged(stored->scene_staged, scene_staged) ||
-      stored->scene_staged_digest.value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted scene staged evidence cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  transaction.Commit();
-  return {*stored, true};
-}
-
-std::optional<PersistedManagerApplySceneStaged>
-SqliteManagerApplyJournal::ReadSceneStaged(
-    const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
-  const auto generation =
-      CheckedSigned(apply_generation.value(), "apply_generation");
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto result = impl_->SceneStagedLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
-}
-
-ManagerApplyActivationSelectionWriteResult
-SqliteManagerApplyJournal::EnsureActivationSelection(
-    const ManagerApplyActivationSelectionDTO &activation_selection) {
-  const auto encoded = EncodeActivationSelection(activation_selection);
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  const auto staged = impl_->SceneStagedLocked(activation_selection.apply_id,
-                                               encoded.apply_generation);
-  if (!staged.has_value() ||
-      staged->scene_staged_digest != activation_selection.scene_staged_digest ||
-      staged->scene_staged.staged_result.expected_active_projection_revision !=
-          activation_selection.predecessor_projection_revision ||
-      *staged->scene_staged.staged_result.projection_stage_generation !=
-          activation_selection.projection_stage_generation ||
-      *staged->scene_staged.staged_result.candidate_projection_revision !=
-          activation_selection.candidate_projection_revision) {
-    throw ManagerApplyJournalConflictError(
-        "activation selection does not match exact staged evidence");
-  }
-  if (const auto existing = impl_->ActivationSelectionLocked(
-          activation_selection.apply_id, encoded.apply_generation);
-      existing.has_value()) {
-    if (existing->activation_selection != activation_selection ||
-        existing->activation_selection_digest.value() != encoded.digest) {
-      throw ManagerApplyJournalConflictError(
-          "Apply generation already has a different activation selection");
-    }
-    transaction.Commit();
-    return {*existing, false};
-  }
-  const auto count =
-      ScalarInteger(impl_->database_,
-                    "SELECT COUNT(*) FROM manager_apply_activation_selections");
-  if (count >=
-      static_cast<std::int64_t>(kMaximumManagerApplyActivationSelections)) {
-    throw ManagerApplyJournalLimitError(
-        "activation-selection inventory reached its fixed limit");
-  }
-  const auto &predecessor =
-      activation_selection.predecessor_projection_revision;
-  const auto &candidate = activation_selection.candidate_projection_revision;
-  Statement insert(impl_->database_,
-                   "INSERT INTO manager_apply_activation_selections ("
-                   "apply_id,apply_generation,scene_staged_digest,"
-                   "predecessor_retained_bundle_id,predecessor_graph_revision,"
-                   "predecessor_scene_id,predecessor_scene_revision_id,"
-                   "predecessor_scene_content_hash,projection_stage_generation,"
-                   "candidate_retained_bundle_id,candidate_graph_revision,"
-                   "candidate_scene_id,candidate_scene_revision_id,"
-                   "candidate_scene_content_hash,activation_selection_digest) "
-                   "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, activation_selection.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, activation_selection.scene_staged_digest.value());
-  insert.Bind(4, predecessor.retained_bundle_id.value());
-  insert.Bind(5, predecessor.graph_revision.value());
-  insert.Bind(6, predecessor.scene_revision.scene_id.value());
-  insert.Bind(7, encoded.predecessor_scene_revision_id);
-  insert.Bind(8, predecessor.scene_revision.content_hash.value());
-  insert.Bind(9, encoded.projection_stage_generation);
-  insert.Bind(10, candidate.retained_bundle_id.value());
-  insert.Bind(11, candidate.graph_revision.value());
-  insert.Bind(12, candidate.scene_revision.scene_id.value());
-  insert.Bind(13, encoded.candidate_scene_revision_id);
-  insert.Bind(14, candidate.scene_revision.content_hash.value());
-  insert.Bind(15, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored = impl_->ActivationSelectionLocked(
-      activation_selection.apply_id, encoded.apply_generation);
-  if (!stored.has_value() ||
-      stored->activation_selection != activation_selection ||
-      stored->activation_selection_digest.value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted activation selection cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  transaction.Commit();
-  return {*stored, true};
-}
-
-std::optional<PersistedManagerApplyActivationSelection>
-SqliteManagerApplyJournal::ReadActivationSelection(
-    const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
-  const auto generation =
-      CheckedSigned(apply_generation.value(), "apply_generation");
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto result = impl_->ActivationSelectionLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
-}
-
-ManagerApplySceneActivatedWriteResult
-SqliteManagerApplyJournal::EnsureSceneActivated(
-    const ManagerApplySceneActivatedDTO &scene_activated) {
-  const auto encoded = EncodeSceneActivated(scene_activated);
-  const auto &result = scene_activated.activation_result;
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  const auto selection = impl_->ActivationSelectionLocked(
-      result.apply_id, encoded.apply_generation);
-  if (!selection.has_value() ||
-      selection->activation_selection_digest !=
-          scene_activated.activation_selection_digest ||
-      selection->activation_selection.predecessor_projection_revision !=
-          result.expected_active_projection_revision ||
-      selection->activation_selection.projection_stage_generation !=
-          result.projection_stage_generation ||
-      selection->activation_selection.candidate_projection_revision !=
-          result.candidate_projection_revision) {
-    throw ManagerApplyJournalConflictError(
-        "scene activation evidence does not match exact selection");
-  }
-  const auto staged =
-      impl_->SceneStagedLocked(result.apply_id, encoded.apply_generation);
-  bool rows_match = staged.has_value() &&
-                    result.transition_evidence.transition_rows.size() ==
-                        staged->scene_staged.staged_result.transition_evidence
-                            ->transition_rows.size();
-  if (rows_match) {
-    for (std::size_t index = 0U;
-         index < result.transition_evidence.transition_rows.size(); ++index) {
-      if (result.transition_evidence.transition_rows[index].transition_row !=
-          staged->scene_staged.staged_result.transition_evidence
-              ->transition_rows[index]
-              .transition_row) {
-        rows_match = false;
-        break;
-      }
-    }
-  }
-  if (!rows_match) {
-    throw ManagerApplyJournalConflictError(
-        "scene activation transition set differs from staged evidence");
-  }
-  if (const auto existing = impl_->SceneActivatedLocked(
-          result.apply_id, encoded.apply_generation);
-      existing.has_value()) {
-    if (!SameManagerApplySceneActivated(existing->scene_activated,
-                                        scene_activated) ||
-        existing->scene_activated_digest.value() != encoded.digest) {
-      throw ManagerApplyJournalConflictError(
-          "Apply generation already has different scene activation "
-          "evidence");
-    }
-    transaction.Commit();
-    return {*existing, false};
-  }
-  const auto count = ScalarInteger(
-      impl_->database_,
-      "SELECT COUNT(*) FROM manager_apply_scene_activated_records");
-  if (count >=
-      static_cast<std::int64_t>(kMaximumManagerApplySceneActivatedRecords)) {
-    throw ManagerApplyJournalLimitError(
-        "scene activation-evidence inventory reached its fixed limit");
-  }
-  const auto &predecessor = result.expected_active_projection_revision;
-  const auto &candidate = result.candidate_projection_revision;
-  Statement insert(impl_->database_,
-                   "INSERT INTO manager_apply_scene_activated_records ("
-                   "apply_id,apply_generation,activation_selection_digest,"
-                   "predecessor_retained_bundle_id,predecessor_graph_revision,"
-                   "predecessor_scene_id,predecessor_scene_revision_id,"
-                   "predecessor_scene_content_hash,projection_stage_generation,"
-                   "candidate_retained_bundle_id,candidate_graph_revision,"
-                   "candidate_scene_id,candidate_scene_revision_id,"
-                   "candidate_scene_content_hash,result_state,"
-                   "transition_evidence_encoding,scene_activated_digest) "
-                   "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, result.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, scene_activated.activation_selection_digest.value());
-  insert.Bind(4, predecessor.retained_bundle_id.value());
-  insert.Bind(5, predecessor.graph_revision.value());
-  insert.Bind(6, predecessor.scene_revision.scene_id.value());
-  insert.Bind(7, encoded.predecessor_scene_revision_id);
-  insert.Bind(8, predecessor.scene_revision.content_hash.value());
-  insert.Bind(9, encoded.projection_stage_generation);
-  insert.Bind(10, candidate.retained_bundle_id.value());
-  insert.Bind(11, candidate.graph_revision.value());
-  insert.Bind(12, candidate.scene_revision.scene_id.value());
-  insert.Bind(13, encoded.candidate_scene_revision_id);
-  insert.Bind(14, candidate.scene_revision.content_hash.value());
-  insert.Bind(15, "activated");
-  insert.Bind(16, encoded.transition_evidence);
-  insert.Bind(17, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored =
-      impl_->SceneActivatedLocked(result.apply_id, encoded.apply_generation);
-  if (!stored.has_value() ||
-      !SameManagerApplySceneActivated(stored->scene_activated,
-                                      scene_activated) ||
-      stored->scene_activated_digest.value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted scene activation evidence cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  transaction.Commit();
-  return {*stored, true};
-}
-
-std::optional<PersistedManagerApplySceneActivated>
-SqliteManagerApplyJournal::ReadSceneActivated(
-    const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
-  const auto generation =
-      CheckedSigned(apply_generation.value(), "apply_generation");
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto result = impl_->SceneActivatedLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
-}
-
 ManagerApplyPrivateMaterializationWriteResult
 SqliteManagerApplyJournal::EnsurePrivateMaterialization(
     const ManagerApplyPrivateMaterializationDTO &private_materialization) {
@@ -7248,19 +4872,21 @@ SqliteManagerApplyJournal::EnsurePrivateMaterialization(
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
   static_cast<void>(impl_->VerifyIntegrityLocked());
-  const auto activated = impl_->SceneActivatedLocked(
+  const auto intent = impl_->IntentLocked(
       private_materialization.apply_id, encoded.apply_generation);
-  if (!activated.has_value() ||
-      activated->scene_activated_digest !=
-          private_materialization.scene_activated_digest ||
-      activated->scene_activated.activation_result
-              .projection_stage_generation !=
-          private_materialization.projection_stage_generation ||
-      activated->scene_activated.activation_result
-              .candidate_projection_revision !=
-          private_materialization.candidate_projection_revision) {
+  if (!intent.has_value() ||
+      private_materialization.authoritative_scene_snapshot_digest !=
+          private_materialization.candidate_projection_revision.scene_revision
+              .content_hash ||
+      intent->intent.candidate_retained_bundle_id !=
+          private_materialization.candidate_projection_revision
+              .retained_bundle_id ||
+      intent->intent.candidate_graph_revision !=
+          private_materialization.candidate_projection_revision
+              .graph_revision) {
     throw ManagerApplyJournalConflictError(
-        "private materialization does not match exact scene activation");
+        "private materialization does not match its exact Apply and "
+        "authoritative Scene snapshot");
   }
   if (const auto existing = impl_->PrivateMaterializationLocked(
           private_materialization.apply_id, encoded.apply_generation);
@@ -7286,28 +4912,28 @@ SqliteManagerApplyJournal::EnsurePrivateMaterialization(
   const auto &candidate = private_materialization.candidate_projection_revision;
   Statement insert(impl_->database_,
                    "INSERT INTO manager_apply_private_materializations ("
-                   "apply_id,apply_generation,scene_activated_digest,"
-                   "projection_stage_generation,candidate_retained_bundle_id,"
+                   "apply_id,apply_generation,authoritative_scene_snapshot_digest,"
+                   "candidate_retained_bundle_id,"
                    "candidate_graph_revision,candidate_scene_id,"
                    "candidate_scene_revision_id,candidate_scene_content_hash,"
                    "retained_bundle_canonical_content_digest,"
                    "retained_bundle_canonical_byte_size,"
                    "private_materialization_content_digest) "
-                   "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+                   "VALUES (?,?,?,?,?,?,?,?,?,?,?)");
   insert.Bind(1, private_materialization.apply_id.value());
   insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, private_materialization.scene_activated_digest.value());
-  insert.Bind(4, encoded.projection_stage_generation);
-  insert.Bind(5, candidate.retained_bundle_id.value());
-  insert.Bind(6, candidate.graph_revision.value());
-  insert.Bind(7, candidate.scene_revision.scene_id.value());
-  insert.Bind(8, encoded.candidate_scene_revision_id);
-  insert.Bind(9, candidate.scene_revision.content_hash.value());
+  insert.Bind(3,
+              private_materialization.authoritative_scene_snapshot_digest.value());
+  insert.Bind(4, candidate.retained_bundle_id.value());
+  insert.Bind(5, candidate.graph_revision.value());
+  insert.Bind(6, candidate.scene_revision.scene_id.value());
+  insert.Bind(7, encoded.candidate_scene_revision_id);
+  insert.Bind(8, candidate.scene_revision.content_hash.value());
   insert.Bind(
-      10,
+      9,
       private_materialization.retained_bundle_canonical_content_digest.value());
-  insert.Bind(11, encoded.retained_bundle_canonical_byte_size);
-  insert.Bind(12, encoded.digest);
+  insert.Bind(10, encoded.retained_bundle_canonical_byte_size);
+  insert.Bind(11, encoded.digest);
   static_cast<void>(insert.Step());
   const auto stored = impl_->PrivateMaterializationLocked(
       private_materialization.apply_id, encoded.apply_generation);
@@ -7337,87 +4963,6 @@ SqliteManagerApplyJournal::ReadPrivateMaterialization(
   return result;
 }
 
-ManagerApplyObsoleteCommandSurfacesRetiredWriteResult
-SqliteManagerApplyJournal::EnsureObsoleteCommandSurfacesRetired(
-    const ManagerApplyObsoleteCommandSurfacesRetiredDTO
-        &retired_command_surfaces) {
-  const auto encoded = EncodeRetiredCommandSurfaces(retired_command_surfaces);
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  const auto materialization = impl_->PrivateMaterializationLocked(
-      retired_command_surfaces.apply_id, encoded.apply_generation);
-  if (!materialization.has_value() ||
-      materialization->private_materialization_content_digest !=
-          retired_command_surfaces.private_materialization_content_digest) {
-    throw ManagerApplyJournalConflictError(
-        "command-surface retirement does not match exact private "
-        "materialization");
-  }
-  if (const auto existing = impl_->RetiredCommandSurfacesLocked(
-          retired_command_surfaces.apply_id, encoded.apply_generation);
-      existing.has_value()) {
-    if (existing->retired_command_surfaces != retired_command_surfaces ||
-        existing->obsolete_managed_command_surfaces_retired_evidence_digest
-                .value() != encoded.digest) {
-      throw ManagerApplyJournalConflictError(
-          "Apply generation already has different command-surface "
-          "retirement evidence");
-    }
-    transaction.Commit();
-    return {*existing, false};
-  }
-  const auto count = ScalarInteger(
-      impl_->database_,
-      "SELECT COUNT(*) FROM manager_apply_retired_command_surfaces");
-  if (count >= static_cast<std::int64_t>(
-                   kMaximumManagerApplyRetiredCommandSurfaceRecords)) {
-    throw ManagerApplyJournalLimitError(
-        "command-surface retirement inventory reached its fixed limit");
-  }
-  Statement insert(
-      impl_->database_,
-      "INSERT INTO manager_apply_retired_command_surfaces ("
-      "apply_id,apply_generation,private_materialization_content_digest,"
-      "command_surfaces_encoding,retired_command_surfaces_evidence_digest) "
-      "VALUES (?,?,?,?,?)");
-  insert.Bind(1, retired_command_surfaces.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(
-      3,
-      retired_command_surfaces.private_materialization_content_digest.value());
-  insert.Bind(4, encoded.command_surfaces);
-  insert.Bind(5, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored = impl_->RetiredCommandSurfacesLocked(
-      retired_command_surfaces.apply_id, encoded.apply_generation);
-  if (!stored.has_value() ||
-      stored->retired_command_surfaces != retired_command_surfaces ||
-      stored->obsolete_managed_command_surfaces_retired_evidence_digest
-              .value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted command-surface retirement evidence cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  transaction.Commit();
-  return {*stored, true};
-}
-
-std::optional<PersistedManagerApplyObsoleteCommandSurfacesRetired>
-SqliteManagerApplyJournal::ReadObsoleteCommandSurfacesRetired(
-    const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
-  const auto generation =
-      CheckedSigned(apply_generation.value(), "apply_generation");
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto result = impl_->RetiredCommandSurfacesLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
-}
-
 ManagerApplyPublicationReceiptWriteResult
 SqliteManagerApplyJournal::EnsurePublicationReceipt(
     const ManagerApplyPublicationReceiptDTO &publication) {
@@ -7433,17 +4978,15 @@ SqliteManagerApplyJournal::EnsurePublicationReceipt(
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
   static_cast<void>(impl_->VerifyIntegrityLocked());
-  const auto retired = impl_->RetiredCommandSurfacesLocked(
+  const auto materialization = impl_->PrivateMaterializationLocked(
       named->apply_id, encoded.apply_generation);
-  if (!retired.has_value() ||
-      retired->obsolete_managed_command_surfaces_retired_evidence_digest !=
-          publication
-              .obsolete_managed_command_surfaces_retired_evidence_digest ||
-      retired->retired_command_surfaces
-              .private_materialization_content_digest !=
+  if (!materialization.has_value() ||
+      materialization->private_materialization_content_digest !=
+          publication.private_materialization_content_digest ||
+      publication.private_materialization_content_digest !=
           request.private_materialization_content_digest) {
     throw ManagerApplyJournalConflictError(
-        "publication receipt does not match exact retirement evidence");
+        "publication receipt does not match exact private materialization");
   }
   if (const auto existing = impl_->PublicationReceiptLocked(
           named->apply_id, encoded.apply_generation);
@@ -7478,30 +5021,25 @@ SqliteManagerApplyJournal::EnsurePublicationReceipt(
       impl_->database_,
       "INSERT INTO manager_apply_publication_receipts ("
       "apply_id,apply_generation,"
-      "retired_command_surfaces_evidence_digest,"
-      "projection_stage_generation,candidate_retained_bundle_id,"
+      "candidate_retained_bundle_id,"
       "candidate_graph_revision,candidate_scene_id,"
       "candidate_scene_revision_id,candidate_scene_content_hash,"
       "expected_previous_publication_generation,"
       "private_materialization_content_digest,publication_generation,"
       "durable_public_pointer_content_digest,publication_receipt_digest) "
-      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
   insert.Bind(1, named->apply_id.value());
   insert.Bind(2, encoded.apply_generation);
-  insert.Bind(
-      3, publication.obsolete_managed_command_surfaces_retired_evidence_digest
-             .value());
-  insert.Bind(4, encoded.projection_stage_generation);
-  insert.Bind(5, candidate.retained_bundle_id.value());
-  insert.Bind(6, candidate.graph_revision.value());
-  insert.Bind(7, candidate.scene_revision.scene_id.value());
-  insert.Bind(8, encoded.candidate_scene_revision_id);
-  insert.Bind(9, candidate.scene_revision.content_hash.value());
-  insert.Bind(10, encoded.expected_previous_publication_generation);
-  insert.Bind(11, request.private_materialization_content_digest.value());
-  insert.Bind(12, encoded.publication_generation);
-  insert.Bind(13, receipt.durable_public_pointer_content_digest.value());
-  insert.Bind(14, encoded.digest);
+  insert.Bind(3, candidate.retained_bundle_id.value());
+  insert.Bind(4, candidate.graph_revision.value());
+  insert.Bind(5, candidate.scene_revision.scene_id.value());
+  insert.Bind(6, encoded.candidate_scene_revision_id);
+  insert.Bind(7, candidate.scene_revision.content_hash.value());
+  insert.Bind(8, encoded.expected_previous_publication_generation);
+  insert.Bind(9, request.private_materialization_content_digest.value());
+  insert.Bind(10, encoded.publication_generation);
+  insert.Bind(11, receipt.durable_public_pointer_content_digest.value());
+  insert.Bind(12, encoded.digest);
   static_cast<void>(insert.Step());
   const auto stored = impl_->PublicationReceiptLocked(named->apply_id,
                                                       encoded.apply_generation);
@@ -7529,124 +5067,6 @@ SqliteManagerApplyJournal::ReadPublicationReceipt(
   return result;
 }
 
-ManagerApplySceneFinalizedWriteResult
-SqliteManagerApplyJournal::EnsureSceneFinalized(
-    const ManagerApplySceneFinalizedDTO &scene_finalized) {
-  const auto encoded = EncodeSceneFinalized(scene_finalized);
-  const auto &result = scene_finalized.finalized_result;
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  const auto publication = impl_->PublicationReceiptLocked(
-      result.apply_id, encoded.apply_generation);
-  if (!publication.has_value() ||
-      publication->publication_receipt_digest !=
-          scene_finalized.publication_receipt_digest ||
-      publication->publication.publication_receipt !=
-          result.publication_receipt) {
-    throw ManagerApplyJournalConflictError(
-        "scene Finalize evidence does not match exact publication receipt");
-  }
-  const auto activated =
-      impl_->SceneActivatedLocked(result.apply_id, encoded.apply_generation);
-  bool rows_match = activated.has_value() &&
-                    activated->scene_activated.activation_result
-                            .projection_stage_generation ==
-                        result.projection_stage_generation &&
-                    activated->scene_activated.activation_result
-                            .candidate_projection_revision ==
-                        result.candidate_projection_revision &&
-                    activated->scene_activated.activation_result
-                            .transition_evidence.transition_rows.size() ==
-                        result.transition_evidence.transition_rows.size();
-  if (rows_match) {
-    for (std::size_t index = 0U;
-         index < result.transition_evidence.transition_rows.size(); ++index) {
-      if (activated->scene_activated.activation_result.transition_evidence
-              .transition_rows[index]
-              .transition_row !=
-          result.transition_evidence.transition_rows[index].transition_row) {
-        rows_match = false;
-        break;
-      }
-    }
-  }
-  if (!rows_match) {
-    throw ManagerApplyJournalConflictError(
-        "scene Finalize transition set differs from activation evidence");
-  }
-  if (const auto existing = impl_->SceneFinalizedLocked(
-          result.apply_id, encoded.apply_generation);
-      existing.has_value()) {
-    if (!SameManagerApplySceneFinalized(existing->scene_finalized,
-                                        scene_finalized) ||
-        existing->scene_finalized_digest.value() != encoded.digest) {
-      throw ManagerApplyJournalConflictError(
-          "Apply generation already has different scene Finalize evidence");
-    }
-    transaction.Commit();
-    return {*existing, false};
-  }
-  const auto count = ScalarInteger(
-      impl_->database_,
-      "SELECT COUNT(*) FROM manager_apply_scene_finalized_records");
-  if (count >=
-      static_cast<std::int64_t>(kMaximumManagerApplySceneFinalizedRecords)) {
-    throw ManagerApplyJournalLimitError(
-        "scene-Finalize inventory reached its fixed limit");
-  }
-  const auto &candidate = result.candidate_projection_revision;
-  Statement insert(
-      impl_->database_,
-      "INSERT INTO manager_apply_scene_finalized_records ("
-      "apply_id,apply_generation,publication_receipt_digest,"
-      "projection_stage_generation,candidate_retained_bundle_id,"
-      "candidate_graph_revision,candidate_scene_id,"
-      "candidate_scene_revision_id,candidate_scene_content_hash,"
-      "transition_evidence_encoding,candidate_aggregate_health_encoding,"
-      "scene_finalized_digest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
-  insert.Bind(1, result.apply_id.value());
-  insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, scene_finalized.publication_receipt_digest.value());
-  insert.Bind(4, encoded.projection_stage_generation);
-  insert.Bind(5, candidate.retained_bundle_id.value());
-  insert.Bind(6, candidate.graph_revision.value());
-  insert.Bind(7, candidate.scene_revision.scene_id.value());
-  insert.Bind(8, encoded.candidate_scene_revision_id);
-  insert.Bind(9, candidate.scene_revision.content_hash.value());
-  insert.Bind(10, encoded.transition_evidence);
-  insert.Bind(11, encoded.aggregate_health);
-  insert.Bind(12, encoded.digest);
-  static_cast<void>(insert.Step());
-  const auto stored =
-      impl_->SceneFinalizedLocked(result.apply_id, encoded.apply_generation);
-  if (!stored.has_value() ||
-      !SameManagerApplySceneFinalized(stored->scene_finalized,
-                                      scene_finalized) ||
-      stored->scene_finalized_digest.value() != encoded.digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted scene Finalize evidence cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  transaction.Commit();
-  return {*stored, true};
-}
-
-std::optional<PersistedManagerApplySceneFinalized>
-SqliteManagerApplyJournal::ReadSceneFinalized(
-    const ApplyId &apply_id, const ApplyGeneration apply_generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
-  const auto generation =
-      CheckedSigned(apply_generation.value(), "apply_generation");
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto result = impl_->SceneFinalizedLocked(apply_id, generation);
-  transaction.Commit();
-  return result;
-}
-
 ManagerApplyFenceReleaseIntentWriteResult
 SqliteManagerApplyJournal::EnsureFenceReleaseIntent(
     const ManagerApplyFenceReleaseIntentDTO &fence_release_intent) {
@@ -7657,17 +5077,15 @@ SqliteManagerApplyJournal::EnsureFenceReleaseIntent(
   impl_->RequireOpen();
   Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
   static_cast<void>(impl_->VerifyIntegrityLocked());
-  const auto finalized =
-      impl_->SceneFinalizedLocked(owner.apply_id, encoded.apply_generation);
   const auto acceptance =
       impl_->FenceAcceptanceLocked(owner.apply_id, encoded.apply_generation);
   const auto publication =
       impl_->PublicationReceiptLocked(owner.apply_id, encoded.apply_generation);
   const auto &evidence =
       fence_release_intent.release_request.reconciliation_evidence;
-  if (!finalized.has_value() ||
-      finalized->scene_finalized_digest !=
-          fence_release_intent.scene_finalized_digest ||
+  if (!publication.has_value() ||
+      publication->publication_receipt_digest !=
+          fence_release_intent.scene_completion_digest ||
       !acceptance.has_value() ||
       acceptance->acceptance_digest !=
           fence_release_intent.fence_acceptance_digest ||
@@ -7676,17 +5094,16 @@ SqliteManagerApplyJournal::EnsureFenceReleaseIntent(
       acceptance->accepted_fence.configuration_fence_generation !=
           evidence.configuration_fence_generation ||
       acceptance->accepted_fence.captured_scope != evidence.reconciled_scope ||
-      finalized->scene_finalized.finalized_result
+      publication->publication.publication_receipt.request
               .candidate_projection_revision !=
           evidence.active_projection_revision ||
-      !publication.has_value() ||
       publication->publication.publication_receipt.publication_generation !=
           evidence.active_publication_generation ||
       publication->publication.publication_receipt
               .durable_public_pointer_content_digest !=
           evidence.active_public_pointer_digest) {
     throw ManagerApplyJournalConflictError(
-        "fence-release intent does not match exact finalized, fence, and "
+        "fence-release intent does not match exact completed, fence, and "
         "publication evidence");
   }
   if (const auto existing = impl_->FenceReleaseIntentLocked(
@@ -7710,12 +5127,12 @@ SqliteManagerApplyJournal::EnsureFenceReleaseIntent(
   }
   Statement insert(impl_->database_,
                    "INSERT INTO manager_apply_fence_release_intents ("
-                   "apply_id,apply_generation,scene_finalized_digest,"
+                   "apply_id,apply_generation,scene_completion_digest,"
                    "fence_acceptance_digest,release_request_encoding,"
                    "fence_release_intent_digest) VALUES (?,?,?,?,?,?)");
   insert.Bind(1, owner.apply_id.value());
   insert.Bind(2, encoded.apply_generation);
-  insert.Bind(3, fence_release_intent.scene_finalized_digest.value());
+  insert.Bind(3, fence_release_intent.scene_completion_digest.value());
   insert.Bind(4, fence_release_intent.fence_acceptance_digest.value());
   insert.Bind(5, encoded.release_request);
   insert.Bind(6, encoded.digest);
@@ -7836,20 +5253,17 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
   if (succeeded) {
     const auto released = impl_->FenceReleasedLocked(terminal_outcome.apply_id,
                                                      encoded.apply_generation);
-    const auto finalized = impl_->SceneFinalizedLocked(
-        terminal_outcome.apply_id, encoded.apply_generation);
     const auto publication = impl_->PublicationReceiptLocked(
         terminal_outcome.apply_id, encoded.apply_generation);
     if (!released.has_value() ||
         released->fence_released_digest !=
             terminal_outcome.fence_released_digest ||
-        !finalized.has_value() ||
-        finalized->scene_finalized_digest !=
-            terminal_outcome.scene_finalized_digest ||
-        finalized->scene_finalized.finalized_result
+        !publication.has_value() ||
+        publication->publication_receipt_digest !=
+            terminal_outcome.scene_completion_digest ||
+        publication->publication.publication_receipt.request
                 .candidate_projection_revision !=
             terminal_outcome.candidate_projection_revision ||
-        !publication.has_value() ||
         publication->publication_receipt_digest !=
             terminal_outcome.publication_receipt_digest) {
       throw ManagerApplyJournalConflictError(
@@ -7888,7 +5302,7 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
       impl_->database_,
       "INSERT INTO manager_apply_terminal_outcomes ("
       "apply_id,apply_generation,fence_released_digest,"
-      "scene_finalized_digest,publication_receipt_digest,"
+      "scene_completion_digest,publication_receipt_digest,"
       "candidate_retained_bundle_id,candidate_graph_revision,"
       "candidate_scene_id,candidate_scene_revision_id,"
       "candidate_scene_content_hash,intent_digest,failure_phase,failure_code,"
@@ -7900,7 +5314,7 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
   if (succeeded) {
     const auto &candidate = *terminal_outcome.candidate_projection_revision;
     insert.Bind(3, terminal_outcome.fence_released_digest->value());
-    insert.Bind(4, terminal_outcome.scene_finalized_digest->value());
+    insert.Bind(4, terminal_outcome.scene_completion_digest->value());
     insert.Bind(5, terminal_outcome.publication_receipt_digest->value());
     insert.Bind(6, candidate.retained_bundle_id.value());
     insert.Bind(7, candidate.graph_revision.value());

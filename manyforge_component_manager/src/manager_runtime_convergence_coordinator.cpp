@@ -217,15 +217,6 @@ CompatibleRuntimeSuccessor(const RuntimeUnitConvergencePlanRowDTO &predecessor,
   auto candidate_plans =
       VerifyRuntimeProducts(candidate, artifact_source, operating_system,
                             launch_environment_contracts);
-  for (const auto &[runtime_id, predecessor_row] : predecessor_plans) {
-    const auto candidate_row = candidate_plans.find(runtime_id);
-    if (candidate_row == candidate_plans.end()) {
-      Fail("runtime-unit removal is not qualified by the current I4 "
-           "command-surface retirement boundary: " +
-           runtime_id);
-    }
-    static_cast<void>(predecessor_row);
-  }
   std::vector<RuntimeUnitConvergencePlanRowDTO> result;
   result.reserve(candidate_plans.size());
   for (auto &[runtime_id, candidate_row] : candidate_plans) {
@@ -616,9 +607,6 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
     expectations.push_back(MakeExpectation(plan));
   }
   RuntimeObservationReducer reducer(clock_ns_, std::move(declared_runtime_ids));
-  std::map<std::string, manyforge::core::ManagedRuntimeWithdrawalDTO>
-      withdrawals;
-
   for (const auto index : dependency_order) {
     const auto &plan = convergence_intent.runtime_units[index];
     RuntimeUnitConvergenceQueryDTO query{
@@ -629,16 +617,6 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
         durable_intent.record.runtime_convergence_intent_digest,
         plan,
     };
-    const auto old = predecessor_plans.find(plan.runtime_unit_id.value());
-    if (old != predecessor_plans.end() &&
-        plan.lifecycle_control ==
-            manyforge::core::RuntimeLifecycleControl::kManagerManaged &&
-        (old->second.product_identity != plan.product_identity ||
-         old->second.configuration_identity != plan.configuration_identity ||
-         old->second.runtime_contract_offer_digest !=
-             plan.runtime_contract_offer_digest)) {
-      query.replacement = fence.rehydrate_request;
-    }
     if (!query.valid()) {
       Fail("Manager produced an invalid runtime convergence query");
     }
@@ -704,33 +682,6 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       } catch (...) {
         throw ManagerRuntimeProcessEffectUncertainError(
             "managed runtime Ensure outcome is uncertain", query);
-      }
-    }
-    if (query.replacement) {
-      auto withdrawal = process_port_.ReadPredecessorWithdrawal(query);
-      if (!withdrawal && prior_staged_ready) {
-        const auto &prior_rows = prior_staged_ready->staged_ready.runtime_units;
-        const auto prior = std::find_if(
-            prior_rows.begin(), prior_rows.end(), [&](const auto &row) {
-              return row.runtime_unit_id == plan.runtime_unit_id;
-            });
-        if (prior != prior_rows.end())
-          withdrawal = prior->predecessor_withdrawal;
-      }
-      if (withdrawal) {
-        if (!withdrawal->valid() ||
-            withdrawal->apply_id != apply_intent.apply_id ||
-            withdrawal->apply_generation != apply_intent.apply_generation ||
-            withdrawal->runtime_convergence_intent_digest !=
-                durable_intent.record.runtime_convergence_intent_digest ||
-            withdrawal->runtime_unit_id != plan.runtime_unit_id ||
-            withdrawal->product_identity != old->second.product_identity ||
-            withdrawal->configuration_identity !=
-                old->second.configuration_identity ||
-            withdrawal->runtime_epoch.value() == process.process_incarnation())
-          Fail("predecessor withdrawal differs from the exact fenced "
-               "replacement");
-        withdrawals.emplace(plan.runtime_unit_id.value(), *withdrawal);
       }
     }
     if (process.state() == ProcessPresenceState::kPresent) {
@@ -813,9 +764,6 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
       Fail("runtime reducer returned an undeclared observation");
     }
     staged_rows.push_back(MakeStagedEvidence(*found, observation));
-    const auto withdrawal = withdrawals.find(observation.runtime_unit_id());
-    if (withdrawal != withdrawals.end())
-      staged_rows.back().predecessor_withdrawal = withdrawal->second;
   }
   std::sort(staged_rows.begin(), staged_rows.end(),
             [](const auto &left, const auto &right) {

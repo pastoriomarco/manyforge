@@ -57,9 +57,9 @@ const program: ProgramDocument = {
 };
 
 const applied: AppliedProgramSelection = {
-  schemaVersion: 'manyforge.applied_program_selection.v1',
+  schemaVersion: 'manyforge.applied_program_selection.v2',
   scenarioId: 'lite6',
-  scenarioCatalogRevision: 'sha256:catalog',
+  sourceDocumentDigest: 'sha256:catalog',
   programId: 'pick',
   programRevision: 'sha256:program',
   programBindingId: 'sha256:binding',
@@ -70,6 +70,12 @@ const applied: AppliedProgramSelection = {
   sourceOwnerId: 'program-owner',
   sourceOwnerEpoch: 'epoch',
   sourceGeneration: 1,
+  assistantProjection: null,
+  ownerIdentities: [{
+    ownerRole: 'headless_projection',
+    ownerId: 'program-owner',
+    ownerEpoch: 'epoch',
+  }],
   program,
   programBinding: {
     api_version: 'manyforge.program_binding.v1',

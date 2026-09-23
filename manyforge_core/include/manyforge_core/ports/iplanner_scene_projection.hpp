@@ -2,7 +2,7 @@
 
 #include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/ports/iscene_candidate_projection.hpp>
-#include <manyforge_core/types/native_projection_handoff.hpp>
+#include <manyforge_core/types/projection_bootstrap.hpp>
 #include <manyforge_core/types/scene_transaction.hpp>
 #include <manyforge_core/types/scene_frame_resolution.hpp>
 #include <memory>
@@ -57,24 +57,6 @@ public:
   [[nodiscard]] virtual NativeProjectionBootstrapStatusDTO
   BootstrapProjectionStatus(
       const NativeProjectionBootstrapStatusQueryDTO &query) const = 0;
-
-  [[nodiscard]] virtual NativeProjectionStageResultDTO
-  StageProjection(const NativeProjectionStageDTO &request) = 0;
-
-  [[nodiscard]] virtual NativeProjectionActivationResultDTO
-  ActivateStagedProjection(const NativeProjectionActivationDTO &request) = 0;
-
-  [[nodiscard]] virtual NativeProjectionRetireResultDTO
-  RetireProjection(const NativeProjectionRetireDTO &request) = 0;
-
-  [[nodiscard]] virtual NativeProjectionRetireStatusDTO ProjectionRetireStatus(
-      const NativeProjectionRetireStatusQueryDTO &query) const = 0;
-
-  [[nodiscard]] virtual NativeProjectionDiscardResultDTO
-  DiscardStagedProjection(const NativeProjectionDiscardDTO &request) = 0;
-
-  [[nodiscard]] virtual NativeProjectionStatusDTO
-  ProjectionStageStatus(const NativeProjectionStatusQueryDTO &query) const = 0;
 
   [[nodiscard]] virtual Result<SceneFrameResolutionReceiptDTO>
   ResolveSceneFrame(const SceneFrameResolutionQueryDTO &) const {

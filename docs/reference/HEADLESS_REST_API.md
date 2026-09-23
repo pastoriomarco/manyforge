@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-09-17 18:47:20 UTC
+  Last regenerated: 2026-09-23 05:29:42 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -125,6 +125,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 
 | Method | Path | Tag | Summary |
 |---|---|---|---|
+| `POST` | `/api/activation-preparations` |  | Prepare Activation |
 | `GET` | `/api/assistant/modes` |  | Assistant Modes |
 | `GET` | `/api/assistant/modes/{mode_id}` |  | Assistant Mode |
 | `GET` | `/api/assistant/modes/{mode_id}/context` |  | Assistant Mode Context |
@@ -181,14 +182,12 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/health` |  | Health |
 | `POST` | `/api/manager/apply` |  | Manager Apply |
 | `GET` | `/api/manager/apply/status` |  | Manager Apply Status |
-| `POST` | `/api/manager/deployment-candidates/compile` |  | Compile Deployment Candidate |
 | `POST` | `/api/manager/deployment-candidates/preview` |  | Manager Deployment Candidate Preview |
 | `GET` | `/api/manager/diff` |  | Manager Diff |
 | `GET` | `/api/manager/graph` |  | Manager Graph |
 | `GET` | `/api/manager/status` |  | Manager Status |
 | `GET` | `/api/node-environment` |  | Node Environment |
 | `GET` | `/api/program/applied` |  | Program Applied |
-| `POST` | `/api/program/apply` |  | Program Apply |
 | `POST` | `/api/program/authoring-transactions` |  | Acquire Authoring Transaction |
 | `POST` | `/api/program/authoring-transactions/reconcile-owner` |  | Reconcile Authoring Owner |
 | `POST` | `/api/program/authoring-transactions/recovery-receipt` |  | Recover Authoring Transaction |
@@ -217,9 +216,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/runs/{program_run_id}/stop` |  | Program Run Stop |
 | `POST` | `/api/program/scene-preparations` |  | Program Scene Prepare |
 | `GET` | `/api/runtime` |  | Runtime |
-| `GET` | `/api/scenarios` |  | Scenarios |
-| `GET` | `/api/scenarios/{scenario_id}/load-selection` |  | Scenario Load Selection |
-| `GET` | `/api/scenarios/{scenario_id}/program-selection` |  | Scenario Program Selection |
 | `GET` | `/api/scene` |  | Scene |
 | `POST` | `/api/scene/resource-poses/query` |  | Scene Resource Poses |
 | `POST` | `/api/scene/transactions` |  | Scene Commit |

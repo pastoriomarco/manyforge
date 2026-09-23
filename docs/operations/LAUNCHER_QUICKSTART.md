@@ -695,7 +695,7 @@ ______________________________________________________________________
   launcher, Composer, and assistant. Then update the "Interactive wizard"
   sample above and the smoke-test matrix in Step 3 when the new combination is
   part of the maintained operator set. See
-  [`EXAMPLES_CATALOG.md`](EXAMPLES_CATALOG.md#adding-a-new-scenario).
+  [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md).
 - **Add a new lane or assistant value**: bigger surgery —
   use the captured `scripts/launch.sh` wizard, `scripts/lib/compose.sh`
   profile map, and deleted `scripts/lib/preflight.sh` port-owner table only as

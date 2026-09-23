@@ -58,7 +58,6 @@ class HeadlessApiConfig:
     projection_root: Path
     install_root: Path
     artifact_root: Path
-    program_selection_state_root: Path
     node_catalog_path: Path
     node_environment_manifest_path: Path
     alarm_catalog_path: Path
@@ -87,6 +86,7 @@ class HeadlessApiConfig:
     program_runner_timeout_seconds: float = 30.0
     activation_preparer_path: Path | None = None
     activation_preparer_capability_root: Path | None = None
+    activation_preparer_activation_root: Path | None = None
     activation_preparer_timeout_seconds: float = 120.0
 
     def __post_init__(self) -> None:
@@ -94,7 +94,6 @@ class HeadlessApiConfig:
             self.projection_root,
             self.install_root,
             self.artifact_root,
-            self.program_selection_state_root,
             self.node_catalog_path,
             self.node_environment_manifest_path,
             self.alarm_catalog_path,
@@ -179,6 +178,7 @@ class HeadlessApiConfig:
         preparer_parts = (
             self.activation_preparer_path is not None,
             self.activation_preparer_capability_root is not None,
+            self.activation_preparer_activation_root is not None,
         )
         preparer_configured = all(preparer_parts)
         if any(preparer_parts) and not preparer_configured:
@@ -188,9 +188,11 @@ class HeadlessApiConfig:
         if preparer_configured:
             assert self.activation_preparer_path is not None
             assert self.activation_preparer_capability_root is not None
+            assert self.activation_preparer_activation_root is not None
             preparer_paths = (
                 self.activation_preparer_path,
                 self.activation_preparer_capability_root,
+                self.activation_preparer_activation_root,
             )
             if any(not path.is_absolute() for path in preparer_paths):
                 raise ValueError("Activation preparer capabilities must be absolute")
@@ -227,36 +229,6 @@ class HeadlessCorePort(Protocol):
     def source_model_context(self) -> dict[str, Any]: ...
 
     def assistant_mode_context(self, mode_id: str) -> dict[str, Any]: ...
-
-    def scenario_catalog_projection(self) -> dict[str, Any]: ...
-
-    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]: ...
-
-    def prepare_program_apply(
-        self,
-        scenario_id: str,
-        scenario_catalog_revision: str,
-        program: dict[str, Any],
-    ) -> dict[str, Any]: ...
-
-    def replay_program_apply(
-        self,
-        scenario_id: str,
-        scenario_catalog_revision: str,
-        program_id: str,
-        program_revision: str,
-        expected_applied_record_digest: str | None,
-        request_owner_epoch: str,
-        request_id: str,
-    ) -> dict[str, Any] | None: ...
-
-    def commit_program_apply(
-        self,
-        preparation: dict[str, Any],
-        expected_applied_record_digest: str | None,
-        request_owner_epoch: str,
-        request_id: str,
-    ) -> dict[str, Any]: ...
 
     def applied_program_selection(self) -> dict[str, Any]: ...
 
@@ -381,7 +353,6 @@ class NativeHeadlessCore:
                 str(config.projection_root),
                 str(config.install_root),
                 str(config.artifact_root),
-                str(config.program_selection_state_root),
                 str(config.node_catalog_path),
                 str(config.node_environment_manifest_path),
                 str(config.alarm_catalog_path),
@@ -613,95 +584,6 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("assistant_mode_context", mode_id),
             method="assistant_mode_context",
-        )
-
-    def scenario_catalog_projection(self) -> dict[str, Any]:
-        return self._require_object(
-            self._invoke("scenario_catalog_projection"),
-            method="scenario_catalog_projection",
-        )
-
-    def scenario_program_selection(self, scenario_id: str) -> dict[str, Any]:
-        return self._require_object(
-            self._invoke("scenario_program_selection", scenario_id),
-            method="scenario_program_selection",
-        )
-
-    @staticmethod
-    def _canonical_object(value: dict[str, Any], *, label: str) -> str:
-        try:
-            encoded = rfc8785.dumps(value)
-        except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
-            raise HeadlessApiError(
-                "program_apply_request_invalid",
-                f"{label} is not canonically encodable: {exc}",
-            ) from exc
-        if len(encoded) > MAX_PROGRAM_APPLY_REQUEST_BYTES:
-            raise HeadlessApiError(
-                "program_apply_request_oversized",
-                f"{label} exceeds the Program Apply byte bound",
-            )
-        return encoded.decode("utf-8", errors="strict")
-
-    def prepare_program_apply(
-        self,
-        scenario_id: str,
-        scenario_catalog_revision: str,
-        program: dict[str, Any],
-    ) -> dict[str, Any]:
-        return self._require_object(
-            self._invoke(
-                "prepare_program_apply",
-                scenario_id,
-                scenario_catalog_revision,
-                self._canonical_object(program, label="Program Apply candidate"),
-            ),
-            method="prepare_program_apply",
-        )
-
-    def replay_program_apply(
-        self,
-        scenario_id: str,
-        scenario_catalog_revision: str,
-        program_id: str,
-        program_revision: str,
-        expected_applied_record_digest: str | None,
-        request_owner_epoch: str,
-        request_id: str,
-    ) -> dict[str, Any] | None:
-        value = self._invoke(
-            "replay_program_apply",
-            scenario_id,
-            scenario_catalog_revision,
-            program_id,
-            program_revision,
-            expected_applied_record_digest,
-            request_owner_epoch,
-            request_id,
-        )
-        if value is None:
-            return None
-        return self._require_object(value, method="replay_program_apply")
-
-    def commit_program_apply(
-        self,
-        preparation: dict[str, Any],
-        expected_applied_record_digest: str | None,
-        request_owner_epoch: str,
-        request_id: str,
-    ) -> dict[str, Any]:
-        return self._require_object(
-            self._invoke(
-                "commit_program_apply",
-                self._canonical_object(
-                    preparation,
-                    label="Program Apply preparation",
-                ),
-                expected_applied_record_digest,
-                request_owner_epoch,
-                request_id,
-            ),
-            method="commit_program_apply",
         )
 
     def applied_program_selection(self) -> dict[str, Any]:

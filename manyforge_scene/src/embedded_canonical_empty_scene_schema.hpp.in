@@ -16,4 +16,7 @@ inline constexpr std::string_view kEmbeddedNativeProjectionHandoffMigration =
 inline constexpr std::string_view kEmbeddedBoundedHistoryMigration =
     R"mf_bhm(@MANYFORGE_BOUNDED_HISTORY_MIGRATION_SQL@)mf_bhm";
 
+inline constexpr std::string_view kEmbeddedMaintenanceInitializationMigration =
+    R"mf_mim(@MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION_SQL@)mf_mim";
+
 }  // namespace manyforge::scene::detail

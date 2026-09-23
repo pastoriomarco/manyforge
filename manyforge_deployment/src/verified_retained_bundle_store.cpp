@@ -167,18 +167,18 @@ read_verified_bundle_entry(const std::filesystem::path &bundle_data,
 }
 
 [[nodiscard]] std::optional<std::filesystem::path>
-normalize_candidate_package_root(
-    std::optional<std::filesystem::path> candidate_package_root) {
-  if (!candidate_package_root.has_value()) {
+normalize_activation_root(
+    std::optional<std::filesystem::path> activation_root) {
+  if (!activation_root.has_value()) {
     return std::nullopt;
   }
   return posix::normalize_existing_plain_root(
-      *candidate_package_root, kPosixErrors, kTrustedRootMessages);
+      *activation_root, kPosixErrors, kTrustedRootMessages);
 }
 
 [[nodiscard]] const std::filesystem::path &select_package_root(
     const std::filesystem::path &installed_package_root,
-    const std::optional<std::filesystem::path> &candidate_package_root,
+    const std::optional<std::filesystem::path> &activation_root,
     const core::RetainedBundleId &retained_bundle_id) {
   const auto hex = detail::retained_digest_hex(retained_bundle_id.value());
   if (!hex.has_value()) {
@@ -209,9 +209,9 @@ normalize_candidate_package_root(
   if (contains_bundle(installed_package_root, "installed")) {
     return installed_package_root;
   }
-  if (candidate_package_root.has_value() &&
-      contains_bundle(*candidate_package_root, "authored")) {
-    return *candidate_package_root;
+  if (activation_root.has_value() &&
+      contains_bundle(*activation_root, "authored")) {
+    return *activation_root;
   }
   return installed_package_root;
 }
@@ -2334,11 +2334,11 @@ FilesystemVerifiedProgramBindingSource::get_verified(
 
 FilesystemVerifiedRetainedBundleSource::FilesystemVerifiedRetainedBundleSource(
     std::filesystem::path trusted_package_root,
-    std::optional<std::filesystem::path> candidate_package_root)
+    std::optional<std::filesystem::path> activation_root)
     : trusted_package_root_(posix::normalize_existing_plain_root(
           trusted_package_root, kPosixErrors, kTrustedRootMessages)),
-      candidate_package_root_(
-          normalize_candidate_package_root(std::move(candidate_package_root))) {
+      activation_root_(
+          normalize_activation_root(std::move(activation_root))) {
   (void)require_read_only_retention_paths(trusted_package_root_);
 }
 
@@ -2346,7 +2346,7 @@ std::shared_ptr<const RetainedBundle>
 FilesystemVerifiedRetainedBundleSource::get_verified(
     const core::RetainedBundleId &retained_bundle_id) const {
   const std::filesystem::path current_root = require_unchanged_trusted_root(
-      select_package_root(trusted_package_root_, candidate_package_root_,
+      select_package_root(trusted_package_root_, activation_root_,
                           retained_bundle_id),
       "read-only retained-bundle");
   const ReadOnlyRetentionPaths paths =
@@ -2363,11 +2363,11 @@ FilesystemVerifiedRetainedBundleSource::get_verified(
 FilesystemVerifiedRetainedProductArtifactSource::
     FilesystemVerifiedRetainedProductArtifactSource(
         std::filesystem::path trusted_package_root,
-        std::optional<std::filesystem::path> candidate_package_root)
+        std::optional<std::filesystem::path> activation_root)
     : trusted_package_root_(posix::normalize_existing_plain_root(
           trusted_package_root, kPosixErrors, kTrustedRootMessages)),
-      candidate_package_root_(
-          normalize_candidate_package_root(std::move(candidate_package_root))) {
+      activation_root_(
+          normalize_activation_root(std::move(activation_root))) {
   (void)require_read_only_retention_paths(trusted_package_root_);
 }
 
@@ -2430,7 +2430,7 @@ std::optional<VerifiedRetainedProductArtifact>
 FilesystemVerifiedRetainedProductArtifactSource::get_verified(
     const RetainedProductArtifactQuery &query) const {
   const std::filesystem::path current_root = require_unchanged_trusted_root(
-      select_package_root(trusted_package_root_, candidate_package_root_,
+      select_package_root(trusted_package_root_, activation_root_,
                           query.retained_bundle_id),
       "read-only retained-product");
   const ReadOnlyRetentionPaths paths =
@@ -2696,11 +2696,11 @@ verify_reference_runtime_unit_product(
 FilesystemVerifiedRetainedModelMapSource::
     FilesystemVerifiedRetainedModelMapSource(
         std::filesystem::path trusted_package_root,
-        std::optional<std::filesystem::path> candidate_package_root)
+        std::optional<std::filesystem::path> activation_root)
     : trusted_package_root_(posix::normalize_existing_plain_root(
           trusted_package_root, kPosixErrors, kTrustedRootMessages)),
-      candidate_package_root_(
-          normalize_candidate_package_root(std::move(candidate_package_root))) {
+      activation_root_(
+          normalize_activation_root(std::move(activation_root))) {
   (void)require_read_only_retention_paths(trusted_package_root_);
 }
 
@@ -2708,7 +2708,7 @@ std::optional<VerifiedRetainedModelMap>
 FilesystemVerifiedRetainedModelMapSource::get_verified(
     const RetainedModelMapQuery &query) const {
   const std::filesystem::path current_root = require_unchanged_trusted_root(
-      select_package_root(trusted_package_root_, candidate_package_root_,
+      select_package_root(trusted_package_root_, activation_root_,
                           query.retained_bundle_id),
       "read-only retained model-map");
   const ReadOnlyRetentionPaths paths =
@@ -2852,11 +2852,11 @@ FilesystemVerifiedRetainedPlanningModelSource::get_verified(
 FilesystemVerifiedRetainedViewerModelSource::
     FilesystemVerifiedRetainedViewerModelSource(
         std::filesystem::path trusted_package_root,
-        std::optional<std::filesystem::path> candidate_package_root)
+        std::optional<std::filesystem::path> activation_root)
     : trusted_package_root_(posix::normalize_existing_plain_root(
           trusted_package_root, kPosixErrors, kTrustedRootMessages)),
-      candidate_package_root_(
-          normalize_candidate_package_root(std::move(candidate_package_root))) {
+      activation_root_(
+          normalize_activation_root(std::move(activation_root))) {
   (void)require_read_only_retention_paths(trusted_package_root_);
 }
 
@@ -2864,7 +2864,7 @@ std::optional<VerifiedRetainedViewerModel>
 FilesystemVerifiedRetainedViewerModelSource::get_verified(
     const RetainedViewerModelQuery &query) const {
   const std::filesystem::path current_root = require_unchanged_trusted_root(
-      select_package_root(trusted_package_root_, candidate_package_root_,
+      select_package_root(trusted_package_root_, activation_root_,
                           query.retained_bundle_id),
       "read-only retained viewer-model");
   const ReadOnlyRetentionPaths paths =

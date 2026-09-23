@@ -31,7 +31,6 @@ class ProgramNodeAvailabilityRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     applied: dict[str, Any]
-    selection: dict[str, Any]
 
 
 __all__ = [

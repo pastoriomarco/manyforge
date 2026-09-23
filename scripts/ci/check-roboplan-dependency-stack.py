@@ -118,11 +118,23 @@ def _roboplan_installation(
             + ", ".join(str(path) for path in sorted(roots))
         )
 
-    root = roots.pop()
-    selected_libraries = [root / "lib" / name for name in ROBOPLAN_LIBRARIES]
-    for library in selected_libraries:
-        if not library.is_file() or library.resolve() not in recorded:
-            raise RuntimeError(f"unrecorded or missing RoboPlan library: {library}")
+    roots.pop()
+    selected_libraries: list[Path] = []
+    for name in ROBOPLAN_LIBRARIES:
+        matches = sorted(path for path in recorded if path.name == name and path.is_file())
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"expected one recorded RoboPlan library named {name}, found "
+                + ", ".join(str(path) for path in matches)
+            )
+        selected_libraries.append(matches[0])
+    library_roots = {path.parent.resolve() for path in selected_libraries}
+    if len(library_roots) != 1:
+        raise RuntimeError(
+            "expected one recorded RoboPlan library root, found "
+            + ", ".join(str(path) for path in sorted(library_roots))
+        )
+    library_root = library_roots.pop()
 
     for module in native_modules:
         raw_path = getattr(module, "__file__", None)
@@ -143,12 +155,12 @@ def _roboplan_installation(
             )
 
     system_duplicates = sorted(Path("/usr/local/lib").glob("libroboplan*.so*"))
-    if system_duplicates and (root / "lib").resolve() != Path("/usr/local/lib"):
+    if system_duplicates and library_root != Path("/usr/local/lib"):
         raise RuntimeError(
             "competing RoboPlan libraries exist outside the selected distribution: "
             + ", ".join(str(path) for path in system_duplicates)
         )
-    return (root / "lib").resolve(), [path.resolve() for path in selected_libraries]
+    return library_root, [path.resolve() for path in selected_libraries]
 
 
 def _check_linkage(

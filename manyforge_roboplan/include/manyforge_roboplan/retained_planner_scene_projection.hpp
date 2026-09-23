@@ -61,10 +61,8 @@ public:
           nullptr);
 
   /// Preload one exact candidate structural model while the current
-  /// projection remains active. This is a host-internal staged-ready step,
-  /// not part of the logical-scene projection port: StageProjection still
-  /// consumes only the owner-issued frozen scene and retained product
-  /// identity and never resolves deployment artifacts itself.
+  /// projection remains active. The next exact RebuildProjection consumes
+  /// this host-internal preparation without resolving deployment artifacts.
   [[nodiscard]] core::Result<void> PrepareCandidateProjection(
       RetainedCollisionWorldProjector candidate_projector,
       core::RetainedProductDTO candidate_planning_collision_model,
@@ -72,10 +70,8 @@ public:
           candidate_frame_resolver = nullptr);
 
   /// Install the direct-provider resolver assembled by the exact active
-  /// physical composition. A command-fenced candidate is staged without any
-  /// frame resolver or fabricated state. The caller performs this once while
-  /// the Apply configuration fence is held, after candidate participants are
-  /// installed and before command admission opens.
+  /// physical composition. The caller performs this once while command
+  /// admission is closed, after candidate participants are installed.
   [[nodiscard]] core::Result<void> InstallActiveFrameResolver(
       const core::ProjectionRevisionDTO &expected_active_revision,
       std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver);
@@ -96,19 +92,6 @@ public:
   [[nodiscard]] core::NativeProjectionBootstrapStatusDTO
   BootstrapProjectionStatus(const core::NativeProjectionBootstrapStatusQueryDTO
                                 &query) const override;
-  [[nodiscard]] core::NativeProjectionStageResultDTO
-  StageProjection(const core::NativeProjectionStageDTO &request) override;
-  [[nodiscard]] core::NativeProjectionActivationResultDTO
-  ActivateStagedProjection(
-      const core::NativeProjectionActivationDTO &request) override;
-  [[nodiscard]] core::NativeProjectionRetireResultDTO
-  RetireProjection(const core::NativeProjectionRetireDTO &request) override;
-  [[nodiscard]] core::NativeProjectionRetireStatusDTO ProjectionRetireStatus(
-      const core::NativeProjectionRetireStatusQueryDTO &query) const override;
-  [[nodiscard]] core::NativeProjectionDiscardResultDTO DiscardStagedProjection(
-      const core::NativeProjectionDiscardDTO &request) override;
-  [[nodiscard]] core::NativeProjectionStatusDTO ProjectionStageStatus(
-      const core::NativeProjectionStatusQueryDTO &query) const override;
   [[nodiscard]] core::Result<core::SceneFrameResolutionReceiptDTO>
   ResolveSceneFrame(
       const core::SceneFrameResolutionQueryDTO &query) const override;
@@ -167,46 +150,6 @@ private:
     kBootstrap,
   };
 
-  /// Terminal record for the one native stage that owns this runtime.
-  ///
-  /// It is the bounded replay record for Stage, activation, status and discard.
-  /// A confirmed discard or a consumed activation releases every heavy capture
-  /// - the candidate projector with its shared collision model, the candidate
-  /// planning collision model, the candidate frame resolver and the candidate
-  /// publisher - while the exact identity and the one stored result stay
-  /// available, so replay describes what happened instead of depending on a
-  /// candidate that can no longer be published.
-  struct StageRecord final {
-    core::NativeProjectionStageDTO request;
-    std::optional<RetainedCollisionWorldProjector> candidate_projector;
-    std::optional<core::RetainedProductDTO> candidate_planning_collision_model;
-    std::shared_ptr<const RetainedSceneFrameResolver> candidate_frame_resolver;
-    std::shared_ptr<RetainedCollisionWorldPublisher> candidate_publisher;
-    core::NativeProjectionStageResultDTO stage_result;
-    bool activated{};
-    bool discarded{};
-
-    /// Drops everything except the exact identity and the stored result.
-    void ReleaseCaptures() {
-      candidate_projector.reset();
-      candidate_planning_collision_model.reset();
-      candidate_frame_resolver.reset();
-      candidate_publisher.reset();
-    }
-
-    /// The staged-candidate identity this record was created for.
-    [[nodiscard]] core::ProjectionStagedCandidateDTO staged_candidate() const {
-      return {request.apply_id, request.apply_generation,
-              request.projection_stage_generation,
-              request.candidate_projection_revision};
-    }
-  };
-
-  struct RetireRecord final {
-    core::NativeProjectionRetireDTO request;
-    core::NativeProjectionRetireResultDTO result;
-  };
-
   struct RetainedProjectionLease final {
     std::shared_ptr<RetainedCollisionWorldPublisher> publisher;
     std::int64_t captured_at_ns{};
@@ -234,13 +177,6 @@ private:
                 core::ErrorDTO error);
   [[nodiscard]] bool
   HealthyAt(const core::ProjectionRevisionDTO &revision) const noexcept;
-  /// True when the retained StageRecord can still be honored as staged: it is
-  /// either already activated - a historical truth whose duplicate captures
-  /// have been released - or its candidate publisher is still the one the
-  /// health row publishes. A confirmed discard or a recovery Rebuild that
-  /// replaced the staged candidate makes this false, so no observation path can
-  /// reconstruct a Staged success for a candidate that can never publish.
-  [[nodiscard]] bool RetainedStageReplayable() const;
   [[nodiscard]] core::ProjectionCommitResultDTO
   RebuildProjectionLocked(
       const core::NativeProjectionRebuildDTO &request,
@@ -268,8 +204,6 @@ private:
   std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_snapshot_;
   std::map<std::uint64_t, TransactionRecord> transaction_records_;
   std::optional<BootstrapRecord> bootstrap_record_;
-  std::optional<StageRecord> stage_record_;
-  std::optional<RetireRecord> retire_record_;
   std::map<core::ProjectionLeaseId, RetainedProjectionLease>
       retained_lease_publishers_;
   std::deque<core::ProjectionLeaseId> retained_lease_order_;

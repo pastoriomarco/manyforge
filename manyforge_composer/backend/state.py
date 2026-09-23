@@ -68,7 +68,7 @@ RUNTIME_UNAVAILABLE_MESSAGE = (
 
 _CURRENT_SCENARIO_FIELDS = (
     "scenario_id",
-    "scenario_catalog_revision",
+    "source_document_digest",
     "deployment_artifact_id",
     "deployment_revision",
     "retained_bundle_id",
@@ -79,6 +79,7 @@ _CURRENT_SCENARIO_FIELDS = (
 )
 _PREPARED_ACTIVATION_FIELDS = (
     "prepared_activation_id",
+    "scenario_id",
     "source_document_digest",
     "captured_input_digest",
     "deployment_artifact_id",
@@ -212,32 +213,15 @@ class ComposerState:
     def node_catalog(self):
         return self.node_environment.catalog
 
-    # -- temporary migration shims (UA2D.2) -------------------------------
-    # The Scenario project facts now live in the composite workspace owner.
-    # These accessors keep the writers that have not migrated yet working: the
-    # Composer Scenario-document and Deployment-candidate paths migrate in
-    # UA2D.5, the external Scenario-load publication in UA3. Each accessor is
-    # deleted with its last caller.
-    #
-    # A legacy writer that assigns several fields for one logical operation
-    # produces more than one composite advance until its substep collapses the
-    # operation into a single commit. That is conservative: the composite
-    # revision is a staleness fence, so an extra advance only makes one more
-    # client refresh, while a missed advance would be a correctness defect. No
-    # consumer may read ``workspace_revision`` as a count of user changes.
+    # Scenario project facts are read-only projections of the one composite
+    # authoring workspace. Writers commit through AuthoringWorkspace so one
+    # logical mutation advances the shared revision exactly once.
     def _authoring_project_fact(self, name: str) -> Any:
         return self.authoring_workspace.project_facts()[name]
-
-    def _set_authoring_project_fact(self, name: str, value: Any) -> None:
-        self.authoring_workspace.migrate_project_facts({name: value})
 
     @property
     def scenario_document_path(self) -> str | None:
         return self._authoring_project_fact("document_path")
-
-    @scenario_document_path.setter
-    def scenario_document_path(self, value: str | None) -> None:
-        self._set_authoring_project_fact("document_path", value)
 
     @property
     def scenario_document_id(self) -> str | None:
@@ -259,43 +243,21 @@ class ComposerState:
     def scenario_source_document_digest(self) -> str | None:
         return self._authoring_project_fact("source_document_digest")
 
-    @scenario_source_document_digest.setter
-    def scenario_source_document_digest(self, value: str | None) -> None:
-        self._set_authoring_project_fact("source_document_digest", value)
-
     @property
     def scenario_program_role_assignment(self) -> dict[str, Any] | None:
         return self._authoring_project_fact("program_role_assignment")
-
-    @scenario_program_role_assignment.setter
-    def scenario_program_role_assignment(
-        self, value: dict[str, Any] | None
-    ) -> None:
-        self._set_authoring_project_fact("program_role_assignment", value)
 
     @property
     def scenario_typed_parameter_overrides(self) -> dict[str, Any]:
         return self._authoring_project_fact("typed_parameter_overrides")
 
-    @scenario_typed_parameter_overrides.setter
-    def scenario_typed_parameter_overrides(self, value: dict[str, Any]) -> None:
-        self._set_authoring_project_fact("typed_parameter_overrides", value)
-
     @property
     def scenario_source_program_digest(self) -> str | None:
         return self._authoring_project_fact("source_program_digest")
 
-    @scenario_source_program_digest.setter
-    def scenario_source_program_digest(self, value: str | None) -> None:
-        self._set_authoring_project_fact("source_program_digest", value)
-
     @property
     def scenario_source_deployment_digest(self) -> str | None:
         return self._authoring_project_fact("source_deployment_digest")
-
-    @scenario_source_deployment_digest.setter
-    def scenario_source_deployment_digest(self, value: str | None) -> None:
-        self._set_authoring_project_fact("source_deployment_digest", value)
 
     def remember_scenario_document(
         self,
@@ -650,6 +612,7 @@ class ComposerState:
         response = self.headless_client.prepare_activation(
             {
                 "source_document_digest": intent["source_document_digest"],
+                "scenario_id": intent["scenario_id"],
                 "captured_input_digest": intent["captured_input_digest"],
                 "deployment": deepcopy(intent["deployment"]),
                 "model_source_closure": deepcopy(intent["model_source_closure"]),
@@ -765,21 +728,8 @@ class ComposerState:
                 "expected_current": receipt["expected_current"],
                 "reject_if_affected_busy": True,
                 "prepared_activation": {
-                    "captured_input_digest": prepared_activation[
-                        "captured_input_digest"
-                    ],
-                    "deployment_artifact_id": prepared_activation[
-                        "deployment_artifact_id"
-                    ],
-                    "deployment_revision": prepared_activation[
-                        "deployment_revision"
-                    ],
-                    "program_binding_id": prepared_activation[
-                        "program_binding_id"
-                    ],
-                    "prepared_activation_id": prepared_activation[
-                        "prepared_activation_id"
-                    ],
+                    field: deepcopy(prepared_activation[field])
+                    for field in _PREPARED_ACTIVATION_FIELDS
                 },
                 "expected_admission_generation": intent[
                     "expected_admission_generation"
@@ -814,7 +764,7 @@ class ComposerState:
         prepared: dict[str, Any] | None = None,
         prepare_only: bool = False,
     ) -> dict[str, Any]:
-        """Prepare one candidate; UA3 owns the runtime transition."""
+        """Prepare or submit one candidate to Manager's transition owner."""
 
         if self.headless_client is None:
             raise AuthoringOperationError(
@@ -869,7 +819,6 @@ class ComposerState:
                 "prepared_activation": prepared_activation,
                 "candidate_preview": preview,
                 "manager_apply": None,
-                "selection": None,
                 "preparation": preparation,
                 "phases_ms": phases,
                 "apply_id": None,
@@ -881,7 +830,6 @@ class ComposerState:
                 "prepared_activation": prepared_activation,
                 "candidate_preview": preview,
                 "manager_apply": None,
-                "selection": None,
                 "preparation": None,
                 "phases_ms": phases,
                 "apply_id": None,
@@ -895,7 +843,6 @@ class ComposerState:
                 "prepared_activation": prepared_activation,
                 "candidate_preview": preview,
                 "manager_apply": None,
-                "selection": deepcopy(prepared_activation),
                 "preparation": None,
                 "phases_ms": phases,
                 "apply_id": None,
@@ -909,7 +856,6 @@ class ComposerState:
             "prepared_activation": prepared_activation,
             "candidate_preview": preview,
             "manager_apply": manager_result,
-            "selection": None,
             "preparation": None,
             "phases_ms": phases,
             "apply_id": manager_result.get("apply_id"),

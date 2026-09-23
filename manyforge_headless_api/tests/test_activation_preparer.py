@@ -47,7 +47,6 @@ def test_headless_config_accepts_source_owned_activation_preparer(
         projection_root=root / "projection",
         install_root=root / "install",
         artifact_root=root / "artifacts",
-        program_selection_state_root=root / "program-selection",
         node_catalog_path=root / "node-catalog.yaml",
         node_environment_manifest_path=root / "node-environment.yaml",
         alarm_catalog_path=root / "alarm-catalog.yaml",
@@ -57,6 +56,7 @@ def test_headless_config_accepts_source_owned_activation_preparer(
         cell_id="cell_a",
         activation_preparer_path=root / "preparer",
         activation_preparer_capability_root=root / "capabilities",
+        activation_preparer_activation_root=root / "artifacts",
     )
 
     assert config.activation_preparer_capability_root == root / "capabilities"
@@ -70,6 +70,7 @@ def _preparer(tmp_path: Path) -> ActivationPreparer:
     return ActivationPreparer(
         executable=executable,
         capability_root=capabilities,
+        activation_root=tmp_path / "artifacts",
         timeout_seconds=3.0,
     )
 
@@ -78,6 +79,7 @@ def _result() -> dict[str, object]:
     identity: dict[str, object] = {
         "schema_version": "manyforge.prepared_activation_input.v2",
         "source_document_digest": _DIGEST,
+        "scenario_id": "scenario_a",
         "captured_input_digest": _DIGEST,
         "deployment_artifact_id": "cell_a",
         "deployment_revision": _DIGEST,
@@ -118,6 +120,7 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
     monkeypatch.setattr(subprocess, "run", run)
     result = preparer.prepare(
         source_document_digest=_DIGEST,
+        scenario_id="scenario_a",
         captured_input_digest=_DIGEST,
         deployment={"z": 1, "a": "deployment"},
         model_source_closure=_CLOSURE,
@@ -132,6 +135,7 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
     assert observed["input"] == {
         "schema_version": "manyforge.activation_preparation_request.v1",
         "source_document_digest": _DIGEST,
+        "scenario_id": "scenario_a",
         "captured_input_digest": _DIGEST,
         "deployment": {"a": "deployment", "z": 1},
         "model_source_closure": _CLOSURE,

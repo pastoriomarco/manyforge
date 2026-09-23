@@ -123,7 +123,7 @@
       "identity": {
         "commit": "099dfa5ccd80b191eb3d6da9f4795f808a63913f",
         "source_content_sha256": "d117c17658a0765f66c39187739e7af4b6533dac68a8aeb5f7dabc3b8fc67bef",
-        "build_content_sha256": "f1da8fab0782f5114b88ff20da36bf51ceddb483f46c78819de4c0b23d34e777",
+        "build_content_sha256": "3795ce3459edea67cf83140c2bff2689681e5d39e7b63280730fd41d66929513",
         "git_archive_sha256": "189ba1dccb9d30c0dd2cc7fbfcc4de0d710060cf56c36dd1a2144a904cf27345",
         "tree": "3ce46cce8b51b21a0eb7b803858cb0750524e5be",
         "version": "0.7.0"

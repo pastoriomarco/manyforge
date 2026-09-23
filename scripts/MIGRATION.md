@@ -62,33 +62,14 @@ old demos:
   force the non-TTY codepath (no ANSI, periodic reprints every 30 s)
   for CI / log capture.
 
-## 2. Preserved through aliases
+## 2. Scenario launcher aliases removed
 
-Scenario names were renamed to descriptive canonical forms that
-include the robot model and workflow. Every previous short name still
-resolves through an alias table in `scripts/lib/scenarios.sh`, with a
-**one-time deprecation warning per launch invocation** pointing at the
-canonical name. The launcher's review-gate summary and the "to
-reproduce non-interactively" hint also canonicalise the chosen name,
-so copy-pasting the launcher's own output never propagates the old
-alias forward.
-
-| Deprecated alias      | Canonical name                      |
-| --------------------- | ----------------------------------- |
-| `pick-place`          | `ur5-pick-place`                    |
-| `ur10e`               | `ur10e-pick-place`                  |
-| `shape-pick`          | `ur5-semantic-shape-pick`           |
-| `vision-pose`         | `ur5-vision-pose-pick`              |
-| `assistant-authoring` | `ur10e-scene-authoring`             |
-| `isaac-light`         | `isaac-ur10e-light-scene`           |
-| `isaac-assistant`     | `isaac-ur10e-light-scene-assistant` |
-
-The new `ur5-simple-pick-place` scenario (from `demo.sh --simple`) was
-introduced canonical-from-day-one and has no alias entry.
-
-Old runbooks keep working unchanged. Operators see the warning, and
-the launcher hint they copy points at the canonical name — so
-migration happens passively as scripts get touched.
+The former built-in Scenario catalog and its short-name aliases were removed.
+Startup now accepts an optional Scenario project path through the ordinary
+document workflow; starting without a selected Scenario is valid. Update old
+runbooks to pass a project path instead of names such as `pick-place`, `ur10e`
+or `isaac-light`. No runtime alias table or implicit latest-scenario selection
+remains.
 
 ## 3. Replaced
 

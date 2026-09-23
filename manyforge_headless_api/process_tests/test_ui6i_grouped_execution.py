@@ -34,17 +34,18 @@ def _dual_robot_stack() -> Iterator[ProcessStack]:
     # short regardless of pytest's descriptive test-directory names.
     with TemporaryDirectory(prefix="mf-ui6i-") as temporary_root:
         root = Path(temporary_root)
-        source = _required_path("MANYFORGE_UI6I_DUAL_SCENARIO_PACKAGE_ROOT")
-        package = root / "retained-package"
-        shutil.copytree(source, package)
+        source = _required_path("MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT")
+        examples = _required_path("MANYFORGE_EXAMPLE_SCENARIO_ROOT")
+        bootstrap = root / "cell-bootstrap"
+        shutil.copytree(source, bootstrap)
         stack_root = root / "stack"
         stack_root.mkdir()
-        with _read_only_tree(package):
+        with _read_only_tree(bootstrap):
             stack = ProcessStack(
                 stack_root,
-                package_root=package,
+                package_root=bootstrap,
                 cell_id=CELL_ID,
-                composer_fs_roots=(stack_root,),
+                composer_fs_roots=(examples, stack_root),
                 freshness_milliseconds=120_000,
                 enable_program_runner=True,
             )
@@ -101,6 +102,7 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
                         ],
                         "path": rows[scenario_id]["path"],
                         "confirmDiscard": False,
+                        "activate": True,
                     },
                 )
                 break
@@ -112,15 +114,35 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
                 ):
                     raise
                 draft = composer.request("GET", "/api/program/draft")
-        assert loaded["status"] == "opened"
+        assert loaded["status"] == "accepted"
         assert loaded["path"] == rows[scenario_id]["path"]
+        activation = loaded["activation"]
+        deadline = time.monotonic() + 30.0
+        with HeadlessHttpClient(
+            stack.base_url, timeout_seconds=10.0
+        ) as headless:
+            while True:
+                status = headless.manager_apply_status(
+                    activation["apply_id"], activation["apply_generation"]
+                )
+                if status["state"] != "pending":
+                    assert status["state"] == "succeeded"
+                    break
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        f"Scenario activation did not settle: {status!r}"
+                    )
+                time.sleep(0.02)
         deployment = composer.request("GET", "/api/deployment/workspace")
         assert deployment["draft"]["document"]["deployment_artifact_id"] == (
             "ur5e_lite6_wall"
         )
         applied = composer.program_applied()
         assert applied["scenario_id"] == scenario_id
-        return applied, scenarios["scenario_catalog_revision"]
+        return (
+            applied,
+            loaded["authoringWorkspace"]["project"]["source_document_digest"],
+        )
 
 
 def _save_and_reopen_current_scenario(
@@ -209,7 +231,7 @@ def _start_run(
     stack: ProcessStack,
     *,
     scenario_id: str,
-    scenario_catalog_revision: str,
+    source_document_digest: str,
     applied: dict[str, Any],
 ) -> dict[str, Any]:
     with HeadlessHttpClient(stack.composer_url, timeout_seconds=20.0) as composer:
@@ -223,7 +245,7 @@ def _start_run(
                         "source_label": "ui6i_grouped_process_test",
                         "correlation_id": f"ui6i.{scenario_id}.run",
                         "scenario_id": scenario_id,
-                        "scenario_catalog_revision": scenario_catalog_revision,
+                        "source_document_digest": source_document_digest,
                         "expected_applied_record_digest": applied["source"][
                             "record_digest"
                         ],
@@ -437,6 +459,44 @@ def _reset_cycle(client: HeadlessHttpClient, program_run_id: str) -> None:
     assert client.program_cycle_status()["state"] == "idle_after_reset"
 
 
+def test_repeated_project_activation_replaces_one_coherent_publication() -> None:
+    with _dual_robot_stack() as stack:
+        observed: list[tuple[str, str, str]] = []
+        for scenario_id in (
+            GROUPED_SCENARIO,
+            ISOLATION_SCENARIO,
+            GROUPED_SCENARIO,
+            ISOLATION_SCENARIO,
+        ):
+            applied, _source_document_digest = _load_scenario(stack, scenario_id)
+            assert applied["scenario_id"] == scenario_id
+            assert applied["deployment_artifact_id"] == "ur5e_lite6_wall"
+            assert applied["program_binding_id"]
+            observed.append(
+                (
+                    applied["scenario_id"],
+                    applied["program_revision"],
+                    applied["program_binding_id"],
+                )
+            )
+            with HeadlessHttpClient(
+                stack.composer_url, timeout_seconds=10.0
+            ) as composer:
+                runtime = composer.runtime()
+                manager = composer.manager_status()["status"]
+            assert runtime["complete"] is True
+            assert manager["active"]["retained_bundle_id"] == applied[
+                "retained_bundle_id"
+            ]
+            assert manager["active"]["graph_revision"] == applied[
+                "graph_revision"
+            ]
+
+        assert observed[0] == observed[2]
+        assert observed[1] == observed[3]
+        assert observed[0] != observed[1]
+
+
 def test_grouped_dual_robot_run_scales_stops_and_resumes() -> None:
     with _dual_robot_stack() as stack:
         applied, catalog_revision = _load_scenario(stack, GROUPED_SCENARIO)
@@ -448,7 +508,7 @@ def test_grouped_dual_robot_run_scales_stops_and_resumes() -> None:
             started = _start_run(
                 stack,
                 scenario_id=GROUPED_SCENARIO,
-                scenario_catalog_revision=catalog_revision,
+                source_document_digest=catalog_revision,
                 applied=applied,
             )
             program_run_id = started["capture"]["program_run_id"]
@@ -523,7 +583,7 @@ def test_separate_group_stop_does_not_stop_the_other_robot() -> None:
             started = _start_run(
                 stack,
                 scenario_id=ISOLATION_SCENARIO,
-                scenario_catalog_revision=catalog_revision,
+                source_document_digest=catalog_revision,
                 applied=applied,
             )
             program_run_id = started["capture"]["program_run_id"]
