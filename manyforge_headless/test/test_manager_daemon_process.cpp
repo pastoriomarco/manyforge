@@ -260,6 +260,9 @@ struct ManagerApplyFixtureMetadata final {
   std::string physical_candidate_retained_bundle_id;
   std::string physical_deployment_artifact_id;
   std::string physical_deployment_revision;
+  std::string program_binding_id;
+  std::string program_id;
+  std::string program_revision;
   std::string predecessor_graph_revision;
   std::string predecessor_retained_bundle_id;
 };
@@ -274,7 +277,7 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
   const std::string bytes{std::istreambuf_iterator<char>(stream),
                           std::istreambuf_iterator<char>()};
   const auto root = deployment::parse_strict_json_model_yaml(bytes).root();
-  if (!root.is_object() || root.as_object().size() != 10U ||
+  if (!root.is_object() || root.as_object().size() != 13U ||
       content_identity::canonical_json(root) != bytes) {
     throw std::runtime_error("Manager Apply fixture metadata is invalid");
   }
@@ -287,6 +290,9 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
       RequiredText(root, "physical_candidate_retained_bundle_id"),
       RequiredText(root, "physical_deployment_artifact_id"),
       RequiredText(root, "physical_deployment_revision"),
+      RequiredText(root, "program_binding_id"),
+      RequiredText(root, "program_id"),
+      RequiredText(root, "program_revision"),
       RequiredText(root, "predecessor_graph_revision"),
       RequiredText(root, "predecessor_retained_bundle_id"),
   };
@@ -1069,6 +1075,7 @@ std::string ApplyRequest(
   if (preview_only) {
     return preview_response;
   }
+  const auto fixture = ReadManagerApplyFixtureMetadata();
   const auto preview =
       deployment::parse_strict_json_model_yaml(preview_response).root();
   const auto *ok = std::get_if<bool>(&RequiredMember(preview, "ok").storage());
@@ -1109,12 +1116,10 @@ std::string ApplyRequest(
             CanonicalValue("sha256:1616161616161616161616161616161616161616161616"
                            "161616161616161616")},
            {"program_binding_id",
-            CanonicalValue("sha256:1717171717171717171717171717171717171717171717"
-                           "171717171717171717")},
-           {"program_id", CanonicalValue("program.test")},
+            CanonicalValue(fixture.program_binding_id)},
+           {"program_id", CanonicalValue(fixture.program_id)},
            {"program_revision",
-            CanonicalValue("sha256:1919191919191919191919191919191919191919191919"
-                           "191919191919191919")},
+            CanonicalValue(fixture.program_revision)},
            {"retained_bundle_id", CanonicalValue(candidate_bundle)},
            {"scenario_id", CanonicalValue("scenario.test")},
            {"schema_version",
@@ -2294,7 +2299,7 @@ TEST(ManagerDaemonProcess,
 }
 
 TEST(ManagerDaemonProcess,
-     RuntimeOnlyNamedApplyUsesTheRealManagedFenceAndSurvivesReplacement) {
+     NamedApplyUsesTheRealManagedFenceAndSurvivesReplacement) {
   const auto fixture = ReadManagerApplyFixtureMetadata();
   DaemonDirectory directory;
   std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
@@ -2351,9 +2356,10 @@ TEST(ManagerDaemonProcess,
     request = ApplyRequest(
         directory, first_manager_epoch,
         WaitForAuthoringAdmission(directory).admission_generation,
-        fixture.deployment_artifact_id, fixture.deployment_revision,
+        fixture.physical_deployment_artifact_id,
+        fixture.physical_deployment_revision,
         fixture.predecessor_graph_revision,
-        fixture.predecessor_retained_bundle_id, "manager-runtime-only-apply.1");
+        fixture.predecessor_retained_bundle_id, "manager-program-apply.1");
 
     // Model a browser disappearing after the kernel accepted its packet but
     // before it received any HTTP/RPC receipt. Manager must finish without
@@ -2367,7 +2373,7 @@ TEST(ManagerDaemonProcess,
       const auto observed = manager_source.Read();
       if (observed.has_value()) {
         applied = content_identity::canonical_json(observed->payload);
-        if (applied.find(R"("request_id":"manager-runtime-only-apply.1")") !=
+        if (applied.find(R"("request_id":"manager-program-apply.1")") !=
                 std::string::npos &&
             applied.find(R"("terminal_state":"succeeded")") !=
                 std::string::npos) {
@@ -2379,17 +2385,10 @@ TEST(ManagerDaemonProcess,
     SCOPED_TRACE(applied);
     EXPECT_NE(applied.find(R"("terminal_state":"succeeded")"),
               std::string::npos);
-    EXPECT_NE(applied.find(fixture.candidate_retained_bundle_id),
+    EXPECT_NE(applied.find(fixture.physical_candidate_retained_bundle_id),
               std::string::npos);
     const auto execution_status = wait_execution_response();
-    EXPECT_NE(execution_status.find("\"ok\":false"), std::string::npos)
-        << execution_status;
-    EXPECT_NE(execution_status.find("\"code\":\"execution_owner_not_ready\""),
-              std::string::npos)
-        << execution_status;
-    EXPECT_NE(
-        execution_status.find("\"details\":{\"owner_epoch\":\"kernel-owner-"),
-        std::string::npos)
+    EXPECT_NE(execution_status.find("\"ok\":true"), std::string::npos)
         << execution_status;
     const auto replayed = SendCommand(directory.socket_path(), request);
     EXPECT_NE(replayed.find("\"replay_status\":\"replayed_exact\""),
@@ -2409,7 +2408,7 @@ TEST(ManagerDaemonProcess,
     EXPECT_EQ(inventory.front()
                   .terminal_outcome->terminal_outcome
                   .candidate_projection_revision->retained_bundle_id.value(),
-              fixture.candidate_retained_bundle_id);
+              fixture.physical_candidate_retained_bundle_id);
 
     const auto manager_after = manager_source.Read();
     const auto scene_after = scene_source.Read();
@@ -2418,13 +2417,16 @@ TEST(ManagerDaemonProcess,
     ASSERT_TRUE(scene_after.has_value());
     ASSERT_TRUE(scene_runtime_after.has_value());
     EXPECT_NE(content_identity::canonical_json(manager_after->payload)
-                  .find(fixture.candidate_retained_bundle_id),
+                  .find(fixture.physical_candidate_retained_bundle_id),
               std::string::npos);
     EXPECT_NE(content_identity::canonical_json(scene_after->payload)
-                  .find(fixture.candidate_retained_bundle_id),
+                  .find(fixture.physical_candidate_retained_bundle_id),
+              std::string::npos);
+    EXPECT_NE(content_identity::canonical_json(scene_after->payload)
+                  .find("apply_fixture_marker"),
               std::string::npos);
     EXPECT_NE(content_identity::canonical_json(scene_runtime_after->payload)
-                  .find(fixture.candidate_retained_bundle_id),
+                  .find(fixture.physical_candidate_retained_bundle_id),
               std::string::npos);
     const auto status = manager.Stop(SIGKILL);
     EXPECT_TRUE(WIFSIGNALED(status));
@@ -2436,35 +2438,42 @@ TEST(ManagerDaemonProcess,
   replacement.WaitReady(directory);
   AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
                                              "manager-source.json");
+  AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
+                                           "logical-scene-source.json");
   AtomicSourceSnapshotChannel scene_runtime_source(directory.publication_root(),
                                                    "scene-runtime-source.json");
   const auto recovered = manager_source.Read();
+  const auto recovered_scene = scene_source.Read();
   const auto scene_runtime_recovered = scene_runtime_source.Read();
   ASSERT_TRUE(recovered.has_value());
+  ASSERT_TRUE(recovered_scene.has_value());
   ASSERT_TRUE(scene_runtime_recovered.has_value());
   const auto recovered_manager_bytes =
       content_identity::canonical_json(recovered->payload);
   EXPECT_NE(recovered->source_owner_epoch, first_manager_epoch);
-  EXPECT_NE(recovered_manager_bytes.find(fixture.candidate_retained_bundle_id),
+  EXPECT_NE(recovered_manager_bytes.find(
+                fixture.physical_candidate_retained_bundle_id),
             std::string::npos);
   EXPECT_NE(recovered_manager_bytes.find(
-                R"("request_id":"manager-runtime-only-apply.1")"),
+                R"("request_id":"manager-program-apply.1")"),
             std::string::npos);
   EXPECT_NE(
       recovered_manager_bytes.find(R"("incomplete":false,"intent_digest":)"),
       std::string::npos);
   EXPECT_NE(content_identity::canonical_json(scene_runtime_recovered->payload)
-                .find(fixture.candidate_retained_bundle_id),
+                .find(fixture.physical_candidate_retained_bundle_id),
+            std::string::npos);
+  EXPECT_NE(content_identity::canonical_json(recovered_scene->payload)
+                .find("apply_fixture_marker"),
             std::string::npos);
   const auto recovered_execution_status = wait_execution_response();
-  EXPECT_NE(recovered_execution_status.find("\"ok\":false"), std::string::npos)
-      << recovered_execution_status;
-  EXPECT_NE(
-      recovered_execution_status.find("\"code\":\"execution_owner_not_ready\""),
-      std::string::npos)
+  // Reopening the Manager may read completed Apply evidence, but it must not
+  // silently restart a physical execution owner after process loss.
+  EXPECT_NE(recovered_execution_status.find("\"ok\":false"),
+            std::string::npos)
       << recovered_execution_status;
   EXPECT_NE(recovered_execution_status.find(
-                "\"details\":{\"owner_epoch\":\"kernel-owner-"),
+                "\"code\":\"execution_owner_not_ready\""),
             std::string::npos)
       << recovered_execution_status;
   const auto replay = SendCommand(directory.socket_path(), request);

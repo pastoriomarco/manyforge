@@ -189,6 +189,7 @@ private:
   std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_snapshot_;
   std::map<std::uint64_t, TransactionRecord> transaction_records_;
   std::optional<BootstrapRecord> bootstrap_record_;
+  std::optional<core::NativeProjectionRebuildDTO> maintenance_successor_;
   std::map<core::ProjectionLeaseId, RetainedProjectionLease>
       retained_lease_publishers_;
   std::deque<core::ProjectionLeaseId> retained_lease_order_;

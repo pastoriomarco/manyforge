@@ -10069,6 +10069,67 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     try_release_retired_composition();
     try_start_current_composition();
     rethrow_composition_failure();
+    if (request.phase == component_manager::
+                             ManagerSelectedRuntimeCompositionPhase::kFinalize) {
+      std::optional<component_manager::ManagerSelectedRuntimeCompositionRequestDTO>
+          prepared_request;
+      {
+        std::lock_guard lock(managed_composition_mutex);
+        if (installed_under_fence_composition_request.has_value() &&
+            installed_under_fence_composition_request->phase ==
+                component_manager::ManagerSelectedRuntimeCompositionPhase::
+                    kPrepare) {
+          prepared_request = installed_under_fence_composition_request;
+        }
+      }
+      if (prepared_request.has_value()) {
+        auto expected = request;
+        expected.phase = component_manager::
+            ManagerSelectedRuntimeCompositionPhase::kPrepare;
+        expected.candidate_projection_revision =
+            prepared_request->candidate_projection_revision;
+        expected.authoritative_scene_snapshot_digest =
+            prepared_request->authoritative_scene_snapshot_digest;
+        Require(expected == *prepared_request &&
+                    request.candidate_projection_revision.scene_revision.scene_id ==
+                        prepared_request->candidate_projection_revision
+                            .scene_revision.scene_id &&
+                    request.candidate_projection_revision.scene_revision.revision_id >
+                        prepared_request->candidate_projection_revision
+                            .scene_revision.revision_id,
+                "final runtime composition differs from its exact prepared Apply");
+        require_installed_candidate_configuration();
+        const auto bundle = LoadExactManagedCandidateBundle(config, request);
+        if (!bundle->value().cell_graph.controllable_components.empty()) {
+          Require(SelectManagedComponentProjections(
+                      config, *bundle, projections,
+                      request.candidate_projection_revision, false)
+                      .has_value(),
+                  "final runtime composition has no installed Scene projection");
+        }
+        Composition *current = nullptr;
+        {
+          std::lock_guard lock(managed_composition_mutex);
+          Require(installed_under_fence_composition_request == prepared_request &&
+                      !current_composition_building &&
+                      !managed_composition_building &&
+                      (bundle->value().cell_graph.controllable_components.empty() ||
+                       active_managed_composition != nullptr) &&
+                      (active_managed_composition == nullptr ||
+                       active_managed_composition->projection_revision ==
+                           prepared_request->candidate_projection_revision),
+                  "prepared runtime changed before final Scene handoff");
+          current = active_managed_composition.get();
+          if (current != nullptr) {
+            current->projection_revision = request.candidate_projection_revision;
+          }
+          installed_under_fence_composition_request = request;
+        }
+        if (current != nullptr) {
+          InstallDirectSceneFrameResolver(projections, *current);
+        }
+      }
+    }
     const bool publication_is_successor =
         CurrentPublicationIsInstalledSuccessor(config, request);
     const auto successor_bundle =
@@ -10103,6 +10164,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         Require(*installed_under_fence_composition_request == request,
                 "another selected runtime composition is installed under "
                 "the held fence");
+        if (request.phase == component_manager::
+                                 ManagerSelectedRuntimeCompositionPhase::kPrepare) {
+          return {request,
+                  component_manager::ManagerSelectedRuntimeCompositionState::
+                      kInstalled};
+        }
         reconcile_installed_candidate = true;
       }
       if (published_installed_composition == nullptr &&
@@ -10145,6 +10212,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   component_manager::ManagerSelectedRuntimeCompositionState::
                       kInstalled};
         }
+        Require(request.phase == component_manager::
+                    ManagerSelectedRuntimeCompositionPhase::kPrepare,
+                "final runtime composition has no exact prepared candidate");
         if (retired_managed_composition != nullptr) {
           return {request,
                   component_manager::ManagerSelectedRuntimeCompositionState::
@@ -10272,26 +10342,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   component_manager::ManagerSelectedRuntimeCompositionState::
                       kPreparing};
         }
-        // A previous preparation may have been consumed by an installation
-        // attempt that failed before the candidate became installed.  Keep
-        // the exact held request recoverable: clear only that stale in-memory
-        // marker and rebuild the same request under the still-held fence.
-        // Without this transition the next retry reported the misleading
-        // "no preparation outcome" error forever and left Manager recovery
-        // nonterminal until the whole workbench was recreated.
-        std::cerr << "retrying selected runtime composition preparation after "
-                     "an incomplete installation\n";
-        preparing_composition_request.reset();
-        preparing_composition_request = request;
-        managed_composition_building = true;
-        start_builder = true;
-        if (active_managed_composition != nullptr) {
-          shared_clock = active_managed_composition->runtime->clock;
-          shared_scheduler = active_managed_composition->runtime->scheduler;
-        } else if (detached_addressed_kernel != nullptr) {
-          shared_clock = detached_owner_clock;
-          shared_scheduler = detached_owner_scheduler;
-        }
+        Fail("selected runtime preparation was consumed without an exact "
+             "installed result; automatic replacement is forbidden");
       }
     }
     if (managed_composition_builder.joinable()) {
@@ -10460,6 +10512,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         });
     bind_disable_handoff_owner();
     require_installed_candidate_configuration();
+    if (request.phase == component_manager::
+                             ManagerSelectedRuntimeCompositionPhase::kPrepare) {
+      return {request,
+              component_manager::ManagerSelectedRuntimeCompositionState::
+                  kInstalled};
+    }
     {
       std::lock_guard lock(managed_composition_mutex);
       Require(installed_under_fence_composition_request.has_value() &&

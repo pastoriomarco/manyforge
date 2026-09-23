@@ -592,6 +592,16 @@ class ExecutionControlSession:
                 else None
             )
         except Exception as error:
+            # Admission failures can precede a captured run and therefore have
+            # no run history entry. Retain the owner message with the request
+            # identity instead of leaving only the receipt's coarse code.
+            _LOGGER.warning(
+                "Execution control command failed: correlation_id=%s command=%s code=%s message=%r",
+                request.command.command_envelope.correlation_id,
+                kind,
+                getattr(error, "code", "execution_control_delivery_uncertain"),
+                str(error)[:2048],
+            )
             receipt = self._ingress.rejection_receipt(
                 request.command,
                 code=getattr(error, "code", "execution_control_delivery_uncertain"),

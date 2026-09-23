@@ -1412,7 +1412,8 @@ load_maintained_scenario_inputs(const std::filesystem::path &root) {
 }
 
 template <typename Record>
-[[nodiscard]] Record make_reference(std::string_view bytes) {
+[[nodiscard]] Record make_reference(std::string_view bytes,
+                                    std::string_view source = "maintained") {
   constexpr core::CatalogRecordKind kind = Record::kRecordKind;
   const auto *descriptor = core::catalog_record_type_descriptor(kind);
   if (descriptor == nullptr) {
@@ -1439,8 +1440,9 @@ template <typename Record>
   }
   const core::ContentDigest content_digest(deployment::sha256_digest(bytes));
   const core::ContentAddressedStoreKey store_key(
-      "catalog/maintained/" + std::string(core::to_string(kind)) + "/" +
-      record_id + "/" + record_revision.substr(7U));
+      "catalog/" + std::string(source) + "/" +
+      std::string(core::to_string(kind)) + "/" + record_id + "/" +
+      record_revision.substr(7U));
   return Record{
       typename Record::IdType(record_id),
       typename Record::RevisionType(record_revision),
@@ -1457,6 +1459,59 @@ void insert_reference(QualifiedCatalogClosure &closure,
     throw std::invalid_argument(
         "maintained catalog contains a duplicate typed referent");
   }
+}
+
+[[nodiscard]] core::RuntimePolicyCatalogRecordRefDTO
+prepare_captured_motion_policy(const deployment::detail::ActivationDeploymentIntent &intent,
+                               QualifiedCatalogClosure &catalog,
+                               ExactCompilerInputSource &input_source) {
+  // An authored Deployment currently grants no interrupt or open-loop grasp
+  // permissions. Retain that restrictive choice explicitly: the execution
+  // kernel requires one verified policy even for ordinary motion.
+  const auto policy_root = [&](std::string revision) {
+    return deployment::CanonicalValue(deployment::CanonicalValue::Object{
+        {"api_version",
+         deployment::CanonicalValue("manyforge.runtime_policy.v1")},
+        {"runtime_policy_id",
+         deployment::CanonicalValue(intent.deployment_artifact_id)},
+        {"runtime_policy_revision",
+         deployment::CanonicalValue(std::move(revision))},
+        {"interrupt_policy_ids",
+         deployment::CanonicalValue(deployment::CanonicalValue::Array{})},
+        {"open_loop_grasp_acknowledgements",
+         deployment::CanonicalValue(deployment::CanonicalValue::Array{})},
+    });
+  };
+  const auto *schema = deployment::build_qualified_closed_schema_registry()
+                           .find_catalog_schema_family(
+                               core::CatalogRecordKind::kRuntimePolicy);
+  if (schema == nullptr || schema->compiled_schema() == nullptr ||
+      schema->qualification() !=
+          deployment::CatalogSchemaQualification::kQualified) {
+    throw std::logic_error("runtime policy schema is not build-qualified");
+  }
+  const auto candidate = policy_root("sha256:" + std::string(64U, '0'));
+  const auto normalized =
+      deployment::validate_and_normalize_unqualified_artifact_candidate(
+          *schema->compiled_schema(),
+          deployment::parse_strict_json_model_yaml(
+              deployment::canonical_json(candidate)));
+  const std::string revision = deployment::detail::compute_content_identity(
+      normalized.normalized_root(),
+      deployment::detail::ContentIdentitySpec{
+          .identity_domain = "catalog-record-revision/runtime_policy",
+          .api_version = "manyforge.runtime_policy.v1",
+          .own_field = "runtime_policy_revision",
+      });
+  const std::string bytes = deployment::canonical_json(policy_root(revision));
+  const auto reference =
+      make_reference<core::RuntimePolicyCatalogRecordRefDTO>(bytes, "prepared");
+  catalog.runtime_policies.push_back(deployment::resolve_and_qualify_runtime_policy(
+      reference, reference.content_addressed_store_key, bytes));
+  input_source.add(reference.content_addressed_store_key,
+                   reference.content_digest, bytes);
+  insert_reference(catalog, reference);
+  return reference;
 }
 
 [[nodiscard]] QualifiedCatalogClosure
@@ -2281,8 +2336,10 @@ PreparedActivationMaterialization materialize_prepared_activation(
   options.workspace_root = std::filesystem::canonical(capability_root);
 
   ExactCompilerInputSource input_source;
-  const auto catalog = qualify_catalog(options.workspace_root, input_source,
-                                       {}, prepared_models);
+  auto catalog = qualify_catalog(options.workspace_root, input_source, {},
+                                 prepared_models);
+  const auto runtime_policy =
+      prepare_captured_motion_policy(intent, catalog, input_source);
   std::vector<core::CatalogRecordRefDTO> catalog_records;
   catalog_records.reserve(catalog.records.size());
   for (const auto &[unused, reference] : catalog.records) {
@@ -2293,7 +2350,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
   try {
     compiled = compile_activation_deployment(
         intent, component_profiles, prepared_models, catalog_records,
-        catalog.runtime_profiles);
+        catalog.runtime_profiles, runtime_policy);
   } catch (const std::bad_alloc &) {
     throw std::runtime_error(
         "activation Deployment compiler exhausted memory");

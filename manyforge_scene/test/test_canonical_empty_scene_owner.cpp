@@ -2615,34 +2615,302 @@ void ResetProjections(
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
   const ApplyId operation_id(std::move(apply_id));
-  const auto initialized = owner.BeginMaintenanceInitialization({
+  const core::ProjectionMaintenanceInitializationRequestDTO request{
       operation_id,
       ApplyGeneration(1U),
       accepted.canonical_empty_target,
       candidate.value(),
       native_bindings,
-  });
+  };
+  const auto initialized = owner.BeginMaintenanceInitialization(request);
   Require(initialized.state ==
               core::ProjectionMaintenanceInitializationState::kInitialized,
           "native candidate did not initialize");
+  const auto installed = owner.InstallInitialScene(request);
+  Require(installed.ready_for_publication(),
+          "native candidate did not install its initial Scene");
   ActiveBundlePublicationReceiptDTO receipt{
       ActiveBundlePublicationRequestDTO{
           NamedApplyPublicationTransactionDTO{
               operation_id, ApplyGeneration(1U)},
-          initialized.target_projection_revision,
-          initialized.target_projection_revision.retained_bundle_id,
-          initialized.target_projection_revision.graph_revision,
+          installed.target_projection_revision,
+          installed.target_projection_revision.retained_bundle_id,
+          installed.target_projection_revision.graph_revision,
           ActiveBundlePublicationGeneration(1U), Digest('d')},
       ActiveBundlePublicationGeneration(2U), Digest('f')};
   publication_reader.SetCurrent(receipt);
   const auto completed = owner.CompleteMaintenanceInitialization({
       operation_id, ApplyGeneration(1U),
-      initialized.target_projection_revision,
-      initialized.authoritative_snapshot_identity, receipt});
+      installed.target_projection_revision,
+      installed.authoritative_snapshot_identity, receipt});
   Require(completed.state ==
               core::ProjectionMaintenanceInitializationState::kCompleted,
           "native candidate did not complete");
   return completed.target_projection_revision;
+}
+
+TEST(CanonicalEmptySceneOwner,
+     InitialSceneIsInstalledOnceBeforePublicationAndSurvivesReadback) {
+  TemporaryDirectory directory("scene-initial-baseline");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto bindings = NativeRuntimeBindings(candidate.bundle->value(),
+                                               "runtime-initial-baseline");
+  auto projections = MakeFakeProjections(bindings);
+  FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
+  TestCellAdmissionPort cell_admission;
+  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                                 admission, publication_reader, bundle_source,
+                                 resolver, cell_admission);
+  const auto accepted =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission);
+  const auto authored = owner.Commit(AddBoxRequest(
+      accepted.canonical_empty_target, admission.cell_id(), "before-apply"));
+  ASSERT_TRUE(authored.success);
+  ASSERT_TRUE(authored.committed_projection_revision.has_value());
+  const auto predecessor = *authored.committed_projection_revision;
+  core::Pose3DTO pose;
+  pose.position_m = {0.2, 0.1, 0.3};
+  const core::ProjectionMaintenanceInitializationRequestDTO request{
+      ApplyId("apply-initial-baseline"), ApplyGeneration(1U),
+      predecessor, candidate.bundle->value(), bindings,
+      {core::AddObjectRequestDTO{
+           core::SceneResourceId("frame_object"),
+           core::SphereShapeDTO{0.05}, pose,
+           core::ComponentSceneFrameRefDTO{
+               core::ControllableComponentId("candidate-component"),
+               core::ModelInstanceId("candidate-model"),
+               core::FrameRoleId("candidate-frame")},
+           {core::SupportContactDTO{.support_object_id = "wall"}}},
+       core::AddObjectRequestDTO{
+           core::SceneResourceId("mesh"),
+           core::MeshShapeDTO{"asset://fixture/mesh", {1.0, 1.0, 1.0}},
+           pose, core::CellSceneFrameRefDTO{admission.cell_id()}, {}},
+       core::AddObjectRequestDTO{
+          core::SceneResourceId("wall"), core::BoxShapeDTO{{0.1, 0.2, 0.3}},
+          pose, core::CellSceneFrameRefDTO{admission.cell_id()}, {}}}};
+  const auto provisional = owner.BeginMaintenanceInitialization(request);
+  ASSERT_EQ(provisional.state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  EXPECT_FALSE(provisional.ready_for_publication());
+  EXPECT_NE(provisional.target_projection_revision.scene_revision,
+            predecessor.scene_revision);
+  ASSERT_EQ(owner.ReadActiveSnapshot()->shared()->objects.size(), 1U);
+  EXPECT_EQ(owner.ReadActiveSnapshot()->shared()->objects.front()
+                .scene_resource_id.value(),
+            "scene-box");
+  for (auto &projection : projections) {
+    projection->SetFrameResolution(
+        core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}});
+  }
+  const auto final = owner.InstallInitialScene(request);
+  ASSERT_TRUE(final.ready_for_publication());
+  EXPECT_NE(final.target_projection_revision, provisional.target_projection_revision);
+  EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
+  EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
+  EXPECT_EQ(owner.InstallInitialScene(request), final);
+  for (const auto &projection : projections) {
+    EXPECT_EQ(projection->rebuild_calls(), 2U);
+  }
+  const core::ActiveBundlePublicationReceiptDTO receipt{
+      core::ActiveBundlePublicationRequestDTO{
+          core::NamedApplyPublicationTransactionDTO{
+              request.apply_id, request.apply_generation},
+          final.target_projection_revision,
+          final.target_projection_revision.retained_bundle_id,
+          final.target_projection_revision.graph_revision,
+          ActiveBundlePublicationGeneration(1U), Digest('d')},
+      ActiveBundlePublicationGeneration(2U), Digest('f')};
+  publication_reader.SetCurrent(receipt);
+  const auto completed = owner.CompleteMaintenanceInitialization({
+      request.apply_id, request.apply_generation,
+      final.target_projection_revision, final.authoritative_snapshot_identity,
+      receipt});
+  ASSERT_EQ(completed.state,
+            core::ProjectionMaintenanceInitializationState::kCompleted);
+  const auto snapshot = owner.ReadActiveSnapshot();
+  ASSERT_TRUE(snapshot.has_value());
+  ASSERT_EQ(snapshot->shared()->objects.size(), 3U);
+  EXPECT_EQ(snapshot->shared()->objects.front().scene_resource_id.value(),
+            "frame_object");
+  ASSERT_EQ(snapshot->shared()->objects.front().support_contacts.size(), 1U);
+  EXPECT_EQ(snapshot->shared()->objects.front().support_contacts.front()
+                .support_object_id,
+            "wall");
+  const auto *placement = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+      &snapshot->shared()->objects.front().placement);
+  ASSERT_NE(placement, nullptr);
+  EXPECT_NEAR(placement->pose_in_cell.position_m.x_m, 1.2, 1e-9);
+  EXPECT_NEAR(placement->pose_in_cell.position_m.y_m, 2.1, 1e-9);
+  EXPECT_NEAR(placement->pose_in_cell.position_m.z_m, 3.3, 1e-9);
+  EXPECT_EQ(snapshot->shared()->objects[1].scene_resource_id.value(), "mesh");
+  ASSERT_EQ(snapshot->shared()->objects[1].collision_shapes.size(), 1U);
+  EXPECT_TRUE(std::holds_alternative<core::MeshShapeDTO>(
+      snapshot->shared()->objects[1].collision_shapes.front()));
+  EXPECT_EQ(snapshot->shared()->objects.back().scene_resource_id.value(),
+            "wall");
+  EXPECT_EQ(snapshot->shared()->revision,
+            final.target_projection_revision.scene_revision);
+
+  // Changing only the selected Program may keep the same Deployment bundle.
+  // Its empty initial Scene must still replace the prior Program's objects.
+  const auto next_bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-empty-program");
+  auto next_projections = MakeFakeProjections(next_bindings);
+  resolver.ReplaceWith(ProjectionClients(next_projections));
+  const core::ProjectionMaintenanceInitializationRequestDTO empty_program{
+      ApplyId("apply-program-only-empty-scene"), ApplyGeneration(1U),
+      completed.target_projection_revision, candidate.bundle->value(),
+      next_bindings, {}};
+  ASSERT_EQ(owner.BeginMaintenanceInitialization(empty_program).state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  const auto empty_installed = owner.InstallInitialScene(empty_program);
+  ASSERT_TRUE(empty_installed.ready_for_publication());
+  const core::ActiveBundlePublicationReceiptDTO empty_receipt{
+      core::ActiveBundlePublicationRequestDTO{
+          core::NamedApplyPublicationTransactionDTO{
+              empty_program.apply_id, empty_program.apply_generation},
+          empty_installed.target_projection_revision,
+          empty_installed.target_projection_revision.retained_bundle_id,
+          empty_installed.target_projection_revision.graph_revision,
+          ActiveBundlePublicationGeneration(2U), Digest('f')},
+      ActiveBundlePublicationGeneration(3U), Digest('g')};
+  publication_reader.SetCurrent(empty_receipt);
+  ASSERT_EQ(owner.CompleteMaintenanceInitialization({
+                empty_program.apply_id, empty_program.apply_generation,
+                empty_installed.target_projection_revision,
+                empty_installed.authoritative_snapshot_identity, empty_receipt})
+                .state,
+            core::ProjectionMaintenanceInitializationState::kCompleted);
+  const auto empty_snapshot = owner.ReadActiveSnapshot();
+  ASSERT_TRUE(empty_snapshot.has_value());
+  EXPECT_TRUE(empty_snapshot->shared()->objects.empty());
+  EXPECT_EQ(empty_snapshot->shared()->revision,
+            empty_installed.target_projection_revision.scene_revision);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     UnresolvableCandidateFrameCannotPublishInitialScene) {
+  TemporaryDirectory directory("scene-initial-frame-rejection");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto bindings = NativeRuntimeBindings(candidate.bundle->value(),
+                                               "runtime-initial-frame");
+  auto projections = MakeFakeProjections(bindings);
+  for (auto &projection : projections) {
+    projection->RejectFrameResolution(
+        ErrorDTO{"missing_reference", "candidate frame does not exist",
+                 {{"reason", "scene_frame_reference_missing"}}});
+  }
+  FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
+  TestCellAdmissionPort cell_admission;
+  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                                 admission, publication_reader, bundle_source,
+                                 resolver, cell_admission);
+  const auto accepted =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission);
+  core::Pose3DTO pose;
+  const core::ProjectionMaintenanceInitializationRequestDTO invalid_geometry{
+      ApplyId("apply-invalid-geometry"), ApplyGeneration(1U),
+      accepted.canonical_empty_target, candidate.bundle->value(), bindings,
+      {core::AddObjectRequestDTO{
+          core::SceneResourceId("fixture"), core::SphereShapeDTO{-0.1}, pose,
+          core::CellSceneFrameRefDTO{admission.cell_id()}, {}}}};
+  EXPECT_THROW(owner.BeginMaintenanceInitialization(invalid_geometry),
+               std::invalid_argument);
+  EXPECT_EQ(projections.front()->rebuild_calls(), 0U);
+  const core::ProjectionMaintenanceInitializationRequestDTO request{
+      ApplyId("apply-invalid-frame"), ApplyGeneration(1U),
+      accepted.canonical_empty_target, candidate.bundle->value(), bindings,
+      {core::AddObjectRequestDTO{
+          core::SceneResourceId("fixture"),
+          core::BoxShapeDTO{{0.1, 0.2, 0.3}}, pose,
+          core::ComponentSceneFrameRefDTO{
+              core::ControllableComponentId("missing-component"),
+              core::ModelInstanceId("missing-model"),
+              core::FrameRoleId("missing-frame")},
+          {}}}};
+  ASSERT_EQ(owner.BeginMaintenanceInitialization(request).state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  const auto failed = owner.InstallInitialScene(request);
+  EXPECT_EQ(failed.state,
+            core::ProjectionMaintenanceInitializationState::kFailed);
+  EXPECT_FALSE(failed.ready_for_publication());
+  EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
+  EXPECT_EQ(owner.InstallInitialScene(request), failed);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     InterruptedInitialSceneEffectReopensClosedWithoutReplaying) {
+  TemporaryDirectory directory("scene-initial-effect-interrupted");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto bindings = NativeRuntimeBindings(candidate.bundle->value(),
+                                               "runtime-initial-interrupted");
+  auto projections = MakeFakeProjections(bindings);
+  FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
+  TestCellAdmissionPort cell_admission;
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  std::optional<core::ProjectionMaintenanceInitializationRequestDTO> request;
+  std::size_t rebuild_calls = 0U;
+  {
+    CanonicalEmptySceneOwner owner(database_path, admission,
+                                   publication_reader, bundle_source, resolver,
+                                   cell_admission);
+    const auto accepted =
+        FinalizeCanonicalBootstrap(owner, publication_reader, admission);
+    request.emplace(core::ProjectionMaintenanceInitializationRequestDTO{
+        ApplyId("apply-initial-effect-interrupted"), ApplyGeneration(1U),
+        accepted.canonical_empty_target, candidate.bundle->value(), bindings,
+        {core::AddObjectRequestDTO{
+            core::SceneResourceId("wall"), core::BoxShapeDTO{{0.1, 0.2, 0.3}},
+            core::Pose3DTO{}, core::CellSceneFrameRefDTO{admission.cell_id()},
+            {}}}});
+    ASSERT_EQ(owner.BeginMaintenanceInitialization(*request).state,
+              core::ProjectionMaintenanceInitializationState::kInitialized);
+    projections.front()->ThrowAfterNextRebuildEffect();
+    const auto interrupted = owner.InstallInitialScene(*request);
+    EXPECT_EQ(interrupted.state,
+              core::ProjectionMaintenanceInitializationState::kInterrupted);
+    EXPECT_TRUE(interrupted.effects_unknown);
+    EXPECT_FALSE(interrupted.ready_for_publication());
+    EXPECT_EQ(owner.InstallInitialScene(*request), interrupted);
+    rebuild_calls = projections.front()->rebuild_calls();
+    owner.Close();
+  }
+
+  CanonicalEmptySceneOwner reopened(database_path, admission,
+                                    publication_reader, bundle_source, resolver,
+                                    cell_admission);
+  const auto interrupted = reopened.ReadMaintenanceInitialization(
+      {request->apply_id, request->apply_generation});
+  ASSERT_TRUE(interrupted.has_value());
+  EXPECT_EQ(interrupted->state,
+            core::ProjectionMaintenanceInitializationState::kInterrupted);
+  EXPECT_TRUE(interrupted->effects_unknown);
+  EXPECT_FALSE(interrupted->ready_for_publication());
+  EXPECT_FALSE(reopened.ReadAccessStatus().scene_writes_open);
+  EXPECT_FALSE(reopened.ReadAccessStatus().projection_leases_open);
+  EXPECT_EQ(reopened.InstallInitialScene(*request), *interrupted);
+  EXPECT_EQ(projections.front()->rebuild_calls(), rebuild_calls);
 }
 
 TEST(CanonicalEmptySceneOwner,

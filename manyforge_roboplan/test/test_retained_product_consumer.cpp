@@ -4650,6 +4650,34 @@ TEST(RetainedProductCrossConsumer,
   const auto added_replay = added_projection->RebuildProjection(added_rebuild);
   EXPECT_EQ(added_replay.native_projection_generation,
             added.native_projection_generation);
+
+  // The Program baseline advances the Scene revision under the same held
+  // Apply. The existing publisher, model, and composition must stay alive.
+  auto maintenance_scene = candidate_scene;
+  ++maintenance_scene.revision.revision_id;
+  const core::ProjectionRevisionDTO maintenance_revision{
+      candidate_revision.retained_bundle_id,
+      candidate_revision.graph_revision, maintenance_scene.revision};
+  const core::NativeProjectionRebuildDTO maintenance_request{
+      added_binding, maintenance_revision, products.planning_collision_model,
+      std::make_shared<const core::LogicalSceneSnapshotDTO>(maintenance_scene),
+      std::pair{core::ApplyId("apply-initial-scene"), core::ApplyGeneration(1U)},
+      candidate_revision};
+  const auto maintenance = added_projection->RebuildProjection(maintenance_request);
+  ASSERT_TRUE(maintenance.presence_valid());
+  EXPECT_EQ(maintenance.result,
+            core::ProjectionCommitResultStateDTO::kCommitted);
+  EXPECT_TRUE(maintenance.resulting_health.healthy_for_target(
+      maintenance_revision));
+  const auto maintenance_replay =
+      added_projection->RebuildProjection(maintenance_request);
+  EXPECT_EQ(maintenance_replay.native_projection_generation,
+            maintenance.native_projection_generation);
+  auto foreign_apply = maintenance_request;
+  foreign_apply.maintenance_successor =
+      std::pair{core::ApplyId("other-apply"), core::ApplyGeneration(1U)};
+  EXPECT_EQ(added_projection->RebuildProjection(foreign_apply).result,
+            core::ProjectionCommitResultStateDTO::kRejectedRollbackProven);
 }
 
 TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExactAlternatingKeys) {

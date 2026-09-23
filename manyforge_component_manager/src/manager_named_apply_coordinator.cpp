@@ -335,6 +335,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     core::RuntimeEpoch manager_runtime_epoch, std::string operating_system,
     std::vector<std::string> launch_environment_contracts,
     RuntimeObservationReducer::Clock clock_ns, ApplyIdFactory apply_id_factory,
+    InitialSceneSource initial_scene_source,
     RuntimePreStartGuard pre_start_guard,
     ApplyProgressObserver apply_progress_observer)
     : apply_journal_(apply_journal), active_plan_source_(active_plan_source),
@@ -343,6 +344,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
       kernel_fence_(kernel_fence), cell_admission_(cell_admission),
       manager_runtime_epoch_(std::move(manager_runtime_epoch)),
       apply_id_factory_(std::move(apply_id_factory)),
+      initial_scene_source_(std::move(initial_scene_source)),
       apply_progress_observer_(std::move(apply_progress_observer)),
       fence_coordinator_(apply_journal_, kernel_fence_, manager_runtime_epoch_),
       planned_maintenance_(planned_maintenance),
@@ -365,6 +367,8 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
   Require(!manager_runtime_epoch_.empty(),
           "Manager runtime epoch cannot be empty");
   Require(static_cast<bool>(apply_id_factory_), "Apply ID factory is required");
+  Require(static_cast<bool>(initial_scene_source_),
+          "Apply initial-Scene source is required");
 }
 
 core::ApplyId ManagerNamedApplyCoordinator::MintApplyId() {
@@ -413,6 +417,10 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
           "identity and revision");
   Require(candidate_value.cell_graph.cell_id == apply_journal_.cell_id(),
           "selected candidate belongs to another cell");
+  auto initial_scene = initial_scene_source_(request.prepared_activation,
+                                             *candidate);
+  Require(core::ValidInitialSceneObjects(initial_scene),
+          "captured initial Scene has invalid geometry, pose, or ordering");
 
   const auto inventory = apply_journal_.ReadStatusInventory();
   for (const auto &status : inventory) {
@@ -470,7 +478,8 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
         ManagerApplyEffectDisposition::kKnown, false);
   }
   captured_apply_inputs_.emplace(CapturedApplyInputs{
-      intent.apply_id, intent.apply_generation, predecessor, candidate});
+      intent.apply_id, intent.apply_generation, predecessor, candidate,
+      std::move(initial_scene)});
   if (apply_progress_observer_) {
     apply_progress_observer_(durable_intent.intent);
   }
@@ -521,6 +530,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
           "named Apply continuation lacks its process-local captured inputs");
   const auto &predecessor = *captured_apply_inputs_->predecessor;
   const auto &candidate = *captured_apply_inputs_->candidate;
+  const auto &initial_scene = captured_apply_inputs_->initial_scene;
 
   if (!apply_journal_
            .ReadFenceAttempt(intent.apply_id, intent.apply_generation)
@@ -642,9 +652,11 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
         ManagerApplyEffectDisposition::kUnknown, request_replayed);
   }
 
+  bool scene_is_installed = false;
   try {
-    static_cast<void>(scene_initialization_coordinator_.Initialize(
-        intent.apply_id, intent.apply_generation, candidate));
+    const auto initialized = scene_initialization_coordinator_.Initialize(
+        intent.apply_id, intent.apply_generation, candidate, initial_scene);
+    scene_is_installed = initialized.ready_for_publication();
   } catch (const ManagerSceneInitializationPending &) {
     return {intent.apply_id, intent.apply_generation,
             ManagerNamedApplyResultState::kPending, request_replayed,
@@ -652,6 +664,38 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   } catch (const std::exception &error) {
     return RetainTerminalFailure(
         apply_journal_, durable_intent, "scene_initialization_failed",
+        error.what(), ManagerApplyEffectDisposition::kUnknown,
+        request_replayed);
+  }
+
+  if (!scene_is_installed) {
+    try {
+      const auto composition = runtime_composition_coordinator_.PrepareOrObserve(
+          intent.apply_id, intent.apply_generation, candidate);
+      if (composition.state ==
+          ManagerSelectedRuntimeCompositionResultState::kPending) {
+        return {intent.apply_id, intent.apply_generation,
+                ManagerNamedApplyResultState::kPending, request_replayed,
+                std::nullopt};
+      }
+    } catch (const std::exception &error) {
+      return RetainTerminalFailure(
+          apply_journal_, durable_intent,
+          "runtime_composition_preparation_failed", error.what(),
+          ManagerApplyEffectDisposition::kUnknown, request_replayed);
+    }
+  }
+
+  try {
+    static_cast<void>(scene_initialization_coordinator_.InstallInitialScene(
+        intent.apply_id, intent.apply_generation, candidate, initial_scene));
+  } catch (const ManagerSceneInitializationPending &) {
+    return {intent.apply_id, intent.apply_generation,
+            ManagerNamedApplyResultState::kPending, request_replayed,
+            std::nullopt};
+  } catch (const std::exception &error) {
+    return RetainTerminalFailure(
+        apply_journal_, durable_intent, "initial_scene_installation_failed",
         error.what(), ManagerApplyEffectDisposition::kUnknown,
         request_replayed);
   }
@@ -667,7 +711,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
     }
   } catch (const std::exception &error) {
     return RetainTerminalFailure(
-        apply_journal_, durable_intent, "runtime_composition_failed",
+        apply_journal_, durable_intent, "runtime_composition_finalization_failed",
         error.what(), ManagerApplyEffectDisposition::kUnknown,
         request_replayed);
   }

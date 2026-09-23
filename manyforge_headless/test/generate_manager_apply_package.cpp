@@ -119,11 +119,17 @@ NamedRuntimeOnlyCandidate(
       profiles);
 }
 
+struct ProgramPublication final {
+  core::ProgramBindingId binding_id;
+  core::ProgramRevision program_revision;
+};
+
 void WriteMetadata(
     const std::filesystem::path &path,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const deployment::RetainedBundle &candidate,
     const deployment::RetainedBundle &physical_candidate,
+    const ProgramPublication &program,
     const std::filesystem::path &admission_filename) {
   const auto bytes = deployment::canonical_json(
       deployment::CanonicalValue(deployment::CanonicalValue::Object{
@@ -151,6 +157,11 @@ void WriteMetadata(
           {"physical_deployment_revision",
            deployment::CanonicalValue(
                physical_candidate.value().deployment_revision.value())},
+          {"program_binding_id",
+           deployment::CanonicalValue(program.binding_id.value())},
+          {"program_id", deployment::CanonicalValue("program_apply_fixture")},
+          {"program_revision",
+           deployment::CanonicalValue(program.program_revision.value())},
       }));
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);
   if (!stream) {
@@ -163,13 +174,9 @@ void WriteMetadata(
   }
 }
 
-struct ProgramPublication final {
-  core::ProgramBindingId binding_id;
-  core::ProgramRevision program_revision;
-};
-
 [[nodiscard]] std::string ProgramBytes(const deployment::RetainedBundle &bundle,
-                                       const bool operator_confirmation) {
+                                       const bool operator_confirmation,
+                                       const bool initial_scene) {
   const auto arm_binding =
       std::find_if(bundle.value().cell_graph.control_bindings.begin(),
                    bundle.value().cell_graph.control_bindings.end(),
@@ -200,8 +207,16 @@ struct ProgramPublication final {
       {"program_profile", deployment::CanonicalValue("composable-cell-v1")},
       {"program_revision",
        deployment::CanonicalValue(std::string(kZeroDigest))},
-      {"scene",
-       deployment::CanonicalValue(deployment::CanonicalValue::Array{})},
+      {"scene", initial_scene
+                    ? deployment::parse_strict_json_model_yaml(R"([
+        {"scene_resource_id":"apply_fixture_marker",
+         "shape":{"type":"box","box_dimensions_m":[0.1,0.1,0.1]},
+         "pose":{"frame_ref":{"kind":"cell_frame"},
+                 "position_m":[3.0,0.0,0.0],
+                 "orientation":{"xyzw":[0.0,0.0,0.0,1.0]}}}
+      ])").root()
+                    : deployment::CanonicalValue(
+                          deployment::CanonicalValue::Array{})},
       {"target_roles",
        deployment::CanonicalValue(deployment::CanonicalValue::Object{
            {"arm",
@@ -308,7 +323,8 @@ struct ProgramPublication final {
 [[nodiscard]] ProgramPublication PublishAssistantNativeProgram(
     const std::filesystem::path &package_root,
     const std::shared_ptr<const deployment::RetainedBundle> &bundle,
-    const bool operator_confirmation = false) {
+    const bool operator_confirmation = false,
+    const bool initial_scene = false) {
   if (bundle == nullptr ||
       bundle->value().compiled_products.symbol_role_maps.size() != 1U) {
     throw std::logic_error("assistant-native bundle has no sole model map");
@@ -325,7 +341,7 @@ struct ProgramPublication final {
     throw std::logic_error("assistant-native model map did not reopen");
   }
   const auto program = deployment::verify_program_binding_contract(
-      ProgramBytes(*bundle, operator_confirmation), *bundle);
+      ProgramBytes(*bundle, operator_confirmation, initial_scene), *bundle);
   deployment::FilesystemCatalogArtifactStore catalogs(package_root);
   std::vector<core::ProgramTargetRoleAssignmentDTO> targets{
       {core::TargetRoleId("arm"), core::CommandTargetId(std::string(
@@ -490,8 +506,10 @@ int main(int argc, char **argv) {
       return 0;
     }
 
+    const auto program = PublishAssistantNativeProgram(
+        arguments.package_root, physical_candidate, false, true);
     WriteMetadata(arguments.metadata_path, admission, *candidate,
-                  *physical_candidate, admission_filename);
+                  *physical_candidate, program, admission_filename);
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

@@ -9,6 +9,7 @@
 #include <manyforge_component_manager/manager_selected_bundle_transition_coordinator.hpp>
 #include <manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
+#include <manyforge_core/types/scene_transaction.hpp>
 
 #include <functional>
 #include <memory>
@@ -83,6 +84,12 @@ struct ManagerNamedApplyResult final {
 /// interrupted operation as unknown rather than resuming it automatically.
 class ManagerNamedApplyCoordinator final {
 public:
+  /// Exact, verified Program/Binding projection captured before any Apply
+  /// effect. The source may read retained products; it must not select a
+  /// mutable public or authoring workspace.
+  using InitialSceneSource = std::function<std::vector<manyforge::core::AddObjectRequestDTO>(
+      const ManagerApplyPreparedActivationDTO &,
+      const manyforge::deployment::RetainedBundle &)>;
   using ApplyIdFactory = std::function<manyforge::core::ApplyId()>;
   using ApplyProgressObserver =
       std::function<void(const ManagerApplyIntentDTO &)>;
@@ -109,6 +116,7 @@ public:
       std::vector<std::string> launch_environment_contracts,
       RuntimeObservationReducer::Clock clock_ns,
       ApplyIdFactory apply_id_factory,
+      InitialSceneSource initial_scene_source,
       RuntimePreStartGuard pre_start_guard = {},
       ApplyProgressObserver apply_progress_observer = {});
 
@@ -134,6 +142,7 @@ private:
     manyforge::core::ApplyGeneration apply_generation;
     std::shared_ptr<const manyforge::deployment::RetainedBundle> predecessor;
     std::shared_ptr<const manyforge::deployment::RetainedBundle> candidate;
+    std::vector<manyforge::core::AddObjectRequestDTO> initial_scene;
   };
 
   [[nodiscard]] ManagerNamedApplyResult
@@ -149,6 +158,7 @@ private:
   manyforge::core::IKernelCellAdmissionPort &cell_admission_;
   manyforge::core::RuntimeEpoch manager_runtime_epoch_;
   ApplyIdFactory apply_id_factory_;
+  InitialSceneSource initial_scene_source_;
   ApplyProgressObserver apply_progress_observer_;
   ManagerApplyFenceCoordinator fence_coordinator_;
   ManagerPlannedMaintenanceCoordinator &planned_maintenance_;

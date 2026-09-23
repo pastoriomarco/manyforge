@@ -6,6 +6,7 @@
 
 #include <mutex>
 #include <stdexcept>
+#include <vector>
 
 namespace manyforge::component_manager {
 
@@ -22,8 +23,8 @@ public:
 
 /// Thin Manager participant for the Scene-owned Begin/Read boundary. It does
 /// not persist projection progress, replay an effect after owner loss, or
-/// derive Scene content. Exact runtime epochs come from the already durable
-/// staged-ready record and Scene captures the authoritative snapshot.
+/// derive runtime epochs. The captured Program Scene is operation input;
+/// Scene remains the only authority that resolves it and mints its identity.
 class ManagerSceneInitializationCoordinator final {
 public:
   ManagerSceneInitializationCoordinator(
@@ -34,7 +35,17 @@ public:
   manyforge::core::ProjectionMaintenanceInitializationStatusDTO
   Initialize(const manyforge::core::ApplyId &apply_id,
              manyforge::core::ApplyGeneration apply_generation,
-             const manyforge::deployment::RetainedBundle &candidate);
+             const manyforge::deployment::RetainedBundle &candidate,
+             const std::vector<manyforge::core::AddObjectRequestDTO>
+                 &initial_scene_objects);
+
+  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  InstallInitialScene(
+      const manyforge::core::ApplyId &apply_id,
+      manyforge::core::ApplyGeneration apply_generation,
+      const manyforge::deployment::RetainedBundle &candidate,
+      const std::vector<manyforge::core::AddObjectRequestDTO>
+          &initial_scene_objects);
 
 private:
   SqliteManagerApplyJournal &apply_journal_;

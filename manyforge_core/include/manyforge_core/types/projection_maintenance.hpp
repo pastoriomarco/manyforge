@@ -9,8 +9,27 @@
 #include <manyforge_core/types/logical_scene_snapshot.hpp>
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/retained_product.hpp>
+#include <manyforge_core/types/scene_transaction.hpp>
 
 namespace manyforge::core {
+
+[[nodiscard]] inline bool ValidInitialSceneObjects(
+    const std::vector<AddObjectRequestDTO> &objects) noexcept {
+  if (objects.size() > 4096U) {
+    return false;
+  }
+  for (std::size_t index = 0U; index < objects.size(); ++index) {
+    if (objects[index].scene_resource_id.empty() ||
+        !logical_scene_detail::ValidCollisionShape(objects[index].shape) ||
+        !logical_scene_detail::FinitePose(objects[index].pose) ||
+        (index != 0U &&
+         !(objects[index - 1U].scene_resource_id <
+           objects[index].scene_resource_id))) {
+      return false;
+    }
+  }
+  return true;
+}
 
 /// Exact Manager operation accepted by Scene for one fresh maintenance
 /// initialization. Scene, not Manager, selects the immutable logical snapshot
@@ -21,6 +40,9 @@ struct ProjectionMaintenanceInitializationRequestDTO final {
   ProjectionRevisionDTO expected_active_projection_revision;
   RetainedBundleDTO candidate_retained_bundle;
   std::vector<ProjectionNativeRuntimeBindingDTO> native_runtime_bindings;
+  /// Exact Program-authored baseline captured with the candidate. An empty
+  /// vector deliberately replaces the old baseline with an empty one.
+  std::vector<AddObjectRequestDTO> initial_scene_objects{};
 
   [[nodiscard]] bool valid() const noexcept {
     if (apply_id.empty() || !apply_generation.nonzero() ||
@@ -28,6 +50,7 @@ struct ProjectionMaintenanceInitializationRequestDTO final {
         candidate_retained_bundle.retained_bundle_id.empty() ||
         candidate_retained_bundle.cell_graph.graph_revision.empty() ||
         candidate_retained_bundle.cell_graph.cell_id.empty() ||
+        !ValidInitialSceneObjects(initial_scene_objects) ||
         !std::is_sorted(native_runtime_bindings.begin(),
                         native_runtime_bindings.end(),
                         CanonicalProjectionNativeBindingLess)) {
@@ -73,6 +96,10 @@ struct ProjectionMaintenanceInitializationStatusDTO final {
   std::optional<ActiveBundlePublicationReceiptDTO> publication_receipt;
   std::optional<ErrorDTO> first_error;
   bool effects_unknown{};
+  /// Legacy v8 operations were complete after projection initialization.
+  /// UA7S operations are publishable only after Scene has installed the
+  /// Program baseline and every required projection acknowledges it.
+  bool initial_scene_installed{false};
 
   [[nodiscard]] bool valid() const noexcept {
     if (apply_id.empty() || !apply_generation.nonzero() ||
@@ -102,7 +129,7 @@ struct ProjectionMaintenanceInitializationStatusDTO final {
       return !publication_receipt.has_value() && !first_error.has_value() &&
              !effects_unknown;
     case ProjectionMaintenanceInitializationState::kCompleted:
-      return publication_receipt.has_value() && !first_error.has_value() &&
+      return initial_scene_installed && publication_receipt.has_value() && !first_error.has_value() &&
              !effects_unknown &&
              publication_receipt->matches_named_apply(
                  apply_id, apply_generation,
@@ -119,7 +146,8 @@ struct ProjectionMaintenanceInitializationStatusDTO final {
 
   [[nodiscard]] bool ready_for_publication() const noexcept {
     return valid() &&
-           state == ProjectionMaintenanceInitializationState::kInitialized;
+           state == ProjectionMaintenanceInitializationState::kInitialized &&
+           initial_scene_installed;
   }
 
   friend bool operator==(

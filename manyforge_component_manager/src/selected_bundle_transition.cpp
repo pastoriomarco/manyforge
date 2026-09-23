@@ -7,7 +7,9 @@
 namespace manyforge::component_manager {
 
 bool ManagerSelectedRuntimeCompositionRequestDTO::valid() const noexcept {
-  return manyforge::core::IsExactLowercaseSha256Digest(
+  return (phase == ManagerSelectedRuntimeCompositionPhase::kPrepare ||
+          phase == ManagerSelectedRuntimeCompositionPhase::kFinalize) &&
+         manyforge::core::IsExactLowercaseSha256Digest(
              authoritative_scene_snapshot_digest.value()) &&
          !apply_id.empty() && apply_generation.nonzero() &&
          candidate_projection_revision.valid() &&

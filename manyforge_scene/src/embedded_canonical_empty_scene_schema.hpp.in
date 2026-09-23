@@ -19,4 +19,7 @@ inline constexpr std::string_view kEmbeddedBoundedHistoryMigration =
 inline constexpr std::string_view kEmbeddedMaintenanceInitializationMigration =
     R"mf_mim(@MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION_SQL@)mf_mim";
 
+inline constexpr std::string_view kEmbeddedInitialSceneBaselineMigration =
+    R"mf_isbm(@MANYFORGE_INITIAL_SCENE_BASELINE_MIGRATION_SQL@)mf_isbm";
+
 }  // namespace manyforge::scene::detail

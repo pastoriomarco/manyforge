@@ -23,6 +23,13 @@ class IManagerSceneProjectionMaintenancePort {
   BeginMaintenanceInitialization(
       const ProjectionMaintenanceInitializationRequestDTO &request) = 0;
 
+  /// Finish the exact captured Program baseline after the candidate's frame
+  /// resolver is privately available under the held Apply fence. This is not
+  /// an ordinary authored Scene transaction or a public readiness event.
+  [[nodiscard]] virtual ProjectionMaintenanceInitializationStatusDTO
+  InstallInitialScene(
+      const ProjectionMaintenanceInitializationRequestDTO &request) = 0;
+
   [[nodiscard]] virtual ProjectionMaintenanceInitializationStatusDTO
   CompleteMaintenanceInitialization(
       const ProjectionMaintenanceCompletionDTO &completion) = 0;

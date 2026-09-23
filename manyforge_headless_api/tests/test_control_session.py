@@ -1729,7 +1729,7 @@ def test_last_client_drains_physical_read_and_cancels_remaining_capture() -> Non
 
 @pytest.mark.parametrize("busy", [False, True])
 def test_stop_rejection_does_not_require_initial_semantic_snapshot(
-    monkeypatch, busy
+    monkeypatch, busy, caplog
 ) -> None:
     async def exercise() -> None:
         ingress = _ingress([])
@@ -1780,6 +1780,10 @@ def test_stop_rejection_does_not_require_initial_semantic_snapshot(
             assert receipts[0].receipt.disposition == "rejected"
             assert receipts[0].receipt.correlation_id == "stop.before.snapshot"
             assert receipts[0].receipt.current_identity is None
+            if not busy:
+                assert "correlation_id=stop.before.snapshot" in caplog.text
+                assert "command=program_stop" in caplog.text
+                assert "Stop dispatch unavailable" in caplog.text
             assert not session._closed  # noqa: SLF001
             assert session._next_heartbeat(1) is not None  # noqa: SLF001
         finally:

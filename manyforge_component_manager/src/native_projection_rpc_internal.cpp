@@ -22,7 +22,7 @@ namespace core = manyforge::core;
 namespace scene = manyforge::scene;
 
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'P',
-                                              'R', 'P', 'C', '2'};
+                                              'R', 'P', 'C', '3'};
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
 
 [[noreturn]] void Fail(const std::string &detail) {
@@ -796,6 +796,12 @@ void WriteRebuild(Writer &writer,
   WriteProjectionRevision(writer, request.target_projection_revision);
   WriteProduct(writer, request.planning_collision_model);
   writer.String(scene::EncodeLogicalSceneSnapshot(*request.logical_scene));
+  writer.Boolean(request.maintenance_successor.has_value());
+  if (request.maintenance_successor.has_value()) {
+    WriteStrong(writer, request.maintenance_successor->first);
+    WriteGeneration(writer, request.maintenance_successor->second);
+    WriteProjectionRevision(writer, *request.maintenance_predecessor);
+  }
 }
 
 [[nodiscard]] core::NativeProjectionRebuildDTO ReadRebuild(Reader &reader) {
@@ -803,6 +809,12 @@ void WriteRebuild(Writer &writer,
       ReadBinding(reader), ReadProjectionRevision(reader), ReadProduct(reader),
       std::make_shared<const core::LogicalSceneSnapshotDTO>(
           scene::DecodeLogicalSceneSnapshot(reader.String()))};
+  if (reader.Boolean()) {
+    request.maintenance_successor = std::pair{
+        ReadStrong<core::ApplyId>(reader),
+        ReadGeneration<core::ApplyGeneration>(reader)};
+    request.maintenance_predecessor = ReadProjectionRevision(reader);
+  }
   if (!request.valid()) {
     Fail("decoded projection rebuild request is invalid");
   }

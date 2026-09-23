@@ -23,6 +23,7 @@ namespace manyforge::deployment::detail {
     const std::vector<ActivationComponentProfile> &component_profiles,
     const std::vector<ActivationPreparedModel> &prepared_models,
     const std::vector<core::CatalogRecordRefDTO> &catalog_records,
-    const std::vector<QualifiedRuntimeProfile> &runtime_profiles);
+    const std::vector<QualifiedRuntimeProfile> &runtime_profiles,
+    const core::RuntimePolicyCatalogRecordRefDTO &runtime_policy);
 
 } // namespace manyforge::deployment::detail

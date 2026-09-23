@@ -46,25 +46,36 @@ constexpr std::string_view kDigestTwo =
 
 TEST(SelectedRuntimeCompositionRpcInternal,
      RoundTripsExactRequestAndBothResultStates) {
-  const auto request = Request();
-  ASSERT_TRUE(request.valid());
-  const auto encoded_request =
-      EncodeSelectedRuntimeCompositionRpcRequest(request);
-  EXPECT_TRUE(IsSelectedRuntimeCompositionRpcPacket(encoded_request));
-  EXPECT_EQ(DecodeSelectedRuntimeCompositionRpcRequest(encoded_request),
-            request);
-
-  for (const auto state :
-       {ManagerSelectedRuntimeCompositionState::kPreparing,
-        ManagerSelectedRuntimeCompositionState::kInstalled}) {
-    const ManagerSelectedRuntimeCompositionResultDTO result{request, state};
-    const auto decoded = DecodeSelectedRuntimeCompositionRpcResponse(
-        EncodeSelectedRuntimeCompositionRpcResponse(result));
-    const auto *round_trip =
-        std::get_if<ManagerSelectedRuntimeCompositionResultDTO>(&decoded);
-    ASSERT_NE(round_trip, nullptr);
-    EXPECT_EQ(*round_trip, result);
+  for (const auto phase : {ManagerSelectedRuntimeCompositionPhase::kPrepare,
+                           ManagerSelectedRuntimeCompositionPhase::kFinalize}) {
+    auto request = Request();
+    request.phase = phase;
+    ASSERT_TRUE(request.valid());
+    const auto encoded_request =
+        EncodeSelectedRuntimeCompositionRpcRequest(request);
+    EXPECT_TRUE(IsSelectedRuntimeCompositionRpcPacket(encoded_request));
+    EXPECT_EQ(DecodeSelectedRuntimeCompositionRpcRequest(encoded_request),
+              request);
+    for (const auto state :
+         {ManagerSelectedRuntimeCompositionState::kPreparing,
+          ManagerSelectedRuntimeCompositionState::kInstalled}) {
+      const ManagerSelectedRuntimeCompositionResultDTO result{request, state};
+      const auto decoded = DecodeSelectedRuntimeCompositionRpcResponse(
+          EncodeSelectedRuntimeCompositionRpcResponse(result));
+      const auto *round_trip =
+          std::get_if<ManagerSelectedRuntimeCompositionResultDTO>(&decoded);
+      ASSERT_NE(round_trip, nullptr);
+      EXPECT_EQ(*round_trip, result);
+    }
   }
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal, RejectsUnknownPhase) {
+  auto request = Request();
+  request.phase = static_cast<ManagerSelectedRuntimeCompositionPhase>(255);
+  EXPECT_FALSE(request.valid());
+  EXPECT_THROW(EncodeSelectedRuntimeCompositionRpcRequest(request),
+               std::invalid_argument);
 }
 
 TEST(SelectedRuntimeCompositionRpcInternal,

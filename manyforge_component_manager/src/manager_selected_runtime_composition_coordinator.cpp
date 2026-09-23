@@ -41,6 +41,25 @@ ManagerSelectedRuntimeCompositionCoordinator::InstallOrRecover(
     const core::ApplyId &apply_id,
     const core::ApplyGeneration apply_generation,
     const deployment::RetainedBundle &candidate) {
+  return Advance(apply_id, apply_generation, candidate,
+                 ManagerSelectedRuntimeCompositionPhase::kFinalize);
+}
+
+ManagerSelectedRuntimeCompositionCoordinatorResult
+ManagerSelectedRuntimeCompositionCoordinator::PrepareOrObserve(
+    const core::ApplyId &apply_id,
+    const core::ApplyGeneration apply_generation,
+    const deployment::RetainedBundle &candidate) {
+  return Advance(apply_id, apply_generation, candidate,
+                 ManagerSelectedRuntimeCompositionPhase::kPrepare);
+}
+
+ManagerSelectedRuntimeCompositionCoordinatorResult
+ManagerSelectedRuntimeCompositionCoordinator::Advance(
+    const core::ApplyId &apply_id,
+    const core::ApplyGeneration apply_generation,
+    const deployment::RetainedBundle &candidate,
+    const ManagerSelectedRuntimeCompositionPhase phase) {
   std::lock_guard lock(operation_mutex_);
   const auto apply = apply_journal_.ReadIntent(apply_id, apply_generation);
   const auto attempt =
@@ -67,6 +86,9 @@ ManagerSelectedRuntimeCompositionCoordinator::InstallOrRecover(
               initialized->predecessor_projection_revision ==
                   apply->intent.expected_active_projection_revision,
           "selected runtime composition has invalid Scene initialization evidence");
+  Require(phase == ManagerSelectedRuntimeCompositionPhase::kPrepare ||
+              initialized->ready_for_publication(),
+          "selected runtime composition cannot finalize before Scene is installed");
   const auto &accepted_fence = acceptance->accepted_fence;
   const auto &fence_intent = attempt->fence_intent;
   const auto &runtime_unit = runtime->staged_ready.runtime_units.front();
@@ -118,6 +140,7 @@ ManagerSelectedRuntimeCompositionCoordinator::InstallOrRecover(
       accepted_fence.configuration_fence_id,
       accepted_fence.configuration_fence_generation,
       accepted_fence.captured_scope,
+      phase,
   };
   Require(request.valid(), "selected runtime-composition request is invalid");
   const auto result = runtime_composition_.InstallOrObserve(request);
@@ -126,6 +149,10 @@ ManagerSelectedRuntimeCompositionCoordinator::InstallOrRecover(
           "evidence");
   if (result.state == ManagerSelectedRuntimeCompositionState::kPreparing) {
     return {ManagerSelectedRuntimeCompositionResultState::kPending, result,
+            std::nullopt};
+  }
+  if (phase == ManagerSelectedRuntimeCompositionPhase::kPrepare) {
+    return {ManagerSelectedRuntimeCompositionResultState::kInstalled, result,
             std::nullopt};
   }
   auto durable = apply_journal_.EnsurePrivateMaterialization(materialization);

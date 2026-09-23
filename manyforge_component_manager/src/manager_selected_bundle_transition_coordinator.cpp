@@ -103,8 +103,9 @@ ManagerSelectedBundleTransitionCoordinator::AdvanceOrRecover(
       (initialized->state !=
            core::ProjectionMaintenanceInitializationState::kInitialized &&
        initialized->state !=
-           core::ProjectionMaintenanceInitializationState::kCompleted)) {
-    Fail("selected-bundle publication requires initialized Scene state");
+           core::ProjectionMaintenanceInitializationState::kCompleted) ||
+      !initialized->initial_scene_installed) {
+    Fail("selected-bundle publication requires the final initial Scene");
   }
   if (initialized->predecessor_projection_revision !=
           apply->intent.expected_active_projection_revision ||

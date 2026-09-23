@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/initial_scene_projection.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
@@ -46,6 +47,7 @@ using manyforge::core::ResourceId;
 using manyforge::core::ResourceRoleId;
 using manyforge::core::TargetRoleId;
 using manyforge::deployment::CompositionComponentModelFrame;
+using manyforge::deployment::CanonicalValue;
 using manyforge::deployment::FilesystemProgramBindingRepository;
 using manyforge::deployment::FilesystemVerifiedProgramBindingSource;
 using manyforge::deployment::FilesystemVerifiedRetainedBundleSource;
@@ -299,6 +301,117 @@ struct BindingContext final {
   std::string result = bytes;
   result.replace(begin + prefix.size(), end - begin - prefix.size(), table);
   return result;
+}
+
+TEST(ProgramBindingTest,
+     InitialSceneProjectionKeepsCellAndExactCandidateComponentFrames) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  const auto binding = make_binding_value(context);
+  const auto &component = binding.component_role_bindings.front();
+  const auto model_role =
+      component.model_role_bindings.front().model_role_id.value();
+  const CanonicalValue scene(CanonicalValue::Object{
+      {"scene",
+       CanonicalValue(CanonicalValue::Array{
+           CanonicalValue(CanonicalValue::Object{
+               {"scene_resource_id", CanonicalValue("fixture")},
+               {"shape", CanonicalValue(CanonicalValue::Object{
+                             {"type", CanonicalValue("box")},
+                             {"box_dimensions_m",
+                              CanonicalValue(CanonicalValue::Array{
+                                  CanonicalValue(0.1), CanonicalValue(0.2),
+                                  CanonicalValue(0.3)})}})},
+               {"pose", CanonicalValue(CanonicalValue::Object{
+                            {"frame_ref",
+                             CanonicalValue(CanonicalValue::Object{
+                                 {"kind", CanonicalValue("component_frame")},
+                                 {"component_role", CanonicalValue("robot")},
+                                 {"model_role", CanonicalValue(model_role)},
+                                 {"frame_role", CanonicalValue("tcp")}})},
+                            {"position_m",
+                             CanonicalValue(CanonicalValue::Array{
+                                 CanonicalValue(0.0), CanonicalValue(0.0),
+                                 CanonicalValue(0.0)})},
+                            {"orientation",
+                             CanonicalValue(CanonicalValue::Object{
+                                 {"rpy_deg",
+                                  CanonicalValue(CanonicalValue::Array{
+                                      CanonicalValue(0.0),
+                                      CanonicalValue(0.0),
+                                      CanonicalValue(90.0)})}})}})},
+           }),
+           CanonicalValue(CanonicalValue::Object{
+               {"scene_resource_id", CanonicalValue("ground")},
+               {"shape", CanonicalValue(CanonicalValue::Object{
+                             {"type", CanonicalValue("sphere")},
+                             {"sphere_radius_m", CanonicalValue(0.5)}})},
+               {"pose", CanonicalValue(CanonicalValue::Object{
+                            {"frame_ref", CanonicalValue(
+                                              CanonicalValue::Object{{"kind",
+                                                                      CanonicalValue("cell_frame")}})},
+                            {"position_m",
+                             CanonicalValue(CanonicalValue::Array{
+                                 CanonicalValue(1.0), CanonicalValue(2.0),
+                                 CanonicalValue(3.0)})},
+                            {"orientation",
+                             CanonicalValue(CanonicalValue::Object{
+                                 {"xyzw",
+                                  CanonicalValue(CanonicalValue::Array{
+                                      CanonicalValue(0.0),
+                                      CanonicalValue(0.0),
+                                      CanonicalValue(0.0),
+                                      CanonicalValue(1.0)})}})}})},
+           }),
+       })},
+  });
+  const auto objects =
+      manyforge::deployment::detail::project_bound_initial_scene_value(
+          scene, binding, context.bundle->value().cell_graph.cell_id);
+  ASSERT_EQ(objects.size(), 2U);
+  const auto *frame = std::get_if<manyforge::core::ComponentSceneFrameRefDTO>(
+      &objects.front().frame_ref);
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(frame->controllable_component_id,
+            component.controllable_component_id);
+  EXPECT_EQ(frame->model_instance_id,
+            component.model_role_bindings.front().model_instance_id);
+  EXPECT_NEAR(objects.front().pose.orientation.z, 0.70710678118, 1e-9);
+  EXPECT_TRUE(std::holds_alternative<manyforge::core::CellSceneFrameRefDTO>(
+      objects.back().frame_ref));
+  EXPECT_EQ(objects.back().pose.position_m.x_m, 1.0);
+}
+
+TEST(ProgramBindingTest, InitialSceneProjectionRejectsMissingComponentFrame) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  const auto binding = make_binding_value(context);
+  const CanonicalValue scene(CanonicalValue::Object{
+      {"scene", CanonicalValue(CanonicalValue::Array{
+                    CanonicalValue(CanonicalValue::Object{
+                        {"scene_resource_id", CanonicalValue("object")},
+                        {"shape", CanonicalValue(CanonicalValue::Object{
+                                      {"type", CanonicalValue("sphere")},
+                                      {"sphere_radius_m", CanonicalValue(0.1)}})},
+                        {"pose", CanonicalValue(CanonicalValue::Object{
+                                     {"frame_ref", CanonicalValue(CanonicalValue::Object{
+                                                       {"kind", CanonicalValue("component_frame")},
+                                                       {"component_role", CanonicalValue("robot")},
+                                                       {"model_role", CanonicalValue("missing")},
+                                                       {"frame_role", CanonicalValue("tcp")}})},
+                                     {"position_m", CanonicalValue(CanonicalValue::Array{
+                                                        CanonicalValue(0.0), CanonicalValue(0.0),
+                                                        CanonicalValue(0.0)})},
+                                     {"orientation", CanonicalValue(CanonicalValue::Object{
+                                                         {"xyzw", CanonicalValue(CanonicalValue::Array{
+                                                                      CanonicalValue(0.0), CanonicalValue(0.0),
+                                                                      CanonicalValue(0.0), CanonicalValue(1.0)})}})}})},
+                    })})},
+  });
+  EXPECT_THROW(static_cast<void>(
+                   manyforge::deployment::detail::project_bound_initial_scene_value(
+                       scene, binding, context.bundle->value().cell_graph.cell_id)),
+               ProgramBindingError);
 }
 
 TEST(ProgramBindingTest,

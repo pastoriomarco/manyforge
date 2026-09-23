@@ -476,7 +476,8 @@ CanonicalValue WithField(const CanonicalValue &value,
 
 CanonicalValue ManagerPayloadWithIncompleteApply(
     const std::string_view phase = "runtime_convergence_pending",
-    const std::string_view scoped_component = "robot-a") {
+    const std::string_view scoped_component = "robot-a",
+    const bool empty_predecessor = false) {
   auto payload = ManagerPayload();
   auto active = *payload.find_object_member("active");
   auto graph = *active.find_object_member("cell_graph");
@@ -488,6 +489,16 @@ CanonicalValue ManagerPayloadWithIncompleteApply(
               {"runtime_unit_ids", CanonicalValue(CanonicalValue::Array{
                                        CanonicalValue("runtime-a")})},
           })}));
+  if (empty_predecessor) {
+    graph = WithField(graph, "controllable_components",
+                      CanonicalValue(CanonicalValue::Array{}));
+    graph = WithField(
+        graph, "runtime_units",
+        CanonicalValue(CanonicalValue::Array{CanonicalValue(
+            CanonicalValue::Object{
+                {"runtime_unit_id", CanonicalValue("runtime-a")},
+            })}));
+  }
   active = WithField(active, "cell_graph", std::move(graph));
   payload = WithField(payload, "active", std::move(active));
   auto runtime = *payload.find_object_member("runtime");
@@ -508,6 +519,7 @@ CanonicalValue ManagerPayloadWithIncompleteApply(
                    {"apply_generation", CanonicalValue(1.0)},
                    {"apply_id", CanonicalValue("apply-transition-1")},
                    {"fence", CanonicalValue(CanonicalValue::Object{
+                                 {"state", CanonicalValue("held")},
                                  {"scope", CanonicalValue(
                                       CanonicalValue::Object{
                                           {"controllable_component_ids",
@@ -674,13 +686,15 @@ void PublishHealthySources(const TemporaryDirectory &directory,
 void PublishManagerApplyTransition(
     const TemporaryDirectory &directory,
     const std::string_view phase = "runtime_convergence_pending",
-    const std::string_view scoped_component = "robot-a") {
+    const std::string_view scoped_component = "robot-a",
+    const bool empty_predecessor = false) {
   AtomicSourceSnapshotChannel manager(directory.publications(),
                                       "manager-source.json");
   static_cast<void>(manager.Publish(
       "component_manager", "component-manager." + std::string(kCellId),
       "manager.epoch.1", 2,
-      ManagerPayloadWithIncompleteApply(phase, scoped_component)));
+      ManagerPayloadWithIncompleteApply(phase, scoped_component,
+                                        empty_predecessor)));
 }
 
 const CanonicalValue &OnlyAlarm(const CanonicalValue &snapshot) {
@@ -923,6 +937,131 @@ TEST(HeadlessApiCore,
   const auto alarms = core.AlarmSnapshot();
   EXPECT_TRUE(Array(alarms, "alarms").empty());
   EXPECT_FALSE(std::get<bool>(Member(alarms, "reconciled").storage()));
+}
+
+TEST(HeadlessApiCore,
+     EmptyCellApplyIsExpectedAtStartupAndAfterReturningToEmpty) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  auto wall_time = std::make_shared<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  HeadlessApiCore core(
+      Config(directory, "api.epoch.1"),
+      HeadlessApiCoreClocks{
+          [wall_time]() { return *wall_time; },
+          []() { return 1000; },
+          []() { return "2026-08-05T00:00:00Z"; },
+      });
+  EXPECT_TRUE(
+      std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+
+  for (int activation = 0; activation < 2; ++activation) {
+    SCOPED_TRACE(activation);
+    PublishManagerApplyTransition(directory, "runtime_convergence_pending",
+                                  "robot-a", true);
+    *wall_time += 20'000'000'000LL;
+    EXPECT_FALSE(
+        std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+    const auto alarms = core.AlarmSnapshot();
+    EXPECT_TRUE(Array(alarms, "alarms").empty());
+    EXPECT_FALSE(std::get<bool>(Member(alarms, "reconciled").storage()));
+
+    // A later empty Scenario is ready in the same Headless session. The next
+    // Apply must receive the same treatment as the initial empty-cell Apply.
+    PublishHealthySources(directory, "open", 2U + activation);
+    *wall_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count();
+    EXPECT_TRUE(
+        std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+    EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
+  }
+
+  // Once the operation is gone, an unexplained loss is still an alarm.
+  *wall_time += 20'000'000'000LL;
+  EXPECT_EQ(Text(OnlyAlarm(core.AlarmSnapshot()), "definition_id"),
+            "manyforge.runtime.provider_unavailable");
+}
+
+TEST(HeadlessApiCore,
+     EmptyCellDoesNotHideUnfencedTerminalOrUnrelatedProviderLoss) {
+  for (const std::string_view condition :
+       {"before_admission", "terminal", "released_fence", "empty_scope",
+        "unexpected_desired_units", "existing_runtime"}) {
+    SCOPED_TRACE(condition);
+    TemporaryDirectory directory;
+    PublishHealthySources(directory, "open");
+    auto wall_time = std::make_shared<std::int64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    HeadlessApiCore core(
+        Config(directory, "api.epoch.1"),
+        HeadlessApiCoreClocks{
+            [wall_time]() { return *wall_time; },
+            []() { return 1000; },
+            []() { return "2026-08-05T00:00:00Z"; },
+        });
+    EXPECT_TRUE(
+        std::get<bool>(Member(core.RuntimeSnapshot(), "complete").storage()));
+
+    auto payload = ManagerPayloadWithIncompleteApply(
+        "runtime_convergence_pending", "robot-a", true);
+    auto apply = Member(payload, "apply");
+    auto row = Array(apply, "records").front();
+    if (condition == "before_admission") {
+      row = WithField(row, "phase", CanonicalValue("fence_acquire_pending"));
+    } else if (condition == "terminal") {
+      row = WithField(row, "incomplete", CanonicalValue(false));
+    } else if (condition == "released_fence") {
+      row = WithField(row, "fence",
+                      WithField(Member(row, "fence"), "state",
+                                CanonicalValue("released")));
+    } else if (condition == "empty_scope") {
+      const auto &fence = Member(row, "fence");
+      row = WithField(
+          row, "fence",
+          WithField(fence, "scope",
+                    WithField(Member(fence, "scope"),
+                              "controllable_component_ids",
+                              CanonicalValue(CanonicalValue::Array{}))));
+    } else if (condition == "unexpected_desired_units") {
+      payload = WithField(
+          payload, "runtime",
+          WithField(Member(payload, "runtime"), "desired_units",
+                    CanonicalValue(CanonicalValue::Array{CanonicalValue(
+                        CanonicalValue::Object{
+                            {"runtime_unit_id",
+                             CanonicalValue("unrelated-runtime")},
+                        })})));
+    } else if (condition == "existing_runtime") {
+      const auto &active = Member(payload, "active");
+      payload = WithField(
+          payload, "active",
+          WithField(active, "cell_graph",
+                    WithField(Member(active, "cell_graph"), "runtime_units",
+                              CanonicalValue(CanonicalValue::Array{
+                                  CanonicalValue(CanonicalValue::Object{
+                                      {"runtime_unit_id",
+                                       CanonicalValue("unrelated-runtime")},
+                                  }),
+                              }))));
+    }
+    payload = WithField(
+        payload, "apply",
+        WithField(apply, "records",
+                  CanonicalValue(CanonicalValue::Array{std::move(row)})));
+    AtomicSourceSnapshotChannel manager(directory.publications(),
+                                        "manager-source.json");
+    static_cast<void>(manager.Publish(
+        "component_manager", "component-manager." + std::string(kCellId),
+        "manager.epoch.1", 2, payload));
+    *wall_time += 20'000'000'000LL;
+    EXPECT_EQ(Text(OnlyAlarm(core.AlarmSnapshot()), "definition_id"),
+              "manyforge.runtime.provider_unavailable");
+  }
 }
 
 TEST(HeadlessApiCore,

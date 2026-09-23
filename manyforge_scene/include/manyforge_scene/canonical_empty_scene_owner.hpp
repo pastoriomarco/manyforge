@@ -28,8 +28,8 @@ inline constexpr std::string_view kCanonicalEmptySceneStoreSchemaId =
     "manyforge.internal.logical-scene.i4.v2";
 inline constexpr std::int64_t kCanonicalEmptySceneStoreSchemaVersion = 2;
 inline constexpr std::string_view kLogicalSceneStoreSchemaId =
-    "manyforge.internal.logical-scene.ua4.v8";
-inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 8;
+    "manyforge.internal.logical-scene.ua7s.v9";
+inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 9;
 inline constexpr std::int64_t kCanonicalEmptySceneSqliteApplicationId =
     1296454467; // "MFSC"
 inline constexpr std::size_t kMaximumSceneStoreIdentifierBytes = 256U;
@@ -238,6 +238,11 @@ public:
   [[nodiscard]]
   manyforge::core::ProjectionMaintenanceInitializationStatusDTO
   BeginMaintenanceInitialization(
+      const manyforge::core::ProjectionMaintenanceInitializationRequestDTO
+          &request) override;
+
+  [[nodiscard]] manyforge::core::ProjectionMaintenanceInitializationStatusDTO
+  InstallInitialScene(
       const manyforge::core::ProjectionMaintenanceInitializationRequestDTO
           &request) override;
   [[nodiscard]]

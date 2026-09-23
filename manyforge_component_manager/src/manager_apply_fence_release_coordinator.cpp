@@ -165,6 +165,7 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
   if (!completed.has_value() || !completed->valid() ||
       completed->state !=
           core::ProjectionMaintenanceInitializationState::kCompleted ||
+      !completed->initial_scene_installed ||
       !publication.has_value() || !acceptance.has_value() ||
       completed->publication_receipt !=
           std::optional<core::ActiveBundlePublicationReceiptDTO>{

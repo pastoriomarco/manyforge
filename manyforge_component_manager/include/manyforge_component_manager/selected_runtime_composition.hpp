@@ -7,6 +7,11 @@
 
 namespace manyforge::component_manager {
 
+enum class ManagerSelectedRuntimeCompositionPhase {
+  kPrepare,
+  kFinalize,
+};
+
 /// Exact Manager-to-managed-host request to install the already selected
 /// product composition while its durable Kernel configuration fence is held.
 /// This is a private Apply effect, not caller authorization or a command
@@ -27,6 +32,8 @@ struct ManagerSelectedRuntimeCompositionRequestDTO final {
   manyforge::core::ConfigurationFenceId configuration_fence_id;
   manyforge::core::ConfigurationFenceGeneration configuration_fence_generation;
   manyforge::core::ConfigurationFenceScopeDTO configuration_fence_scope;
+  ManagerSelectedRuntimeCompositionPhase phase{
+      ManagerSelectedRuntimeCompositionPhase::kFinalize};
 
   [[nodiscard]] bool valid() const noexcept;
 

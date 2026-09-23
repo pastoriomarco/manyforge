@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -21,6 +22,9 @@ namespace manyforge::core {
 /// and is never persisted as object placement truth.
 struct SceneResourceSceneFrameRefDTO final {
   SceneResourceId scene_resource_id;
+
+  friend bool operator==(const SceneResourceSceneFrameRefDTO &,
+                         const SceneResourceSceneFrameRefDTO &) = default;
 };
 
 using SceneTransactionFrameRefDTO =
@@ -46,6 +50,9 @@ struct AddObjectRequestDTO final {
   /// resolves these portable resource ids to instance-scoped collision bodies;
   /// callers never author planner-native body names here.
   std::vector<SupportContactDTO> support_contacts{};
+
+  friend bool operator==(const AddObjectRequestDTO&,
+                         const AddObjectRequestDTO&) = default;
 };
 
 /// Public request to create or completely replace one portable scene
@@ -204,6 +211,11 @@ struct NativeProjectionRebuildDTO final {
   ProjectionRevisionDTO target_projection_revision;
   RetainedProductDTO planning_collision_model;
   std::shared_ptr<const LogicalSceneSnapshotDTO> logical_scene;
+  /// Only the Scene owner may request an in-place, fenced maintenance
+  /// successor. This preserves the publisher already held by the privately
+  /// prepared runtime; ordinary recovery still rejects a healthy target.
+  std::optional<std::pair<ApplyId, ApplyGeneration>> maintenance_successor{};
+  std::optional<ProjectionRevisionDTO> maintenance_predecessor{};
 
   [[nodiscard]] bool valid() const noexcept {
     return expected_native_runtime_binding.valid() &&
@@ -215,7 +227,19 @@ struct NativeProjectionRebuildDTO final {
            !planning_collision_model.product_contract_revision.empty() &&
            logical_scene != nullptr && logical_scene->locally_valid() &&
            logical_scene->revision ==
-               target_projection_revision.scene_revision;
+               target_projection_revision.scene_revision &&
+           maintenance_successor.has_value() ==
+               maintenance_predecessor.has_value() &&
+           (!maintenance_successor.has_value() ||
+            (!maintenance_successor->first.empty() &&
+             maintenance_successor->second.nonzero() &&
+             maintenance_predecessor->valid() &&
+             maintenance_predecessor->retained_bundle_id ==
+                 target_projection_revision.retained_bundle_id &&
+             maintenance_predecessor->graph_revision ==
+                 target_projection_revision.graph_revision &&
+             maintenance_predecessor->scene_revision.scene_id ==
+                 target_projection_revision.scene_revision.scene_id));
   }
 
   friend bool operator==(const NativeProjectionRebuildDTO& lhs,
@@ -225,7 +249,9 @@ struct NativeProjectionRebuildDTO final {
            lhs.target_projection_revision == rhs.target_projection_revision &&
            lhs.planning_collision_model == rhs.planning_collision_model &&
            lhs.logical_scene != nullptr && rhs.logical_scene != nullptr &&
-           *lhs.logical_scene == *rhs.logical_scene;
+           *lhs.logical_scene == *rhs.logical_scene &&
+           lhs.maintenance_successor == rhs.maintenance_successor &&
+           lhs.maintenance_predecessor == rhs.maintenance_predecessor;
   }
 };
 

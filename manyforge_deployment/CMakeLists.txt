@@ -661,6 +661,7 @@ add_library(manyforge_deployment_verification_core
   src/native_execution_runtime_unit_internal.cpp
   src/ordinary_motion_jerk.cpp
   src/deployment_jerk_import.cpp
+  src/initial_scene_projection.cpp
   src/ros2_control_execution_runtime_unit_internal.cpp
   src/planning_resource_map_internal.cpp
   src/posix_read_only_internal.cpp

@@ -3713,9 +3713,33 @@ class HeadlessSceneProgramPort:
     ) -> bool:
         scene_resource_id = _text(operation.get("scene_resource_id"), field="scene_resource_id")
         current = view.objects.get(scene_resource_id)
+        # Commands use the binding DTO spelling; snapshots use the Scene
+        # owner's public representation (owner_publication.cpp). Compare in
+        # snapshot form rather than treating identical geometry as an edit.
+        shape = operation["shape"]
+        kind = shape["type"]
+        if kind == "box":
+            expected_shape = {
+                "type": kind,
+                "dimensions_m": {axis: shape["box_dimensions_m"][f"{axis}_m"] for axis in "xyz"},
+            }
+        elif kind == "sphere":
+            expected_shape = {"type": kind, "radius_m": shape["sphere_radius_m"]}
+        elif kind == "cylinder":
+            expected_shape = {
+                "type": kind, "radius_m": shape["cylinder_radius_m"],
+                "height_m": shape["cylinder_height_m"],
+            }
+        elif kind == "mesh":
+            expected_shape = {
+                "type": kind, "resource_uri": shape["mesh_resource_uri"],
+                "scale": {axis: shape["mesh_scale"][f"{axis}_m"] for axis in "xyz"},
+            }
+        else:
+            raise ProductionPortError("initial Scene operation has an unsupported shape")
         if current is None or (
             list(_sequence(current.get("collision_shapes"), field="collision_shapes"))
-            != [operation.get("shape")]
+            != [expected_shape]
             or list(
                 _sequence(
                     current.get("support_contacts", ()),
@@ -3727,15 +3751,19 @@ class HeadlessSceneProgramPort:
         ):
             return False
         frame_ref = _mapping(operation.get("frame_ref"), field="frame_ref")
-        # Cell-frame intent has the same normalized representation in the
-        # owner snapshot. Component-frame intent is resolved by the native
+        # Component-frame intent is resolved by the native
         # owner, so only an owner-issued prepared proof can compare it.
         if frame_ref.get("kind") != "cell_frame":
             return False
         return current.get("placement") == {
             "kind": "cell_fixed",
             "cell_id": view.cell_id,
-            "pose_in_cell": operation.get("pose"),
+            "pose_in_cell": {
+                "position_m": {
+                    axis: operation["pose"]["position_m"][f"{axis}_m"] for axis in "xyz"
+                },
+                "orientation_xyzw": [operation["pose"]["orientation"][axis] for axis in "xyzw"],
+            },
         }
 
     @staticmethod

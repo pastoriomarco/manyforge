@@ -10,6 +10,7 @@
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
 #include <manyforge_component_manager/manager_liveness_transport.hpp>
 #include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
+#include <manyforge_deployment/initial_scene_projection.hpp>
 #include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
@@ -2116,9 +2117,79 @@ public:
       std::filesystem::path package_root,
       std::optional<std::filesystem::path> activation_root =
           std::nullopt)
-      : bundles_(package_root, activation_root),
-        artifacts_(std::move(package_root),
-                   std::move(activation_root)) {}
+      : package_root_(package_root), activation_root_(activation_root),
+        bundles_(package_root, activation_root),
+        artifacts_(package_root, activation_root) {}
+
+  [[nodiscard]] std::vector<core::AddObjectRequestDTO> initial_scene(
+      const component_manager::ManagerApplyPreparedActivationDTO &activation,
+      const deployment::RetainedBundle &bundle) const {
+    const auto receipt = content_identity::parse_canonical_json(
+        activation.canonical_receipt_json,
+        {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
+         4096U});
+    const auto required = [&](std::string_view key) {
+      const auto *field = receipt.find_object_member(key);
+      if (field == nullptr || !field->is_string() ||
+          field->as_string().empty()) {
+        throw std::invalid_argument(
+            "Apply initial Scene has no exact prepared " + std::string(key));
+      }
+      return field->as_string();
+    };
+    if (required("prepared_activation_id") !=
+            activation.prepared_activation_id.value() ||
+        required("program_binding_id") !=
+            activation.program_binding_id.value() ||
+        required("retained_bundle_id") != bundle.retained_bundle_id().value() ||
+        required("graph_revision") !=
+            bundle.value().cell_graph.graph_revision.value() ||
+        required("deployment_artifact_id") !=
+            activation.deployment_artifact_id.value() ||
+        required("deployment_revision") !=
+            activation.deployment_revision.value()) {
+      throw std::invalid_argument(
+          "Apply initial Scene prepared identity differs from candidate");
+    }
+    const auto &maps = bundle.value().compiled_products.symbol_role_maps;
+    if (maps.size() != 1U) {
+      throw std::invalid_argument(
+          "Apply initial Scene requires one exact retained model map");
+    }
+    deployment::FilesystemVerifiedRetainedModelMapSource map_source(
+        package_root_, activation_root_);
+    const auto model_map = map_source.get_verified({
+        bundle.retained_bundle_id(), maps.front().product_id});
+    if (!model_map.has_value()) {
+      throw std::invalid_argument(
+          "Apply initial Scene retained model map is unavailable");
+    }
+    const auto read_program = [&](const std::filesystem::path &root) {
+      return deployment::FilesystemVerifiedProgramSource(root).get_verified(
+          core::ProgramId(required("program_id")),
+          core::ProgramRevision(required("program_revision")), bundle);
+    };
+    const auto read_binding = [&](const std::filesystem::path &root) {
+      return deployment::FilesystemVerifiedProgramBindingSource(root)
+          .get_verified(activation.program_binding_id, bundle, *model_map);
+    };
+    auto program = activation_root_.has_value()
+                       ? read_program(*activation_root_)
+                       : nullptr;
+    if (program == nullptr)
+      program = read_program(package_root_);
+    auto binding = activation_root_.has_value()
+                       ? read_binding(*activation_root_)
+                       : nullptr;
+    if (binding == nullptr)
+      binding = read_binding(package_root_);
+    if (program == nullptr || binding == nullptr) {
+      throw std::invalid_argument(
+          "Apply initial Scene Program or binding is not retained");
+    }
+    return deployment::project_bound_initial_scene(
+        *program, *binding, bundle.value().cell_graph.cell_id);
+  }
 
   [[nodiscard]] std::shared_ptr<const deployment::RetainedBundle> get_verified(
       const core::RetainedBundleId &retained_bundle_id) const override {
@@ -2190,6 +2261,8 @@ public:
   }
 
 private:
+  std::filesystem::path package_root_;
+  std::optional<std::filesystem::path> activation_root_;
   deployment::FilesystemVerifiedRetainedBundleSource bundles_;
   deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts_;
   mutable std::mutex mutex_;
@@ -2320,6 +2393,9 @@ public:
                              kLaunchEnvironmentContract)},
             [this] { return ElapsedNs(); },
             [] { return core::ApplyId(RandomToken("apply-")); },
+            [this](const auto &activation, const auto &bundle) {
+              return verified_package_.initial_scene(activation, bundle);
+            },
             [this] { RequireCurrentPackageGeneration(); },
             [this](const component_manager::ManagerApplyIntentDTO &) {
               TryPublishApplyTransition();
@@ -3391,6 +3467,7 @@ private:
       // readiness closed and leave ordinary active reconciliation alone.
       if (HasIncompleteApply()) {
         TrySubmitFailClosedReadiness();
+        TryPublishApplyTransition();
         RequestApplyProgress();
         return;
       }

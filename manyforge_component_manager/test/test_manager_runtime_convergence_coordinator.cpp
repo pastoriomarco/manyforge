@@ -824,6 +824,7 @@ public:
   [[nodiscard]] ManagerSelectedRuntimeCompositionResultDTO InstallOrObserve(
       const ManagerSelectedRuntimeCompositionRequestDTO &request) override {
     ++calls;
+    phases.push_back(request.phase);
     last_request = request;
     auto response_request = request;
     if (foreign_response) {
@@ -838,6 +839,7 @@ public:
   bool prepare_once{false};
   bool foreign_response{false};
   int calls{0};
+  std::vector<ManagerSelectedRuntimeCompositionPhase> phases;
   std::optional<ManagerSelectedRuntimeCompositionRequestDTO> last_request;
 };
 
@@ -959,7 +961,24 @@ public:
         std::nullopt,
         std::nullopt,
         false,
+        false,
     };
+    return *status_;
+  }
+
+  [[nodiscard]] core::ProjectionMaintenanceInitializationStatusDTO
+  InstallInitialScene(
+      const core::ProjectionMaintenanceInitializationRequestDTO &request)
+      override {
+    ++install_scene_calls;
+    if (!status_.has_value() || !last_request.has_value() ||
+        request != *last_request || status_->initial_scene_installed) {
+      throw std::runtime_error("scene fixture received foreign baseline");
+    }
+    ++status_->target_projection_revision.scene_revision.revision_id;
+    status_->authoritative_snapshot_identity.revision =
+        status_->target_projection_revision.scene_revision;
+    status_->initial_scene_installed = true;
     return *status_;
   }
 
@@ -1013,6 +1032,7 @@ public:
   }
 
   int begin_calls{0};
+  int install_scene_calls{0};
   int complete_calls{0};
   mutable int read_calls{0};
   std::optional<core::ProjectionMaintenanceInitializationRequestDTO>
@@ -1497,6 +1517,7 @@ TEST(ManagerNamedApplyCoordinator,
   AlwaysIdleMaintenanceGate maintenance_gate;
   ManagerPlannedMaintenanceCoordinator planned_maintenance(
       active_plan_source, active_runtime, maintenance_gate);
+  bool invalid_initial_scene = true;
   ManagerNamedApplyCoordinator coordinator(
       journal, active_plan_source, bundle_source,
       *package.artifact_source, publication_store, scene_owner, nullptr,
@@ -1504,7 +1525,17 @@ TEST(ManagerNamedApplyCoordinator,
       runtime_ports, planned_maintenance,
       RuntimeEpoch("manager-runtime.aggregate.1"), "linux",
       {"posix.1-2017"}, [] { return 1'000U; },
-      [] { return ApplyId("apply.aggregate.1"); });
+      [] { return ApplyId("apply.aggregate.1"); },
+      [&](const auto &, const auto &) {
+        if (invalid_initial_scene) {
+          return std::vector<core::AddObjectRequestDTO>{
+              {core::SceneResourceId("invalid"), core::SphereShapeDTO{-0.1},
+               core::Pose3DTO{},
+               core::CellSceneFrameRefDTO{
+                   package.bundle->value().cell_graph.cell_id}, {}}};
+        }
+        return std::vector<core::AddObjectRequestDTO>{};
+      });
   const ManagerNamedApplyRequestDTO request{
       intent_template.request_context,
       package.bundle->value().deployment_artifact_id,
@@ -1517,6 +1548,14 @@ TEST(ManagerNamedApplyCoordinator,
       std::nullopt,
   };
 
+  EXPECT_THROW(coordinator.AcceptOrReplay(request),
+               ManagerNamedApplyCoordinatorError);
+  EXPECT_FALSE(journal.ReadRequest(request.request_context.request_owner_epoch,
+                                   request.request_context.request_id)
+                   .has_value());
+  EXPECT_EQ(runtime_ports.ensure_calls, 0);
+  EXPECT_EQ(scene_owner.begin_calls, 0);
+  invalid_initial_scene = false;
   const auto accepted = coordinator.AcceptOrReplay(request);
   EXPECT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
   EXPECT_FALSE(accepted.request_replayed);
@@ -1542,8 +1581,16 @@ TEST(ManagerNamedApplyCoordinator,
   ASSERT_TRUE(completed->terminal_outcome.has_value());
   EXPECT_EQ(runtime_ports.ensure_calls, 1);
   EXPECT_EQ(scene_owner.begin_calls, 1);
+  EXPECT_EQ(scene_owner.install_scene_calls, 1);
   EXPECT_EQ(scene_owner.complete_calls, 1);
-  EXPECT_EQ(runtime_composition.calls, 1);
+  EXPECT_EQ(runtime_composition.calls, 2);
+  EXPECT_EQ(runtime_composition.phases,
+            (std::vector<ManagerSelectedRuntimeCompositionPhase>{
+                ManagerSelectedRuntimeCompositionPhase::kPrepare,
+                ManagerSelectedRuntimeCompositionPhase::kFinalize}));
+  ASSERT_TRUE(runtime_composition.last_request.has_value());
+  EXPECT_EQ(runtime_composition.last_request->phase,
+            ManagerSelectedRuntimeCompositionPhase::kFinalize);
   EXPECT_EQ(publication_store.publish_calls, 1);
   EXPECT_EQ(kernel_fence.acquire_calls, 1);
   EXPECT_EQ(kernel_fence.release_calls, 1);
@@ -1555,8 +1602,9 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(replayed.terminal_outcome, completed->terminal_outcome);
   EXPECT_EQ(runtime_ports.ensure_calls, 1);
   EXPECT_EQ(scene_owner.begin_calls, 1);
+  EXPECT_EQ(scene_owner.install_scene_calls, 1);
   EXPECT_EQ(scene_owner.complete_calls, 1);
-  EXPECT_EQ(runtime_composition.calls, 1);
+  EXPECT_EQ(runtime_composition.calls, 2);
   EXPECT_EQ(publication_store.publish_calls, 1);
   EXPECT_EQ(kernel_fence.acquire_calls, 1);
   EXPECT_EQ(kernel_fence.release_calls, 1);
@@ -1610,7 +1658,10 @@ TEST(ManagerNamedApplyCoordinator,
         runtime_ports, planned_maintenance,
         RuntimeEpoch("manager-runtime.aggregate.1"), "linux",
         {"posix.1-2017"}, [] { return 1'000U; },
-        [] { return ApplyId("apply.reopened.1"); });
+        [] { return ApplyId("apply.reopened.1"); },
+        [](const auto &, const auto &) {
+          return std::vector<core::AddObjectRequestDTO>{};
+        });
     EXPECT_EQ(first.AcceptOrReplay(request).state,
               ManagerNamedApplyResultState::kPending);
   }
@@ -1622,7 +1673,10 @@ TEST(ManagerNamedApplyCoordinator,
       runtime_ports, planned_maintenance,
       RuntimeEpoch("manager-runtime.aggregate.2"), "linux",
       {"posix.1-2017"}, [] { return 2'000U; },
-      [] { return ApplyId("must-not-be-minted"); });
+      [] { return ApplyId("must-not-be-minted"); },
+      [](const auto &, const auto &) {
+        return std::vector<core::AddObjectRequestDTO>{};
+      });
   const auto interrupted = reopened.RecoverIncompleteApply();
   ASSERT_TRUE(interrupted.has_value());
   EXPECT_EQ(interrupted->state, ManagerNamedApplyResultState::kUnknownEffect);

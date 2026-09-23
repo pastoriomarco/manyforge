@@ -705,6 +705,12 @@ RetainedPlannerSceneProjection::RebuildProjectionLocked(
   }
   if (HealthyAt(request.target_projection_revision) &&
       *logical_snapshot_ == *request.logical_scene) {
+    if (request.maintenance_successor.has_value() &&
+        (!maintenance_successor_.has_value() ||
+         *maintenance_successor_ != request)) {
+      return invalid("maintenance successor replay changed its exact Apply "
+                     "identity", "native_projection_maintenance_conflict");
+    }
     return {std::nullopt,
             request.target_projection_revision,
             core::ProjectionCommitResultStateDTO::kCommitted,
@@ -713,6 +719,74 @@ RetainedPlannerSceneProjection::RebuildProjectionLocked(
             false,
             health_,
             std::nullopt};
+  }
+  if (request.maintenance_successor.has_value()) {
+    if (!HealthyAt(*request.maintenance_predecessor) ||
+        request.target_projection_revision.scene_revision.revision_id <=
+            request.maintenance_predecessor->scene_revision.revision_id ||
+        health_.source_sequence >
+            std::numeric_limits<std::uint64_t>::max() - 1U ||
+        (health_.native_projection_generation.has_value() &&
+         *health_.native_projection_generation ==
+             std::numeric_limits<std::uint64_t>::max())) {
+      return invalid("maintenance successor has no exact healthy fenced "
+                     "predecessor", "native_projection_maintenance_stale");
+    }
+    auto publisher = active_publisher_.load(std::memory_order_acquire);
+    if (!publisher) {
+      return invalid("maintenance publisher is unavailable",
+                     "native_projection_maintenance_unavailable");
+    }
+    try {
+      const auto observed_at = clock_();
+      if (observed_at < 0) {
+        return invalid("maintenance clock returned a negative timestamp",
+                       "native_projection_maintenance_clock_invalid");
+      }
+      const auto published = publisher->publish(
+          *request.logical_scene,
+          RetainedCollisionWorldPublicationContext{
+              core::CollisionWorldMutationSource::kDeploymentApply, {},
+              observed_at, {}, "initial_scene_maintenance", std::nullopt});
+      if (!published.ok()) {
+        return Desynchronize(
+            std::nullopt, request.target_projection_revision,
+            error("projection_state_uncertain", published.error().message,
+                  "native_projection_maintenance_publication_uncertain"));
+      }
+      const auto digest = publisher_digest(publisher);
+      if (!digest.has_value()) {
+        return Desynchronize(std::nullopt,
+                             request.target_projection_revision,
+                             error("projection_state_uncertain",
+                                   "maintenance publisher has no digest",
+                                   "native_projection_maintenance_digest_missing"));
+      }
+      ++health_.source_sequence;
+      health_.active_projection_revision = request.target_projection_revision;
+      health_.native_projection_generation =
+          health_.native_projection_generation.value_or(0U) + 1U;
+      health_.projection_content_digest = *digest;
+      logical_snapshot_ = request.logical_scene;
+      transaction_records_.clear();
+      maintenance_successor_ = request;
+      return {std::nullopt, request.target_projection_revision,
+              core::ProjectionCommitResultStateDTO::kCommitted,
+              request.target_projection_revision,
+              health_.native_projection_generation, false, health_,
+              std::nullopt};
+    } catch (const std::exception &exception) {
+      return Desynchronize(
+          std::nullopt, request.target_projection_revision,
+          error("projection_state_uncertain", exception.what(),
+                "native_projection_maintenance_effect_uncertain"));
+    } catch (...) {
+      return Desynchronize(
+          std::nullopt, request.target_projection_revision,
+          error("projection_state_uncertain",
+                "maintenance publication ended without a result",
+                "native_projection_maintenance_effect_uncertain"));
+    }
   }
   if (health_.state == core::ProjectionHealthState::kHealthy) {
     return invalid("recovery cannot replace a healthy native projection at "

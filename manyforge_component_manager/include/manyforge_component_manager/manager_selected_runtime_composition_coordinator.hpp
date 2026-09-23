@@ -41,11 +41,21 @@ public:
       manyforge::core::RuntimeEpoch manager_runtime_epoch);
 
   [[nodiscard]] ManagerSelectedRuntimeCompositionCoordinatorResult
+  PrepareOrObserve(const manyforge::core::ApplyId &apply_id,
+                   manyforge::core::ApplyGeneration apply_generation,
+                   const manyforge::deployment::RetainedBundle &candidate);
+
+  [[nodiscard]] ManagerSelectedRuntimeCompositionCoordinatorResult
   InstallOrRecover(const manyforge::core::ApplyId &apply_id,
                    manyforge::core::ApplyGeneration apply_generation,
                    const manyforge::deployment::RetainedBundle &candidate);
 
 private:
+  [[nodiscard]] ManagerSelectedRuntimeCompositionCoordinatorResult
+  Advance(const manyforge::core::ApplyId &apply_id,
+          manyforge::core::ApplyGeneration apply_generation,
+          const manyforge::deployment::RetainedBundle &candidate,
+          ManagerSelectedRuntimeCompositionPhase phase);
   SqliteManagerApplyJournal &apply_journal_;
   manyforge::core::IManagerSceneProjectionMaintenancePort &scene_owner_;
   IManagerSelectedRuntimeCompositionPort &runtime_composition_;

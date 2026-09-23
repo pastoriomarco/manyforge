@@ -254,6 +254,10 @@ ManagerApplyTransitionId(const CanonicalValue &runtime) {
       continue;
     }
     const auto &fence = RequiredMember(row, "fence");
+    const auto fence_state = RequiredString(fence, "state");
+    if (fence_state != "held" && fence_state != "release_pending") {
+      continue;
+    }
     const auto &scope = RequiredMember(fence, "scope");
     std::set<std::string> affected_components;
     for (const auto &value :
@@ -285,7 +289,19 @@ ManagerApplyTransitionId(const CanonicalValue &runtime) {
     for (const auto &unit : RequiredArray(manager_runtime, "desired_units")) {
       desired_units.insert(RequiredString(unit, "runtime_unit_id"));
     }
-    if (desired_units.empty() || affected_units != desired_units) {
+    // An empty active cell has no predecessor components to map to runtime
+    // units. It may still have a cell-level host runtime unit.
+    const bool initializing_empty_cell =
+        RequiredArray(graph, "controllable_components").empty() &&
+        !affected_components.empty();
+    std::set<std::string> active_units;
+    for (const auto &unit : RequiredArray(graph, "runtime_units")) {
+      active_units.insert(RequiredString(unit, "runtime_unit_id"));
+    }
+    // desired_units describes the active predecessor, not the candidate.
+    if (initializing_empty_cell ? desired_units != active_units
+                                : desired_units.empty() ||
+                                      affected_units != desired_units) {
       continue;
     }
     Require(!transition.has_value(), "headless_source_invalid",

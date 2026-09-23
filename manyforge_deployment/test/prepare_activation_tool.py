@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import json
 from pathlib import Path
@@ -175,6 +176,39 @@ def _run(
         raise AssertionError("preparer returned an incomplete direct payload")
     if not payload["raw_artifacts"] or not payload["catalog_artifacts"]:
         raise AssertionError("preparer omitted its exact artifact closure")
+    bundle = payload["retained_bundle"]
+    policies = bundle["retained_policy_records"]
+    if len(policies) != 1 or policies[0]["record_kind"] != "runtime_policy":
+        raise AssertionError("motion bundle has no single verified runtime policy")
+    policy_ref = policies[0]
+    if policy_ref not in bundle["catalogs"]["records"]:
+        raise AssertionError("runtime policy is not in the exact catalog closure")
+    artifacts = [
+        artifact for artifact in payload["catalog_artifacts"]
+        if artifact["content_addressed_store_key"]
+        == policy_ref["content_addressed_store_key"]
+    ]
+    if (
+        len(artifacts) != 1
+        or artifacts[0]["content_digest"] != policy_ref["content_digest"]
+    ):
+        raise AssertionError("runtime policy bytes are missing from the handoff")
+    policy_bytes = base64.b64decode(
+        "".join(artifacts[0]["chunks"]), validate=True
+    )
+    if (
+        len(policy_bytes) != artifacts[0]["byte_size"]
+        or raw_sha256_digest(policy_bytes) != policy_ref["content_digest"]
+    ):
+        raise AssertionError("prepared runtime policy has incorrect byte identity")
+    policy = json.loads(policy_bytes)
+    if (
+        policy["runtime_policy_id"] != request["deployment"]["deployment_artifact_id"]
+        or policy["runtime_policy_revision"] != policy_ref["record_revision"]
+        or policy["interrupt_policy_ids"] != []
+        or policy["open_loop_grasp_acknowledgements"] != []
+    ):
+        raise AssertionError("prepared runtime policy is not restrictive and exact")
     if not any(activation_root.iterdir()):
         raise AssertionError("preparer omitted the activation closure")
     return value

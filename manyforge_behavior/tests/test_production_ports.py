@@ -2363,15 +2363,15 @@ def _fixed_scene_object(
         "collision_shapes": [
             {
                 "type": "box",
-                "box_dimensions_m": {"x_m": 0.1, "y_m": 0.1, "z_m": 0.1},
+                "dimensions_m": {"x": 0.1, "y": 0.1, "z": 0.1},
             }
         ],
         "placement": {
             "kind": "cell_fixed",
             "cell_id": "cell-a",
             "pose_in_cell": {
-                "position_m": {"x_m": 1.0, "y_m": 2.0, "z_m": 3.0},
-                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                "position_m": {"x": 1.0, "y": 2.0, "z": 3.0},
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
             },
         },
         "provider_evidence": None,
@@ -2524,13 +2524,28 @@ class _SceneTransport:
             self.objects.pop(operation["scene_resource_id"])
         elif kind in {"add_object", "upsert_object"}:
             frame_ref = operation["frame_ref"]
+            shape = operation["shape"]
+            # Match the public native Scene snapshot, not the command DTO.
+            assert shape["type"] == "box"
             scene_object = {
                 "scene_resource_id": operation["scene_resource_id"],
-                "collision_shapes": [deepcopy(operation["shape"])],
+                "collision_shapes": [{
+                    "type": "box",
+                    "dimensions_m": {
+                        axis: shape["box_dimensions_m"][f"{axis}_m"] for axis in "xyz"
+                    },
+                }],
                 "placement": {
                     "kind": "cell_fixed",
                     "cell_id": "cell-a",
-                    "pose_in_cell": deepcopy(operation["pose"]),
+                    "pose_in_cell": {
+                        "position_m": {
+                            axis: operation["pose"]["position_m"][f"{axis}_m"] for axis in "xyz"
+                        },
+                        "orientation_xyzw": [
+                            operation["pose"]["orientation"][axis] for axis in "xyzw"
+                        ],
+                    },
                 },
                 "provider_evidence": None,
                 "support_contacts": deepcopy(operation["support_contacts"]),
@@ -2795,9 +2810,9 @@ def test_scene_initialization_upserts_only_the_changed_authored_object() -> None
     port.prepare_initial_scene(_scene_context(), scene)
     transport.submissions.clear()
     transport.objects["graspable"]["placement"]["pose_in_cell"]["position_m"] = {
-        "x_m": 0.8,
-        "y_m": 0.1,
-        "z_m": 0.4,
+        "x": 0.8,
+        "y": 0.1,
+        "z": 0.4,
     }
     revision_id = transport.revision["scene_revision"]["revision_id"] + 1
     transport.revision["scene_revision"] = {
@@ -2812,19 +2827,36 @@ def test_scene_initialization_upserts_only_the_changed_authored_object() -> None
     assert transport.submissions[0]["operation"]["kind"] == "upsert_object"
     assert transport.submissions[0]["operation"]["scene_resource_id"] == "graspable"
     assert transport.objects["graspable"]["placement"]["pose_in_cell"] == {
-        "position_m": {"x_m": 0.3, "y_m": 0.0, "z_m": 0.2},
-        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        "position_m": {"x": 0.3, "y": 0.0, "z": 0.2},
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
     }
 
 
-def test_exact_cell_frame_initial_scene_is_a_read_only_fast_path() -> None:
+@pytest.mark.parametrize(
+    ("authored_shape", "published_shape"),
+    [
+        ({"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]},
+         {"type": "box", "dimensions_m": {"x": 0.1, "y": 0.1, "z": 0.1}}),
+        ({"type": "sphere", "sphere_radius_m": 0.1},
+         {"type": "sphere", "radius_m": 0.1}),
+        ({"type": "cylinder", "cylinder_radius_m": 0.1, "cylinder_height_m": 0.2},
+         {"type": "cylinder", "radius_m": 0.1, "height_m": 0.2}),
+        ({"type": "mesh", "mesh_resource_uri": "asset://part.stl", "mesh_scale": [1, 2, 3]},
+         {"type": "mesh", "resource_uri": "asset://part.stl", "scale": {"x": 1, "y": 2, "z": 3}}),
+    ],
+)
+def test_exact_cell_frame_initial_scene_is_a_read_only_fast_path(
+    authored_shape, published_shape,
+) -> None:
     transport = _SceneTransport()
     scene = [_authored_scene()[0]]
-    first = _scene_port(transport)
-    first.prepare_initial_scene(_scene_context(), scene)
-    assert len(transport.submissions) == 1
-
-    transport.submissions.clear()
+    scene[0]["shape"] = authored_shape
+    # Activation already installed the Scene. A fresh port has no cached proof
+    # and must compare the native publication without submitting any writes.
+    obj = _fixed_scene_object("graspable")
+    obj["collision_shapes"] = [published_shape]
+    obj["placement"]["pose_in_cell"]["position_m"] = {"x": 0.3, "y": 0.0, "z": 0.2}
+    transport.objects["graspable"] = obj
     replacement = _scene_port(transport)
     proof = replacement.prepare_initial_scene(_scene_context(), scene)
 

@@ -15,7 +15,7 @@ namespace {
 namespace core = manyforge::core;
 
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'S',
-                                              'R', 'C', '2', 0};
+                                              'R', 'C', '3', 0};
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
 constexpr std::uint8_t kRequestTag = 1U;
 constexpr std::uint8_t kPreparingTag = 2U;
@@ -288,6 +288,7 @@ void WriteRequest(Writer &writer,
   WriteStrong(writer, request.configuration_fence_id);
   WriteGeneration(writer, request.configuration_fence_generation);
   WriteScope(writer, request.configuration_fence_scope);
+  writer.Byte(static_cast<std::uint8_t>(request.phase));
 }
 
 [[nodiscard]] ManagerSelectedRuntimeCompositionRequestDTO
@@ -307,6 +308,7 @@ ReadRequest(Reader &reader) {
       ReadStrong<core::ConfigurationFenceId>(reader),
       ReadGeneration<core::ConfigurationFenceGeneration>(reader),
       ReadScope(reader),
+      static_cast<ManagerSelectedRuntimeCompositionPhase>(reader.Byte()),
   };
 }
 

@@ -493,7 +493,8 @@ CanonicalValue compile_activation_deployment(
     const std::vector<ActivationComponentProfile> &component_profiles,
     const std::vector<ActivationPreparedModel> &prepared_models,
     const std::vector<core::CatalogRecordRefDTO> &catalog_records,
-    const std::vector<QualifiedRuntimeProfile> &runtime_profiles) {
+    const std::vector<QualifiedRuntimeProfile> &runtime_profiles,
+    const core::RuntimePolicyCatalogRecordRefDTO &runtime_policy) {
   if (intent.components.size() != component_profiles.size() ||
       intent.components.size() != prepared_models.size()) {
     fail("component/profile/model joins differ in size");
@@ -502,6 +503,11 @@ CanonicalValue compile_activation_deployment(
     fail("component attachments are not yet supported by the authored compiler");
   }
   CatalogSelection catalog(catalog_records);
+  const auto &policy_ref = catalog.require(core::CatalogRecordKind::kRuntimePolicy,
+                                           runtime_policy.record_id.value());
+  if (policy_ref != core::CatalogRecordRefDTO(runtime_policy)) {
+    fail("selected runtime policy differs from the prepared referent");
+  }
   const auto &runtime_ref = catalog.require(
       core::CatalogRecordKind::kRuntimeProfile,
       "manyforge.native_execution_runtime");
@@ -830,7 +836,8 @@ CanonicalValue compile_activation_deployment(
   std::sort(stop_timing.begin(), stop_timing.end(), by("control_binding_id"));
 
   Object policies{
-      {"retained_policy_records", CanonicalValue(Array{})},
+      {"retained_policy_records",
+       CanonicalValue(Array{catalog_value(policy_ref)})},
       {"stop_stage_parameters", CanonicalValue(std::move(stop_stages))},
       {"stop_timing_parameters", CanonicalValue(std::move(stop_timing))},
       {"commissioned_stop_interfaces", CanonicalValue(Array{})},
