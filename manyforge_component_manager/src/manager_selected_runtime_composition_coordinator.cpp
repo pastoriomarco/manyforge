@@ -86,8 +86,14 @@ ManagerSelectedRuntimeCompositionCoordinator::Advance(
               initialized->predecessor_projection_revision ==
                   apply->intent.expected_active_projection_revision,
           "selected runtime composition has invalid Scene initialization evidence");
+  // Finalize runs before publication (Scene installed, not yet published) and
+  // once more after it, while the parent fence is still held, so the runtime
+  // owner can verify and adopt the published candidate.
   Require(phase == ManagerSelectedRuntimeCompositionPhase::kPrepare ||
-              initialized->ready_for_publication(),
+              initialized->ready_for_publication() ||
+              (initialized->state ==
+                   core::ProjectionMaintenanceInitializationState::kCompleted &&
+               initialized->initial_scene_installed),
           "selected runtime composition cannot finalize before Scene is installed");
   const auto &accepted_fence = acceptance->accepted_fence;
   const auto &fence_intent = attempt->fence_intent;

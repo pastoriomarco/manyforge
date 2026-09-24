@@ -170,63 +170,74 @@ def _stable_active_configuration(
     }
 
 
-def _qualify_native_cclc_product(
-    execution_run_root: Path,
-) -> None:
+def _submit_native_cclc_lifecycle(
+    execution_run_root: Path, *, intent_kind: str, request_id: str
+) -> dict[str, Any]:
     client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=5.0)
     admission = CellAdmissionClient(execution_run_root, timeout_seconds=5.0)
-
-    def context(request_id: str, owner_epoch: str) -> dict[str, Any]:
-        return {
-            "request_id": request_id,
-            "request_owner_epoch": owner_epoch,
-            "source_label": "native-process-qualification",
+    owner_epoch = client.owner_identity()["request_owner_epoch"]
+    snapshot = client.component_snapshot("lite6_arm")
+    expected_domains = [
+        {
+            "control_domain_id": domain["control_domain_id"],
+            "control_domain_revision": domain["control_domain_revision"],
+            "controller_topology_id": domain["controller_topology_id"],
+            "topology_revision": domain["topology_revision"],
+            "expected_active_control_configuration": _expected_active_configuration(
+                domain["active_control_configuration"]
+            ),
+            "expected_control_bindings": domain["current_control_bindings"],
         }
+        for domain in snapshot["domains"]
+    ]
+    result = client.submit_lifecycle(
+        {
+            "request_context": {
+                "request_id": request_id,
+                "request_owner_epoch": owner_epoch,
+                "source_label": "native-process-qualification",
+            },
+            "controllable_component_id": snapshot["controllable_component_id"],
+            "intent": intent_kind,
+            "expected_graph_revision": snapshot["graph_revision"],
+            "expected_component_lifecycle_generation": snapshot[
+                "component_lifecycle_generation"
+            ],
+            "expected_admission_generation": admission.get()["admission_generation"],
+            "expected_control_domains": expected_domains,
+        }
+    )
+    acceptance = result.get("acceptance")
+    if not isinstance(acceptance, dict):
+        raise RuntimeError(f"native CCLC {intent_kind} was not accepted: {result}")
+    return _wait_for_cclc_terminal(
+        client.lifecycle_status,
+        acceptance["lifecycle_transaction_id"],
+        label=intent_kind,
+    )
 
-    for intent_kind in ("prepare", "enable"):
-        owner_epoch = client.owner_identity()["request_owner_epoch"]
-        snapshot = client.component_snapshot("lite6_arm")
-        admission_generation = admission.get()["admission_generation"]
-        expected_domains = [
-            {
-                "control_domain_id": domain["control_domain_id"],
-                "control_domain_revision": domain["control_domain_revision"],
-                "controller_topology_id": domain["controller_topology_id"],
-                "topology_revision": domain["topology_revision"],
-                "expected_active_control_configuration": (
-                    _expected_active_configuration(
-                        domain["active_control_configuration"]
-                    )
-                ),
-                "expected_control_bindings": domain["current_control_bindings"],
-            }
-            for domain in snapshot["domains"]
-        ]
-        result = client.submit_lifecycle(
-            {
-                "request_context": context(
-                    f"process.lifecycle.{intent_kind}", owner_epoch
-                ),
-                "controllable_component_id": snapshot["controllable_component_id"],
-                "intent": intent_kind,
-                "expected_graph_revision": snapshot["graph_revision"],
-                "expected_component_lifecycle_generation": snapshot[
-                    "component_lifecycle_generation"
-                ],
-                "expected_admission_generation": admission_generation,
-                "expected_control_domains": expected_domains,
-            }
-        )
-        acceptance = result.get("acceptance")
-        if not isinstance(acceptance, dict):
-            raise RuntimeError(f"native CCLC {intent_kind} was not accepted: {result}")
-        _wait_for_cclc_terminal(
-            client.lifecycle_status,
-            acceptance["lifecycle_transaction_id"],
-            label=intent_kind,
-        )
 
+def _qualify_native_cclc_product(execution_run_root: Path) -> None:
+    _submit_native_cclc_lifecycle(
+        execution_run_root,
+        intent_kind="prepare",
+        request_id="process.lifecycle.prepare",
+    )
+    # This fixture was published without Manager Apply. Establish its routes
+    # through ordinary CCLC before Enable opens command admission.
     _submit_native_cclc_routes(execution_run_root)
+    _submit_native_cclc_lifecycle(
+        execution_run_root,
+        intent_kind="enable",
+        request_id="process.lifecycle.enable",
+    )
+
+    client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=5.0)
+    final_snapshot = client.component_snapshot("lite6_arm")
+    if final_snapshot["component_lifecycle_state"] != "active":
+        raise RuntimeError(
+            f"native CCLC product did not become active: {final_snapshot}"
+        )
 
 
 def _submit_native_cclc_routes(
@@ -290,7 +301,7 @@ def _submit_native_cclc_routes(
         )
 
     final_snapshot = client.component_snapshot("lite6_arm")
-    if final_snapshot["component_lifecycle_state"] != "active" or any(
+    if any(
         domain["active_control_configuration"] is None
         for domain in final_snapshot["domains"]
     ):
@@ -336,6 +347,24 @@ def _cclc_active_routes_are_current(snapshot: Mapping[str, Any]) -> bool:
         == active.get("source_runtime_epoch")
         for domain in domains
     )
+
+
+def _wait_for_component_lifecycle_management(execution_run_root: Path) -> None:
+    """Wait until owner route recovery settled, whatever the lifecycle state."""
+
+    execution = ExecutionCommandClient(execution_run_root, timeout_seconds=1.0)
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            if (
+                execution.identity()["identity"]["control_management_mode"]
+                == "component_lifecycle"
+            ):
+                return
+        except HeadlessApiError:
+            pass
+        time.sleep(0.01)
+    raise RuntimeError("native CCLC route recovery did not settle")
 
 
 def _wait_for_current_cclc_routes(
@@ -1105,6 +1134,171 @@ def test_production_standalone_cclc_remains_closed_without_manager_liveness(
             _qualify_native_cclc_product(execution_run_root)
         assert rejected.value.code == "authoring_not_ready"
         assert _wait_for_cclc_component(execution_run_root) == before
+    finally:
+        _stop_host(process)
+
+
+def test_native_disable_closes_arm_and_gripper_dispatch(
+    tmp_path: Path,
+) -> None:
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(_required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT"), fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    state_root, run_root = tmp_path / "state", tmp_path / "run"
+    state_root.mkdir()
+    run_root.mkdir()
+    process = _start_host(fixture_root, state_root, run_root, manifest)
+    raw_api = TestClient(
+        create_app(
+            service=HeadlessService(
+                UnusedCore(),  # type: ignore[arg-type]
+                UnusedManager(),  # type: ignore[arg-type]
+                ExecutionCommandClient(run_root, timeout_seconds=5.0),
+            ),
+            trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
+        )
+    )
+    headless = HeadlessHttpClient("http://headless.test", client=raw_api)
+    admission = CellAdmissionClient(run_root, timeout_seconds=5.0)
+    try:
+        before = headless.execution_diagnostics()["status"]
+        assert admission.get()["authoring_allowed"] is True
+        disabled = _submit_native_cclc_lifecycle(
+            run_root, intent_kind="disable", request_id="process.lifecycle.disable"
+        )
+        assert disabled["current_state"] == "disabled"
+        snapshot = CCLCOpenRequestClient(run_root).component_snapshot("lite6_arm")
+        assert snapshot["component_lifecycle_state"] == "disabled"
+        assert all(
+            domain["active_control_configuration"] is not None
+            for domain in snapshot["domains"]
+        )
+
+        before_positions = list(
+            before["direct_control"]["observed_state"]["positions_rad"]
+        )
+        arm_positions = list(before_positions)
+        arm_positions[0] += 0.05
+        for operation in (
+            _direct_control_joint_operation(
+                before,
+                before["direct_control"],
+                request_id="disabled.arm",
+                positions_rad=arm_positions,
+            ),
+            _direct_control_gripper_operation(
+                before, request_id="disabled.gripper", position=0.02
+            ),
+        ):
+            with pytest.raises(HeadlessClientError) as refused:
+                headless.execute(operation)
+            # The exact Kernel eligibility refusal, not any other failure.
+            assert refused.value.details.get("reason") == (
+                "component_command_not_eligible"
+            ), (refused.value.code, refused.value.details)
+        # No dispatch or motion: the observed arm is exactly where it was.
+        after_refusal = headless.execution_diagnostics()["status"]
+        assert (
+            after_refusal["direct_control"]["observed_state"]["positions_rad"]
+            == before_positions
+        )
+
+        # Retained Disable survives an owner restart: route recovery settles,
+        # routes stay installed, and nothing re-enables the component.
+        _stop_host(process)
+        process = _start_host(
+            fixture_root, state_root, run_root, manifest, qualify_cclc=False
+        )
+        _wait_for_component_lifecycle_management(run_root)
+        restarted_snapshot = CCLCOpenRequestClient(run_root).component_snapshot(
+            "lite6_arm"
+        )
+        assert restarted_snapshot["component_lifecycle_state"] == "disabled"
+        assert all(
+            domain["active_control_configuration"] is not None
+            for domain in restarted_snapshot["domains"]
+        )
+        restarted = headless.execution_diagnostics()["status"]
+        with pytest.raises(HeadlessClientError) as refused_after_restart:
+            headless.execute(
+                _direct_control_joint_operation(
+                    restarted,
+                    restarted["direct_control"],
+                    request_id="disabled.arm.after-restart",
+                    positions_rad=arm_positions,
+                )
+            )
+        # The Disabled component's adopted route is installed but not current,
+        # which is the first refusal; its eligibility is closed as well.
+        assert refused_after_restart.value.details.get("reason") in {
+            "runtime_route_publication_required",
+            "runtime_route_configuration_not_ready",
+        }, refused_after_restart.value.details
+
+        _submit_native_cclc_lifecycle(
+            run_root, intent_kind="prepare", request_id="process.lifecycle.reprepare"
+        )
+        # The restarted owner kept the Disabled component's routes adopted but
+        # not current; Enable requires current routes, so select them first.
+        _submit_native_cclc_routes(run_root)
+        _submit_native_cclc_lifecycle(
+            run_root, intent_kind="enable", request_id="process.lifecycle.reenable"
+        )
+        assert admission.get()["authoring_allowed"] is True
+
+        # Equivalent commands with fresh identities and current expectations
+        # now execute to completion on both arm and gripper.
+        current = headless.execution_diagnostics()["status"]
+        reenabled_positions = list(
+            current["direct_control"]["observed_state"]["positions_rad"]
+        )
+        reenabled_positions[0] += 0.05
+        arm = headless.execute(
+            _direct_control_joint_operation(
+                current,
+                current["direct_control"],
+                request_id="reenabled.arm",
+                positions_rad=reenabled_positions,
+            )
+        )
+        arm_terminal = _wait_terminal(headless, arm["accepted"]["operation_id"])
+        assert arm_terminal["operation"]["state"] == "completed", arm_terminal
+        gripper = _manual_gripper_submission(
+            headless,
+            request_id="reenabled.gripper",
+            position_kind=headless.execution_diagnostics()["status"][
+                "direct_control_gripper"
+            ]["resource"]["coordinate_kind"],
+            position=0.007,
+        )
+        gripper_terminal = _wait_terminal(headless, gripper["accepted"]["operation_id"])
+        assert gripper_terminal["operation"]["state"] == "completed", gripper_terminal
+
+        # An Active component is reconstructed command-eligible after restart.
+        _stop_host(process)
+        process = _start_host(
+            fixture_root, state_root, run_root, manifest, qualify_cclc=False
+        )
+        _wait_for_current_cclc_routes(run_root)
+        after_restart = headless.execution_diagnostics()["status"]
+        after_restart_positions = list(
+            after_restart["direct_control"]["observed_state"]["positions_rad"]
+        )
+        after_restart_positions[0] -= 0.05
+        restarted_arm = headless.execute(
+            _direct_control_joint_operation(
+                after_restart,
+                after_restart["direct_control"],
+                request_id="reenabled.arm.after-restart",
+                positions_rad=after_restart_positions,
+            )
+        )
+        restarted_terminal = _wait_terminal(
+            headless, restarted_arm["accepted"]["operation_id"]
+        )
+        assert restarted_terminal["operation"]["state"] == "completed", (
+            restarted_terminal
+        )
     finally:
         _stop_host(process)
 

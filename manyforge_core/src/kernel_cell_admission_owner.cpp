@@ -234,6 +234,33 @@ bool KernelCellAdmissionOwner::BaseReadinessLocked() const noexcept {
          readiness_.program_cycle_status->state == ProgramCycleStateDTO::kIdleAfterReset;
 }
 
+std::optional<std::string_view> KernelCellAdmissionOwner::LifecycleBlockingReasonLocked()
+    const noexcept {
+  // An intentionally disabled required component is not execution-ready, but
+  // must still be eligible for an explicit idle-time Enable. All other cell
+  // freshness, convergence and fault requirements remain mandatory. The first
+  // failing condition is reported so the caller knows what must settle.
+  if (!manager_liveness_required_set_.has_value() ||
+      manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size()) {
+    return "component_lifecycle_manager_liveness_not_current";
+  }
+  if (!readiness_.required_component_status_current || !readiness_.deployment_status_current) {
+    return "component_lifecycle_status_not_current";
+  }
+  if (!readiness_.deployment_converged) return "component_lifecycle_deployment_not_converged";
+  if (readiness_.blocking_fault_count != 0U) return "component_lifecycle_blocking_fault";
+  if (readiness_.unresolved_owner_count != 0U) return "component_lifecycle_owner_unresolved";
+  if (readiness_.unsettled_effect_count != 0U) return "component_lifecycle_effects_not_settled";
+  if (!readiness_.program_cycle_status_current || !readiness_.program_cycle_status.has_value()) {
+    return "component_lifecycle_program_status_not_current";
+  }
+  if (readiness_.program_cycle_status->state != ProgramCycleStateDTO::kIdleAfterReset) {
+    return "component_lifecycle_program_not_idle_after_reset";
+  }
+  if (held_claim_count_ != 0U) return "component_lifecycle_conflicting_claim_held";
+  return std::nullopt;
+}
+
 bool KernelCellAdmissionOwner::ManualParentReadyLocked(const Entry* parent) const noexcept {
   const auto& cycle = readiness_.program_cycle_status;
   return parent && NonCycleReadinessLocked() && readiness_.program_cycle_status_current && cycle &&
@@ -326,6 +353,11 @@ Result<void> KernelCellAdmissionOwner::SetRouteRecoveryPending(bool pending) {
   if (!advanced.ok()) return advanced;
   route_recovery_pending_ = pending;
   return Result<void>::Ok();
+}
+
+bool KernelCellAdmissionOwner::route_recovery_pending() const {
+  std::lock_guard lock(mutex_);
+  return route_recovery_pending_;
 }
 
 AuthoringAdmissionDTO KernelCellAdmissionOwner::GetAuthoringAdmission() const {
@@ -689,6 +721,13 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "program_cycle_resetting");
   }
   if (intent.program_node_evidence.has_value()) {
+    // A Program runs under a held cycle claim. Component lifecycle changes
+    // are explicit idle-time configuration operations, so no Program child
+    // claim may acquire their authority, even with valid node evidence.
+    if (intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle) {
+      return AuthoringNotReady<CellAdmissionClaimDTO>(
+          generation_, "component_lifecycle_requires_idle_cell");
+    }
     const auto& evidence = *intent.program_node_evidence;
     const auto& cycle = readiness_.program_cycle_status;
     if (parent == nullptr || !program_node_validator_ ||
@@ -774,6 +813,15 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
                                                              ? evidence.error().code
                                                              : reason->second);
       return Result<CellAdmissionClaimDTO>::Err(std::move(error));
+    }
+  } else if (intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle) {
+    const auto blocking = LifecycleBlockingReasonLocked();
+    if (intent.intervention_evidence.has_value() || blocking.has_value() ||
+        route_recovery_pending_) {
+      return AuthoringNotReady<CellAdmissionClaimDTO>(
+          generation_, blocking.has_value()                ? std::string(*blocking)
+                       : route_recovery_pending_          ? "component_lifecycle_route_recovery_pending"
+                                                          : "component_lifecycle_requires_idle_cell");
     }
   } else if (!AdmissionLocked().authoring_allowed && !MatchingStartingProgramCycleLocked(intent)) {
     return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "positive_admission_required");

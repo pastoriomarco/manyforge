@@ -22,7 +22,6 @@ from manyforge_behavior.assistant_program_port import (
     ProgramModelTransport,
     ProgramSnapshotSource,
 )
-from manyforge_behavior.cclc_program_port import CCLCProgramTaskPort
 from manyforge_behavior.executable_node_resolver import (
     build_executable_node_resolver,
 )
@@ -327,11 +326,6 @@ class ProgramRuntime:
         self._scene = HeadlessSceneProgramPort(
             self._headless, program_node_evidence=self._program_node_admission_evidence
         )
-        self._cclc = CCLCProgramTaskPort(
-            self._headless,
-            maximum_retained_tasks=config.maximum_retained_runs,
-            program_node_evidence=self._program_node_admission_evidence,
-        )
         self._assistant = (
             None
             if model_transport is None
@@ -342,7 +336,7 @@ class ProgramRuntime:
                 snapshot_source=snapshot_source,
             )
         )
-        context_members = [self._native, self._scene, self._cclc]
+        context_members = [self._native, self._scene]
         if self._assistant is not None:
             context_members.append(self._assistant)
         if self._simulation_control is not None:
@@ -358,8 +352,6 @@ class ProgramRuntime:
             scene_transactions=self._scene,
             assistant_requests=self._assistant,
             simulator_control=self._simulation_control,
-            cclc_lifecycle=self._cclc,
-            cclc_routes=self._cclc,
             program_run_scope=self._native.scope,
             program_run_context=CompositeProgramRunContextPort(*context_members),
             program_interventions=self._interventions,
@@ -2722,6 +2714,59 @@ class ProgramRuntime:
                 snapshot=value,
             )
 
+    def _verify_required_components_active(
+        self, applied: Mapping[str, Any]
+    ) -> None:
+        """Check the Program's bound components against current CCLC truth.
+
+        The Applied publication is validated before this check. An incomplete
+        or malformed binding fails closed.
+        """
+
+        binding = applied.get("program_binding")
+        if not isinstance(binding, Mapping):
+            raise ProgramRunnerError(
+                "program_run_binding_invalid", "Applied Program Binding is invalid"
+            )
+        roles = binding.get("component_role_bindings")
+        if not isinstance(roles, list) or not roles or len(roles) > 4096:
+            raise ProgramRunnerError(
+                "program_run_binding_invalid",
+                "Applied Program has no bounded component requirements",
+            )
+        component_ids: set[str] = set()
+        for row in roles:
+            component_id = (
+                row.get("controllable_component_id")
+                if isinstance(row, Mapping)
+                else None
+            )
+            if not isinstance(component_id, str) or not component_id:
+                raise ProgramRunnerError(
+                    "program_run_binding_invalid",
+                    "Applied Program has an invalid component requirement",
+                )
+            component_ids.add(component_id)
+        for component_id in sorted(component_ids):
+            observed = self._headless.cclc_component(component_id)
+            if (
+                not isinstance(observed, Mapping)
+                or observed.get("controllable_component_id") != component_id
+                or observed.get("retained_bundle_id")
+                != applied.get("retained_bundle_id")
+                or observed.get("graph_revision") != applied.get("graph_revision")
+            ):
+                raise ProgramRunnerError(
+                    "program_required_component_stale",
+                    f"Required component {component_id} has no current CCLC identity",
+                )
+            state = observed.get("component_lifecycle_state")
+            if state != "active":
+                raise ProgramRunnerError(
+                    "program_required_component_not_active",
+                    f"Required component {component_id} is {state!r}, not active",
+                )
+
     def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]:
         if not isinstance(request, ProgramRunStartRequest):
             raise TypeError("start_run requires one ProgramRunStartRequest")
@@ -2871,6 +2916,7 @@ class ProgramRuntime:
                     environment=self._environment,
                     owner_availability=self._owner_availability,
                 )
+                self._verify_required_components_active(applied)
                 # One identity spans the synchronous Program-cycle claim,
                 # scene context, Program owner, and every Kernel operation.
                 # The Kernel can therefore fence a Run before its first
@@ -2981,6 +3027,10 @@ class ProgramRuntime:
                         "program_run_applied_selection_stale",
                         "Applied Program changed during Run admission",
                     )
+                # CCLC excludes lifecycle mutations while this claim is held.
+                # Re-read here so a Disable that won after the first check
+                # cannot be overtaken by Program execution.
+                self._verify_required_components_active(applied_after_claim)
                 self._verify_run_scene(
                     scene_context,
                     initial_scene,

@@ -132,7 +132,8 @@ CCLCRuntimeComposition::Create(
     std::function<
         core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
             const core::ControlDomainId &)>
-        kernel_current_configuration_source) {
+        kernel_current_configuration_source,
+    core::ICCLCComponentCommandReadinessPort *component_command_readiness_port) {
   if (!config.trusted_roots_valid() || retained_bundle == nullptr ||
       !expected_active_publication.valid() ||
       expected_active_publication.request.candidate_retained_bundle_id !=
@@ -158,7 +159,7 @@ CCLCRuntimeComposition::Create(
             std::move(kernel_current_configuration_source),
             kernel_disable_handoff_port, kernel_cell_admission_port,
             kernel_route_fence_port, kernel_publication_owner, clock,
-            scheduler));
+            scheduler, component_command_readiness_port));
     return core::Result<std::unique_ptr<CCLCRuntimeComposition>>::Ok(
         std::move(result));
   } catch (const std::exception &exception) {
@@ -223,7 +224,8 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
-    core::IClock &clock, core::IScheduler &scheduler)
+    core::IClock &clock, core::IScheduler &scheduler,
+    core::ICCLCComponentCommandReadinessPort *component_command_readiness_port)
     : config_(std::move(config)), retained_bundle_(std::move(retained_bundle)),
       journal_(config_.state_root / std::string(core::kCCLCJournalFilename),
                config_.cell_id, config_.exact_result_history_capacity,
@@ -251,7 +253,8 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
                    scheduler, &kernel_cell_admission_port,
                    core::ComponentLifecycleCoordinatorRouteServices{
                        &route_snapshot_source_, &port_registry_,
-                       &kernel_route_fence_port, &route_publication_port_}),
+                       &kernel_route_fence_port, &route_publication_port_},
+                   component_command_readiness_port),
       open_request_port_(coordinator_, lifecycle_snapshot_source_,
                          route_snapshot_source_) {}
 

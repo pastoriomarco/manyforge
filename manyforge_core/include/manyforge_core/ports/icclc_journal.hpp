@@ -229,6 +229,12 @@ class ICCLCJournal : public ICCLCCurrentFactReader {
  public:
   ~ICCLCJournal() override = default;
 
+  /// An unfinished parent Apply may have reserved generations or published
+  /// partial candidate routes. Fresh ordinary mutations must wait; exact
+  /// request replay remains available for observation.
+  [[nodiscard]] virtual Result<std::optional<NamedApplyPublicationTransactionDTO>>
+  ReadUnsettledNativeApplyPlan() = 0;
+
   /// Mints one never-before-used receiver namespace from a startup-unique seed
   /// plus the durable epoch counter, and returns it with prior nonterminal
   /// work. The supplied seed is not a caller-selected namespace. New admission

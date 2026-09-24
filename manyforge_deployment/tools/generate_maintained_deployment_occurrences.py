@@ -1186,7 +1186,8 @@ def lifecycle_product(
         + canonical_bytes(semantic_projection)
     )
     lifecycle_capabilities = tuple(
-        f"component.lifecycle.{intent}" for intent in LIFECYCLE_INTENTS
+        f"component.lifecycle.{intent}"
+        for intent in sorted({"observe", *(plan["intent"] for plan in plans)})
     )
     manifest = revisioned_document(
         {
@@ -1305,7 +1306,67 @@ def lite6_gripper_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
     )
 
 
-def native_lite6_provider_manifest(
+def native_control_lifecycle_plans() -> list[dict[str, Any]]:
+    """In-process native readiness; no physical drive or ROS enable is implied."""
+
+    def observed(state: str, enabled: bool) -> dict[str, Any]:
+        return lifecycle_predicate(
+            [state],
+            {
+                "native.runtime.present": lifecycle_boolean(True),
+                "native.control.enabled": lifecycle_boolean(enabled),
+            },
+        )
+
+    declared = lifecycle_predicate(
+        ["declared", "disabled"],
+        {
+            "native.runtime.present": lifecycle_boolean(True),
+            "native.control.enabled": lifecycle_boolean(False),
+        },
+    )
+    prepared = observed("prepared", False)
+    active = observed("active", True)
+    disabled = observed("disabled", False)
+    return [
+        {
+            "intent": "prepare",
+            "requested_state": "prepared",
+            "requested_postcondition": prepared,
+            "timeout_duration_ns": 30_000_000_000,
+            "transitions": [
+                lifecycle_transition("native.control.prepare", declared, prepared)
+            ],
+        },
+        {
+            "intent": "enable",
+            "requested_state": "active",
+            "requested_postcondition": active,
+            "timeout_duration_ns": 30_000_000_000,
+            "transitions": [
+                lifecycle_transition("native.control.enable", prepared, active)
+            ],
+        },
+        {
+            "intent": "disable",
+            "requested_state": "disabled",
+            "requested_postcondition": disabled,
+            "timeout_duration_ns": 30_000_000_000,
+            "transitions": [
+                lifecycle_transition(
+                    "native.control.disable",
+                    lifecycle_predicate(
+                        ["prepared", "active", "degraded", "faulted"],
+                        {"native.runtime.present": lifecycle_boolean(True)},
+                    ),
+                    disabled,
+                )
+            ],
+        },
+    ]
+
+
+def native_lifecycle_provider_manifest(
     lifecycle_manifest: dict[str, Any],
     capability_ids: tuple[str, ...],
     *,
@@ -1859,23 +1920,44 @@ def catalog_sources(
             if CAPABILITIES[capability_id][2] == "control_binding"
         )
     )
-    native_arm_manifest = native_lite6_provider_manifest(
+    native_arm_manifest = native_lifecycle_provider_manifest(
         lifecycle_manifest,
         native_arm_capabilities,
         include_motion_controlled_stop=True,
     )
-    native_gripper_manifest = native_lite6_provider_manifest(
+    native_gripper_manifest = native_lifecycle_provider_manifest(
         gripper_lifecycle_manifest,
         native_gripper_capabilities,
         include_motion_controlled_stop=False,
     )
-    manifests = {
-        "control": provider_manifest(
-            "manyforge.provider.native_control",
-            control_capabilities,
-            ["command", "state"],
-            include_native_stop_support=True,
+    native_control_lifecycle_manifest, _ = lifecycle_product(
+        "manyforge.provider.native_control", native_control_lifecycle_plans()
+    )
+    native_control_manifest = native_lifecycle_provider_manifest(
+        native_control_lifecycle_manifest,
+        control_capabilities,
+        include_motion_controlled_stop=True,
+    )
+    native_control_catalog_content = {
+        "api_version": LIFECYCLE_CATALOG_API_VERSION,
+        "provider_manifest_id": native_control_manifest["provider_manifest_id"],
+        "provider_manifest_revision": native_control_manifest[
+            "provider_manifest_revision"
+        ],
+        "plans": native_control_lifecycle_plans(),
+    }
+    native_control_lifecycle_catalog = {
+        **native_control_catalog_content,
+        "catalog_digest": sha256_digest(
+            CONTENT_IDENTITY_PREFIX
+            + b"brand-lifecycle-plan-catalog\0"
+            + LIFECYCLE_CATALOG_API_VERSION.encode("ascii")
+            + b"\0"
+            + canonical_bytes(native_control_catalog_content)
         ),
+    }
+    manifests = {
+        "control": native_control_manifest,
         "planning": provider_manifest(
             "manyforge.provider.native_planning",
             planner_capabilities,
@@ -2088,6 +2170,12 @@ def catalog_sources(
     lifecycle_outputs = [
         (
             root
+            / "manyforge_roboplan/resources/lifecycle/native_control.lifecycle_plan_catalog.json",
+            canonical_bytes(native_control_lifecycle_catalog),
+            "build-owned generic native lifecycle plan catalog",
+        ),
+        (
+            root
             / "manyforge_xarm_control/resources/lifecycle/lite6_arm_provider.lifecycle_plan_catalog.json",
             canonical_bytes(lifecycle_catalog),
             "build-owned Lite6 lifecycle plan catalog",
@@ -2122,23 +2210,6 @@ def domain_id(occurrence: str, target: str) -> str:
     return f"{occurrence}.{target}.control"
 
 
-def native_lite6_lifecycle_enabled(
-    deployment: dict[str, Any], *, family_id: str, ros2_control: bool
-) -> bool:
-    """Select the optional native Lite6 lifecycle product.
-
-    Native simulated compositions may deliberately use the generic fixed
-    direct-control product instead. Existing maintained Lite6 deployments
-    keep lifecycle management by default.
-    """
-
-    return (
-        not ros2_control
-        and family_id == LITE6_NATIVE_MODEL_FAMILY_ID
-        and deployment.get("native_lifecycle_management", True) is not False
-    )
-
-
 def graph_and_applicability(
     deployment: dict[str, Any],
     family: dict[str, Any],
@@ -2152,9 +2223,6 @@ def graph_and_applicability(
         "ros2_control_runtime" if ros2_control else "native_runtime"
     ]
     key_prefix = "ros2_control:" if ros2_control else ""
-    native_lite6_lifecycle = native_lite6_lifecycle_enabled(
-        deployment, family_id=family_id, ros2_control=ros2_control
-    )
     component_ref = refs[
         f"component:{'fixed_scale:' if ros2_control else ''}{family_id}"
     ]
@@ -2208,14 +2276,8 @@ def graph_and_applicability(
         ("gripper", GRIPPER_CAPABILITIES, gripper_resources),
     ):
         stop_ref = arm_stop_ref if target == "arm" else goal_cancel_stop_ref
-        target_control_ref = (
-            refs[f"provider:lite6_{target}"] if native_lite6_lifecycle else control_ref
-        )
-        target_provider_instance_id = (
-            f"{occurrence}.native_gripper_control"
-            if native_lite6_lifecycle and target == "gripper"
-            else physical_provider_instance_id
-        )
+        target_control_ref = control_ref
+        target_provider_instance_id = physical_provider_instance_id
         contract = refs[f"contract:{key_prefix}{target}"]
         topology = refs[f"topology:{key_prefix}{target}"]
         for capability_id in capabilities:
@@ -2762,9 +2824,6 @@ def deployment_candidate(
         refs,
     )
     family_id = family["model_family_id"]
-    native_lite6_lifecycle = native_lite6_lifecycle_enabled(
-        deployment, family_id=family_id, ros2_control=ros2_control
-    )
     catalog_keys = {
         *(
             f"capability:{capability_id}"
@@ -2775,9 +2834,12 @@ def deployment_candidate(
         *(f"capability:{capability_id}" for capability_id in GRIPPER_CAPABILITIES),
         *(f"capability:{capability_id}" for capability_id in CELL_CAPABILITIES),
         *(
-            (f"capability:component.lifecycle.{intent}" for intent in LIFECYCLE_INTENTS)
-            if ros2_control or native_lite6_lifecycle
-            else []
+            f"capability:component.lifecycle.{intent}"
+            for intent in (
+                LIFECYCLE_INTENTS
+                if ros2_control
+                else ("disable", "enable", "observe", "prepare")
+            )
         ),
         "command_schema",
         f"component:{'fixed_scale:' if ros2_control else ''}{family_id}",
@@ -2785,11 +2847,7 @@ def deployment_candidate(
         f"contract:{key_prefix}gripper",
         f"model:{family_id}",
         "provider:logical_scene",
-        *(
-            ("provider:lite6_arm", "provider:lite6_gripper")
-            if native_lite6_lifecycle
-            else ("provider:ros2_control" if ros2_control else "provider:control",)
-        ),
+        ("provider:ros2_control" if ros2_control else "provider:control"),
         *([] if ros2_control else ["provider:planning"]),
         ("runtime:ros2_control" if ros2_control else "runtime"),
         f"runtime_policy:{deployment['deployment_artifact_id']}",
@@ -3095,9 +3153,6 @@ def _deployment_intent(
                         runtime_profile["stop_profiles"][
                             "default_fault_stop_profile"
                         ]
-                    ),
-                    "native_lifecycle_management": deployment.get(
-                        "native_lifecycle_management", True
                     ),
                 },
             }

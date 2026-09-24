@@ -50,8 +50,11 @@ describe('CCLC presentation', () => {
     expect(html).toContain('component.arm');
     expect(html).toContain('prepared');
     expect(html).toContain('generation 4');
-    expect(html).toContain('Start / prepare');
-    expect(html).toContain('Connect / enable');
+    expect(html).toContain('Prepare');
+    expect(html).toContain('Enable');
+    expect(html).toContain('Disable');
+    expect(html).not.toContain('Recover / restart');
+    expect(html).not.toContain('Stop / disable');
     expect(html).toContain('Owner-issued state');
   });
 
@@ -59,14 +62,37 @@ describe('CCLC presentation', () => {
     const unavailable = controller();
     unavailable.snapshot = null;
     unavailable.routeTemplates = null;
-    unavailable.readUnavailableReason = 'This Deployment uses direct native control.';
+    unavailable.readUnavailableReason = 'Current component state is unavailable.';
     const html = renderToStaticMarkup(createElement(CCLCPanelView, {
       enabled: true,
       mutationAvailable: true,
       mutationUnavailableReason: null,
       controller: unavailable,
     }));
-    expect(html).toContain('This Deployment uses direct native control.');
+    expect(html).toContain('Current component state is unavailable.');
     expect(html).not.toContain('error-state');
+  });
+
+  it('shows an owner-issued failure phase and reason without treating it as an operator Disable', () => {
+    const failed = controller();
+    failed.pendingTransaction = { kind: 'lifecycle', id: 'lifecycle.7' };
+    failed.transaction = {
+      kind: 'lifecycle', transactionId: 'lifecycle.7', phase: 'failed',
+      terminalResult: 'failed_known_no_effect', reconciliationRequired: false,
+      error: {
+        code: 'native_lifecycle_route_unavailable',
+        message: 'The native route did not become ready',
+        details: { reason: 'route_readback_missing' },
+      },
+    };
+    const html = renderToStaticMarkup(createElement(CCLCPanelView, {
+      enabled: true,
+      mutationAvailable: false,
+      mutationUnavailableReason: 'The component is not ready.',
+      controller: failed,
+    }));
+    expect(html).toContain('native_lifecycle_route_unavailable');
+    expect(html).toContain('The native route did not become ready');
+    expect(html).toContain('route_readback_missing');
   });
 });

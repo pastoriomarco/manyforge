@@ -759,21 +759,6 @@ def main() -> None:
         help="With --scene-transactions, recover a committed attach receipt only after Stop",
     )
     parser.add_argument(
-        "--lifecycle-transactions",
-        action="store_true",
-        help="Real CCLC Disable/Stop/Resume/Prepare/Enable/Reset workflow, without arm motion",
-    )
-    parser.add_argument(
-        "--lost-lifecycle-reply",
-        action="store_true",
-        help="With --lifecycle-transactions, recover a lost Disable response only after Stop",
-    )
-    parser.add_argument(
-        "--route-transactions",
-        action="store_true",
-        help="Short real CCLC route/Stop/Resume/Reset workflow, without arm motion",
-    )
-    parser.add_argument(
         "--pending-scene-apply",
         action="store_true",
         help="Hold a Scene read after the real jerk-authoring Apply fence",
@@ -886,8 +871,6 @@ def main() -> None:
         help="Drive --selections --recover-parallel through the actual GUI/WebSocket",
     )
     args = parser.parse_args()
-    if args.lost_lifecycle_reply and not args.lifecycle_transactions:
-        parser.error("--lost-lifecycle-reply requires --lifecycle-transactions")
     if args.ordinary_jerk_import and not args.ordinary_jerk:
         parser.error("--ordinary-jerk-import requires --ordinary-jerk")
     if args.ordinary_jerk_required and not args.ordinary_jerk_import:
@@ -925,8 +908,6 @@ def main() -> None:
         or args.controls
         or args.selections
         or args.scene_transactions
-        or args.lifecycle_transactions
-        or args.route_transactions
         or args.authoring_groups
     ):
         parser.error(
@@ -938,9 +919,9 @@ def main() -> None:
         )
     if args.lost_scene_reply and not args.scene_transactions:
         parser.error("--lost-scene-reply requires --scene-transactions")
-    transactions = sum(
-        (args.scene_transactions, args.lifecycle_transactions, args.route_transactions)
-    )
+    # Component lifecycle and route changes are explicit idle-time
+    # operations, not Program nodes; only Scene transactions run in a Program.
+    transactions = int(args.scene_transactions)
     if (
         transactions
         and (args.controls or args.selections or args.authoring_groups)
@@ -1217,71 +1198,6 @@ def main() -> None:
                 detach,
             ],
         }
-    if args.lifecycle_transactions or args.route_transactions:
-        node_id = (
-            "controller.select_route"
-            if args.route_transactions
-            else "lifecycle.enable_component"
-        )
-        parameters = (
-            {"target_role": "arm", "route_role": "arm_position"}
-            if args.route_transactions
-            else {"component_role": "robot"}
-        )
-        if args.route_transactions:
-            # Route selection uses the retained arm control binding. Its
-            # controller-domain capabilities are not target capabilities.
-            query_capabilities = program["target_roles"]["arm"]["required_capabilities"]
-            program["target_roles"]["arm"] = authored["target_roles"]["arm"]
-            capabilities = {
-                row["capability_id"]: row
-                for row in (
-                    *program["target_roles"]["arm"]["required_capabilities"],
-                    *query_capabilities,
-                )
-            }
-            program["target_roles"]["arm"]["required_capabilities"] = [
-                capabilities[key] for key in sorted(capabilities)
-            ]
-        program["tree"] = {
-            "node_id": "sequence",
-            "instance_id": "lifecycle_root",
-            "parameters": {},
-            "children": [
-                {
-                    "node_id": (
-                        "lifecycle.disable_component"
-                        if args.lifecycle_transactions
-                        else node_id
-                    ),
-                    "instance_id": "first",
-                    "parameters": dict(parameters),
-                    "children": [],
-                },
-                {
-                    "node_id": "timer",
-                    "instance_id": "between",
-                    "parameters": {"duration_s": 1.0},
-                    "children": [],
-                },
-                {
-                    "node_id": node_id,
-                    "instance_id": "second",
-                    "parameters": dict(parameters),
-                    "children": [],
-                },
-            ],
-        }
-    if args.lifecycle_transactions:
-        program["tree"]["children"].insert(
-            2,
-            {
-                "node_id": "lifecycle.prepare_component",
-                "instance_id": "prepare_again",
-                "parameters": dict(parameters),
-                "children": [],
-            },
-        )
     program["program_revision"] = compute_content_identity(
         program,
         own_field="program_revision",
@@ -1473,7 +1389,6 @@ def main() -> None:
     if (
         args.uncertain_resume_reset
         or args.lost_scene_reply
-        or args.lost_lifecycle_reply
     ):
         # Test-only transport loss after the real owner processed a command.
         # No owner result, settlement, journal row or admission is fabricated.
@@ -1534,39 +1449,6 @@ def read_receipt(self, body):
     return result
 HeadlessHttpClient.commit_scene_transaction = commit_once
 HeadlessHttpClient.scene_transaction_status = read_receipt
-"""
-                if args.lost_lifecycle_reply:
-                    injection += f"""
-import json
-from pathlib import Path
-from manyforge_headless_api.client import HeadlessHttpClient
-submit_lifecycle = HeadlessHttpClient.submit_component_lifecycle
-read_lifecycle = HeadlessHttpClient.component_lifecycle_request_result
-lost_lifecycle_request = None
-lifecycle_evidence = Path({str(state / 'lost-lifecycle-reply.json')!r})
-lifecycle_release = Path({str(state / 'release-lifecycle-reply')!r})
-def submit_lifecycle_once(self, body):
-    global lost_lifecycle_request
-    disabling = body['intent'] == 'disable'
-    assert not (disabling and lost_lifecycle_request is not None), 'Disable was resubmitted'
-    result = submit_lifecycle(self, body)
-    if disabling:
-        assert result.get('acceptance') and not result.get('rejection'), result
-        lost_lifecycle_request = body['request_context']['request_id']
-        lifecycle_evidence.write_text(json.dumps({{'request_id': lost_lifecycle_request, 'accepted': result}}))
-        raise OSError('qualification: actual Disable response lost')
-    return result
-def read_lifecycle_once(self, body):
-    result = read_lifecycle(self, body)
-    if body['request_context']['request_id'] == lost_lifecycle_request:
-        if not lifecycle_release.exists():
-            raise OSError('qualification: Disable receipt unavailable until held')
-        evidence = json.loads(lifecycle_evidence.read_text())
-        evidence['recovered'] = result
-        lifecycle_evidence.write_text(json.dumps(evidence))
-    return result
-HeadlessHttpClient.submit_component_lifecycle = submit_lifecycle_once
-HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
 """
                 injection += "runpy.run_module('manyforge_program_runner', run_name='__main__')\n"
                 command = (command[0], "-c", injection, *command[3:])
@@ -1866,24 +1748,6 @@ HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
             assert configured["requested_scale"] == 0.8, configured
         with HeadlessHttpClient("http://127.0.0.1:9101", timeout_seconds=3) as client:
             applied = client.program_applied()
-            if args.lifecycle_transactions:
-                binding_id = stack.metadata["program_binding_id"].removeprefix(
-                    "sha256:"
-                )
-                binding = json.loads(
-                    (
-                        package / "program-bindings/sha256" / f"{binding_id}.json"
-                    ).read_text()
-                )
-                lifecycle_component = next(
-                    row["controllable_component_id"]
-                    for row in binding["component_role_bindings"]
-                    if row["component_role_id"] == "robot"
-                )
-                lifecycle_before = client.cclc_component(lifecycle_component)
-                assert (
-                    lifecycle_before["component_lifecycle_state"] == "active"
-                ), lifecycle_before
             scene_baseline = (
                 client.scene()["logical_scene"]["payload"]["snapshot"]["objects"]
                 if args.scene_transactions
@@ -1924,11 +1788,7 @@ HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
                 started = client.program_run_start(start_request)
             run_id = started["capture"]["program_run_id"]
             if transactions:
-                first_node, second_node = (
-                    ("attach", "detach")
-                    if args.scene_transactions
-                    else ("first", "second")
-                )
+                first_node, second_node = ("attach", "detach")
 
                 def attached_and_waiting():
                     current = client.program_run(run_id)
@@ -1939,17 +1799,6 @@ HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
                             current
                             if (state / "lost-scene-reply.json").exists()
                             and nodes.get(first_node) == "running"
-                            else None
-                        )
-                    if args.lost_lifecycle_reply:
-                        return (
-                            current
-                            if (state / "lost-lifecycle-reply.json").exists()
-                            and nodes.get(first_node) == "running"
-                            and client.cclc_component(lifecycle_component)[
-                                "component_lifecycle_state"
-                            ]
-                            == "disabled"
                             else None
                         )
                     return (
@@ -1964,15 +1813,6 @@ HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
                     attached_and_waiting,
                     stack.processes,
                 )
-                if args.lifecycle_transactions:
-                    lifecycle_disabled = client.cclc_component(lifecycle_component)
-                    assert (
-                        lifecycle_disabled["component_lifecycle_state"] == "disabled"
-                    ), lifecycle_disabled
-                    assert (
-                        lifecycle_disabled["component_lifecycle_generation"]
-                        > lifecycle_before["component_lifecycle_generation"]
-                    )
                 attached_scene = client.scene()["logical_scene"]["payload"]["snapshot"]
                 if args.scene_transactions:
                     assert (
@@ -1987,26 +1827,17 @@ HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
                     "group_ids": ["all"],
                 }
                 client.program_run_motion_stop(run_id, request)
-                if args.lost_lifecycle_reply or args.lost_scene_reply:
+                if args.lost_scene_reply:
                     unknown = client.program_run(run_id)
                     assert unknown["node_statuses"][first_node] == "running", unknown
                     assert unknown["node_statuses"][second_node] == "idle", unknown
-                    if args.lost_lifecycle_reply:
-                        assert (
-                            unknown["node_statuses"]["prepare_again"] == "idle"
-                        ), unknown
                     unknown_controls = client.program_runtime_controls(run_id)
                     assert not next(
                         row["resume_allowed"]
                         for row in unknown_controls["execution_selections"]["groups"]
                         if row["group_id"] == "all"
                     ), unknown_controls
-                    release = (
-                        "release-lifecycle-reply"
-                        if args.lost_lifecycle_reply
-                        else "release-scene-reply"
-                    )
-                    (state / release).touch()
+                    (state / "release-scene-reply").touch()
                 previous_held_revision = None
 
                 def held_ready():
@@ -2017,10 +1848,6 @@ HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
                         "success",
                     }, current
                     assert current["node_statuses"][second_node] == "idle", current
-                    if args.lifecycle_transactions:
-                        assert (
-                            current["node_statuses"]["prepare_again"] == "idle"
-                        ), current
                     controls = client.program_runtime_controls(run_id)
                     stable = previous_held_revision == controls["run_revision"]
                     previous_held_revision = controls["run_revision"]
@@ -2049,21 +1876,6 @@ HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
                     assert (
                         recovered["result"]["request_id"] == evidence["request_id"]
                     ), evidence
-                if args.lost_lifecycle_reply:
-                    evidence = json.loads(
-                        (state / "lost-lifecycle-reply.json").read_text()
-                    )
-                    recovered = evidence["recovered"]["result"]
-                    assert (
-                        recovered["acceptance"] == evidence["accepted"]["acceptance"]
-                    ), evidence
-                    assert (
-                        recovered["acceptance"]["request_id"] == evidence["request_id"]
-                    ), evidence
-                if args.lifecycle_transactions:
-                    assert (
-                        client.cclc_component(lifecycle_component) == lifecycle_disabled
-                    )
                 assert (
                     client.scene()["logical_scene"]["payload"]["snapshot"][
                         "transaction_sequence"
@@ -2122,15 +1934,6 @@ HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
                         "second native owner transaction", completed, stack.processes
                     )
                     assert set(result["node_statuses"].values()) == {"success"}, result
-                    if args.lifecycle_transactions:
-                        lifecycle_enabled = client.cclc_component(lifecycle_component)
-                        assert (
-                            lifecycle_enabled["component_lifecycle_state"] == "active"
-                        ), lifecycle_enabled
-                        assert (
-                            lifecycle_enabled["component_lifecycle_generation"]
-                            > lifecycle_disabled["component_lifecycle_generation"]
-                        )
                     final_scene = workbench._wait_until(
                         "Scene detach publication", detach_published, stack.processes
                     )
@@ -2192,19 +1995,10 @@ HeadlessHttpClient.component_lifecycle_request_result = read_lifecycle_once
                         {
                             "passed": True,
                             "lost_scene_reply_recovered": args.lost_scene_reply,
-                            "lost_lifecycle_reply_recovered": args.lost_lifecycle_reply,
                             "qualification": (
                                 "scene_unknown_resume_reset"
                                 if args.uncertain_resume_reset
-                                else (
-                                    "scene_stop_resume_reset"
-                                    if args.scene_transactions
-                                    else (
-                                        "route_stop_resume_reset"
-                                        if args.route_transactions
-                                        else "lifecycle_stop_resume_reset"
-                                    )
-                                )
+                                else "scene_stop_resume_reset"
                             ),
                             "private_state": str(state),
                             "result": result,

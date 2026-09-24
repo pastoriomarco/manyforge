@@ -208,7 +208,8 @@ struct RetainedNativeRuntimeInput final {
 /// addressed owner unsubscribes first, then the subordinate Kernel quiesces,
 /// then backends/scheduler/state/model resources retire.
 struct RetainedNativeRuntime final
-    : public deployment::IRouteConfigurationKernelPublicationOwner {
+    : public deployment::IRouteConfigurationKernelPublicationOwner,
+      public core::ICCLCComponentCommandReadinessPort {
   RetainedNativeRuntime(core::RuntimeParticipantBinding motion,
                         std::optional<core::RuntimeParticipantBinding> gripper)
       : motion_binding(std::move(motion)), gripper_binding(std::move(gripper)) {
@@ -303,6 +304,25 @@ struct RetainedNativeRuntime final
       const core::ActiveControlConfigurationDTO &configuration,
       std::vector<deployment::VerifiedRouteReadinessParticipant> participants)
       override;
+
+  /// Close one component's command eligibility under its exact held claim.
+  [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
+  CloseComponentCommandEligibility(
+      const core::LifecycleTransactionId &lifecycle_transaction_id,
+      const core::ControllableComponentId &controllable_component_id) override;
+
+  /// Publish one complete component result for the whole cell: re-seal the
+  /// component's participants in every robot runtime at the published
+  /// generation (same engines, routes and Stop plans), rebuild the Kernel
+  /// participant resolver, and set eligibility atomically in the Kernel.
+  [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
+  PublishComponentCommandReadiness(
+      const core::ComponentCommandReadinessPublicationDTO &publication) override;
+
+  [[nodiscard]] core::Result<core::ComponentCommandReadinessDTO>
+  ReadComponentCommandReadiness(
+      const core::ControllableComponentId &controllable_component_id)
+      const override;
 
   /// Rebind the new in-process runtime to one exact durable predecessor while
   /// retaining the new provider epoch and keeping operation admission closed.

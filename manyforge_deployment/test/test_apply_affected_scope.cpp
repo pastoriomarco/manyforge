@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_deployment/apply_affected_scope.hpp>
+#include <manyforge_deployment/native_domain_topology.hpp>
 
 #include <optional>
 #include <string>
@@ -309,6 +310,43 @@ TEST(ApplyAffectedScope, CrossCellValuesRejectBeforeScopeProduction) {
       static_cast<void>(derive_apply_configuration_fence_scope_verified_values(
           predecessor, candidate)),
       ApplyAffectedScopeError);
+}
+
+TEST(NativeDomainTopology, RefusesSharedNativeDomainsButNotOtherProviders) {
+  const auto native = [](const std::string &id, const std::string &component,
+                         const std::string &domain, const std::string &resource) {
+    auto binding = Binding(id, id + "-r1", component, domain, {resource});
+    binding.provider_manifest_id =
+        core::ProviderManifestId(std::string(kNativeControlProviderManifestId));
+    return binding;
+  };
+  const auto components =
+      std::vector{Component("component-a"), Component("component-b")};
+  const auto one_each =
+      Graph({}, components, {Domain("domain-a"), Domain("domain-b")},
+            {native("binding-a", "component-a", "domain-a", "resource-a"),
+             native("binding-b", "component-b", "domain-b", "resource-b")});
+  EXPECT_TRUE(VerifySupportedNativeDomainTopology(one_each).ok());
+
+  const auto shared =
+      Graph({}, components, {Domain("domain-a")},
+            {native("binding-a", "component-a", "domain-a", "resource-a"),
+             native("binding-b", "component-b", "domain-a", "resource-b")});
+  const auto refused = VerifySupportedNativeDomainTopology(shared);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "native_shared_domain_unsupported");
+  EXPECT_EQ(refused.error().details.at("control_domain_id"), "domain-a");
+  EXPECT_EQ(refused.error().details.at("controllable_component_ids"),
+            "component-a,component-b");
+
+  // The generic graph contract still allows a shared non-native domain.
+  const auto generic = Graph(
+      {}, components, {Domain("domain-a")},
+      {Binding("binding-a", "binding-a-r1", "component-a", "domain-a",
+               {"resource-a"}),
+       Binding("binding-b", "binding-b-r1", "component-b", "domain-a",
+               {"resource-b"})});
+  EXPECT_TRUE(VerifySupportedNativeDomainTopology(generic).ok());
 }
 
 } // namespace

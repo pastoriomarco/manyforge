@@ -746,10 +746,12 @@ function MeshResourceBrowser({
 function SceneShapeFields({
   shape,
   disabled,
+  disabledTitle,
   onChange,
 }: {
   shape: ProgramSceneResource['shape'];
   disabled: boolean;
+  disabledTitle?: string;
   onChange: (shape: ProgramSceneResource['shape']) => void;
 }) {
   const [meshBrowserOpen, setMeshBrowserOpen] = useState(false);
@@ -774,6 +776,7 @@ function SceneShapeFields({
         <select
           value={shape.type}
           disabled={disabled}
+          title={disabled ? disabledTitle : undefined}
           onChange={(event) => setShapeType(
             event.target.value as ProgramSceneResource['shape']['type'],
           )}
@@ -795,6 +798,7 @@ function SceneShapeFields({
                 step={0.001}
                 value={shape.box_dimensions_m[index]}
                 disabled={disabled}
+                title={disabled ? disabledTitle : undefined}
                 onChange={(event) => finite(event.currentTarget.valueAsNumber, () => {
                   const dimensions = [...shape.box_dimensions_m] as [number, number, number];
                   dimensions[index] = event.currentTarget.valueAsNumber;
@@ -814,6 +818,7 @@ function SceneShapeFields({
             step={0.001}
             value={shape.sphere_radius_m}
             disabled={disabled}
+            title={disabled ? disabledTitle : undefined}
             onChange={(event) => finite(event.currentTarget.valueAsNumber, () => {
               onChange({ ...shape, sphere_radius_m: event.currentTarget.valueAsNumber });
             })}
@@ -833,6 +838,7 @@ function SceneShapeFields({
                   ? shape.cylinder_radius_m
                   : shape.cylinder_height_m}
                 disabled={disabled}
+                title={disabled ? disabledTitle : undefined}
                 onChange={(event) => finite(event.currentTarget.valueAsNumber, () => {
                   onChange(label === 'Radius'
                     ? { ...shape, cylinder_radius_m: event.currentTarget.valueAsNumber }
@@ -851,6 +857,7 @@ function SceneShapeFields({
               type="text"
               value={shape.mesh_resource_uri}
               disabled={disabled}
+              title={disabled ? disabledTitle : undefined}
               required
               placeholder="examples/cell/meshes/object.glb"
               onChange={(event) => onChange({
@@ -864,6 +871,7 @@ function SceneShapeFields({
             className="quiet-button"
             aria-expanded={meshBrowserOpen}
             disabled={disabled}
+            title={disabled ? disabledTitle : undefined}
             onPointerDown={(event) => event.preventDefault()}
             onClick={() => setMeshBrowserOpen((current) => !current)}
           >
@@ -887,6 +895,7 @@ function SceneShapeFields({
                   step={0.01}
                   value={shape.mesh_scale?.[index] ?? 1}
                   disabled={disabled}
+                  title={disabled ? disabledTitle : undefined}
                   onChange={(event) => finite(event.currentTarget.valueAsNumber, () => {
                     const scale = [
                       ...(shape.mesh_scale ?? [1, 1, 1]),
@@ -908,6 +917,7 @@ function ProgramSceneEditor({
   program,
   draftRevision,
   busy,
+  busyReason,
   mutate,
   selectedResourceId,
   onSelectResource,
@@ -915,10 +925,12 @@ function ProgramSceneEditor({
   program: ProgramAuthoringDocument;
   draftRevision: number;
   busy: boolean;
+  busyReason: string | null;
   mutate: ProgramWorkspaceController['mutate'];
   selectedResourceId: string | null;
   onSelectResource: (sceneResourceId: string | null) => void;
 }) {
+  const blockedTitle = busy ? busyReason ?? undefined : undefined;
   const resources = program.scene ?? EMPTY_PROGRAM_RESOURCES;
   const selected = resources.find(
     (resource) => resource.scene_resource_id === selectedResourceId,
@@ -1035,6 +1047,7 @@ function ProgramSceneEditor({
         <button
           type="button"
           disabled={busy}
+          title={blockedTitle}
           onPointerDown={(event) => event.preventDefault()}
           onClick={() => addResource(defaultResource(
             new Set(resources.map((resource) => resource.scene_resource_id)),
@@ -1066,6 +1079,7 @@ function ProgramSceneEditor({
           <SceneShapeFields
             shape={staged.shape}
             disabled={busy}
+            disabledTitle={blockedTitle}
             onChange={(shape) => setStaged({ ...staged, shape })}
           />
           <label className="scene-shape-select">
@@ -1073,6 +1087,7 @@ function ProgramSceneEditor({
             <select
               value={selectedFrameId}
               disabled={busy}
+              title={blockedTitle}
               onChange={(event) => {
                 if (staged === null) return;
                 if (event.target.value === 'cell') {
@@ -1118,6 +1133,7 @@ function ProgramSceneEditor({
                   step={0.001}
                   value={staged.pose.position_m[index]}
                   disabled={busy}
+                  title={blockedTitle}
                   onChange={(event) => setPosePosition(index, event.currentTarget.valueAsNumber)}
                 />
               </label>
@@ -1135,6 +1151,7 @@ function ProgramSceneEditor({
                       ? staged.pose.orientation.xyzw[index]
                       : 0}
                     disabled={busy}
+                    title={blockedTitle}
                     onChange={(event) => setQuaternion(index, event.currentTarget.valueAsNumber)}
                   />
                 </label>
@@ -1152,6 +1169,7 @@ function ProgramSceneEditor({
                       ? staged.pose.orientation.rpy_deg[index]
                       : 0}
                     disabled={busy}
+                    title={blockedTitle}
                     onChange={(event) => setRpyDegrees(index, event.currentTarget.valueAsNumber)}
                   />
                 </label>
@@ -1185,6 +1203,7 @@ function ProgramSceneEditor({
             <button
               type="button"
               disabled={busy}
+              title={blockedTitle}
               onPointerDown={(event) => event.preventDefault()}
               onClick={duplicateSelected}
             >
@@ -1194,6 +1213,7 @@ function ProgramSceneEditor({
               className="danger-button"
               type="button"
               disabled={busy}
+              title={blockedTitle}
               onPointerDown={(event) => event.preventDefault()}
               onClick={() => mutate('scene_draft_remove_objects', {
                 scene_resource_ids: [staged.scene_resource_id],
@@ -1216,13 +1236,16 @@ function ViewerMetadataEditor({
   program,
   draftRevision,
   busy,
+  busyReason,
   mutate,
 }: {
   program: ProgramAuthoringDocument;
   draftRevision: number;
   busy: boolean;
+  busyReason: string | null;
   mutate: ProgramWorkspaceController['mutate'];
 }) {
+  const blockedTitle = busy ? busyReason ?? undefined : undefined;
   const [draft, setDraft] = useState(() => viewerPresentationDraftFromProgram(program.viewer));
   useEffect(() => {
     setDraft(viewerPresentationDraftFromProgram(program.viewer));
@@ -1274,6 +1297,7 @@ function ViewerMetadataEditor({
               type="checkbox"
               checked={draft.frameRoleVisibility[role] ?? true}
               disabled={busy}
+              title={blockedTitle}
               onChange={(event) => dispatchAndCommit({
                 type: 'set_frame_visibility',
                 frameId: role,
@@ -1289,6 +1313,7 @@ function ViewerMetadataEditor({
               type="checkbox"
               checked={draft.resourceRoleVisibility[role] ?? true}
               disabled={busy}
+              title={blockedTitle}
               onChange={(event) => dispatchAndCommit({
                 type: 'set_resource_visibility',
                 resourceRoleId: role,
@@ -1309,6 +1334,7 @@ function ViewerMetadataEditor({
             step={0.01}
             value={draft.frameGizmoSizeM}
             disabled={busy}
+            title={blockedTitle}
             onChange={(event) => dispatch({
               type: 'set_frame_gizmo_size',
               sizeM: event.currentTarget.valueAsNumber,
@@ -1324,6 +1350,7 @@ function ViewerMetadataEditor({
             step={0.01}
             value={draft.objectAxesGizmoSizeM}
             disabled={busy}
+            title={blockedTitle}
             onChange={(event) => dispatch({
               type: 'set_object_axes_gizmo_size',
               sizeM: event.currentTarget.valueAsNumber,
@@ -1533,6 +1560,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   onInspectorPanelChange,
   onOpenRuntimeHistory,
   runtimeOverlay,
+  executionActive,
 }: {
   active: boolean;
   source: HeadlessStateSource;
@@ -1592,6 +1620,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   onInspectorPanelChange?: (panel: ViewerInspectorPanel) => void;
   onOpenRuntimeHistory?: () => void;
   runtimeOverlay?: ReactNode;
+  executionActive: boolean;
 }) {
   const headlessState = useViewerHeadlessState(source, active);
   const observationTransport = useExecutionObservationTransport(source);
@@ -1661,14 +1690,17 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     ?? EMPTY_LOGICAL_SCENE_OBJECTS;
   const ownerSceneKnown = presentationFacts !== null;
   const [sceneSourceChoice, setSceneSourceChoice] = useState<'auto' | 'draft' | 'applied'>('auto');
+  // While execution is not Idle the Draft cannot be edited, and runtime Scene
+  // changes (carried or moved objects) are real, not authored differences. Show
+  // only the live Scene and skip the Draft comparison entirely.
   const draftPreviewObjects = useMemo(() => (
-    ownerSceneKnown
+    ownerSceneKnown && !executionActive
       ? (program?.scene ?? []).map(programScenePreviewObject).filter(
           (object): object is LogicalSceneObject => object !== null,
         )
       : EMPTY_LOGICAL_SCENE_OBJECTS
-  ), [ownerSceneKnown, program?.scene]);
-  const draftSceneDifferent = ownerSceneKnown && draftIdentity !== null && (
+  ), [executionActive, ownerSceneKnown, program?.scene]);
+  const draftSceneDifferent = !executionActive && ownerSceneKnown && draftIdentity !== null && (
     draftPreviewObjects.length !== (program?.scene?.length ?? 0)
     || draftPreviewObjects.length !== objects.length
     || draftPreviewObjects.some((draftObject) => {
@@ -1686,7 +1718,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
             ? appliedObject.placement.pose_in_cell : null);
     })
   );
-  const programDraftPreview = sceneSourceIsDraft(
+  const programDraftPreview = !executionActive && sceneSourceIsDraft(
     sceneSourceChoice, ownerSceneKnown, draftIdentity !== null,
     draftSceneDifferent,
     programDraftPreviewActive(ownerSceneKnown, objects.length,
@@ -2198,6 +2230,8 @@ export function SceneAuthoringWorkspace({
   runtimeOverlay,
 }: SceneAuthoringWorkspaceProps) {
   const headlessState = useShellHeadlessState(headlessStateSource);
+  const executionActive = headlessState.snapshot !== null
+    && headlessState.snapshot.programCycle.state !== 'idle_after_reset';
   const programWorkspace = programController.state.workspace;
   const program = programWorkspace?.draft.authoring ?? null;
   const viewer = program?.viewer;
@@ -2442,6 +2476,12 @@ export function SceneAuthoringWorkspace({
   const busyDraft = programController.state.status === 'loading'
     || (programController.state.status === 'ready'
       && programController.state.pendingAction !== null);
+  // Program Draft editors are authoring: blocked while busy and whenever the
+  // shared authoring gate is closed (for example while execution is not Idle).
+  const draftEditBlocked = busyDraft || !programController.mutationAvailable;
+  const draftEditBlockReason = busyDraft
+    ? 'Another Program operation is in progress.'
+    : programController.mutationUnavailableReason;
   const selectedProgramResource = program?.scene?.find(
     (resource) => resource.scene_resource_id === selectedProgramResourceId,
   ) ?? null;
@@ -2762,6 +2802,9 @@ export function SceneAuthoringWorkspace({
                       step={gizmo.settings.linearStepM}
                       value={livePose.position_m[field]}
                       disabled={editReason !== null || commitState.kind === 'busy'}
+                      title={commitState.kind === 'busy'
+                        ? 'A Scene commit is in progress.'
+                        : editReason ?? undefined}
                       onChange={(event) => editLivePose(field, event.currentTarget.valueAsNumber)}
                     />
                   </label>
@@ -2776,6 +2819,9 @@ export function SceneAuthoringWorkspace({
                       step={0.001}
                       value={livePose.orientation_xyzw[index]}
                       disabled={editReason !== null || commitState.kind === 'busy'}
+                      title={commitState.kind === 'busy'
+                        ? 'A Scene commit is in progress.'
+                        : editReason ?? undefined}
                       onChange={(event) => editLivePose(
                         index as 0 | 1 | 2 | 3,
                         event.currentTarget.valueAsNumber,
@@ -2789,6 +2835,9 @@ export function SceneAuthoringWorkspace({
                   shape={liveShape}
                   disabled={selectedMutationAvailability?.shape !== true
                     || commitState.kind === 'busy'}
+                  disabledTitle={commitState.kind === 'busy'
+                    ? 'A Scene commit is in progress.'
+                    : selectedMutationAvailability?.shapeReason ?? undefined}
                   onChange={setLiveShape}
                 />
               )}
@@ -2932,6 +2981,7 @@ export function SceneAuthoringWorkspace({
   const viewerSurface = (
     <SceneViewerBridge
       active={viewerActive}
+      executionActive={executionActive}
       source={headlessStateSource}
       sourceValue={sourceValue}
       sourceModelState={sourceModel}
@@ -3136,7 +3186,8 @@ export function SceneAuthoringWorkspace({
             <ProgramSceneEditor
               program={program}
               draftRevision={draftRevision}
-              busy={busyDraft}
+              busy={draftEditBlocked}
+              busyReason={draftEditBlockReason}
               mutate={programController.mutate}
               selectedResourceId={selection?.kind === 'program_resource'
                 ? selection.id
@@ -3150,7 +3201,8 @@ export function SceneAuthoringWorkspace({
           <ProgramContactPolicyEditor
             program={program}
             draftRevision={draftRevision}
-            busy={busyDraft || !programController.mutationAvailable}
+            busy={draftEditBlocked}
+            busyReason={draftEditBlockReason}
             mutate={programController.mutate}
           />
         )}
@@ -3158,7 +3210,8 @@ export function SceneAuthoringWorkspace({
           <ViewerMetadataEditor
             program={program}
             draftRevision={draftRevision}
-            busy={busyDraft}
+            busy={draftEditBlocked}
+            busyReason={draftEditBlockReason}
             mutate={programController.mutate}
           />
         )}

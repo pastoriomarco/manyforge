@@ -37,6 +37,12 @@ inline constexpr std::string_view kBrandLifecyclePlanCatalogSemanticIdentityDoma
 [[nodiscard]] Result<void> VerifyBrandLifecyclePlanCatalog(
     const BrandLifecyclePlanCatalogDTO& catalog);
 
+/// The generic in-process native control lifecycle, shared by every native
+/// provider: Prepare verifies the constructed engine, Enable opens and Disable
+/// closes its Kernel command gate. A provider selects it by anchoring these
+/// plans (under its own manifest ID) in its manifest. No Recover plan exists.
+[[nodiscard]] std::vector<LifecycleIntentPlanDTO> MakeNativeControlLifecyclePlans();
+
 /// Emit the complete RFC-8785 canonical catalog artifact, including its
 /// verified own digest.
 [[nodiscard]] Result<std::string> EncodeBrandLifecyclePlanCatalog(

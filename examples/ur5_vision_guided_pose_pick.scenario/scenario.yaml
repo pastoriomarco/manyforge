@@ -8,13 +8,13 @@
   "description": "Local deployment for the vision-guided pose-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
   "members": {
     "assignment.yaml": "sha256:10e42acc3e46a6f842fc6fd5e2bb3eef41f005fb4ea03423f340ac4c2b34eee6",
-    "deployment.yaml": "sha256:31d3438d9d058c4d6ee297704311e72828eedf3e478f29d7369a42a67ca798d7",
+    "deployment.yaml": "sha256:8c5716fc24c73b3e67170095333de45939068c512bb721d07f632902e6c6e8b4",
     "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
     "program.yaml": "sha256:f0fbc5280b6e04e30946ad72046e29830b52f15f0f374560b982b25eca78b646"
   },
   "name": "ur5_roboplan_local_vision_guided_pose_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:55adfac49506b3dcd005cb2e9c839cf617c4ee5f908c58447364c88a9d7df70f",
+    "checked_content_digest": "sha256:3589da42f0bde8894b4f3103fc9a5410df2c3932e11479a9e31dfa20001c2c05",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

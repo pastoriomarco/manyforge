@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <manyforge_core/addressed_observed_state_publication.hpp>
 #include <set>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -202,7 +203,7 @@ Result<void> AddressedObservedStatePublication::rebind_route_context(
 }
 
 ObservedStateQueryContextDTO AddressedObservedStatePublication::query_context() const {
-  std::lock_guard lock(route_context_mutex_);
+  std::shared_lock lock(route_context_mutex_);
   return current_query_context_;
 }
 
@@ -300,7 +301,7 @@ ObservedStatePublicationDTO AddressedObservedStatePublication::make_publication(
 
 Result<ObservedStateSnapshotDTO> AddressedObservedStatePublication::current_state(
     const ObservedStateQueryContextDTO& context, std::int64_t now_ns) const {
-  std::unique_lock lock(route_context_mutex_, std::try_to_lock);
+  std::shared_lock lock(route_context_mutex_, std::try_to_lock);
   if (!lock.owns_lock()) {
     return Result<ObservedStateSnapshotDTO>::Err(state_error("observed_state_route_context_busy"));
   }
@@ -335,7 +336,7 @@ Result<ObservedStateSnapshotDTO> AddressedObservedStatePublication::current_stat
 Result<ObservedStatePublicationDTO> AddressedObservedStatePublication::publication(
     const ControlBindingId& control_binding_id,
     const ControlBindingRevision& control_binding_revision) const {
-  std::unique_lock lock(route_context_mutex_, std::try_to_lock);
+  std::shared_lock lock(route_context_mutex_, std::try_to_lock);
   if (!lock.owns_lock()) {
     return Result<ObservedStatePublicationDTO>::Err(
         state_error("observed_state_route_context_busy"));
@@ -360,7 +361,7 @@ Result<ObservedStatePublicationDTO> AddressedObservedStatePublication::publicati
 Result<ObservedStatePublicationDTO> AddressedObservedStatePublication::publication_at(
     const ControlBindingId& control_binding_id,
     const ControlBindingRevision& control_binding_revision, std::int64_t now_ns) const {
-  std::unique_lock lock(route_context_mutex_, std::try_to_lock);
+  std::shared_lock lock(route_context_mutex_, std::try_to_lock);
   if (!lock.owns_lock()) {
     return Result<ObservedStatePublicationDTO>::Err(
         state_error("observed_state_route_context_busy"));

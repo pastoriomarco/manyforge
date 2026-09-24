@@ -7,7 +7,7 @@
 #include <tuple>
 #include <utility>
 
-#include <manyforge_lite6_product/lifecycle_profile.hpp>
+#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_roboplan/retained_native_brand_lifecycle_port.hpp>
 
 namespace manyforge::roboplan_backend {
@@ -22,15 +22,17 @@ namespace {
 
 [[nodiscard]] core::Result<core::BrandLifecyclePlanCatalogDTO>
 make_catalog(const core::ProviderManifestDTO &manifest) {
-  if (manifest.provider_manifest_id ==
-      core::ProviderManifestId(
-          std::string(lite6_product::kLifecycleProviderManifestId))) {
-    return lite6_product::make_lite6_lifecycle_catalog(manifest);
-  }
-  if (manifest.provider_manifest_id ==
-      core::ProviderManifestId(
-          std::string(lite6_product::kGripperLifecycleProviderManifestId))) {
-    return lite6_product::make_lite6_gripper_lifecycle_catalog(manifest);
+  // Any native provider that anchors exactly the generic native plans under
+  // its own manifest ID selects this product; a vendor catalog (for example
+  // the Lite6 real-robot lifecycle) anchors other plans and is refused.
+  if (manifest.lifecycle_plan_catalog.has_value()) {
+    auto catalog = core::MakeBrandLifecyclePlanCatalog(
+        manifest.provider_manifest_id, manifest.provider_manifest_revision,
+        core::MakeNativeControlLifecyclePlans());
+    if (catalog.ok() &&
+        core::VerifyBrandLifecyclePlanCatalogManifestAnchor(manifest, catalog.value()).ok()) {
+      return catalog;
+    }
   }
   return core::Result<core::BrandLifecyclePlanCatalogDTO>::Err(product_error(
       "native_lifecycle_product_unsupported",
@@ -52,10 +54,19 @@ RetainedNativeLifecycleProduct::Create(
     const deployment::IVerifiedRetainedProviderManifestSource
         &provider_manifest_source,
     const std::vector<core::RuntimeParticipantBinding> &physical_bindings,
-    core::IClock &clock, const core::Duration observation_freshness_ns) {
+    core::IClock &clock, const core::Duration observation_freshness_ns,
+    std::function<core::Result<void>(const core::ControlDomainId &)>
+        verify_native_engine,
+    std::function<core::Result<bool>(const core::ControlDomainId &)>
+        route_ready,
+    std::function<core::Result<std::optional<core::ComponentLifecycleStateDTO>>(
+        const core::ControllableComponentId &)>
+        retained_state,
+    bool allow_closed_active_during_route_recovery) {
   if (retained_bundle == nullptr ||
       !deployment::verify_retained_bundle_identity(*retained_bundle) ||
-      physical_bindings.empty() ||
+      physical_bindings.empty() || !verify_native_engine || !route_ready ||
+      !retained_state ||
       observation_freshness_ns <= 0 ||
       observation_freshness_ns >
           core::kMaxLifecycleTransactionTimeoutNs) {
@@ -76,6 +87,7 @@ RetainedNativeLifecycleProduct::Create(
   for (const auto &desired :
        retained_bundle->value().desired_control_configurations) {
     const core::RuntimeControlPathDTO *selected_path = nullptr;
+    std::optional<core::ControllableComponentId> selected_component;
     for (const auto &binding : physical_bindings) {
       const auto &value = binding.value();
       if (!value.control_path.has_value() ||
@@ -83,6 +95,15 @@ RetainedNativeLifecycleProduct::Create(
         continue;
       }
       const auto &path = *value.control_path;
+      if (!selected_component) {
+        selected_component = value.controllable_component_id;
+      } else if (*selected_component != value.controllable_component_id) {
+        return core::Result<
+            std::unique_ptr<RetainedNativeLifecycleProduct>>::Err(
+            product_error("native_lifecycle_domain_component_ambiguous",
+                          "one native control domain spans multiple components",
+                          "component_domain_ambiguous"));
+      }
       if (path.control_domain_revision != desired.control_domain_revision) {
         return core::Result<
             std::unique_ptr<RetainedNativeLifecycleProduct>>::Err(
@@ -110,7 +131,7 @@ RetainedNativeLifecycleProduct::Create(
                           "provider_occurrence_ambiguous"));
       }
     }
-    if (selected_path == nullptr) {
+    if (selected_path == nullptr || !selected_component) {
       return core::Result<
           std::unique_ptr<RetainedNativeLifecycleProduct>>::Err(product_error(
           "native_lifecycle_product_domain_missing",
@@ -155,8 +176,21 @@ RetainedNativeLifecycleProduct::Create(
         selected_path->provider_runtime_unit_id,
         selected_path->provider_runtime_epoch,
         entry->second.catalog.catalog_digest};
+    auto initial = retained_state(*selected_component);
+    if (!initial.ok()) {
+      return core::Result<
+          std::unique_ptr<RetainedNativeLifecycleProduct>>::Err(initial.error());
+    }
     auto port = RetainedNativeBrandLifecyclePort::Create(
-        occurrence, entry->second.catalog, clock, observation_freshness_ns);
+        occurrence, entry->second.catalog, clock, observation_freshness_ns,
+        [verify_native_engine,
+         domain = desired.control_domain_id]() {
+          return verify_native_engine(domain);
+        },
+        [route_ready, domain = desired.control_domain_id]() {
+          return route_ready(domain);
+        },
+        initial.value(), allow_closed_active_during_route_recovery);
     if (!port.ok()) {
       return core::Result<
           std::unique_ptr<RetainedNativeLifecycleProduct>>::Err(port.error());

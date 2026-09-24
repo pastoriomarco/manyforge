@@ -27,6 +27,7 @@ import {
 import { useAuthoringWorkspace } from './hooks/useAuthoringWorkspace';
 import { useDeploymentWorkspace } from './hooks/useDeploymentWorkspace';
 import { useManagerApplyStatus } from './hooks/useManagerApplyStatus';
+import { activationFailureNotice } from './state/activationNotices';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
@@ -473,15 +474,7 @@ export default function App() {
     if (observedApply === null) return [];
     const id = `activation.${observedApply.applyId}:${observedApply.applyGeneration}`;
     if (activationStatus?.state === 'failed' || activationStatus?.state === 'unknown_effect') {
-      return [{
-        id,
-        severity: 'error',
-        domain: 'activation',
-        title: activationStatus.state === 'failed'
-          ? 'Activation failed'
-          : 'Activation outcome unknown',
-        message: `${activationStatus.failure?.message ?? 'Manager reported a terminal failure.'} Applied state was not confirmed (${observedApply.applyId}).`,
-      }];
+      return [activationFailureNotice(id, observedApply.applyId, activationStatus)];
     }
     if (activationStatus?.state === 'succeeded') return [];
     if (activationUnobservable) {
@@ -569,15 +562,9 @@ export default function App() {
       });
     }
     const reason = authoringWorkspace.unavailableReason ?? '';
-    if (authoringCause === 'execution_active') {
-      notices.push({
-        id: 'authoring.unavailable',
-        severity: 'info',
-        domain: 'program_authoring',
-        title: 'Authoring waits for Idle',
-        message: `${reason} Draft inspection remains available.`,
-      });
-    } else if (authoringCause === 'synchronizing' || authoringCause === 'not_read') {
+    // Execution that is not Idle is not reported here: it is the direct
+    // consequence of a Run, shown as the editors' status and control tooltips.
+    if (authoringCause === 'synchronizing' || authoringCause === 'not_read') {
       notices.push({
         id: 'authoring.unavailable',
         severity: 'info',

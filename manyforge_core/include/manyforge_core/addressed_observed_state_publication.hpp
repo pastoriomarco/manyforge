@@ -7,6 +7,7 @@
 #include <manyforge_core/ports/iobserved_state_provider.hpp>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <vector>
 
@@ -78,7 +79,9 @@ class AddressedObservedStatePublication final : public IObservedStateProvider {
 
   AddressedObservedStatePublicationConfig config_;
   ObservedRobotStatePublication publication_;
-  mutable std::mutex route_context_mutex_;
+  // Readers share this lock and never wait: they only refuse while a route
+  // rebind holds it exclusively, so ordinary readers cannot fail each other.
+  mutable std::shared_mutex route_context_mutex_;
   ObservedStateQueryContextDTO current_query_context_;
   std::uint64_t context_first_sequence_{};
 };

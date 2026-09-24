@@ -6,6 +6,9 @@
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace manyforge::core {
@@ -81,6 +84,7 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] bool has_unresolved_claims_except(CellAdmissionOwnerRoleDTO owner_role) const;
   /// Kernel-owned attachment barrier; Manager readiness cannot clear it.
   [[nodiscard]] Result<void> SetRouteRecoveryPending(bool pending);
+  [[nodiscard]] bool route_recovery_pending() const;
   /// Current held authority, excluding released and reconciled predecessors.
   [[nodiscard]] std::optional<CellAdmissionClaimDTO> held_claim(
       CellAdmissionClaimKindDTO kind) const;
@@ -105,6 +109,7 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
 
   [[nodiscard]] AuthoringAdmissionDTO AdmissionLocked() const noexcept;
   [[nodiscard]] bool NonCycleReadinessLocked() const noexcept;
+  [[nodiscard]] std::optional<std::string_view> LifecycleBlockingReasonLocked() const noexcept;
   [[nodiscard]] bool ManualParentReadyLocked(const Entry* parent) const noexcept;
   [[nodiscard]] bool BaseReadinessLocked() const noexcept;
   [[nodiscard]] bool MatchingStartingProgramCycleLocked(

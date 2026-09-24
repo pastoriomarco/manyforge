@@ -127,11 +127,19 @@ struct RuntimeEpochRouteReconciliation final {
   core::RuntimeEpoch source_runtime_epoch;
   std::optional<core::RouteSelectionTransactionId> transaction_id;
   bool settled{};
+  /// The retained component is explicitly Disabled. Route selection admits
+  /// only Prepared/Active expectations, so its adopted predecessor stays
+  /// installed and command-closed; Prepare, route selection and Enable later
+  /// establish a current route.
+  bool retained_disabled{};
 };
 
 struct RuntimeEpochRouteReconciliationState final {
   std::mutex mutex;
   std::vector<RuntimeEpochRouteReconciliation> rows;
+  /// Component readiness was rebuilt from committed facts after the last
+  /// recovered route, while the Kernel's route-recovery exclusion was held.
+  bool readiness_reconstructed{};
 };
 
 [[nodiscard]] core::Result<std::vector<RuntimeEpochRouteReconciliation>>
@@ -198,8 +206,7 @@ adopt_durable_route_configurations(
 
       if (active.state == core::ActiveControlConfigurationStateDTO::
                               kExternalOrUnknownUnreconciled) {
-        auto published =
-            runtime.PublishAndReadBackRouteConfiguration(active, {});
+        auto published = runtime.PublishAndReadBackRouteConfiguration(active, {});
         if (!published.ok()) {
           return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::
               Err(published.error());
@@ -257,16 +264,42 @@ adopt_durable_route_configurations(
           return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::
               Err(adopted.error());
         }
+        const auto retained_fact = std::find_if(
+            facts.value().components.begin(), facts.value().components.end(),
+            [&](const auto &candidate) {
+              return candidate.controllable_component_id == *current_component_id;
+            });
         reconciliations.push_back({
             .predecessor = active,
             .controllable_component_id = *current_component_id,
             .source_runtime_epoch = *current_source_epoch,
             .transaction_id = std::nullopt,
             .settled = false,
+            .retained_disabled =
+                retained_fact != facts.value().components.end() &&
+                retained_fact->current_state ==
+                    core::ComponentLifecycleStateDTO::kDisabled,
         });
         continue;
       }
 
+      {
+        // A native Apply has just installed exactly this durable route in
+        // this Kernel. Route readiness is already current; component command
+        // eligibility is reconstructed separately after every route.
+        const auto installed =
+            runtime.addressed_kernel->current_runtime_route_configuration(
+                active.control_domain_id);
+        if (!installed.ok()) {
+          return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::Err(
+              installed.error());
+        }
+        if (installed.value().has_value() &&
+            installed.value()->active_configuration == active &&
+            installed.value()->operation_admission_open) {
+          continue;
+        }
+      }
       const auto expected =
           deployment::load_verified_controller_lifecycle_expected_domain(
               retained_bundle, artifact_source, *desired,
@@ -318,6 +351,11 @@ adopt_durable_route_configurations(
         return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::Err(
             published.error());
       }
+      if (!published.value().operation_admission_open) {
+        return reject<std::vector<RuntimeEpochRouteReconciliation>>(
+            "native_cclc_restart_route_not_ready",
+            "the restored route did not read back complete route readiness");
+      }
     }
     return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::Ok(
         std::move(reconciliations));
@@ -331,6 +369,80 @@ adopt_durable_route_configurations(
   }
 }
 
+/// Rebuild component command eligibility only from matching committed facts,
+/// under the Kernel's route-recovery exclusion. A component stays
+/// command-closed when its fact is absent (including after a settled partial
+/// effect, which erases it) or not Active, when its latest lifecycle
+/// transaction is not terminal, when a native Apply plan is unadopted, or
+/// when one of its routes is not yet current. Nothing here dispatches a
+/// primitive or implicitly Enables anything.
+[[nodiscard]] core::Result<void> reconstruct_component_command_readiness(
+    const deployment::CCLCRuntimeCompositionConfig &config,
+    RetainedNativeRuntime &runtime) {
+  try {
+    std::set<core::ControllableComponentId> component_ids;
+    std::set<core::ControlDomainId> domain_ids;
+    const auto collect = [&](const RetainedNativeRuntime &owner) {
+      for (const auto &binding : owner.control_binding_representatives) {
+        if (!binding.value().control_path.has_value()) continue;
+        component_ids.insert(binding.value().controllable_component_id);
+        domain_ids.insert(binding.value().control_path->control_domain_id);
+      }
+    };
+    collect(runtime);
+    for (const auto &peer : runtime.participant_peers) collect(*peer);
+    if (component_ids.empty() || domain_ids.empty()) {
+      return core::Result<void>::Ok();
+    }
+    core::SqliteCCLCJournal journal(
+        config.state_root / std::string(core::kCCLCJournalFilename),
+        config.cell_id, config.exact_result_history_capacity,
+        config.terminal_result_bytes_capacity);
+    const auto facts = journal.LoadCurrentSnapshotFacts(
+        std::vector<core::ControllableComponentId>(component_ids.begin(),
+                                                   component_ids.end()),
+        std::vector<core::ControlDomainId>(domain_ids.begin(),
+                                           domain_ids.end()));
+    if (!facts.ok()) return core::Result<void>::Err(facts.error());
+    const auto unsettled = journal.LoadComponentsWithUnsettledLifecycle();
+    if (!unsettled.ok()) return core::Result<void>::Err(unsettled.error());
+    const auto pending_apply = journal.ReadUnsettledNativeApplyPlan();
+    if (!pending_apply.ok()) {
+      return core::Result<void>::Err(pending_apply.error());
+    }
+    journal.Close();
+    for (const auto &fact : facts.value().components) {
+      if (!fact.durable_generation.has_value()) continue;
+      const bool eligible =
+          !pending_apply.value().has_value() &&
+          fact.current_state == core::ComponentLifecycleStateDTO::kActive &&
+          std::find(unsettled.value().begin(), unsettled.value().end(),
+                    fact.controllable_component_id) == unsettled.value().end();
+      core::ComponentCommandReadinessPublicationDTO publication{
+          core::ComponentReadinessAuthorityDTO::kRestartExclusion, std::nullopt,
+          std::nullopt, fact.controllable_component_id, *fact.durable_generation,
+          eligible};
+      auto published = runtime.PublishComponentCommandReadiness(publication);
+      const auto reason =
+          published.ok() ? std::string{}
+                         : (published.error().details.contains("reason")
+                                ? published.error().details.at("reason")
+                                : std::string{});
+      if (!published.ok() && eligible &&
+          reason == "component_readiness_route_not_current") {
+        // A route still awaits owner reconciliation; stay closed until the
+        // route-recovery path rebuilds readiness from current facts.
+        publication.command_eligible = false;
+        published = runtime.PublishComponentCommandReadiness(publication);
+      }
+      if (!published.ok()) return core::Result<void>::Err(published.error());
+    }
+    return core::Result<void>::Ok();
+  } catch (const std::exception &error) {
+    return reject<void>("native_cclc_readiness_reconstruction_failed", error.what());
+  }
+}
+
 [[nodiscard]] core::Result<void> reconcile_runtime_epoch_routes(
     deployment::CCLCRuntimeComposition &composition,
     core::IKernelCellAdmissionPort &cell_admission,
@@ -341,6 +453,12 @@ adopt_durable_route_configurations(
     auto &required = reconciliations[index];
     if (required.settled)
       continue;
+    if (required.retained_disabled) {
+      // Keep the adopted predecessor installed and command-closed; no
+      // controller recovery runs for an explicitly Disabled component.
+      required.settled = true;
+      continue;
+    }
     if (!required.transaction_id) {
       if (!composition.coordinator().accepting_new_requests()) {
         return reject<void>("native_cclc_restart_recovery_pending",
@@ -751,6 +869,177 @@ bool RetainedNativeCCLCRuntimeConfig::locally_valid() const noexcept {
   return composition.locally_valid() && controller_observation_freshness_ns > 0;
 }
 
+core::Result<void> InitializeRetainedNativeCandidateControlRoutes(
+    const deployment::RetainedBundle &bundle, RetainedNativeRuntime &runtime,
+    const core::ActiveBundlePublicationGeneration candidate_publication_generation,
+    const core::NativeApplyPlanDTO &plan,
+    const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
+    const std::span<const core::RuntimeParticipantBinding> physical_bindings,
+    const std::filesystem::path &execution_run_root,
+    const core::ConfigurationFenceId &parent_apply_fence_id) {
+  try {
+    if (!deployment::verify_retained_bundle_identity(bundle) ||
+        runtime.addressed_kernel == nullptr ||
+        !candidate_publication_generation.nonzero() || !plan.apply.valid() ||
+        plan.candidate_retained_bundle_id != bundle.retained_bundle_id() ||
+        plan.candidate_graph_revision != bundle.value().cell_graph.graph_revision ||
+        plan.routes.size() != bundle.value().desired_control_configurations.size()) {
+      return reject<void>("native_candidate_input_invalid",
+                          "native CCLC candidate route inputs do not match the recorded plan");
+    }
+    core::FilesystemResolvedStopBasePlanRepository plan_repository(
+        execution_run_root);
+    for (const auto &desired : bundle.value().desired_control_configurations) {
+      std::vector<core::RuntimeParticipantBinding> representatives;
+      representatives.reserve(desired.binding_routes.size());
+      const core::RuntimeControlPathDTO *source_path = nullptr;
+      for (const auto &route : desired.binding_routes) {
+        const auto representative = std::find_if(
+            physical_bindings.begin(),
+            physical_bindings.end(),
+            [&](const auto &candidate) {
+              return candidate.value().control_path.has_value() &&
+                     candidate.value().control_path->control_domain_id ==
+                         desired.control_domain_id &&
+                     candidate.value().control_path->control_binding_id ==
+                         route.control_binding_id &&
+                     candidate.value().control_path->control_binding_revision ==
+                         route.control_binding_revision;
+            });
+        if (representative == physical_bindings.end()) {
+          return reject<void>("native_candidate_binding_missing",
+                              "candidate route has no exact physical binding");
+        }
+        const auto &path = *representative->value().control_path;
+        if (source_path == nullptr) {
+          source_path = &path;
+        } else if (source_path->provider_runtime_unit_id !=
+                       path.provider_runtime_unit_id ||
+                   source_path->provider_runtime_epoch !=
+                       path.provider_runtime_epoch ||
+                   source_path->active_control_configuration_id !=
+                       path.active_control_configuration_id ||
+                   source_path->active_control_configuration_generation !=
+                       path.active_control_configuration_generation) {
+          return reject<void>("native_candidate_source_ambiguous",
+                              "candidate domain spans different runtime sources");
+        }
+        representatives.push_back(*representative);
+      }
+      if (source_path == nullptr) {
+        return reject<void>("native_candidate_domain_empty",
+                            "candidate control domain has no binding routes");
+      }
+      const auto planned_route = std::find_if(
+          plan.routes.begin(), plan.routes.end(), [&](const auto &row) {
+            return row.control_domain_id == desired.control_domain_id;
+          });
+      const auto domain_component =
+          representatives.front().value().controllable_component_id;
+      const auto planned_component = std::find_if(
+          plan.components.begin(), plan.components.end(), [&](const auto &row) {
+            return row.component_id == domain_component;
+          });
+      if (planned_route == plan.routes.end() ||
+          planned_component == plan.components.end() ||
+          std::any_of(representatives.begin(), representatives.end(),
+                      [&](const auto &row) {
+                        return row.value().controllable_component_id !=
+                               domain_component;
+                      })) {
+        return reject<void>("native_candidate_plan_scope_mismatch",
+                            "candidate domain has no single planned component and route");
+      }
+      std::vector<core::ActiveControlConfigurationBindingRouteDTO> active_routes;
+      active_routes.reserve(desired.binding_routes.size());
+      for (const auto &route : desired.binding_routes) {
+        active_routes.push_back({route.control_binding_id,
+                                 route.control_binding_revision,
+                                 route.control_route_id});
+      }
+      std::sort(active_routes.begin(), active_routes.end(),
+                core::CanonicalActiveControlConfigurationBindingRouteLess);
+      core::ActiveControlConfigurationDTO configuration{
+          source_path->active_control_configuration_id,
+          desired.control_domain_id,
+          desired.control_domain_revision,
+          std::move(active_routes),
+          desired.activation_set_id,
+          desired.controller_topology_id,
+          desired.topology_revision,
+          source_path->provider_runtime_unit_id,
+          source_path->provider_runtime_epoch,
+          candidate_publication_generation.value(),
+          {},
+          planned_route->generation,
+          core::ActiveControlConfigurationStateDTO::kReconciled};
+      auto projections =
+          DeriveRetainedNativeStateSourceProjections(representatives);
+      if (!projections.ok()) {
+        return core::Result<void>::Err(projections.error());
+      }
+      configuration.kinematic_resource_source_projections =
+          std::move(projections.value());
+      if (!configuration.locally_valid()) {
+        return reject<void>("native_candidate_configuration_invalid",
+                            "candidate route configuration is not valid");
+      }
+      const auto current = runtime.addressed_kernel
+                               ->current_runtime_route_configuration(
+                                   desired.control_domain_id);
+      if (!current.ok()) {
+        return core::Result<void>::Err(current.error());
+      }
+      if (current.value().has_value() &&
+          current.value()->active_configuration == configuration &&
+          current.value()->operation_admission_open) {
+        continue;
+      }
+      const auto expected =
+          deployment::load_verified_controller_lifecycle_expected_domain(
+              bundle, artifact_source, desired,
+              source_path->provider_runtime_unit_id,
+              source_path->provider_runtime_epoch);
+      // The same generation and state CCLC recorded and will adopt.
+      std::vector<core::RouteSelectionComponentExpectationDTO> components{
+          {domain_component, planned_component->generation,
+           planned_component->state}};
+      auto participants =
+          deployment::resolve_store_and_verify_route_readiness_batch(
+              bundle, artifact_source, expected, configuration, components,
+              representatives, plan_repository);
+      if (!participants.ok()) {
+        return core::Result<void>::Err(participants.error());
+      }
+      const auto published = runtime.PublishAndReadBackRouteConfiguration(
+          configuration, std::move(participants.value()));
+      if (!published.ok()) {
+        return core::Result<void>::Err(published.error());
+      }
+      if (!published.value().operation_admission_open) {
+        return reject<void>("native_candidate_route_not_ready",
+                            "candidate route readback has no complete route readiness");
+      }
+    }
+    // Publish each planned component's complete result once all of its
+    // routes are current. Only a component without a retained explicit
+    // Disable is enabled; the plan's generation is the one CCLC will adopt.
+    for (const auto &component : plan.components) {
+      const core::ComponentCommandReadinessPublicationDTO publication{
+          core::ComponentReadinessAuthorityDTO::kParentApplyFence, std::nullopt,
+          parent_apply_fence_id, component.component_id, component.generation,
+          component.state == core::ComponentLifecycleStateDTO::kActive};
+      const auto published = runtime.PublishComponentCommandReadiness(publication);
+      if (!published.ok()) {
+        return core::Result<void>::Err(published.error());
+      }
+    }
+    return core::Result<void>::Ok();
+  } catch (const std::exception &error) {
+    return reject<void>("native_candidate_initialization_failed", error.what());
+  }
+}
+
 core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>
 CreateRetainedNativeCCLCRuntime(
     RetainedNativeCCLCRuntimeConfig config,
@@ -772,7 +1061,8 @@ CreateRetainedNativeCCLCRuntime(
             const core::ControlDomainId &)>
         kernel_current_configuration_source,
     RetainedExternallyManagedDomainSnapshotSource
-        externally_managed_controller_snapshot_source) {
+        externally_managed_controller_snapshot_source,
+    core::ICCLCComponentCommandReadinessPort *component_command_readiness_port) {
   if (!config.composition.trusted_roots_valid()) {
     return reject<std::unique_ptr<deployment::CCLCRuntimeComposition>>(
         "native_cclc_storage_capabilities_invalid",
@@ -802,7 +1092,8 @@ CreateRetainedNativeCCLCRuntime(
       std::move(value.controller_ports), std::move(value.source_projections),
       kernel_disable_handoff_port, kernel_cell_admission_port,
       kernel_route_fence_port, kernel_publication_owner, clock, scheduler,
-      std::move(kernel_current_configuration_source));
+      std::move(kernel_current_configuration_source),
+      component_command_readiness_port);
   return composition;
 }
 
@@ -856,6 +1147,13 @@ CreateRetainedNativeCCLCRuntime(
     return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
         Err(manual_reconciled.error());
   }
+  const auto readiness_config = config.composition;
+  auto reconstructed =
+      reconstruct_component_command_readiness(readiness_config, runtime);
+  if (!reconstructed.ok()) {
+    return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
+        Err(reconstructed.error());
+  }
   auto observation_bundle = retained_bundle;
   auto physical_bindings = runtime.control_binding_representatives;
   std::function<
@@ -872,7 +1170,7 @@ CreateRetainedNativeCCLCRuntime(
       std::move(physical_bindings), kernel_disable_handoff_port,
       kernel_cell_admission_port, kernel_route_fence_port, runtime,
       *runtime.clock, *runtime.scheduler, std::move(current_configuration),
-      std::move(externally_managed_controller_snapshot_source));
+      std::move(externally_managed_controller_snapshot_source), &runtime);
   if (!composition.ok()) {
     return composition;
   }
@@ -884,14 +1182,33 @@ CreateRetainedNativeCCLCRuntime(
   auto reconciliation_state =
       std::make_shared<RuntimeEpochRouteReconciliationState>();
   reconciliation_state->rows = std::move(adopted.value());
+  // With nothing to recover, readiness was already rebuilt above.
+  reconciliation_state->readiness_reconstructed =
+      reconciliation_state->rows.empty();
+  if (reconciliation_state->rows.empty()) {
+    auto ready = runtime.addressed_kernel->SetRouteRecoveryPending(false);
+    if (!ready.ok()) {
+      return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::Err(
+          ready.error());
+    }
+  }
   runtime.reconcile_controller_routes = [owner = composition.value().get(),
                                          &kernel_cell_admission_port, &runtime,
-                                         reconciliation_state]() mutable {
+                                         reconciliation_state,
+                                         readiness_config]() mutable {
     std::lock_guard lock(reconciliation_state->mutex);
     auto result = reconcile_runtime_epoch_routes(
         *owner, kernel_cell_admission_port, reconciliation_state->rows);
     if (!result.ok())
       return result;
+    // Recovered routes are current again: rebuild eligibility once from the
+    // same committed facts before recovery stops holding admission closed.
+    if (!reconciliation_state->readiness_reconstructed) {
+      result = reconstruct_component_command_readiness(readiness_config, runtime);
+      if (!result.ok())
+        return result;
+      reconciliation_state->readiness_reconstructed = true;
+    }
     return runtime.addressed_kernel->SetRouteRecoveryPending(false);
   };
   runtime.stop_recovery_configuration_source =
@@ -916,7 +1233,7 @@ CreateRetainedNativeCCLCRuntime(
       const auto recovered = std::find_if(
           reconciliation_state->rows.begin(), reconciliation_state->rows.end(),
           [&](const auto &row) {
-            return row.settled &&
+            return row.settled && row.transaction_id.has_value() &&
                    row.predecessor.control_domain_id ==
                        expectation.control_domain_id &&
                    row.predecessor.active_control_configuration_id ==

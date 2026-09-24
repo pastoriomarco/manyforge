@@ -2384,7 +2384,14 @@ TEST(ManagerDaemonProcess,
     }
     SCOPED_TRACE(applied);
     EXPECT_NE(applied.find(R"("terminal_state":"succeeded")"),
-              std::string::npos);
+              std::string::npos)
+        << [&] {
+             // The daemon's own diagnostics name the failed Apply phase.
+             std::ifstream stderr_file(directory.startup_stderr());
+             const std::string text{std::istreambuf_iterator<char>(stderr_file),
+                                    std::istreambuf_iterator<char>()};
+             return text.size() > 6000U ? text.substr(text.size() - 6000U) : text;
+           }();
     EXPECT_NE(applied.find(fixture.physical_candidate_retained_bundle_id),
               std::string::npos);
     const auto execution_status = wait_execution_response();

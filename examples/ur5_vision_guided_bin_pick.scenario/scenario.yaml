@@ -8,13 +8,13 @@
   "description": "Local deployment for the vision-guided bin-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
   "members": {
     "assignment.yaml": "sha256:97a61aed742ff302a7ccf3c68eedb6b9c5e80516ef145a131db5f27b51538a60",
-    "deployment.yaml": "sha256:36df096cd6e5ed4fc7b0ebbfd9d7d82ec8a88813db8a809398a9581657d5c5df",
+    "deployment.yaml": "sha256:21b627b8dec1aec3dd6597ec2612ccca9fd5e30eee3f822ae31e5aac0265f594",
     "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
     "program.yaml": "sha256:749333803441f6c2455f5914526143992efc7beae8a4307108bd9adb1ed43b25"
   },
   "name": "ur5_roboplan_local_vision_guided_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:921fc47a9f9e7690a50c9e3676cc27dba42e0c01f2921f8f784ca2404d1ef8fc",
+    "checked_content_digest": "sha256:88d3ae6f9e0150b84766a657cb6f7f9d9fc21149564b469cae3b2edda0c7bdd5",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

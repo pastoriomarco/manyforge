@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <fstream>
 #include <iostream>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
@@ -11,7 +12,6 @@
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
-#include <manyforge_lite6_product/lifecycle_profile.hpp>
 #include <map>
 #include <memory>
 #include <optional>
@@ -289,18 +289,22 @@ int main(int argc, char **argv) {
     std::filesystem::create_directories(manager_state_root);
 
     auto materialized = [&]() {
-      if (arguments.fixture_kind == FixtureKind::kCCLCProduct ||
-          arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation) {
-        const auto arm_semantic = manyforge::lite6_product::
-            compute_lite6_lifecycle_catalog_semantic_digest();
-        const auto gripper_semantic = manyforge::lite6_product::
-            compute_lite6_gripper_lifecycle_catalog_semantic_digest();
-        if (!arm_semantic.ok() || !gripper_semantic.ok()) {
-          throw std::logic_error(
-              "native CCLC lifecycle semantic digest is unavailable");
-        }
+      if (arguments.fixture_kind != FixtureKind::kCCLCReadiness) {
+        // The native host initializes every component through CCLC with the
+        // generic native lifecycle (its only product), never the Lite6
+        // real-robot vendor catalog. Each provider anchors those plans
+        // under its own manifest ID.
+        const auto plans = core::MakeNativeControlLifecyclePlans();
+        const auto anchor = [&](std::string_view provider_id) {
+          const auto digest = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+              core::ProviderManifestId(std::string(provider_id)), plans);
+          if (!digest.ok()) {
+            throw std::logic_error("generic native lifecycle anchor is unavailable");
+          }
+          return digest.value().value();
+        };
         return deployment::test::materialize_lite6_native_cclc_product_retained_consumer_fixture(
-            package_root, arm_semantic.value().value(), gripper_semantic.value().value(),
+            package_root, anchor("lite6_arm_provider"), anchor("lite6_gripper_provider"),
             arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation);
       }
       if (arguments.fixture_kind == FixtureKind::kCCLCReadiness) {
@@ -308,9 +312,7 @@ int main(int argc, char **argv) {
             materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
                 package_root);
       }
-      return deployment::test::
-          materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
-              package_root);
+      throw std::logic_error("native execution fixture kind is unhandled");
     }();
     if (materialized.bundle == nullptr) {
       throw std::logic_error("native execution fixture has no bundle");

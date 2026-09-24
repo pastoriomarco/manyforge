@@ -100,6 +100,9 @@ struct RouteReadinessPublicationReceiptDTO final {
   ActiveControlConfigurationId active_control_configuration_id;
   ActiveControlConfigurationGeneration active_control_configuration_generation{0U};
   std::vector<RouteReadinessPublicationRowDTO> readiness_rows;
+  /// Domain route readiness: the route and its Stop readiness are coherent.
+  /// It is not component command eligibility, which the Kernel keeps
+  /// separately per component and lifecycle generation.
   bool operation_admission_open{};
   std::int64_t published_at_ns{};
   ContentDigest receipt_digest;
@@ -116,6 +119,9 @@ struct RouteReadinessPublicationReceiptDTO final {
 struct RuntimeRouteConfigurationReadbackDTO final {
   ActiveControlConfigurationDTO active_configuration;
   std::vector<RouteReadinessPublicationRowDTO> readiness_rows;
+  /// Domain route readiness: the route and its Stop readiness are coherent.
+  /// It is not component command eligibility, which the Kernel keeps
+  /// separately per component and lifecycle generation.
   bool operation_admission_open{};
 
   friend bool operator==(const RuntimeRouteConfigurationReadbackDTO&,

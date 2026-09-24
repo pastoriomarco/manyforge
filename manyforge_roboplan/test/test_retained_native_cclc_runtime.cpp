@@ -20,6 +20,7 @@
 #include <manyforge_deployment/retained_runtime_policy.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/retained_native_cclc_runtime.hpp>
+#include <manyforge_roboplan/retained_native_brand_lifecycle_port.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <stop_token>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -39,6 +41,122 @@ namespace {
 namespace component_manager = manyforge::component_manager;
 namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
+
+[[nodiscard]] std::string Sha(const char value);
+
+TEST(RetainedNativeCCLCRuntime, NativeAdapterOwnsProviderReadinessButNeverCommandPermission) {
+  using State = core::ComponentLifecycleStateDTO;
+  using Intent = core::ComponentLifecycleIntentKindDTO;
+  const core::ProviderManifestId manifest_id("manyforge.provider.native_control");
+  const core::ProviderManifestRevision manifest_revision(Sha('1'));
+  const core::LifecyclePredicateDTO active{{State::kActive}, {}};
+  const core::LifecyclePredicateDTO prepared{{State::kPrepared}, {}};
+  const core::LifecyclePredicateDTO disabled{{State::kDisabled}, {}};
+  const auto catalog = core::MakeBrandLifecyclePlanCatalog(
+      manifest_id, manifest_revision,
+      {{Intent::kPrepare, State::kPrepared, std::nullopt, prepared, 10'000,
+        {{core::LifecyclePrimitiveId("native.control.prepare"), disabled, prepared}}},
+       {Intent::kEnable, State::kActive, std::nullopt, active, 10'000,
+        {{core::LifecyclePrimitiveId("native.control.enable"), prepared, active}}},
+       {Intent::kDisable, State::kDisabled, std::nullopt, disabled, 10'000,
+        {{core::LifecyclePrimitiveId("native.control.disable"), active, disabled}}}});
+  ASSERT_TRUE(catalog.ok()) << catalog.error().message;
+  const core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
+      core::ControlDomainId("domain.1"), core::ControlDomainRevision("domain.revision.1"),
+      core::ProviderInstanceId("provider.1"), manifest_id, manifest_revision,
+      core::RuntimeUnitId("runtime.1"), core::RuntimeEpoch("epoch.1"),
+      catalog.value().catalog_digest};
+  core::FakeClock clock;
+  clock.set(100);
+  // Route readiness is observed only; the adapter has no command-gate seam.
+  bool route_open = true;
+  const auto port = RetainedNativeBrandLifecyclePort::Create(
+      occurrence, catalog.value(), clock, 1000,
+      [] { return core::Result<void>::Ok(); },
+      [&] { return core::Result<bool>::Ok(route_open); }, State::kActive);
+  ASSERT_TRUE(port.ok()) << port.error().message;
+  const core::BrandLifecycleObservationQueryDTO query{
+      core::LifecycleTransactionId("lifecycle.1"), core::LifecycleTransactionGeneration(1U),
+      core::ControllableComponentId("component.1"), occurrence.control_domain_id,
+      occurrence.control_domain_revision, occurrence.provider_instance_id,
+      occurrence.provider_manifest_id, occurrence.provider_manifest_revision,
+      occurrence.provider_runtime_unit_id, occurrence.provider_runtime_epoch};
+  const auto dispatch = [&](const char* primitive, std::uint64_t generation) {
+    const core::BrandLifecyclePrimitiveIntentDTO request{
+        query.lifecycle_transaction_id, query.lifecycle_transaction_generation,
+        query.controllable_component_id, query.control_domain_id,
+        query.control_domain_revision, query.provider_instance_id,
+        query.provider_manifest_id, query.provider_manifest_revision,
+        query.provider_runtime_unit_id, query.provider_runtime_epoch,
+        core::LifecyclePrimitiveId(primitive),
+        core::LifecyclePrimitiveAttemptId("attempt.1"), generation, 10'000};
+    return port.value()->Dispatch(request, std::stop_token{});
+  };
+
+  const auto first = port.value()->Observe(query);
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  EXPECT_EQ(first.value().observed_state, State::kActive);
+  const auto stale = dispatch("native.control.disable", 2U);
+  EXPECT_EQ(stale.dispatch_state, core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+
+  // Disable and Prepare change only the provider's readiness state; the
+  // route stays installed and its readiness is untouched.
+  const auto off = dispatch("native.control.disable", first.value().observation_generation);
+  EXPECT_EQ(off.dispatch_state, core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown);
+  EXPECT_TRUE(route_open);
+  const auto disabled_observation = port.value()->Observe(query);
+  ASSERT_TRUE(disabled_observation.ok()) << disabled_observation.error().message;
+  EXPECT_EQ(disabled_observation.value().observed_state, State::kDisabled);
+
+  const auto prepared_result = dispatch("native.control.prepare",
+                                        disabled_observation.value().observation_generation);
+  EXPECT_EQ(prepared_result.dispatch_state,
+            core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown);
+  const auto prepared_observation = port.value()->Observe(query);
+  ASSERT_TRUE(prepared_observation.ok()) << prepared_observation.error().message;
+  EXPECT_EQ(prepared_observation.value().observed_state, State::kPrepared);
+
+  // Enable requires a current native route and reports honestly otherwise.
+  route_open = false;
+  const auto refused = dispatch("native.control.enable",
+                                prepared_observation.value().observation_generation);
+  EXPECT_EQ(refused.dispatch_state, core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  EXPECT_EQ(refused.effect, core::LifecyclePrimitiveEffectDTO::kNone);
+  ASSERT_TRUE(refused.error.has_value());
+  EXPECT_EQ(refused.error->code, "native_lifecycle_route_not_current");
+  const auto still_prepared = port.value()->Observe(query);
+  ASSERT_TRUE(still_prepared.ok()) << still_prepared.error().message;
+  EXPECT_EQ(still_prepared.value().observed_state, State::kPrepared);
+
+  route_open = true;
+  const auto on =
+      dispatch("native.control.enable", still_prepared.value().observation_generation);
+  EXPECT_EQ(on.dispatch_state, core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown);
+  const auto active_observation = port.value()->Observe(query);
+  ASSERT_TRUE(active_observation.ok()) << active_observation.error().message;
+  EXPECT_EQ(active_observation.value().observed_state, State::kActive);
+
+  // An Active provider without a current route is not an observation.
+  route_open = false;
+  EXPECT_FALSE(port.value()->Observe(query).ok());
+
+  const auto strict_restart = RetainedNativeBrandLifecyclePort::Create(
+      occurrence, catalog.value(), clock, 1000,
+      [] { return core::Result<void>::Ok(); },
+      [&] { return core::Result<bool>::Ok(route_open); }, State::kActive);
+  EXPECT_FALSE(strict_restart.ok());
+  const auto recovering = RetainedNativeBrandLifecyclePort::Create(
+      occurrence, catalog.value(), clock, 1000,
+      [] { return core::Result<void>::Ok(); },
+      [&] { return core::Result<bool>::Ok(route_open); }, State::kActive, true);
+  ASSERT_TRUE(recovering.ok()) << recovering.error().message;
+  // Construction during closed route recovery is not an Active observation.
+  EXPECT_FALSE(recovering.value()->Observe(query).ok());
+  route_open = true;
+  const auto recovered = recovering.value()->Observe(query);
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  EXPECT_EQ(recovered.value().observed_state, State::kActive);
+}
 
 [[nodiscard]] std::string Sha(const char value) {
   return std::string("sha256:") + std::string(64U, value);
@@ -305,6 +423,8 @@ make_prepare_catalog(const core::ControlBindingDTO &binding) {
       {core::ComponentLifecycleStateDTO::kDeclared}, {}};
   const core::LifecyclePredicateDTO prepared{
       {core::ComponentLifecycleStateDTO::kPrepared}, {}};
+  const core::LifecyclePredicateDTO active{
+      {core::ComponentLifecycleStateDTO::kActive}, {}};
   auto result = core::MakeBrandLifecyclePlanCatalog(
       binding.provider_manifest_id, binding.provider_manifest_revision,
       {{core::ComponentLifecycleIntentKindDTO::kPrepare,
@@ -312,7 +432,13 @@ make_prepare_catalog(const core::ControlBindingDTO &binding) {
         std::nullopt,
         prepared,
         1'000'000'000LL,
-        {{core::LifecyclePrimitiveId("prepare"), declared, prepared}}}});
+        {{core::LifecyclePrimitiveId("prepare"), declared, prepared}}},
+       {core::ComponentLifecycleIntentKindDTO::kEnable,
+        core::ComponentLifecycleStateDTO::kActive,
+        std::nullopt,
+        active,
+        1'000'000'000LL,
+        {{core::LifecyclePrimitiveId("enable"), prepared, active}}}});
   if (!result.ok()) {
     throw std::runtime_error(result.error().message);
   }
@@ -347,9 +473,7 @@ public:
   [[nodiscard]] core::Result<core::BrandLifecycleObservationDTO>
   Observe(const core::BrandLifecycleObservationQueryDTO &query) override {
     const auto sequence = next_sequence_.fetch_add(1U);
-    const auto state = prepared_.load()
-                           ? core::ComponentLifecycleStateDTO::kPrepared
-                           : core::ComponentLifecycleStateDTO::kDeclared;
+    const auto state = state_.load();
     return core::Result<core::BrandLifecycleObservationDTO>::Ok(
         {query.lifecycle_transaction_id,
          query.lifecycle_transaction_generation,
@@ -373,9 +497,14 @@ public:
   [[nodiscard]] core::BrandLifecyclePrimitiveResultDTO
   Dispatch(const core::BrandLifecyclePrimitiveIntentDTO &intent,
            std::stop_token cancellation) override {
+    const bool prepare = intent.lifecycle_primitive_id ==
+                         core::LifecyclePrimitiveId("prepare");
+    const bool enable = intent.lifecycle_primitive_id ==
+                        core::LifecyclePrimitiveId("enable");
     if (cancellation.stop_requested() ||
-        intent.lifecycle_primitive_id !=
-            core::LifecyclePrimitiveId("prepare")) {
+        (!prepare && !enable) ||
+        (prepare && state_.load() != core::ComponentLifecycleStateDTO::kDeclared) ||
+        (enable && state_.load() != core::ComponentLifecycleStateDTO::kPrepared)) {
       return {intent.lifecycle_transaction_id,
               intent.lifecycle_transaction_generation,
               intent.controllable_component_id,
@@ -394,7 +523,8 @@ public:
               std::nullopt,
               core::ErrorDTO{"prepare_cancelled", "prepare was cancelled", {}}};
     }
-    prepared_.store(true);
+    state_.store(prepare ? core::ComponentLifecycleStateDTO::kPrepared
+                         : core::ComponentLifecycleStateDTO::kActive);
     dispatch_count_.fetch_add(1U);
     return {intent.lifecycle_transaction_id,
             intent.lifecycle_transaction_generation,
@@ -422,7 +552,8 @@ public:
 private:
   std::atomic<std::uint64_t> next_sequence_{1U};
   std::atomic<std::size_t> dispatch_count_{0U};
-  std::atomic<bool> prepared_{false};
+  std::atomic<core::ComponentLifecycleStateDTO> state_{
+      core::ComponentLifecycleStateDTO::kDeclared};
 };
 
 class KernelPorts final : public core::ICCLCKernelDisableHandoffPort,
@@ -1237,7 +1368,7 @@ public:
                   .resolved_stop_base_plan.deadline_budget});
     }
     auto published = kernel_->publish_runtime_route_configuration(
-        configuration, {std::move(registration)});
+        configuration, {std::move(registration)}, {});
     if (!published.ok()) {
       return published;
     }
@@ -1541,6 +1672,30 @@ TEST(RetainedNativeCCLCRuntime,
             core::ComponentLifecycleStateDTO::kPrepared);
   EXPECT_EQ(brand_port->dispatch_count(), 1U);
 
+  // This synthetic adapter fixture has no Manager Apply or native lifecycle
+  // product. Its fake provider reaches Active before route selection so the
+  // publication test can exercise the admitted-route case. Production native
+  // Enable still requires a previously installed, command-closed route.
+  auto enable = prepare;
+  enable.request_context.request_id = core::RequestId("enable.native.readiness");
+  enable.intent = core::ComponentLifecycleIntentKindDTO::kEnable;
+  enable.expected_component_lifecycle_generation =
+      lifecycle_status.value()->acceptance.component_lifecycle_generation;
+  const auto enabled = composition.value()->coordinator().SubmitLifecycle(enable);
+  ASSERT_TRUE(enabled.ok()) << enabled.error().message;
+  ASSERT_TRUE(enabled.value().acceptance.has_value());
+  EXPECT_TRUE(composition.value()->coordinator().DrainFor(std::chrono::seconds(5)));
+  const auto enabled_status = composition.value()->coordinator().LoadLifecycleStatus(
+      enabled.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(enabled_status.ok()) << enabled_status.error().message;
+  ASSERT_TRUE(enabled_status.value().has_value());
+  ASSERT_TRUE(enabled_status.value()->terminal_result.has_value());
+  EXPECT_EQ(*enabled_status.value()->terminal_result,
+            core::ComponentLifecycleTerminalResultDTO::kSucceeded);
+  EXPECT_EQ(enabled_status.value()->current_state,
+            core::ComponentLifecycleStateDTO::kActive);
+  EXPECT_EQ(brand_port->dispatch_count(), 2U);
+
   core::RouteSelectionIntentDTO route{
       {core::RequestId("route.native.readiness"), current_request_owner, "test",
        std::nullopt},
@@ -1550,8 +1705,8 @@ TEST(RetainedNativeCCLCRuntime,
       {core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
        std::nullopt, std::nullopt},
       {{runtime.component->controllable_component_id,
-        lifecycle_status.value()->acceptance.component_lifecycle_generation,
-        core::ComponentLifecycleStateDTO::kPrepared}},
+        enabled_status.value()->acceptance.component_lifecycle_generation,
+        core::ComponentLifecycleStateDTO::kActive}},
       {core::RequestTransportDTO::kInternal,
        core::RequestAssuranceDTO::kUnverified, std::nullopt},
       kernel_ports.GetAuthoringAdmission().admission_generation};
@@ -1559,13 +1714,16 @@ TEST(RetainedNativeCCLCRuntime,
       composition.value()->coordinator().SubmitRouteSelection(route);
   ASSERT_TRUE(route_result.ok()) << route_result.error().message;
   ASSERT_TRUE(route_result.value().acceptance.has_value());
-  EXPECT_TRUE(
-      composition.value()->coordinator().DrainFor(std::chrono::seconds(5)));
+  const bool route_drained =
+      composition.value()->coordinator().DrainFor(std::chrono::seconds(5));
   const auto route_status =
       composition.value()->coordinator().LoadRouteSelectionStatus(
           route_result.value().acceptance->route_selection_transaction_id);
   ASSERT_TRUE(route_status.ok()) << route_status.error().message;
   ASSERT_TRUE(route_status.value().has_value());
+  EXPECT_TRUE(route_drained)
+      << "route phase=" << static_cast<int>(route_status.value()->phase)
+      << " sequence=" << route_status.value()->status_sequence;
   ASSERT_TRUE(route_status.value()->terminal_result.has_value());
   EXPECT_EQ(*route_status.value()->terminal_result,
             core::RouteSelectionTerminalResultDTO::kSucceeded);
@@ -1591,6 +1749,26 @@ TEST(RetainedNativeCCLCRuntime,
            .resolved_stop_base_plan.resolved_stop_base_plan_id.value()
            .substr(7U) +
        ".json")));
+
+  // Route selection installed route and Stop readiness only: it never
+  // enables the component, even though CCLC recorded it Active.
+  const auto route_only =
+      publication_owner.kernel().execute(motion_operation(runtime.binding));
+  ASSERT_FALSE(route_only.ok());
+  EXPECT_EQ(route_only.error().details.at("reason"),
+            "component_command_not_eligible");
+  EXPECT_EQ(publication_owner.execute_count(), 0U);
+
+  // Publish the committed Active result as owner reconstruction would, under
+  // the Kernel's restart exclusion and at the lifecycle generation.
+  ASSERT_TRUE(publication_owner.kernel().SetRouteRecoveryPending(true).ok());
+  const auto published_readiness =
+      publication_owner.kernel().publish_component_command_readiness(
+      {core::ComponentReadinessAuthorityDTO::kRestartExclusion, std::nullopt, std::nullopt,
+       runtime.component->controllable_component_id,
+       enabled_status.value()->acceptance.component_lifecycle_generation, true});
+  ASSERT_TRUE(publication_owner.kernel().SetRouteRecoveryPending(false).ok());
+  ASSERT_TRUE(published_readiness.ok()) << published_readiness.error().message;
 
   const auto accepted =
       publication_owner.kernel().execute(motion_operation(runtime.binding));

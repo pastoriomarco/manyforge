@@ -297,6 +297,12 @@ class IResourceOperationAdmissionGate {
   /// alternative resource-state owner.
   [[nodiscard]] virtual std::vector<ResourceId> current_fenced_resources(
       const std::vector<ResourceId>& resources) const = 0;
+  /// Whether the one exact held fence covers every listed resource. Coverage
+  /// by any other fence does not count. Gates without fence identity refuse.
+  [[nodiscard]] virtual bool exact_fence_covers(const ConfigurationFenceId& /*fence_id*/,
+                                                const std::vector<ResourceId>& /*resources*/) const {
+    return false;
+  }
 };
 
 }  // namespace manyforge::core

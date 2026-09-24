@@ -232,6 +232,7 @@ def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("manual_handover_required") == 409
     assert _error_status("deployment_candidate_cell_mismatch") == 409
     assert _error_status("manual_operation_scope_stale") == 409
+    assert _error_status("program_required_component_not_active") == 409
 
 
 def test_full_native_applied_program_projection_is_accepted() -> None:

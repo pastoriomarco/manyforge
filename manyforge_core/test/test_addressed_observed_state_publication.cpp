@@ -3,7 +3,10 @@
 #include <array>
 #include <atomic>
 #include <barrier>
+#include <chrono>
+#include <future>
 #include <manyforge_core/addressed_observed_state_publication.hpp>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -11,8 +14,15 @@
 
 namespace manyforge::core {
 struct AddressedObservedStatePublicationTestAccess {
-  static std::unique_lock<std::mutex> LockContext(AddressedObservedStatePublication& publication) {
+  /// Holds the context the way a route rebind does.
+  static std::unique_lock<std::shared_mutex> LockContext(
+      AddressedObservedStatePublication& publication) {
     return std::unique_lock(publication.route_context_mutex_);
+  }
+  /// Holds the context the way an ordinary reader does.
+  static std::shared_lock<std::shared_mutex> ShareContext(
+      AddressedObservedStatePublication& publication) {
+    return std::shared_lock(publication.route_context_mutex_);
   }
 };
 namespace {
@@ -291,6 +301,58 @@ TEST(AddressedObservedStatePublicationTest,
           .ok());
   held.unlock();
   EXPECT_TRUE(publication.current_state(query, 100).ok());
+}
+
+TEST(AddressedObservedStatePublicationTest, OrdinaryReadersDoNotRefuseEachOther) {
+  AddressedObservedStatePublication publication(config(context({CoordinateKind::kAngular})));
+  const auto query = publication.query_context();
+  const std::array positions{0.1};
+  ASSERT_TRUE(publication
+                  .publish(ObservedStateSourceKind::kPredictedState, query.joint_names, positions,
+                           {}, 100, 100)
+                  .published);
+  // Another reader is inside its read. Every read kind still succeeds.
+  auto reader = AddressedObservedStatePublicationTestAccess::ShareContext(publication);
+  EXPECT_TRUE(publication.current_state(query, 100).ok());
+  EXPECT_TRUE(
+      publication.publication(query.control_binding_id, query.control_binding_revision).ok());
+  EXPECT_TRUE(
+      publication.publication_at(query.control_binding_id, query.control_binding_revision, 100)
+          .ok());
+  EXPECT_EQ(publication.query_context(), query);
+}
+
+TEST(AddressedObservedStatePublicationTest,
+     RebindWaitsForAReaderAndNeverExposesAPartialRoute) {
+  AddressedObservedStatePublication publication(config(context({CoordinateKind::kAngular})));
+  const auto original = publication.query_context();
+  const std::array position{0.1}, velocity{0.0};
+  ASSERT_TRUE(publication
+                  .publish(ObservedStateSourceKind::kPredictedState, original.joint_names, position,
+                           velocity, 100, 100)
+                  .published);
+  auto next = original;
+  next.control_route_id = ControlRouteId("successor");
+
+  auto reader = AddressedObservedStatePublicationTestAccess::ShareContext(publication);
+  auto rebind = std::async(std::launch::async, [&publication, next] {
+    return publication.rebind_route_context(next, 110);
+  });
+  // The rebind is not refused and cannot complete while the reader holds the
+  // context; the reader keeps seeing the predecessor route.
+  EXPECT_EQ(rebind.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+  const auto during = publication.current_state(original, 100);
+  ASSERT_TRUE(during.ok());
+  EXPECT_EQ(during.value().control_route_id, original.control_route_id);
+
+  reader.unlock();
+  const auto rebound = rebind.get();
+  ASSERT_TRUE(rebound.ok());
+  EXPECT_EQ(publication.query_context(), next);
+  EXPECT_FALSE(publication.current_state(original, 110).ok());
+  const auto after = publication.current_state(next, 110);
+  ASSERT_TRUE(after.ok());
+  EXPECT_EQ(after.value().control_route_id, next.control_route_id);
 }
 
 TEST(AddressedObservedStatePublicationTest,

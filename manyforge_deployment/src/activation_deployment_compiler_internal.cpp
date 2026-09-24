@@ -14,6 +14,7 @@
 #include <variant>
 
 #include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_deployment/native_domain_topology.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
@@ -70,10 +71,12 @@ constexpr std::array<std::string_view, 14U> kCellCapabilities{{
     "scene.shape.mesh",
     "scene.shape.sphere",
 }};
-constexpr std::array<std::string_view, 5U> kLifecycleCapabilities{{
+// The generic native provider's lifecycle surface: exactly the intents its
+// catalog plans. Recover is offered only for named supported conditions, and
+// the native catalog currently has none.
+constexpr std::array<std::string_view, 4U> kLifecycleCapabilities{{
     "component.lifecycle.disable", "component.lifecycle.enable",
     "component.lifecycle.observe", "component.lifecycle.prepare",
-    "component.lifecycle.recover",
 }};
 
 [[noreturn]] void fail(std::string message) {
@@ -110,12 +113,6 @@ constexpr std::array<std::string_view, 5U> kLifecycleCapabilities{{
   return *result;
 }
 
-[[nodiscard]] bool boolean(const CanonicalValue &value,
-                           std::string_view label) {
-  const auto *result = std::get_if<bool>(&value.storage());
-  if (result == nullptr) fail(std::string(label) + " must be boolean");
-  return *result;
-}
 
 [[nodiscard]] CanonicalValue object_with(const CanonicalValue &source,
                                          std::string name,
@@ -297,7 +294,6 @@ struct ComponentProjection final {
   CanonicalValue component;
   Array domains;
   Array bindings;
-  bool lifecycle{false};
 };
 
 [[nodiscard]] ComponentProjection project_component(
@@ -320,12 +316,10 @@ struct ComponentProjection final {
                                      "runtime_configuration", "configuration");
   CanonicalValue runtime_configuration = object_with(
       configuration, "motion_target_limits", motion_limits(component));
-  const auto *lifecycle_value =
-      component.configuration.find_object_member("native_lifecycle_management");
-  const bool lifecycle = lifecycle_value != nullptr && boolean(
-      *lifecycle_value, "native_lifecycle_management");
-  if (lifecycle && profile.model_family_id != "lite6_lite_gripper") {
-    fail("native lifecycle management is only qualified for Lite6");
+  if (component.configuration.find_object_member(
+          "native_lifecycle_management") != nullptr) {
+    fail("native_lifecycle_management is obsolete; native component lifecycle "
+         "is selected by the qualified provider product");
   }
 
   Array domains;
@@ -344,9 +338,7 @@ struct ComponentProjection final {
         core::CatalogRecordKind::kStopEvidencePolicy,
         target == "arm" ? "manyforge.arm_motion_controlled_stop"
                         : "manyforge.native_controller_goal_terminal");
-    const std::string provider_id = lifecycle
-        ? (target == "arm" ? "lite6_arm_provider" : "lite6_gripper_provider")
-        : "manyforge.provider.native_control";
+    const std::string provider_id = "manyforge.provider.native_control";
     const auto &provider = catalog.require(
         core::CatalogRecordKind::kProviderManifest, provider_id);
     domains.emplace_back(Object{
@@ -398,10 +390,8 @@ struct ComponentProjection final {
               {"command_endpoint_role_ids", CanonicalValue(Array{CanonicalValue("command")})},
               {"state_endpoint_role_ids", CanonicalValue(Array{CanonicalValue("state")})},
           })})},
-          {"provider_instance_id", CanonicalValue(
-              lifecycle && target == "gripper"
-                  ? component.component_id + ".native_gripper_control"
-                  : component.component_id + ".native_control")},
+          // One generic native provider serves every native domain.
+          {"provider_instance_id", CanonicalValue(component.component_id + ".native_control")},
           {"provider_runtime_unit_id", CanonicalValue(std::string(runtime_unit_id))},
           {"provider_manifest_id", CanonicalValue(provider_id)},
           {"provider_manifest_revision", CanonicalValue(revision(provider))},
@@ -451,7 +441,7 @@ struct ComponentProjection final {
           {"runtime_unit_ids", CanonicalValue(Array{CanonicalValue(std::string(runtime_unit_id))})},
           {"root_pose_in_cell", component.root_pose_in_cell},
       }),
-      std::move(domains), std::move(bindings), lifecycle};
+      std::move(domains), std::move(bindings)};
 }
 
 [[nodiscard]] const CanonicalValue &find_record(const Array &rows,
@@ -613,6 +603,12 @@ CanonicalValue compile_activation_deployment(
   const auto graph_parsed = parse_strict_json_model_yaml(canonical_json(graph));
   const auto typed = decode_cell_graph_candidate(graph_parsed);
   const auto intrinsic = validate_intrinsic_cell_graph_candidate(typed);
+  // The native provider composes one controllable component per domain;
+  // explain that limitation at compile time rather than at activation.
+  if (const auto topology = VerifySupportedNativeDomainTopology(intrinsic.graph());
+      !topology.ok()) {
+    fail(topology.error().message);
+  }
   const auto ready = prepare_cell_graph_identity(intrinsic, selected_profiles);
   const auto computed = compute_graph_revision(ready);
   const auto &computed_graph = computed.normalized_root();
@@ -624,7 +620,6 @@ CanonicalValue compile_activation_deployment(
   for (std::size_t index = 0; index < intent.components.size(); ++index) {
     const auto &component = intent.components[index];
     const auto &profile = component_profiles[index];
-    const bool lifecycle = projections[index].lifecycle;
     for (const std::string_view target : {std::string_view("arm"),
                                           std::string_view("gripper")}) {
       const std::string topology_id = std::string("manyforge.native_") +
@@ -788,10 +783,9 @@ CanonicalValue compile_activation_deployment(
         });
       }
     }
-    if (lifecycle) {
-      for (const auto capability : kLifecycleCapabilities) {
-        static_cast<void>(selector(catalog, capability));
-      }
+    // Every native component uses the generic CCLC lifecycle provider.
+    for (const auto capability : kLifecycleCapabilities) {
+      static_cast<void>(selector(catalog, capability));
     }
   }
   const auto &logical = catalog.require(core::CatalogRecordKind::kProviderManifest,

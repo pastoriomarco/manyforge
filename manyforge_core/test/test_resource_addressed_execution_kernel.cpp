@@ -1765,7 +1765,13 @@ class FakeResourceAdmissionGate final : public IResourceOperationAdmissionGate {
     return reject_reservation ? resources : std::vector<ResourceId>{};
   }
 
+  [[nodiscard]] bool exact_fence_covers(const ConfigurationFenceId& fence_id,
+                                        const std::vector<ResourceId>&) const override {
+    return reject_reservation && held_fence_id.has_value() && *held_fence_id == fence_id;
+  }
+
   bool reject_reservation{true};
+  std::optional<ConfigurationFenceId> held_fence_id;
   int reserve_calls{};
 
  private:
@@ -1909,15 +1915,40 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
 }
 
 [[nodiscard]] ControllerLifecycleExpectedDomain controller_domain_for(
-    const RuntimeParticipantBinding& participant, const ResolvedStopBasePlanDTO& plan) {
+    const RuntimeParticipantBinding& participant, const ResolvedStopBasePlanDTO& plan,
+    std::vector<RuntimeParticipantBinding> domain_members = {}) {
+  // Every binding routed in the participant's domain. A single-component
+  // domain has only the participant itself.
+  if (domain_members.empty()) domain_members.push_back(participant);
+  std::sort(domain_members.begin(), domain_members.end(), [](const auto& lhs, const auto& rhs) {
+    return lhs.value().control_path->control_binding_id <
+           rhs.value().control_path->control_binding_id;
+  });
   const auto& binding = participant.value();
   const auto& control = *binding.control_path;
-  std::vector<ControllerInterfaceInstanceDTO> interfaces;
-  interfaces.reserve(binding.resources.size());
-  for (const auto& resource : binding.resources) {
-    interfaces.push_back(ControllerInterfaceInstanceDTO{resource.resource_id, "position"});
-  }
   const ControllerRoleId controller_role("hardware");
+  std::vector<ControllerInterfaceInstanceDTO> all_interfaces;
+  std::vector<DesiredControlBindingRouteDTO> routes;
+  std::vector<ControllerLifecycleExpectedBindingDTO> binding_interfaces;
+  std::vector<ControllerLifecycleExpectedEndpointDTO> endpoint_bindings;
+  for (const auto& member : domain_members) {
+    const auto& path = *member.value().control_path;
+    std::vector<ControllerInterfaceInstanceDTO> interfaces;
+    for (const auto& resource : member.value().resources) {
+      interfaces.push_back(ControllerInterfaceInstanceDTO{resource.resource_id, "position"});
+    }
+    all_interfaces.insert(all_interfaces.end(), interfaces.begin(), interfaces.end());
+    routes.push_back({path.control_binding_id, path.control_binding_revision, path.control_route_id});
+    binding_interfaces.push_back({path.control_binding_id, path.control_binding_revision,
+                                  path.control_interface_contract_id,
+                                  path.control_interface_revision, interfaces, interfaces});
+    endpoint_bindings.push_back({path.control_binding_id, path.control_binding_revision,
+                                 path.control_route_id, EndpointRoleId("endpoint.command"),
+                                 "controller.command", true, false});
+  }
+  std::sort(all_interfaces.begin(), all_interfaces.end(), [](const auto& lhs, const auto& rhs) {
+    return lhs.resource_id < rhs.resource_id;
+  });
   ControllerLifecycleExpectedDomainDTO value{
       control.control_domain_id,
       control.control_domain_revision,
@@ -1950,21 +1981,18 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
        control.controller_topology_id,
        control.topology_revision,
        control.activation_set_id,
-       {{control.control_binding_id, control.control_binding_revision, control.control_route_id}}},
-      {{control.control_binding_id, control.control_binding_revision,
-        control.control_interface_contract_id, control.control_interface_revision, interfaces,
-        interfaces}},
+       std::move(routes)},
+      std::move(binding_interfaces),
       {{controller_role,
         ControllerImplementationId("implementation.hardware"),
         ControllerImplementationRevision(test_digest('4')),
         "controller_interface.ControllerInterface",
         ContentDigest(test_digest('5')),
-        interfaces,
-        interfaces,
+        all_interfaces,
+        all_interfaces,
         {},
         {}}},
-      {{control.control_binding_id, control.control_binding_revision, control.control_route_id,
-        EndpointRoleId("endpoint.command"), "controller.command", true, false}}};
+      std::move(endpoint_bindings)};
   auto sealed = verify_controller_lifecycle_expected_domain(std::move(value));
   if (!sealed.ok()) {
     throw std::logic_error(sealed.error().message);
@@ -1974,7 +2002,8 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
 
 [[nodiscard]] RuntimeParticipantExecutionRegistration registration(
     const RuntimeParticipantBinding& participant, IResolvedParticipantExecutionEngine& engine,
-    const bool include_controlled_fallback = false) {
+    const bool include_controlled_fallback = false,
+    std::vector<RuntimeParticipantBinding> domain_members = {}) {
   auto plan = stop_base_plan_for(participant);
   if (include_controlled_fallback) {
     auto intermediate = plan.escalation_stages.front();
@@ -1997,7 +2026,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
     if (!sealed.ok()) throw std::logic_error(sealed.error().message);
     plan = std::move(sealed.value());
   }
-  auto expected = controller_domain_for(participant, plan);
+  auto expected = controller_domain_for(participant, plan, std::move(domain_members));
   auto readiness = verify_runtime_participant_stop_readiness(
       RuntimeParticipantStopReadinessDTO{participant.value().controllable_component_id,
                                          ComponentLifecycleGeneration(1U), expected.value(), plan},
@@ -2456,6 +2485,52 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
     throw std::logic_error("test sibling route configuration is invalid");
   }
   return result;
+}
+
+/// Publish one component result under the Kernel's restart exclusion, the
+/// positive authority owner attachment holds while reconstructing facts.
+[[nodiscard]] Result<ComponentCommandReadinessDTO> publish_under_restart_exclusion(
+    ResourceAddressedExecutionKernel& kernel, const ControllableComponentId& component,
+    const ComponentLifecycleGeneration generation, const bool eligible) {
+  if (!kernel.SetRouteRecoveryPending(true).ok()) {
+    throw std::logic_error("test restart exclusion could not be held");
+  }
+  auto published = kernel.publish_component_command_readiness(
+      {ComponentReadinessAuthorityDTO::kRestartExclusion, std::nullopt, std::nullopt, component,
+       generation,
+       eligible});
+  if (!kernel.SetRouteRecoveryPending(false).ok()) {
+    throw std::logic_error("test restart exclusion could not be released");
+  }
+  return published;
+}
+
+/// Publish the component of `registered` as command-eligible at its sealed
+/// generation.
+void enable_component_commands(ResourceAddressedExecutionKernel& kernel,
+                               const RuntimeParticipantExecutionRegistration& registered) {
+  const auto& readiness = registered.stop_readiness->value();
+  const auto enabled = publish_under_restart_exclusion(
+      kernel, readiness.controllable_component_id, readiness.component_lifecycle_generation, true);
+  ASSERT_TRUE(enabled.ok()) << enabled.error().message;
+  ASSERT_TRUE(enabled.value().command_eligible);
+}
+
+/// Move `source` into `owner`'s control domain under another component: the
+/// generic graph contract allows several components in one domain.
+[[nodiscard]] RuntimeParticipantBinding in_domain_of(const RuntimeParticipantBinding& source,
+                                                     const RuntimeParticipantBinding& owner,
+                                                     std::string component) {
+  auto value = source.value();
+  value.controllable_component_id = ControllableComponentId(std::move(component));
+  value.control_path->control_domain_id = owner.value().control_path->control_domain_id;
+  value.control_path->control_domain_revision =
+      owner.value().control_path->control_domain_revision;
+  auto sealed = verify_runtime_participant_binding(std::move(value));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
 }
 
 [[nodiscard]] RuntimeParticipantBinding with_planner_capability(
@@ -5990,9 +6065,6 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto exact = kernel.capture_disable_handoff_runtime_snapshot(exact_query);
   ASSERT_TRUE(exact.ok()) << exact.error().message;
   EXPECT_EQ(exact.value().scope_resolution, DisableHandoffScopeResolutionDTO::kExact);
-  ASSERT_TRUE(exact.value().current_component_lifecycle_generation.has_value());
-  EXPECT_EQ(*exact.value().current_component_lifecycle_generation,
-            ComponentLifecycleGeneration(1U));
 
   DisableHandoffRequestDTO persisted_request{
       {RequestId("request.disable.1"), RequestOwnerEpoch("kernel.epoch.1"), "cclc", std::nullopt},
@@ -6007,7 +6079,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       ContentDigest("public-pointer-1"),
       exact.value().graph_revision,
       exact.value().retained_bundle_id,
-      *exact.value().current_component_lifecycle_generation,
+      expectation.component_lifecycle_generation,
       exact.value().operation_resource_generation,
       ConfigurationFenceGeneration(0U),
       exact.value().current_active_control_configurations};
@@ -6017,17 +6089,17 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(revalidated.value().scope_resolution, DisableHandoffScopeResolutionDTO::kExact);
 
   persisted_request.expected_component_lifecycle_generation = ComponentLifecycleGeneration(2U);
-  const auto revalidated_stale = kernel.revalidate_disable_handoff_request(persisted_request);
-  ASSERT_TRUE(revalidated_stale.ok()) << revalidated_stale.error().message;
-  EXPECT_EQ(revalidated_stale.value().scope_resolution,
-            DisableHandoffScopeResolutionDTO::kStaleButUnambiguouslyResolved);
+  const auto advanced_generation = kernel.revalidate_disable_handoff_request(persisted_request);
+  ASSERT_TRUE(advanced_generation.ok()) << advanced_generation.error().message;
+  EXPECT_EQ(advanced_generation.value().scope_resolution,
+            DisableHandoffScopeResolutionDTO::kExact);
 
   exact_query.component_expectation->component_lifecycle_generation =
       ComponentLifecycleGeneration(2U);
-  const auto stale = kernel.capture_disable_handoff_runtime_snapshot(exact_query);
-  ASSERT_TRUE(stale.ok()) << stale.error().message;
-  EXPECT_EQ(stale.value().scope_resolution,
-            DisableHandoffScopeResolutionDTO::kStaleButUnambiguouslyResolved);
+  const auto current_cclc_generation = kernel.capture_disable_handoff_runtime_snapshot(exact_query);
+  ASSERT_TRUE(current_cclc_generation.ok()) << current_cclc_generation.error().message;
+  EXPECT_EQ(current_cclc_generation.value().scope_resolution,
+            DisableHandoffScopeResolutionDTO::kExact);
 
   exact_query.controllable_component_id = ControllableComponentId("unknown.component");
   exact_query.component_expectation->component_scope.controllable_component_ids = {
@@ -15475,6 +15547,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(predecessor_engine.subscription_count(), 0U);
   EXPECT_EQ(candidate_engine.subscription_count(), 1U);
 
+  enable_component_commands(kernel, candidate_registration);
   const auto candidate = kernel.execute(candidate_motion_operation());
   ASSERT_TRUE(candidate.ok()) << candidate.error().message;
   EXPECT_EQ(predecessor_engine.execute_calls, 1);
@@ -15606,6 +15679,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       published.value().active_configuration.active_control_configuration_generation);
   ASSERT_TRUE(readback.ok()) << readback.error().message;
   EXPECT_EQ(readback.value(), published.value());
+  enable_component_commands(kernel, candidate_registration);
   const auto scale_open = kernel.get_runtime_scale_control(scale_request.selector);
   ASSERT_TRUE(scale_open.ok());
   EXPECT_FALSE(scale_open.value().frozen);
@@ -15631,6 +15705,247 @@ TEST(ResourceAddressedExecutionKernelTest,
       kernel.execute(candidate_motion_operation("request.motion.candidate.rejected"));
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "runtime_route_configuration_not_ready");
+}
+
+TEST(ResourceAddressedExecutionKernelTest, RouteReadinessNeverGrantsComponentCommandEligibility) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto registered = registration(binding, engine);
+  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, journal,
+                                          {RequestOwnerEpoch("kernel.epoch.1"),
+                                           CellId("cell.test"), 16U});
+  const auto published =
+      kernel.publish_runtime_route_configuration(route_configuration_for(registered), {registered});
+  ASSERT_TRUE(published.ok()) << published.error().message;
+  // The route and its Stop readiness are coherent, yet nothing enabled the
+  // component: route readiness alone is not command permission.
+  EXPECT_TRUE(published.value().operation_admission_open);
+  const auto blocked = kernel.execute(motion_operation("request.motion.route-only"));
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "component_command_not_eligible");
+  EXPECT_EQ(engine.execute_calls, 0);
+
+  enable_component_commands(kernel, registered);
+  const auto admitted = kernel.execute(motion_operation("request.motion.enabled"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+  EXPECT_EQ(engine.execute_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, RouteRepublicationNeitherEnablesNorClosesAComponent) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto registered = registration(binding, engine);
+  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, journal,
+                                          {RequestOwnerEpoch("kernel.epoch.1"),
+                                           CellId("cell.test"), 16U});
+  const auto configuration = route_configuration_for(registered);
+  ASSERT_TRUE(kernel.publish_runtime_route_configuration(configuration, {registered}).ok());
+  const auto component = binding.value().controllable_component_id;
+  const auto generation = registered.stop_readiness->value().component_lifecycle_generation;
+
+  // A Disabled component keeps its route: republishing it stays route-ready
+  // and still refuses commands.
+  ASSERT_TRUE(publish_under_restart_exclusion(kernel, component, generation, false).ok());
+  const auto republished = kernel.publish_runtime_route_configuration(configuration, {registered});
+  ASSERT_TRUE(republished.ok()) << republished.error().message;
+  EXPECT_TRUE(republished.value().operation_admission_open);
+  const auto disabled = kernel.execute(motion_operation("request.motion.disabled-republished"));
+  ASSERT_FALSE(disabled.ok());
+  EXPECT_EQ(disabled.error().details.at("reason"), "component_command_not_eligible");
+
+  // An enabled component is not closed by route republication either.
+  ASSERT_TRUE(publish_under_restart_exclusion(kernel, component, generation, true).ok());
+  ASSERT_TRUE(kernel.publish_runtime_route_configuration(configuration, {registered}).ok());
+  const auto enabled = kernel.execute(motion_operation("request.motion.enabled-republished"));
+  ASSERT_TRUE(enabled.ok()) << enabled.error().message;
+  EXPECT_EQ(engine.execute_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ComponentReadinessRefusesAStaleGenerationAndResealsWithoutRouteChurn) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto registered = registration(binding, engine);
+  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, journal,
+                                          {RequestOwnerEpoch("kernel.epoch.1"),
+                                           CellId("cell.test"), 16U});
+  const auto published =
+      kernel.publish_runtime_route_configuration(route_configuration_for(registered), {registered});
+  ASSERT_TRUE(published.ok()) << published.error().message;
+  const auto component = binding.value().controllable_component_id;
+
+  // A newer generation re-seals the participant with the same engine, route
+  // configuration and Stop plan; only the component generation changes.
+  const auto advanced =
+      publish_under_restart_exclusion(kernel, component, ComponentLifecycleGeneration(3U), true);
+  ASSERT_TRUE(advanced.ok()) << advanced.error().message;
+  EXPECT_EQ(advanced.value().component_lifecycle_generation, ComponentLifecycleGeneration(3U));
+  const auto route = kernel.current_runtime_route_configuration(
+      published.value().active_configuration.control_domain_id);
+  ASSERT_TRUE(route.ok() && route.value().has_value());
+  EXPECT_EQ(route.value()->active_configuration, published.value().active_configuration);
+  ASSERT_EQ(route.value()->readiness_rows.size(), 1U);
+  EXPECT_EQ(route.value()->readiness_rows.front().component_lifecycle_generation,
+            ComponentLifecycleGeneration(3U));
+  EXPECT_EQ(route.value()->readiness_rows.front().resolved_stop_base_plan_id,
+            published.value().readiness_rows.front().resolved_stop_base_plan_id);
+  const auto admitted = kernel.execute(motion_operation("request.motion.resealed"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+
+  // Composition that read older facts can never overtake a newer result.
+  const auto stale =
+      publish_under_restart_exclusion(kernel, component, ComponentLifecycleGeneration(2U), true);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"), "component_readiness_generation_stale");
+  const auto current = kernel.component_command_readiness(component);
+  ASSERT_TRUE(current.ok());
+  EXPECT_EQ(current.value().component_lifecycle_generation, ComponentLifecycleGeneration(3U));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     SharedDomainEligibilityStaysSpecificToEachComponent) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine arm_engine;
+  FakeParticipantEngine peer_engine;
+  FakeOperationJournal journal;
+  const auto arm =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto peer = in_domain_of(
+      make_binding("gripper", "gripper.target", "tool.gripper.command",
+                   CoordinateKind::kLinear, schema),
+      arm, "robot.2");
+  const auto arm_registration = registration(arm, arm_engine, false, {arm, peer});
+  const auto peer_registration = registration(peer, peer_engine, false, {arm, peer});
+  ResourceAddressedExecutionKernel kernel({arm_registration, peer_registration}, clock, scheduler,
+                                          journal,
+                                          {RequestOwnerEpoch("kernel.epoch.1"),
+                                           CellId("cell.test"), 16U});
+  const auto published = kernel.publish_runtime_route_configuration(
+      route_configuration_for(arm_registration, peer),
+      {arm_registration, peer_registration});
+  ASSERT_TRUE(published.ok()) << published.error().message;
+
+  // Enabling the peer never enables the arm's component.
+  enable_component_commands(kernel, peer_registration);
+  const auto blocked = kernel.execute(motion_operation("request.motion.peer-enabled"));
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "component_command_not_eligible");
+
+  // Closing the peer never blocks an independently enabled arm.
+  enable_component_commands(kernel, arm_registration);
+  ASSERT_TRUE(publish_under_restart_exclusion(
+                  kernel, peer.value().controllable_component_id,
+                  peer_registration.stop_readiness->value().component_lifecycle_generation, false)
+                  .ok());
+  const auto admitted = kernel.execute(motion_operation("request.motion.arm-enabled"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+  EXPECT_EQ(arm_engine.execute_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ApplyReadinessRequiresThatExactParentFenceNotAnyFence) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeResourceAdmissionGate gate;
+  gate.held_fence_id = ConfigurationFenceId("fence.parent-apply");
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto registered = registration(binding, engine);
+  ResourceAddressedExecutionKernel kernel(
+      {registered}, clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U, {}, &gate});
+  ASSERT_TRUE(kernel
+                  .publish_runtime_route_configuration(route_configuration_for(registered),
+                                                       {registered})
+                  .ok());
+  const auto component = binding.value().controllable_component_id;
+  const auto generation = registered.stop_readiness->value().component_lifecycle_generation;
+
+  // Every resource is fenced, but by a fence this publication does not own.
+  const auto foreign = kernel.publish_component_command_readiness(
+      {ComponentReadinessAuthorityDTO::kParentApplyFence, std::nullopt,
+       ConfigurationFenceId("fence.other-apply"), component, generation, true});
+  ASSERT_FALSE(foreign.ok());
+  EXPECT_EQ(foreign.error().details.at("reason"), "component_readiness_apply_fence_not_held");
+
+  const auto owned = kernel.publish_component_command_readiness(
+      {ComponentReadinessAuthorityDTO::kParentApplyFence, std::nullopt,
+       ConfigurationFenceId("fence.parent-apply"), component, generation, true});
+  ASSERT_TRUE(owned.ok()) << owned.error().message;
+  EXPECT_TRUE(owned.value().command_eligible);
+
+  // Once the parent fence is released it is no longer authority.
+  gate.reject_reservation = false;
+  const auto released = kernel.publish_component_command_readiness(
+      {ComponentReadinessAuthorityDTO::kParentApplyFence, std::nullopt,
+       ConfigurationFenceId("fence.parent-apply"), component, generation, false});
+  ASSERT_FALSE(released.ok());
+  EXPECT_EQ(released.error().details.at("reason"), "component_readiness_apply_fence_not_held");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ComponentEligibilityChangesOnlyUnderItsExactHeldLifecycleClaim) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto registered = registration(binding, engine);
+  ResourceAddressedExecutionKernel kernel({registered}, clock, scheduler, journal,
+                                          {RequestOwnerEpoch("kernel.epoch.1"),
+                                           CellId("cell.test"), 16U});
+  ASSERT_TRUE(kernel
+                  .publish_runtime_route_configuration(route_configuration_for(registered),
+                                                       {registered})
+                  .ok());
+  enable_component_commands(kernel, registered);
+  const auto component = binding.value().controllable_component_id;
+  const auto closed =
+      kernel.close_component_command_eligibility(LifecycleTransactionId("lifecycle.unheld"),
+                                                 component);
+  ASSERT_FALSE(closed.ok());
+  EXPECT_EQ(closed.error().details.at("reason"), "component_readiness_claim_not_held");
+  const auto refused = kernel.publish_component_command_readiness(
+      {ComponentReadinessAuthorityDTO::kLifecycleClaim, LifecycleTransactionId("lifecycle.unheld"),
+       std::nullopt, component, ComponentLifecycleGeneration(2U), false});
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "component_readiness_claim_not_held");
+  // Absence of another claim is not permission: composition must prove the
+  // restart exclusion or the parent Apply fence.
+  const auto unexcluded = kernel.publish_component_command_readiness(
+      {ComponentReadinessAuthorityDTO::kRestartExclusion, std::nullopt, std::nullopt, component,
+       ComponentLifecycleGeneration(2U), true});
+  ASSERT_FALSE(unexcluded.ok());
+  EXPECT_EQ(unexcluded.error().details.at("reason"),
+            "component_readiness_restart_exclusion_not_held");
+  const auto unfenced = kernel.publish_component_command_readiness(
+      {ComponentReadinessAuthorityDTO::kParentApplyFence, std::nullopt,
+       ConfigurationFenceId("fence.not-held"), component, ComponentLifecycleGeneration(2U), true});
+  ASSERT_FALSE(unfenced.ok());
+  EXPECT_EQ(unfenced.error().details.at("reason"), "component_readiness_apply_fence_not_held");
+  const auto current = kernel.component_command_readiness(component);
+  ASSERT_TRUE(current.ok());
+  EXPECT_TRUE(current.value().command_eligible);
+  EXPECT_EQ(current.value().component_lifecycle_generation, ComponentLifecycleGeneration(1U));
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -15671,6 +15986,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       kernel.publish_runtime_route_configuration(route_configuration_for(qualified), {qualified});
   ASSERT_TRUE(published.ok()) << published.error().message;
   EXPECT_TRUE(published.value().operation_admission_open);
+  enable_component_commands(kernel, qualified);
 
   const auto admitted = kernel.execute(motion_operation("request.motion.bootstrap-open"));
   ASSERT_TRUE(admitted.ok()) << admitted.error().message;

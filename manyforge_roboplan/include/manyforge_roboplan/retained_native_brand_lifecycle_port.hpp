@@ -3,16 +3,18 @@
 #include <manyforge_core/ports/ibrand_lifecycle_port.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
+#include <functional>
 #include <memory>
+#include <optional>
 
 namespace manyforge::roboplan_backend {
 
-/// Deterministic native adapter for a retained declarative lifecycle profile.
+/// Observation adapter for one constructed in-process native domain.
 ///
-/// This adapter is intentionally limited to in-process retained product
-/// fixtures. CCLC remains the sole owner of selection, retries, deadlines,
-/// reconciliation, and durable transaction truth. The adapter owns only the
-/// current normalized product observation and one-wave primitive effects.
+/// The in-process native engine is already constructed by Manager. Each
+/// observation verifies the exact engine and, for Active, current route
+/// readiness. The adapter owns provider readiness only; it never changes
+/// Kernel command eligibility, which CCLC publishes for the whole component.
 class RetainedNativeBrandLifecyclePort final
     : public core::IBrandLifecyclePort {
 public:
@@ -20,7 +22,11 @@ public:
       std::shared_ptr<RetainedNativeBrandLifecyclePort>>
   Create(core::ResolvedLifecycleProviderOccurrenceDTO provider_occurrence,
          core::BrandLifecyclePlanCatalogDTO verified_catalog,
-         core::IClock &clock, core::Duration observation_freshness_ns);
+         core::IClock &clock, core::Duration observation_freshness_ns,
+         std::function<core::Result<void>()> verify_engine,
+         std::function<core::Result<bool>()> route_ready,
+         std::optional<core::ComponentLifecycleStateDTO> retained_state,
+         bool allow_closed_active_during_route_recovery = false);
 
   [[nodiscard]] core::Result<core::BrandLifecycleObservationDTO>
   Observe(const core::BrandLifecycleObservationQueryDTO &query) override;
@@ -38,4 +44,3 @@ private:
 };
 
 } // namespace manyforge::roboplan_backend
-

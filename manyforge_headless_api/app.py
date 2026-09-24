@@ -336,6 +336,7 @@ def _error_status(code: str) -> int:
             "scene_projection_transition_in_progress",
             "program_run_admission_failed",
             "program_run_already_active",
+            "program_required_component_not_active",
             "authoring_not_ready",
             "program_run_draft_applied_mismatch",
             "deployment_candidate_compiler_busy",

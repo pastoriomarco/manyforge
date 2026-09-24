@@ -520,7 +520,9 @@ PhysicalConfigurationScope(const NativeFixture &fixture) {
           "native adapter fixture control domain is unresolved");
     }
     domains.push_back(core::ConfigurationFenceDomainScopeDTO{
-        domain_id, found->control_domain_revision,
+        // This fixture publishes a bundle without an Apply, so it has no
+        // predecessor route configuration to reconcile.
+        domain_id, std::nullopt,
         found->control_domain_revision});
   }
   std::sort(bindings.begin(), bindings.end(),

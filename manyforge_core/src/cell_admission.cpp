@@ -359,10 +359,7 @@ Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO&
     const bool scene = intent.claim_kind == CellAdmissionClaimKindDTO::kAuthoredScene &&
                        (evidence.owner_api == "scene.transaction" ||
                         evidence.owner_api == "scene.carried_attachment");
-    const bool lifecycle =
-        intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle &&
-        (evidence.owner_api == "cclc.lifecycle" || evidence.owner_api == "cclc.control_route");
-    if ((!scene && !lifecycle) || intent.program_cycle_evidence.has_value() ||
+    if (!scene || intent.program_cycle_evidence.has_value() ||
         intent.intervention_evidence.has_value() || !evidence.locally_valid()) {
       return Invalid<void>("program_node_evidence_invalid");
     }

@@ -109,12 +109,17 @@ struct RetainedNativeBrandLifecyclePort::State final {
   State(core::ResolvedLifecycleProviderOccurrenceDTO occurrence_in,
         core::BrandLifecyclePlanCatalogDTO catalog_in,
         core::IClock &clock_in, const core::Duration freshness_ns_in,
-        std::vector<core::LifecycleFactDTO> facts_in)
+        std::vector<core::LifecycleFactDTO> facts_in,
+        core::ComponentLifecycleStateDTO observed_state_in,
+        std::function<core::Result<void>()> verify_engine_in,
+        std::function<core::Result<bool>()> route_ready_in)
       : occurrence(std::move(occurrence_in)),
         catalog(std::move(catalog_in)), clock(&clock_in),
         freshness_ns(freshness_ns_in),
-        observed_state(core::ComponentLifecycleStateDTO::kDeclared),
-        facts(std::move(facts_in)) {}
+        observed_state(observed_state_in),
+        facts(std::move(facts_in)),
+        verify_engine(std::move(verify_engine_in)),
+        route_ready(std::move(route_ready_in)) {}
 
   core::ResolvedLifecycleProviderOccurrenceDTO occurrence;
   core::BrandLifecyclePlanCatalogDTO catalog;
@@ -122,6 +127,8 @@ struct RetainedNativeBrandLifecyclePort::State final {
   core::Duration freshness_ns;
   core::ComponentLifecycleStateDTO observed_state;
   std::vector<core::LifecycleFactDTO> facts;
+  std::function<core::Result<void>()> verify_engine;
+  std::function<core::Result<bool>()> route_ready;
   std::uint64_t source_sequence{1U};
   std::uint64_t observation_generation{1U};
   std::mutex mutex;
@@ -135,7 +142,11 @@ core::Result<std::shared_ptr<RetainedNativeBrandLifecyclePort>>
 RetainedNativeBrandLifecyclePort::Create(
     core::ResolvedLifecycleProviderOccurrenceDTO provider_occurrence,
     core::BrandLifecyclePlanCatalogDTO verified_catalog, core::IClock &clock,
-    const core::Duration observation_freshness_ns) {
+    const core::Duration observation_freshness_ns,
+    std::function<core::Result<void>()> verify_engine,
+    std::function<core::Result<bool>()> route_ready,
+    const std::optional<core::ComponentLifecycleStateDTO> retained_state,
+    bool allow_closed_active_during_route_recovery) {
   const auto verified =
       core::VerifyBrandLifecyclePlanCatalog(verified_catalog);
   if (!provider_occurrence.locally_valid() || !verified.ok() ||
@@ -146,6 +157,7 @@ RetainedNativeBrandLifecyclePort::Create(
       verified_catalog.catalog_digest !=
           provider_occurrence.lifecycle_plan_catalog_digest ||
       observation_freshness_ns <= 0 ||
+      !verify_engine || !route_ready ||
       observation_freshness_ns >
           core::kMaxLifecycleTransactionTimeoutNs) {
     return core::Result<
@@ -156,40 +168,59 @@ RetainedNativeBrandLifecyclePort::Create(
                    "profile_or_occurrence_invalid"));
   }
 
+  const auto engine = verify_engine();
+  if (!engine.ok()) {
+    return core::Result<
+        std::shared_ptr<RetainedNativeBrandLifecyclePort>>::Err(
+        engine.error());
+  }
+  const auto ready = route_ready();
+  if (!ready.ok()) {
+    return core::Result<
+        std::shared_ptr<RetainedNativeBrandLifecyclePort>>::Err(
+        ready.error());
+  }
+  // Without a retained CCLC fact the constructed engine is only Prepared:
+  // route readiness never implies that a component was enabled.
+  const auto initial_state =
+      retained_state.value_or(core::ComponentLifecycleStateDTO::kPrepared);
+  const bool closed_active_recovery = allow_closed_active_during_route_recovery &&
+      initial_state == core::ComponentLifecycleStateDTO::kActive && !ready.value();
+  if (!closed_active_recovery &&
+      initial_state == core::ComponentLifecycleStateDTO::kActive && !ready.value()) {
+    return core::Result<
+        std::shared_ptr<RetainedNativeBrandLifecyclePort>>::Err(
+        port_error("native_brand_lifecycle_retained_state_mismatch",
+                   "a retained Active component has no current native route",
+                   "retained_active_route_not_ready"));
+  }
   const core::LifecyclePredicateDTO *initial = nullptr;
   for (const auto &plan : verified_catalog.plans) {
-    for (const auto &transition : plan.transitions) {
-      if (!std::binary_search(
-              transition.eligibility_predicate.allowed_states.begin(),
-              transition.eligibility_predicate.allowed_states.end(),
-              core::ComponentLifecycleStateDTO::kDeclared)) {
-        continue;
-      }
-      if (initial != nullptr && *initial != transition.eligibility_predicate) {
+    if (plan.requested_state == initial_state) {
+      if (initial != nullptr && *initial != plan.requested_postcondition) {
         return core::Result<
             std::shared_ptr<RetainedNativeBrandLifecyclePort>>::Err(
             port_error("native_brand_lifecycle_initial_state_ambiguous",
-                       "the retained lifecycle profile has multiple declared "
-                       "initial predicates",
-                       "initial_predicate_ambiguous"));
+                       "the retained lifecycle profile has multiple actual "
+                       "initial predicates", "initial_predicate_ambiguous"));
       }
-      initial = &transition.eligibility_predicate;
+      initial = &plan.requested_postcondition;
     }
   }
   if (initial == nullptr) {
     return core::Result<
         std::shared_ptr<RetainedNativeBrandLifecyclePort>>::Err(
         port_error("native_brand_lifecycle_initial_state_missing",
-                   "the retained lifecycle profile has no declared initial "
+                   "the retained lifecycle profile has no actual initial "
                    "predicate",
                    "initial_predicate_missing"));
   }
   auto facts = predicate_facts(*initial);
-  augment_unambiguous_next_facts(
-      verified_catalog, core::ComponentLifecycleStateDTO::kDeclared, facts);
+  augment_unambiguous_next_facts(verified_catalog, initial_state, facts);
   auto state = std::make_shared<State>(
       std::move(provider_occurrence), std::move(verified_catalog), clock,
-      observation_freshness_ns, std::move(facts));
+      observation_freshness_ns, std::move(facts), initial_state,
+      std::move(verify_engine), std::move(route_ready));
   return core::Result<
       std::shared_ptr<RetainedNativeBrandLifecyclePort>>::Ok(
       std::shared_ptr<RetainedNativeBrandLifecyclePort>(
@@ -200,6 +231,25 @@ core::Result<core::BrandLifecycleObservationDTO>
 RetainedNativeBrandLifecyclePort::Observe(
     const core::BrandLifecycleObservationQueryDTO &query) {
   std::lock_guard<std::mutex> lock(state_->mutex);
+  const auto engine = state_->verify_engine();
+  if (!engine.ok()) {
+    return core::Result<core::BrandLifecycleObservationDTO>::Err(
+        engine.error());
+  }
+  const auto route = state_->route_ready();
+  if (!route.ok()) {
+    return core::Result<core::BrandLifecycleObservationDTO>::Err(
+        route.error());
+  }
+  // Active native readiness requires a current route. Command eligibility
+  // is the Kernel's separate fact and is not observed here.
+  if (state_->observed_state == core::ComponentLifecycleStateDTO::kActive &&
+      !route.value()) {
+    return core::Result<core::BrandLifecycleObservationDTO>::Err(port_error(
+        "native_brand_lifecycle_route_state_changed",
+        "an Active native provider no longer has a current route",
+        "active_route_not_ready"));
+  }
   const auto now = state_->clock->now();
   if (!query.locally_valid() || !exact_occurrence(state_->occurrence, query) ||
       now < 0 || now > std::numeric_limits<core::TimePoint>::max() -
@@ -261,6 +311,12 @@ RetainedNativeBrandLifecyclePort::Dispatch(
   };
 
   std::lock_guard<std::mutex> lock(state_->mutex);
+  const auto engine = state_->verify_engine();
+  if (!engine.ok()) {
+    return result(core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched,
+                  core::LifecyclePrimitiveEffectDTO::kNone, std::nullopt,
+                  engine.error());
+  }
   if (!intent.locally_valid() ||
       !exact_occurrence(state_->occurrence, intent) ||
       cancellation.stop_requested() ||
@@ -275,99 +331,62 @@ RetainedNativeBrandLifecyclePort::Dispatch(
                        ? "cancelled"
                        : "intent_or_observation_generation_invalid"));
   }
-
-  core::BrandLifecycleObservationDTO observation{
-      intent.lifecycle_transaction_id,
-      intent.lifecycle_transaction_generation,
-      intent.controllable_component_id,
-      intent.control_domain_id,
-      intent.control_domain_revision,
-      intent.provider_instance_id,
-      intent.provider_manifest_id,
-      intent.provider_manifest_revision,
-      intent.provider_runtime_unit_id,
-      intent.provider_runtime_epoch,
-      state_->source_sequence,
-      state_->observation_generation,
-      0,
-      0,
-      1,
-      state_->observed_state,
-      state_->facts};
-  const core::LifecyclePrimitiveTransitionDTO *selected = nullptr;
-  for (const auto &plan : state_->catalog.plans) {
-    for (const auto &transition : plan.transitions) {
-      if (transition.lifecycle_primitive_id != intent.lifecycle_primitive_id ||
-          core::EvaluateLifecyclePredicate(transition.eligibility_predicate,
-                                           observation) !=
-              core::LifecyclePostconditionResultDTO::kSatisfied) {
-        continue;
-      }
-      if (selected != nullptr) {
-        return result(
-            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched,
-            core::LifecyclePrimitiveEffectDTO::kNone, std::nullopt,
-            port_error("native_brand_lifecycle_primitive_ambiguous",
-                       "the lifecycle primitive resolves to multiple current "
-                       "transitions",
-                       "primitive_transition_ambiguous"));
-      }
-      selected = &transition;
+  const auto target = [&]() -> std::optional<core::ComponentLifecycleStateDTO> {
+    if (intent.lifecycle_primitive_id ==
+        core::LifecyclePrimitiveId("native.control.prepare")) {
+      return core::ComponentLifecycleStateDTO::kPrepared;
+    }
+    if (intent.lifecycle_primitive_id ==
+        core::LifecyclePrimitiveId("native.control.enable")) {
+      return core::ComponentLifecycleStateDTO::kActive;
+    }
+    if (intent.lifecycle_primitive_id ==
+        core::LifecyclePrimitiveId("native.control.disable")) {
+      return core::ComponentLifecycleStateDTO::kDisabled;
+    }
+    return std::nullopt;
+  }();
+  const auto plan = std::find_if(state_->catalog.plans.begin(),
+                                 state_->catalog.plans.end(),
+                                 [&](const auto& candidate) {
+    return target && candidate.requested_state == *target &&
+           candidate.transitions.size() == 1U &&
+           candidate.transitions.front().lifecycle_primitive_id ==
+               intent.lifecycle_primitive_id;
+  });
+  if (plan == state_->catalog.plans.end() ||
+      !std::binary_search(
+          plan->transitions.front().eligibility_predicate.allowed_states.begin(),
+          plan->transitions.front().eligibility_predicate.allowed_states.end(),
+          state_->observed_state)) {
+    return result(core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched,
+                  core::LifecyclePrimitiveEffectDTO::kNone, std::nullopt,
+                  port_error("native_brand_lifecycle_transition_ineligible",
+                             "native lifecycle transition is not eligible from current state",
+                             "state_or_primitive_mismatch"));
+  }
+  // The native provider's readiness is its constructed engine (verified
+  // above) and, for Active, its current routes. Command eligibility is not
+  // changed here: CCLC publishes the complete component result to the
+  // Kernel only after every domain's postcondition holds.
+  if (*target == core::ComponentLifecycleStateDTO::kActive) {
+    const auto ready = state_->route_ready();
+    if (!ready.ok()) {
+      return result(core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched,
+                    core::LifecyclePrimitiveEffectDTO::kNone, std::nullopt,
+                    ready.error());
+    }
+    if (!ready.value()) {
+      return result(core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched,
+                    core::LifecyclePrimitiveEffectDTO::kNone, std::nullopt,
+                    port_error("native_lifecycle_route_not_current",
+                               "Enable requires a current native route",
+                               "route_not_current"));
     }
   }
-  std::optional<core::ComponentLifecycleStateDTO> next_state;
-  if (selected != nullptr) {
-    const auto &allowed = selected->postcondition_predicate.allowed_states;
-    if (allowed.size() == 1U) {
-      next_state = allowed.front();
-    } else if (std::find(allowed.begin(), allowed.end(),
-                         state_->observed_state) != allowed.end()) {
-      next_state = state_->observed_state;
-    } else {
-      // This deterministic simulator does not invent a new hardware fault.
-      // A catalog may permit nominal or faulted feedback for the same command;
-      // select only a unique nominal outcome, never an arbitrary first state.
-      for (const auto candidate : allowed) {
-        if (candidate == core::ComponentLifecycleStateDTO::kFaulted)
-          continue;
-        if (next_state.has_value()) {
-          next_state.reset();
-          break;
-        }
-        next_state = candidate;
-      }
-    }
-  }
-  if (!next_state.has_value() ||
-      state_->observation_generation ==
-          std::numeric_limits<std::uint64_t>::max()) {
-    return result(
-        core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched,
-        core::LifecyclePrimitiveEffectDTO::kNone, std::nullopt,
-        port_error("native_brand_lifecycle_primitive_ineligible",
-                   "the lifecycle primitive has no sole eligible transition",
-                   "primitive_not_eligible"));
-  }
-
-  state_->observed_state = *next_state;
-  // Simulated primitives change their declared facts, not unrelated feedback
-  // (for example, disabling motion must not erase the known fault status).
-  for (const auto &fact : predicate_facts(selected->postcondition_predicate)) {
-    const auto existing = std::lower_bound(
-        state_->facts.begin(), state_->facts.end(), fact.lifecycle_fact_id,
-        [](const core::LifecycleFactDTO &candidate,
-           const core::LifecycleFactId &id) {
-          return candidate.lifecycle_fact_id < id;
-        });
-    if (existing != state_->facts.end() &&
-        existing->lifecycle_fact_id == fact.lifecycle_fact_id) {
-      *existing = fact;
-    } else {
-      state_->facts.insert(existing, fact);
-    }
-  }
-  augment_unambiguous_next_facts(state_->catalog, state_->observed_state,
-                                 state_->facts);
+  state_->observed_state = *target;
+  state_->facts = predicate_facts(plan->requested_postcondition);
+  augment_unambiguous_next_facts(state_->catalog, *target, state_->facts);
   ++state_->observation_generation;
   return result(core::LifecyclePrimitiveDispatchStateDTO::kDispatchedKnown,
                 core::LifecyclePrimitiveEffectDTO::kObserved,

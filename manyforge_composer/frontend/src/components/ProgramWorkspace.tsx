@@ -344,10 +344,30 @@ export function ProgramWorkspace({
     setPaletteWidth((current) => clamp(current, PROGRAM_TOOL_MIN, paletteWidthMax));
   }, [paletteWidthMax]);
 
-  // Workspace command results, failures and authoring availability belong to
-  // the workbench notification rows; this rail keeps only canvas-gesture
-  // feedback that is meaningful beside the canvas.
-  const canvasNotices = notices;
+  // Workspace command results and failures belong to the workbench
+  // notification rows. Authoring availability is a status of this editor, so
+  // it stays beside the canvas as a fixed, non-dismissible line.
+  const canvasNotices = useMemo(() => {
+    const statusNotices: ProgramNotice[] = [];
+    if (runtime.active) {
+      statusNotices.push({
+        id: 'program-runtime-active',
+        key: 'program-runtime-active',
+        kind: 'info',
+        message: 'Run active. Draft inspection remains available; authoring waits for Idle.',
+        dismissible: false,
+      });
+    } else if (workspace !== null && !mutationAvailable) {
+      statusNotices.push({
+        id: 'program-authoring-unavailable',
+        key: 'program-authoring-unavailable',
+        kind: 'info',
+        message: `Authoring unavailable. ${mutationUnavailableReason}`,
+        dismissible: false,
+      });
+    }
+    return [...statusNotices, ...notices];
+  }, [mutationAvailable, mutationUnavailableReason, notices, runtime.active, workspace]);
 
   const gridClassName = [
     'program-authoring-grid',

@@ -3554,6 +3554,18 @@ def _validate_program_tree(
     try:
         entry = context.catalog.get(node_id)
     except KeyError:
+        if node_id in {
+            "controller.select_route",
+            "lifecycle.prepare_component",
+            "lifecycle.enable_component",
+            "lifecycle.disable_component",
+            "lifecycle.recover_component",
+        }:
+            _program_error(
+                f"{path}.node_id",
+                "is an unsupported lifecycle Program node; use the explicit "
+                "idle-time component-management API",
+            )
         _program_error(f"{path}.node_id", "is absent from the active v2 catalog")
     if entry.min_program_profile != _PROGRAM_PROFILE:
         _program_error(path, "requires an unsupported Program profile")

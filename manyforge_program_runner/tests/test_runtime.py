@@ -142,6 +142,7 @@ class _Headless:
     def __init__(self) -> None:
         self.applied_reads = 0
         self.registered_captures: list[dict[str, Any]] = []
+        self.cclc_reads: list[str] = []
 
     def program_applied(self) -> dict[str, Any]:
         self.applied_reads += 1
@@ -149,10 +150,27 @@ class _Headless:
             "scenario_id": "cell-pick",
             "source_document_digest": _DIGEST_A,
             "program_revision": _DIGEST_A,
+            "retained_bundle_id": _DIGEST_A,
+            "graph_revision": _DIGEST_B,
+            "program_binding": {
+                "component_role_bindings": [
+                    {"controllable_component_id": "robot.1"}
+                ]
+            },
             "source": {
                 "record_digest": _DIGEST_B,
                 "source_generation": 1,
             },
+        }
+
+    def cclc_component(self, component_id: str) -> dict[str, Any]:
+        assert component_id == "robot.1"
+        self.cclc_reads.append(component_id)
+        return {
+            "controllable_component_id": component_id,
+            "retained_bundle_id": _DIGEST_A,
+            "graph_revision": _DIGEST_B,
+            "component_lifecycle_state": "active",
         }
 
     def identity(self) -> dict[str, Any]:
@@ -161,8 +179,8 @@ class _Headless:
             "identity": {
                 "owner_epoch": "execution.epoch.1",
                 "program_binding_id": None,
-                "retained_bundle_id": None,
-                "graph_revision": None,
+                "retained_bundle_id": _DIGEST_A,
+                "graph_revision": _DIGEST_B,
                 "active_publication_generation": 1,
                 "scene_revision": {"revision_id": 1},
             },
@@ -190,6 +208,113 @@ class _Headless:
             raise AssertionError(f"unexpected effectful headless call: {name}")
 
         return unexpected
+
+
+def test_program_component_readiness_uses_exact_cclc_state() -> None:
+    class ComponentHeadless:
+        def __init__(self) -> None:
+            self.state = "disabled"
+            self.graph = _DIGEST_B
+            self.reads: list[str] = []
+
+        def cclc_component(self, component_id: str) -> dict[str, Any]:
+            self.reads.append(component_id)
+            return {
+                "controllable_component_id": component_id,
+                "retained_bundle_id": _DIGEST_A,
+                "graph_revision": self.graph,
+                "component_lifecycle_state": self.state,
+            }
+
+    headless = ComponentHeadless()
+    runtime = ProgramRuntime.__new__(ProgramRuntime)
+    runtime._headless = headless  # type: ignore[assignment]
+    applied = {
+        "retained_bundle_id": _DIGEST_A,
+        "graph_revision": _DIGEST_B,
+        "program_binding": {
+            "component_role_bindings": [
+                {"controllable_component_id": "robot.1"},
+                {"controllable_component_id": "robot.1"},
+            ]
+        },
+    }
+    with pytest.raises(ProgramRunnerError) as disabled:
+        runtime._verify_required_components_active(applied)
+    assert disabled.value.code == "program_required_component_not_active"
+    assert "robot.1" in str(disabled.value)
+    assert headless.reads == ["robot.1"]
+
+    headless.state = "active"
+    headless.graph = _DIGEST_A
+    with pytest.raises(ProgramRunnerError) as stale:
+        runtime._verify_required_components_active(applied)
+    assert stale.value.code == "program_required_component_stale"
+
+    headless.graph = _DIGEST_B
+    runtime._verify_required_components_active(applied)
+    assert headless.reads == ["robot.1", "robot.1", "robot.1"]
+
+
+def test_program_component_readiness_does_not_block_an_unbound_peer() -> None:
+    class Components:
+        def cclc_component(self, component_id: str) -> dict[str, Any]:
+            assert component_id == "robot.enabled"
+            return {
+                "controllable_component_id": component_id,
+                "retained_bundle_id": _DIGEST_A,
+                "graph_revision": _DIGEST_B,
+                "component_lifecycle_state": "active",
+            }
+
+    runtime = ProgramRuntime.__new__(ProgramRuntime)
+    runtime._headless = Components()  # type: ignore[assignment]
+    runtime._verify_required_components_active(
+        {
+            "retained_bundle_id": _DIGEST_A,
+            "graph_revision": _DIGEST_B,
+            "program_binding": {
+                "component_role_bindings": [
+                    {"controllable_component_id": "robot.enabled"}
+                ]
+            },
+        }
+    )
+
+
+def test_disabled_required_component_rejects_program_before_claim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    class DisabledHeadless(_Headless):
+        def cclc_component(self, component_id: str) -> dict[str, Any]:
+            return {
+                **super().cclc_component(component_id),
+                "component_lifecycle_state": "disabled",
+            }
+
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: object(),
+    )
+    headless = DisabledHeadless()
+    admission = _Admission()
+    journal = ProgramCycleJournal(
+        tmp_path / "cycle.sqlite3", owner_epoch="runner.1"
+    )
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
+        headless_client=headless,  # type: ignore[arg-type]
+        execution_transport=headless,  # type: ignore[arg-type]
+        admission_client=admission,  # type: ignore[arg-type]
+        cycle_journal=journal,
+    )
+    runtime.start()
+    with pytest.raises(ProgramRunnerError) as refused:
+        runtime.start_run(_start_request())
+    assert refused.value.code == "program_required_component_not_active"
+    assert admission.claims == []
+    assert journal.read().state == "idle_after_reset"
+    runtime.shutdown()
 
 
 class _Snapshot:
@@ -2344,10 +2469,10 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
 ) -> None:
     headless = _Headless()
     admitted = object()
-    joins: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    joins: list[dict[str, Any]] = []
 
-    def join(applied: dict[str, Any], live: dict[str, Any], **_kwargs: object):
-        joins.append((deepcopy(applied), deepcopy(live)))
+    def join(applied: dict[str, Any], **_kwargs: object):
+        joins.append(deepcopy(applied))
         return admitted
 
     monkeypatch.setattr(
@@ -2413,6 +2538,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     assert host.start_admissions == [admitted]
     assert host.scheduled == [started["capture"]["program_run_id"]]
     assert headless.applied_reads == 2
+    assert headless.cclc_reads == ["robot.1", "robot.1"]
     assert len(joins) == 1
     assert len(headless.registered_captures) == 1
     assert "table" not in headless.registered_captures[0]
@@ -5333,7 +5459,6 @@ def test_node_availability_marks_only_native_ports_unavailable_without_owner(
             ("program_execution_owner_unavailable",),
         )
     assert availability["scene_transactions"] == AvailabilityFact(True)
-    assert availability["cclc_lifecycle"] == AvailabilityFact(True)
     runtime.shutdown()
 
 

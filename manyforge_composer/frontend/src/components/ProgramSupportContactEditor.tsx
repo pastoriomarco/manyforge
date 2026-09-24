@@ -161,13 +161,16 @@ export function ProgramSupportContactEditor({
   program,
   draftRevision,
   busy,
+  busyReason = null,
   mutate,
 }: {
   program: ProgramAuthoringDocument;
   draftRevision: number;
   busy: boolean;
+  busyReason?: string | null;
   mutate: ProgramWorkspaceController['mutate'];
 }) {
+  const blockedTitle = busy ? busyReason ?? undefined : undefined;
   const objectIds = useMemo(
     () => (program.scene ?? []).map((row) => row.scene_resource_id).sort(),
     [program.scene],
@@ -261,6 +264,7 @@ export function ProgramSupportContactEditor({
               <select
                 value={draft.supportedObjectId}
                 disabled={busy || selected !== null}
+                title={blockedTitle}
                 onChange={(event) => {
                   const supportedObjectId = event.currentTarget.value;
                   update({
@@ -280,6 +284,7 @@ export function ProgramSupportContactEditor({
               <select
                 value={draft.supportObjectId}
                 disabled={busy}
+                title={blockedTitle}
                 onChange={(event) => update(
                   { ...draft, supportObjectId: event.currentTarget.value },
                   selected !== null,
@@ -295,6 +300,7 @@ export function ProgramSupportContactEditor({
             <select
               value={draft.modality}
               disabled={busy}
+              title={blockedTitle}
               onChange={(event) => update(
                 {
                   ...draft,
@@ -314,6 +320,7 @@ export function ProgramSupportContactEditor({
               label="Limit starting penetration"
               value={draft.enforceMaxStart}
               busy={busy}
+              blockedTitle={blockedTitle}
               onChange={(value) => update(
                 { ...draft, enforceMaxStart: value },
                 selected !== null,
@@ -324,6 +331,7 @@ export function ProgramSupportContactEditor({
                 label="Maximum starting penetration (m)"
                 value={draft.maxStartPenetrationM}
                 busy={busy}
+                blockedTitle={blockedTitle}
                 onChange={(value) => update({ ...draft, maxStartPenetrationM: value })}
                 onCommit={() => selected !== null && replace(draft)}
               />
@@ -333,6 +341,7 @@ export function ProgramSupportContactEditor({
                 label="Release tolerance (m)"
                 value={draft.releaseToleranceM}
                 busy={busy}
+                blockedTitle={blockedTitle}
                 onChange={(value) => update({ ...draft, releaseToleranceM: value })}
                 onCommit={() => selected !== null && replace(draft)}
               />
@@ -340,6 +349,7 @@ export function ProgramSupportContactEditor({
                 label="Minimum release progress (m)"
                 value={draft.minReleaseProgressM}
                 busy={busy}
+                blockedTitle={blockedTitle}
                 onChange={(value) => update({ ...draft, minReleaseProgressM: value })}
                 onCommit={() => selected !== null && replace(draft)}
               />
@@ -350,6 +360,7 @@ export function ProgramSupportContactEditor({
               label="Maximum contact penetration (m)"
               value={draft.maxContactPenetrationM}
               busy={busy}
+              blockedTitle={blockedTitle}
               onChange={(value) => update({ ...draft, maxContactPenetrationM: value })}
               onCommit={() => selected !== null && replace(draft)}
             />
@@ -361,6 +372,7 @@ export function ProgramSupportContactEditor({
                 label="Require separation by end"
                 value={draft.requireSeparationByEnd}
                 busy={busy}
+                blockedTitle={blockedTitle}
                 onChange={(value) => update(
                   { ...draft, requireSeparationByEnd: value },
                   selected !== null,
@@ -371,6 +383,7 @@ export function ProgramSupportContactEditor({
                   label="Require decreasing penetration"
                   value={draft.requireDecreasingPenetration}
                   busy={busy}
+                  blockedTitle={blockedTitle}
                   onChange={(value) => update(
                     { ...draft, requireDecreasingPenetration: value },
                     selected !== null,
@@ -381,6 +394,7 @@ export function ProgramSupportContactEditor({
                 label="Allow re-contact"
                 value={draft.allowRecontact}
                 busy={busy}
+                blockedTitle={blockedTitle}
                 onChange={(value) => update(
                   { ...draft, allowRecontact: value },
                   selected !== null,
@@ -393,6 +407,7 @@ export function ProgramSupportContactEditor({
               <button
                 type="button"
                 disabled={busy || !valid(draft)}
+                title={blockedTitle}
                 onClick={() => replace(draft)}
               >Add support contact</button>
             ) : (
@@ -400,6 +415,7 @@ export function ProgramSupportContactEditor({
                 type="button"
                 className="danger-button"
                 disabled={busy}
+                title={blockedTitle}
                 onClick={() => replace(draft, true)}
               >Remove support contact</button>
             )}
@@ -414,12 +430,14 @@ function SupportNumber({
   label,
   value,
   busy,
+  blockedTitle,
   onChange,
   onCommit,
 }: {
   label: string;
   value: number;
   busy: boolean;
+  blockedTitle?: string;
   onChange: (value: number) => void;
   onCommit: () => void;
 }) {
@@ -432,6 +450,7 @@ function SupportNumber({
         step="any"
         value={Number.isFinite(value) ? value : ''}
         disabled={busy}
+        title={blockedTitle}
         onChange={(event) => onChange(event.currentTarget.valueAsNumber)}
         onBlur={onCommit}
         onKeyDown={(event) => {
@@ -446,11 +465,13 @@ function SupportCheck({
   label,
   value,
   busy,
+  blockedTitle,
   onChange,
 }: {
   label: string;
   value: boolean;
   busy: boolean;
+  blockedTitle?: string;
   onChange: (value: boolean) => void;
 }) {
   return (
@@ -459,6 +480,7 @@ function SupportCheck({
         type="checkbox"
         checked={value}
         disabled={busy}
+        title={blockedTitle}
         onChange={(event) => onChange(event.currentTarget.checked)}
       />
       <span>{label}</span>

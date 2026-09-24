@@ -1080,16 +1080,11 @@ TEST(RouteSelectionCoordinator, RetainsPublicationFailureWithoutFloodingAndClear
                                             scheduler, nullptr, route_services);
   ASSERT_TRUE(coordinator.Start().ok());
   auto intent = Intent(coordinator.request_owner_epoch());
-  intent.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{RequestOwnerEpoch("runner.1"),
-                                                                 ProgramRunId("run.1"),
-                                                                 CellAdmissionClaimGeneration(7U),
-                                                                 "route",
-                                                                 "route.1",
-                                                                 "cclc.control_route"};
   disable_port.RejectNextClaim(
-      {"invalid_state_transition",
-       "Not started — held by Stop",
-       {{"reason", "program_node_stop_fence_active"}, {"selection_revision", "9"}}});
+      {"authoring_not_ready",
+       "Not started — the cell is not idle",
+       {{"reason", "component_lifecycle_program_not_idle_after_reset"},
+        {"selection_revision", "9"}}});
   const auto stopped = coordinator.SubmitRouteSelection(intent);
   ASSERT_FALSE(stopped.ok());
   EXPECT_EQ(stopped.error().details.at("effect"), "not_started");
@@ -1101,7 +1096,6 @@ TEST(RouteSelectionCoordinator, RetainsPublicationFailureWithoutFloodingAndClear
   ASSERT_TRUE(rejected.ok() && rejected.value() && rejected.value()->rejection);
   EXPECT_EQ(rejected.value()->rejection, stopped.error());
   intent.request_context.request_id = RequestId("route.after-stop");
-  intent.program_node_evidence->node_attempt_id = "route.2";
   disable_port.LoseNextReleaseReply();
   const auto accepted = coordinator.SubmitRouteSelection(intent);
   ASSERT_TRUE(accepted.ok());

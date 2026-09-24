@@ -791,6 +791,20 @@ ManagedKernelAdmissionGate::current_fenced_resources(
   return result;
 }
 
+bool ManagedKernelAdmissionGate::exact_fence_covers(
+    const core::ConfigurationFenceId &fence_id,
+    const std::vector<core::ResourceId> &resources) const {
+  std::lock_guard lock(*admission_mutex_);
+  const auto held = std::find_if(
+      held_fences_.begin(), held_fences_.end(),
+      [&](const auto &candidate) { return candidate.fence_id == fence_id; });
+  return !fence_id.empty() && !resources.empty() && held != held_fences_.end() &&
+         std::all_of(resources.begin(), resources.end(), [&](const auto &resource) {
+           return std::binary_search(held->scope.resources.begin(),
+                                     held->scope.resources.end(), resource);
+         });
+}
+
 ManagedKernelAdmissionObservation ManagedKernelAdmissionGate::Observe(
     const core::ConfigurationFenceScopeDTO &scope) const {
   Require(scope.valid(), "admission observation scope is invalid");
@@ -912,6 +926,9 @@ ManagedKernelAdmissionGate::AcquireDisableFenceDurably(
   const auto snapshot = table != nullptr
                             ? table->admission_snapshot(scope.resources)
                             : core::ResourceSlotAdmissionSnapshotDTO{};
+  Require(snapshot.affected_queued_operation_count == 0U &&
+              snapshot.affected_active_operation_count == 0U,
+          "ordinary Disable refuses outstanding work; Stop is a separate operation");
   ManagedKernelAdmissionObservation observation{
       snapshot.operation_resource_generation,
       snapshot.active_control_configurations,
@@ -1412,6 +1429,52 @@ public:
                                           query.expected_scope, effect);
   }
 
+  void RunWithExactHeldSuccessor(
+      const core::ConfigurationFenceStatusQueryDTO &query,
+      const core::ActiveBundlePublicationReceiptDTO &successor,
+      const std::function<void()> &effect) const {
+    std::lock_guard lock(mutex_);
+    Require(query.valid() && successor.valid() && static_cast<bool>(effect),
+            "fenced successor operation has invalid inputs");
+    const auto *named_apply =
+        std::get_if<core::NamedApplyPublicationTransactionDTO>(
+            &successor.request.transaction_ref);
+    Require(named_apply != nullptr &&
+                named_apply->apply_id == query.owner_transaction.apply_id &&
+                named_apply->apply_generation ==
+                    query.owner_transaction.apply_generation,
+            "fenced successor does not name the parent Apply");
+    const auto row = ReadByFence(query.configuration_fence_id,
+                                 query.configuration_fence_generation);
+    Require(row.has_value() && row->state == 0 &&
+                row->owner_kind == DurableFenceOwnerKind::kApply,
+            "fenced successor has no held parent Apply fence");
+    const auto intent = DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(
+        row->intent_bytes);
+    const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
+        row->accepted_bytes);
+    Require(intent.owner_transaction == query.owner_transaction &&
+                accepted.configuration_fence_id ==
+                    query.configuration_fence_id &&
+                accepted.configuration_fence_generation ==
+                    query.configuration_fence_generation &&
+                accepted.captured_scope == query.expected_scope &&
+                successor.request.expected_previous_publication_generation
+                    .has_value() &&
+                successor.publication_generation.value() ==
+                    successor.request.expected_previous_publication_generation
+                            ->value() + 1U,
+            "fenced successor conflicts with the durable parent Apply");
+    // No other publication can occur while this Apply's fence is held, and
+    // the pre-publication step already verified the fenced predecessor. The
+    // publication store keeps only recent receipts, so history is not re-read.
+    const auto active = ReadActivePublication();
+    Require(active.receipt == successor,
+            "fenced successor is no longer the active publication");
+    admission_gate_.RunWithExactHeldFence(query.configuration_fence_id,
+                                          query.expected_scope, effect);
+  }
+
   [[nodiscard]] core::ConfigurationFenceReleasedDTO
   Release(const core::ConfigurationFenceReleaseDTO &request) {
     std::lock_guard lock(mutex_);
@@ -1832,24 +1895,15 @@ public:
         "durable fence ledger has reached its fixed record bound");
 
     auto capture = RevalidateDisableHandoffRequestLocked(request);
-    if (capture.runtime.scope_resolution !=
-            core::DisableHandoffScopeResolutionDTO::kPromotedToFull &&
-        (!capture.runtime.affected_queued_operations.empty() ||
-         capture.runtime.affected_active_operation_count != 0U)) {
-      const core::DisableHandoffAdmissionQueryDTO full_query{
-          request.controllable_component_id,
-          core::DisableHandoffScopeRequestKindDTO::kFullStopRequired,
-          std::nullopt};
-      capture = CaptureDisableRuntimeLocked(full_query);
-    }
-    Require(request.scope_resolution !=
-                    core::DisableHandoffScopeResolutionDTO::kPromotedToFull ||
+    Require(request.scope_resolution ==
+                    core::DisableHandoffScopeResolutionDTO::kExact &&
                 capture.runtime.scope_resolution ==
-                    core::DisableHandoffScopeResolutionDTO::kPromotedToFull,
-            "Disable-handoff revalidation narrowed a prior Full-Stop request");
-    Require(ScopeMembershipIsSubset(request.affected_scope,
-                                    capture.runtime.current_scope),
-            "Disable-handoff revalidation narrowed the persisted scope");
+                    core::DisableHandoffScopeResolutionDTO::kExact &&
+                request.affected_scope == capture.runtime.current_scope &&
+                capture.runtime.affected_queued_operations.empty() &&
+                capture.runtime.affected_active_operation_count == 0U,
+            "ordinary Disable requires the exact idle component scope; "
+            "it cannot escalate to Stop");
 
     const auto predecessor_generation = ReadFenceGeneration();
     Require(predecessor_generation < std::numeric_limits<std::uint64_t>::max(),
@@ -1910,23 +1964,11 @@ public:
               selected_configurations;
         });
 
-    std::optional<core::StopAcceptedDTO> stop_acceptance;
-    if (admitted.affected_queued_operation_count != 0U ||
-        admitted.affected_active_operation_count != 0U) {
-      Require(disable_handoff_kernel_ != nullptr,
-              "Disable-handoff Kernel is not bound after durable containment");
-      const core::FullStopIntentDTO intent{
-          request.owner_request_context,
-          capture.runtime.current_cell_stop_generation,
-          {}};
-      auto result = disable_handoff_kernel_->full_stop(intent);
-      if (!result.ok()) {
-        Fail("durable Disable containment could not hand off Full Stop: " +
-             result.error().message);
-      }
-      stop_acceptance = std::move(result.value());
-    }
-
+    // Ordinary Disable is idle-only: work found under the durable fence is a
+    // refusal, never a reason to escalate to Stop.
+    Require(admitted.affected_queued_operation_count == 0U &&
+                admitted.affected_active_operation_count == 0U,
+            "ordinary Disable found work under its fence; it cannot escalate to Stop");
     const auto scope_digest =
         core::ComputeDisableHandoffScopeDigest(scope_record.scope);
     Require(scope_digest.ok(),
@@ -1941,12 +1983,8 @@ public:
         scope_digest.value(),
         fence_id,
         core::ConfigurationFenceGeneration(next_generation),
-        stop_acceptance.has_value()
-            ? std::optional<core::StopId>(stop_acceptance->stop_id)
-            : std::nullopt,
-        stop_acceptance.has_value() ? std::optional<core::StopGeneration>(
-                                          stop_acceptance->stop_generation)
-                                    : std::nullopt};
+        std::nullopt,
+        std::nullopt};
     Require(accepted.matches(request),
             "constructed Disable-handoff acceptance is invalid");
     const auto accepted_bytes =
@@ -2993,6 +3031,13 @@ void ManagedKernelApplyFenceOwner::RunWithExactHeldPredecessor(
   impl_->RunWithExactHeldPredecessor(
       query, expected_predecessor_publication_generation,
       expected_predecessor_public_pointer_digest, effect);
+}
+
+void ManagedKernelApplyFenceOwner::RunWithExactHeldSuccessor(
+    const core::ConfigurationFenceStatusQueryDTO &query,
+    const core::ActiveBundlePublicationReceiptDTO &successor,
+    const std::function<void()> &effect) const {
+  impl_->RunWithExactHeldSuccessor(query, successor, effect);
 }
 
 core::ConfigurationFenceReleasedDTO ManagedKernelApplyFenceOwner::Release(

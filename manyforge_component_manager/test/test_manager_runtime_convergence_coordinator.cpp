@@ -1583,10 +1583,13 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(scene_owner.begin_calls, 1);
   EXPECT_EQ(scene_owner.install_scene_calls, 1);
   EXPECT_EQ(scene_owner.complete_calls, 1);
-  EXPECT_EQ(runtime_composition.calls, 2);
+  // Finalize before publication, then once more after it under the held
+  // fence so the runtime owner adopts the published candidate (UA7W.L L6).
+  EXPECT_EQ(runtime_composition.calls, 3);
   EXPECT_EQ(runtime_composition.phases,
             (std::vector<ManagerSelectedRuntimeCompositionPhase>{
                 ManagerSelectedRuntimeCompositionPhase::kPrepare,
+                ManagerSelectedRuntimeCompositionPhase::kFinalize,
                 ManagerSelectedRuntimeCompositionPhase::kFinalize}));
   ASSERT_TRUE(runtime_composition.last_request.has_value());
   EXPECT_EQ(runtime_composition.last_request->phase,
@@ -1604,7 +1607,7 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(scene_owner.begin_calls, 1);
   EXPECT_EQ(scene_owner.install_scene_calls, 1);
   EXPECT_EQ(scene_owner.complete_calls, 1);
-  EXPECT_EQ(runtime_composition.calls, 2);
+  EXPECT_EQ(runtime_composition.calls, 3);  // Replay repeats no effect.
   EXPECT_EQ(publication_store.publish_calls, 1);
   EXPECT_EQ(kernel_fence.acquire_calls, 1);
   EXPECT_EQ(kernel_fence.release_calls, 1);

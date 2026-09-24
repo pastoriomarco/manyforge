@@ -268,8 +268,8 @@ def test_headless_selector_builds_producer_closure_before_native_headless(
         '  if [ "${FAKE_CTEST_OMIT_NATIVE:-0}" != 1 ]; then\n'
         "    printf '%s\\n' \\\n"
         "      'Test #2: ManagerDaemonProcess.CompatibleNativeReplacementUsesFreshEpochAfterCleanStop' \\\n"
-        "      'Test #3: ManagerDaemonProcess.RuntimeOnlyNamedApplyUsesTheRealManagedFenceAndSurvivesReplacement' \\\n"
-        "      'Test #4: ManagerDaemonProcess.PhysicalCompositionReopensAfterChildAndManagerReplacement'\n"
+        "      'Test #3: ManagerDaemonProcess.NamedApplyUsesTheRealManagedFenceAndSurvivesReplacement' \\\n"
+        "      'Test #4: ManagerDaemonProcess.PhysicalCompositionStaysClosedAfterUnexpectedChildLossAndManagerReplacement'\n"
         "  fi\n"
         "  printf '%s\\n' 'Total Tests: 99'\n"
         "fi\n",

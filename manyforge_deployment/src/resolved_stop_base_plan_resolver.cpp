@@ -1380,8 +1380,19 @@ resolve_store_and_verify_route_readiness_batch(
             component_expectations.begin(), component_expectations.end(),
             core::CanonicalRouteSelectionComponentExpectationLess) ||
         !std::all_of(component_expectations.begin(),
-                     component_expectations.end(),
-                     [](const auto &row) { return row.locally_valid(); })) {
+                     component_expectations.end(), [](const auto &row) {
+                       // Ordinary route requests permit Prepared/Active only.
+                       // Restart also restores a retained Disabled route with
+                       // complete Stop readiness but a closed command gate.
+                       return !row.controllable_component_id.empty() &&
+                              row.expected_component_lifecycle_generation.nonzero() &&
+                              (row.expected_component_lifecycle_state ==
+                                   core::ComponentLifecycleStateDTO::kPrepared ||
+                               row.expected_component_lifecycle_state ==
+                                   core::ComponentLifecycleStateDTO::kActive ||
+                               row.expected_component_lifecycle_state ==
+                                   core::ComponentLifecycleStateDTO::kDisabled);
+                     })) {
       return readiness_error<std::vector<VerifiedRouteReadinessParticipant>>(
           "route_readiness_batch_shape_invalid",
           "route readiness batch is incomplete, noncanonical, or unreconciled");

@@ -33,7 +33,7 @@ EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
 EXPECTED_CONTENT_VERSION = "2.3.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:07fbfcadc5ea5fab59cdb1bf3cf61baa35c482453a1c92d0deef64d691083f8a"
+    "sha256:d2ca039d89bb8b6fecb6ca64a4fe52d02f444c0040f818112a4fddb4700985fa"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")

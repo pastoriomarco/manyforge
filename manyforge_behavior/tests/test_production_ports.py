@@ -3159,6 +3159,59 @@ def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:
     assert transport.attachments == []
 
 
+def test_scene_node_failure_keeps_the_owner_reason() -> None:
+    class _UnavailableStateTransport(_SceneTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reject_detach = False
+
+        def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            if (
+                self.reject_detach
+                and body["operation"]["kind"] == "detach_carried_object_at_current_pose"
+            ):
+                error = _scene_rejection(
+                    body, "invalid_request", "addressed observed state is unavailable"
+                )
+                error.response["error"]["details"]["reason"] = (
+                    "observed_state_unavailable_at_evaluation_time"
+                )
+                raise error
+            return super().commit_scene_transaction(body)
+
+    transport = _UnavailableStateTransport()
+    transport.objects["graspable"] = _fixed_scene_object("graspable")
+    port = _scene_port(transport)
+    port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
+    attached = port.invoke(
+        "scene.attach_carried_object",
+        _identity("attach"),
+        OwnerNodeInputs(
+            parameters={
+                "scene_resource_id": "graspable",
+                "target_role": "arm",
+                "carrier_frame_role": "tcp",
+                "touch_body_roles": ["tool_collision"],
+            }
+        ),
+    )
+    assert attached.succeeded is True
+    transport.reject_detach = True
+
+    detached = port.invoke(
+        "scene.detach_carried_object",
+        _identity("detach"),
+        OwnerNodeInputs(parameters={"scene_resource_id": "graspable", "target_role": "arm"}),
+    )
+
+    assert detached.succeeded is False
+    assert detached.reason_code == "invalid_request"
+    assert detached.message == (
+        "addressed observed state is unavailable "
+        "(observed_state_unavailable_at_evaluation_time)"
+    )
+
+
 @pytest.mark.parametrize(
     "code,reason,retry",
     [

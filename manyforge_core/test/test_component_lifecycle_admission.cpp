@@ -166,25 +166,6 @@ constexpr std::int64_t kUnresolvedDisableTimeoutNs = 9'000;
           ContentDigest("disable-admission.1")};
 }
 
-[[nodiscard]] DisableHandoffAdmissionSnapshotDTO FullDisableAdmission(
-    const ComponentLifecycleCurrentSnapshotDTO& illustrative_cell_snapshot) {
-  const auto expectation = BuildDisableHandoffComponentScopeExpectation(illustrative_cell_snapshot);
-  EXPECT_TRUE(expectation.ok());
-  return {{illustrative_cell_snapshot.controllable_component_id,
-           DisableHandoffScopeRequestKindDTO::kFullStopRequired, std::nullopt},
-          RequestOwnerEpoch("kernel-owner.1"),
-          DisableHandoffScopeResolutionDTO::kPromotedToFull,
-          expectation.value().component_scope,
-          expectation.value().active_publication_generation,
-          expectation.value().active_public_pointer_digest,
-          expectation.value().retained_bundle_id,
-          expectation.value().graph_revision,
-          9U,
-          ConfigurationFenceGeneration(11U),
-          expectation.value().current_active_control_configurations,
-          ContentDigest("full-disable-admission.1")};
-}
-
 [[nodiscard]] ComponentLifecycleAdmissionCandidate Candidate(
     std::optional<ComponentLifecycleCurrentSnapshotDTO> snapshot,
     std::vector<BrandLifecyclePlanCatalogDTO> catalogs,
@@ -286,7 +267,7 @@ TEST(ComponentLifecycleAdmission, RejectsStaleSnapshotAndWrongCatalogBeforeReser
   EXPECT_EQ(prepared.error().code, "component_lifecycle_current_snapshot_mismatch");
 }
 
-TEST(ComponentLifecycleAdmission, DisableAcceptsExpectedCurrentUnionAndReservesOnlyCurrentDomains) {
+TEST(ComponentLifecycleAdmission, DisableRejectsChangedDomainSetBeforeReservation) {
   const auto expected_a = ExpectedDomain("a");
   const auto expected_b = ExpectedDomain("b");
   const auto current_c = ExpectedDomain("c");
@@ -304,42 +285,11 @@ TEST(ComponentLifecycleAdmission, DisableAcceptsExpectedCurrentUnionAndReservesO
                 ScopedDisableAdmission(
                     snapshot, DisableHandoffScopeResolutionDTO::kStaleButUnambiguouslyResolved)));
 
-  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-  EXPECT_EQ(prepared.value().acceptance.timeout_duration_ns, 6'000);
-  EXPECT_EQ(
-      prepared.value().reserved_control_domains,
-      (std::vector<ControlDomainId>{ControlDomainId("domain-a"), ControlDomainId("domain-c")}));
-  ASSERT_EQ(prepared.value().initial_status.domains.size(), 3U);
-  EXPECT_TRUE(prepared.value().initial_status.domains[0].expected_domain.has_value());
-  EXPECT_TRUE(prepared.value().initial_status.domains[0].current_scope.has_value());
-  EXPECT_EQ(prepared.value().initial_status.domains[0].action_state,
-            ComponentLifecycleDomainActionStateDTO::kReserved);
-  EXPECT_TRUE(prepared.value().initial_status.domains[1].expected_domain.has_value());
-  EXPECT_FALSE(prepared.value().initial_status.domains[1].current_scope.has_value());
-  EXPECT_FALSE(prepared.value().initial_status.domains[1].current_state.has_value());
-  EXPECT_EQ(prepared.value().initial_status.domains[1].action_state,
-            ComponentLifecycleDomainActionStateDTO::kNotStarted);
-  EXPECT_FALSE(prepared.value().initial_status.domains[2].expected_domain.has_value());
-  EXPECT_TRUE(prepared.value().initial_status.domains[2].current_scope.has_value());
-  EXPECT_EQ(prepared.value().initial_status.domains[2].action_state,
-            ComponentLifecycleDomainActionStateDTO::kReserved);
-
-  std::vector<ControlDomainId> status_reserved_domains;
-  for (const auto& domain : prepared.value().initial_status.domains) {
-    if (domain.action_state == ComponentLifecycleDomainActionStateDTO::kReserved) {
-      ASSERT_TRUE(domain.current_scope.has_value());
-      status_reserved_domains.push_back(domain.control_domain_id);
-    }
-  }
-  EXPECT_EQ(status_reserved_domains, prepared.value().reserved_control_domains);
-  ASSERT_TRUE(prepared.value().qualified_lifecycle_plan_catalogs.has_value());
-  EXPECT_EQ(*prepared.value().qualified_lifecycle_plan_catalogs,
-            (std::vector<BrandLifecyclePlanCatalogDTO>{catalog_a, catalog_c}));
-  EXPECT_FALSE(prepared.value().lifecycle_mutation_eligible);
+  ASSERT_FALSE(prepared.ok());
+  EXPECT_EQ(prepared.error().code, "component_lifecycle_configuration_stale");
 }
 
-TEST(ComponentLifecycleAdmission,
-     ExactResolvedDisableWithUnqualifiedCatalogMayQualifyOnlyLaterUnderFence) {
+TEST(ComponentLifecycleAdmission, DisableRejectsUnqualifiedCatalogBeforeReservation) {
   const auto expected = ExpectedDomain("a");
   auto snapshot = Snapshot({expected}, ComponentLifecycleStateDTO::kActive);
   auto catalog = Catalog(snapshot.provider_occurrences.front(),
@@ -351,19 +301,11 @@ TEST(ComponentLifecycleAdmission,
       Intent(ComponentLifecycleIntentKindDTO::kDisable, {expected}),
       Candidate(snapshot, {catalog}, ScopedDisableAdmission(snapshot)));
 
-  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-  EXPECT_EQ(prepared.value().acceptance.timeout_duration_ns, kUnresolvedDisableTimeoutNs);
-  EXPECT_FALSE(prepared.value().qualified_lifecycle_plan_catalogs.has_value());
-  // This records that the original graph/lifecycle/domain/configuration
-  // expectations were exact. It is not permission to mutate: no executable
-  // catalog is retained here, and the coordinator must requalify an exact
-  // catalog/plan closure under the matching held Kernel fence first.
-  EXPECT_TRUE(prepared.value().lifecycle_mutation_eligible);
-  EXPECT_EQ(prepared.value().reserved_control_domains,
-            std::vector<ControlDomainId>{ControlDomainId("domain-a")});
+  ASSERT_FALSE(prepared.ok());
+  EXPECT_EQ(prepared.error().code, "component_lifecycle_catalog_mismatch");
 }
 
-TEST(ComponentLifecycleAdmission, StaleResolvedDisableMintsCurrentDurableSuccessor) {
+TEST(ComponentLifecycleAdmission, StaleResolvedDisableDoesNotMintSuccessor) {
   const auto expected = ExpectedDomain("a");
   auto snapshot = Snapshot({expected}, ComponentLifecycleStateDTO::kActive);
   snapshot.component_lifecycle_generation = ComponentLifecycleGeneration(5U);
@@ -378,11 +320,8 @@ TEST(ComponentLifecycleAdmission, StaleResolvedDisableMintsCurrentDurableSuccess
                     snapshot, DisableHandoffScopeResolutionDTO::kStaleButUnambiguouslyResolved),
                 ComponentLifecycleGeneration(5U)));
 
-  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-  EXPECT_EQ(prepared.value().acceptance.component_lifecycle_generation,
-            ComponentLifecycleGeneration(6U));
-  EXPECT_EQ(prepared.value().initial_status.accepted_intent.expected_component_lifecycle_generation,
-            ComponentLifecycleGeneration(3U));
+  ASSERT_FALSE(prepared.ok());
+  EXPECT_EQ(prepared.error().code, "component_lifecycle_current_snapshot_mismatch");
 }
 
 TEST(ComponentLifecycleAdmission, NonDisableAndFutureDisableCannotBypassDurablePredecessor) {
@@ -411,43 +350,14 @@ TEST(ComponentLifecycleAdmission, NonDisableAndFutureDisableCannotBypassDurableP
   EXPECT_EQ(prepared.error().code, "component_lifecycle_current_snapshot_mismatch");
 }
 
-TEST(ComponentLifecycleAdmission, NoSnapshotDisableIsContainmentOnlyAndInventsNoStateOrPlan) {
+TEST(ComponentLifecycleAdmission, NoSnapshotDisableDoesNotPromoteToContainment) {
   const auto expected = ExpectedDomain("a");
   const auto illustrative_snapshot = Snapshot({expected}, ComponentLifecycleStateDTO::kActive);
   const auto prepared = PrepareComponentLifecycleAdmission(
       Intent(ComponentLifecycleIntentKindDTO::kDisable, {expected}),
-      Candidate(std::nullopt, {}, FullDisableAdmission(illustrative_snapshot)));
-
-  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-  EXPECT_EQ(prepared.value().acceptance.timeout_duration_ns, kUnresolvedDisableTimeoutNs);
-  EXPECT_EQ(prepared.value().acceptance.component_lifecycle_generation,
-            ComponentLifecycleGeneration(4U));
-  EXPECT_TRUE(prepared.value().reserved_control_domains.empty());
-  EXPECT_FALSE(prepared.value().qualified_lifecycle_plan_catalogs.has_value());
-  EXPECT_FALSE(prepared.value().lifecycle_mutation_eligible);
-  EXPECT_FALSE(prepared.value().initial_status.previous_state.has_value());
-  EXPECT_FALSE(prepared.value().initial_status.current_state.has_value());
-  ASSERT_EQ(prepared.value().initial_status.domains.size(), 1U);
-  EXPECT_FALSE(prepared.value().initial_status.domains.front().current_scope.has_value());
-  EXPECT_FALSE(prepared.value().initial_status.domains.front().previous_state.has_value());
-  EXPECT_FALSE(prepared.value().initial_status.domains.front().current_state.has_value());
-  EXPECT_EQ(prepared.value().initial_status.domains.front().action_state,
-            ComponentLifecycleDomainActionStateDTO::kNotStarted);
-  EXPECT_TRUE(prepared.value().initial_status.locally_valid());
-}
-
-TEST(ComponentLifecycleAdmission, NoSnapshotDisableUsesExistingDurablePredecessorWhenStale) {
-  const auto expected = ExpectedDomain("a");
-  const auto illustrative_snapshot = Snapshot({expected}, ComponentLifecycleStateDTO::kActive);
-  const auto prepared = PrepareComponentLifecycleAdmission(
-      Intent(ComponentLifecycleIntentKindDTO::kDisable, {expected}),
-      Candidate(std::nullopt, {}, FullDisableAdmission(illustrative_snapshot),
-                ComponentLifecycleGeneration(5U)));
-
-  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-  EXPECT_EQ(prepared.value().acceptance.component_lifecycle_generation,
-            ComponentLifecycleGeneration(6U));
-  EXPECT_TRUE(prepared.value().reserved_control_domains.empty());
+      Candidate(std::nullopt, {}, ScopedDisableAdmission(illustrative_snapshot)));
+  ASSERT_FALSE(prepared.ok());
+  EXPECT_EQ(prepared.error().code, "component_lifecycle_scope_unresolved");
 }
 
 TEST(ComponentLifecycleAdmission, RejectsDisableAdmissionForAnotherSnapshot) {

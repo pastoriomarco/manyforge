@@ -122,18 +122,20 @@ function nullableTextAt(value: unknown, path: string): string | null {
   return value === null ? null : textAt(value, path);
 }
 
-function errorAt(value: unknown, path: string): void {
-  if (value === null) return;
+function errorAt(value: unknown, path: string): CCLCTransactionStatus['error'] {
+  if (value === null) return null;
   const row = objectAt(value, path);
   exact(row, ['code', 'details', 'message'], path);
-  textAt(row.code, `${path}.code`);
-  textAt(row.message, `${path}.message`);
+  const code = textAt(row.code, `${path}.code`);
+  const message = textAt(row.message, `${path}.message`);
   const details = objectAt(row.details, `${path}.details`);
   if (Object.keys(details).length > 64) fail(`${path}.details`, 'at most 64 rows');
+  const parsedDetails: Record<string, string> = {};
   Object.entries(details).forEach(([key, detail]) => {
     textAt(key, `${path}.details key`);
-    textAt(detail, `${path}.details.${key}`);
+    parsedDetails[key] = textAt(detail, `${path}.details.${key}`);
   });
+  return { code, message, details: parsedDetails };
 }
 
 export function parseCCLCOwnerIdentity(value: unknown): CCLCOwnerIdentity {
@@ -587,7 +589,7 @@ function statusAt(
   safeIntegerAt(row.remaining_duration_ns, `${path}.remaining_duration_ns`);
   textAt(row.status_owner_epoch, `${path}.status_owner_epoch`);
   integerAt(row.status_sequence, `${path}.status_sequence`);
-  errorAt(row.error, `${path}.error`);
+  const error = errorAt(row.error, `${path}.error`);
   const phase = textAt(row.phase, `${path}.phase`);
   if (!(kind === 'lifecycle' ? LIFECYCLE_PHASES : ROUTE_PHASES).has(phase)) {
     fail(`${path}.phase`, 'a known transaction phase');
@@ -611,6 +613,7 @@ function statusAt(
     ),
     phase,
     terminalResult,
+    error,
     reconciliationRequired: booleanAt(
       row.reconciliation_required,
       `${path}.reconciliation_required`,

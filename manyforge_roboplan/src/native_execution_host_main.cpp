@@ -7357,7 +7357,6 @@ struct Composition final {
   std::unique_ptr<deployment::CCLCRuntimeComposition> cclc_runtime;
   std::atomic_bool cclc_attached{false};
   std::atomic_bool route_recovery_pending{false};
-  bool direct_control_mode_selected{};
   std::vector<std::unique_ptr<Composition>> participant_compositions;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   std::unique_ptr<RetainedRos2ControlAdmissionOwner>
@@ -7447,7 +7446,6 @@ struct ExecutionCompositionAccess final {
   mutable std::shared_mutex mutex;
   Composition *current{};
   core::ResourceAddressedExecutionKernel *addressed_kernel{};
-  std::function<void()> on_cell_admission_settled;
 
   void replace_current(Composition *replacement) {
     // Caller holds mutex exclusively; current remains alive through this
@@ -8818,222 +8816,153 @@ CellControlBindingRepresentatives(const Composition &composition) {
   return representatives;
 }
 
-[[nodiscard]] bool RetainedProductDeclaresLifecycle(
-    const Composition &composition,
-    const deployment::FilesystemVerifiedRetainedProviderManifestSource
-        &provider_manifest_source,
-    const std::vector<core::RuntimeParticipantBinding> &physical_bindings) {
-  // The ordinary maintained native products predate the lifecycle-qualified
-  // CCLC product and deliberately retain the generic native-control provider
-  // manifest.  They remain valid direct native runtimes, but have no lifecycle
-  // product to attach.  A lifecycle declaration is the sealed package-level
-  // opt-in; once one physical provider declares it, the product constructor
-  // below remains fail-closed for every desired domain and exact manifest.
-  std::set<std::pair<core::ProviderManifestId, core::ProviderManifestRevision>>
-      provider_manifest_keys;
-  bool lifecycle_product_declared = false;
-  for (const auto &binding : physical_bindings) {
-    Require(binding.value().control_path.has_value(),
-            "native CCLC eligibility has no exact control path");
-    const auto &path = *binding.value().control_path;
-    const auto key =
-        std::pair{path.provider_manifest_id, path.provider_manifest_revision};
-    if (!provider_manifest_keys.insert(key).second) {
-      continue;
-    }
-    const auto manifest = provider_manifest_source.get_verified(
-        {composition.bundle->retained_bundle_id(), path.provider_manifest_id,
-         path.provider_manifest_revision});
-    Require(manifest.has_value(),
-            "native CCLC eligibility cannot resolve the exact provider "
-            "manifest");
-    lifecycle_product_declared =
-        lifecycle_product_declared ||
-        manifest->value().lifecycle_plan_catalog.has_value();
-  }
-  return lifecycle_product_declared;
-}
-
-void SelectDirectNativeControlMode(Composition &composition,
-                                   const std::filesystem::path &package_root) {
-  if (composition.direct_control_mode_selected ||
-      composition.cclc_runtime != nullptr) {
-    return;
-  }
-  const auto physical_bindings = PhysicalControlBindings(composition);
-  const deployment::FilesystemVerifiedRetainedProviderManifestSource
-      provider_manifest_source(package_root);
-  if (RetainedProductDeclaresLifecycle(composition, provider_manifest_source,
-                                       physical_bindings)) {
-    return;
-  }
-  // This product has no lifecycle transition owner. Select its fixed direct
-  // bindings here; attachment publishes their exact observed route and
-  // artifact-backed Stop readiness without changing controllers.
-  composition.direct_control_mode_selected = true;
-  composition.route_recovery_pending.store(false, std::memory_order_release);
-}
-
-void PublishDirectNativeControlRoutes(
-    Composition &composition, const std::filesystem::path &package_root,
-    const std::filesystem::path &execution_run_root) {
-  Require(composition.direct_control_mode_selected &&
-              composition.runtime != nullptr &&
-              composition.runtime->addressed_kernel != nullptr,
-          "direct route publication requires the selected stable runtime");
-
-  const deployment::FilesystemVerifiedRetainedProductArtifactSource
-      artifact_source(package_root);
-  core::FilesystemResolvedStopBasePlanRepository plan_repository(
-      execution_run_root);
-  const auto cell_representatives =
-      CellControlBindingRepresentatives(composition);
-
-  for (const auto &desired :
-       composition.bundle->value().desired_control_configurations) {
-    std::vector<core::RuntimeParticipantBinding> representatives;
-    representatives.reserve(desired.binding_routes.size());
-    const core::RuntimeControlPathDTO *source_path = nullptr;
-    for (const auto &route : desired.binding_routes) {
-      const auto representative = std::find_if(
-          cell_representatives.begin(), cell_representatives.end(),
-          [&](const auto &candidate) {
-            return candidate.value().control_path.has_value() &&
-                   candidate.value().control_path->control_domain_id ==
-                       desired.control_domain_id &&
-                   candidate.value().control_path->control_binding_id ==
-                       route.control_binding_id &&
-                   candidate.value().control_path->control_binding_revision ==
-                       route.control_binding_revision;
-          });
-      Require(representative != cell_representatives.end(),
-              "direct route publication has no exact physical representative");
-      const auto &path = *representative->value().control_path;
-      if (source_path == nullptr) {
-        source_path = &path;
-      } else {
-        Require(source_path->provider_runtime_unit_id ==
-                        path.provider_runtime_unit_id &&
-                    source_path->provider_runtime_epoch ==
-                        path.provider_runtime_epoch &&
-                    source_path->active_control_configuration_id ==
-                        path.active_control_configuration_id &&
-                    source_path->active_control_configuration_generation ==
-                        path.active_control_configuration_generation,
-                "direct route publication sources disagree within one domain");
-      }
-      representatives.push_back(*representative);
-    }
-    Require(source_path != nullptr,
-            "direct route publication has an empty desired domain");
-
-    std::vector<core::ActiveControlConfigurationBindingRouteDTO> active_routes;
-    active_routes.reserve(desired.binding_routes.size());
-    for (const auto &route : desired.binding_routes) {
-      active_routes.push_back({route.control_binding_id,
-                               route.control_binding_revision,
-                               route.control_route_id});
-    }
-    std::sort(active_routes.begin(), active_routes.end(),
-              core::CanonicalActiveControlConfigurationBindingRouteLess);
-    core::ActiveControlConfigurationDTO configuration{
-        source_path->active_control_configuration_id,
-        desired.control_domain_id,
-        desired.control_domain_revision,
-        std::move(active_routes),
-        desired.activation_set_id,
-        desired.controller_topology_id,
-        desired.topology_revision,
-        source_path->provider_runtime_unit_id,
-        source_path->provider_runtime_epoch,
-        composition.publication_generation.value(),
-        {},
-        source_path->active_control_configuration_generation,
-        core::ActiveControlConfigurationStateDTO::kReconciled};
-    auto source_projections =
-        DeriveRetainedNativeStateSourceProjections(representatives);
-    if (!source_projections.ok()) {
-      Fail("direct route state-source projection could not be derived: " +
-           source_projections.error().message);
-    }
-    configuration.kinematic_resource_source_projections =
-        std::move(source_projections.value());
-    Require(configuration.locally_valid(),
-            "direct route publication produced an invalid configuration");
-
-    const auto current =
-        composition.runtime->addressed_kernel
-            ->current_runtime_route_configuration(desired.control_domain_id);
-    Require(current.ok(), "direct route publication readback failed");
-    if (current.value().has_value() &&
-        current.value()->active_configuration == configuration &&
-        current.value()->operation_admission_open) {
-      continue;
-    }
-
-    const auto expected =
-        deployment::load_verified_controller_lifecycle_expected_domain(
-            *composition.bundle, artifact_source, desired,
-            source_path->provider_runtime_unit_id,
-            source_path->provider_runtime_epoch);
-    std::vector<core::RouteSelectionComponentExpectationDTO>
-        component_expectations;
-    component_expectations.reserve(representatives.size());
-    for (const auto &representative : representatives) {
-      const auto component_id =
-          representative.value().controllable_component_id;
-      if (std::none_of(component_expectations.begin(),
-                       component_expectations.end(), [&](const auto &row) {
-                         return row.controllable_component_id == component_id;
-                       })) {
-        component_expectations.push_back(
-            {component_id,
-             core::ComponentLifecycleGeneration(
-                 composition.publication_generation.value()),
-             core::ComponentLifecycleStateDTO::kActive});
+[[nodiscard]] core::Result<void> VerifyNativeEngineForDomain(
+    const Composition &composition, const core::ControlDomainId &domain) {
+  if (composition.runtime != nullptr) {
+    for (const auto &registration :
+         composition.runtime->participant_registrations) {
+      const auto &path = registration.binding.value().control_path;
+      if (path && path->control_domain_id == domain &&
+          registration.engine != nullptr &&
+          registration.stop_execution_port != nullptr) {
+        return core::Result<void>::Ok();
       }
     }
-    std::sort(component_expectations.begin(), component_expectations.end(),
-              core::CanonicalRouteSelectionComponentExpectationLess);
-    auto participants =
-        deployment::resolve_store_and_verify_route_readiness_batch(
-            *composition.bundle, artifact_source, expected, configuration,
-            component_expectations, representatives, plan_repository);
-    if (!participants.ok()) {
-      Fail("direct route Stop readiness could not be resolved: " +
-           participants.error().message);
-    }
-    const auto published =
-        composition.runtime->PublishAndReadBackRouteConfiguration(
-            configuration, std::move(participants.value()));
-    Require(published.ok() && published.value().operation_admission_open,
-            "direct route publication did not establish admission");
   }
+  for (const auto &participant : composition.participant_compositions) {
+    if (VerifyNativeEngineForDomain(*participant, domain).ok()) {
+      return core::Result<void>::Ok();
+    }
+  }
+  return core::Result<void>::Err(
+      {"native_lifecycle_engine_unavailable",
+       "the exact native participant engine is not installed for the control domain",
+       {{"reason", "native_engine_or_stop_port_missing"},
+        {"control_domain_id", domain.value()}}});
 }
 
 void DetachRetainedCCLC(Composition &composition);
 
-void PublishReconciledDirectNativeControlRoutes(
-    Composition &composition, const std::filesystem::path &package_root,
-    const std::filesystem::path &execution_run_root) {
-  PublishDirectNativeControlRoutes(composition, package_root,
-                                   execution_run_root);
-  auto reconciled = composition.runtime->ReconcileCommandFreeOrphans();
-  if (!reconciled.ok()) {
-    Fail("direct route attachment could not reconcile command-free orphan "
-         "resources: " +
-         reconciled.error().message);
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+[[nodiscard]] core::NativeApplyFactAdoptionDTO ReadNativeApplyFacts(
+    Composition &composition,
+    const core::ActiveBundlePublicationReceiptDTO &publication,
+    const core::NativeApplyPlanDTO &plan) {
+  Require(publication.valid() &&
+              publication.publication_generation ==
+                  composition.publication_generation &&
+              publication.request.candidate_retained_bundle_id ==
+                  composition.bundle->retained_bundle_id() &&
+              plan.candidate_retained_bundle_id ==
+                  composition.bundle->retained_bundle_id(),
+          "native CCLC adoption does not name the installed candidate");
+  core::NativeApplyFactAdoptionDTO facts{publication, {}, {}};
+  const auto planned_component = [&](const core::ControllableComponentId &id) {
+    const auto found = std::find_if(
+        plan.components.begin(), plan.components.end(),
+        [&](const auto &row) { return row.component_id == id; });
+    Require(found != plan.components.end(),
+            "native CCLC adoption has an unplanned component");
+    return *found;
+  };
+  const auto representatives = CellControlBindingRepresentatives(composition);
+  std::set<core::ControllableComponentId> ready_components;
+  for (const auto &desired :
+       composition.bundle->value().desired_control_configurations) {
+    const auto engine = VerifyNativeEngineForDomain(
+        composition, desired.control_domain_id);
+    if (!engine.ok()) {
+      Fail("native CCLC adoption has no exact engine: " +
+           engine.error().message);
+    }
+    const auto current = composition.runtime->addressed_kernel
+                             ->current_runtime_route_configuration(
+                                 desired.control_domain_id);
+    Require(current.ok() && current.value().has_value(),
+            "native CCLC adoption has no route readback");
+    const auto &active = current.value()->active_configuration;
+    const auto planned_route = std::find_if(
+        plan.routes.begin(), plan.routes.end(), [&](const auto &row) {
+          return row.control_domain_id == desired.control_domain_id;
+        });
+    Require(planned_route != plan.routes.end() &&
+                active.active_control_configuration_generation ==
+                    planned_route->generation,
+            "native CCLC adoption route generation differs from the plan");
+    Require(active.locally_valid() &&
+                active.state ==
+                    core::ActiveControlConfigurationStateDTO::kReconciled &&
+                active.control_domain_id == desired.control_domain_id &&
+                active.control_domain_revision ==
+                    desired.control_domain_revision &&
+                active.activation_set_id == desired.activation_set_id &&
+                active.controller_topology_id ==
+                    desired.controller_topology_id &&
+                active.topology_revision == desired.topology_revision &&
+                active.binding_routes.size() == desired.binding_routes.size() &&
+                current.value()->readiness_rows.size() ==
+                    desired.binding_routes.size(),
+            "native CCLC adoption route differs from retained intent");
+    for (const auto &route : desired.binding_routes) {
+      Require(std::any_of(active.binding_routes.begin(),
+                          active.binding_routes.end(), [&](const auto &row) {
+                            return row.control_binding_id ==
+                                       route.control_binding_id &&
+                                   row.control_binding_revision ==
+                                       route.control_binding_revision &&
+                                   row.control_route_id == route.control_route_id;
+                          }),
+              "native CCLC adoption is missing a retained binding route");
+      const auto representative = std::find_if(
+          representatives.begin(), representatives.end(), [&](const auto &row) {
+            return row.value().control_path.has_value() &&
+                   row.value().control_path->control_domain_id ==
+                       desired.control_domain_id &&
+                   row.value().control_path->control_binding_id ==
+                       route.control_binding_id &&
+                   row.value().control_path->control_binding_revision ==
+                       route.control_binding_revision;
+          });
+      Require(representative != representatives.end(),
+              "native CCLC adoption has no physical binding representative");
+      ready_components.insert(
+          representative->value().controllable_component_id);
+      // The gate is open exactly for an enabled component; an explicitly
+      // disabled one keeps its verified route but admits no command.
+      Require(current.value()->operation_admission_open ==
+                  (planned_component(representative->value()
+                                         .controllable_component_id)
+                       .state == core::ComponentLifecycleStateDTO::kActive),
+              "native CCLC adoption route gate differs from the planned state");
+    }
+    facts.current_routes.push_back(active);
   }
-  Require(composition.runtime->addressed_kernel
-              ->SetRouteRecoveryPending(false)
-              .ok(),
-          "direct route attachment could not release admission");
-  composition.route_recovery_pending.store(false, std::memory_order_release);
+  for (const auto &component :
+       composition.bundle->value().cell_graph.controllable_components) {
+    Require(ready_components.erase(component.controllable_component_id) == 1U,
+            "native CCLC adoption has a component without verified routes");
+    facts.components.push_back(
+        planned_component(component.controllable_component_id));
+  }
+  Require(ready_components.empty(),
+          "native CCLC adoption contains an undeclared route component");
+  std::sort(facts.components.begin(), facts.components.end(),
+            [](const auto &a, const auto &b) {
+              return a.component_id < b.component_id;
+            });
+  std::sort(facts.current_routes.begin(), facts.current_routes.end(),
+            [](const auto &a, const auto &b) {
+              return a.control_domain_id < b.control_domain_id;
+            });
+  return facts;
 }
+#endif
 
 void AttachRetainedNativeCCLC(Composition &composition,
                               const HostConfig &config,
-                              ManagedKernelApplyFenceOwner &fence_owner) {
+                              ManagedKernelApplyFenceOwner &fence_owner,
+                              const std::optional<core::ConfigurationFenceStatusQueryDTO>
+                                  &parent_apply = std::nullopt) {
   Require(composition.runtime != nullptr &&
               composition.runtime->addressed_kernel != nullptr &&
               composition.runtime->clock != nullptr &&
@@ -9041,16 +8970,6 @@ void AttachRetainedNativeCCLC(Composition &composition,
           "native CCLC attachment requires one stable addressed runtime");
 
   auto &kernel = *composition.runtime->addressed_kernel;
-  // Products without lifecycle-managed routes keep their retained direct
-  // bindings. The Stop latch still independently blocks public authoring;
-  // there is no CCLC service or recovery barrier to start.
-  SelectDirectNativeControlMode(composition, config.package_root);
-  if (composition.direct_control_mode_selected) {
-    std::cerr << "native composition phase: publishing direct routes\n";
-    PublishReconciledDirectNativeControlRoutes(
-        composition, config.package_root, config.execution_run_root);
-    return;
-  }
   if (composition.cclc_runtime) {
     Require(composition.cclc_attached.load(std::memory_order_acquire),
             "constructed native CCLC is not attached");
@@ -9090,6 +9009,33 @@ void AttachRetainedNativeCCLC(Composition &composition,
               composition.bundle->value().cell_graph.graph_revision,
       "native CCLC cannot re-read the exact active product");
 
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  if (parent_apply.has_value()) {
+    fence_owner.RunWithExactHeldSuccessor(
+        *parent_apply, active_publication.value(), [&] {
+          core::SqliteCCLCJournal journal(
+              config.execution_state_root /
+                  std::string(core::kCCLCJournalFilename),
+              core::CellId(config.cell_id));
+          const auto plan = journal.LoadNativeApplyPlan(
+              {parent_apply->owner_transaction.apply_id,
+               parent_apply->owner_transaction.apply_generation});
+          if (!plan.ok() || !plan.value().has_value()) {
+            Fail("native CCLC has no recorded plan for this Apply");
+          }
+          auto facts = ReadNativeApplyFacts(composition,
+                                            active_publication.value(),
+                                            *plan.value());
+          const auto adopted = journal.AdoptNativeApplyFacts(facts);
+          if (!adopted.ok()) {
+            Fail("native CCLC could not adopt exact Apply facts: " +
+                 adopted.error().message);
+          }
+          journal.Close();
+        });
+  }
+#endif
+
   auto artifact_source = std::make_unique<
       deployment::FilesystemVerifiedRetainedProductArtifactSource>(
       config.package_root);
@@ -9106,9 +9052,78 @@ void AttachRetainedNativeCCLC(Composition &composition,
       composition.ros2_control_runtime_handle, *composition.runtime->clock,
       1'000'000'000LL);
 #else
+  core::SqliteCCLCJournal native_state_journal(
+      config.execution_state_root /
+          std::string(core::kCCLCJournalFilename),
+      core::CellId(config.cell_id));
   auto lifecycle_product = RetainedNativeLifecycleProduct::Create(
       composition.bundle, *provider_manifest_source, physical_bindings,
-      *composition.runtime->clock, 1'000'000'000LL);
+      *composition.runtime->clock, 1'000'000'000LL,
+      [&composition](const core::ControlDomainId &domain) {
+        return VerifyNativeEngineForDomain(composition, domain);
+      },
+      [&composition](const core::ControlDomainId &domain)
+          -> core::Result<bool> {
+        const auto current = composition.runtime->addressed_kernel
+                                 ->current_runtime_route_configuration(domain);
+        if (!current.ok()) return core::Result<bool>::Err(current.error());
+        if (!current.value().has_value() ||
+            !current.value()->operation_admission_open ||
+            current.value()->active_configuration.state !=
+                core::ActiveControlConfigurationStateDTO::kReconciled) {
+          return core::Result<bool>::Ok(false);
+        }
+        const auto desired = std::find_if(
+            composition.bundle->value().desired_control_configurations.begin(),
+            composition.bundle->value().desired_control_configurations.end(),
+            [&](const auto &row) { return row.control_domain_id == domain; });
+        return core::Result<bool>::Ok(
+            desired != composition.bundle->value()
+                           .desired_control_configurations.end() &&
+            current.value()->active_configuration.control_domain_revision ==
+                desired->control_domain_revision &&
+            current.value()->active_configuration.activation_set_id ==
+                desired->activation_set_id &&
+            current.value()->active_configuration.controller_topology_id ==
+                desired->controller_topology_id &&
+            current.value()->active_configuration.topology_revision ==
+                desired->topology_revision &&
+            current.value()->active_configuration.binding_routes.size() ==
+                desired->binding_routes.size() &&
+            std::all_of(desired->binding_routes.begin(),
+                        desired->binding_routes.end(), [&](const auto &route) {
+                          return std::any_of(
+                              current.value()->active_configuration
+                                  .binding_routes.begin(),
+                              current.value()->active_configuration
+                                  .binding_routes.end(), [&](const auto &active) {
+                                return active.control_binding_id ==
+                                           route.control_binding_id &&
+                                       active.control_binding_revision ==
+                                           route.control_binding_revision &&
+                                       active.control_route_id ==
+                                           route.control_route_id;
+                              });
+                        }) &&
+            current.value()->readiness_rows.size() ==
+                desired->binding_routes.size());
+      },
+      [&native_state_journal](const core::ControllableComponentId &component)
+          -> core::Result<std::optional<core::ComponentLifecycleStateDTO>> {
+        const auto retained =
+            native_state_journal.LoadCurrentComponentLifecycleFact(component);
+        if (!retained.ok()) {
+          return core::Result<
+              std::optional<core::ComponentLifecycleStateDTO>>::Err(
+              retained.error());
+        }
+        return core::Result<
+            std::optional<core::ComponentLifecycleStateDTO>>::Ok(
+            retained.value().current_state);
+      },
+      !parent_apply.has_value() && composition.route_recovery_pending.load(
+                                      std::memory_order_acquire));
+  native_state_journal.Close();
 #endif
   if (!lifecycle_product.ok()) {
     Fail("native lifecycle product cannot be composed: " +
@@ -9136,6 +9151,22 @@ void AttachRetainedNativeCCLC(Composition &composition,
   if (!cclc.ok()) {
     Fail("native CCLC composition failed: " + cclc.error().message);
   }
+
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  Require(static_cast<bool>(composition.runtime->reconcile_controller_routes),
+          "native CCLC has no route reconciliation owner");
+  const auto routes = composition.runtime->reconcile_controller_routes();
+  if (parent_apply.has_value() && !routes.ok()) {
+    composition.runtime->reconcile_controller_routes = {};
+    composition.runtime->stop_recovery_configuration_source = {};
+    Fail("native CCLC Apply routes did not settle: " +
+         routes.error().message);
+  }
+  if (routes.ok()) {
+    composition.route_recovery_pending.store(false,
+                                             std::memory_order_release);
+  }
+#endif
 
   composition.cclc_active_publication_reader =
       std::move(active_publication_reader);
@@ -9188,17 +9219,14 @@ void DetachRetainedCCLC(Composition &composition) {
   composition.cclc_active_publication_reader.reset();
 }
 
-[[nodiscard]] bool TryAttachManagedCCLC(
+[[nodiscard]] bool AttachCurrentPublishedCCLCIfReady(
     Composition &composition, const ManagedRuntimeChildConfig &config,
-    ManagedKernelApplyFenceOwner &fence_owner) {
+    ManagedKernelApplyFenceOwner &fence_owner,
+    const std::optional<core::ConfigurationFenceStatusQueryDTO>
+        &parent_apply = std::nullopt) {
   auto &kernel = *composition.runtime->addressed_kernel;
   if (composition.cclc_attached.load(std::memory_order_acquire))
     return true;
-  if (composition.direct_control_mode_selected) {
-    PublishReconciledDirectNativeControlRoutes(
-        composition, config.package_root, config.execution_run_root);
-    return true;
-  }
   Require(kernel.SetRouteRecoveryPending(true).ok(),
           "route attachment could not close admission");
   component_manager::SqliteActiveBundlePublicationStore publication_store(
@@ -9206,10 +9234,30 @@ void DetachRetainedCCLC(Composition &composition) {
           std::string(component_manager::kActiveBundlePublicationStoreFilename),
       core::CellId(config.cell_id));
   const auto integrity = publication_store.VerifyIntegrity();
+  const auto publication = publication_store.ReadActiveBundlePublication(
+      integrity.current_generation);
   publication_store.Close();
   if (integrity.current_generation != composition.publication_generation) {
     return false;
   }
+  Require(publication.ok() && publication.value().valid(),
+          "native CCLC attachment cannot verify current publication");
+#if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  if (!parent_apply.has_value() &&
+      std::holds_alternative<core::NamedApplyPublicationTransactionDTO>(
+          publication.value().request.transaction_ref)) {
+    core::SqliteCCLCJournal journal(
+        config.execution_state_root /
+            std::string(core::kCCLCJournalFilename),
+        core::CellId(config.cell_id));
+    const auto adopted = journal.HasNativeApplyFacts(publication.value());
+    if (!adopted.ok()) {
+      Fail("native CCLC adoption verification failed: " +
+           adopted.error().message);
+    }
+    if (!adopted.value()) return false;
+  }
+#endif
   HostConfig attachment_config;
   attachment_config.package_root = config.package_root;
   attachment_config.manager_state_root = config.manager_state_root;
@@ -9217,14 +9265,8 @@ void DetachRetainedCCLC(Composition &composition) {
   attachment_config.execution_run_root = config.execution_run_root;
   attachment_config.candidate_worker = config.candidate_worker;
   attachment_config.cell_id = config.cell_id;
-  SelectDirectNativeControlMode(composition, config.package_root);
-  if (composition.direct_control_mode_selected) {
-    PublishReconciledDirectNativeControlRoutes(
-        composition, config.package_root, config.execution_run_root);
-    std::cerr << "native composition phase: direct routes reconciled\n";
-    return true;
-  }
-  AttachRetainedNativeCCLC(composition, attachment_config, fence_owner);
+  AttachRetainedNativeCCLC(composition, attachment_config, fence_owner,
+                           parent_apply);
   return composition.cclc_attached.load(std::memory_order_acquire);
 }
 
@@ -9731,82 +9773,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   ExecutionCompositionAccess execution_composition;
   execution_composition.addressed_kernel = detached_addressed_kernel.get();
   bool current_composition_building = false;
-  std::mutex deferred_attachment_mutex;
-  std::condition_variable_any deferred_attachment_changed;
-  bool deferred_attachment_requested = false;
-  execution_composition.on_cell_admission_settled = [&] {
-    bool attachment_pending = false;
-    {
-      std::lock_guard lock(managed_composition_mutex);
-      attachment_pending =
-          active_managed_composition != nullptr &&
-          active_managed_composition->route_recovery_pending.load(
-              std::memory_order_acquire) &&
-          (active_managed_composition->direct_control_mode_selected ||
-           !active_managed_composition->cclc_attached.load(
-               std::memory_order_acquire));
-    }
-    if (!attachment_pending) {
-      return;
-    }
-    // Releasing the authoring claim can otherwise expose one transient ready
-    // sample before the deferred route attachment starts. Close that cheap
-    // admission barrier on the request lane; all materialization stays on the
-    // worker below.
-    Require(stable_kernel_owner->SetRouteRecoveryPending(true).ok(),
-            "deferred route attachment could not close admission");
-    {
-      std::lock_guard lock(deferred_attachment_mutex);
-      deferred_attachment_requested = true;
-    }
-    deferred_attachment_changed.notify_one();
-  };
-  std::jthread deferred_attachment_worker(
-      [&](const std::stop_token stop_token) {
-        while (!stop_token.stop_requested()) {
-          {
-            std::unique_lock lock(deferred_attachment_mutex);
-            if (!deferred_attachment_changed.wait(
-                    lock, stop_token,
-                    [&] { return deferred_attachment_requested; })) {
-              return;
-            }
-            deferred_attachment_requested = false;
-          }
-          Composition *composition = nullptr;
-          {
-            std::lock_guard lock(managed_composition_mutex);
-            if (current_composition_building ||
-                active_managed_composition == nullptr) {
-              continue;
-            }
-            // Claim release is already durable. Reserve the current
-            // composition here, off the request lane, while its routes catch
-            // up to that release.
-            current_composition_building = true;
-            composition = active_managed_composition.get();
-          }
-          try {
-            const bool attached =
-                TryAttachManagedCCLC(*composition, config, fence_owner);
-            if (!attached) {
-              std::cerr << "native deferred route attachment is waiting for "
-                           "the current publication\n";
-            }
-          } catch (const std::exception &error) {
-            std::cerr
-                << "native CCLC attachment after claim settlement failed: "
-                << error.what() << '\n';
-          } catch (...) {
-            std::cerr
-                << "native CCLC attachment after claim settlement failed\n";
-          }
-          {
-            std::lock_guard lock(managed_composition_mutex);
-            current_composition_building = false;
-          }
-        }
-      });
+
   ManagedExecutionSurfaceControl execution_surface_control(
       config.execution_run_root, &execution_composition,
       &manager_liveness_admission,
@@ -10003,7 +9970,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   std::memory_order_release);
               installed = active_managed_composition.get();
               bind_stable_kernel_to_runtime(*installed->runtime);
-              SelectDirectNativeControlMode(*installed, config.package_root);
               fence_owner.BindDisableHandoffKernel(
                   *installed->runtime->addressed_kernel);
             }
@@ -10013,7 +9979,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             // command channel remains responsive and cannot advertise an
             // installed composition before its exact routes are current.
             const auto routes_attached =
-                TryAttachManagedCCLC(*installed, config, fence_owner);
+                AttachCurrentPublishedCCLCIfReady(*installed, config, fence_owner);
             std::cerr << "native composition phase: control routes "
                       << (routes_attached ? "attached" : "deferred") << '\n';
             {
@@ -10023,10 +9989,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       "recovery");
               current_composition_building = false;
             }
-            // A release may have arrived after the builder deferred recovery
-            // but before it dropped the reservation. Join that event once;
-            // completed attachment is read-only and held claims defer again.
-            execution_composition.on_cell_admission_settled();
           } catch (...) {
             std::lock_guard lock(managed_composition_mutex);
             managed_composition_failure = std::current_exception();
@@ -10211,10 +10173,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   "recovered active composition differs from the published "
                   "Apply successor");
           installed_composition_request = request;
-          publish_installed_liveness_handoff(request);
-          return {request,
-                  component_manager::ManagerSelectedRuntimeCompositionState::
-                      kInstalled};
+          current_composition_building = true;
+          published_installed_composition =
+              active_managed_composition.get();
         }
         Require(request.phase == component_manager::
                     ManagerSelectedRuntimeCompositionPhase::kPrepare,
@@ -10229,8 +10190,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     if (published_installed_composition != nullptr) {
       bool attached = false;
       try {
-        attached = TryAttachManagedCCLC(*published_installed_composition,
-                                        config, fence_owner);
+        attached = AttachCurrentPublishedCCLCIfReady(
+            *published_installed_composition, config, fence_owner, fence_query);
       } catch (...) {
         std::lock_guard lock(managed_composition_mutex);
         current_composition_building = false;
@@ -10243,10 +10204,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 "published installed runtime changed during route recovery");
         current_composition_building = false;
       }
-      // A claim settlement may have requested attachment while this observer
-      // held the composition reservation. Re-evaluate that retained request
-      // once, now that the worker can safely reserve the current runtime.
-      execution_composition.on_cell_admission_settled();
+      if (attached) {
+        publish_installed_liveness_handoff(request);
+      }
       return {
           request,
           attached
@@ -10257,6 +10217,73 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
     if (reconcile_installed_candidate) {
       require_installed_candidate_configuration();
+      // Finalization is still a private parent-Apply effect. Publish and
+      // read back every required native route before reporting the selected
+      // runtime installed; a later CCLC service attachment is not a route
+      // readiness substitute. The Apply fence continues to block commands.
+      if (active_managed_composition != nullptr) {
+        fence_owner.RunWithExactHeldPredecessor(
+            fence_query, request.expected_predecessor_publication_generation,
+            request.expected_predecessor_public_pointer_digest, [&] {
+              const deployment::FilesystemVerifiedRetainedProductArtifactSource
+                  artifacts(config.package_root);
+              const auto representatives =
+                  CellControlBindingRepresentatives(*active_managed_composition);
+              const auto &candidate = *active_managed_composition->bundle;
+              // CCLC records its delegated decision before any candidate
+              // route exists: which components keep an explicit Disable and
+              // the generations routes and facts will use.
+              core::NativeApplyPlanRequestDTO plan_request{
+                  {fence_query.owner_transaction.apply_id,
+                   fence_query.owner_transaction.apply_generation},
+                  candidate.retained_bundle_id(),
+                  candidate.value().cell_graph.graph_revision,
+                  {},
+                  {}};
+              for (const auto &component :
+                   candidate.value().cell_graph.controllable_components) {
+                plan_request.components.push_back(
+                    component.controllable_component_id);
+              }
+              for (const auto &desired :
+                   candidate.value().desired_control_configurations) {
+                const auto compiled = std::find_if(
+                    representatives.begin(), representatives.end(),
+                    [&](const auto &row) {
+                      return row.value().control_path.has_value() &&
+                             row.value().control_path->control_domain_id ==
+                                 desired.control_domain_id;
+                    });
+                Require(compiled != representatives.end(),
+                        "native candidate domain has no compiled binding");
+                plan_request.compiled_routes.push_back(
+                    {desired.control_domain_id,
+                     compiled->value()
+                         .control_path->active_control_configuration_generation});
+              }
+              core::SqliteCCLCJournal plan_journal(
+                  config.execution_state_root /
+                      std::string(core::kCCLCJournalFilename),
+                  core::CellId(config.cell_id));
+              const auto plan = plan_journal.PlanNativeApply(plan_request);
+              plan_journal.Close();
+              if (!plan.ok()) {
+                Fail("native CCLC could not record the Apply plan: " +
+                     plan.error().message);
+              }
+              const auto initialized =
+                  InitializeRetainedNativeCandidateControlRoutes(
+                      candidate, *active_managed_composition->runtime,
+                      active_managed_composition->publication_generation,
+                      plan.value(), artifacts, representatives,
+                      config.execution_run_root,
+                      fence_query.configuration_fence_id);
+              if (!initialized.ok()) {
+                Fail("native CCLC candidate routes are not ready: " +
+                     initialized.error().message);
+              }
+            });
+      }
       {
         std::lock_guard lock(managed_composition_mutex);
         Require(installed_under_fence_composition_request.has_value() &&
@@ -10497,7 +10524,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     ->SetRouteRecoveryPending(true)
                     .ok(),
                 "selected runtime could not close route recovery admission");
-            SelectDirectNativeControlMode(candidate, config.package_root);
             candidate.route_recovery_pending.store(true,
                                                    std::memory_order_release);
             // Program/Scene-only activation has no changed control domains.
@@ -10870,7 +10896,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   // Otherwise reverse declaration order stops renewal before that drain while
   // the receiver's independent watchdog is still armed.
   struct DrainBeforeLivenessShutdown {
-    std::array<std::jthread *, 4> workers;
+    std::array<std::jthread *, 3> workers;
     ManagedProjectionRegistry *projections;
     ~DrainBeforeLivenessShutdown() {
       for (auto *worker : workers)
@@ -10883,8 +10909,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
   } drain_before_liveness_shutdown{{&execution_surface,
                                     &current_composition_builder,
-                                    &managed_composition_builder,
-                                    &deferred_attachment_worker},
+                                    &managed_composition_builder},
                                    &projections};
 
   while (g_stop_requested == 0) {
@@ -11050,12 +11075,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           Require(owner != nullptr, "stable Kernel is not installed");
           response = component_manager::detail::DispatchKernelCellAdmissionRpc(
               *owner, decoded);
-        }
-        if ((decoded.command == "cell_admission_release" ||
-             decoded.command == "cell_admission_reconcile") &&
-            std::holds_alternative<core::AuthoringAdmissionDTO>(response)) {
-          execution_composition.on_cell_admission_settled();
-          response = owner->GetAuthoringAdmission();
         }
       } catch (const std::exception &error) {
         response =
@@ -12115,8 +12134,7 @@ private:
                         std::memory_order_acquire)
                         ? "pending"
                         : "component_lifecycle")
-             : composition.direct_control_mode_selected ? "direct"
-                                                        : "pending")},
+             : "pending")},
         {"graph_revision",
          CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
         {"gripper_command_schema_id",
@@ -13531,16 +13549,6 @@ private:
               auto result =
                   component_manager::detail::DispatchKernelCellAdmissionRpc(
                       *owner, *cell_admission);
-              if ((cell_admission->command == "cell_admission_release" ||
-                   cell_admission->command == "cell_admission_reconcile") &&
-                  std::holds_alternative<core::AuthoringAdmissionDTO>(result) &&
-                  composition_access_.on_cell_admission_settled) {
-                // Attachment takes the Manager composition mutex and may
-                // reconfigure routes. Never invert its execution-lock order.
-                composition_lock.unlock();
-                composition_access_.on_cell_admission_settled();
-                result = owner->GetAuthoringAdmission();
-              }
               response = detail::CellAdmissionResponseValue(
                   cell_admission->command, result);
             } else {

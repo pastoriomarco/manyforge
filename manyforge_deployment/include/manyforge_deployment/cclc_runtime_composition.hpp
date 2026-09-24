@@ -1,5 +1,7 @@
 #pragma once
 
+#include <manyforge_core/ports/icclc_component_command_readiness_port.hpp>
+
 #include <filesystem>
 #include <manyforge_core/cclc_open_request.hpp>
 #include <manyforge_core/component_lifecycle_coordinator.hpp>
@@ -78,7 +80,9 @@ public:
          std::function<
              core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
                  const core::ControlDomainId &)>
-             kernel_current_configuration_source = {});
+             kernel_current_configuration_source = {},
+         core::ICCLCComponentCommandReadinessPort
+             *component_command_readiness_port = nullptr);
 
   /// Starts effectful retained-transaction recovery and request transports.
   /// Construction alone permits owner-local observation, without admitting
@@ -126,7 +130,8 @@ private:
       core::IKernelCellAdmissionPort &kernel_cell_admission_port,
       core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
       IRouteConfigurationKernelPublicationOwner &kernel_publication_owner,
-      core::IClock &clock, core::IScheduler &scheduler);
+      core::IClock &clock, core::IScheduler &scheduler,
+      core::ICCLCComponentCommandReadinessPort *component_command_readiness_port);
 
   CCLCRuntimeCompositionConfig config_;
   std::shared_ptr<const RetainedBundle> retained_bundle_;

@@ -20,6 +20,7 @@ from manyforge_headless_api.models import (
     OperationControlRequest,
     OperationIntentRequest,
     OperationParticipantRequest,
+    ProgramNodeAdmissionEvidenceRequest,
     ProgramDiagnosticRequest,
     ProgramSelectionStopRequest,
     PickSequencePlanningRequest,
@@ -28,6 +29,21 @@ from manyforge_headless_api.models import (
     SceneTransactionRequest,
     StopIntentRequest,
 )
+
+
+@pytest.mark.parametrize("owner_api", ["cclc.lifecycle", "cclc.control_route"])
+def test_program_nodes_cannot_request_component_lifecycle_authority(owner_api: str) -> None:
+    with pytest.raises(ValidationError):
+        ProgramNodeAdmissionEvidenceRequest.model_validate(
+            {
+                "program_runner_owner_epoch": "runner.1",
+                "program_run_id": "run.1",
+                "parent_program_cycle_claim_generation": 1,
+                "node_instance_id": "node.1",
+                "node_attempt_id": "attempt.1",
+                "owner_api": owner_api,
+            }
+        )
 
 
 def test_candidate_preview_requires_exact_prepared_activation_identity() -> None:
@@ -775,12 +791,22 @@ def test_apply_requires_one_exact_ua2a_prepared_activation() -> None:
 
 
 def _status_body() -> dict[str, object]:
+    prepared = _prepared_activation()
     return {
         "apply_id": "apply.3",
         "apply_generation": 3,
         "request_id": "request.3",
         "request_owner_epoch": "client.epoch.3",
-        "prepared_activation": _prepared_activation(),
+        "prepared_activation": {
+            key: prepared[key]
+            for key in (
+                "captured_input_digest",
+                "deployment_artifact_id",
+                "deployment_revision",
+                "program_binding_id",
+                "prepared_activation_id",
+            )
+        },
         "phase": "accepted",
         "last_progress": {
             "phase": "accepted",
@@ -788,6 +814,18 @@ def _status_body() -> dict[str, object]:
         },
         "state": "pending",
         "candidate_projection_revision": None,
+    }
+
+
+def _candidate_projection_revision() -> dict[str, object]:
+    return {
+        "retained_bundle_id": "sha256:" + "2" * 64,
+        "graph_revision": "sha256:" + "3" * 64,
+        "scene_revision": {
+            "scene_id": "sha256:" + "1" * 64,
+            "revision_id": 4,
+            "content_hash": "sha256:" + "2" * 64,
+        },
     }
 
 
@@ -850,15 +888,7 @@ def test_apply_status_reports_one_exact_failure_disposition(
         ManagerApplyStatus.model_validate(
             {
                 **body,
-                "candidate_projection_revision": {
-                    "retained_bundle_id": "sha256:" + "2" * 64,
-                    "graph_revision": "sha256:" + "3" * 64,
-                    "scene_revision": {
-                        "scene_id": "sha256:" + "1" * 64,
-                        "revision_id": 4,
-                        "content_hash": "sha256:" + "2" * 64,
-                    },
-                },
+                "candidate_projection_revision": _candidate_projection_revision(),
             }
         )
 
@@ -886,11 +916,19 @@ def test_apply_status_reports_one_exact_failure_disposition(
 
     # A pending or successful operation never carries a failure.
     for consistent_state in ("pending", "succeeded"):
-        with pytest.raises(ValidationError, match="only a terminal failure"):
-            ManagerApplyStatus.model_validate(
-                {**_status_body(), "state": consistent_state,
+        other = {**_status_body(), "state": consistent_state,
                  "failure": _retained_failure()}
+        if consistent_state == "succeeded":
+            other.update(
+                phase="settled",
+                last_progress={
+                    "phase": "settled",
+                    "record_digest": "sha256:" + "f" * 64,
+                },
+                candidate_projection_revision=_candidate_projection_revision(),
             )
+        with pytest.raises(ValidationError, match="only a terminal failure"):
+            ManagerApplyStatus.model_validate(other)
 
 
 def test_apply_status_is_one_closed_bounded_lifecycle() -> None:
@@ -935,15 +973,7 @@ def test_apply_status_is_one_closed_bounded_lifecycle() -> None:
             {
                 **_status_body(),
                 "state": "succeeded",
-                "candidate_projection_revision": {
-                    "retained_bundle_id": "bundle.2",
-                    "graph_revision": "graph.2",
-                    "scene_revision": {
-                        "scene_id": "sha256:" + "1" * 64,
-                        "revision_id": 4,
-                        "content_hash": "sha256:" + "2" * 64,
-                    },
-                },
+                "candidate_projection_revision": _candidate_projection_revision(),
             }
         )
     assert "successful operation must be settled" in str(captured.value)
@@ -952,15 +982,7 @@ def test_apply_status_is_one_closed_bounded_lifecycle() -> None:
         ManagerApplyStatus.model_validate(
             {
                 **_status_body(),
-                "candidate_projection_revision": {
-                    "retained_bundle_id": "bundle.2",
-                    "graph_revision": "graph.2",
-                    "scene_revision": {
-                        "scene_id": "sha256:" + "1" * 64,
-                        "revision_id": 4,
-                        "content_hash": "sha256:" + "2" * 64,
-                    },
-                },
+                "candidate_projection_revision": _candidate_projection_revision(),
             }
         )
     assert "terminal success carries" in str(captured.value)

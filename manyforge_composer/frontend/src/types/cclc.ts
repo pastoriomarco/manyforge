@@ -145,6 +145,11 @@ export interface CCLCTransactionStatus {
     | 'failed_partial_effect'
     | null;
   reconciliationRequired: boolean;
+  error: {
+    code: string;
+    message: string;
+    details: Record<string, string>;
+  } | null;
 }
 
 export interface CCLCAdmission {

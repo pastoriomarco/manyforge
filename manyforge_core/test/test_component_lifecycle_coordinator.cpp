@@ -593,6 +593,35 @@ class RoutedResolver final : public ICCLCBrandLifecyclePortResolver {
   std::vector<ResolvedLifecycleProviderOccurrenceDTO> providers_;
 };
 
+class DomainPortResolver final : public ICCLCBrandLifecyclePortResolver {
+ public:
+  DomainPortResolver(
+      ResolvedLifecycleProviderOccurrenceDTO first,
+      std::shared_ptr<IBrandLifecyclePort> first_port,
+      ResolvedLifecycleProviderOccurrenceDTO second,
+      std::shared_ptr<IBrandLifecyclePort> second_port)
+      : first_(std::move(first)), first_port_(std::move(first_port)),
+        second_(std::move(second)), second_port_(std::move(second_port)) {}
+
+  [[nodiscard]] Result<std::shared_ptr<IBrandLifecyclePort>> ResolveExactLifecyclePort(
+      const ResolvedLifecycleProviderOccurrenceDTO& provider) const override {
+    if (provider == first_) {
+      return Result<std::shared_ptr<IBrandLifecyclePort>>::Ok(first_port_);
+    }
+    if (provider == second_) {
+      return Result<std::shared_ptr<IBrandLifecyclePort>>::Ok(second_port_);
+    }
+    return Result<std::shared_ptr<IBrandLifecyclePort>>::Err(
+        ErrorDTO{"lifecycle_port_mismatch", "provider mismatch", {}});
+  }
+
+ private:
+  ResolvedLifecycleProviderOccurrenceDTO first_;
+  std::shared_ptr<IBrandLifecyclePort> first_port_;
+  ResolvedLifecycleProviderOccurrenceDTO second_;
+  std::shared_ptr<IBrandLifecyclePort> second_port_;
+};
+
 using test::FakeCellAdmissionPort;
 
 class UnusedKernelPort final : public ICCLCKernelDisableHandoffPort,
@@ -673,71 +702,10 @@ class WaitableManualScheduler final : public IScheduler {
   bool fail_drain_ = false;
 };
 
-class BlockingScheduleReturnScheduler final : public IScheduler {
- public:
-  ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback,
-                          SchedulerPriority priority = SchedulerPriority::Lifecycle) override {
-    const auto handle = scheduler_.schedule(
-        deadline,
-        [this, callback = std::move(callback)] {
-          callback_count_.fetch_add(1U, std::memory_order_acq_rel);
-          callback();
-        },
-        priority);
-    std::unique_lock lock(mutex_);
-    schedule_entered_ = true;
-    changed_.notify_all();
-    changed_.wait(lock, [&] { return release_schedule_; });
-    return handle;
-  }
-
-  void cancel(ScheduleHandle handle) override {
-    cancel_count_.fetch_add(1U, std::memory_order_acq_rel);
-    scheduler_.cancel(handle);
-  }
-
-  [[nodiscard]] bool WaitForScheduleEntered(std::chrono::nanoseconds timeout) const {
-    std::unique_lock lock(mutex_);
-    return changed_.wait_for(lock, timeout, [&] { return schedule_entered_; });
-  }
-
-  void ReleaseSchedule() {
-    {
-      std::lock_guard lock(mutex_);
-      release_schedule_ = true;
-    }
-    changed_.notify_all();
-  }
-
-  void AdvanceTo(TimePoint time) { scheduler_.advance_to(time); }
-
-  [[nodiscard]] std::size_t cancel_count() const noexcept {
-    return cancel_count_.load(std::memory_order_acquire);
-  }
-
-  [[nodiscard]] std::size_t callback_count() const noexcept {
-    return callback_count_.load(std::memory_order_acquire);
-  }
-
- private:
-  ManualScheduler scheduler_;
-  mutable std::mutex mutex_;
-  mutable std::condition_variable changed_;
-  bool schedule_entered_ = false;
-  bool release_schedule_ = false;
-  std::atomic<std::size_t> cancel_count_{0U};
-  std::atomic<std::size_t> callback_count_{0U};
-};
-
-enum class DisableHandoffProgress { kDirectReady, kStoppingThenReady };
-
 class FakeKernelDisablePort final : public ICCLCKernelDisableHandoffPort,
                                     public FakeCellAdmissionPort {
  public:
-  explicit FakeKernelDisablePort(
-      SqliteCCLCJournal& journal,
-      DisableHandoffProgress progress = DisableHandoffProgress::kDirectReady)
-      : journal_(journal), progress_(progress) {}
+  explicit FakeKernelDisablePort(SqliteCCLCJournal& journal) : journal_(journal) {}
 
   [[nodiscard]] Result<DisableHandoffAdmissionSnapshotDTO> ObserveDisableHandoffAdmission(
       const DisableHandoffAdmissionQueryDTO& query) const override {
@@ -827,10 +795,6 @@ class FakeKernelDisablePort final : public ICCLCKernelDisableHandoffPort,
     ++status_count_;
     const auto& request = *handoff_request_;
     const auto& acceptance = *handoff_acceptance_;
-    const auto state =
-        progress_ == DisableHandoffProgress::kStoppingThenReady && status_count_ == 1U
-            ? DisableHandoffStateDTO::kStopping
-            : DisableHandoffStateDTO::kReady;
     DisableHandoffStatusDTO status{
         request.lifecycle_transaction_id,
         request.lifecycle_transaction_generation,
@@ -839,7 +803,7 @@ class FakeKernelDisablePort final : public ICCLCKernelDisableHandoffPort,
         acceptance.component_scope_digest,
         acceptance.configuration_fence_id,
         acceptance.configuration_fence_generation,
-        state,
+        DisableHandoffStateDTO::kReady,
         request.affected_scope,
         {acceptance.configuration_fence_id, acceptance.configuration_fence_generation,
          request.lifecycle_transaction_id, request.lifecycle_transaction_generation,
@@ -968,7 +932,6 @@ class FakeKernelDisablePort final : public ICCLCKernelDisableHandoffPort,
 
  private:
   SqliteCCLCJournal& journal_;
-  DisableHandoffProgress progress_;
   mutable std::mutex mutex_;
   mutable std::atomic<std::size_t> admission_observation_count_{0U};
   std::atomic<std::size_t> begin_count_{0U};
@@ -1188,7 +1151,331 @@ TEST(ComponentLifecycleCoordinator, PersistsBeforeDispatchAndReconcilesLostRelea
   EXPECT_TRUE(coordinator.accepting_new_requests());
 }
 
-TEST(ComponentLifecycleCoordinator, ProgramNodeStopRejectionDoesNotPoisonOwnerOrConsumeGeneration) {
+TEST(ComponentLifecycleCoordinator,
+     MultiDomainPrepareFailureRetainsTheSuccessfulDomainAsPartialEffect) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  const auto catalog = PrepareCatalog();
+  auto snapshot = Snapshot("snapshot.two-domains", ComponentLifecycleStateDTO::kDeclared,
+                           ComponentLifecycleGeneration(3U), catalog);
+  auto second = CurrentDomain();
+  second.control_domain_id = ControlDomainId("domain.2");
+  second.control_domain_revision = ControlDomainRevision("domain-revision.2");
+  second.controller_topology_id = ControllerTopologyId("topology.2");
+  second.topology_revision = TopologyRevision("topology-revision.2");
+  second.current_control_bindings.front().control_binding_id = ControlBindingId("binding.2");
+  second.current_control_bindings.front().control_binding_revision =
+      ControlBindingRevision("binding-revision.2");
+  second.current_control_bindings.front().control_route_id = ControlRouteId("route.2");
+  second.current_resources = {ResourceId("resource.2")};
+  auto second_provider = Provider(catalog);
+  second_provider.control_domain_id = second.control_domain_id;
+  second_provider.control_domain_revision = second.control_domain_revision;
+  second_provider.provider_instance_id = ProviderInstanceId("provider.2");
+  snapshot.domains.push_back(second);
+  snapshot.provider_occurrences.push_back(second_provider);
+  auto intent = PrepareIntent(RequestOwnerEpoch("cclc-owner.1"));
+  auto expected_second = ExpectedDomain();
+  expected_second.control_domain_id = second.control_domain_id;
+  expected_second.control_domain_revision = second.control_domain_revision;
+  expected_second.controller_topology_id = second.controller_topology_id;
+  expected_second.topology_revision = second.topology_revision;
+  expected_second.expected_control_bindings = second.current_control_bindings;
+  intent.expected_control_domains.push_back(expected_second);
+
+  FakeSnapshotSource snapshots({snapshot});
+  FakeCatalogSource catalogs(catalog);
+  auto first_port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kPrepared});
+  auto second_port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared},
+      DispatchMode::kUncertain);
+  DomainPortResolver resolver(snapshot.provider_occurrences.front(), first_port,
+                              second_provider, second_port);
+  UnusedKernelPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+
+  ASSERT_TRUE(coordinator.Start().ok());
+  intent.request_context.request_owner_epoch = coordinator.request_owner_epoch();
+  const auto accepted = coordinator.SubmitLifecycle(intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance.has_value());
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status = coordinator.LoadLifecycleStatus(
+      accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok());
+  ASSERT_TRUE(status.value().has_value());
+  EXPECT_EQ(status.value()->terminal_result,
+            ComponentLifecycleTerminalResultDTO::kFailedPartialEffect);
+  ASSERT_EQ(status.value()->domains.size(), 2U);
+  EXPECT_EQ(first_port->dispatch_count(), 1U);
+  EXPECT_EQ(second_port->dispatch_count(), 1U);
+  EXPECT_TRUE(reservations.snapshot().empty());
+}
+
+/// Records the coordinator's Kernel readiness calls in order.
+class FakeReadinessPort final : public ICCLCComponentCommandReadinessPort {
+ public:
+  [[nodiscard]] Result<ComponentCommandReadinessDTO> CloseComponentCommandEligibility(
+      const LifecycleTransactionId&, const ControllableComponentId& component) override {
+    std::lock_guard lock(mutex_);
+    calls_.push_back("close");
+    state_ = {component, state_.component_lifecycle_generation, false};
+    return Result<ComponentCommandReadinessDTO>::Ok(state_);
+  }
+
+  [[nodiscard]] Result<ComponentCommandReadinessDTO> PublishComponentCommandReadiness(
+      const ComponentCommandReadinessPublicationDTO& publication) override {
+    std::lock_guard lock(mutex_);
+    calls_.push_back(publication.command_eligible ? "publish_open" : "publish_closed");
+    publications_.push_back(publication);
+    if (failures_remaining_ > 0U) {
+      --failures_remaining_;
+      return Result<ComponentCommandReadinessDTO>::Err(
+          {"invalid_state_transition", "Kernel readback unavailable",
+           {{"reason", "injected_readiness_failure"}}});
+    }
+    state_ = {publication.controllable_component_id, publication.component_lifecycle_generation,
+              publication.command_eligible};
+    return Result<ComponentCommandReadinessDTO>::Ok(state_);
+  }
+
+  [[nodiscard]] Result<ComponentCommandReadinessDTO> ReadComponentCommandReadiness(
+      const ControllableComponentId&) const override {
+    std::lock_guard lock(mutex_);
+    return Result<ComponentCommandReadinessDTO>::Ok(state_);
+  }
+
+  void FailNextPublications(std::size_t count) {
+    std::lock_guard lock(mutex_);
+    failures_remaining_ = count;
+  }
+  [[nodiscard]] std::vector<std::string> calls() const {
+    std::lock_guard lock(mutex_);
+    return calls_;
+  }
+  [[nodiscard]] std::vector<ComponentCommandReadinessPublicationDTO> publications() const {
+    std::lock_guard lock(mutex_);
+    return publications_;
+  }
+  [[nodiscard]] ComponentCommandReadinessDTO state() const {
+    std::lock_guard lock(mutex_);
+    return state_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::string> calls_;
+  std::vector<ComponentCommandReadinessPublicationDTO> publications_;
+  ComponentCommandReadinessDTO state_{ControllableComponentId("component.1"), std::nullopt, true};
+  std::size_t failures_remaining_{};
+};
+
+[[nodiscard]] BrandLifecyclePlanCatalogDTO EnableCatalog() {
+  auto plans = PrepareCatalog().plans;
+  plans.push_back({ComponentLifecycleIntentKindDTO::kEnable,
+                   ComponentLifecycleStateDTO::kActive,
+                   std::nullopt,
+                   Predicate(ComponentLifecycleStateDTO::kActive),
+                   1'000'000,
+                   {{LifecyclePrimitiveId("enable"), Predicate(ComponentLifecycleStateDTO::kPrepared),
+                     Predicate(ComponentLifecycleStateDTO::kActive)}}});
+  std::sort(plans.begin(), plans.end(), [](const auto& lhs, const auto& rhs) {
+    return static_cast<int>(lhs.intent) < static_cast<int>(rhs.intent);
+  });
+  auto catalog = MakeBrandLifecyclePlanCatalog(
+      ProviderManifestId("manifest.1"), ProviderManifestRevision(Sha('1')), std::move(plans));
+  if (!catalog.ok()) {
+    ADD_FAILURE() << catalog.error().code << ": " << catalog.error().message;
+    throw std::runtime_error("failed to construct enable lifecycle catalog");
+  }
+  return std::move(catalog.value());
+}
+
+struct EnableRun final {
+  std::optional<ComponentLifecycleStatusDTO> status;
+  std::vector<std::string> calls;
+  std::vector<ComponentCommandReadinessPublicationDTO> publications;
+  ComponentLifecycleGeneration accepted_generation{1U};
+  bool accepting_after{};
+};
+
+[[nodiscard]] EnableRun RunEnable(std::size_t failing_publications) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  const auto catalog = EnableCatalog();
+  FakeSnapshotSource snapshots({Snapshot("snapshot.enable", ComponentLifecycleStateDTO::kPrepared,
+                                         ComponentLifecycleGeneration(3U), catalog)});
+  FakeCatalogSource catalogs(catalog);
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kPrepared,
+                                                       ComponentLifecycleStateDTO::kActive});
+  FakeResolver resolver(port, catalog);
+  UnusedKernelPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  FakeReadinessPort readiness;
+  readiness.FailNextPublications(failing_publications);
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler, nullptr,
+                                            std::nullopt, &readiness);
+  EnableRun run;
+  if (!coordinator.Start().ok()) return run;
+  auto intent = PrepareIntent(coordinator.request_owner_epoch());
+  intent.intent = ComponentLifecycleIntentKindDTO::kEnable;
+  const auto accepted = coordinator.SubmitLifecycle(intent);
+  if (!accepted.ok() || !accepted.value().acceptance.has_value()) return run;
+  static_cast<void>(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  if (status.ok() && status.value().has_value()) run.status = *status.value();
+  run.calls = readiness.calls();
+  run.publications = readiness.publications();
+  run.accepted_generation = accepted.value().acceptance->component_lifecycle_generation;
+  run.accepting_after = coordinator.accepting_new_requests();
+  return run;
+}
+
+TEST(ComponentLifecycleCoordinator, EnableOpensEligibilityOnlyAfterVerifiedCompletion) {
+  const auto run = RunEnable(0U);
+  ASSERT_TRUE(run.status.has_value());
+  EXPECT_EQ(run.status->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded)
+      << (run.status->error ? run.status->error->code + ": " + run.status->error->message + " " +
+                                  (run.status->error->details.contains("reason")
+                                       ? run.status->error->details.at("reason")
+                                       : std::string{})
+                            : std::string{});
+  // Closed before any adapter work; opened once, at the accepted generation.
+  EXPECT_EQ(run.calls, (std::vector<std::string>{"close", "publish_open"}));
+  ASSERT_EQ(run.publications.size(), 1U);
+  EXPECT_EQ(run.publications.front().authority, ComponentReadinessAuthorityDTO::kLifecycleClaim);
+  EXPECT_EQ(run.publications.front().component_lifecycle_generation, run.accepted_generation);
+  EXPECT_TRUE(run.accepting_after);
+}
+
+TEST(ComponentLifecycleCoordinator, UnverifiedReadinessPublicationCannotReportSuccess) {
+  const auto run = RunEnable(1U);
+  ASSERT_TRUE(run.status.has_value());
+  // The adapter succeeded but the Kernel result was not verified: the known
+  // failure after effects settles command-closed, never Active.
+  EXPECT_EQ(run.status->terminal_result, ComponentLifecycleTerminalResultDTO::kFailedPartialEffect);
+  EXPECT_EQ(run.calls, (std::vector<std::string>{"close", "publish_open", "publish_closed"}));
+  EXPECT_TRUE(run.accepting_after);
+}
+
+TEST(ComponentLifecycleCoordinator, UnverifiedContainmentRetainsTheClaimAndClosesAdmission) {
+  const auto run = RunEnable(2U);
+  // Neither the enabled nor the closed result was read back: no terminal
+  // settlement or claim release is recorded.
+  ASSERT_TRUE(run.status.has_value());
+  EXPECT_FALSE(run.status->terminal_result.has_value());
+  EXPECT_EQ(run.calls, (std::vector<std::string>{"close", "publish_open", "publish_closed"}));
+  EXPECT_FALSE(run.accepting_after);
+}
+
+TEST(ComponentLifecycleCoordinator,
+     MultiDomainPartialFailureSettlesTheWholeComponentCommandClosed) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  const auto catalog = PrepareCatalog();
+  auto snapshot = Snapshot("snapshot.two-domains.readiness", ComponentLifecycleStateDTO::kDeclared,
+                           ComponentLifecycleGeneration(3U), catalog);
+  auto second = CurrentDomain();
+  second.control_domain_id = ControlDomainId("domain.2");
+  second.control_domain_revision = ControlDomainRevision("domain-revision.2");
+  second.controller_topology_id = ControllerTopologyId("topology.2");
+  second.topology_revision = TopologyRevision("topology-revision.2");
+  second.current_control_bindings.front().control_binding_id = ControlBindingId("binding.2");
+  second.current_control_bindings.front().control_binding_revision =
+      ControlBindingRevision("binding-revision.2");
+  second.current_control_bindings.front().control_route_id = ControlRouteId("route.2");
+  second.current_resources = {ResourceId("resource.2")};
+  auto second_provider = Provider(catalog);
+  second_provider.control_domain_id = second.control_domain_id;
+  second_provider.control_domain_revision = second.control_domain_revision;
+  second_provider.provider_instance_id = ProviderInstanceId("provider.2");
+  snapshot.domains.push_back(second);
+  snapshot.provider_occurrences.push_back(second_provider);
+  auto intent = PrepareIntent(RequestOwnerEpoch("cclc-owner.1"));
+  auto expected_second = ExpectedDomain();
+  expected_second.control_domain_id = second.control_domain_id;
+  expected_second.control_domain_revision = second.control_domain_revision;
+  expected_second.controller_topology_id = second.controller_topology_id;
+  expected_second.topology_revision = second.topology_revision;
+  expected_second.expected_control_bindings = second.current_control_bindings;
+  intent.expected_control_domains.push_back(expected_second);
+
+  FakeSnapshotSource snapshots({snapshot});
+  FakeCatalogSource catalogs(catalog);
+  auto first_port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kPrepared});
+  auto second_port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared},
+      DispatchMode::kUncertain);
+  DomainPortResolver resolver(snapshot.provider_occurrences.front(), first_port,
+                              second_provider, second_port);
+  UnusedKernelPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  FakeReadinessPort readiness;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler, nullptr,
+                                            std::nullopt, &readiness);
+  ASSERT_TRUE(coordinator.Start().ok());
+  intent.request_context.request_owner_epoch = coordinator.request_owner_epoch();
+  const auto accepted = coordinator.SubmitLifecycle(intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance.has_value());
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok() && status.value().has_value());
+  EXPECT_EQ(status.value()->terminal_result,
+            ComponentLifecycleTerminalResultDTO::kFailedPartialEffect);
+  // The first domain succeeded, yet no domain of the component was ever
+  // opened, and the settled result is verified closed before release.
+  const auto calls = readiness.calls();
+  EXPECT_EQ(std::count(calls.begin(), calls.end(), "publish_open"), 0);
+  ASSERT_FALSE(calls.empty());
+  EXPECT_EQ(calls.front(), "close");
+  EXPECT_EQ(calls.back(), "publish_closed");
+  EXPECT_FALSE(readiness.state().command_eligible);
+  // The partial effect leaves no durable current state for restart to
+  // reconstruct as readiness.
+  const auto fact =
+      journal.LoadCurrentComponentLifecycleFact(intent.controllable_component_id);
+  ASSERT_TRUE(fact.ok());
+  EXPECT_FALSE(fact.value().current_state.has_value());
+
+  // A restarted owner reading the same durable journal finds a settled
+  // transaction and no current state to reconstruct as command readiness.
+  SqliteCCLCJournal reopened(temporary.path() / std::string(kCCLCJournalFilename),
+                             CellId("cell.1"), 8U);
+  const auto reopened_fact =
+      reopened.LoadCurrentComponentLifecycleFact(intent.controllable_component_id);
+  ASSERT_TRUE(reopened_fact.ok()) << reopened_fact.error().message;
+  EXPECT_TRUE(reopened_fact.value().durable_generation.has_value());
+  EXPECT_FALSE(reopened_fact.value().current_state.has_value());
+  const auto unsettled = reopened.LoadComponentsWithUnsettledLifecycle();
+  ASSERT_TRUE(unsettled.ok()) << unsettled.error().message;
+  EXPECT_TRUE(unsettled.value().empty());
+}
+
+TEST(ComponentLifecycleCoordinator, KernelClaimRejectionDoesNotPoisonOwnerOrConsumeGeneration) {
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
@@ -1207,16 +1494,11 @@ TEST(ComponentLifecycleCoordinator, ProgramNodeStopRejectionDoesNotPoisonOwnerOr
                                             resolver, kernel, clock, scheduler);
   ASSERT_TRUE(coordinator.Start().ok());
   auto intent = PrepareIntent(coordinator.request_owner_epoch());
-  intent.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{RequestOwnerEpoch("runner.1"),
-                                                                 ProgramRunId("run.1"),
-                                                                 CellAdmissionClaimGeneration(7U),
-                                                                 "prepare",
-                                                                 "prepare.1",
-                                                                 "cclc.lifecycle"};
   kernel.RejectNextClaim(
-      {"invalid_state_transition",
-       "Not started — held by Stop",
-       {{"reason", "program_node_stop_fence_active"}, {"selection_revision", "9"}}});
+      {"authoring_not_ready",
+       "Not started — the cell is not idle",
+       {{"reason", "component_lifecycle_program_not_idle_after_reset"},
+        {"selection_revision", "9"}}});
   const auto rejected = coordinator.SubmitLifecycle(intent);
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("selection_revision"), "9");
@@ -1229,10 +1511,9 @@ TEST(ComponentLifecycleCoordinator, ProgramNodeStopRejectionDoesNotPoisonOwnerOr
   ASSERT_TRUE(absent.value()->rejection);
   EXPECT_EQ(absent.value()->rejection->details.at("selection_revision"), "9");
 
-  // A newer owner release allows a fresh node attempt, not replay of a command
-  // with an uncertain effect. The first real transaction still has generation 1.
+  // Once the cell is idle a fresh request is admitted, not a replay of the
+  // refused one. The first real transaction still has generation 1.
   intent.request_context.request_id = RequestId("prepare.after-release");
-  intent.program_node_evidence->node_attempt_id = "prepare.2";
   const auto accepted = coordinator.SubmitLifecycle(intent);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
@@ -1241,13 +1522,12 @@ TEST(ComponentLifecycleCoordinator, ProgramNodeStopRejectionDoesNotPoisonOwnerOr
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(result.value());
   ASSERT_TRUE(result.value()->status);
-  EXPECT_EQ(result.value()->status->accepted_intent.program_node_evidence,
-            intent.program_node_evidence);
   EXPECT_EQ(result.value()->status->terminal_result,
             ComponentLifecycleTerminalResultDTO::kSucceeded);
   EXPECT_EQ(port->dispatch_count(), 1U);
+  // The same request identity with different content is a conflict, not a replay.
   auto conflict = intent;
-  conflict.program_node_evidence->node_attempt_id = "foreign.3";
+  conflict.expected_component_lifecycle_generation = ComponentLifecycleGeneration(99U);
   const auto wrong = coordinator.ReadLifecycleRequestResult(conflict);
   ASSERT_TRUE(wrong.ok());
   ASSERT_TRUE(wrong.value());
@@ -1813,7 +2093,7 @@ TEST(ComponentLifecycleCoordinator,
   EXPECT_TRUE(reservations.snapshot().empty());
 }
 
-TEST(ComponentLifecycleCoordinator, ResolvedStaleDisableContainsAndReleasesWithoutVendorMutation) {
+TEST(ComponentLifecycleCoordinator, StaleDisableRejectsBeforeFenceOrVendorMutation) {
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
@@ -1834,35 +2114,15 @@ TEST(ComponentLifecycleCoordinator, ResolvedStaleDisableContainsAndReleasesWitho
   auto intent = DisableIntent(coordinator.request_owner_epoch());
   intent.request_context.request_id = RequestId("disable-stale.1");
   intent.expected_component_lifecycle_generation = ComponentLifecycleGeneration(2U);
-  ASSERT_TRUE(intent.locally_valid());
-  const auto accepted = coordinator.SubmitLifecycle(intent);
-  ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
-  EXPECT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
-
-  const auto status =
-      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
-  ASSERT_TRUE(status.ok());
-  ASSERT_TRUE(status.value().has_value());
-  EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kFailed);
-  EXPECT_EQ(status.value()->terminal_result,
-            ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);
-  ASSERT_TRUE(status.value()->error.has_value());
-  EXPECT_EQ(status.value()->error->code, "component_lifecycle_disable_mutation_not_eligible");
-  ASSERT_TRUE(status.value()->configuration_fence.has_value());
-  EXPECT_EQ(status.value()->configuration_fence->state, ConfigurationFenceState::kReleased);
-  EXPECT_TRUE(status.value()->disable_fence_released.has_value());
-  EXPECT_EQ(kernel.begin_count(), 1U);
-  EXPECT_EQ(kernel.release_count(), 1U);
-  EXPECT_TRUE(kernel.saw_handoff_prepared());
-  EXPECT_TRUE(kernel.saw_release_prepared());
-  EXPECT_TRUE(kernel.terminal_candidate_locally_valid());
-  EXPECT_EQ(port->observation_count(), 0U);
+  const auto rejected = coordinator.SubmitLifecycle(intent);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code, "component_lifecycle_current_snapshot_mismatch");
+  EXPECT_EQ(kernel.begin_count(), 0U);
   EXPECT_EQ(port->dispatch_count(), 0U);
   EXPECT_TRUE(reservations.snapshot().empty());
 }
 
-TEST(ComponentLifecycleCoordinator,
-     ResolvedCatalogUnavailableDisableContainsAndReleasesWithoutVendorMutation) {
+TEST(ComponentLifecycleCoordinator, MissingDisableCatalogRejectsBeforeFence) {
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
@@ -1882,289 +2142,13 @@ TEST(ComponentLifecycleCoordinator,
   ASSERT_TRUE(coordinator.Start().ok());
   auto intent = DisableIntent(coordinator.request_owner_epoch());
   intent.request_context.request_id = RequestId("disable-catalog-unavailable.1");
-  const auto accepted = coordinator.SubmitLifecycle(intent);
-  ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
-  ASSERT_TRUE(accepted.value().acceptance.has_value());
-  EXPECT_EQ(accepted.value().acceptance->timeout_duration_ns,
-            Config().containment_only_disable_timeout_duration_ns);
-  EXPECT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
-
-  const auto status =
-      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
-  ASSERT_TRUE(status.ok());
-  ASSERT_TRUE(status.value().has_value());
-  EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kFailed);
-  EXPECT_EQ(status.value()->terminal_result,
-            ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);
-  ASSERT_TRUE(status.value()->error.has_value());
-  EXPECT_EQ(status.value()->error->code, "lifecycle_catalog_unavailable");
-  ASSERT_TRUE(status.value()->configuration_fence.has_value());
-  EXPECT_EQ(status.value()->configuration_fence->state, ConfigurationFenceState::kReleased);
-  ASSERT_TRUE(status.value()->disable_fence_released.has_value());
-  // Admission intentionally proceeds without a catalog. The held-fence lane
-  // retries the exact catalog once; persistent unavailability then resolves
-  // containment without authorizing a vendor primitive.
-  EXPECT_EQ(catalogs.load_count(), 2U);
-  EXPECT_EQ(kernel.begin_count(), 1U);
-  EXPECT_EQ(kernel.release_count(), 1U);
-  EXPECT_TRUE(kernel.saw_handoff_prepared());
-  EXPECT_TRUE(kernel.saw_release_prepared());
-  EXPECT_TRUE(kernel.terminal_candidate_locally_valid());
-  EXPECT_EQ(port->observation_count(), 0U);
+  const auto rejected = coordinator.SubmitLifecycle(intent);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().code, "lifecycle_catalog_unavailable");
+  EXPECT_EQ(kernel.begin_count(), 0U);
   EXPECT_EQ(port->dispatch_count(), 0U);
   EXPECT_TRUE(reservations.snapshot().empty());
 }
-
-TEST(ComponentLifecycleCoordinator, ExactDisableCanQualifyCatalogUnderHeldFenceAfterAdmissionMiss) {
-  ScopedTemporaryDirectory temporary;
-  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
-                            8U);
-  CCLCDomainReservationTable reservations;
-  FakeSnapshotSource snapshots(ResolvedDisableSnapshots());
-  FakeCatalogSource catalogs(DisableCatalog(), CatalogAvailability::kUnavailableOnce);
-  auto port = std::make_shared<FakeBrandPort>(
-      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kActive,
-                                                       ComponentLifecycleStateDTO::kDisabled});
-  FakeResolver resolver(port);
-  FakeKernelDisablePort kernel(journal);
-  FakeClock clock;
-  clock.set(100);
-  ManualScheduler scheduler;
-  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
-                                            resolver, kernel, clock, scheduler);
-
-  ASSERT_TRUE(coordinator.Start().ok());
-  auto intent = DisableIntent(coordinator.request_owner_epoch());
-  intent.request_context.request_id = RequestId("disable-catalog-late.1");
-  const auto accepted = coordinator.SubmitLifecycle(intent);
-  ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
-  ASSERT_TRUE(accepted.value().acceptance.has_value());
-  EXPECT_EQ(accepted.value().acceptance->timeout_duration_ns,
-            Config().containment_only_disable_timeout_duration_ns);
-  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
-
-  const auto status =
-      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
-  ASSERT_TRUE(status.ok());
-  ASSERT_TRUE(status.value().has_value());
-  EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kSucceeded);
-  EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
-  ASSERT_TRUE(status.value()->configuration_fence.has_value());
-  EXPECT_EQ(status.value()->configuration_fence->state, ConfigurationFenceState::kReleased);
-  EXPECT_EQ(catalogs.load_count(), 2U);
-  EXPECT_EQ(kernel.begin_count(), 1U);
-  EXPECT_EQ(kernel.release_count(), 1U);
-  EXPECT_EQ(port->dispatch_count(), 1U);
-  EXPECT_EQ(port->last_dispatched_primitive_id(), LifecyclePrimitiveId("disable"));
-  EXPECT_TRUE(reservations.snapshot().empty());
-}
-
-TEST(ComponentLifecycleCoordinator,
-     NoSnapshotDisablePromotesFullReconcilesTruthAndNeverDispatchesVendorMutation) {
-  ScopedTemporaryDirectory temporary;
-  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
-                            8U);
-  CCLCDomainReservationTable reservations;
-  const auto current = Snapshot("snapshot.after-full-stop.1", ComponentLifecycleStateDTO::kActive,
-                                ComponentLifecycleGeneration(4U));
-  FakeSnapshotSource snapshots({current, current}, 1U);
-  FakeCatalogSource catalogs(DisableCatalog());
-  auto port = std::make_shared<FakeBrandPort>(
-      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kActive});
-  FakeResolver resolver(port);
-  FakeKernelDisablePort kernel(journal);
-  FakeClock clock;
-  clock.set(100);
-  ManualScheduler scheduler;
-  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
-                                            resolver, kernel, clock, scheduler);
-
-  ASSERT_TRUE(coordinator.Start().ok());
-  auto intent = DisableIntent(coordinator.request_owner_epoch());
-  intent.request_context.request_id = RequestId("disable-promoted-full.1");
-  const auto accepted = coordinator.SubmitLifecycle(intent);
-  ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
-  ASSERT_TRUE(accepted.value().acceptance.has_value());
-  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
-
-  const auto status =
-      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
-  ASSERT_TRUE(status.ok());
-  ASSERT_TRUE(status.value().has_value());
-  EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kFailed);
-  EXPECT_EQ(status.value()->terminal_result,
-            ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);
-  EXPECT_EQ(status.value()->previous_state, ComponentLifecycleStateDTO::kActive);
-  EXPECT_EQ(status.value()->current_state, ComponentLifecycleStateDTO::kActive);
-  ASSERT_TRUE(status.value()->disable_handoff.has_value());
-  EXPECT_EQ(status.value()->disable_handoff->scope_resolution,
-            DisableHandoffScopeResolutionDTO::kPromotedToFull);
-  ASSERT_TRUE(status.value()->configuration_fence.has_value());
-  EXPECT_EQ(status.value()->configuration_fence->state, ConfigurationFenceState::kReleased);
-  ASSERT_TRUE(status.value()->disable_fence_released.has_value());
-  EXPECT_EQ(kernel.begin_count(), 1U);
-  EXPECT_EQ(kernel.release_count(), 1U);
-  EXPECT_EQ(port->observation_count(), 0U);
-  EXPECT_EQ(port->dispatch_count(), 0U);
-  EXPECT_TRUE(reservations.snapshot().empty());
-  EXPECT_TRUE(coordinator.accepting_new_requests());
-}
-
-TEST(ComponentLifecycleCoordinator,
-     PromotedFullContainmentGateRejectsUnseenAdmissionButPreservesExactReplay) {
-  ScopedTemporaryDirectory temporary;
-  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
-                            8U);
-  CCLCDomainReservationTable reservations;
-  FakeSnapshotSource snapshots({});
-  FakeCatalogSource catalogs(DisableCatalog());
-  auto port = std::make_shared<FakeBrandPort>(
-      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kActive});
-  FakeResolver resolver(port);
-  FakeKernelDisablePort kernel(journal, DisableHandoffProgress::kStoppingThenReady);
-  FakeClock clock;
-  clock.set(100);
-  WaitableManualScheduler scheduler;
-  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
-                                            resolver, kernel, clock, scheduler);
-
-  ASSERT_TRUE(coordinator.Start().ok());
-  auto disable = DisableIntent(coordinator.request_owner_epoch());
-  disable.request_context.request_id = RequestId("disable-promoted-full-gate.1");
-  const auto accepted = coordinator.SubmitLifecycle(disable);
-  ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
-  ASSERT_TRUE(accepted.value().acceptance.has_value());
-  ASSERT_TRUE(scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
-  EXPECT_FALSE(coordinator.accepting_new_requests());
-
-  const auto unseen = coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
-  ASSERT_FALSE(unseen.ok());
-  EXPECT_EQ(unseen.error().code, "component_lifecycle_admission_closed");
-  const auto replay = coordinator.SubmitLifecycle(disable);
-  ASSERT_TRUE(replay.ok()) << replay.error().code << ": " << replay.error().message;
-  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
-  ASSERT_TRUE(replay.value().acceptance.has_value());
-  EXPECT_EQ(replay.value().acceptance->lifecycle_transaction_id,
-            accepted.value().acceptance->lifecycle_transaction_id);
-  EXPECT_EQ(kernel.begin_count(), 1U);
-  EXPECT_EQ(kernel.release_count(), 0U);
-  EXPECT_EQ(port->dispatch_count(), 0U);
-}
-
-TEST(ComponentLifecycleCoordinator,
-     StoppingDisablePollsThroughSchedulerBeforeMutationAndReadyRelease) {
-  ScopedTemporaryDirectory temporary;
-  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
-                            8U);
-  CCLCDomainReservationTable reservations;
-  FakeSnapshotSource snapshots(ResolvedDisableSnapshots());
-  FakeCatalogSource catalogs(DisableCatalog());
-  auto port = std::make_shared<FakeBrandPort>(
-      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kActive,
-                                                       ComponentLifecycleStateDTO::kDisabled});
-  FakeResolver resolver(port);
-  FakeKernelDisablePort kernel(journal, DisableHandoffProgress::kStoppingThenReady);
-  FakeClock clock;
-  clock.set(100);
-  WaitableManualScheduler scheduler;
-  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
-                                            resolver, kernel, clock, scheduler);
-
-  ASSERT_TRUE(coordinator.Start().ok());
-  auto intent = DisableIntent(coordinator.request_owner_epoch());
-  intent.request_context.request_id = RequestId("disable-stopping.1");
-  const auto accepted = coordinator.SubmitLifecycle(intent);
-  ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
-  ASSERT_TRUE(scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
-  EXPECT_EQ(scheduler.last_priority(), SchedulerPriority::Lifecycle);
-  EXPECT_EQ(kernel.begin_count(), 1U);
-  EXPECT_EQ(kernel.status_count(), 1U);
-  EXPECT_EQ(kernel.release_count(), 0U);
-  EXPECT_TRUE(kernel.saw_handoff_prepared());
-  EXPECT_EQ(port->observation_count(), 0U);
-  EXPECT_EQ(port->dispatch_count(), 0U);
-
-  scheduler.AdvanceTo(1'100);
-  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
-
-  const auto status =
-      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
-  ASSERT_TRUE(status.ok());
-  ASSERT_TRUE(status.value().has_value());
-  EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kSucceeded);
-  EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
-  ASSERT_TRUE(status.value()->configuration_fence.has_value());
-  EXPECT_EQ(status.value()->configuration_fence->state, ConfigurationFenceState::kReleased);
-  ASSERT_TRUE(status.value()->disable_fence_released.has_value());
-  EXPECT_EQ(kernel.begin_count(), 1U);
-  EXPECT_EQ(kernel.status_count(), 2U);
-  EXPECT_EQ(kernel.release_count(), 1U);
-  EXPECT_TRUE(kernel.saw_release_prepared());
-  EXPECT_EQ(port->observation_count(), 2U);
-  EXPECT_EQ(port->dispatch_count(), 1U);
-  EXPECT_TRUE(reservations.snapshot().empty());
-}
-
-TEST(ComponentLifecycleCoordinator,
-     ShutdownWaitsForScheduleHandlePublicationAndCancelsTheLateHandle) {
-  ScopedTemporaryDirectory temporary;
-  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
-                            8U);
-  CCLCDomainReservationTable reservations;
-  FakeSnapshotSource snapshots(ResolvedDisableSnapshots());
-  FakeCatalogSource catalogs(DisableCatalog());
-  auto port = std::make_shared<FakeBrandPort>(
-      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kActive,
-                                                       ComponentLifecycleStateDTO::kDisabled});
-  FakeResolver resolver(port);
-  FakeKernelDisablePort kernel(journal, DisableHandoffProgress::kStoppingThenReady);
-  FakeClock clock;
-  clock.set(100);
-  BlockingScheduleReturnScheduler scheduler;
-  auto coordinator = std::make_unique<ComponentLifecycleCoordinator>(
-      Config(), journal, reservations, snapshots, catalogs, resolver, kernel, clock, scheduler);
-
-  ASSERT_TRUE(coordinator->Start().ok());
-  auto intent = DisableIntent(coordinator->request_owner_epoch());
-  intent.request_context.request_id = RequestId("disable-shutdown-publication-race.1");
-  const auto accepted = coordinator->SubmitLifecycle(intent);
-  ASSERT_TRUE(accepted.ok()) << accepted.error().code << ": " << accepted.error().message;
-  ASSERT_TRUE(scheduler.WaitForScheduleEntered(std::chrono::seconds(2)));
-
-  std::mutex destruction_mutex;
-  std::condition_variable destruction_changed;
-  bool destruction_started = false;
-  bool destruction_completed = false;
-  std::thread destroyer([&] {
-    {
-      std::lock_guard lock(destruction_mutex);
-      destruction_started = true;
-    }
-    destruction_changed.notify_all();
-    coordinator.reset();
-    {
-      std::lock_guard lock(destruction_mutex);
-      destruction_completed = true;
-    }
-    destruction_changed.notify_all();
-  });
-  {
-    std::unique_lock lock(destruction_mutex);
-    EXPECT_TRUE(destruction_changed.wait_for(lock, std::chrono::seconds(2),
-                                             [&] { return destruction_started; }));
-    EXPECT_FALSE(destruction_changed.wait_for(lock, std::chrono::milliseconds(50),
-                                              [&] { return destruction_completed; }));
-  }
-
-  scheduler.ReleaseSchedule();
-  destroyer.join();
-
-  EXPECT_TRUE(destruction_completed);
-  EXPECT_EQ(scheduler.cancel_count(), 1U);
-  scheduler.AdvanceTo(1'100);
-  EXPECT_EQ(scheduler.callback_count(), 0U);
-}
-
 TEST(ComponentLifecycleCoordinator, ShutdownFailsClosedWhenTheLifecycleSchedulerLaneCannotDrain) {
   EXPECT_DEATH(
       {

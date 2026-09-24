@@ -72,6 +72,11 @@ describe('Program workspace lifecycle controls', () => {
     expect(scene).toContain("programDraftPreview ? 'Draft Scene' : 'Applied Scene'");
     expect(scene).toContain('robot models and observation status remain from Applied Deployment');
     expect(scene).not.toContain('Draft objects · Applied robots');
+    // While execution is not Idle the live Scene is shown and the Draft is
+    // neither previewed nor compared.
+    expect(scene).toContain('const draftSceneDifferent = !executionActive && ');
+    expect(scene).toContain('const programDraftPreview = !executionActive && sceneSourceIsDraft(');
+    expect(scene).toContain('ownerSceneKnown && !executionActive');
   });
 
   it('wires fenced New, Revert, and Discard with concrete prerequisites', () => {
@@ -209,12 +214,19 @@ describe('Program workspace lifecycle controls', () => {
     expect(workspaceSource).toContain(
       'busy || authoringUnavailable || !mutationAvailable',
     );
-    // Authoring availability is presented once, classified by its typed
-    // cause, in the workbench notification rows rather than the canvas rail.
+    // Failures and transitions stay in the workbench notification rows. A
+    // non-Idle cycle is the direct consequence of a Run: it is an editor
+    // status beside the canvas, never a notification row.
     const appSource = readFileSync(new URL('../App.tsx', import.meta.url), 'utf8');
     expect(appSource).toContain('authoringUnavailableCause(authoringWorkspace.published, headlessSnapshot)');
     expect(appSource).toContain("authoringCause === 'not_admitted'");
-    expect(workspaceSource).not.toContain('Authoring unavailable. ${mutationUnavailableReason}');
+    expect(appSource).not.toContain("authoringCause === 'execution_active'");
+    expect(appSource).not.toContain('Authoring waits for Idle');
+    expect(workspaceSource).toContain(
+      'Run active. Draft inspection remains available; authoring waits for Idle.',
+    );
+    expect(workspaceSource).toContain('Authoring unavailable. ${mutationUnavailableReason}');
+    expect(workspaceSource).toContain('dismissible: false');
     expect(workspaceSource).toContain('? mutationUnavailableReason');
     expect(controlsSource).toContain('busy || !mutationAvailable');
     expect(workspaceSource).not.toContain('affect only later runs');

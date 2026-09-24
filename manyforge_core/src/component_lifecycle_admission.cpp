@@ -147,28 +147,6 @@ namespace {
   return result;
 }
 
-[[nodiscard]] std::vector<ComponentLifecycleDomainStatusDTO> unresolved_disable_domains(
-    const ComponentLifecycleIntentDTO& intent,
-    const ComponentLifecycleRequestedStateDTO& requested_state) {
-  std::vector<ComponentLifecycleDomainStatusDTO> result;
-  result.reserve(intent.expected_control_domains.size());
-  for (const auto& expected : intent.expected_control_domains) {
-    result.push_back({expected.control_domain_id,
-                      expected,
-                      std::nullopt,
-                      std::nullopt,
-                      std::nullopt,
-                      std::nullopt,
-                      requested_state,
-                      ComponentLifecycleDomainActionStateDTO::kNotStarted,
-                      ComponentLifecycleDomainEffectDTO::kNone,
-                      {},
-                      std::nullopt,
-                      std::nullopt});
-  }
-  return result;
-}
-
 }  // namespace
 
 Result<DisableHandoffComponentScopeExpectationDTO> BuildDisableHandoffComponentScopeExpectation(
@@ -261,30 +239,9 @@ Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
   bool lifecycle_mutation_eligible = false;
 
   if (!candidate.current_snapshot.has_value()) {
-    if (intent.intent != ComponentLifecycleIntentKindDTO::kDisable ||
-        !candidate.lifecycle_plan_catalogs.empty() ||
-        !candidate.disable_handoff_admission.has_value() ||
-        !candidate.disable_handoff_admission->locally_valid() ||
-        candidate.disable_handoff_admission->query.controllable_component_id !=
-            intent.controllable_component_id ||
-        candidate.disable_handoff_admission->query.request_kind !=
-            DisableHandoffScopeRequestKindDTO::kFullStopRequired ||
-        candidate.disable_handoff_admission->query.component_expectation.has_value() ||
-        candidate.disable_handoff_admission->scope_resolution !=
-            DisableHandoffScopeResolutionDTO::kPromotedToFull) {
-      return reject("component_lifecycle_scope_unresolved",
-                    "only a recognized promoted Full-Stop Disable may omit current scope",
-                    "unresolved_scope_not_promoted_disable");
-    }
-    if (intent.expected_component_lifecycle_generation.value() >
-        candidate.durable_component_generation_predecessor.value()) {
-      return reject("component_lifecycle_current_snapshot_mismatch",
-                    "an unresolved-scope Disable expectation cannot advance the durable "
-                    "predecessor",
-                    "unresolved_disable_expected_generation_ahead");
-    }
-    timeout_duration_ns = candidate.containment_only_disable_timeout_duration_ns;
-    domains = unresolved_disable_domains(intent, requested_state);
+    return reject("component_lifecycle_scope_unresolved",
+                  "ordinary lifecycle work requires an exact current component snapshot",
+                  "current_snapshot_missing");
   } else {
     const auto& snapshot = *candidate.current_snapshot;
     if (!snapshot.locally_valid() ||
@@ -295,68 +252,47 @@ Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
                     "the coherent current component snapshot does not match admission",
                     "snapshot_identity_or_generation_mismatch");
     }
-    if (intent.intent != ComponentLifecycleIntentKindDTO::kDisable) {
-      if (snapshot.active_publication_receipt.request.candidate_graph_revision !=
-              intent.expected_graph_revision ||
-          candidate.lifecycle_plan_catalogs.size() != snapshot.provider_occurrences.size()) {
-        return reject("component_lifecycle_current_snapshot_mismatch",
-                      "the coherent current graph or catalog closure does not match admission",
-                      "snapshot_graph_or_catalog_count_mismatch");
-      }
-      if (intent.expected_component_lifecycle_generation !=
-          candidate.durable_component_generation_predecessor) {
-        return reject("component_lifecycle_current_snapshot_mismatch",
-                      "the lifecycle expectation does not match the durable predecessor",
-                      "expected_generation_or_watermark_mismatch");
-      }
-      if (intent.expected_control_domains.size() != snapshot.domains.size()) {
-        return reject("component_lifecycle_configuration_stale",
-                      "the current domain set differs from the caller expectation",
-                      "domain_set_changed");
-      }
-      for (std::size_t index = 0U; index < snapshot.domains.size(); ++index) {
-        if (!ExpectedDomainMatchesResolvedScope(intent.expected_control_domains[index],
-                                                snapshot.domains[index])) {
-          return reject("component_lifecycle_configuration_stale",
-                        "the current domain configuration differs from the caller expectation",
-                        "domain_revision_or_route_changed");
-        }
-      }
-    } else if (intent.expected_component_lifecycle_generation.value() >
-               candidate.durable_component_generation_predecessor.value()) {
+    if (snapshot.active_publication_receipt.request.candidate_graph_revision !=
+            intent.expected_graph_revision ||
+        candidate.lifecycle_plan_catalogs.size() != snapshot.provider_occurrences.size() ||
+        intent.expected_component_lifecycle_generation !=
+            candidate.durable_component_generation_predecessor) {
       return reject("component_lifecycle_current_snapshot_mismatch",
-                    "a Disable expectation cannot advance the durable predecessor",
-                    "disable_expected_generation_ahead");
+                    "the current graph, catalogs or lifecycle generation do not match admission",
+                    "snapshot_identity_or_generation_mismatch");
     }
-    const bool complete_catalog_closure =
-        candidate.lifecycle_plan_catalogs.size() == snapshot.provider_occurrences.size();
-    bool catalogs_qualified = complete_catalog_closure;
-    if (complete_catalog_closure) {
-      for (std::size_t index = 0U; index < snapshot.provider_occurrences.size(); ++index) {
-        catalogs_qualified = catalogs_qualified &&
-                             catalog_matches_occurrence(candidate.lifecycle_plan_catalogs[index],
-                                                        snapshot.provider_occurrences[index]);
+    if (intent.expected_control_domains.size() != snapshot.domains.size()) {
+      return reject("component_lifecycle_configuration_stale",
+                    "the current domain set differs from the caller expectation",
+                    "domain_set_changed");
+    }
+    for (std::size_t index = 0U; index < snapshot.domains.size(); ++index) {
+      if (!ExpectedDomainMatchesResolvedScope(intent.expected_control_domains[index],
+                                              snapshot.domains[index])) {
+        return reject("component_lifecycle_configuration_stale",
+                      "the current domain configuration differs from the caller expectation",
+                      "domain_revision_or_route_changed");
       }
     }
-    if (intent.intent != ComponentLifecycleIntentKindDTO::kDisable && !catalogs_qualified) {
+    bool catalogs_qualified = true;
+    for (std::size_t index = 0U; index < snapshot.provider_occurrences.size(); ++index) {
+      catalogs_qualified = catalogs_qualified &&
+                           catalog_matches_occurrence(candidate.lifecycle_plan_catalogs[index],
+                                                      snapshot.provider_occurrences[index]);
+    }
+    if (!catalogs_qualified) {
       return reject("component_lifecycle_catalog_mismatch",
                     "one or more lifecycle catalogs do not match the accepted provider closure",
                     "catalog_identity_or_shape_mismatch");
     }
-    const auto selected_timeout = catalogs_qualified
-                                      ? admission_timeout(intent, candidate.lifecycle_plan_catalogs)
-                                      : std::nullopt;
-    if (!selected_timeout.has_value() &&
-        intent.intent != ComponentLifecycleIntentKindDTO::kDisable) {
+    const auto selected_timeout = admission_timeout(intent, candidate.lifecycle_plan_catalogs);
+    if (!selected_timeout.has_value()) {
       return reject("component_lifecycle_intent_unsupported",
                     "one or more accepted provider catalogs do not support the lifecycle intent",
                     "catalog_plan_missing");
     }
-    timeout_duration_ns =
-        selected_timeout.value_or(candidate.containment_only_disable_timeout_duration_ns);
-    if (selected_timeout.has_value()) {
-      qualified_catalogs = candidate.lifecycle_plan_catalogs;
-    }
+    timeout_duration_ns = *selected_timeout;
+    qualified_catalogs = candidate.lifecycle_plan_catalogs;
     component_state = snapshot.component_lifecycle_state;
     domains = resolved_status_domains(intent, snapshot, requested_state);
     reserved_domains.reserve(snapshot.domains.size());
@@ -380,16 +316,12 @@ Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
       }
       lifecycle_mutation_eligible =
           candidate.disable_handoff_admission->scope_resolution ==
-              DisableHandoffScopeResolutionDTO::kExact &&
-          snapshot.active_publication_receipt.request.candidate_graph_revision ==
-              intent.expected_graph_revision &&
-          intent.expected_component_lifecycle_generation ==
-              candidate.durable_component_generation_predecessor &&
-          intent.expected_control_domains.size() == snapshot.domains.size() &&
-          std::equal(intent.expected_control_domains.begin(), intent.expected_control_domains.end(),
-                     snapshot.domains.begin(), [](const auto& expected, const auto& current) {
-                       return ExpectedDomainMatchesResolvedScope(expected, current);
-                     });
+              DisableHandoffScopeResolutionDTO::kExact;
+      if (!lifecycle_mutation_eligible) {
+        return reject("component_lifecycle_disable_admission_mismatch",
+                      "ordinary Disable cannot promote to Stop or an uncertain scope",
+                      "disable_scope_not_exact");
+      }
     } else if (candidate.disable_handoff_admission.has_value()) {
       return reject("component_lifecycle_admission_invalid",
                     "a non-Disable lifecycle admission cannot carry a Kernel handoff snapshot",

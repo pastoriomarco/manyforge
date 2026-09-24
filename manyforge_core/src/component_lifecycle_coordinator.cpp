@@ -432,7 +432,8 @@ class ComponentLifecycleCoordinator::Impl final {
        const ICCLCBrandLifecyclePortResolver& lifecycle_port_resolver,
        ICCLCKernelDisableHandoffPort& kernel_disable_handoff_port, IClock& clock,
        IScheduler& scheduler, IKernelCellAdmissionPort* kernel_cell_admission_port,
-       std::optional<ComponentLifecycleCoordinatorRouteServices> route_services)
+       std::optional<ComponentLifecycleCoordinatorRouteServices> route_services,
+       ICCLCComponentCommandReadinessPort* component_command_readiness_port)
       : config_(std::move(config)),
         request_epoch_(std::make_shared<const RequestOwnerEpoch>(config_.request_owner_epoch)),
         journal_(journal),
@@ -447,6 +448,7 @@ class ComponentLifecycleCoordinator::Impl final {
             kernel_cell_admission_port != nullptr
                 ? kernel_cell_admission_port
                 : dynamic_cast<IKernelCellAdmissionPort*>(&kernel_disable_handoff_port)),
+        component_command_readiness_port_(component_command_readiness_port),
         route_services_(std::move(route_services)),
         worker_pool_(kMaxCoordinatorActiveTransactions),
         kernel_worker_pool_(kMaxCoordinatorActiveTransactions) {}
@@ -889,9 +891,7 @@ class ComponentLifecycleCoordinator::Impl final {
     }
 
     for (std::size_t attempt = 0U; attempt < kMaximumAdmissionResolutionAttempts; ++attempt) {
-      const bool force_full_disable = intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
-                                      attempt + 1U == kMaximumAdmissionResolutionAttempts;
-      const auto facts = ReadAdmissionFacts(intent, force_full_disable);
+      const auto facts = ReadAdmissionFacts(intent);
       if (!facts.ok()) {
         return Result<CCLCLifecycleRequestResultDTO>::Err(facts.error());
       }
@@ -1350,6 +1350,9 @@ class ComponentLifecycleCoordinator::Impl final {
     std::optional<CellAdmissionClaimReleaseDTO> cell_claim_release;
     std::uint64_t expected_observation_generation = 0U;
     bool initialized = false;
+    /// The Kernel closed this component's eligibility for this transaction;
+    /// every terminal settlement must then publish its complete result.
+    bool command_eligibility_closed = false;
     bool lifecycle_lane_active = false;
     bool release_scheduled = false;
     bool release_retry_scheduled = false;
@@ -1494,6 +1497,29 @@ class ComponentLifecycleCoordinator::Impl final {
              ContentDigest(std::move(digest))}};
   }
 
+  [[nodiscard]] Result<void> RequireSettledNativeApply() {
+    try {
+      const auto pending = journal_.ReadUnsettledNativeApplyPlan();
+      if (!pending.ok()) return Result<void>::Err(pending.error());
+      if (pending.value().has_value()) {
+        auto error = coordinator_error(
+            "component_lifecycle_native_apply_unsettled",
+            "a planned native Apply has not been adopted; ordinary lifecycle and route changes remain closed",
+            "native_apply_plan_pending");
+        error.details["apply_id"] = pending.value()->apply_id.value();
+        error.details["apply_generation"] =
+            std::to_string(pending.value()->apply_generation.value());
+        return Result<void>::Err(std::move(error));
+      }
+      return Result<void>::Ok();
+    } catch (...) {
+      return Result<void>::Err(coordinator_error(
+          "component_lifecycle_native_apply_status_unavailable",
+          "CCLC could not verify whether the native Apply plan settled",
+          "native_apply_plan_query_failed"));
+    }
+  }
+
   [[nodiscard]] Result<CCLCRouteSelectionRequestResultDTO> CommitRouteAdmission(
       const RouteSelectionIntentDTO& intent, std::uint64_t admission_gate_generation,
       bool& known_unstarted, const ActiveControlConfigurationDTO* recovery_predecessor) {
@@ -1543,6 +1569,10 @@ class ComponentLifecycleCoordinator::Impl final {
     }
     if (reinspection.value().has_value()) {
       return ReplayRouteResult(*reinspection.value());
+    }
+    const auto native_apply = RequireSettledNativeApply();
+    if (!native_apply.ok()) {
+      return Result<CCLCRouteSelectionRequestResultDTO>::Err(native_apply.error());
     }
 
     Result<RouteSelectionCurrentSnapshot> snapshot =
@@ -3215,35 +3245,15 @@ class ComponentLifecycleCoordinator::Impl final {
     }
   }
 
-  [[nodiscard]] Result<AdmissionFacts> ReadAdmissionFacts(const ComponentLifecycleIntentDTO& intent,
-                                                          bool force_full_disable) {
-    const auto full_stop_facts = [&]() -> Result<AdmissionFacts> {
-      try {
-        const auto admission = kernel_disable_handoff_port_.ObserveDisableHandoffAdmission(
-            {intent.controllable_component_id, DisableHandoffScopeRequestKindDTO::kFullStopRequired,
-             std::nullopt});
-        if (!admission.ok()) {
-          return Result<AdmissionFacts>::Err(admission.error());
-        }
-        return Result<AdmissionFacts>::Ok({std::nullopt, {}, admission.value()});
-      } catch (...) {
-        return Result<AdmissionFacts>::Err(
-            coordinator_error("component_lifecycle_full_stop_admission_failed",
-                              "the Kernel Full-Stop admission observation raised an exception",
-                              "kernel_admission_exception"));
-      }
-    };
+  [[nodiscard]] Result<AdmissionFacts> ReadAdmissionFacts(const ComponentLifecycleIntentDTO& intent) {
     try {
-      if (force_full_disable) {
-        return full_stop_facts();
-      }
       const auto snapshot =
           current_snapshot_source_.ReadCurrentComponentSnapshot(intent.controllable_component_id);
-      if (snapshot.ok()) {
+      if (!snapshot.ok()) return Result<AdmissionFacts>::Err(snapshot.error());
+      {
         AdmissionFacts result;
         result.current_snapshot = snapshot.value();
         result.catalogs.reserve(snapshot.value().provider_occurrences.size());
-        bool complete_catalog_closure = true;
         for (const auto& provider : snapshot.value().provider_occurrences) {
           const auto catalog = lifecycle_plan_catalog_source_.LoadExactLifecyclePlanCatalog(
               provider.provider_manifest_id, provider.provider_manifest_revision,
@@ -3254,49 +3264,36 @@ class ComponentLifecycleCoordinator::Impl final {
               catalog.value().provider_manifest_revision == provider.provider_manifest_revision &&
               catalog.value().catalog_digest == provider.lifecycle_plan_catalog_digest;
           if (!catalog_verified) {
-            if (intent.intent != ComponentLifecycleIntentKindDTO::kDisable) {
-              return Result<AdmissionFacts>::Err(
-                  catalog.ok()
-                      ? coordinator_error(
-                            "component_lifecycle_catalog_mismatch",
-                            "the lifecycle catalog does not match its canonical provider closure",
-                            "catalog_digest_or_provider_identity_mismatch")
-                      : catalog.error());
-            }
-            complete_catalog_closure = false;
-            break;
+            return Result<AdmissionFacts>::Err(
+                catalog.ok()
+                    ? coordinator_error(
+                          "component_lifecycle_catalog_mismatch",
+                          "the lifecycle catalog does not match its canonical provider closure",
+                          "catalog_digest_or_provider_identity_mismatch")
+                    : catalog.error());
           }
           result.catalogs.push_back(catalog.value());
-        }
-        if (!complete_catalog_closure) {
-          result.catalogs.clear();
         }
         if (intent.intent == ComponentLifecycleIntentKindDTO::kDisable) {
           const auto expectation = BuildDisableHandoffComponentScopeExpectation(snapshot.value());
           if (!expectation.ok()) {
-            return full_stop_facts();
+            return Result<AdmissionFacts>::Err(expectation.error());
           }
           const auto admission = kernel_disable_handoff_port_.ObserveDisableHandoffAdmission(
               {intent.controllable_component_id,
                DisableHandoffScopeRequestKindDTO::kResolvedComponentScope, expectation.value()});
           if (!admission.ok()) {
-            return full_stop_facts();
+            return Result<AdmissionFacts>::Err(admission.error());
           }
           result.disable_admission = admission.value();
         }
         return Result<AdmissionFacts>::Ok(std::move(result));
       }
-      if (intent.intent != ComponentLifecycleIntentKindDTO::kDisable) {
-        return Result<AdmissionFacts>::Err(snapshot.error());
-      }
     } catch (...) {
-      if (intent.intent != ComponentLifecycleIntentKindDTO::kDisable) {
-        return Result<AdmissionFacts>::Err(coordinator_error(
-            "component_lifecycle_admission_source_failed",
-            "a lifecycle admission source raised an exception", "admission_source_exception"));
-      }
+      return Result<AdmissionFacts>::Err(coordinator_error(
+          "component_lifecycle_admission_source_failed",
+          "a lifecycle admission source raised an exception", "admission_source_exception"));
     }
-    return full_stop_facts();
   }
 
   [[nodiscard]] Result<CCLCLifecycleRequestResultDTO> CommitAdmission(
@@ -3321,6 +3318,12 @@ class ComponentLifecycleCoordinator::Impl final {
       return ReplayResult(*reinspection.value());
     }
     known_unstarted = true;
+    admission_lock.unlock();
+    const auto native_apply = RequireSettledNativeApply();
+    admission_lock.lock();
+    if (!native_apply.ok()) {
+      return Result<CCLCLifecycleRequestResultDTO>::Err(native_apply.error());
+    }
     if (!accepting_.load(std::memory_order_acquire) ||
         admission_gate_generation != admission_gate_generation_) {
       return Result<CCLCLifecycleRequestResultDTO>::Err(coordinator_error(
@@ -3345,12 +3348,6 @@ class ComponentLifecycleCoordinator::Impl final {
                    : watermark->second);
     if (watermark != component_generation_watermarks_.end() &&
         watermark->second != predecessor_value) {
-      if (intent.intent == ComponentLifecycleIntentKindDTO::kDisable) {
-        return Result<CCLCLifecycleRequestResultDTO>::Err(coordinator_error(
-            "component_lifecycle_snapshot_changed_during_admission",
-            "the resolved Disable snapshot does not match the durable component generation",
-            "disable_snapshot_watermark_mismatch_requires_promotion"));
-      }
       return Result<CCLCLifecycleRequestResultDTO>::Err(
           coordinator_error("component_lifecycle_generation_conflict",
                             "the coherent snapshot does not match the durable component generation",
@@ -3492,6 +3489,9 @@ class ComponentLifecycleCoordinator::Impl final {
                             "admission_precommit_gate_changed"));
     }
     const auto semantic_digest = detail::ComponentLifecycleSemanticIntentDigest(intent);
+    // An ordinary lifecycle claim is whole-cell and exclusive (idle cell, no
+    // other claim), so it carries no resource/configuration scope; the
+    // journal persists and recovers it in exactly that form.
     CellAdmissionClaimIntentDTO claim_intent{
         CellAdmissionClaimKindDTO::kComponentLifecycle,
         CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
@@ -3503,7 +3503,7 @@ class ComponentLifecycleCoordinator::Impl final {
         {},
         std::nullopt,
         std::nullopt,
-        intent.program_node_evidence};
+        std::nullopt};
     admission_persistence_active_ = true;
     known_unstarted = false;
     admission_lock.unlock();
@@ -3702,7 +3702,11 @@ class ComponentLifecycleCoordinator::Impl final {
                                  : ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect;
     failed.error = error;
     failed.remaining_duration_ns = 0;
-    if (!failed.locally_valid() || !CommitTerminalAndReleaseClaim(runtime, std::move(failed))) {
+    if (!failed.locally_valid() || !PublishTerminalComponentReadiness(runtime, failed).ok()) {
+      CloseAdmission();
+      return;
+    }
+    if (!CommitTerminalAndReleaseClaim(runtime, std::move(failed))) {
       return;
     }
     runtime->recovering = false;
@@ -5032,6 +5036,11 @@ class ComponentLifecycleCoordinator::Impl final {
             "one_or_more_domains_failed");
       }
     }
+    if (!terminal_status.locally_valid() ||
+        !PublishTerminalComponentReadiness(runtime, terminal_status).ok()) {
+      CloseAdmission();
+      return;
+    }
     auto completed_attempt = PreparedDisableFenceReleaseAttempt(request, runtime->effect_sequence);
     completed_attempt.state = CCLCEffectAttemptStateDTO::kCompleted;
     completed_attempt.disable_fence_release_result = DisableFenceReleaseEffectResultDTO{
@@ -5069,6 +5078,34 @@ class ComponentLifecycleCoordinator::Impl final {
   }
 
   [[nodiscard]] bool Initialize(const std::shared_ptr<RuntimeState>& runtime) {
+    // Close command eligibility before any adapter work. The held claim
+    // already excludes commands; closing first makes every later failure
+    // settle command-closed unless a verified result reopens it.
+    if (component_command_readiness_port_ != nullptr && !runtime->command_eligibility_closed) {
+      Result<ComponentCommandReadinessDTO> closed =
+          Result<ComponentCommandReadinessDTO>::Err(coordinator_error(
+              "component_lifecycle_readiness_close_failed",
+              "the Kernel could not close component command eligibility",
+              "close_exception"));
+      try {
+        closed = component_command_readiness_port_->CloseComponentCommandEligibility(
+            runtime->status.acceptance.lifecycle_transaction_id,
+            runtime->status.accepted_intent.controllable_component_id);
+      } catch (...) {
+      }
+      if (!closed.ok() || closed.value().command_eligible ||
+          closed.value().controllable_component_id !=
+              runtime->status.accepted_intent.controllable_component_id) {
+        FailBeforeEffect(runtime, closed.ok()
+                                      ? coordinator_error(
+                                            "component_lifecycle_readiness_close_failed",
+                                            "the Kernel did not read back a closed component",
+                                            "close_readback_mismatch")
+                                      : closed.error());
+        return false;
+      }
+      runtime->command_eligibility_closed = true;
+    }
     if (!runtime->qualified_catalogs.has_value() ||
         runtime->qualified_catalogs->size() != runtime->status.domains.size()) {
       FailBeforeEffect(
@@ -5608,6 +5645,68 @@ class ComponentLifecycleCoordinator::Impl final {
     FailTransaction(runtime, error);
   }
 
+  /// Publish the complete component result to the Kernel before durable
+  /// settlement. Eligibility opens only for a verified Active result; a known
+  /// no-effect failure keeps its predecessor state; any other failure is
+  /// closed. Nothing is published when this transaction never closed the
+  /// component (a preflight refusal leaves the predecessor unchanged).
+  [[nodiscard]] Result<void> PublishTerminalComponentReadiness(
+      const std::shared_ptr<RuntimeState>& runtime, const ComponentLifecycleStatusDTO& status) {
+    if (component_command_readiness_port_ == nullptr ||
+        (!runtime->command_eligibility_closed && !runtime->recovering)) {
+      return Result<void>::Ok();
+    }
+    const bool eligible =
+        status.terminal_result.has_value() &&
+        *status.terminal_result != ComponentLifecycleTerminalResultDTO::kFailedPartialEffect &&
+        status.current_state == ComponentLifecycleStateDTO::kActive;
+    const ComponentCommandReadinessPublicationDTO publication{
+        ComponentReadinessAuthorityDTO::kLifecycleClaim,
+        status.acceptance.lifecycle_transaction_id,
+        std::nullopt,
+        status.accepted_intent.controllable_component_id,
+        status.acceptance.component_lifecycle_generation, eligible};
+    Result<ComponentCommandReadinessDTO> published =
+        Result<ComponentCommandReadinessDTO>::Err(coordinator_error(
+            "component_lifecycle_readiness_publication_failed",
+            "the Kernel component readiness publication raised an exception",
+            "publication_exception"));
+    try {
+      published = component_command_readiness_port_->PublishComponentCommandReadiness(publication);
+    } catch (...) {
+    }
+    if (!published.ok() && !runtime->command_eligibility_closed) {
+      // Recovery after owner replacement may no longer hold a claim in the
+      // new Kernel. Settle only on a verified closed readback; otherwise the
+      // claim is retained and admission closes.
+      Result<ComponentCommandReadinessDTO> readback =
+          Result<ComponentCommandReadinessDTO>::Err(published.error());
+      try {
+        readback = component_command_readiness_port_->ReadComponentCommandReadiness(
+            publication.controllable_component_id);
+      } catch (...) {
+      }
+      if (readback.ok() && !readback.value().command_eligible &&
+          readback.value().controllable_component_id == publication.controllable_component_id) {
+        return Result<void>::Ok();
+      }
+      return Result<void>::Err(published.error());
+    }
+    if (!published.ok()) {
+      return Result<void>::Err(published.error());
+    }
+    if (published.value().controllable_component_id != publication.controllable_component_id ||
+        published.value().component_lifecycle_generation !=
+            publication.component_lifecycle_generation ||
+        published.value().command_eligible != eligible) {
+      return Result<void>::Err(coordinator_error(
+          "component_lifecycle_readiness_publication_failed",
+          "the Kernel component readiness readback differs from the lifecycle result",
+          "readiness_readback_mismatch"));
+    }
+    return Result<void>::Ok();
+  }
+
   [[nodiscard]] bool CommitTerminalAndReleaseClaim(const std::shared_ptr<RuntimeState>& runtime,
                                                    ComponentLifecycleStatusDTO status) {
     if (!runtime->cell_claim.has_value()) {
@@ -5725,7 +5824,16 @@ class ComponentLifecycleCoordinator::Impl final {
                                         : ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect;
     status.error = error;
     status.remaining_duration_ns = 0;
-    if (!status.locally_valid() || !CommitTerminalAndReleaseClaim(runtime, std::move(status))) {
+    if (!status.locally_valid()) {
+      return;
+    }
+    // Release after a known failure requires verified containment: the
+    // Kernel must read back the settled result. Otherwise keep the claim.
+    if (!PublishTerminalComponentReadiness(runtime, status).ok()) {
+      CloseAdmission();
+      return;
+    }
+    if (!CommitTerminalAndReleaseClaim(runtime, std::move(status))) {
       return;
     }
     Complete(runtime);
@@ -5743,7 +5851,16 @@ class ComponentLifecycleCoordinator::Impl final {
     status.error.reset();
     status.reconciliation_required = false;
     status.remaining_duration_ns = 0;
-    if (!status.locally_valid() || !CommitTerminalAndReleaseClaim(runtime, std::move(status))) {
+    if (!status.locally_valid()) {
+      return;
+    }
+    // Success requires the verified Kernel result. Otherwise this is a
+    // known failure after effects, which settles command-closed.
+    if (auto published = PublishTerminalComponentReadiness(runtime, status); !published.ok()) {
+      FailTransaction(runtime, published.error());
+      return;
+    }
+    if (!CommitTerminalAndReleaseClaim(runtime, std::move(status))) {
       return;
     }
     Complete(runtime);
@@ -5991,6 +6108,7 @@ class ComponentLifecycleCoordinator::Impl final {
   IClock& clock_;
   IScheduler& scheduler_;
   IKernelCellAdmissionPort* kernel_cell_admission_port_;
+  ICCLCComponentCommandReadinessPort* component_command_readiness_port_;
   std::optional<ComponentLifecycleCoordinatorRouteServices> route_services_;
   FixedWorkerPool worker_pool_;
   FixedWorkerPool kernel_worker_pool_;
@@ -6033,11 +6151,13 @@ ComponentLifecycleCoordinator::ComponentLifecycleCoordinator(
     const ICCLCBrandLifecyclePortResolver& lifecycle_port_resolver,
     ICCLCKernelDisableHandoffPort& kernel_disable_handoff_port, IClock& clock,
     IScheduler& scheduler, IKernelCellAdmissionPort* kernel_cell_admission_port,
-    std::optional<ComponentLifecycleCoordinatorRouteServices> route_services)
+    std::optional<ComponentLifecycleCoordinatorRouteServices> route_services,
+    ICCLCComponentCommandReadinessPort* component_command_readiness_port)
     : impl_(std::make_unique<Impl>(
           std::move(config), journal, domain_reservations, current_snapshot_source,
           lifecycle_plan_catalog_source, lifecycle_port_resolver, kernel_disable_handoff_port,
-          clock, scheduler, kernel_cell_admission_port, std::move(route_services))) {}
+          clock, scheduler, kernel_cell_admission_port, std::move(route_services),
+          component_command_readiness_port)) {}
 
 ComponentLifecycleCoordinator::~ComponentLifecycleCoordinator() = default;
 

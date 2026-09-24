@@ -10,6 +10,7 @@
 #include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
 #include <manyforge_core/kernel_cell_admission_owner.hpp>
 #include <manyforge_core/orphan_resource_reconciliation.hpp>
+#include <manyforge_core/ports/icclc_component_command_readiness_port.hpp>
 #include <manyforge_core/ports/i_manager_liveness_fail_safe_port.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
 #include <manyforge_core/ports/iaddressed_operation_owner.hpp>
@@ -162,7 +163,6 @@ struct KernelDisableHandoffRuntimeSnapshotDTO final {
   GraphRevision graph_revision;
   std::uint64_t operation_resource_generation{};
   std::vector<CurrentDomainActiveControlConfigurationDTO> current_active_control_configurations;
-  std::optional<ComponentLifecycleGeneration> current_component_lifecycle_generation;
   StopGeneration current_cell_stop_generation{0U};
   std::vector<OperationId> affected_queued_operations;
   std::uint64_t affected_active_operation_count{};
@@ -564,7 +564,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// registrations and independently retained readiness projection. An
   /// unreconciled publication carries no candidate registrations and closes
   /// admission for that domain while leaving its observable old runtime
-  /// inventory intact under the held route fence.
+  /// inventory intact under the held route fence. Route readiness says only
+  /// that the domain route and its Stop readiness are coherent; it never
+  /// grants or removes a component's command eligibility.
   [[nodiscard]] Result<RuntimeRouteConfigurationReadbackDTO> publish_runtime_route_configuration(
       ActiveControlConfigurationDTO configuration,
       std::vector<RuntimeParticipantExecutionRegistration> registrations = {},
@@ -581,6 +583,27 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// I/O.
   [[nodiscard]] Result<std::optional<RuntimeRouteConfigurationReadbackDTO>>
   current_runtime_route_configuration(const ControlDomainId& control_domain_id) const;
+
+  /// Close one component's command eligibility under its exact held
+  /// lifecycle claim, before any transition effect. Routes, engines and Stop
+  /// readiness stay installed; Stop and containment remain available.
+  [[nodiscard]] Result<ComponentCommandReadinessDTO> close_component_command_eligibility(
+      const LifecycleTransactionId& lifecycle_transaction_id,
+      const ControllableComponentId& controllable_component_id);
+
+  /// Publish one complete component result: re-seal every participant of the
+  /// component at the published lifecycle generation (reusing engines, route
+  /// configurations and Stop-plan bytes) and set its eligibility for all of
+  /// its domains together. The caller supplies the rebuilt participant
+  /// resolver whose physical registrations carry the same generation. A
+  /// failure leaves the component command-closed.
+  [[nodiscard]] Result<ComponentCommandReadinessDTO> publish_component_command_readiness(
+      const ComponentCommandReadinessPublicationDTO& publication,
+      RuntimeParticipantAdmissionResolver participant_resolver = {});
+
+  /// Bounded readback of one component's current command eligibility.
+  [[nodiscard]] Result<ComponentCommandReadinessDTO> component_command_readiness(
+      const ControllableComponentId& controllable_component_id) const;
 
   /// A removed subordinate engine stays lifetime-pinned while an operation
   /// still references it. Once this returns false, release_retired_engine()
@@ -625,6 +648,16 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct PreviewSession;
 
   [[nodiscard]] bool operation_control_reconfiguration_busy_locked() const;
+  /// The one eligibility predicate shared by single, coordinated, manual,
+  /// Program, arm and gripper dispatch. A domain without route authority has
+  /// no lifecycle projection to consult. Returns the refusal, if any.
+  [[nodiscard]] std::optional<ErrorDTO> component_command_refusal_locked(
+      const RuntimeParticipantExecutionRegistration& registration) const;
+  [[nodiscard]] Result<void> require_held_lifecycle_claim_locked(
+      const LifecycleTransactionId& lifecycle_transaction_id) const;
+  [[nodiscard]] Result<void> require_idle_for_component_readiness_locked() const;
+  [[nodiscard]] Result<void> require_component_routes_current_locked(
+      const ControllableComponentId& controllable_component_id, bool command_eligible) const;
   [[nodiscard]] std::vector<IResolvedParticipantExecutionEngine*> operation_control_engines_locked(
       const std::vector<RuntimeParticipantExecutionRegistration>& registrations) const;
   [[nodiscard]] const RuntimeParticipantExecutionRegistration* registration_for(
@@ -776,6 +809,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::map<ControlDomainId, RuntimeRouteConfigurationReadbackDTO>
       runtime_route_configuration_readbacks_;
   std::set<ControlDomainId> runtime_route_configuration_publication_required_;
+  /// Component command eligibility, separate from route readiness. Guarded
+  /// like the route readbacks it is checked together with.
+  std::map<ControllableComponentId, ComponentCommandReadinessDTO> component_command_readiness_;
   IClock& clock_;
   IScheduler& scheduler_;
   IOperationJournal& journal_;

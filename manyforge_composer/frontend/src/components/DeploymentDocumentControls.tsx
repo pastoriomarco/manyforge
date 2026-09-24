@@ -34,6 +34,11 @@ export function DeploymentDocumentControls({
     && workspace.managerApplied.deploymentRevision !== null
     && !draftMatchesManager;
   const pendingConfirmation = controller.pendingApplyConfirmation;
+  // Why authoring is blocked comes first, so every disabled control explains
+  // itself the same way the Program controls do.
+  const blockReason = controller.busy
+    ? 'Another Deployment operation is in progress.'
+    : controller.mutationUnavailableReason;
   const chooseArtifact = useCallback((
     _kind: ArtifactKind,
     entry: FileBrowserEntry | null,
@@ -74,24 +79,35 @@ export function DeploymentDocumentControls({
           <button
             type="button"
             disabled={!controller.mutationAvailable || controller.busy}
+            title={blockReason ?? 'Open a Deployment as the Draft.'}
             onClick={() => setAction('open')}
           >Open</button>
           <button
             type="button"
             disabled={!controller.mutationAvailable || controller.busy || !workspace?.draft.document || !workspace.saved.path || !workspace.draft.differsFromSaved}
+            title={blockReason ?? (!workspace?.draft.document
+              ? 'No Deployment Draft is loaded.'
+              : !workspace.saved.path
+                ? 'The Draft has no saved file yet; use Save As.'
+                : !workspace.draft.differsFromSaved
+                  ? 'Draft already matches Saved.'
+                  : 'Save the current Deployment Draft.')}
             onClick={() => { void controller.save(); }}
           >Save</button>
           <button
             type="button"
             disabled={!controller.mutationAvailable || controller.busy || !workspace?.draft.document}
+            title={blockReason ?? (!workspace?.draft.document
+              ? 'No Deployment Draft is loaded.'
+              : 'Save the current Deployment Draft to another file.')}
             onClick={() => setAction('save_as')}
           >Save As</button>
           <button
             type="button"
             disabled={!controller.mutationAvailable || controller.busy || !hasUnappliedChanges}
-            title={hasUnappliedChanges
+            title={blockReason ?? (hasUnappliedChanges
               ? 'Discard Draft changes and return to Manager Applied.'
-              : 'Draft already matches Manager Applied.'}
+              : 'Draft already matches Manager Applied.')}
             onClick={() => setAction('discard')}
           >Discard</button>
           <button
@@ -103,6 +119,12 @@ export function DeploymentDocumentControls({
               || workspace?.saved.deploymentRevision
                 === workspace?.managerApplied.deploymentRevision
             }
+            title={blockReason ?? (workspace?.savedScenarioCandidates.length === 0
+              ? 'No saved Deployment is available to revert to.'
+              : workspace?.saved.deploymentRevision
+                  === workspace?.managerApplied.deploymentRevision
+                ? 'Applied already matches Saved.'
+                : 'Replace Draft and Manager Applied with the Saved Deployment.')}
             onClick={() => setAction('revert')}
           >Revert</button>
           <span className="header-action-divider" aria-hidden="true" />
@@ -115,9 +137,11 @@ export function DeploymentDocumentControls({
               || !workspace?.draft.document
               || draftMatchesManager
             }
-            title={draftMatchesManager
-              ? 'Draft already matches Manager Applied.'
-              : 'Validate and apply this Deployment Draft to runtime.'}
+            title={blockReason ?? (!workspace?.draft.document
+              ? 'No Deployment Draft is loaded.'
+              : draftMatchesManager
+                ? 'Draft already matches Manager Applied.'
+                : 'Validate and apply this Deployment Draft to runtime.')}
             onClick={() => { void controller.applyDraft(); }}
           >{controller.applying ? 'Applying Deployment' : 'Apply'}</button>
         </div>
@@ -201,6 +225,7 @@ export function DeploymentDocumentControls({
               type="button"
               className="primary-action"
               disabled={!controller.mutationAvailable || controller.busy}
+              title={blockReason ?? 'Apply the validated Deployment to runtime.'}
               onClick={() => { void controller.confirmApply(); }}
             >{controller.applying ? 'Applying Deployment' : 'Confirm Apply'}</button>
           </div>

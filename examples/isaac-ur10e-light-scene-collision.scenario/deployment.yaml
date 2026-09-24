@@ -35,7 +35,6 @@
           "require_backend_confirmation": true,
           "stop_mode": "spring_back_hold"
         },
-        "native_lifecycle_management": true,
         "runtime_configuration": {
           "collision_monitor_period_ms": 100.0,
           "execution_tick_hz": 100,

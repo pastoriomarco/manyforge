@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-09-24 09:17:11 UTC
+  Last regenerated: 2026-09-24 13:29:10 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -785,9 +785,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "owner_api": {
             "enum": [
               "scene.transaction",
-              "scene.carried_attachment",
-              "cclc.lifecycle",
-              "cclc.control_route"
+              "scene.carried_attachment"
             ],
             "title": "Owner Api",
             "type": "string"
@@ -5749,9 +5747,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "owner_api": {
             "enum": [
               "scene.transaction",
-              "scene.carried_attachment",
-              "cclc.lifecycle",
-              "cclc.control_route"
+              "scene.carried_attachment"
             ],
             "title": "Owner Api",
             "type": "string"

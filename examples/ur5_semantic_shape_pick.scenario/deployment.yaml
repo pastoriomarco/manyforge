@@ -31,7 +31,6 @@
           "profile_id": "default_fault_spring_back",
           "stop_mode": "spring_back_hold"
         },
-        "native_lifecycle_management": true,
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,
           "direct_control_joint_limits": [],

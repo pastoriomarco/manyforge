@@ -1634,6 +1634,7 @@ qualify_catalog(const std::filesystem::path &root,
 
   bool found_lite6_arm_lifecycle_manifest = false;
   bool found_lite6_gripper_lifecycle_manifest = false;
+  bool found_native_control_lifecycle_manifest = false;
   bool found_ros2_control_lifecycle_manifest = false;
   for (const auto &path :
        source_files(catalog_root / "provider_manifest", 8U)) {
@@ -1651,7 +1652,20 @@ qualify_catalog(const std::filesystem::path &root,
                                   role_id;
                          });
     };
-    if (manifest.value().provider_manifest_id.value() == "lite6_arm_provider") {
+    if (manifest.value().provider_manifest_id.value() ==
+        "manyforge.provider.native_control") {
+      if (found_native_control_lifecycle_manifest ||
+          !manifest.value().lifecycle_plan_catalog.has_value() ||
+          manifest.value().lifecycle_plan_catalog->catalog_api_version.value() !=
+              core::kBrandLifecyclePlanCatalogApiVersion ||
+          manifest.value().provider_contracts.size() != 2U ||
+          !has_contract_role("software_hard_stop") ||
+          !has_contract_role("stop_contract")) {
+        throw std::logic_error(
+            "maintained generic native lifecycle provider manifest is not exact");
+      }
+      found_native_control_lifecycle_manifest = true;
+    } else if (manifest.value().provider_manifest_id.value() == "lite6_arm_provider") {
       if (found_lite6_arm_lifecycle_manifest ||
           !manifest.value().lifecycle_plan_catalog.has_value() ||
           manifest.value()
@@ -1700,7 +1714,8 @@ qualify_catalog(const std::filesystem::path &root,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
   }
-  if (!found_lite6_arm_lifecycle_manifest ||
+  if (!found_native_control_lifecycle_manifest ||
+      !found_lite6_arm_lifecycle_manifest ||
       !found_lite6_gripper_lifecycle_manifest ||
       !found_ros2_control_lifecycle_manifest) {
     throw std::logic_error(
@@ -1952,10 +1967,11 @@ void verify_scenarios(const std::filesystem::path &root,
     for (const auto &resource : applicability.external_resources) {
       external_manifest_ids.insert(resource.provider_manifest_id);
     }
+    // Every native family uses the one generic lifecycle provider (its four
+    // lifecycle capability definitions); the Lite6 vendor providers are no
+    // longer selected by native scenarios.
     const std::size_t expected_catalog_count =
-        (scenario.ros2_control_execution
-             ? 54U
-             : (scenario.family_id == "lite6_lite_gripper" ? 57U : 51U)) +
+        (scenario.ros2_control_execution ? 54U : 55U) +
         2U * external_manifest_ids.size();
     if (verified.catalog_records().size() != expected_catalog_count) {
       throw std::invalid_argument(

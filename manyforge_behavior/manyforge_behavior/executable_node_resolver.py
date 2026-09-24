@@ -384,8 +384,6 @@ _TASK_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
         "assistant.model_request": "assistant_requests",
         "assistant.scene_context": "assistant_requests",
         "assistant.scene_selection": "assistant_requests",
-        "cclc.control_route": "cclc_routes",
-        "cclc.lifecycle": "cclc_lifecycle",
         "kernel.operation": "kernel_operations",
         "kernel.pause": "kernel_controls",
         "kernel.reset": "kernel_controls",

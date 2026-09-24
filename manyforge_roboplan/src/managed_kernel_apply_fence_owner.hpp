@@ -56,6 +56,9 @@ public:
   [[nodiscard]] std::vector<manyforge::core::ResourceId>
   current_fenced_resources(
       const std::vector<manyforge::core::ResourceId> &resources) const override;
+  [[nodiscard]] bool exact_fence_covers(
+      const manyforge::core::ConfigurationFenceId &fence_id,
+      const std::vector<manyforge::core::ResourceId> &resources) const override;
 
   /// Attach the exact table owned by the currently composed addressed Kernel.
   /// The gate keeps only a weak reference and owns no duplicate operation or
@@ -183,6 +186,14 @@ public:
           &expected_predecessor_publication_generation,
       const manyforge::core::ContentDigest
           &expected_predecessor_public_pointer_digest,
+      const std::function<void()> &effect) const;
+
+  /// The post-publication half of the same parent Apply interlock. The
+  /// successor receipt must name that Apply and still be the active pointer;
+  /// the parent fence remains held throughout the delegated operation.
+  void RunWithExactHeldSuccessor(
+      const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
+      const manyforge::core::ActiveBundlePublicationReceiptDTO &successor,
       const std::function<void()> &effect) const;
 
   [[nodiscard]] manyforge::core::ConfigurationFenceReleasedDTO Release(

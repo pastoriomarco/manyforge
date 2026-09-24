@@ -1795,8 +1795,8 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
         participant_peers.begin(), participant_peers.end(),
         [&](const auto &candidate) { return owns_domain(*candidate); });
     if (peer != participant_peers.end())
-      return (*peer)->PublishAndReadBackRouteConfiguration(configuration,
-                                                           std::move(participants));
+      return (*peer)->PublishAndReadBackRouteConfiguration(
+          configuration, std::move(participants));
   }
   auto *const cell_root = cell_runtime_root != nullptr ? cell_runtime_root : this;
   std::lock_guard lock(cell_root->route_publication_mutex_);
@@ -2215,6 +2215,189 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
         "route_publication_native_composition_failed",
         "native route publication failed");
+  }
+}
+
+namespace {
+
+/// The same deterministic re-seal the Kernel applies to its registrations:
+/// every participant of the component moves to the published generation.
+[[nodiscard]] core::Result<
+    std::vector<core::RuntimeParticipantExecutionRegistration>>
+rebind_component_registrations(
+    std::vector<core::RuntimeParticipantExecutionRegistration> registrations,
+    const core::ControllableComponentId &component,
+    const core::ComponentLifecycleGeneration generation) {
+  for (auto &registration : registrations) {
+    if (registration.binding.value().controllable_component_id != component ||
+        !registration.stop_readiness.has_value() ||
+        registration.stop_readiness->value().component_lifecycle_generation ==
+            generation) {
+      continue;
+    }
+    auto refreshed = core::rebind_runtime_participant_stop_readiness_generation(
+        *registration.stop_readiness, generation);
+    if (!refreshed.ok()) {
+      return core::Result<
+          std::vector<core::RuntimeParticipantExecutionRegistration>>::Err(
+          refreshed.error());
+    }
+    registration.stop_readiness = std::move(refreshed.value());
+  }
+  return core::Result<
+      std::vector<core::RuntimeParticipantExecutionRegistration>>::Ok(
+      std::move(registrations));
+}
+
+} // namespace
+
+core::Result<core::ComponentCommandReadinessDTO>
+RetainedNativeRuntime::CloseComponentCommandEligibility(
+    const core::LifecycleTransactionId &lifecycle_transaction_id,
+    const core::ControllableComponentId &controllable_component_id) {
+  auto *const cell_root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  auto *const kernel = cell_root->addressed_kernel != nullptr
+                           ? cell_root->addressed_kernel.get()
+                           : cell_root->cell_addressed_kernel;
+  if (kernel == nullptr) {
+    return route_publication_error<core::ComponentCommandReadinessDTO>(
+        "component_readiness_kernel_missing",
+        "native component readiness has no stable addressed Kernel owner",
+        core::ErrorCode::kMissingReference);
+  }
+  return kernel->close_component_command_eligibility(lifecycle_transaction_id,
+                                                     controllable_component_id);
+}
+
+core::Result<core::ComponentCommandReadinessDTO>
+RetainedNativeRuntime::ReadComponentCommandReadiness(
+    const core::ControllableComponentId &controllable_component_id) const {
+  const auto *const cell_root =
+      cell_runtime_root != nullptr ? cell_runtime_root : this;
+  const auto *const kernel = cell_root->addressed_kernel != nullptr
+                                 ? cell_root->addressed_kernel.get()
+                                 : cell_root->cell_addressed_kernel;
+  if (kernel == nullptr) {
+    return route_publication_error<core::ComponentCommandReadinessDTO>(
+        "component_readiness_kernel_missing",
+        "native component readiness has no stable addressed Kernel owner",
+        core::ErrorCode::kMissingReference);
+  }
+  return kernel->component_command_readiness(controllable_component_id);
+}
+
+core::Result<core::ComponentCommandReadinessDTO>
+RetainedNativeRuntime::PublishComponentCommandReadiness(
+    const core::ComponentCommandReadinessPublicationDTO &publication) {
+  if (!publication.locally_valid()) {
+    return route_publication_error<core::ComponentCommandReadinessDTO>(
+        "component_readiness_publication_invalid",
+        "native component readiness publication is invalid",
+        core::ErrorCode::kInvalidRequest);
+  }
+  auto *const cell_root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  auto *const kernel = cell_root->addressed_kernel != nullptr
+                           ? cell_root->addressed_kernel.get()
+                           : cell_root->cell_addressed_kernel;
+  if (kernel == nullptr) {
+    return route_publication_error<core::ComponentCommandReadinessDTO>(
+        "component_readiness_kernel_missing",
+        "native component readiness has no stable addressed Kernel owner",
+        core::ErrorCode::kMissingReference);
+  }
+  try {
+    // Stage the re-sealed caches for every robot runtime in the cell. The
+    // root's cache is the complete cell registration set the Kernel holds.
+    std::vector<std::pair<RetainedNativeRuntime *,
+                          std::vector<core::RuntimeParticipantExecutionRegistration>>>
+        staged;
+    std::vector<core::RuntimeParticipantBinding> physical_bindings;
+    std::optional<core::Result<void>> failure;
+    for_each_cell_runtime(*this, [&](RetainedNativeRuntime &runtime) {
+      if (failure.has_value()) return;
+      auto rebound = rebind_component_registrations(
+          runtime.participant_registrations,
+          publication.controllable_component_id,
+          publication.component_lifecycle_generation);
+      if (!rebound.ok()) {
+        failure = core::Result<void>::Err(rebound.error());
+        return;
+      }
+      staged.emplace_back(&runtime, std::move(rebound.value()));
+      physical_bindings.push_back(runtime.motion_binding);
+      if (runtime.gripper_binding) {
+        physical_bindings.push_back(*runtime.gripper_binding);
+      }
+    });
+    if (failure.has_value()) {
+      return core::Result<core::ComponentCommandReadinessDTO>::Err(
+          failure->error());
+    }
+    const auto &cell_registrations = staged.front().second;
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        cell_physical_registrations;
+    cell_physical_registrations.reserve(physical_bindings.size());
+    for (const auto &physical_binding : physical_bindings) {
+      const auto registration = std::find_if(
+          cell_registrations.begin(), cell_registrations.end(),
+          [&](const auto &candidate) {
+            return candidate.binding.value() == physical_binding.value();
+          });
+      if (registration == cell_registrations.end()) {
+        return route_publication_error<core::ComponentCommandReadinessDTO>(
+            "component_readiness_physical_binding_missing",
+            "cell readiness publication has no physical participant "
+            "registration");
+      }
+      cell_physical_registrations.push_back(*registration);
+    }
+    RetainedRuntimeParticipantResolver binding_resolver;
+    if (cell_root->participant_resolver_factory) {
+      binding_resolver =
+          cell_root->participant_resolver_factory(std::move(physical_bindings));
+      if (!binding_resolver) {
+        return route_publication_error<core::ComponentCommandReadinessDTO>(
+            "component_readiness_resolver_factory_failed",
+            "native participant resolver factory returned no resolver");
+      }
+    } else if (cell_root->participant_resolver) {
+      return route_publication_error<core::ComponentCommandReadinessDTO>(
+          "component_readiness_resolver_factory_missing",
+          "dynamic native participant resolution cannot retain stale "
+          "readiness");
+    }
+    auto kernel_resolver = make_kernel_participant_resolver(
+        std::move(binding_resolver), std::move(cell_physical_registrations));
+    auto published =
+        kernel->publish_component_command_readiness(publication, kernel_resolver);
+    if (!published.ok()) {
+      return published;
+    }
+    auto readback = kernel->component_command_readiness(
+        publication.controllable_component_id);
+    if (!readback.ok() || readback.value() != published.value() ||
+        readback.value().command_eligible != publication.command_eligible ||
+        readback.value().component_lifecycle_generation !=
+            publication.component_lifecycle_generation) {
+      return route_publication_error<core::ComponentCommandReadinessDTO>(
+          "component_readiness_readback_mismatch",
+          "native Kernel component readiness readback differs from its "
+          "publication",
+          core::ErrorCode::kInvariantViolation);
+    }
+    for (auto &[runtime, registrations] : staged) {
+      runtime->participant_registrations = std::move(registrations);
+    }
+    cell_root->participant_resolver = kernel_resolver;
+    if (cell_root != this) {
+      participant_resolver = std::move(kernel_resolver);
+    }
+    return readback;
+  } catch (const std::exception &exception) {
+    return route_publication_error<core::ComponentCommandReadinessDTO>(
+        "component_readiness_native_composition_failed", exception.what());
   }
 }
 

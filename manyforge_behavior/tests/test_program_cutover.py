@@ -100,6 +100,25 @@ def test_program_mapping_construction_rejects_non_v1_document() -> None:
         Program.from_dict({}, catalog)
 
 
+@pytest.mark.parametrize(
+    "node_id",
+    (
+        "controller.select_route",
+        "lifecycle.prepare_component",
+        "lifecycle.enable_component",
+        "lifecycle.disable_component",
+        "lifecycle.recover_component",
+    ),
+)
+def test_controlled_component_mutations_are_not_program_nodes(node_id: str) -> None:
+    catalog = _catalog()
+    source = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    source["tree"]["node_id"] = node_id
+
+    with pytest.raises(ProgramValidationError, match="explicit idle-time"):
+        Program.from_dict(_identified(source), catalog)
+
+
 @pytest.mark.parametrize("relative_path", _MAINTAINED_PROGRAMS)
 def test_maintained_v1_programs_validate_against_active_catalog(
     relative_path: str,

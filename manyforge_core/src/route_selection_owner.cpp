@@ -244,11 +244,13 @@ Result<void> VerifyRouteReadinessPublicationReceipt(
   }
 
   if (configuration.state == ActiveControlConfigurationStateDTO::kReconciled) {
+    // Route readiness is domain route/Stop coherence only. Component command
+    // eligibility is published separately and never follows route selection.
     if (!receipt.operation_admission_open ||
         receipt.readiness_rows.size() != acceptance.desired_configuration.binding_routes.size()) {
       return receipt_error(
           "readiness_incomplete",
-          "a reconciled route requires complete binding readiness and open admission");
+          "a reconciled route requires complete binding readiness and route readiness");
     }
     for (std::size_t index = 0U; index < receipt.readiness_rows.size(); ++index) {
       const auto& row = receipt.readiness_rows[index];

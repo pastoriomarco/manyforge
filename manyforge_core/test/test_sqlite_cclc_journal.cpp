@@ -1,5 +1,11 @@
 #include <gtest/gtest.h>
 #include <sqlite3.h>
+
+// Storage revision 11 objects, absent from every older journal shape.
+#define MANYFORGE_DROP_NATIVE_APPLY_TABLES                                              \
+  "DROP TABLE cclc_native_apply_adoptions; DROP TABLE cclc_native_apply_plans;"         \
+  "DROP TABLE cclc_native_apply_plan_components; DROP TABLE cclc_native_apply_plan_routes;" \
+  "DROP TABLE cclc_native_apply_reservations;"
 #include <unistd.h>
 
 #include <atomic>
@@ -1638,6 +1644,7 @@ TEST(SqliteCCLCJournal, VersionNineMigrationDoesNotInventRecoveryForAnOrdinaryCl
   ASSERT_EQ(
       sqlite3_exec(raw,
                    "ALTER TABLE cclc_lifecycle_cell_claims DROP COLUMN recovery_configuration;"
+                   MANYFORGE_DROP_NATIVE_APPLY_TABLES
                    "UPDATE cclc_journal_metadata SET schema_version=9; PRAGMA user_version=9;",
                    nullptr, nullptr, nullptr),
       SQLITE_OK);
@@ -1674,6 +1681,9 @@ TEST(SqliteCCLCJournal, RouteCodecAndVersionEightMigrationPreserveLegacyClaimles
             detail::RouteSelectionSemanticIntentDigest(intent));
   changed.expected_admission_generation.reset();
   EXPECT_FALSE(changed.locally_valid());
+  // The codec still reads legacy Program-node evidence, but route selection
+  // is no longer a Program node: the claimed request carries none.
+  intent.program_node_evidence.reset();
   ASSERT_TRUE(SeedRouteClaim(journal, owner, prepared).ok());
   ASSERT_TRUE(
       journal
@@ -1709,6 +1719,7 @@ TEST(SqliteCCLCJournal, RouteCodecAndVersionEightMigrationPreserveLegacyClaimles
       sqlite3_exec(raw,
                    "DELETE FROM cclc_lifecycle_cell_claims;"
                    "ALTER TABLE cclc_lifecycle_cell_claims DROP COLUMN recovery_configuration;"
+                   MANYFORGE_DROP_NATIVE_APPLY_TABLES
                    "UPDATE cclc_journal_metadata SET schema_version=8; PRAGMA user_version=8;",
                    nullptr, nullptr, nullptr),
       SQLITE_OK);
@@ -2169,50 +2180,6 @@ TEST(SqliteCCLCJournal, UnstartedAbsenceSurvivesOtherCallerCutoverUntilNextFullR
   EXPECT_FALSE(retired_route.value());
 }
 
-TEST(SqliteCCLCJournal, ProgramChildEvidenceSurvivesReplacementAndReadOnlyLookup) {
-  ScopedTemporaryDirectory temporary;
-  RequestOwnerEpoch owner("owner.1");
-  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"), 8U);
-  ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, 8U).ok());
-  auto intent = Intent("request.program.1", owner, 3U);
-  intent.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{RequestOwnerEpoch("runner.1"),
-                                                                 ProgramRunId("run.1"),
-                                                                 CellAdmissionClaimGeneration(7U),
-                                                                 "enable",
-                                                                 "enable.1",
-                                                                 "cclc.lifecycle"};
-  const auto acceptance = Acceptance(intent, 1U, "lifecycle.1");
-  const auto initial = InitialStatus(intent, acceptance);
-  {
-    ASSERT_TRUE(SeedLifecycleClaim(journal, owner, intent, acceptance).ok());
-    ASSERT_TRUE(journal.AcceptOrReplayLifecycle(owner, intent, acceptance, initial).ok());
-  }
-  journal.Close();
-  SqliteCCLCJournal reopened(JournalPath(temporary), CellId("cell.1"), 8U);
-  const auto recovered = reopened.BeginOwnerEpoch(RequestOwnerEpoch("owner.2"), 2, 8U);
-  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
-  ASSERT_EQ(recovered.value().cell_claims.size(), 1U);
-  EXPECT_EQ(recovered.value().cell_claims[0].intent.program_node_evidence,
-            intent.program_node_evidence);
-  const auto read = reopened.ReadLifecycleRequestResult(intent);
-  ASSERT_TRUE(read.ok());
-  ASSERT_TRUE(read.value());
-  ASSERT_TRUE(read.value()->status);
-  EXPECT_EQ(read.value()->status, initial);
-  EXPECT_EQ(read.value()->replay_status, RequestReplayStatusDTO::kReplayedExact);
-  auto wrong = intent;
-  wrong.program_node_evidence->node_attempt_id = "different";
-  const auto conflict = reopened.ReadLifecycleRequestResult(wrong);
-  ASSERT_TRUE(conflict.ok());
-  ASSERT_TRUE(conflict.value());
-  EXPECT_EQ(conflict.value()->replay_status, RequestReplayStatusDTO::kRequestIdConflict);
-  auto malformed = intent;
-  malformed.program_node_evidence->owner_api = "scene.transaction";
-  EXPECT_FALSE(reopened.ReadLifecycleRequestResult(malformed).ok());
-  EXPECT_EQ(detail::DecodeComponentLifecycleStatus(detail::EncodeComponentLifecycleStatus(initial)),
-            initial);
-}
-
 TEST(SqliteCCLCJournal, VersionSixUpgradePreservesExistingRequestAndStatusBytes) {
   ScopedTemporaryDirectory temporary;
   RequestOwnerEpoch owner("owner.1");
@@ -2236,6 +2203,7 @@ TEST(SqliteCCLCJournal, VersionSixUpgradePreservesExistingRequestAndStatusBytes)
                    "ALTER TABLE cclc_lifecycle_cell_claims DROP COLUMN program_node_evidence;"
                    "ALTER TABLE cclc_request_memberships DROP COLUMN rejection_blob;"
                    "ALTER TABLE cclc_request_memberships DROP COLUMN rejection_sequence;"
+                   MANYFORGE_DROP_NATIVE_APPLY_TABLES
                    "UPDATE cclc_journal_metadata SET schema_version=6; PRAGMA user_version=6;",
                    nullptr, nullptr, nullptr);
   const std::string detail = sqlite3_errmsg(raw);
@@ -4150,6 +4118,226 @@ TEST(SqliteCCLCJournal,
   EXPECT_FALSE(ValidateCCLCCellAdmissionReconciliationReadOnly(path, CellId("cell.1"), {*claim},
                                                                current_owners, reconcile)
                    .ok());
+}
+
+[[nodiscard]] ActiveBundlePublicationReceiptDTO NativeApplyPublication(
+    const std::string& apply_id, std::uint64_t apply_generation,
+    const std::string& bundle, std::uint64_t publication_generation) {
+  const ProjectionRevisionDTO projection{
+      RetainedBundleId(bundle), GraphRevision("graph.1"),
+      {SceneId(Sha('a')), 1U, ContentDigest(Sha('b'))}};
+  return {{NamedApplyPublicationTransactionDTO{ApplyId(apply_id),
+                                               ApplyGeneration(apply_generation)},
+           projection, projection.retained_bundle_id, projection.graph_revision,
+           ActiveBundlePublicationGeneration(publication_generation - 1U),
+           ContentDigest(Sha('c'))},
+          ActiveBundlePublicationGeneration(publication_generation), ContentDigest(Sha('d'))};
+}
+
+[[nodiscard]] NativeApplyPlanRequestDTO NativeApplyPlanRequest(
+    const std::string& apply_id, std::uint64_t apply_generation, const std::string& bundle,
+    const ActiveControlConfigurationDTO& route) {
+  return {{ApplyId(apply_id), ApplyGeneration(apply_generation)},
+          RetainedBundleId(bundle),
+          GraphRevision("graph.1"),
+          {ControllableComponentId("component.1")},
+          {{route.control_domain_id, route.active_control_configuration_generation}}};
+}
+
+TEST(SqliteCCLCJournal, NativeApplyFactsRequireARecordedPlanAndExactReplay) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+  const auto initially_unsettled = journal.ReadUnsettledNativeApplyPlan();
+  ASSERT_TRUE(initially_unsettled.ok());
+  EXPECT_FALSE(initially_unsettled.value().has_value());
+  const auto publication = NativeApplyPublication("apply.1", 1U, "bundle.1", 2U);
+  ASSERT_TRUE(publication.valid());
+  const auto route = ActiveConfiguration(ExpectedDomain());
+  ASSERT_TRUE(route.locally_valid());
+
+  // Nothing planned: facts observed after publication cannot be adopted.
+  const NativeApplyFactAdoptionDTO unplanned{
+      publication,
+      {{ControllableComponentId("component.1"), ComponentLifecycleStateDTO::kActive,
+        ComponentLifecycleGeneration(1U)}},
+      {route}};
+  EXPECT_FALSE(journal.AdoptNativeApplyFacts(unplanned).ok());
+
+  const auto plan = journal.PlanNativeApply(
+      NativeApplyPlanRequest("apply.1", 1U, "bundle.1", route));
+  ASSERT_TRUE(plan.ok());
+  const auto pending = journal.ReadUnsettledNativeApplyPlan();
+  ASSERT_TRUE(pending.ok());
+  ASSERT_TRUE(pending.value().has_value());
+  EXPECT_EQ(*pending.value(), plan.value().apply);
+  ASSERT_EQ(plan.value().components.size(), 1U);
+  EXPECT_EQ(plan.value().components.front().state, ComponentLifecycleStateDTO::kActive);
+  EXPECT_EQ(plan.value().components.front().generation, ComponentLifecycleGeneration(1U));
+  // The first publication keeps the compiled route generation.
+  ASSERT_EQ(plan.value().routes.size(), 1U);
+  EXPECT_EQ(plan.value().routes.front().generation,
+            route.active_control_configuration_generation);
+
+  // A pending parent Apply reserves those generations. Fresh CCLC work
+  // cannot mint a colliding successor, even if it reaches the journal.
+  RequestOwnerEpoch owner("owner.native-apply-guard");
+  ASSERT_TRUE(BeginTestOwnerEpoch(journal, owner, 1, kDefaultCCLCExactResultHistory).ok());
+  const auto lifecycle_intent = DisableIntent("request.lifecycle", owner, 3U);
+  const auto lifecycle_acceptance = Acceptance(lifecycle_intent, 1U, "lifecycle.1");
+  const auto lifecycle_denied = journal.AcceptOrReplayLifecycle(
+      owner, lifecycle_intent, lifecycle_acceptance,
+      InitialUnresolvedDisableStatus(lifecycle_intent, lifecycle_acceptance));
+  ASSERT_FALSE(lifecycle_denied.ok());
+  EXPECT_EQ(lifecycle_denied.error().code, "component_lifecycle_native_apply_unsettled");
+  const auto route_intent = RouteIntent(owner);
+  const auto route_prepared = PreparedRoute(owner);
+  const auto route_denied = journal.AcceptOrReplayRouteSelection(
+      owner, route_intent, route_prepared.acceptance, route_prepared.initial_status);
+  ASSERT_FALSE(route_denied.ok());
+  EXPECT_EQ(route_denied.error().code, "component_lifecycle_native_apply_unsettled");
+
+  const NativeApplyFactAdoptionDTO adoption{publication, plan.value().components, {route}};
+  const auto before = journal.HasNativeApplyFacts(publication);
+  ASSERT_TRUE(before.ok());
+  EXPECT_FALSE(before.value());
+  ASSERT_TRUE(journal.AdoptNativeApplyFacts(adoption).ok());
+  ASSERT_TRUE(journal.AdoptNativeApplyFacts(adoption).ok());
+  const auto settled = journal.ReadUnsettledNativeApplyPlan();
+  ASSERT_TRUE(settled.ok());
+  EXPECT_FALSE(settled.value().has_value());
+  const auto after = journal.HasNativeApplyFacts(publication);
+  ASSERT_TRUE(after.ok());
+  EXPECT_TRUE(after.value());
+  const auto current = journal.LoadCurrentActiveControlConfiguration(route.control_domain_id);
+  ASSERT_TRUE(current.ok());
+  ASSERT_TRUE(current.value().has_value());
+  EXPECT_EQ(*current.value(), route);
+  const auto fact =
+      journal.LoadCurrentComponentLifecycleFact(ControllableComponentId("component.1"));
+  ASSERT_TRUE(fact.ok());
+  EXPECT_EQ(fact.value().durable_generation, ComponentLifecycleGeneration(1U));
+  EXPECT_EQ(fact.value().current_state, ComponentLifecycleStateDTO::kActive);
+
+  auto changed = adoption;
+  changed.components.front().state = ComponentLifecycleStateDTO::kDisabled;
+  EXPECT_FALSE(journal.AdoptNativeApplyFacts(changed).ok());
+  auto wrong_publication = publication;
+  wrong_publication.publication_generation = ActiveBundlePublicationGeneration(3U);
+  EXPECT_FALSE(journal.HasNativeApplyFacts(wrong_publication).ok());
+}
+
+TEST(SqliteCCLCJournal, UnadoptedNativeApplyPlanStaysContainedAcrossRestart) {
+  ScopedTemporaryDirectory temporary;
+  const auto route = ActiveConfiguration(ExpectedDomain());
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    ASSERT_TRUE(
+        journal.PlanNativeApply(NativeApplyPlanRequest("apply.lost", 4U, "bundle.a", route)).ok());
+    journal.Close();  // The process ends before the Apply adopts or fails cleanly.
+  }
+  SqliteCCLCJournal reopened(JournalPath(temporary), CellId("cell.1"));
+  const auto pending = reopened.ReadUnsettledNativeApplyPlan();
+  ASSERT_TRUE(pending.ok());
+  ASSERT_TRUE(pending.value().has_value());
+  EXPECT_EQ(pending.value()->apply_id, ApplyId("apply.lost"));
+  EXPECT_EQ(pending.value()->apply_generation, ApplyGeneration(4U));
+  // Restart route reconciliation uses ordinary route selection: it stays
+  // refused and names the Apply, so no reserved generation can be minted.
+  RequestOwnerEpoch owner("owner.after-restart");
+  ASSERT_TRUE(BeginTestOwnerEpoch(reopened, owner, 1, kDefaultCCLCExactResultHistory).ok());
+  const auto prepared = PreparedRoute(owner);
+  const auto denied = reopened.AcceptOrReplayRouteSelection(
+      owner, RouteIntent(owner), prepared.acceptance, prepared.initial_status);
+  ASSERT_FALSE(denied.ok());
+  EXPECT_EQ(denied.error().code, "component_lifecycle_native_apply_unsettled");
+  EXPECT_NE(denied.error().message.find("apply.lost/4"), std::string::npos);
+  const auto still = reopened.ReadUnsettledNativeApplyPlan();
+  ASSERT_TRUE(still.ok());
+  EXPECT_TRUE(still.value().has_value());
+}
+
+TEST(SqliteCCLCJournal, NativeApplyPlanNeverReusesAGenerationAndKeepsAnExplicitDisable) {
+  ScopedTemporaryDirectory temporary;
+  const auto route = ActiveConfiguration(ExpectedDomain());
+  const auto compiled = route.active_control_configuration_generation.value();
+  {
+    SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+    const auto plan =
+        journal.PlanNativeApply(NativeApplyPlanRequest("apply.1", 1U, "bundle.a", route));
+    ASSERT_TRUE(plan.ok());
+    ASSERT_TRUE(journal
+                    .AdoptNativeApplyFacts({NativeApplyPublication("apply.1", 1U, "bundle.a", 2U),
+                                            plan.value().components,
+                                            {route}})
+                    .ok());
+    journal.Close();
+  }
+  {
+    // The operator explicitly disabled the component after the first Apply.
+    sqlite3* database = nullptr;
+    ASSERT_EQ(sqlite3_open(JournalPath(temporary).c_str(), &database), SQLITE_OK);
+    const auto update = "UPDATE lifecycle_component_current_facts SET component_lifecycle_state=" +
+                        std::to_string(static_cast<int>(ComponentLifecycleStateDTO::kDisabled));
+    ASSERT_EQ(sqlite3_exec(database, update.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+  }
+  SqliteCCLCJournal journal(JournalPath(temporary), CellId("cell.1"));
+  // A later Apply (another bundle, then the first one again) keeps the
+  // Disable and continues every generation past the previous Apply.
+  const auto second =
+      journal.PlanNativeApply(NativeApplyPlanRequest("apply.2", 1U, "bundle.b", route));
+  ASSERT_TRUE(second.ok());
+  const auto pending_second = journal.ReadUnsettledNativeApplyPlan();
+  ASSERT_TRUE(pending_second.ok());
+  ASSERT_TRUE(pending_second.value().has_value());
+  EXPECT_EQ(*pending_second.value(), second.value().apply);
+  EXPECT_EQ(second.value().components.front().state, ComponentLifecycleStateDTO::kDisabled);
+  EXPECT_EQ(second.value().components.front().generation, ComponentLifecycleGeneration(2U));
+  EXPECT_EQ(second.value().routes.front().generation.value(), compiled + 1U);
+  // Exact replay returns the recorded plan without reserving again.
+  const auto replay =
+      journal.PlanNativeApply(NativeApplyPlanRequest("apply.2", 1U, "bundle.b", route));
+  ASSERT_TRUE(replay.ok());
+  EXPECT_EQ(replay.value().components.front().generation, ComponentLifecycleGeneration(2U));
+  EXPECT_EQ(replay.value().routes.front().generation.value(), compiled + 1U);
+  EXPECT_FALSE(
+      journal.PlanNativeApply(NativeApplyPlanRequest("apply.2", 1U, "bundle.c", route)).ok());
+  // apply.2 is abandoned before adoption: its generations are never reused.
+  const auto third =
+      journal.PlanNativeApply(NativeApplyPlanRequest("apply.3", 1U, "bundle.a", route));
+  ASSERT_TRUE(third.ok());
+  const auto pending_third = journal.ReadUnsettledNativeApplyPlan();
+  ASSERT_TRUE(pending_third.ok());
+  ASSERT_TRUE(pending_third.value().has_value());
+  EXPECT_EQ(*pending_third.value(), third.value().apply);
+  EXPECT_EQ(third.value().components.front().state, ComponentLifecycleStateDTO::kDisabled);
+  EXPECT_EQ(third.value().components.front().generation, ComponentLifecycleGeneration(3U));
+  EXPECT_EQ(third.value().routes.front().generation.value(), compiled + 2U);
+  // The superseded plan can no longer be adopted.
+  auto stale_route = route;
+  stale_route.active_control_configuration_generation =
+      ActiveControlConfigurationGeneration(compiled + 1U);
+  EXPECT_FALSE(journal
+                   .AdoptNativeApplyFacts({NativeApplyPublication("apply.2", 1U, "bundle.b", 3U),
+                                           second.value().components,
+                                           {stale_route}})
+                   .ok());
+  auto current_route = route;
+  current_route.active_control_configuration_generation =
+      ActiveControlConfigurationGeneration(compiled + 2U);
+  ASSERT_TRUE(journal
+                  .AdoptNativeApplyFacts({NativeApplyPublication("apply.3", 1U, "bundle.a", 3U),
+                                          third.value().components,
+                                          {current_route}})
+                  .ok());
+  const auto settled_third = journal.ReadUnsettledNativeApplyPlan();
+  ASSERT_TRUE(settled_third.ok());
+  EXPECT_FALSE(settled_third.value().has_value());
+  const auto fact =
+      journal.LoadCurrentComponentLifecycleFact(ControllableComponentId("component.1"));
+  ASSERT_TRUE(fact.ok());
+  EXPECT_EQ(fact.value().durable_generation, ComponentLifecycleGeneration(3U));
+  EXPECT_EQ(fact.value().current_state, ComponentLifecycleStateDTO::kDisabled);
 }
 
 }  // namespace

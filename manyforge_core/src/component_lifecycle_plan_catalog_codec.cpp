@@ -365,4 +365,51 @@ Result<std::string> EncodeBrandLifecyclePlanCatalog(const BrandLifecyclePlanCata
   }
 }
 
+namespace {
+
+[[nodiscard]] LifecyclePredicateDTO NativeControlPredicate(
+    std::vector<ComponentLifecycleStateDTO> states, bool enabled) {
+  std::sort(states.begin(), states.end());
+  return {std::move(states),
+          {{LifecycleFactId("native.control.enabled"),
+            {LifecycleFactValueKindDTO::kBoolean, enabled, std::nullopt,
+             std::nullopt}},
+           {LifecycleFactId("native.runtime.present"),
+            {LifecycleFactValueKindDTO::kBoolean, true, std::nullopt,
+             std::nullopt}}}};
+}
+
+}  // namespace
+
+std::vector<LifecycleIntentPlanDTO> MakeNativeControlLifecyclePlans() {
+  using State = ComponentLifecycleStateDTO;
+  using Intent = ComponentLifecycleIntentKindDTO;
+  const auto declared = NativeControlPredicate({State::kDeclared, State::kDisabled}, false);
+  const auto prepared = NativeControlPredicate({State::kPrepared}, false);
+  const auto active = NativeControlPredicate({State::kActive}, true);
+  const auto disabled = NativeControlPredicate({State::kDisabled}, false);
+  std::vector<State> disable_states{State::kPrepared, State::kActive,
+                                    State::kDegraded, State::kFaulted};
+  std::sort(disable_states.begin(), disable_states.end());
+  const LifecyclePredicateDTO disable_eligible{
+      std::move(disable_states),
+      {{LifecycleFactId("native.runtime.present"),
+        {LifecycleFactValueKindDTO::kBoolean, true, std::nullopt,
+         std::nullopt}}}};
+  constexpr std::int64_t timeout = 30'000'000'000LL;
+  return {
+      {Intent::kPrepare, State::kPrepared, std::nullopt, prepared, timeout,
+       {{LifecyclePrimitiveId("native.control.prepare"), declared,
+         prepared}}},
+      {Intent::kEnable, State::kActive, std::nullopt, active, timeout,
+       {{LifecyclePrimitiveId("native.control.enable"), prepared,
+         active}}},
+      {Intent::kDisable, State::kDisabled, std::nullopt, disabled, timeout,
+       {{LifecyclePrimitiveId("native.control.disable"),
+         disable_eligible,
+         disabled}}},
+  };
+}
+
+
 }  // namespace manyforge::core

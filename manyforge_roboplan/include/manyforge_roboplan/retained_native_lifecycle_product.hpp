@@ -5,7 +5,9 @@
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
@@ -21,7 +23,15 @@ public:
       const deployment::IVerifiedRetainedProviderManifestSource
           &provider_manifest_source,
       const std::vector<core::RuntimeParticipantBinding> &physical_bindings,
-      core::IClock &clock, core::Duration observation_freshness_ns);
+      core::IClock &clock, core::Duration observation_freshness_ns,
+      std::function<core::Result<void>(const core::ControlDomainId &)>
+          verify_native_engine,
+      std::function<core::Result<bool>(const core::ControlDomainId &)>
+          route_ready,
+      std::function<core::Result<std::optional<core::ComponentLifecycleStateDTO>>(
+          const core::ControllableComponentId &)>
+          retained_state,
+      bool allow_closed_active_during_route_recovery);
 
   [[nodiscard]] const core::BuildOwnedLifecyclePlanCatalogSource &
   catalog_source() const noexcept;
@@ -39,4 +49,3 @@ private:
 };
 
 } // namespace manyforge::roboplan_backend
-

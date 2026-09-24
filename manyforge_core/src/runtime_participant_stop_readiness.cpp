@@ -198,4 +198,17 @@ Result<RuntimeParticipantStopReadiness> verify_runtime_participant_stop_readines
       RuntimeParticipantStopReadiness(std::move(value)));
 }
 
+Result<RuntimeParticipantStopReadiness> rebind_runtime_participant_stop_readiness_generation(
+    const RuntimeParticipantStopReadiness& verified, const ComponentLifecycleGeneration generation) {
+  constexpr std::uint64_t kMaximumIJsonInteger = 9'007'199'254'740'991ULL;
+  if (!generation.nonzero() || generation.value() > kMaximumIJsonInteger) {
+    return invalid<RuntimeParticipantStopReadiness>(
+        "runtime_participant_stop_component_generation_invalid");
+  }
+  auto value = verified.value();
+  value.component_lifecycle_generation = generation;
+  return Result<RuntimeParticipantStopReadiness>::Ok(
+      RuntimeParticipantStopReadiness(std::move(value)));
+}
+
 }  // namespace manyforge::core

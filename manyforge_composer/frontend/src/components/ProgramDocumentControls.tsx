@@ -544,6 +544,7 @@ export function ProgramDocumentControls({
                     || !selectedScenarioLoadable
                     || (replaceNeedsConfirmation && !confirmDiscard)
                   }
+                  title={authoringBlockReason ?? undefined}
                   onClick={() => {
                     const selected = selectedScenarioDocument;
                     if (!selected || !selectedScenarioLoadable) return;
@@ -601,6 +602,7 @@ export function ProgramDocumentControls({
                     || !scenarioIdValid
                     || !scenarioName.trim()
                   }
+                  title={authoringBlockReason ?? undefined}
                   onClick={() => complete(() => saveScenarioDocument({
                     path: scenarioSavePath.trim(),
                     scenarioId: scenarioId.trim(),
@@ -667,7 +669,7 @@ export function ProgramDocumentControls({
         {action === 'discard' && (
           <div className="program-dialog-copy program-compact-confirmation">
             <p>The editor will return to the Applied Program. Your Saved Program will not change.</p>
-            <button type="button" className="primary-action" disabled={authoringBusy || workspace?.hasUnappliedChanges !== true} onClick={() => complete(discard)}>
+            <button type="button" className="primary-action" disabled={authoringBusy || workspace?.hasUnappliedChanges !== true} title={authoringBlockReason ?? undefined} onClick={() => complete(discard)}>
               Discard changes
             </button>
           </div>
@@ -676,7 +678,7 @@ export function ProgramDocumentControls({
         {action === 'revert' && (
           <div className="program-dialog-copy program-compact-confirmation">
             <p>Replace the Applied Program and Draft with the Saved Program?</p>
-            <button type="button" className="primary-action" disabled={authoringBusy || !hasAppliedUnsavedChanges} onClick={() => complete(revert)}>
+            <button type="button" className="primary-action" disabled={authoringBusy || !hasAppliedUnsavedChanges} title={authoringBlockReason ?? undefined} onClick={() => complete(revert)}>
               Revert to Saved
             </button>
           </div>

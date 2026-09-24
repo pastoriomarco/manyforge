@@ -49,7 +49,18 @@ class RuntimeParticipantStopReadiness final {
   friend Result<RuntimeParticipantStopReadiness> verify_runtime_participant_stop_readiness(
       RuntimeParticipantStopReadinessDTO, const RuntimeParticipantBinding&,
       const ControllerLifecycleExpectedDomain&);
+  friend Result<RuntimeParticipantStopReadiness>
+  rebind_runtime_participant_stop_readiness_generation(const RuntimeParticipantStopReadiness&,
+                                                       ComponentLifecycleGeneration);
 };
+
+/// Re-issue already verified readiness for a CCLC lifecycle transition. The
+/// verified base plan, participant and controller-domain joins are unchanged:
+/// a Prepare/Enable/Disable advances only the component lifecycle generation,
+/// so engines, route configurations and Stop-plan bytes are reused as-is.
+[[nodiscard]] Result<RuntimeParticipantStopReadiness>
+rebind_runtime_participant_stop_readiness_generation(const RuntimeParticipantStopReadiness& verified,
+                                                     ComponentLifecycleGeneration generation);
 
 /// Verify one CCLC-produced readiness value against a sealed runtime
 /// participant. The verified base-plan bytes remain authoritative; this

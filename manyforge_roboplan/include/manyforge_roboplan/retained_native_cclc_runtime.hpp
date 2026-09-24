@@ -2,9 +2,11 @@
 
 #include <manyforge_core/fixed_cclc_port_registry.hpp>
 #include <manyforge_deployment/cclc_runtime_composition.hpp>
+#include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <functional>
+#include <filesystem>
 #include <memory>
 #include <span>
 #include <vector>
@@ -26,6 +28,22 @@ struct RetainedNativeCCLCRuntimeConfig final {
     std::vector<core::KinematicResourceSourceProjectionDTO>>
 DeriveRetainedNativeStateSourceProjections(
     std::span<const core::RuntimeParticipantBinding> physical_bindings);
+
+/// Parent-Apply candidate initialization delegated to CCLC. The caller must
+/// hold and verify the exact Manager fence around this call and pass the plan
+/// CCLC recorded for this Apply before any route is published. Each route uses
+/// the planned generation and component expectation; a component that keeps
+/// an explicit Disable stays command-closed. This uses the same retained
+/// native controller/Stop-readiness path as post-publication CCLC; it never
+/// opens the parent fence or starts motion.
+[[nodiscard]] core::Result<void> InitializeRetainedNativeCandidateControlRoutes(
+    const deployment::RetainedBundle &bundle, RetainedNativeRuntime &runtime,
+    core::ActiveBundlePublicationGeneration candidate_publication_generation,
+    const core::NativeApplyPlanDTO &plan,
+    const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
+    std::span<const core::RuntimeParticipantBinding> physical_bindings,
+    const std::filesystem::path &execution_run_root,
+    const core::ConfigurationFenceId &parent_apply_fence_id);
 
 /// Construct the CCLC owner and verified observation sources without starting
 /// workers or request admission. The caller explicitly invokes Start.
@@ -58,7 +76,9 @@ CreateRetainedNativeCCLCRuntime(
             const core::ControlDomainId &)>
         kernel_current_configuration_source = {},
     RetainedExternallyManagedDomainSnapshotSource
-        externally_managed_controller_snapshot_source = {});
+        externally_managed_controller_snapshot_source = {},
+    core::ICCLCComponentCommandReadinessPort *component_command_readiness_port =
+        nullptr);
 
 /// Convenience overload for the production retained-native owner. Only the
 /// physical representatives are consumed; Program aliases cannot widen CCLC

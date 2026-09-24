@@ -500,6 +500,44 @@ constexpr std::string_view kProgramNodeSchemaUpgrade =
 constexpr std::string_view kRouteRecoverySchemaUpgrade =
     "ALTER TABLE cclc_lifecycle_cell_claims ADD COLUMN recovery_configuration BLOB";
 
+constexpr std::string_view kNativeApplySchemaUpgrade = R"sql(
+CREATE TABLE cclc_native_apply_adoptions (
+  apply_id TEXT NOT NULL,
+  apply_generation INTEGER NOT NULL,
+  publication_generation INTEGER NOT NULL UNIQUE,
+  public_pointer_digest TEXT NOT NULL,
+  candidate_bundle_id TEXT NOT NULL,
+  candidate_graph_revision TEXT NOT NULL,
+  facts_digest TEXT NOT NULL,
+  PRIMARY KEY(apply_id, apply_generation)
+) STRICT;
+CREATE TABLE cclc_native_apply_plans (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  apply_id TEXT NOT NULL,
+  apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
+  candidate_bundle_id TEXT NOT NULL,
+  candidate_graph_revision TEXT NOT NULL
+) STRICT;
+CREATE TABLE cclc_native_apply_plan_components (
+  controllable_component_id TEXT PRIMARY KEY,
+  component_lifecycle_state INTEGER NOT NULL CHECK (
+    component_lifecycle_state BETWEEN 0 AND 7),
+  component_lifecycle_generation INTEGER NOT NULL CHECK (
+    component_lifecycle_generation > 0)
+) STRICT;
+CREATE TABLE cclc_native_apply_plan_routes (
+  control_domain_id TEXT PRIMARY KEY,
+  active_control_configuration_generation INTEGER NOT NULL CHECK (
+    active_control_configuration_generation > 0)
+) STRICT;
+CREATE TABLE cclc_native_apply_reservations (
+  reservation_kind TEXT NOT NULL CHECK (reservation_kind IN ('component', 'route')),
+  identity TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  PRIMARY KEY(reservation_kind, identity)
+) STRICT;
+)sql";
+
 [[nodiscard]] bool ValidCCLCClaimIntent(const CellAdmissionClaimIntentDTO& intent) {
   return ValidateCellAdmissionClaimIntent(intent).ok() &&
          intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner &&
@@ -576,6 +614,7 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
       Exec(expected, kSchema);
       if (version >= 7) Exec(expected, kProgramNodeSchemaUpgrade);
       if (version >= 10) Exec(expected, kRouteRecoverySchemaUpgrade);
+      if (version >= 11) Exec(expected, kNativeApplySchemaUpgrade);
       auto result = SchemaDefinitions(expected);
       const auto close_result = sqlite3_close(expected);
       if (close_result != SQLITE_OK) {
@@ -594,8 +633,10 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
   };
   static const auto legacy = build(6);
   static const auto previous = build(9);
-  static const auto current = build(10);
-  return version == 6 ? legacy : version < 10 ? previous : current;
+  static const auto previous_current = build(10);
+  static const auto current = build(11);
+  return version == 6 ? legacy : version < 10 ? previous
+                      : version == 10 ? previous_current : current;
 }
 
 [[nodiscard]] const std::set<std::string>& ExpectedSchemaObjects() {
@@ -617,6 +658,11 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
       "table:control_domain_active_configurations",
       "table:cclc_effect_attempts",
       "table:cclc_route_effect_attempts",
+      "table:cclc_native_apply_adoptions",
+      "table:cclc_native_apply_plan_components",
+      "table:cclc_native_apply_plan_routes",
+      "table:cclc_native_apply_plans",
+      "table:cclc_native_apply_reservations",
       "table:lifecycle_transactions",
       "table:route_selection_transactions",
   };
@@ -1405,6 +1451,14 @@ class SqliteCCLCJournal::Impl final {
   std::optional<ActiveControlConfigurationDTO> LoadCurrentActiveControlConfiguration(
       const ControlDomainId& control_domain_id);
 
+  NativeApplyPlanDTO PlanNativeApply(const NativeApplyPlanRequestDTO& request);
+  std::optional<NamedApplyPublicationTransactionDTO> ReadUnsettledNativeApplyPlan();
+  std::vector<ControllableComponentId> LoadComponentsWithUnsettledLifecycle();
+  std::optional<NativeApplyPlanDTO> LoadNativeApplyPlan(
+      const NamedApplyPublicationTransactionDTO& apply);
+  void AdoptNativeApplyFacts(const NativeApplyFactAdoptionDTO& adoption);
+  bool HasNativeApplyFacts(const ActiveBundlePublicationReceiptDTO& publication);
+
  private:
   void InsertRejection(const RequestOwnerEpoch& owner, const RequestId& request_id,
                        std::string_view kind, std::string_view digest, const ErrorDTO& error);
@@ -1419,6 +1473,13 @@ class SqliteCCLCJournal::Impl final {
                      const std::optional<CellAdmissionConfigurationScopeDTO>& recovery = {});
   void RetainRecoveredNoAdmission(const RequestOwnerEpoch& owner, std::string_view transaction_id,
                                   const RequestId& request_id, const ContentDigest& digest);
+  /// The current plan when it belongs to ``apply``; caller holds the mutex.
+  std::optional<NativeApplyPlanDTO> ReadNativeApplyPlanLocked(
+      const NamedApplyPublicationTransactionDTO& apply);
+  /// Highest generation already used or reserved for one identity.
+  std::uint64_t NativeApplyGenerationFloorLocked(std::string_view kind,
+                                                 std::string_view identity);
+  std::optional<NamedApplyPublicationTransactionDTO> ReadUnsettledNativeApplyPlanLocked();
   std::uint64_t ActiveTransactionCount() {
     return Nonnegative(
         ScalarInteger(
@@ -1486,6 +1547,7 @@ class SqliteCCLCJournal::Impl final {
       Exec(database_, kSchema);
       Exec(database_, kProgramNodeSchemaUpgrade);
       Exec(database_, kRouteRecoverySchemaUpgrade);
+      Exec(database_, kNativeApplySchemaUpgrade);
       Exec(database_, "PRAGMA application_id=" + std::to_string(kCCLCJournalSqliteApplicationId));
       Exec(database_, "PRAGMA user_version=" + std::to_string(kCCLCJournalSchemaVersion));
       Statement metadata(database_,
@@ -1537,9 +1599,25 @@ class SqliteCCLCJournal::Impl final {
               "component_lifecycle_journal_storage_foreign",
               "predecessor CCLC journal identity is not exact");
       Exec(database_, kRouteRecoverySchemaUpgrade);
-      Exec(database_, "UPDATE cclc_journal_metadata SET schema_version=" +
-                          std::to_string(kCCLCJournalSchemaVersion) + " WHERE singleton=1");
-      Exec(database_, "PRAGMA user_version=" + std::to_string(kCCLCJournalSchemaVersion));
+      Exec(database_, "UPDATE cclc_journal_metadata SET schema_version=10 WHERE singleton=1");
+      Exec(database_, "PRAGMA user_version=10");
+    }
+    if (ScalarInteger(database_, "PRAGMA application_id") == kCCLCJournalSqliteApplicationId &&
+        ScalarInteger(database_, "PRAGMA user_version") == 10) {
+      Require(SchemaDefinitions(database_) == ExpectedSchemaDefinitions(10),
+              "component_lifecycle_journal_storage_foreign",
+              "predecessor native-Apply CCLC schema is not exact");
+      Statement predecessor(database_,
+                            "SELECT schema_id,schema_version,cell_id "
+                            "FROM cclc_journal_metadata WHERE singleton=1");
+      Require(predecessor.Step() && predecessor.Text(0) == kCCLCJournalSchemaId &&
+                  predecessor.Integer(1) == 10 &&
+                  predecessor.Text(2) == cell_id_.value() && !predecessor.Step(),
+              "component_lifecycle_journal_storage_foreign",
+              "predecessor native-Apply CCLC journal identity is not exact");
+      Exec(database_, kNativeApplySchemaUpgrade);
+      Exec(database_, "UPDATE cclc_journal_metadata SET schema_version=11 WHERE singleton=1");
+      Exec(database_, "PRAGMA user_version=11");
     }
     Require(SchemaObjectNames(database_) == ExpectedSchemaObjects() &&
                 SchemaDefinitions(database_) == ExpectedSchemaDefinitions(),
@@ -2889,7 +2967,12 @@ void SqliteCCLCJournal::Impl::RetainCurrentComponentLifecycleFact(
     return;
   }
 
-  if (!status.current_state.has_value()) {
+  // A settled partial effect leaves no single coherent component state: the
+  // retained predecessor state must not survive as current (restart would
+  // otherwise reconstruct it as command readiness). The fact stays absent
+  // until an explicit later transition or authorized Apply establishes one.
+  if (!status.current_state.has_value() ||
+      status.terminal_result == ComponentLifecycleTerminalResultDTO::kFailedPartialEffect) {
     Statement erase(database_,
                     "DELETE FROM lifecycle_component_current_facts "
                     "WHERE controllable_component_id=?");
@@ -3032,6 +3115,13 @@ CCLCLifecycleRequestResultDTO SqliteCCLCJournal::Impl::AcceptOrReplayLifecycle(
   if (existing.has_value()) {
     transaction.Commit();
     return std::move(*existing);
+  }
+  const auto pending_apply = ReadUnsettledNativeApplyPlanLocked();
+  if (pending_apply) {
+    Fail("component_lifecycle_native_apply_unsettled",
+         "native Apply " + pending_apply->apply_id.value() + "/" +
+             std::to_string(pending_apply->apply_generation.value()) +
+             " blocks new lifecycle acceptance");
   }
 
   Require(candidate_acceptance.locally_valid() && candidate_initial_status.locally_valid() &&
@@ -3318,6 +3408,13 @@ CCLCRouteSelectionRequestResultDTO SqliteCCLCJournal::Impl::AcceptOrReplayRouteS
   if (existing.has_value()) {
     transaction.Commit();
     return std::move(*existing);
+  }
+  const auto pending_apply = ReadUnsettledNativeApplyPlanLocked();
+  if (pending_apply) {
+    Fail("component_lifecycle_native_apply_unsettled",
+         "native Apply " + pending_apply->apply_id.value() + "/" +
+             std::to_string(pending_apply->apply_generation.value()) +
+             " blocks new route-selection acceptance");
   }
 
   Require(
@@ -5107,6 +5204,503 @@ SqliteCCLCJournal::Impl::LoadCurrentActiveControlConfiguration(
   return configuration;
 }
 
+std::uint64_t SqliteCCLCJournal::Impl::NativeApplyGenerationFloorLocked(
+    std::string_view kind, std::string_view identity) {
+  const bool component = kind == "component";
+  Statement watermark(database_,
+                      component
+                          ? "SELECT component_lifecycle_generation FROM "
+                            "lifecycle_component_watermarks WHERE controllable_component_id=?"
+                          : "SELECT active_control_configuration_generation FROM "
+                            "control_domain_active_configuration_watermarks "
+                            "WHERE control_domain_id=?");
+  watermark.Bind(1, identity);
+  std::uint64_t floor = 0U;
+  if (watermark.Step()) {
+    floor = Positive(watermark.Integer(0), "native Apply generation watermark");
+    Require(!watermark.Step(), "component_lifecycle_journal_corrupt",
+            "native Apply generation watermark is duplicated");
+  }
+  Statement reserved(database_,
+                     "SELECT generation FROM cclc_native_apply_reservations "
+                     "WHERE reservation_kind=? AND identity=?");
+  reserved.Bind(1, kind);
+  reserved.Bind(2, identity);
+  if (reserved.Step()) {
+    floor = std::max(floor, Positive(reserved.Integer(0), "native Apply reservation"));
+    Require(!reserved.Step(), "component_lifecycle_journal_corrupt",
+            "native Apply reservation is duplicated");
+  }
+  return floor;
+}
+
+std::optional<NamedApplyPublicationTransactionDTO>
+SqliteCCLCJournal::Impl::ReadUnsettledNativeApplyPlan() {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  return ReadUnsettledNativeApplyPlanLocked();
+}
+
+std::vector<ControllableComponentId>
+SqliteCCLCJournal::Impl::LoadComponentsWithUnsettledLifecycle() {
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Statement pending(database_,
+                    "SELECT DISTINCT controllable_component_id FROM lifecycle_transactions "
+                    "WHERE terminal=0 ORDER BY controllable_component_id");
+  std::vector<ControllableComponentId> result;
+  while (pending.Step()) {
+    result.emplace_back(pending.Text(0));
+    Require(!result.back().empty() && result.size() <= kMaxLifecycleFacts,
+            "component_lifecycle_journal_corrupt",
+            "unsettled lifecycle component identity is invalid or unbounded");
+  }
+  return result;
+}
+
+std::optional<NamedApplyPublicationTransactionDTO>
+SqliteCCLCJournal::Impl::ReadUnsettledNativeApplyPlanLocked() {
+  Statement pending(database_,
+                    "SELECT p.apply_id,p.apply_generation FROM cclc_native_apply_plans p "
+                    "WHERE NOT EXISTS(SELECT 1 FROM cclc_native_apply_adoptions a "
+                    "WHERE a.apply_id=p.apply_id AND a.apply_generation=p.apply_generation)");
+  if (!pending.Step()) return std::nullopt;
+  NamedApplyPublicationTransactionDTO result{
+      ApplyId(pending.Text(0)),
+      ApplyGeneration(Positive(pending.Integer(1), "unsettled native Apply generation"))};
+  Require(result.valid() && !pending.Step(), "component_lifecycle_journal_corrupt",
+          "unsettled native Apply identity is invalid or duplicated");
+  return result;
+}
+
+std::optional<NativeApplyPlanDTO> SqliteCCLCJournal::Impl::ReadNativeApplyPlanLocked(
+    const NamedApplyPublicationTransactionDTO& apply) {
+  Statement header(database_,
+                   "SELECT apply_id,apply_generation,candidate_bundle_id,candidate_graph_revision "
+                   "FROM cclc_native_apply_plans WHERE singleton=1");
+  if (!header.Step()) return std::nullopt;
+  if (header.Text(0) != apply.apply_id.value() ||
+      Positive(header.Integer(1), "native Apply plan generation") !=
+          apply.apply_generation.value()) {
+    return std::nullopt;
+  }
+  NativeApplyPlanDTO plan{apply, RetainedBundleId(header.Text(2)),
+                          GraphRevision(header.Text(3)), {}, {}};
+  Require(!header.Step(), "component_lifecycle_journal_corrupt",
+          "native Apply plan header is duplicated");
+  Statement components(database_,
+                       "SELECT controllable_component_id,component_lifecycle_state,"
+                       "component_lifecycle_generation FROM cclc_native_apply_plan_components "
+                       "ORDER BY controllable_component_id");
+  while (components.Step()) {
+    const auto state = static_cast<ComponentLifecycleStateDTO>(components.Integer(1));
+    Require(state == ComponentLifecycleStateDTO::kActive ||
+                state == ComponentLifecycleStateDTO::kDisabled,
+            "component_lifecycle_journal_corrupt", "native Apply plan state is invalid");
+    plan.components.push_back(
+        {ControllableComponentId(components.Text(0)), state,
+         ComponentLifecycleGeneration(
+             Positive(components.Integer(2), "native Apply planned component generation"))});
+  }
+  Statement routes(database_,
+                   "SELECT control_domain_id,active_control_configuration_generation "
+                   "FROM cclc_native_apply_plan_routes ORDER BY control_domain_id");
+  while (routes.Step()) {
+    plan.routes.push_back(
+        {ControlDomainId(routes.Text(0)),
+         ActiveControlConfigurationGeneration(
+             Positive(routes.Integer(1), "native Apply planned route generation"))});
+  }
+  return plan;
+}
+
+NativeApplyPlanDTO SqliteCCLCJournal::Impl::PlanNativeApply(
+    const NativeApplyPlanRequestDTO& request) {
+  Require(request.apply.valid() && !request.candidate_retained_bundle_id.empty() &&
+              !request.candidate_graph_revision.empty() &&
+              request.components.size() <= kMaximumCCLCComponentWatermarks &&
+              request.compiled_routes.size() <= kMaximumCCLCActiveConfigurationWatermarks,
+          "component_lifecycle_native_apply_invalid",
+          "native Apply plan has an invalid Apply, candidate or scope");
+  auto components = request.components;
+  std::sort(components.begin(), components.end());
+  Require(std::adjacent_find(components.begin(), components.end()) == components.end() &&
+              std::all_of(components.begin(), components.end(),
+                          [](const auto& id) {
+                            return !id.empty() && id.value().size() <= kMaxLifecycleIdentityBytes;
+                          }),
+          "component_lifecycle_native_apply_invalid",
+          "native Apply plan components are invalid or duplicated");
+  auto compiled = request.compiled_routes;
+  std::sort(compiled.begin(), compiled.end(), [](const auto& a, const auto& b) {
+    return a.control_domain_id < b.control_domain_id;
+  });
+  for (std::size_t index = 0U; index < compiled.size(); ++index) {
+    Require(!compiled[index].control_domain_id.empty() &&
+                compiled[index].control_domain_id.value().size() <= kMaxLifecycleIdentityBytes &&
+                compiled[index].generation.nonzero() &&
+                FitsSqliteInteger(compiled[index].generation.value()) &&
+                (index == 0U ||
+                 compiled[index - 1U].control_domain_id != compiled[index].control_domain_id),
+            "component_lifecycle_native_apply_invalid",
+            "native Apply plan routes are invalid or duplicated");
+  }
+
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  bool replay = false;
+  {
+    Statement header(database_,
+                     "SELECT apply_id,apply_generation,candidate_bundle_id,"
+                     "candidate_graph_revision FROM cclc_native_apply_plans WHERE singleton=1");
+    if (header.Step() && header.Text(0) == request.apply.apply_id.value() &&
+        Positive(header.Integer(1), "native Apply plan generation") ==
+            request.apply.apply_generation.value()) {
+      // Exact replay of the same delegation returns the recorded plan; it
+      // never recomputes states or generations.
+      Require(header.Text(2) == request.candidate_retained_bundle_id.value() &&
+                  header.Text(3) == request.candidate_graph_revision.value(),
+              "component_lifecycle_native_apply_conflict",
+              "native Apply was already planned for another candidate");
+      replay = true;
+    }
+  }
+  {
+    if (!replay) {
+      Require(ActiveTransactionCount() == 0U &&
+                  ScalarInteger(database_,
+                                "SELECT count(*) FROM cclc_lifecycle_cell_claims "
+                                "WHERE release_receipt_recorded=0") == 0,
+              "component_lifecycle_native_apply_unsettled",
+              "native Apply cannot be planned over unsettled CCLC work");
+      Exec(database_, "DELETE FROM cclc_native_apply_plan_components");
+      Exec(database_, "DELETE FROM cclc_native_apply_plan_routes");
+      Exec(database_, "DELETE FROM cclc_native_apply_plans");
+      Statement insert(database_,
+                       "INSERT INTO cclc_native_apply_plans(singleton,apply_id,apply_generation,"
+                       "candidate_bundle_id,candidate_graph_revision) VALUES(1,?,?,?,?)");
+      insert.Bind(1, request.apply.apply_id.value());
+      insert.Bind(2, static_cast<std::int64_t>(request.apply.apply_generation.value()));
+      insert.Bind(3, request.candidate_retained_bundle_id.value());
+      insert.Bind(4, request.candidate_graph_revision.value());
+      Require(!insert.Step(), "component_lifecycle_journal_corrupt",
+              "native Apply plan write returned a row");
+      const auto reserve = [&](std::string_view kind, std::string_view identity,
+                               std::uint64_t generation) {
+        Statement row(database_,
+                      "INSERT INTO cclc_native_apply_reservations("
+                      "reservation_kind,identity,generation) VALUES(?,?,?) "
+                      "ON CONFLICT(reservation_kind,identity) DO UPDATE SET "
+                      "generation=excluded.generation");
+        row.Bind(1, kind);
+        row.Bind(2, identity);
+        row.Bind(3, static_cast<std::int64_t>(generation));
+        Require(!row.Step(), "component_lifecycle_journal_corrupt",
+                "native Apply reservation write returned a row");
+      };
+      for (const auto& component : components) {
+        // Only an explicit, completed Disable is preserved; every other
+        // native component is enabled by the Apply.
+        auto state = ComponentLifecycleStateDTO::kActive;
+        Statement current(database_,
+                          "SELECT component_lifecycle_state FROM lifecycle_component_current_facts "
+                          "WHERE controllable_component_id=?");
+        current.Bind(1, component.value());
+        if (current.Step() && static_cast<ComponentLifecycleStateDTO>(current.Integer(0)) ==
+                                  ComponentLifecycleStateDTO::kDisabled) {
+          state = ComponentLifecycleStateDTO::kDisabled;
+        }
+        const auto floor = NativeApplyGenerationFloorLocked("component", component.value());
+        Require(FitsSqliteInteger(floor + 1U),
+                "component_lifecycle_native_apply_generation_exhausted",
+                "native Apply component generation cannot advance");
+        reserve("component", component.value(), floor + 1U);
+        Statement row(database_,
+                      "INSERT INTO cclc_native_apply_plan_components(controllable_component_id,"
+                      "component_lifecycle_state,component_lifecycle_generation) VALUES(?,?,?)");
+        row.Bind(1, component.value());
+        row.Bind(2, static_cast<std::int64_t>(state));
+        row.Bind(3, static_cast<std::int64_t>(floor + 1U));
+        Require(!row.Step(), "component_lifecycle_journal_corrupt",
+                "native Apply plan component write returned a row");
+      }
+      for (const auto& route : compiled) {
+        const auto floor = NativeApplyGenerationFloorLocked(
+            "route", route.control_domain_id.value());
+        Require(FitsSqliteInteger(floor + 1U),
+                "component_lifecycle_native_apply_generation_exhausted",
+                "native Apply route generation cannot advance");
+        // First publication keeps the compiled generation; afterwards the
+        // route continues past every used or reserved generation.
+        const auto generation =
+            floor == 0U ? route.generation.value() : std::max(route.generation.value(), floor + 1U);
+        reserve("route", route.control_domain_id.value(), generation);
+        Statement row(database_,
+                      "INSERT INTO cclc_native_apply_plan_routes(control_domain_id,"
+                      "active_control_configuration_generation) VALUES(?,?)");
+        row.Bind(1, route.control_domain_id.value());
+        row.Bind(2, static_cast<std::int64_t>(generation));
+        Require(!row.Step(), "component_lifecycle_journal_corrupt",
+                "native Apply plan route write returned a row");
+      }
+    }
+  }
+  auto plan = ReadNativeApplyPlanLocked(request.apply);
+  Require(plan.has_value(), "component_lifecycle_journal_corrupt",
+          "native Apply plan is not readable after it was recorded");
+  std::vector<ControlDomainId> planned_domains;
+  for (const auto& route : plan->routes) planned_domains.push_back(route.control_domain_id);
+  std::vector<ControlDomainId> requested_domains;
+  for (const auto& route : compiled) requested_domains.push_back(route.control_domain_id);
+  std::vector<ControllableComponentId> planned_components;
+  for (const auto& component : plan->components) planned_components.push_back(component.component_id);
+  Require(planned_domains == requested_domains && planned_components == components,
+          "component_lifecycle_native_apply_conflict",
+          "native Apply replay names another component or route scope");
+  transaction.Commit();
+  return *plan;
+}
+
+std::optional<NativeApplyPlanDTO> SqliteCCLCJournal::Impl::LoadNativeApplyPlan(
+    const NamedApplyPublicationTransactionDTO& apply) {
+  Require(apply.valid(), "component_lifecycle_native_apply_invalid",
+          "native Apply plan query has no exact Apply");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  return ReadNativeApplyPlanLocked(apply);
+}
+
+void SqliteCCLCJournal::Impl::AdoptNativeApplyFacts(
+    const NativeApplyFactAdoptionDTO& adoption) {
+  const auto* named_apply = std::get_if<NamedApplyPublicationTransactionDTO>(
+      &adoption.publication.request.transaction_ref);
+  Require(adoption.publication.valid() && named_apply != nullptr &&
+              adoption.components.size() <= kMaximumCCLCComponentWatermarks &&
+              adoption.current_routes.size() <=
+                  kMaximumCCLCActiveConfigurationWatermarks,
+          "component_lifecycle_native_apply_invalid",
+          "native Apply adoption has an invalid publication or scope");
+  auto components = adoption.components;
+  std::sort(components.begin(), components.end(), [](const auto& a, const auto& b) {
+    return a.component_id < b.component_id;
+  });
+  auto routes = adoption.current_routes;
+  std::sort(routes.begin(), routes.end(), [](const auto& a, const auto& b) {
+    return a.control_domain_id < b.control_domain_id;
+  });
+  std::string facts;
+  const auto append = [&](std::string_view value) {
+    facts += std::to_string(value.size());
+    facts += ':';
+    facts.append(value);
+  };
+  append(adoption.publication.request.candidate_retained_bundle_id.value());
+  append(adoption.publication.request.candidate_graph_revision.value());
+  for (std::size_t index = 0U; index < components.size(); ++index) {
+    const auto& component = components[index];
+    Require(!component.component_id.empty() &&
+                (component.state == ComponentLifecycleStateDTO::kActive ||
+                 component.state == ComponentLifecycleStateDTO::kDisabled) &&
+                component.generation.nonzero() &&
+                FitsSqliteInteger(component.generation.value()) &&
+                (index == 0U || components[index - 1U].component_id != component.component_id),
+            "component_lifecycle_native_apply_invalid",
+            "native Apply component facts are invalid or duplicated");
+    append(component.component_id.value());
+    append(to_string(component.state));
+    append(std::to_string(component.generation.value()));
+  }
+  for (std::size_t index = 0U; index < routes.size(); ++index) {
+    const auto& route = routes[index];
+    Require(route.locally_valid() &&
+                route.state == ActiveControlConfigurationStateDTO::kReconciled &&
+                FitsSqliteInteger(route.active_control_configuration_generation.value()) &&
+                (index == 0U || routes[index - 1U].control_domain_id != route.control_domain_id),
+            "component_lifecycle_native_apply_invalid",
+            "native Apply route facts are invalid or duplicated");
+    append(route.control_domain_id.value());
+    const auto encoded = detail::EncodeActiveControlConfiguration(route);
+    append(std::string_view(reinterpret_cast<const char*>(encoded.data()),
+                            encoded.size()));
+  }
+  const auto facts_digest = content_identity::sha256_digest(facts);
+
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Transaction transaction(database_);
+  Statement prior(database_,
+                  "SELECT publication_generation,public_pointer_digest,"
+                  "candidate_bundle_id,candidate_graph_revision,facts_digest "
+                  "FROM cclc_native_apply_adoptions WHERE apply_id=? AND apply_generation=?");
+  prior.Bind(1, named_apply->apply_id.value());
+  prior.Bind(2, static_cast<std::int64_t>(named_apply->apply_generation.value()));
+  if (prior.Step()) {
+    Require(Positive(prior.Integer(0), "native Apply publication generation") ==
+                    adoption.publication.publication_generation.value() &&
+                prior.Text(1) ==
+                    adoption.publication.durable_public_pointer_content_digest.value() &&
+                prior.Text(2) ==
+                    adoption.publication.request.candidate_retained_bundle_id.value() &&
+                prior.Text(3) ==
+                    adoption.publication.request.candidate_graph_revision.value() &&
+                prior.Text(4) == facts_digest && !prior.Step(),
+            "component_lifecycle_native_apply_conflict",
+            "native Apply was already promoted with different facts");
+    transaction.Commit();
+    return;
+  }
+  // Only the facts CCLC planned before publication may be adopted.
+  const auto plan = ReadNativeApplyPlanLocked(*named_apply);
+  Require(plan.has_value() &&
+              plan->candidate_retained_bundle_id ==
+                  adoption.publication.request.candidate_retained_bundle_id &&
+              plan->candidate_graph_revision ==
+                  adoption.publication.request.candidate_graph_revision &&
+              plan->components.size() == components.size() &&
+              plan->routes.size() == routes.size(),
+          "component_lifecycle_native_apply_unplanned",
+          "native Apply facts have no matching recorded plan");
+  for (std::size_t index = 0U; index < components.size(); ++index) {
+    Require(plan->components[index].component_id == components[index].component_id &&
+                plan->components[index].state == components[index].state &&
+                plan->components[index].generation == components[index].generation,
+            "component_lifecycle_native_apply_unplanned",
+            "native Apply component facts differ from the recorded plan");
+  }
+  for (std::size_t index = 0U; index < routes.size(); ++index) {
+    Require(plan->routes[index].control_domain_id == routes[index].control_domain_id &&
+                plan->routes[index].generation ==
+                    routes[index].active_control_configuration_generation,
+            "component_lifecycle_native_apply_unplanned",
+            "native Apply route generations differ from the recorded plan");
+  }
+  Require(ActiveTransactionCount() == 0U &&
+              ScalarInteger(database_,
+                  "SELECT count(*) FROM cclc_lifecycle_cell_claims "
+                  "WHERE release_receipt_recorded=0") == 0,
+          "component_lifecycle_native_apply_unsettled",
+          "native Apply cannot replace unsettled CCLC facts");
+
+  Exec(database_, "DELETE FROM lifecycle_component_current_facts");
+  Exec(database_, "DELETE FROM control_domain_active_configurations");
+  const auto advance = [&](std::string_view kind, std::string_view identity,
+                           std::uint64_t generation) {
+    // The planned generation is above every earlier one; the watermark and
+    // current fact move to it together, and its reservation is released.
+    Statement old(database_,
+                  kind == "component"
+                      ? "SELECT component_lifecycle_generation FROM "
+                        "lifecycle_component_watermarks WHERE controllable_component_id=?"
+                      : "SELECT active_control_configuration_generation FROM "
+                        "control_domain_active_configuration_watermarks "
+                        "WHERE control_domain_id=?");
+    old.Bind(1, identity);
+    const auto previous = old.Step() ? Positive(old.Integer(0), "native Apply watermark") : 0U;
+    Require(!old.Step() && previous < generation,
+            "component_lifecycle_native_apply_generation_stale",
+            "native Apply planned generation is no longer above the journal watermark");
+    Statement watermark(database_,
+                        kind == "component"
+                            ? "INSERT INTO lifecycle_component_watermarks("
+                              "controllable_component_id,component_lifecycle_generation) "
+                              "VALUES(?,?) ON CONFLICT(controllable_component_id) DO UPDATE SET "
+                              "component_lifecycle_generation=excluded.component_lifecycle_generation"
+                            : "INSERT INTO control_domain_active_configuration_watermarks("
+                              "control_domain_id,active_control_configuration_generation) "
+                              "VALUES(?,?) ON CONFLICT(control_domain_id) DO UPDATE SET "
+                              "active_control_configuration_generation="
+                              "excluded.active_control_configuration_generation");
+    watermark.Bind(1, identity);
+    watermark.Bind(2, static_cast<std::int64_t>(generation));
+    Require(!watermark.Step(), "component_lifecycle_journal_corrupt",
+            "native Apply watermark write returned a row");
+    Statement release(database_,
+                      "DELETE FROM cclc_native_apply_reservations "
+                      "WHERE reservation_kind=? AND identity=? AND generation<=?");
+    release.Bind(1, kind);
+    release.Bind(2, identity);
+    release.Bind(3, static_cast<std::int64_t>(generation));
+    Require(!release.Step(), "component_lifecycle_journal_corrupt",
+            "native Apply reservation release returned a row");
+  };
+  for (const auto& component : components) {
+    advance("component", component.component_id.value(), component.generation.value());
+    Statement current(database_,
+        "INSERT INTO lifecycle_component_current_facts("
+        "controllable_component_id,component_lifecycle_generation,"
+        "component_lifecycle_state) VALUES(?,?,?)");
+    current.Bind(1, component.component_id.value());
+    current.Bind(2, static_cast<std::int64_t>(component.generation.value()));
+    current.Bind(3, static_cast<std::int64_t>(component.state));
+    Require(!current.Step(), "component_lifecycle_journal_corrupt",
+            "native Apply component fact write returned a row");
+  }
+  for (const auto& route : routes) {
+    advance("route", route.control_domain_id.value(),
+            route.active_control_configuration_generation.value());
+    Statement current(database_,
+        "INSERT INTO control_domain_active_configurations("
+        "control_domain_id,active_control_configuration_generation,"
+        "origin_route_selection_transaction_id,"
+        "origin_route_selection_transaction_generation,configuration_blob) "
+        "VALUES(?,?,NULL,NULL,?)");
+    current.Bind(1, route.control_domain_id.value());
+    current.Bind(2, static_cast<std::int64_t>(
+                        route.active_control_configuration_generation.value()));
+    current.BindBlob(3, detail::EncodeActiveControlConfiguration(route));
+    Require(!current.Step(), "component_lifecycle_journal_corrupt",
+            "native Apply route fact write returned a row");
+  }
+  Statement retain(database_,
+      "INSERT INTO cclc_native_apply_adoptions("
+      "apply_id,apply_generation,publication_generation,public_pointer_digest,"
+      "candidate_bundle_id,candidate_graph_revision,facts_digest) "
+      "VALUES(?,?,?,?,?,?,?)");
+  retain.Bind(1, named_apply->apply_id.value());
+  retain.Bind(2, static_cast<std::int64_t>(named_apply->apply_generation.value()));
+  retain.Bind(3, static_cast<std::int64_t>(
+                     adoption.publication.publication_generation.value()));
+  retain.Bind(4, adoption.publication.durable_public_pointer_content_digest.value());
+  retain.Bind(5, adoption.publication.request.candidate_retained_bundle_id.value());
+  retain.Bind(6, adoption.publication.request.candidate_graph_revision.value());
+  retain.Bind(7, facts_digest);
+  Require(!retain.Step(), "component_lifecycle_journal_corrupt",
+          "native Apply adoption write returned a row");
+  transaction.Commit();
+}
+
+bool SqliteCCLCJournal::Impl::HasNativeApplyFacts(
+    const ActiveBundlePublicationReceiptDTO& publication) {
+  const auto* named_apply = std::get_if<NamedApplyPublicationTransactionDTO>(
+      &publication.request.transaction_ref);
+  Require(publication.valid() && named_apply != nullptr,
+          "component_lifecycle_native_apply_invalid",
+          "native Apply fact query has no exact named publication");
+  std::lock_guard lock(mutex_);
+  RequireOpen();
+  Statement row(database_,
+                "SELECT publication_generation,public_pointer_digest,"
+                "candidate_bundle_id,candidate_graph_revision "
+                "FROM cclc_native_apply_adoptions "
+                "WHERE apply_id=? AND apply_generation=?");
+  row.Bind(1, named_apply->apply_id.value());
+  row.Bind(2, static_cast<std::int64_t>(named_apply->apply_generation.value()));
+  if (!row.Step()) return false;
+  Require(Positive(row.Integer(0), "native Apply publication generation") ==
+                  publication.publication_generation.value() &&
+              row.Text(1) ==
+                  publication.durable_public_pointer_content_digest.value() &&
+              row.Text(2) ==
+                  publication.request.candidate_retained_bundle_id.value() &&
+              row.Text(3) ==
+                  publication.request.candidate_graph_revision.value() &&
+              !row.Step(),
+          "component_lifecycle_native_apply_conflict",
+          "native Apply adoption conflicts with the active publication");
+  return true;
+}
+
 void SqliteCCLCJournal::Impl::CompactTerminalResults(std::size_t prospective_terminal_count,
                                                      std::uint64_t prospective_terminal_bytes) {
   Require(prospective_terminal_count <= 1U, "component_lifecycle_journal_corrupt",
@@ -5400,6 +5994,39 @@ Result<std::optional<ActiveControlConfigurationDTO>>
 SqliteCCLCJournal::LoadCurrentActiveControlConfiguration(const ControlDomainId& control_domain_id) {
   return AsResult<std::optional<ActiveControlConfigurationDTO>>(
       [&]() { return impl_->LoadCurrentActiveControlConfiguration(control_domain_id); });
+}
+
+Result<NativeApplyPlanDTO> SqliteCCLCJournal::PlanNativeApply(
+    const NativeApplyPlanRequestDTO& request) {
+  return AsResult<NativeApplyPlanDTO>([&]() { return impl_->PlanNativeApply(request); });
+}
+
+Result<std::optional<NamedApplyPublicationTransactionDTO>>
+SqliteCCLCJournal::ReadUnsettledNativeApplyPlan() {
+  return AsResult<std::optional<NamedApplyPublicationTransactionDTO>>(
+      [&]() { return impl_->ReadUnsettledNativeApplyPlan(); });
+}
+
+Result<std::vector<ControllableComponentId>>
+SqliteCCLCJournal::LoadComponentsWithUnsettledLifecycle() {
+  return AsResult<std::vector<ControllableComponentId>>(
+      [&]() { return impl_->LoadComponentsWithUnsettledLifecycle(); });
+}
+
+Result<std::optional<NativeApplyPlanDTO>> SqliteCCLCJournal::LoadNativeApplyPlan(
+    const NamedApplyPublicationTransactionDTO& apply) {
+  return AsResult<std::optional<NativeApplyPlanDTO>>(
+      [&]() { return impl_->LoadNativeApplyPlan(apply); });
+}
+
+Result<void> SqliteCCLCJournal::AdoptNativeApplyFacts(
+    const NativeApplyFactAdoptionDTO& adoption) {
+  return AsResult<void>([&]() { impl_->AdoptNativeApplyFacts(adoption); });
+}
+
+Result<bool> SqliteCCLCJournal::HasNativeApplyFacts(
+    const ActiveBundlePublicationReceiptDTO& publication) {
+  return AsResult<bool>([&]() { return impl_->HasNativeApplyFacts(publication); });
 }
 
 void SqliteCCLCJournal::Close() {

@@ -1795,8 +1795,6 @@ class ProgramNodeAdmissionEvidenceRequest(StrictRequest):
     owner_api: Literal[
         "scene.transaction",
         "scene.carried_attachment",
-        "cclc.lifecycle",
-        "cclc.control_route",
     ]
 
     @field_validator(
@@ -3226,12 +3224,10 @@ class ComponentLifecycleRequest(StrictRequest):
 
     @model_validator(mode="after")
     def validate_domain_order(self) -> "ComponentLifecycleRequest":
-        if (
-            self.program_node_evidence
-            and self.program_node_evidence.owner_api != "cclc.lifecycle"
-        ):
+        if self.program_node_evidence is not None:
             raise ValueError(
-                "lifecycle requests require the exact cclc.lifecycle node API"
+                "component lifecycle mutations are unsupported as Program nodes; "
+                "use the explicit idle-time component-management API"
             )
         identifiers = [item.control_domain_id for item in self.expected_control_domains]
         if identifiers != sorted(identifiers) or len(identifiers) != len(
@@ -3363,12 +3359,10 @@ class RouteSelectionRequestResultQuery(StrictRequest):
             raise ValueError(
                 "component_expectations must be strictly ordered by component ID"
             )
-        if self.program_node_evidence and (
-            self.program_node_evidence.owner_api != "cclc.control_route"
-            or self.expected_admission_generation is None
-        ):
+        if self.program_node_evidence is not None:
             raise ValueError(
-                "route node evidence requires cclc.control_route and admission generation"
+                "route selection is unsupported as a Program node; use the "
+                "explicit idle-time control-domain API"
             )
         return self
 

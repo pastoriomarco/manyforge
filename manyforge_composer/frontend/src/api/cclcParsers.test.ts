@@ -155,6 +155,19 @@ describe('CCLC closed response parsers', () => {
     expect(parseCCLCStatusEnvelope({ status }, 'lifecycle')?.transactionId)
       .toBe('lifecycle.2');
 
+    const failed = {
+      ...structuredClone(status),
+      phase: 'failed',
+      terminal_result: 'failed_known_no_effect',
+      error: {
+        code: 'native_lifecycle_route_unavailable',
+        message: 'The native route did not become ready',
+        details: { reason: 'route_readback_missing' },
+      },
+    };
+    expect(parseCCLCStatusEnvelope({ status: failed }, 'lifecycle')?.error)
+      .toEqual(failed.error);
+
     const mismatched = structuredClone(status);
     (mismatched.acceptance as Record<string, unknown>).lifecycle_transaction_id =
       'lifecycle.foreign';

@@ -737,6 +737,19 @@ TEST(ResolvedStopBasePlanResolverTest,
   EXPECT_EQ(owner.read_count_, 2U);
   EXPECT_EQ(owner.publish_count_, 2U);
 
+  // Route selection for a Prepared component installs coherent route and
+  // Stop readiness. It neither enables nor closes the component: command
+  // eligibility is the Kernel's separate lifecycle projection.
+  auto prepared_acceptance = acceptance;
+  prepared_acceptance.component_expectations.front()
+      .expected_component_lifecycle_state =
+      core::ComponentLifecycleStateDTO::kPrepared;
+  const auto prepared = publisher.PublishAndReadBack(
+      prepared_acceptance, expected.sealed(), configuration);
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  EXPECT_TRUE(prepared.value().operation_admission_open);
+  EXPECT_EQ(prepared.value().readiness_rows.size(), 1U);
+
   owner.mismatch_configuration_ = true;
   const auto drifted = publisher.PublishAndReadBack(
       acceptance, expected.sealed(), configuration);

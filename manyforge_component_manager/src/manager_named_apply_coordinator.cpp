@@ -1,6 +1,7 @@
 #include "manyforge_component_manager/manager_named_apply_coordinator.hpp"
 
 #include <manyforge_deployment/apply_affected_scope.hpp>
+#include <manyforge_deployment/native_domain_topology.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include <cstddef>
@@ -534,6 +535,17 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   if (!apply_journal_
            .ReadFenceAttempt(intent.apply_id, intent.apply_generation)
            .has_value()) {
+    // Refuse an unsupported native layout before any predecessor teardown:
+    // this is a known pre-effect failure, never a candidate-initialization
+    // surprise after the predecessor is gone.
+    if (const auto topology =
+            deployment::VerifySupportedNativeDomainTopology(
+                candidate.value().cell_graph);
+        !topology.ok()) {
+      return retain_pre_effect_failure(topology.error().code,
+                                       topology.error().message,
+                                       ManagerApplyEffectDisposition::kKnown);
+    }
     const auto refusal = planned_maintenance_.Preflight(
         intent, intent.expected_active_projection_revision);
     if (refusal.has_value()) {
@@ -725,6 +737,25 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
         apply_journal_, durable_intent,
         "configuration_publication_incomplete",
         "coherent publication exceeded its bounded two effects",
+        ManagerApplyEffectDisposition::kUnknown, request_replayed);
+  }
+
+  // The candidate is public only now. Its lifecycle/route owner can verify
+  // that exact publication while the parent fence is still held. Do not
+  // release admission merely because the pointer swap succeeded.
+  try {
+    const auto composition = runtime_composition_coordinator_.InstallOrRecover(
+        intent.apply_id, intent.apply_generation, candidate);
+    if (composition.state ==
+        ManagerSelectedRuntimeCompositionResultState::kPending) {
+      return {intent.apply_id, intent.apply_generation,
+              ManagerNamedApplyResultState::kPending, request_replayed,
+              std::nullopt};
+    }
+  } catch (const std::exception &error) {
+    return RetainTerminalFailure(
+        apply_journal_, durable_intent,
+        "runtime_composition_publication_verification_failed", error.what(),
         ManagerApplyEffectDisposition::kUnknown, request_replayed);
   }
 

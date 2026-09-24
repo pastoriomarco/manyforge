@@ -159,10 +159,8 @@ def build_deployment(
             "description": "UI6-I dual-robot wall qualification occurrence",
             "component_occurrence_id": component,
             "runtime_restoration_profile_id": runtime_profile,
-            # T qualifies cell-level grouped execution. Both simulated engines
-            # use the fixed direct-control product; branded Lite6 lifecycle
-            # behavior remains covered by its maintained single-robot lane.
-            "native_lifecycle_management": False,
+            # T qualifies cell-level grouped execution. Native lifecycle is
+            # selected by the same verified provider product for both robots.
             "assistant_profile_id": None,
             "root_pose_in_cell": {
                 "position_m": [0.0, y_m, 0.0],
@@ -761,7 +759,6 @@ def main() -> int:
                         "runtime_restoration_profile_id": (
                             "lite6_native_simulated_v0"
                         ),
-                        "native_lifecycle_management": False,
                         "assistant_profile_id": None,
                         "root_pose_in_cell": {
                             "position_m": [0.0, 0.0, 0.0],
@@ -788,7 +785,6 @@ def main() -> int:
                         "runtime_restoration_profile_id": (
                             "ur5e_robotiq_native_simulated_v0"
                         ),
-                        "native_lifecycle_management": False,
                         "assistant_profile_id": None,
                         "root_pose_in_cell": {
                             "position_m": [0.0, 1.0, 0.0],

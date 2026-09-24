@@ -17,24 +17,19 @@ const ACTIONS: Array<{
   states: CCLCComponentSnapshot['lifecycleState'][];
 }> = [
   {
-    intent: 'prepare', label: 'Start / prepare',
-    detail: 'Prepare the retained provider process and component.',
+    intent: 'prepare', label: 'Prepare',
+    detail: 'Verify retained runtime resources without admitting commands.',
     states: ['declared', 'disabled'],
   },
   {
-    intent: 'enable', label: 'Connect / enable',
-    detail: 'Enable the prepared component and its retained control route.',
+    intent: 'enable', label: 'Enable',
+    detail: 'Enable the prepared component after its control route is verified.',
     states: ['prepared'],
   },
   {
-    intent: 'disable', label: 'Stop / disable',
-    detail: 'Contain robot work through Kernel Stop, then disable the component.',
+    intent: 'disable', label: 'Disable',
+    detail: 'Only while the cell is idle: keep the component installed but close its command gate. This is not Stop.',
     states: ['prepared', 'active', 'degraded', 'faulted'],
-  },
-  {
-    intent: 'recover', label: 'Recover / restart',
-    detail: 'Run the retained recovery plan, including any required clear or re-arm steps.',
-    states: ['disabled'],
   },
 ];
 
@@ -109,7 +104,7 @@ export function CCLCPanelView({
     <section className="panel cclc-panel" aria-labelledby="cclc-panel-title">
       <header className="panel-header">
         <div>
-          <p className="eyebrow">Manager-owned component</p>
+          <p className="eyebrow">CCLC-owned lifecycle</p>
           <h2 id="cclc-panel-title">Lifecycle and control route</h2>
         </div>
         <span className="muted">Owner-issued state</span>
@@ -151,7 +146,7 @@ export function CCLCPanelView({
           </p>
           <p className="muted">
             {snapshot.domains.length} control domain(s)
-            {' · '}{snapshot.providers.length} managed provider process(es)
+            {' · '}{snapshot.providers.length} provider occurrence(s)
           </p>
           {snapshot.providers.map((provider) => (
             <div className="cclc-provider-card" key={`${provider.controlDomainId}:${provider.providerInstanceId}`}>
@@ -224,6 +219,11 @@ export function CCLCPanelView({
             {transaction?.phase ?? 'awaiting owner status'}
             {transaction?.terminalResult ? ` · ${transaction.terminalResult}` : ''}
             {transaction?.reconciliationRequired ? ' · reconciliation required' : ''}
+            {transaction?.error
+              ? ` · ${transaction.error.code}: ${transaction.error.message}`
+                + (transaction.error.details.reason
+                  ? ` (${transaction.error.details.reason})` : '')
+              : ''}
           </span>
           {(error !== null || transaction?.reconciliationRequired) && (
             <button type="button" disabled={busy} onClick={() => void reconcileTransaction()}>
@@ -232,8 +232,6 @@ export function CCLCPanelView({
           )}
         </div>
       )}
-      {error !== null && <p className="error-state" role="alert">{error}</p>}
-
       <OverlayPanel
         open={confirmation !== null}
         title={confirmation?.label ?? 'Confirm lifecycle action'}

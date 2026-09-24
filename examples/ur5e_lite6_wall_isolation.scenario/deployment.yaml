@@ -29,7 +29,6 @@
           "require_backend_confirmation": true,
           "stop_mode": "spring_back_hold"
         },
-        "native_lifecycle_management": false,
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,
           "direct_control_joint_limits": [],
@@ -162,7 +161,6 @@
           "require_backend_confirmation": true,
           "stop_mode": "spring_back_hold"
         },
-        "native_lifecycle_management": false,
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,
           "direct_control_joint_limits": [],

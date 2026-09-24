@@ -159,13 +159,16 @@ export function ProgramContactPolicyEditor({
   program,
   draftRevision,
   busy,
+  busyReason = null,
   mutate,
 }: {
   program: ProgramAuthoringDocument;
   draftRevision: number;
   busy: boolean;
+  busyReason?: string | null;
   mutate: ProgramWorkspaceController['mutate'];
 }) {
+  const blockedTitle = busy ? busyReason ?? undefined : undefined;
   const options = useMemo(() => targetOptions(program), [program]);
   const keys = useMemo(() => runtimeObjectKeys(program), [program]);
   const policies = program.contact_policies ?? EMPTY_POLICIES;
@@ -240,6 +243,7 @@ export function ProgramContactPolicyEditor({
         <button
           type="button"
           disabled={busy || options.length === 0 || keys.length === 0}
+          title={blockedTitle}
           onClick={() => {
             setSelectedId('');
             setDraft(empty);
@@ -254,6 +258,7 @@ export function ProgramContactPolicyEditor({
         program={program}
         draftRevision={draftRevision}
         busy={busy}
+        busyReason={busyReason}
         mutate={mutate}
       />
       <div className="contact-policy-subheading">
@@ -293,6 +298,7 @@ export function ProgramContactPolicyEditor({
             <input
               value={draft.policyId}
               disabled={busy || existing}
+              title={blockedTitle}
               pattern="[a-z][a-z0-9_.-]*"
               onChange={(event) => update({ ...draft, policyId: event.target.value })}
             />
@@ -302,6 +308,7 @@ export function ProgramContactPolicyEditor({
             <input
               value={draft.zoneId}
               disabled={busy}
+              title={blockedTitle}
               pattern="[a-z][a-z0-9_.-]*"
               onChange={(event) => update({ ...draft, zoneId: event.target.value })}
               onBlur={() => existing && materialize(draft)}
@@ -312,6 +319,7 @@ export function ProgramContactPolicyEditor({
             <select
               value={draft.targetOptionId}
               disabled={busy}
+              title={blockedTitle}
               onChange={(event) => update(
                 { ...draft, targetOptionId: event.target.value }, existing,
               )}
@@ -326,6 +334,7 @@ export function ProgramContactPolicyEditor({
             <select
               value={draft.runtimeObjectKey}
               disabled={busy}
+              title={blockedTitle}
               onChange={(event) => update(
                 { ...draft, runtimeObjectKey: event.target.value }, existing,
               )}
@@ -343,6 +352,7 @@ export function ProgramContactPolicyEditor({
                 ? draft.maxPenetrationM
                 : ''}
               disabled={busy}
+              title={blockedTitle}
               onChange={(event) => update({
                 ...draft,
                 maxPenetrationM: event.currentTarget.valueAsNumber,
@@ -361,6 +371,7 @@ export function ProgramContactPolicyEditor({
                 ? draft.terminalWindowStartFraction
                 : ''}
               disabled={busy}
+              title={blockedTitle}
               onChange={(event) => update({
                 ...draft,
                 terminalWindowStartFraction: event.currentTarget.valueAsNumber,
@@ -373,6 +384,7 @@ export function ProgramContactPolicyEditor({
               <button
                 type="button"
                 disabled={busy || !validDraft(draft, options, keys)}
+                title={blockedTitle}
                 onClick={() => materialize(draft)}
               >Add contact policy</button>
             )}
@@ -381,6 +393,7 @@ export function ProgramContactPolicyEditor({
                 type="button"
                 className="danger-button"
                 disabled={busy}
+                title={blockedTitle}
                 onClick={() => void mutate(
                   'program_draft_remove_contact_policies',
                   { contact_policy_ids: [draft.policyId] },

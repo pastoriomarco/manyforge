@@ -6,18 +6,68 @@
 #include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <memory>
+#include <optional>
 #include <string_view>
+#include <vector>
 
 namespace manyforge::core {
 
 inline constexpr std::string_view kCCLCJournalSchemaId = "manyforge.internal.cclc.journal.v5";
-inline constexpr std::int64_t kCCLCJournalSchemaVersion = 10;
+inline constexpr std::int64_t kCCLCJournalSchemaVersion = 11;
 inline constexpr std::int64_t kCCLCJournalSqliteApplicationId = 0x4D464C4A;
 inline constexpr std::string_view kCCLCJournalFilename = "cclc-journal.sqlite3";
 inline constexpr std::size_t kDefaultCCLCExactResultHistory = 128U;
 inline constexpr std::size_t kMaximumCCLCExactResultHistory = 128U;
 inline constexpr std::size_t kDefaultCCLCTerminalResultBytes = 512U * 1024U * 1024U;
 inline constexpr std::size_t kMaximumCCLCTerminalResultBytes = 512U * 1024U * 1024U;
+
+/// One component of a native Apply: the state its route gate must have and
+/// the lifecycle generation CCLC assigns to it.
+struct NativeApplyComponentFactDTO final {
+  ControllableComponentId component_id;
+  ComponentLifecycleStateDTO state{ComponentLifecycleStateDTO::kDeclared};
+  ComponentLifecycleGeneration generation{0U};
+};
+
+struct NativeApplyRouteGenerationDTO final {
+  ControlDomainId control_domain_id;
+  ActiveControlConfigurationGeneration generation{0U};
+};
+
+/// Parent-Apply delegation to CCLC, recorded before any route is published.
+/// The caller must hold and verify the exact parent Apply fence.
+struct NativeApplyPlanRequestDTO final {
+  NamedApplyPublicationTransactionDTO apply;
+  RetainedBundleId candidate_retained_bundle_id;
+  GraphRevision candidate_graph_revision;
+  std::vector<ControllableComponentId> components;
+  /// Every native control domain with the generation compiled into its
+  /// runtime bindings (the floor for its planned generation).
+  std::vector<NativeApplyRouteGenerationDTO> compiled_routes;
+};
+
+/// CCLC's recorded decision for one native Apply: which components keep an
+/// explicit Disable (their gate stays closed) and the generations the
+/// candidate routes and component facts use. Generations continue from the
+/// journal's watermarks and every earlier plan, so an A->B->A sequence never
+/// reuses or falls behind a generation.
+struct NativeApplyPlanDTO final {
+  NamedApplyPublicationTransactionDTO apply;
+  RetainedBundleId candidate_retained_bundle_id;
+  GraphRevision candidate_graph_revision;
+  std::vector<NativeApplyComponentFactDTO> components;
+  std::vector<NativeApplyRouteGenerationDTO> routes;
+};
+
+/// Private promotion of the planned facts after the matching Manager Apply
+/// has published its candidate, but before its fence is released. Accepted
+/// only when it matches the recorded plan exactly. This is not a public
+/// lifecycle request or permission to perform effects.
+struct NativeApplyFactAdoptionDTO final {
+  ActiveBundlePublicationReceiptDTO publication;
+  std::vector<NativeApplyComponentFactDTO> components;
+  std::vector<ActiveControlConfigurationDTO> current_routes;
+};
 
 /// SQLite-backed CCLC lifecycle journal.
 ///
@@ -33,6 +83,9 @@ class SqliteCCLCJournal final : public ICCLCJournal {
 
   SqliteCCLCJournal(const SqliteCCLCJournal&) = delete;
   SqliteCCLCJournal& operator=(const SqliteCCLCJournal&) = delete;
+
+  [[nodiscard]] Result<std::optional<NamedApplyPublicationTransactionDTO>>
+  ReadUnsettledNativeApplyPlan() override;
 
   [[nodiscard]] Result<CCLCJournalRecoveryDTO> BeginOwnerEpoch(
       const RequestOwnerEpoch& owner_epoch, std::int64_t started_at_ns,
@@ -138,6 +191,31 @@ class SqliteCCLCJournal final : public ICCLCJournal {
 
   [[nodiscard]] Result<std::optional<ActiveControlConfigurationDTO>>
   LoadCurrentActiveControlConfiguration(const ControlDomainId& control_domain_id) override;
+
+  /// Record (or, for the same Apply and candidate, return) the plan before
+  /// any candidate route is published. Another candidate for the same Apply
+  /// or unsettled CCLC work fails closed. Retains only the latest plan.
+  [[nodiscard]] Result<NativeApplyPlanDTO> PlanNativeApply(
+      const NativeApplyPlanRequestDTO& request);
+
+  [[nodiscard]] Result<std::optional<NativeApplyPlanDTO>> LoadNativeApplyPlan(
+      const NamedApplyPublicationTransactionDTO& apply);
+
+  /// Components whose latest lifecycle transaction is not terminal. Restart
+  /// reconstructs command eligibility only for components absent from this
+  /// set: interrupted work stays command-closed until CCLC settles it.
+  [[nodiscard]] Result<std::vector<ControllableComponentId>>
+  LoadComponentsWithUnsettledLifecycle();
+
+  /// The caller must have verified the exact held parent Apply fence and each
+  /// runtime route readback. The facts must equal the recorded plan.
+  /// Repetition of the same promotion is read-only; another candidate or
+  /// unsettled CCLC transaction fails closed.
+  [[nodiscard]] Result<void> AdoptNativeApplyFacts(
+      const NativeApplyFactAdoptionDTO& adoption);
+
+  [[nodiscard]] Result<bool> HasNativeApplyFacts(
+      const ActiveBundlePublicationReceiptDTO& publication);
 
   void Close();
 

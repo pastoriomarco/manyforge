@@ -3542,7 +3542,57 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmis
         "manual claims are minted only by exact Kernel operation admission",
         "manual_operation_claim_requires_execute", ErrorCode::kInvalidRequest);
   }
+  // A lifecycle claim is a whole-cell configuration mutation. Serialize the
+  // physical work check with every command submission, then retain the
+  // admission lock through the durable claim so Start cannot win in between.
+  std::unique_lock<std::mutex> submit_lock(submission_mutex_, std::defer_lock);
+  if (intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle) {
+    submit_lock.lock();
+  }
   std::lock_guard admission_lock(*admission_mutex_);
+  if (intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle) {
+    std::lock_guard state_lock(state_mutex_);
+    // Every blocking condition and the identities it concerns, so a caller
+    // can tell exactly what must settle; nothing is retried or stopped.
+    std::vector<std::string> blocking;
+    if (pending_program_run_admission_.has_value()) blocking.emplace_back("program_run_admission_pending");
+    if (!active_operations_.empty()) blocking.emplace_back("operations_active");
+    if (operation_control_reconfiguration_busy_locked()) blocking.emplace_back("operation_control_busy");
+    if (motion_admission_unreconciled_) blocking.emplace_back("motion_admission_unreconciled");
+    if (manager_liveness_motion_inhibited_) blocking.emplace_back("manager_liveness_inhibited");
+    std::vector<std::string> busy_resources;
+    for (const auto& slot : resource_slots_->snapshot()) {
+      if (slot.state != ResourceSlotState::kFree || slot.owner.has_value()) {
+        busy_resources.push_back(slot.resource_id.value());
+      }
+    }
+    if (!busy_resources.empty()) blocking.emplace_back("resources_not_free");
+    if (!blocking.empty()) {
+      const auto join = [](const auto& values) {
+        std::string joined;
+        for (std::size_t index = 0U; index < values.size() && index < 16U; ++index) {
+          if (!joined.empty()) joined += ',';
+          joined += values[index];
+        }
+        return joined;
+      };
+      std::vector<std::string> operations;
+      for (const auto& [operation_id, operation] : active_operations_) {
+        static_cast<void>(operation);
+        operations.push_back(operation_id.value());
+      }
+      auto rejected = reject<CellAdmissionClaimDTO>(
+          "lifecycle mutation requires settled physical and Program work",
+          blocking.size() == 1U && !busy_resources.empty()
+              ? "component_lifecycle_resources_not_settled"
+              : "component_lifecycle_effects_not_settled");
+      auto error = rejected.error();
+      error.details["blocking_conditions"] = join(blocking);
+      if (!operations.empty()) error.details["active_operation_ids"] = join(operations);
+      if (!busy_resources.empty()) error.details["busy_resource_ids"] = join(busy_resources);
+      return Result<CellAdmissionClaimDTO>::Err(std::move(error));
+    }
+  }
   auto acquired = cell_admission_owner_->AcquireCellAdmissionClaim(intent);
   if (acquired.ok() && intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle) {
     refresh_execution_claims();
@@ -4506,6 +4556,333 @@ ResourceAddressedExecutionKernel::current_runtime_route_configuration(
     return Result<std::optional<RuntimeRouteConfigurationReadbackDTO>>::Ok(std::nullopt);
   }
   return Result<std::optional<RuntimeRouteConfigurationReadbackDTO>>::Ok(found->second);
+}
+
+Result<void> ResourceAddressedExecutionKernel::require_held_lifecycle_claim_locked(
+    const LifecycleTransactionId& lifecycle_transaction_id) const {
+  const auto claim = cell_admission_owner_->held_claim(CellAdmissionClaimKindDTO::kComponentLifecycle);
+  if (lifecycle_transaction_id.empty() || !claim ||
+      claim->intent.owner_transaction_id != lifecycle_transaction_id.value() ||
+      claim->intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner) {
+    return reject<void>("component command readiness requires its exact held CCLC claim",
+                        "component_readiness_claim_not_held");
+  }
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceAddressedExecutionKernel::require_idle_for_component_readiness_locked() const {
+  // The exact lifecycle claim (or the Apply fence during composition) is
+  // whole-cell and exclusive, so no command can be admitted meanwhile. Verify
+  // that nothing was resident when it was taken.
+  if (!active_operations_.empty() || operation_control_reconfiguration_busy_locked()) {
+    return reject<void>("component command readiness changed under resident physical work",
+                        "component_readiness_effects_not_settled");
+  }
+  const auto slots = resource_slots_->snapshot();
+  if (std::any_of(slots.begin(), slots.end(), [](const auto& slot) {
+        return slot.state != ResourceSlotState::kFree || slot.owner.has_value();
+      })) {
+    return reject<void>("component command readiness has reserved physical resources",
+                        "component_readiness_resources_not_settled");
+  }
+  return Result<void>::Ok();
+}
+
+std::optional<ErrorDTO> ResourceAddressedExecutionKernel::component_command_refusal_locked(
+    const RuntimeParticipantExecutionRegistration& registration) const {
+  const auto& binding = registration.binding.value();
+  if (!binding.control_path.has_value() ||
+      !runtime_route_configuration_readbacks_.contains(binding.control_path->control_domain_id)) {
+    // No route authority governs this domain, so there is no lifecycle
+    // projection to consult; the route checks decide admission as before.
+    return std::nullopt;
+  }
+  const auto found = component_command_readiness_.find(binding.controllable_component_id);
+  const auto* readiness =
+      registration.stop_readiness.has_value() ? &registration.stop_readiness->value() : nullptr;
+  if (found == component_command_readiness_.end() || !found->second.command_eligible ||
+      readiness == nullptr ||
+      found->second.component_lifecycle_generation != readiness->component_lifecycle_generation) {
+    ErrorDTO refusal = error(std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                             "the component is not enabled for commands",
+                             "component_command_not_eligible");
+    refusal.details.emplace("controllable_component_id", binding.controllable_component_id.value());
+    if (found != component_command_readiness_.end() &&
+        found->second.component_lifecycle_generation.has_value()) {
+      refusal.details.emplace(
+          "published_component_lifecycle_generation",
+          std::to_string(found->second.component_lifecycle_generation->value()));
+    }
+    if (readiness != nullptr) {
+      refusal.details.emplace("participant_component_lifecycle_generation",
+                              std::to_string(readiness->component_lifecycle_generation.value()));
+    }
+    return refusal;
+  }
+  return std::nullopt;
+}
+
+Result<void> ResourceAddressedExecutionKernel::require_component_routes_current_locked(
+    const ControllableComponentId& controllable_component_id, const bool command_eligible) const {
+  if (!command_eligible) {
+    return Result<void>::Ok();
+  }
+  bool any_domain = false;
+  for (const auto& registration : registrations_) {
+    const auto& binding = registration.binding.value();
+    if (binding.controllable_component_id != controllable_component_id ||
+        !binding.control_path.has_value()) {
+      continue;
+    }
+    any_domain = true;
+    const auto& domain = binding.control_path->control_domain_id;
+    const auto readback = runtime_route_configuration_readbacks_.find(domain);
+    if (!registration.stop_readiness.has_value() ||
+        runtime_route_configuration_publication_required_.contains(domain) ||
+        readback == runtime_route_configuration_readbacks_.end() ||
+        readback->second.active_configuration.state !=
+            ActiveControlConfigurationStateDTO::kReconciled ||
+        !readback->second.operation_admission_open ||
+        readback->second.active_configuration.active_control_configuration_id !=
+            binding.control_path->active_control_configuration_id ||
+        readback->second.active_configuration.active_control_configuration_generation !=
+            binding.control_path->active_control_configuration_generation) {
+      ErrorDTO refusal = error(std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                               "an enabled component requires every one of its routes to be current",
+                               "component_readiness_route_not_current");
+      refusal.details.emplace("control_domain_id", domain.value());
+      return Result<void>::Err(std::move(refusal));
+    }
+  }
+  if (!any_domain) {
+    return reject<void>("an enabled component requires installed route and Stop readiness",
+                        "component_readiness_participants_missing", ErrorCode::kMissingReference);
+  }
+  return Result<void>::Ok();
+}
+
+Result<ComponentCommandReadinessDTO>
+ResourceAddressedExecutionKernel::close_component_command_eligibility(
+    const LifecycleTransactionId& lifecycle_transaction_id,
+    const ControllableComponentId& controllable_component_id) {
+  if (lifecycle_transaction_id.empty() || controllable_component_id.empty()) {
+    return reject<ComponentCommandReadinessDTO>("component readiness closure identity is invalid",
+                                                "component_readiness_identity_invalid",
+                                                ErrorCode::kInvalidRequest);
+  }
+  std::lock_guard submit_lock(submission_mutex_);
+  std::lock_guard admission_lock(*admission_mutex_);
+  if (auto held = require_held_lifecycle_claim_locked(lifecycle_transaction_id); !held.ok()) {
+    return Result<ComponentCommandReadinessDTO>::Err(held.error());
+  }
+  std::lock_guard state_lock(state_mutex_);
+  try {
+    auto [entry, inserted] = component_command_readiness_.try_emplace(
+        controllable_component_id,
+        ComponentCommandReadinessDTO{controllable_component_id, std::nullopt, false});
+    static_cast<void>(inserted);
+    entry->second.command_eligible = false;
+    return Result<ComponentCommandReadinessDTO>::Ok(entry->second);
+  } catch (...) {
+    return reject<ComponentCommandReadinessDTO>(
+        "component readiness closure could not be recorded",
+        "component_readiness_capacity_unavailable", ErrorCode::kInternalError);
+  }
+}
+
+Result<ComponentCommandReadinessDTO>
+ResourceAddressedExecutionKernel::publish_component_command_readiness(
+    const ComponentCommandReadinessPublicationDTO& publication,
+    RuntimeParticipantAdmissionResolver participant_resolver) {
+  if (!publication.locally_valid()) {
+    return reject<ComponentCommandReadinessDTO>("component readiness publication is invalid",
+                                                "component_readiness_publication_invalid",
+                                                ErrorCode::kInvalidRequest);
+  }
+  const auto& component = publication.controllable_component_id;
+  // Each authority is proven positively; absence of another claim is never
+  // permission to enable commands.
+  const auto authorize_locked = [&]() -> Result<void> {
+    if (publication.authority == ComponentReadinessAuthorityDTO::kLifecycleClaim) {
+      return require_held_lifecycle_claim_locked(*publication.lifecycle_transaction_id);
+    }
+    if (cell_admission_owner_->held_claim(CellAdmissionClaimKindDTO::kComponentLifecycle)) {
+      return reject<void>("composition cannot publish readiness under a lifecycle claim",
+                          "component_readiness_lifecycle_claim_held");
+    }
+    if (publication.authority == ComponentReadinessAuthorityDTO::kRestartExclusion) {
+      if (!cell_admission_owner_->route_recovery_pending()) {
+        return reject<void>("restart readiness requires the Kernel route-recovery exclusion",
+                            "component_readiness_restart_exclusion_not_held");
+      }
+      return Result<void>::Ok();
+    }
+    // Parent Apply: this Apply's own held fence (not merely any fence) must
+    // cover every resource of the component while readiness changes.
+    std::vector<ResourceId> resources;
+    for (const auto& registration : registrations_) {
+      if (registration.binding.value().controllable_component_id != component) continue;
+      for (const auto& resource : registration.binding.value().resources) {
+        resources.push_back(resource.resource_id);
+      }
+    }
+    std::sort(resources.begin(), resources.end());
+    resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
+    if (config_.operation_admission_gate == nullptr || resources.empty() ||
+        !config_.operation_admission_gate->exact_fence_covers(*publication.parent_apply_fence_id,
+                                                              resources)) {
+      return reject<void>("Apply readiness requires the held parent fence over the component",
+                          "component_readiness_apply_fence_not_held");
+    }
+    return Result<void>::Ok();
+  };
+
+  // Close first and re-seal outside the short serialization boundary. Any
+  // failure below leaves the component command-closed.
+  std::vector<RuntimeParticipantExecutionRegistration> rebound;
+  bool generation_changed = false;
+  {
+    std::lock_guard submit_lock(submission_mutex_);
+    std::lock_guard admission_lock(*admission_mutex_);
+    if (auto authorized = authorize_locked(); !authorized.ok()) {
+      return Result<ComponentCommandReadinessDTO>::Err(authorized.error());
+    }
+    std::lock_guard state_lock(state_mutex_);
+    // Composition reads durable facts before publishing. A newer lifecycle
+    // result published meanwhile must never be overtaken by that read.
+    if (const auto current = component_command_readiness_.find(component);
+        publication.authority != ComponentReadinessAuthorityDTO::kLifecycleClaim &&
+        current != component_command_readiness_.end() &&
+        current->second.component_lifecycle_generation.has_value() &&
+        current->second.component_lifecycle_generation->value() >
+            publication.component_lifecycle_generation.value()) {
+      return reject<ComponentCommandReadinessDTO>(
+          "composition readiness is older than the published component generation",
+          "component_readiness_generation_stale", ErrorCode::kInvalidStateTransition);
+    }
+    if (auto idle = require_idle_for_component_readiness_locked(); !idle.ok()) {
+      return Result<ComponentCommandReadinessDTO>::Err(idle.error());
+    }
+    if (auto routes = require_component_routes_current_locked(component,
+                                                              publication.command_eligible);
+        !routes.ok()) {
+      return Result<ComponentCommandReadinessDTO>::Err(routes.error());
+    }
+    try {
+      auto [entry, inserted] = component_command_readiness_.try_emplace(
+          component, ComponentCommandReadinessDTO{component, std::nullopt, false});
+      static_cast<void>(inserted);
+      entry->second.command_eligible = false;
+      rebound = registrations_;
+    } catch (...) {
+      return reject<ComponentCommandReadinessDTO>(
+          "component readiness publication could not be staged",
+          "component_readiness_capacity_unavailable", ErrorCode::kInternalError);
+    }
+  }
+  for (auto& registration : rebound) {
+    if (registration.binding.value().controllable_component_id != component ||
+        !registration.stop_readiness.has_value()) {
+      continue;
+    }
+    if (registration.stop_readiness->value().component_lifecycle_generation ==
+        publication.component_lifecycle_generation) {
+      continue;
+    }
+    auto refreshed = rebind_runtime_participant_stop_readiness_generation(
+        *registration.stop_readiness, publication.component_lifecycle_generation);
+    if (!refreshed.ok()) {
+      return Result<ComponentCommandReadinessDTO>::Err(refreshed.error());
+    }
+    registration.stop_readiness = std::move(refreshed.value());
+    generation_changed = true;
+  }
+  if (generation_changed) {
+    if (!participant_resolver && config_.participant_resolver) {
+      return reject<ComponentCommandReadinessDTO>(
+          "a re-sealed component requires its rebuilt participant resolver",
+          "component_readiness_resolver_missing", ErrorCode::kMissingReference);
+    }
+    // Reuses the same engines and route configurations: an unchanged
+    // configuration keeps its route readback and generation.
+    auto reconfigured = reconfigure_runtime_participants_impl(
+        std::move(rebound), std::move(participant_resolver), false, nullptr);
+    if (!reconfigured.ok()) {
+      return Result<ComponentCommandReadinessDTO>::Err(reconfigured.error());
+    }
+  }
+
+  std::lock_guard submit_lock(submission_mutex_);
+  std::lock_guard admission_lock(*admission_mutex_);
+  if (auto authorized = authorize_locked(); !authorized.ok()) {
+    return Result<ComponentCommandReadinessDTO>::Err(authorized.error());
+  }
+  std::lock_guard state_lock(state_mutex_);
+  if (auto idle = require_idle_for_component_readiness_locked(); !idle.ok()) {
+    return Result<ComponentCommandReadinessDTO>::Err(idle.error());
+  }
+  std::set<ControlDomainId> component_domains;
+  for (const auto& registration : registrations_) {
+    const auto& binding = registration.binding.value();
+    if (binding.controllable_component_id != component || !binding.control_path.has_value()) {
+      continue;
+    }
+    if (registration.stop_readiness.has_value() &&
+        registration.stop_readiness->value().component_lifecycle_generation !=
+            publication.component_lifecycle_generation) {
+      return reject<ComponentCommandReadinessDTO>(
+          "component participants changed during readiness publication",
+          "component_readiness_generation_raced", ErrorCode::kInvariantViolation);
+    }
+    component_domains.insert(binding.control_path->control_domain_id);
+  }
+  if (auto routes = require_component_routes_current_locked(component,
+                                                            publication.command_eligible);
+      !routes.ok()) {
+    return Result<ComponentCommandReadinessDTO>::Err(routes.error());
+  }
+  // Refresh each affected route's readiness rows to the published generation
+  // without changing its configuration or route generation.
+  std::map<ControlDomainId, std::vector<RouteReadinessPublicationRowDTO>> refreshed_rows;
+  for (const auto& domain : component_domains) {
+    const auto readback = runtime_route_configuration_readbacks_.find(domain);
+    if (readback == runtime_route_configuration_readbacks_.end() ||
+        readback->second.active_configuration.state !=
+            ActiveControlConfigurationStateDTO::kReconciled ||
+        !readback->second.operation_admission_open ||
+        runtime_route_configuration_publication_required_.contains(domain)) {
+      continue;
+    }
+    auto rows = derive_route_readiness_projection(readback->second.active_configuration,
+                                                  registrations_);
+    if (!rows.ok()) {
+      return Result<ComponentCommandReadinessDTO>::Err(rows.error());
+    }
+    refreshed_rows.emplace(domain, std::move(rows.value()));
+  }
+  for (auto& [domain, rows] : refreshed_rows) {
+    runtime_route_configuration_readbacks_.at(domain).readiness_rows = std::move(rows);
+  }
+  auto& entry = component_command_readiness_.at(component);
+  entry.component_lifecycle_generation = publication.component_lifecycle_generation;
+  entry.command_eligible = publication.command_eligible;
+  return Result<ComponentCommandReadinessDTO>::Ok(entry);
+}
+
+Result<ComponentCommandReadinessDTO> ResourceAddressedExecutionKernel::component_command_readiness(
+    const ControllableComponentId& controllable_component_id) const {
+  if (controllable_component_id.empty()) {
+    return reject<ComponentCommandReadinessDTO>("component readiness query identity is invalid",
+                                                "component_readiness_identity_invalid",
+                                                ErrorCode::kInvalidRequest);
+  }
+  std::lock_guard submit_lock(submission_mutex_);
+  std::lock_guard state_lock(state_mutex_);
+  const auto found = component_command_readiness_.find(controllable_component_id);
+  return Result<ComponentCommandReadinessDTO>::Ok(
+      found == component_command_readiness_.end()
+          ? ComponentCommandReadinessDTO{controllable_component_id, std::nullopt, false}
+          : found->second);
 }
 
 bool ResourceAddressedExecutionKernel::participant_engine_in_use(
@@ -5726,6 +6103,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                         "runtime_route_configuration_not_ready",
                                         ErrorCode::kInvalidStateTransition);
   }
+  if (auto refusal = component_command_refusal_locked(resolved.value()); refusal.has_value()) {
+    return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
+  }
   if (!resolved.value().stop_readiness.has_value()) {
     return reject<OperationAcceptedDTO>("resolved participant has no verified Stop readiness",
                                         "runtime_participant_stop_readiness_missing",
@@ -6522,6 +6902,9 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
       return reject<OperationAcceptedDTO>("runtime route configuration is unreconciled or stale",
                                           "runtime_route_configuration_not_ready",
                                           ErrorCode::kInvalidStateTransition);
+    }
+    if (auto refusal = component_command_refusal_locked(registration); refusal.has_value()) {
+      return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
     }
 
     std::vector<ResourceId> resources;
@@ -8309,6 +8692,8 @@ ResourceAddressedExecutionKernel::get_manual_control_availability(
             control.active_control_configuration_generation)))
     return unavailable(
         {"runtime_route_configuration_not_ready", "target route is not current", {}});
+  if (auto refusal = component_command_refusal_locked(found.value()); refusal.has_value())
+    return unavailable(*refusal);
   std::vector<ResourceId> resources;
   resources.reserve(binding.resources.size());
   for (const auto& resource : binding.resources) resources.push_back(resource.resource_id);
@@ -9728,7 +10113,6 @@ ResourceAddressedExecutionKernel::capture_disable_handoff_runtime_snapshot_impl(
 
     auto resolution = DisableHandoffScopeResolutionDTO::kPromotedToFull;
     auto current_scope = full_scope;
-    std::optional<ComponentLifecycleGeneration> current_component_generation;
     if (expectation.request_kind == DisableHandoffScopeRequestKindDTO::kResolvedComponentScope) {
       const auto component_scope =
           derive_disable_handoff_scope(registrations_, expectation.controllable_component_id);
@@ -9742,14 +10126,17 @@ ResourceAddressedExecutionKernel::capture_disable_handoff_runtime_snapshot_impl(
           component != stop_component_scope_.end() &&
           component->controllable_component_id == expectation.controllable_component_id) {
         current_scope = component_scope;
-        current_component_generation = component->component_lifecycle_generation;
         const auto observation = resource_slots_->admission_snapshot(current_scope.resources);
         const auto current_configurations = select_disable_active_configurations(
             current_scope, observation.active_control_configurations);
+        // CCLC owns lifecycle generations. The registration-derived Stop
+        // component row retains the package's generation and does not advance
+        // on Prepare/Enable. CCLC checks the current generation before and
+        // under the Disable claim; Kernel verifies only the runtime facts it
+        // owns (bundle, graph, exact scope, and current routes) here.
         resolution =
             expectation.retained_bundle_id == stop_retained_bundle_id_ &&
                     expectation.graph_revision == stop_graph_revision_ &&
-                    expectation.component_lifecycle_generation == current_component_generation &&
                     expectation.component_scope == current_scope &&
                     expectation.active_control_configurations == current_configurations
                 ? DisableHandoffScopeResolutionDTO::kExact
@@ -9794,7 +10181,6 @@ ResourceAddressedExecutionKernel::capture_disable_handoff_runtime_snapshot_impl(
         *stop_graph_revision_,
         observation.operation_resource_generation,
         {},
-        current_component_generation,
         cell_stop_generation_,
         std::vector<OperationId>(queued_operations.begin(), queued_operations.end()),
         static_cast<std::uint64_t>(active_operations.size()) + (orphan_present ? 1U : 0U)};

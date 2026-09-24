@@ -23,7 +23,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = "sha256:07fbfcadc5ea5fab59cdb1bf3cf61baa35c482453a1c92d0deef64d691083f8a"
+EXPECTED_CATALOG_DIGEST = "sha256:d2ca039d89bb8b6fecb6ca64a4fe52d02f444c0040f818112a4fddb4700985fa"
 
 
 def _catalog_data() -> dict[str, object]:
@@ -51,7 +51,7 @@ def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
     assert catalog.content_version == EXPECTED_CONTENT_VERSION
     assert catalog.catalog_id == "manyforge_builtin"
     assert catalog.catalog_digest == EXPECTED_CATALOG_DIGEST
-    assert len(catalog.entries) == 51
+    assert len(catalog.entries) == 46
     assert (
         len(
             {
@@ -60,7 +60,7 @@ def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
                 for engine_id, implementation_id in entry.runner_implementation_ids.items()
             }
         )
-        == 51
+        == 46
     )
 
 

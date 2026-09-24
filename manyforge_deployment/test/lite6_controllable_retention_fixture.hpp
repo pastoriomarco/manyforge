@@ -91,13 +91,14 @@ text_array(std::initializer_list<std::string_view> values) {
   return CanonicalValue(std::move(result));
 }
 
+// Native fixtures anchor the generic native lifecycle, whose surface is
+// exactly Observe plus its planned Prepare/Enable/Disable (no Recover plan).
 inline void append_lifecycle_capability_offers(CanonicalValue::Array &offers) {
   for (const std::string_view capability_id : {
            "component.lifecycle.disable",
            "component.lifecycle.enable",
            "component.lifecycle.observe",
            "component.lifecycle.prepare",
-           "component.lifecycle.recover",
        }) {
     const auto *definition =
         core::find_builtin_capability_definition(capability_id);
@@ -554,10 +555,9 @@ qualify_control_catalog(bool chained, bool native_motion = false,
   std::vector<QualifiedCapabilityDefinition> lifecycle_capabilities;
   std::vector<std::string> lifecycle_capability_bytes;
   if (!lifecycle_semantic_digest.empty()) {
-    constexpr std::array<std::string_view, 5U> kLifecycleCapabilities{
+    constexpr std::array<std::string_view, 4U> kLifecycleCapabilities{
         "component.lifecycle.disable", "component.lifecycle.enable",
         "component.lifecycle.observe", "component.lifecycle.prepare",
-        "component.lifecycle.recover",
     };
     lifecycle_capabilities.reserve(kLifecycleCapabilities.size());
     lifecycle_capability_bytes.reserve(kLifecycleCapabilities.size());

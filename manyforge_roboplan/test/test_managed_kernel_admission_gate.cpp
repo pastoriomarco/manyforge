@@ -889,7 +889,7 @@ TEST(ManagedKernelRouteFenceOwner,
 }
 
 TEST(ManagedKernelDisableFenceOwner,
-     IdleFullScopePersistsReadyReplayAndFreshCompareAndSetRelease) {
+     OrdinaryDisableWithoutAnExactComponentScopeIsRefusedBeforeAnyFence) {
   OwnerFixture fixture;
   ManagedKernelAdmissionGate gate;
   const auto binding = FixtureBinding(fixture);
@@ -927,16 +927,31 @@ TEST(ManagedKernelDisableFenceOwner,
   ManagedKernelApplyFenceOwner owner(config, gate);
   owner.BindDisableHandoffKernel(kernel);
 
-  const core::DisableHandoffAdmissionQueryDTO query{
+  const core::DisableHandoffAdmissionQueryDTO full_query{
       binding.value().controllable_component_id,
       core::DisableHandoffScopeRequestKindDTO::kFullStopRequired, std::nullopt};
+  const auto full = owner.ObserveDisableHandoffAdmission(full_query);
+  ASSERT_TRUE(full.ok()) << full.error().message;
+  const core::DisableHandoffComponentScopeExpectationDTO expectation{
+      core::ContentDigest("component-current-snapshot-1"),
+      full.value().active_publication_generation,
+      full.value().active_public_pointer_digest,
+      full.value().retained_bundle_id,
+      full.value().graph_revision,
+      core::ComponentLifecycleGeneration(1U),
+      full.value().current_scope,
+      full.value().current_active_control_configurations};
+  const core::DisableHandoffAdmissionQueryDTO query{
+      binding.value().controllable_component_id,
+      core::DisableHandoffScopeRequestKindDTO::kResolvedComponentScope,
+      expectation};
   const auto observed = owner.ObserveDisableHandoffAdmission(query);
   ASSERT_TRUE(observed.ok()) << observed.error().message;
-  EXPECT_EQ(observed.value().scope_resolution,
-            core::DisableHandoffScopeResolutionDTO::kPromotedToFull);
-  EXPECT_EQ(observed.value().configuration_fence_generation,
-            core::ConfigurationFenceGeneration(0U));
-
+  // This registration has no Stop readiness, so the Kernel cannot resolve an
+  // exact component scope. Ordinary Disable never promotes to Full Stop: it is
+  // refused before any durable fence exists.
+  EXPECT_NE(observed.value().scope_resolution,
+            core::DisableHandoffScopeResolutionDTO::kExact);
   const core::DisableHandoffRequestDTO request{
       {core::RequestId("request.disable.internal.1"), owner_epoch, "cclc",
        std::nullopt},
@@ -955,62 +970,13 @@ TEST(ManagedKernelDisableFenceOwner,
       observed.value().operation_resource_generation,
       observed.value().configuration_fence_generation,
       observed.value().current_active_control_configurations};
-  ASSERT_TRUE(request.locally_valid());
-  const auto accepted = owner.BeginDisableHandoff(request);
-  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-  EXPECT_FALSE(accepted.value().stop_id.has_value());
-  EXPECT_EQ(accepted.value().replay_status,
-            core::RequestReplayStatusDTO::kAcceptedNew);
-
-  const auto status =
-      owner.DisableHandoffStatus(request.lifecycle_transaction_id,
-                                 request.lifecycle_transaction_generation);
-  ASSERT_TRUE(status.ok()) << status.error().message;
-  EXPECT_EQ(status.value().state, core::DisableHandoffStateDTO::kReady);
-  EXPECT_FALSE(status.value().stop_certificate.has_value());
-
-  const auto replay = owner.BeginDisableHandoff(request);
-  ASSERT_TRUE(replay.ok()) << replay.error().message;
-  EXPECT_EQ(replay.value().configuration_fence_id,
-            accepted.value().configuration_fence_id);
-  EXPECT_EQ(replay.value().replay_status,
-            core::RequestReplayStatusDTO::kReplayedExact);
-
-  const auto fresh = owner.ObserveDisableHandoffAdmission(query);
-  ASSERT_TRUE(fresh.ok()) << fresh.error().message;
-  EXPECT_EQ(fresh.value().configuration_fence_generation,
-            accepted.value().configuration_fence_generation);
-  const core::DisableHandoffComponentScopeExpectationDTO
-      current_component_expectation{
-          core::ContentDigest("component-current-snapshot-1"),
-          fresh.value().active_publication_generation,
-          fresh.value().active_public_pointer_digest,
-          fresh.value().retained_bundle_id,
-          fresh.value().graph_revision,
-          core::ComponentLifecycleGeneration(1U),
-          fresh.value().current_scope,
-          fresh.value().current_active_control_configurations};
-  const core::DisableFenceReleaseRequestDTO release_request{
-      {core::RequestId("request.disable.release.1"), owner_epoch, "cclc",
-       std::nullopt},
-      request.initiating_public_request_id,
-      request.lifecycle_transaction_id,
-      request.lifecycle_transaction_generation,
-      request.controllable_component_id,
-      status.value(),
-      1U,
-      core::ContentDigest("cclc-status-digest-1"),
-      current_component_expectation,
-      fresh.value()};
-  ASSERT_TRUE(release_request.locally_valid());
-  const auto released = owner.ReleaseDisableFence(release_request);
-  ASSERT_TRUE(released.ok()) << released.error().message;
-  EXPECT_EQ(released.value().configuration_fence_id,
-            accepted.value().configuration_fence_id);
-  const auto release_replay = owner.ReleaseDisableFence(release_request);
-  ASSERT_TRUE(release_replay.ok()) << release_replay.error().message;
-  EXPECT_EQ(release_replay.value().replay_status,
-            core::RequestReplayStatusDTO::kReplayedExact);
+  const auto refused = owner.BeginDisableHandoff(request);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_NE(refused.error().message.find("cannot escalate to Stop"), std::string::npos);
+  const auto after = owner.ObserveDisableHandoffAdmission(query);
+  ASSERT_TRUE(after.ok()) << after.error().message;
+  EXPECT_EQ(after.value().configuration_fence_generation,
+            observed.value().configuration_fence_generation);
 }
 
 TEST(ManagedKernelAdmissionGate,
@@ -1084,7 +1050,7 @@ TEST(ManagedKernelAdmissionGate,
 
 TEST(
     ManagedKernelAdmissionGate,
-    DisableFenceClosesAdmissionWithResidentWorkAndReopensOnlyAfterDurableRelease) {
+    OrdinaryDisableFenceRefusesResidentWorkAndClosesOnlyAnIdleScope) {
   ManagedKernelAdmissionGate gate;
   const auto scope = AffectedScope();
   auto table = std::make_shared<core::ResourceSlotTable>(
@@ -1093,6 +1059,17 @@ TEST(
   const auto owner = OperationOwner();
   ASSERT_TRUE(gate.reserve(*table, owner, scope.resources).ok());
 
+  // Resident work: ordinary Disable is refused, never escalated to Stop, and
+  // commits nothing durable.
+  bool committed_with_work = false;
+  EXPECT_THROW(static_cast<void>(gate.AcquireDisableFenceDurably(
+                   core::ConfigurationFenceId("fence.disable.busy"), scope,
+                   [&](const auto &) { committed_with_work = true; })),
+               std::runtime_error);
+  EXPECT_FALSE(committed_with_work);
+  ASSERT_TRUE(table->release(owner, scope.resources).ok());
+
+  // Idle: the fence closes admission and reopens it only after durable release.
   std::optional<manyforge::roboplan_backend::ManagedKernelAdmissionObservation>
       acquired_observation;
   const auto admitted = gate.AcquireDisableFenceDurably(
@@ -1100,14 +1077,12 @@ TEST(
       [&](const auto &observation) { acquired_observation = observation; });
   ASSERT_TRUE(acquired_observation.has_value());
   EXPECT_EQ(*acquired_observation, admitted);
-  EXPECT_EQ(admitted.affected_queued_operation_count, 1U);
+  EXPECT_EQ(admitted.affected_queued_operation_count, 0U);
   EXPECT_EQ(admitted.affected_active_operation_count, 0U);
-
   const auto blocked = gate.reserve(*table, owner, scope.resources);
   ASSERT_FALSE(blocked.ok());
   EXPECT_EQ(blocked.error().details.at("reason"), "configuration_fence_held");
 
-  ASSERT_TRUE(table->release(owner, scope.resources).ok());
   bool release_committed = false;
   gate.ReleaseDisableFenceDurably(
       core::ConfigurationFenceId("fence.disable"), scope,

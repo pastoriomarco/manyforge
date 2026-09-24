@@ -251,14 +251,17 @@ VerifiedRouteConfigurationPublicationPort::PublishAndReadBack(
         "route publication has an unknown configuration state");
   }
 
+  // Route selection installs geometry and Stop readiness only. Component
+  // command eligibility is CCLC lifecycle state, published separately; route
+  // selection neither enables a Disabled component nor closes an enabled peer.
+  const bool reconciled = durable_configuration.state ==
+                          core::ActiveControlConfigurationStateDTO::kReconciled;
   auto readback = kernel_owner_.PublishAndReadBackRouteConfiguration(
       durable_configuration, std::move(participants));
   if (!readback.ok()) {
     return core::Result<core::RouteReadinessPublicationReceiptDTO>::Err(
         readback.error());
   }
-  const bool reconciled = durable_configuration.state ==
-                          core::ActiveControlConfigurationStateDTO::kReconciled;
   if (readback.value().active_configuration != durable_configuration ||
       readback.value().operation_admission_open != reconciled ||
       !canonical_rows_equal(readback.value().readiness_rows, expected_rows)) {

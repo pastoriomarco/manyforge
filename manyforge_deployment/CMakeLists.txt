@@ -642,6 +642,7 @@ endif()
 add_library(manyforge_deployment_verification_core
   src/assistant_settings_codec.cpp
   src/apply_affected_scope.cpp
+  src/native_domain_topology.cpp
   src/artifact_codec.cpp
   src/composed_model_symbol_role_map_verifier.cpp
   src/control_domain_control_internal.cpp

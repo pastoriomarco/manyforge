@@ -300,6 +300,40 @@ TEST(KernelCellAdmissionOwner, RouteRecoveryBarrierSurvivesReadyUpdatesAndClaimS
   EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
 }
 
+TEST(KernelCellAdmissionOwner,
+     DisabledRequiredComponentCanBeEnabledOnlyFromWholeCellIdle) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto owner = Owner(clock, journal);
+  auto readiness = Ready();
+  readiness.required_component_current_compatible_ready_converged = 1U;
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(readiness).ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  const auto generation = owner.GetAuthoringAdmission().admission_generation;
+  EXPECT_FALSE(owner.AcquireCellAdmissionClaim(
+      Intent(CellAdmissionClaimKindDTO::kAuthoringMutation, generation)).ok());
+  const auto lifecycle = owner.AcquireCellAdmissionClaim(
+      Intent(CellAdmissionClaimKindDTO::kComponentLifecycle, generation));
+  ASSERT_TRUE(lifecycle.ok());
+  EXPECT_FALSE(owner.AcquireCellAdmissionClaim(
+      Intent(CellAdmissionClaimKindDTO::kProgramCycle,
+             owner.GetAuthoringAdmission().admission_generation)).ok());
+  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(lifecycle.value())).ok());
+  readiness.program_cycle_status->state = ProgramCycleStateDTO::kRunning;
+  readiness.program_cycle_status->cycle_generation = 2U;
+  readiness.program_cycle_status->program_run_id = ProgramRunId("run.1");
+  readiness.program_cycle_status->cycle_claim_generation =
+      CellAdmissionClaimGeneration(1U);
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(readiness).ok());
+  const auto busy = owner.AcquireCellAdmissionClaim(
+      Intent(CellAdmissionClaimKindDTO::kComponentLifecycle,
+             owner.GetAuthoringAdmission().admission_generation, "busy"));
+  ASSERT_FALSE(busy.ok());
+  // The refusal names what must settle, not only that the cell is busy.
+  EXPECT_EQ(busy.error().details.at("reason"),
+            "component_lifecycle_program_not_idle_after_reset");
+}
+
 TEST(KernelCellAdmissionOwner, ProgramChildrenReplayAfterHoldAndDrainBeforeReset) {
   FixedClock clock;
   AdmissionJournal journal;
@@ -346,11 +380,13 @@ TEST(KernelCellAdmissionOwner, ProgramChildrenReplayAfterHoldAndDrainBeforeReset
                                       "enable.attempt.1",
                                       "cclc.lifecycle"};
   const auto enabled = owner.AcquireCellAdmissionClaim(lifecycle);
-  ASSERT_TRUE(enabled.ok());
+  ASSERT_FALSE(enabled.ok());
+  // Lifecycle is not a Program node: its evidence is rejected as invalid.
+  EXPECT_EQ(enabled.error().details.at("reason"), "program_node_evidence_invalid");
   held = true;
   const auto before = journal.sequence.load();
   ASSERT_EQ(owner.AcquireCellAdmissionClaim(child).value(), scene.value());
-  EXPECT_EQ(checks, 2U);  // Exact receipt observation never re-enters effect admission.
+  EXPECT_EQ(checks, 1U);  // Refusal and exact replay never re-enter effect admission.
   EXPECT_EQ(journal.sequence.load(), before);
   auto late = child;
   late.request_id = RequestId("scene.late");
@@ -373,11 +409,6 @@ TEST(KernelCellAdmissionOwner, ProgramChildrenReplayAfterHoldAndDrainBeforeReset
   EXPECT_FALSE(owner.ValidateProgramResetSceneAuthorization(reset).ok());
   EXPECT_FALSE(owner.ReleaseCellAdmissionClaim(Release(parent.value())).ok());
   ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(scene.value())).ok());
-  EXPECT_EQ(owner.unsettled_program_child_nodes(parent.value().claim_generation),
-            std::vector<std::string>{"enable"});
-  EXPECT_FALSE(owner.ValidateProgramResetSceneAuthorization(reset).ok());
-  EXPECT_FALSE(owner.ReleaseCellAdmissionClaim(Release(parent.value())).ok());
-  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(enabled.value())).ok());
   EXPECT_TRUE(owner.unsettled_program_child_nodes(parent.value().claim_generation).empty());
   EXPECT_TRUE(owner.ValidateProgramResetSceneAuthorization(reset).ok());
 }
@@ -1299,6 +1330,32 @@ TEST(KernelCellAdmissionOwner, RunAndAuthoringRaceHasOneWinner) {
   run.join();
   author.join();
   EXPECT_EQ(accepted.load(), 1);
+}
+
+TEST(KernelCellAdmissionOwner, LifecycleVersusProgramOrManualClaimHasOneWinner) {
+  for (const auto competing_kind : {CellAdmissionClaimKindDTO::kProgramCycle,
+                                    CellAdmissionClaimKindDTO::kManualOperation}) {
+    FixedClock clock;
+    AdmissionJournal journal;
+    auto owner = Owner(clock, journal);
+    ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+    const auto generation = owner.GetAuthoringAdmission().admission_generation;
+    std::barrier start(3);
+    std::atomic<int> accepted{};
+    const auto acquire = [&](CellAdmissionClaimKindDTO kind, const char* request) {
+      start.arrive_and_wait();
+      if (owner.AcquireCellAdmissionClaim(Intent(kind, generation, request)).ok()) {
+        ++accepted;
+      }
+    };
+    std::thread lifecycle(acquire, CellAdmissionClaimKindDTO::kComponentLifecycle,
+                          "request.lifecycle");
+    std::thread competing(acquire, competing_kind, "request.competing");
+    start.arrive_and_wait();
+    lifecycle.join();
+    competing.join();
+    EXPECT_EQ(accepted.load(), 1) << static_cast<int>(competing_kind);
+  }
 }
 
 TEST(KernelCellAdmissionOwner, CapacityAndForeignOrStaleReleaseFailClosed) {

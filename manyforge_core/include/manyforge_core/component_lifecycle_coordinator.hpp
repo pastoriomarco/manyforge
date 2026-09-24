@@ -3,6 +3,7 @@
 #include <chrono>
 #include <manyforge_core/cclc_domain_reservation_table.hpp>
 #include <manyforge_core/ports/icclc_brand_lifecycle_port_resolver.hpp>
+#include <manyforge_core/ports/icclc_component_command_readiness_port.hpp>
 #include <manyforge_core/ports/icclc_controller_lifecycle_port_resolver.hpp>
 #include <manyforge_core/ports/icclc_current_component_snapshot_source.hpp>
 #include <manyforge_core/ports/icclc_journal.hpp>
@@ -63,7 +64,8 @@ class ComponentLifecycleCoordinator final {
       ICCLCKernelDisableHandoffPort& kernel_disable_handoff_port, IClock& clock,
       IScheduler& scheduler,
       IKernelCellAdmissionPort* kernel_cell_admission_port = nullptr,
-      std::optional<ComponentLifecycleCoordinatorRouteServices> route_services = std::nullopt);
+      std::optional<ComponentLifecycleCoordinatorRouteServices> route_services = std::nullopt,
+      ICCLCComponentCommandReadinessPort* component_command_readiness_port = nullptr);
   ~ComponentLifecycleCoordinator();
 
   ComponentLifecycleCoordinator(const ComponentLifecycleCoordinator&) = delete;

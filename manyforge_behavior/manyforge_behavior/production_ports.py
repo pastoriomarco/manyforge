@@ -141,6 +141,24 @@ def _number(value: object, *, field: str) -> float:
     return result
 
 
+def _owner_failure_message(exc: BaseException) -> str:
+    """Return a bounded failure message that keeps the owner's structured reason.
+
+    Owner rejections carry the precise cause in ``error.details.reason``; the
+    human message alone is often generic (for example "addressed observed state
+    is unavailable"), so the reason is appended when the message lacks it.
+    """
+
+    message = str(exc) or type(exc).__name__
+    response = getattr(exc, "response", None)
+    error = response.get("error") if isinstance(response, Mapping) else None
+    details = error.get("details") if isinstance(error, Mapping) else None
+    reason = details.get("reason") if isinstance(details, Mapping) else None
+    if isinstance(reason, str) and reason and reason not in message:
+        message = f"{message} ({reason[:256]})"
+    return message[:1024]
+
+
 def _request_identity(prefix: str, *coordinates: str) -> str:
     digest = sha256(b"\x00".join(value.encode("utf-8") for value in coordinates))
     return f"{prefix}:{digest.hexdigest()}"
@@ -4239,7 +4257,7 @@ class HeadlessSceneProgramPort:
             return OwnerInvocationResult(
                 False,
                 reason_code=reason_code,
-                message=(str(exc) or type(exc).__name__)[:1024],
+                message=_owner_failure_message(exc),
             )
 
 

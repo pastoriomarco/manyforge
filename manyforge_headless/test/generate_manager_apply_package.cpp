@@ -5,7 +5,7 @@
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
-#include <manyforge_lite6_product/lifecycle_profile.hpp>
+#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 
 #include <algorithm>
 #include <array>
@@ -417,10 +417,15 @@ int main(int argc, char **argv) {
   try {
     const auto arguments = ParseArguments(argc, argv);
     std::filesystem::create_directories(arguments.package_root);
-    const auto arm_lifecycle_semantic = manyforge::lite6_product::
-        compute_lite6_lifecycle_catalog_semantic_digest();
-    const auto gripper_lifecycle_semantic = manyforge::lite6_product::
-        compute_lite6_gripper_lifecycle_catalog_semantic_digest();
+    // The native host initializes components through CCLC with the generic
+    // native lifecycle only; each provider anchors those plans under its ID.
+    const auto native_plans = manyforge::core::MakeNativeControlLifecyclePlans();
+    const auto arm_lifecycle_semantic =
+        manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+            manyforge::core::ProviderManifestId("lite6_arm_provider"), native_plans);
+    const auto gripper_lifecycle_semantic =
+        manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+            manyforge::core::ProviderManifestId("lite6_gripper_provider"), native_plans);
     if (!arm_lifecycle_semantic.ok() || !gripper_lifecycle_semantic.ok()) {
       throw std::logic_error(
           "Manager Apply fixture lifecycle catalogs are unavailable");
