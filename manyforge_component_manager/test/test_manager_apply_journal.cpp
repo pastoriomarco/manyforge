@@ -1008,9 +1008,11 @@ TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
             ManagerApplyEffectDisposition::kUnknown);
   EXPECT_EQ(terminal.failure->intent_digest, intent.intent_digest);
   EXPECT_FALSE(terminal.candidate_projection_revision.has_value());
-  // The terminal failure is the final durable milestone, not a successful Apply.
+  // A terminal failure retains the phase that actually failed.
   EXPECT_EQ(DeriveManagerApplyProgress(*status).phase,
-            ManagerApplyPhase::kSettled);
+            ManagerApplyPhase::kRuntimeConverged);
+  EXPECT_EQ(DeriveManagerApplyProgress(*status).record_digest,
+            status->terminal_outcome->terminal_outcome_digest);
 
   journal.Close();
 

@@ -608,7 +608,11 @@ class ExecutionControlSession:
                 semantic_owner_epoch=request.command.command_envelope.expected_semantic_owner_epoch,
                 execution_control_revision=request.command.command_envelope.expected_execution_control_revision,
             )
-            result = None
+            result = {
+                "code": getattr(error, "code", "execution_control_delivery_uncertain"),
+                "message": str(error)[:2048],
+                "correlation_id": request.command.command_envelope.correlation_id,
+            }
         message = ExecutionCommandReceiptMessageDTO(
             schema_version=CONTROL_PROTOCOL_VERSION,
             message_kind="command_receipt",

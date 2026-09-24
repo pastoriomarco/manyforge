@@ -463,6 +463,21 @@ describe('viewer failure isolation', () => {
     expect(source).not.toContain('framed: camera !== null');
   });
 
+  it('passes robot geometry only after Manager identity gating and leaves Stop controls mounted', () => {
+    const workspace = readFileSync(
+      new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
+      'utf8',
+    );
+    expect(workspace).toContain(
+      "modelPresentation.status === 'ready'\n    ? modelPresentation.manifest\n    : null",
+    );
+    expect(workspace).toContain('manifest={viewerManifest}');
+    expect(workspace).toContain('modelPresentation={modelPresentation}');
+    expect(workspace).toContain('if (readyManifest === null || motionDescriptor === null) return null;');
+    expect(workspace).toContain('<RobotControlPanelView');
+    expect(workspace).toContain('robotControlSurface={(');
+  });
+
   it('isolates individual retained and logical-scene mesh failures', () => {
     const source = readFileSync(
       new URL('./StructuralViewer.tsx', import.meta.url),
@@ -473,6 +488,21 @@ describe('viewer failure isolation', () => {
     expect(source).toContain('<AssetErrorBoundary resetKey={collision.mesh_url}');
     expect(source).toContain('<AssetErrorBoundary resetKey={url} onError={isolateError}>');
     expect(source).toContain('One mesh is unavailable; the remaining scene is still usable.');
+  });
+
+  it('stacks model and Scene warnings outside the bottom execution controls', () => {
+    const source = readFileSync(new URL('./StructuralViewer.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
+    const stack = source.slice(source.indexOf('className="viewer-notice-stack"'),
+      source.indexOf("{inspectorPanel === 'robot'", source.indexOf('className="viewer-notice-stack"')));
+    expect(stack).toContain('viewer-model-state synchronizing');
+    expect(stack).toContain('viewer-model-state unavailable');
+    expect(stack).toContain('viewer-scene-stale-state');
+    const layout = css.match(/\.viewer-notice-stack\s*\{([^}]+)\}/)?.[1];
+    expect(layout).toContain('display: grid');
+    expect(layout).toContain('top: 0.65rem');
+    expect(layout).toContain('overflow: auto');
+    expect(css).not.toMatch(/\.viewer-model-state\s*\{[^}]*bottom:/);
   });
 
   it('shares disposable object, link, and frame selection with camera tools', () => {

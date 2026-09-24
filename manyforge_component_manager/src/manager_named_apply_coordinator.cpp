@@ -510,8 +510,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
         auto result = RetainTerminalFailure(apply_journal_, durable_intent,
                                             code, message, disposition,
                                             request_replayed);
-        if (durable_intent.intent.parent_authoring_claim.has_value() &&
-            disposition == ManagerApplyEffectDisposition::kKnown) {
+        if (disposition == ManagerApplyEffectDisposition::kKnown) {
           const auto terminal = apply_journal_.ReadTerminalOutcome(
               intent.apply_id, intent.apply_generation);
           Require(terminal.has_value(),
@@ -623,16 +622,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
       return RetainTerminalFailure(
           apply_journal_, durable_intent, maintenance.failure_code,
           maintenance.failure_message,
-          ManagerApplyEffectDisposition::kUnknown, request_replayed);
-    }
-
-    try {
-      static_cast<void>(active_runtime_coordinator_.Shutdown());
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent,
-          "planned_maintenance_shutdown_failed", error.what(),
-          ManagerApplyEffectDisposition::kUnknown, request_replayed);
+          maintenance.effect_disposition, request_replayed);
     }
   }
 

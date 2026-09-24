@@ -3168,23 +3168,23 @@ export function parseScenarioDocumentLoadResponse(
     path,
   );
   const status = stringAt(record.status, `${path}.status`);
-  if (status !== 'opened' && status !== 'accepted') {
-    return fail(`${path}.status`, 'opened or accepted');
+  if (status !== 'accepted' && status !== 'applied') {
+    return fail(`${path}.status`, 'accepted or applied');
   }
-  const activation = record.activation === null
-    ? null
-    : jsonRecordAt(record.activation, `${path}.activation`);
-  if ((status === 'accepted') !== (activation !== null)) {
+  const activation = jsonRecordAt(record.activation, `${path}.activation`);
+  const activationStatus = stringAt(
+    activation.status,
+    `${path}.activation.status`,
+  );
+  if (activationStatus !== status) {
     return fail(
-      `${path}.activation`,
-      'an operation exactly when activation was accepted',
+      `${path}.activation.status`,
+      `to match Scenario Load status ${status}`,
     );
   }
-  return {
-    status,
+  const common = {
     path: stringAt(record.path, `${path}.path`),
     scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
-    activation,
     incomplete: booleanAt(record.incomplete, `${path}.incomplete`),
     diagnostics: arrayAt(record.diagnostics, `${path}.diagnostics`).map(
       (diagnostic, index) => parseProgramAuthoringDiagnostic(
@@ -3202,7 +3202,7 @@ export function parseScenarioDocumentLoadResponse(
           return fail(`${diagnosticPath}.code`, 'scenario_source_changed');
         }
         return {
-          code,
+          code: 'scenario_source_changed' as const,
           sourceId: stringAt(selected.source_id, `${diagnosticPath}.source_id`),
           message: stringAt(selected.message, `${diagnosticPath}.message`),
         };
@@ -3212,6 +3212,35 @@ export function parseScenarioDocumentLoadResponse(
     authoringWorkspace: parseAuthoringWorkspaceSnapshot(
       record.authoringWorkspace,
     ),
+  };
+  if (status === 'accepted') {
+    return {
+      ...common,
+      status,
+      activation: {
+        ...activation,
+        status,
+        apply_id: nonEmptyStringAt(
+          activation.apply_id,
+          `${path}.activation.apply_id`,
+        ),
+        apply_generation: positiveIntegerAt(
+          activation.apply_generation,
+          `${path}.activation.apply_generation`,
+        ),
+      },
+    };
+  }
+  if (activation.apply_id !== null) {
+    return fail(
+      `${path}.activation.apply_id`,
+      'null when the Scenario is already Applied',
+    );
+  }
+  return {
+    ...common,
+    status,
+    activation: { ...activation, status, apply_id: null },
   };
 }
 
@@ -4901,10 +4930,10 @@ export function parseProgramWorkspaceTransitionResponse(
   const record = objectAt(value, path);
   exactKeysAt(record, ['headless', 'status', 'workspace'], path);
   const status = stringAt(record.status, `${path}.status`);
-  if (!['applied', 'loaded', 'reverted'].includes(status)) {
+  if (!['accepted', 'applied', 'loaded', 'reverted'].includes(status)) {
     return fail(
       `${path}.status`,
-      'applied, loaded, or reverted',
+      'accepted, applied, loaded, or reverted',
     );
   }
   let headless: Record<string, JsonValue> | null;
@@ -4913,6 +4942,36 @@ export function parseProgramWorkspaceTransitionResponse(
       return fail(`${path}.headless`, 'an owner response');
     }
     headless = null;
+  } else if (status === 'accepted' || status === 'applied') {
+    const submitted = jsonRecordAt(record.headless, `${path}.headless`);
+    exactKeysAt(submitted, [
+      'status', 'confirmation_token', 'prepared_activation',
+      'candidate_preview', 'manager_apply', 'preparation', 'phases_ms',
+      'apply_id', ...(status === 'accepted' ? ['apply_generation'] : []),
+    ], `${path}.headless`);
+    if (submitted.status !== status || submitted.confirmation_token !== null
+        || submitted.preparation !== null) {
+      return fail(`${path}.headless`, 'the matching submitted activation');
+    }
+    parsePreparedActivationInput(submitted.prepared_activation,
+      `${path}.headless.prepared_activation`);
+    if (submitted.candidate_preview !== null) {
+      parseManagerDeploymentCandidatePreviewResponse(submitted.candidate_preview);
+    }
+    objectAt(submitted.phases_ms, `${path}.headless.phases_ms`);
+    if (status === 'accepted') {
+      const manager = parseManagerApplyResponse(submitted.manager_apply);
+      if (stringAt(submitted.apply_id, `${path}.headless.apply_id`)
+          !== manager.applyId
+          || positiveIntegerAt(submitted.apply_generation,
+            `${path}.headless.apply_generation`) !== manager.applyGeneration) {
+        return fail(`${path}.headless`, 'the exact accepted Manager operation');
+      }
+    } else if (submitted.manager_apply !== null || submitted.apply_id !== null
+               || submitted.apply_generation !== undefined) {
+      return fail(`${path}.headless`, 'an already-active configuration');
+    }
+    headless = submitted;
   } else {
     headless = status === 'loaded'
       ? parseScenarioLoadResult(record.headless, `${path}.headless`)

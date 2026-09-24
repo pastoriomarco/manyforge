@@ -1001,7 +1001,7 @@ def test_composer_source_model_uses_one_coherent_context_request(
     ] == ["/api/source-model-context"]
 
 
-def test_composer_program_routes_are_strict_stateless_forwarders(
+def test_composer_program_routes_forward_when_draft_matches_applied(
     headless_client,
 ) -> None:
     client, requests, _node_environment = headless_client
@@ -1029,6 +1029,12 @@ def test_composer_program_routes_are_strict_stateless_forwarders(
     with _composer_with_program(client) as composer:
         workspace = composer.get("/api/program/workspace").json()
         start["draft_program_revision"] = workspace["draft"]["programRevision"]
+        composer._composer_state.published_scenario = lambda: {  # type: ignore[method-assign]
+            "ready": True,
+            "published_scenario": {
+                "program_revision": start["draft_program_revision"],
+            },
+        }
         assert (
             composer.get("/api/program/runs?active_only=true&limit=1").json()["runs"]
             == []

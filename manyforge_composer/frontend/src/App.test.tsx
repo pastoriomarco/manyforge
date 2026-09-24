@@ -138,6 +138,10 @@ describe('Composer shell continuity', () => {
 
     expect(appSource).toContain('<ProgramDocumentControls');
     expect(appSource).toContain('<DeploymentCompositionPanel');
+    expect(appSource).toContain('viewerModelRefreshKey(headlessSnapshot)');
+    expect(appSource).toMatch(
+      /refreshViewerModelsOnManagerChange\([\s\S]*?retrySourceModel,\s*retryManifest,/,
+    );
     expect(appSource).toContain('runtimeStatusPresentation({');
     expect(appSource).toContain('className={`deployment-status-button readiness-');
     expect(appSource).not.toContain('<RuntimeStatusOverlay');

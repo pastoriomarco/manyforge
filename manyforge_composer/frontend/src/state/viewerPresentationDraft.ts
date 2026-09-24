@@ -36,6 +36,18 @@ export function programDraftPreviewActive(
   return ownerSceneKnown && ownerObjectCount === 0 && draftObjectCount > 0;
 }
 
+export function sceneSourceIsDraft(
+  choice: 'auto' | 'draft' | 'applied',
+  ownerSceneKnown: boolean,
+  draftAvailable: boolean,
+  draftDiffersFromApplied: boolean,
+  emptyOwnerPreview: boolean,
+): boolean {
+  return ownerSceneKnown && draftAvailable
+    && (choice === 'draft' || (choice === 'auto'
+      && (draftDiffersFromApplied || emptyOwnerPreview)));
+}
+
 function orderedVisibility(
   visibility: Record<string, boolean>,
 ): Record<string, boolean> {

@@ -1103,6 +1103,23 @@ class ManagerApplyFailure(StrictRequest):
         )
 
 
+class ManagerApplyStatusPreparedActivation(StrictRequest):
+    """The compact immutable activation identity published by Manager status."""
+
+    captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    deployment_artifact_id: str
+    deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+
+    @field_validator("deployment_artifact_id")
+    @classmethod
+    def validate_identity(cls, value: str) -> str:
+        return _bounded_nfc(
+            value, label="deployment_artifact_id", maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+
 class ManagerApplyStatus(StrictRequest):
     """One bounded lifecycle status for one durable Manager Apply operation.
 
@@ -1119,7 +1136,7 @@ class ManagerApplyStatus(StrictRequest):
     apply_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     request_id: str
     request_owner_epoch: str
-    prepared_activation: ManagerApplyPreparedActivation
+    prepared_activation: ManagerApplyStatusPreparedActivation
     phase: ManagerApplyPhase
     last_progress: ManagerApplyProgress
     state: ManagerApplyTerminalState

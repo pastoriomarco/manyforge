@@ -537,7 +537,7 @@ export function ProgramDocumentControls({
                   </div>
                 )}
                 <p>
-                  Loading a saved Scenario project opens its current authored files for editing. Runtime state is not changed.
+                  Load replaces the current Scenario and applies its Deployment, Scene and Program. It does not start motion.
                 </p>
                 {replaceNeedsConfirmation && (
                   <label className="program-confirmation">

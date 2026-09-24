@@ -28,7 +28,11 @@ import { useDeploymentWorkspace } from './hooks/useDeploymentWorkspace';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
-import { nodeEnvironmentRefreshKey } from './state/nodeEnvironmentRefresh';
+import {
+  nodeEnvironmentRefreshKey,
+  refreshViewerModelsOnManagerChange,
+  viewerModelRefreshKey,
+} from './state/nodeEnvironmentRefresh';
 import { useStructuralResource } from './state/structuralResource';
 import { deriveProgramMotionConfiguration } from './utils/programAuthoring';
 import {
@@ -126,6 +130,7 @@ export default function App() {
     },
   );
   const nodeEnvironmentWakeKey = useRef<string | null>(null);
+  const viewerModelWakeKey = useRef<string | null>(null);
   useEffect(() => {
     if (health.status === 'ready') {
       structuralRetryAttempt.current = 0;
@@ -178,6 +183,7 @@ export default function App() {
   useEffect(() => {
     if (!headlessEnabled) {
       nodeEnvironmentWakeKey.current = null;
+      viewerModelWakeKey.current = null;
       return;
     }
     if (headlessSnapshot === null) return;
@@ -190,6 +196,24 @@ export default function App() {
     nodeEnvironmentWakeKey.current = key;
     retryNodeEnvironment();
   }, [headlessEnabled, headlessSnapshot, retryNodeEnvironment]);
+  useEffect(() => {
+    if (!headlessEnabled) {
+      viewerModelWakeKey.current = null;
+      return;
+    }
+    if (headlessSnapshot === null) return;
+    viewerModelWakeKey.current = refreshViewerModelsOnManagerChange(
+      viewerModelWakeKey.current,
+      viewerModelRefreshKey(headlessSnapshot),
+      retrySourceModel,
+      retryManifest,
+    );
+  }, [
+    headlessEnabled,
+    headlessSnapshot,
+    retryManifest,
+    retrySourceModel,
+  ]);
   const programController = useProgramWorkspace(
     headlessSnapshot,
     authoringWorkspace,

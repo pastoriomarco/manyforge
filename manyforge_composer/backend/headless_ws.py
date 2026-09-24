@@ -30,6 +30,10 @@ _SEND_TIMEOUT_SECONDS = 0.25
 _STATE_MESSAGE = re.compile(r'"message_kind"\s*:\s*"(?:snapshot|delta)"')
 _SNAPSHOT_MESSAGE = re.compile(r'"message_kind"\s*:\s*"snapshot"')
 _SERVER_SEQUENCE = re.compile(r'("server_sequence"\s*:\s*")([1-9][0-9]*)(")')
+_HTTP_ADMITTED_COMMANDS = frozenset({
+    "program_run", "program_motion_start", "program_motion_resume",
+    "program_resume_full_stop", "operation_start", "operation_resume",
+})
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -224,6 +228,29 @@ async def serve_headless_state(
                     message = await websocket.receive_text()
                     if len(message.encode("utf-8")) > CONTROL_MAXIMUM_MESSAGE_BYTES:
                         raise ValueError("control client message is oversized")
+                    # Composer must check its shared Draft before a new Run or
+                    # motion start. Those commands use the admitted HTTP path;
+                    # forwarding one here would bypass that check. Stop and
+                    # the observation session stay on the priority WS lane.
+                    try:
+                        frame = json.loads(message)
+                    except json.JSONDecodeError:
+                        frame = None
+                    if isinstance(frame, dict) and frame.get("message_kind") == "command":
+                        command = frame.get("command")
+                        envelope = (
+                            command.get("command_envelope")
+                            if isinstance(command, dict) else None
+                        )
+                        if (
+                            isinstance(envelope, dict)
+                            and envelope.get("command_kind") in _HTTP_ADMITTED_COMMANDS
+                        ):
+                            await websocket.close(
+                                code=1008,
+                                reason="execution start requires Composer admission",
+                            )
+                            raise WebSocketDisconnect()
                     await upstream.send(message)
 
             async def owner_to_browser() -> None:

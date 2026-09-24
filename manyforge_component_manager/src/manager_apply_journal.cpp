@@ -2311,7 +2311,10 @@ const char *ToString(const ManagerApplyPhase phase) noexcept {
 ManagerApplyProgressDTO DeriveManagerApplyProgress(
     const PersistedManagerApplyStatus &status) {
   if (status.terminal_outcome.has_value()) {
-    return {ManagerApplyPhase::kSettled,
+    const auto &terminal = *status.terminal_outcome;
+    return {terminal.terminal_outcome.failure.has_value()
+                ? terminal.terminal_outcome.failure->phase
+                : ManagerApplyPhase::kSettled,
             status.terminal_outcome->terminal_outcome_digest};
   }
   if (status.fence_released.has_value()) {
@@ -5435,10 +5438,11 @@ core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
         "JOIN manager_apply_terminal_outcomes t "
         "ON t.apply_id=i.apply_id AND "
         "t.apply_generation=i.apply_generation "
-        // Only a published success settles a Kernel admission claim. A terminal
-        // failure or unknown-effect operation never releases the fence, so it
-        // can never prove a settled claim.
-        "AND t.outcome_state='succeeded' "
+        // A published success or a known refusal before any fence effect
+        // settles this exact Manager claim. Later failures remain contained.
+        "AND (t.outcome_state='succeeded' OR "
+        "(t.outcome_state='failed' AND t.effect_disposition='known' "
+        "AND t.failure_phase='accepted')) "
         "WHERE i.apply_id=? AND i.request_owner_epoch=? AND i.request_id=? "
         "AND i.intent_digest=? AND i.expected_admission_generation=? "
         "AND i.parent_authoring_claim IS NULL");

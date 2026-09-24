@@ -148,12 +148,42 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
     assert observed["kwargs"]["stdin"] is subprocess.DEVNULL
     assert "--candidate-root" not in observed["command"]
     retained = preparer.prepared_value(result["prepared_activation_id"])
-    assert retained == _result()
+    assert retained == expected
     assert retained is not None
-    retained["activation_payload"]["raw_artifacts"][0]["bytes"] = "mutated"
-    assert preparer.prepared_value(result["prepared_activation_id"]) == _result()
+    retained["program_id"] = "mutated"
+    assert preparer.prepared_value(result["prepared_activation_id"]) == expected
     preparer.release(result["prepared_activation_id"])
     assert preparer.prepared_value(result["prepared_activation_id"]) is None
+
+
+def test_preparer_failure_retains_bounded_diagnostic_and_input_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    preparer = _preparer(tmp_path)
+    diagnostic = "invalid binding: " + "x" * 5000
+
+    def run(_command, **kwargs):
+        kwargs["stderr"].write(diagnostic.encode())
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(HeadlessApiError) as raised:
+        preparer.prepare(
+            source_document_digest=_DIGEST,
+            scenario_id="scenario_a",
+            captured_input_digest=_DIGEST,
+            deployment={},
+            model_source_closure=_CLOSURE,
+            program={},
+            program_role_assignment={},
+            typed_parameter_overrides={},
+        )
+    assert raised.value.code == "activation_preparation_failed"
+    assert raised.value.details == {"preparer_detail": diagnostic[:4096]}
+    assert "scenario=scenario_a" in caplog.text
+    assert f"input={_DIGEST}" in caplog.text
+    assert diagnostic[:4096] in caplog.text
+    assert diagnostic not in caplog.text
 
 
 def test_preparer_is_capacity_one_and_reports_a_stable_conflict(
@@ -165,6 +195,7 @@ def test_preparer_is_capacity_one_and_reports_a_stable_conflict(
         with pytest.raises(HeadlessApiError) as raised:
             preparer.prepare(
                 source_document_digest=_DIGEST,
+                scenario_id="scenario_a",
                 captured_input_digest=_DIGEST,
                 deployment={"api_version": "manyforge.deployment.v1"},
                 model_source_closure=_CLOSURE,
@@ -197,6 +228,7 @@ def test_preparer_rejects_an_oversized_encoded_request_before_spawning(
     with pytest.raises(HeadlessApiError) as raised:
         preparer.prepare(
             source_document_digest=_DIGEST,
+            scenario_id="scenario_a",
             captured_input_digest=_DIGEST,
             deployment={"api_version": "manyforge.deployment_intent.v1"},
             model_source_closure=_CLOSURE,
@@ -221,6 +253,7 @@ def test_preparer_rejects_timeout_and_invalid_output(
     with pytest.raises(HeadlessApiError) as raised:
         preparer.prepare(
             source_document_digest=_DIGEST,
+            scenario_id="scenario_a",
             captured_input_digest=_DIGEST,
             deployment={"api_version": "manyforge.deployment.v1"},
             model_source_closure=_CLOSURE,
@@ -238,6 +271,7 @@ def test_preparer_rejects_timeout_and_invalid_output(
     with pytest.raises(HeadlessApiError) as raised:
         preparer.prepare(
             source_document_digest=_DIGEST,
+            scenario_id="scenario_a",
             captured_input_digest=_DIGEST,
             deployment={"api_version": "manyforge.deployment.v1"},
             model_source_closure=_CLOSURE,

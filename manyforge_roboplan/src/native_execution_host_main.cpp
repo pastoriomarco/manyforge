@@ -9849,6 +9849,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   bool current_composition_builder_started = false;
   std::jthread managed_composition_builder;
   bool managed_composition_building = false;
+  std::exception_ptr selected_composition_failure;
 
   const auto stable_addressed_kernel =
       [&]() -> core::ResourceAddressedExecutionKernel * {
@@ -9990,12 +9991,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   std::move(detached_operation_journal);
               built->runtime->addressed_kernel =
                   std::move(detached_addressed_kernel);
-              bind_stable_kernel_to_runtime(*built->runtime);
               detached_owner_clock.reset();
               detached_owner_scheduler.reset();
-              SelectDirectNativeControlMode(*built, config.package_root);
-              fence_owner.BindDisableHandoffKernel(
-                  *built->runtime->addressed_kernel);
               active_managed_composition = std::move(built);
               execution_composition.replace_current(
                   active_managed_composition.get());
@@ -10005,6 +10002,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   active_managed_composition->runtime.get(),
                   std::memory_order_release);
               installed = active_managed_composition.get();
+              bind_stable_kernel_to_runtime(*installed->runtime);
+              SelectDirectNativeControlMode(*installed, config.package_root);
+              fence_owner.BindDisableHandoffKernel(
+                  *installed->runtime->addressed_kernel);
             }
             std::cerr << "native composition phase: stable Kernel bound\n";
             // Initial CCLC recovery is part of composing a usable runtime.  It
@@ -10042,6 +10043,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 request.runtime_unit_id.value() == config.runtime_unit_id &&
                 request.runtime_epoch.value() == config.runtime_epoch,
             "runtime-composition request names another managed child");
+    if (selected_composition_failure != nullptr) {
+      std::rethrow_exception(selected_composition_failure);
+    }
     const core::ConfigurationFenceStatusQueryDTO fence_query{
         {request.apply_id, request.apply_generation},
         request.configuration_fence_id,
@@ -10350,7 +10354,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       managed_composition_builder.join();
     }
 
-    fence_owner.RunWithExactHeldPredecessor(
+    try {
+      fence_owner.RunWithExactHeldPredecessor(
         fence_query, request.expected_predecessor_publication_generation,
         request.expected_predecessor_public_pointer_digest, [&] {
           std::unique_lock execution_lock(execution_composition.mutex);
@@ -10436,6 +10441,18 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       ->resource_admission_table());
             } else {
               if (active_managed_composition != nullptr) {
+                Require(prepared->runtime->clock == active_managed_composition->runtime->clock &&
+                            prepared->runtime->scheduler == active_managed_composition->runtime->scheduler,
+                        "prepared runtime crossed the stable Kernel time capabilities");
+              } else {
+                Require(detached_operation_journal != nullptr &&
+                            detached_owner_clock != nullptr &&
+                            detached_owner_scheduler != nullptr &&
+                            prepared->runtime->clock == detached_owner_clock &&
+                            prepared->runtime->scheduler == detached_owner_scheduler,
+                        "detached addressed owner is incomplete");
+              }
+              if (active_managed_composition != nullptr) {
                 DetachRetainedCCLC(*active_managed_composition);
               }
               auto reconfigured = stable_owner->reconfigure_runtime_product(
@@ -10449,11 +10466,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               }
               if (active_managed_composition != nullptr) {
                 auto &stable_runtime = *active_managed_composition->runtime;
-                Require(prepared->runtime->clock == stable_runtime.clock &&
-                            prepared->runtime->scheduler ==
-                                stable_runtime.scheduler,
-                        "prepared runtime crossed the stable Kernel time "
-                        "capabilities");
                 prepared->runtime->operation_journal =
                     std::move(stable_runtime.operation_journal);
                 prepared->runtime->addressed_kernel =
@@ -10461,13 +10473,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 retired_managed_composition =
                     std::move(active_managed_composition);
               } else {
-                Require(detached_operation_journal != nullptr &&
-                            detached_owner_clock != nullptr &&
-                            detached_owner_scheduler != nullptr &&
-                            prepared->runtime->clock == detached_owner_clock &&
-                            prepared->runtime->scheduler ==
-                                detached_owner_scheduler,
-                        "detached addressed owner is incomplete");
                 prepared->runtime->operation_journal =
                     std::move(detached_operation_journal);
                 prepared->runtime->addressed_kernel =
@@ -10475,29 +10480,42 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 detached_owner_clock.reset();
                 detached_owner_scheduler.reset();
               }
-              bind_stable_kernel_to_runtime(*prepared->runtime);
             }
+            // The stable Kernel and its registered engines must outlive every
+            // fallible initialization below. Retain the candidate under the
+            // held fence before those calls; failure must not destroy the
+            // admission owner still referenced by the command surface.
+            active_managed_composition = std::move(prepared);
+            execution_composition.replace_current(active_managed_composition.get());
+            execution_composition.addressed_kernel = stable_addressed_kernel();
+            stop_recovery_runtime.store(active_managed_composition->runtime.get(),
+                                        std::memory_order_release);
+            auto &candidate = *active_managed_composition;
+            bind_stable_kernel_to_runtime(*candidate.runtime);
             Require(
-                prepared->runtime->addressed_kernel
+                candidate.runtime->addressed_kernel
                     ->SetRouteRecoveryPending(true)
                     .ok(),
                 "selected runtime could not close route recovery admission");
-            SelectDirectNativeControlMode(*prepared, config.package_root);
-            prepared->route_recovery_pending.store(true,
+            SelectDirectNativeControlMode(candidate, config.package_root);
+            candidate.route_recovery_pending.store(true,
                                                    std::memory_order_release);
-            auto staged =
-                prepared->runtime->addressed_kernel
+            // Program/Scene-only activation has no changed control domains.
+            // There are no candidate configuration facts to stage in that case.
+            if (!request.configuration_fence_scope.resources.empty()) {
+              auto staged =
+                candidate.runtime->addressed_kernel
                     ->stage_current_runtime_configuration_facts_under_apply_fence(
                         request.configuration_fence_scope);
-            if (!staged.ok()) {
-              Fail("stable Kernel rejected candidate configuration staging: " +
+              if (!staged.ok()) {
+                Fail("stable Kernel rejected candidate configuration staging: " +
                    staged.error().message);
+              }
             }
-            InstallDirectSceneFrameResolver(projections, *prepared);
+            InstallDirectSceneFrameResolver(projections, candidate);
 #if !defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
-            AttachProductPickPlacePlanningOwner(*prepared);
+            AttachProductPickPlacePlanningOwner(candidate);
 #endif
-            active_managed_composition = std::move(prepared);
           }
           execution_composition.replace_current(
               active_managed_composition.get());
@@ -10510,6 +10528,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           installed_under_fence_composition_request = request;
           preparing_composition_request.reset();
         });
+    } catch (...) {
+      // Preparation was consumed. Preserve the first failure rather than
+      // attempting another build on a later observation of this Apply.
+      selected_composition_failure = std::current_exception();
+      throw;
+    }
     bind_disable_handoff_owner();
     require_installed_candidate_configuration();
     if (request.phase == component_manager::
@@ -10939,6 +10963,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             component_manager::detail::
                 DecodeSelectedRuntimeCompositionRpcRequest(request));
       } catch (const std::exception &error) {
+        std::cerr << "native selected composition failed: " << error.what() << '\n';
         response =
             component_manager::detail::SelectedRuntimeCompositionRpcFailure{
                 core::ErrorDTO{"selected_runtime_composition_request_failed",

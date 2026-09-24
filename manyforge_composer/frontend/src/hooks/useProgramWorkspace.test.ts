@@ -532,10 +532,12 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       workspace: workspace(1),
     });
     apiMock.scenarioDocuments.load.mockResolvedValue({
-      status: 'opened',
+      status: 'accepted',
       path: '/workspace/cell',
       scenarioId: 'cell',
-      activation: null,
+      activation: {
+        status: 'accepted', apply_id: 'apply.1', apply_generation: 1,
+      },
       diagnostics: [],
       sourceDiagnostics: [],
       incomplete: false,
@@ -581,5 +583,27 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       '/workspace/cell',
       true,
     );
+    expect(latest?.state.message).toContain('Scenario Load accepted');
+    expect(latest?.state.message).toContain('motion does not start automatically');
+
+    apiMock.scenarioDocuments.load.mockResolvedValueOnce({
+      status: 'applied',
+      path: '/workspace/cell',
+      scenarioId: 'cell',
+      activation: { status: 'applied', apply_id: null },
+      diagnostics: [],
+      sourceDiagnostics: [],
+      incomplete: false,
+      workspace: workspace(1),
+      authoringWorkspace: authoringSnapshot(workspace(1)),
+    });
+    await act(async () => {
+      latest?.loadScenarioDocument('/workspace/cell', false);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(latest?.state.message).toContain('already match the Applied configuration');
+    expect(latest?.state.message).toContain('No activation was needed');
+    expect(latest?.state.transitionStatus).toBe('applied');
   });
 });

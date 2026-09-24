@@ -13,9 +13,10 @@ from fastapi.routing import APIRoute
 from manyforge_behavior.program import Program
 from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha256_digest
 from manyforge_behavior.model_source_capture import capture_deployment_model_sources
+from manyforge_headless_api.client import HeadlessClientError
 from pydantic import BaseModel, ConfigDict, Field
 
-from .authoring_admission import AuthoringMutationEnvelope
+from .authoring_admission import AuthoringMutationEnvelope, headless_client_http_exception
 from .authoring_forest import (
     AuthoringForestError,
     derive_candidate,
@@ -34,6 +35,7 @@ from .authoring_workspace_fence import (
 )
 from .deployment_draft import DeploymentDraftError
 from .draft_session import DraftSessionError
+from .routes_draft import _workspace as program_workspace
 from .scenario_artifacts import (
     ScenarioArtifactError,
     build_scenario_document,
@@ -106,8 +108,6 @@ class SaveScenarioDocumentRequest(_ScenarioFence):
 class LoadScenarioDocumentRequest(_ScenarioFence):
     path: str = Field(min_length=1, max_length=4096)
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
-    confirm_deployment: bool = Field(default=False, alias="confirmDeployment")
-    activate: bool = False
 
 
 class ConvertLegacyScenarioDocumentRequest(BaseModel):
@@ -127,6 +127,8 @@ class ExportScenarioDocumentRequest(_ScenarioFence):
 
 
 def _raise(error: Exception) -> NoReturn:
+    if isinstance(error, HeadlessClientError):
+        raise headless_client_http_exception(error) from error
     if isinstance(error, ScenarioArtifactError):
         raise HTTPException(
             status_code=error.status_code,
@@ -387,15 +389,13 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     source_document_digest=source_digest,
                 ),
             )
+            workspace = program_workspace(state)
             return {
                 "status": "saved",
                 "path": saved_path,
                 "scenario_id": body.scenario_id,
                 "last_known_status": document["saved_status"]["last_known_status"],
-                "workspace": state.draft_session.workspace_snapshot(
-                    applied_program_revision=None
-                ),
-                "authoringWorkspace": commit.snapshot.as_dict(),
+                "workspace": workspace,
             }
         except AuthoringWorkspaceError as error:
             if error.code != "composer_workspace_stale":
@@ -410,6 +410,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "the Scenario project was written but a newer "
                         "workspace revision was not adopted as Saved"
                     ),
+                    "path": saved_path,
                     "currentWorkspace": error.detail.get("workspace"),
                 },
             ) from error
@@ -418,8 +419,13 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/scenario-documents/load")
     def load_document(body: LoadScenarioDocumentRequest) -> dict[str, Any]:
+        committed_path: str | None = None
+        committed_snapshot = None
+        activation: dict[str, Any] | None = None
         try:
             _require_fence(state, body)
+            captured_workspace = state.authoring_workspace.snapshot()
+            _require_captured_workspace_fence(body, captured_workspace.identity)
             authoring_catalog = state.node_catalog
             (
                 scenario_document,
@@ -453,126 +459,94 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 or deployment is None
                 or scenario_document["program_role_assignment"] is None
             )
-            activation_intent: dict[str, Any] | None = None
-            activation_prepared: dict[str, Any] | None = None
-            if body.activate:
-                if incomplete or program is None or not isinstance(deployment, dict):
-                    raise ScenarioArtifactError(
-                        "scenario_activation_incomplete",
-                        "only a complete v2 Scenario document can be activated",
-                        status_code=409,
-                    )
-                if state.headless_client is None:
-                    raise ScenarioArtifactError(
-                        "scenario_activation_unavailable",
-                        "Scenario activation requires the configured Manager",
-                        status_code=503,
-                    )
-                source_closure = capture_deployment_model_sources(
-                    deployment, project_root=Path(source_path)
-                )
-                assignment = deepcopy(
-                    scenario_document["program_role_assignment"]
-                )
-                overrides = deepcopy(
-                    scenario_document["typed_parameter_overrides"]
-                )
-                captured_digest = raw_sha256_digest(
-                    canonical_json_bytes(
-                        {
-                            "scenario_id": scenario_document["scenario_id"],
-                            "source_document_digest": source_digest,
-                            "deployment": deployment,
-                            "model_source_closure": source_closure,
-                            "program": program.to_dict(),
-                            "program_role_assignment": assignment,
-                            "typed_parameter_overrides": overrides,
-                        }
-                    )
-                )
-                bundle, graph, _epoch = state._manager_current(
-                    state.headless_client.manager_status()
-                )
-                activation_intent = {
-                    "scenario_id": scenario_document["scenario_id"],
-                    "source_document_digest": source_digest,
-                    "captured_input_digest": captured_digest,
-                    "deployment": deepcopy(deployment),
-                    "model_source_closure": source_closure,
-                    "program": program.to_dict(),
-                    "program_role_assignment": assignment,
-                    "typed_parameter_overrides": overrides,
-                    "expected_manager_current": {
-                        "retained_bundle_id": bundle,
-                        "graph_revision": graph,
-                    },
-                    "expected_admission_generation": (
-                        body.expected_admission_generation
-                    ),
-                    "manager_request_id": "scenario-document-activation-"
-                    + hashlib.sha256(
-                        f"{body.request_owner_epoch}:{body.request_id}".encode()
-                    ).hexdigest()[:32],
-                    "correlation_id": body.request_id,
-                    "confirmation_token": None,
-                    "draft_id": body.draft_id,
-                    "draft_revision": body.expected_draft_revision,
-                }
-                activation_prepared = state.execute_authored_deployment_candidate(
-                    activation_intent, None, apply=True, prepare_only=True
-                )
-                if activation_prepared.get("confirmation_required") is True:
-                    if not body.confirm_deployment:
-                        raise ScenarioArtifactError(
-                            "scenario_activation_confirmation_required",
-                            "Scenario activation requires explicit Deployment confirmation",
-                            status_code=409,
-                        )
-                    token = activation_prepared.get("confirmation_token")
-                    if not isinstance(token, str) or not token:
-                        raise ScenarioArtifactError(
-                            "scenario_activation_confirmation_unavailable",
-                            "Deployment confirmation has no exact preview identity",
-                            status_code=503,
-                        )
-                    activation_intent["confirmation_token"] = token
-                    confirmed = state.execute_authored_deployment_candidate(
-                        activation_intent, None, apply=True, prepare_only=True
-                    )
-                    if (
-                        confirmed.get("confirmation_required") is not False
-                        or confirmed.get("prepared_activation", {}).get(
-                            "prepared_activation_id"
-                        )
-                        != activation_prepared.get("prepared_activation", {}).get(
-                            "prepared_activation_id"
-                        )
-                    ):
-                        raise ScenarioArtifactError(
-                            "scenario_activation_confirmation_stale",
-                            "Deployment changed during confirmation",
-                            status_code=409,
-                        )
-                    activation_prepared = confirmed
-            current_program = state.draft_session.retained_state()
-            current_deployment = state.deployment_draft_session.retained_state()
-            if not body.confirm_discard and not state.current_drafts_match_remembered_scenario() and (
-                (
-                    current_program.get("program") is not None
-                    and current_program.get("program")
-                    != current_program.get("saved_document")
-                )
-                or (
-                    current_deployment.get("document") is not None
-                    and current_deployment.get("document")
-                    != current_deployment.get("saved_document")
-                )
-            ):
+            if incomplete or program is None or not isinstance(deployment, dict):
                 raise ScenarioArtifactError(
-                    "scenario_discard_confirmation_required",
-                    "Loading would replace unsaved Program or Deployment Draft changes",
+                    "scenario_activation_incomplete",
+                    "only a complete v2 Scenario document can be loaded",
                     status_code=409,
                 )
+            if state.headless_client is None:
+                raise ScenarioArtifactError(
+                    "scenario_activation_unavailable",
+                    "Scenario Load requires the configured Manager",
+                    status_code=503,
+                )
+            source_closure = capture_deployment_model_sources(
+                deployment, project_root=Path(source_path)
+            )
+            assignment = deepcopy(scenario_document["program_role_assignment"])
+            overrides = deepcopy(scenario_document["typed_parameter_overrides"])
+            captured_digest = raw_sha256_digest(
+                canonical_json_bytes(
+                    {
+                        "scenario_id": scenario_document["scenario_id"],
+                        "source_document_digest": source_digest,
+                        "deployment": deployment,
+                        "model_source_closure": source_closure,
+                        "program": program.to_dict(),
+                        "program_role_assignment": assignment,
+                        "typed_parameter_overrides": overrides,
+                    }
+                )
+            )
+            bundle, graph, _epoch = state._manager_current(
+                state.headless_client.manager_status()
+            )
+            activation_intent: dict[str, Any] = {
+                "scenario_id": scenario_document["scenario_id"],
+                "source_document_digest": source_digest,
+                "captured_input_digest": captured_digest,
+                "deployment": deepcopy(deployment),
+                "model_source_closure": source_closure,
+                "program": program.to_dict(),
+                "program_role_assignment": assignment,
+                "typed_parameter_overrides": overrides,
+                "expected_manager_current": {
+                    "retained_bundle_id": bundle,
+                    "graph_revision": graph,
+                },
+                "expected_admission_generation": body.expected_admission_generation,
+                "manager_request_id": "scenario-document-activation-"
+                + hashlib.sha256(
+                    f"{body.request_owner_epoch}:{body.request_id}".encode()
+                ).hexdigest()[:32],
+                "correlation_id": body.request_id,
+                "confirmation_token": None,
+                "draft_id": body.draft_id,
+                "draft_revision": body.expected_draft_revision,
+            }
+            # Load is the operator's deliberate confirmation to replace the
+            # current Scenario and activate this exact captured candidate. Keep
+            # the Manager's confirmation token internal; it is revalidated
+            # under the one authoring claim before the local workspace commit.
+            activation_preview = state.execute_authored_deployment_candidate(
+                activation_intent, None, apply=True, prepare_only=True
+            )
+            if activation_preview.get("confirmation_required") is True:
+                token = activation_preview.get("confirmation_token")
+                if not isinstance(token, str) or not token:
+                    raise ScenarioArtifactError(
+                        "scenario_activation_confirmation_unavailable",
+                        "Deployment confirmation has no exact preview identity",
+                        status_code=503,
+                    )
+                activation_intent["confirmation_token"] = token
+                confirmed_preview = state.execute_authored_deployment_candidate(
+                    activation_intent, None, apply=True, prepare_only=True
+                )
+                if (
+                    confirmed_preview.get("confirmation_required") is not False
+                    or confirmed_preview.get("prepared_activation")
+                    != activation_preview.get("prepared_activation")
+                    or confirmed_preview.get("candidate_preview")
+                    != activation_preview.get("candidate_preview")
+                ):
+                    raise ScenarioArtifactError(
+                        "scenario_activation_preview_changed",
+                        "Deployment preview changed while confirming this Load",
+                        status_code=409,
+                    )
+                activation_preview = confirmed_preview
             # Both retained Draft replacements are validated outside every
             # owner lock, and the whole load commits as one workspace
             # replacement: the successor Program and Deployment identities and
@@ -597,116 +571,157 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 )
                 return program_changed or deployment_changed
 
-            commit = commit_local_authoring(
-                state,
-                body,
-                operation_kind="load_scenario_document",
-                session="whole-workspace",
-                project=scenario_project_facts(
-                    scenario_document,
-                    document_path=source_path,
-                    source_document_digest=source_digest,
-                    source_diagnostics=source_diagnostics,
-                ),
-                install=install_load,
-            )
-            activation = None
-            if activation_intent is not None and activation_prepared is not None:
-                coordinator = state.authoring_admission
-                if coordinator is None:
+            coordinator = state.authoring_admission
+            if coordinator is None:
+                raise ScenarioArtifactError(
+                    "scenario_activation_unavailable",
+                    "Scenario Load requires authoring admission",
+                    status_code=503,
+                )
+            activation_prepared: dict[str, Any] | None = None
+
+            def validate_load(claim: dict[str, Any]) -> None:
+                nonlocal activation_prepared
+                acquired_generation = claim.get("acquired_admission_generation")
+                if type(acquired_generation) is not int or acquired_generation < 1:
                     raise ScenarioArtifactError(
-                        "scenario_activation_unavailable",
-                        "Scenario activation requires authoring admission",
+                        "scenario_activation_claim_invalid",
+                        "Authoring claim omitted its acquired admission generation",
                         status_code=503,
                     )
-                activation_intent["expected_admission_generation"] = (
-                    commit.admission_generation
+                _require_captured_workspace_fence(
+                    body, state.authoring_workspace.identity()
                 )
-                manager_apply = activation_prepared.get("manager_apply")
-                if isinstance(manager_apply, dict):
-                    # The local workspace commit advances admission. A preview
-                    # receipt from before that commit cannot authorize Apply;
-                    # refresh only the cheap Manager preview, not preparation.
-                    selected = activation_prepared["prepared_activation"]
-                    refreshed = state.headless_client.manager_deployment_candidate_preview(
-                        {
-                            "prepared_activation_id": selected["prepared_activation_id"],
-                            "candidate_retained_bundle_id": selected["retained_bundle_id"],
-                            "candidate_graph_revision": selected["graph_revision"],
-                            "deployment_artifact_id": selected["deployment_artifact_id"],
-                            "deployment_revision": selected["deployment_revision"],
-                            "expected_current": manager_apply["expected_current"],
-                            "expected_admission_generation": commit.admission_generation,
-                            "request_owner_epoch": manager_apply["request_owner_epoch"],
-                        }
+                current_program = state.draft_session.retained_state()
+                current_deployment = state.deployment_draft_session.retained_state()
+                has_unsaved_drafts = (
+                    (
+                        current_program.get("program") is not None
+                        and current_program.get("program")
+                        != current_program.get("saved_document")
                     )
-                    receipt = refreshed.get("candidate_receipt")
-                    previous = activation_prepared["candidate_preview"]
-                    if (
-                        refreshed.get("ok") is not True
-                        or not isinstance(receipt, dict)
-                        or refreshed.get("diff") != previous.get("diff")
-                        or receipt.get("prepared_activation_id")
-                        != selected["prepared_activation_id"]
-                    ):
-                        raise ScenarioArtifactError(
-                            "scenario_activation_preview_changed",
-                            "Deployment preview changed after the workspace commit",
-                            status_code=409,
-                        )
-                    manager_apply["candidate_receipt"] = receipt
-                    manager_apply["expected_admission_generation"] = (
-                        commit.admission_generation
+                    or (
+                        current_deployment.get("document") is not None
+                        and current_deployment.get("document")
+                        != current_deployment.get("saved_document")
                     )
-                    activation_prepared["candidate_preview"] = refreshed
-                activation_envelope = AuthoringMutationEnvelope(
-                    expected_admission_generation=commit.admission_generation,
-                    request_owner_epoch=body.request_owner_epoch,
-                    request_id=body.request_id + ".activate",
                 )
-                committed_identity = commit.snapshot.identity
+                if (
+                    has_unsaved_drafts
+                    and not state.current_drafts_match_remembered_scenario()
+                    and not body.confirm_discard
+                ):
+                    raise ScenarioArtifactError(
+                        "scenario_discard_confirmation_required",
+                        "Loading would replace unsaved Program or Deployment Draft changes",
+                        status_code=409,
+                    )
+                # Preparation and Manager preview are effect-free and belong
+                # to the idle generation in the claim intent. Re-preparing
+                # after acquisition is invalid: the claim deliberately closes
+                # idle admission. Manager rechecks the exact preview receipt
+                # and current publication when it accepts the operation.
+                current_bundle, current_graph, _ = state._manager_current(
+                    state.headless_client.manager_status()
+                )
+                if activation_intent["expected_manager_current"] != {
+                    "retained_bundle_id": current_bundle,
+                    "graph_revision": current_graph,
+                }:
+                    raise ScenarioArtifactError(
+                        "scenario_activation_preview_changed",
+                        "Deployment preview changed before the workspace commit",
+                        status_code=409,
+                    )
+                activation_prepared = activation_preview
 
-                def validate_activation(_claim: dict[str, Any]) -> None:
-                    if state.authoring_workspace.identity() != committed_identity:
-                        raise ScenarioArtifactError(
-                            "scenario_activation_workspace_changed",
-                            "Scenario workspace changed before activation submission",
-                            status_code=409,
-                        )
-
-                activation = coordinator.execute_external_submission(
-                    activation_envelope,
-                    operation_kind="activate_scenario_document",
-                    draft_id=commit.snapshot.program["draftId"],
-                    draft_revision=commit.snapshot.program["draftRevision"],
-                    payload={
-                        "source_document_digest": source_digest,
-                        "captured_input_digest": activation_intent[
-                            "captured_input_digest"
-                        ],
-                    },
-                    validate_under_claim=validate_activation,
-                    submit=lambda claim: state.execute_authored_deployment_candidate(
-                        activation_intent,
-                        claim,
-                        apply=True,
-                        prepared=activation_prepared,
+            def commit_load() -> None:
+                nonlocal committed_path, committed_snapshot
+                committed_snapshot = state.authoring_workspace.replace(
+                    expected_identity=captured_workspace.identity,
+                    install=install_load,
+                    project=scenario_project_facts(
+                        scenario_document,
+                        document_path=source_path,
+                        source_document_digest=source_digest,
+                        source_diagnostics=source_diagnostics,
                     ),
+                    notify=False,
                 )
+                committed_path = source_path
+
+            def submit_load(claim: dict[str, Any]) -> dict[str, Any]:
+                nonlocal activation
+                if activation_prepared is None:
+                    raise ScenarioArtifactError(
+                        "scenario_activation_preparation_missing",
+                        "Scenario Load candidate was not validated under its claim",
+                        status_code=503,
+                    )
+                activation = state.execute_authored_deployment_candidate(
+                    activation_intent,
+                    claim,
+                    apply=True,
+                    prepared=activation_prepared,
+                )
+                return activation
+
+            activation = coordinator.execute_external_submission(
+                body.admission_envelope(),
+                operation_kind="load_scenario_document",
+                draft_id=body.draft_id,
+                draft_revision=body.expected_draft_revision,
+                payload={
+                    "path": source_path,
+                    "source_document_digest": source_digest,
+                    "captured_input_digest": captured_digest,
+                    "scenario_content_digest": _document_content_digest(
+                        scenario_document
+                    ),
+                },
+                validate_under_claim=validate_load,
+                submit=submit_load,
+                commit_before_submit=commit_load,
+                after_release=state.authoring_workspace.publish_commit_wake,
+            )
+            workspace = program_workspace(state)
             return {
-                "status": "accepted" if activation is not None else "opened",
+                "status": activation["status"],
                 "activation": activation,
                 "diagnostics": diagnostics,
                 "source_diagnostics": source_diagnostics,
                 "path": source_path,
                 "scenario_id": scenario_document_id,
-                "incomplete": incomplete,
-                "workspace": state.draft_session.workspace_snapshot(
-                    applied_program_revision=None
-                ),
-                "authoringWorkspace": commit.snapshot.as_dict(),
+                "incomplete": False,
+                "workspace": workspace,
+                "authoringWorkspace": workspace["authoringWorkspace"],
             }
         except Exception as error:
+            if committed_path is not None and committed_snapshot is not None:
+                # The local workspace was committed before Manager submission.
+                # Preserve that observable partial result; never report Load as
+                # complete or silently roll it back when Manager rejects or its
+                # acceptance cannot be observed.
+                manager_outcome = (
+                    "accepted"
+                    if isinstance(activation, dict)
+                    and activation.get("status") == "accepted"
+                    else "applied"
+                    if isinstance(activation, dict)
+                    and activation.get("status") == "applied"
+                    else "not_confirmed"
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "scenario_load_activation_not_confirmed",
+                        "message": "The Scenario workspace was replaced, but Manager activation was not confirmed in this response. Inspect Manager operation status and refresh the workspace before retrying.",
+                        "path": committed_path,
+                        "managerOutcome": manager_outcome,
+                        "causeCode": getattr(error, "code", None),
+                        "workspace": committed_snapshot.identity.as_dict(),
+                    },
+                ) from error
             _raise(error)
 
     @router.post("/api/scenario-documents/convert-legacy")

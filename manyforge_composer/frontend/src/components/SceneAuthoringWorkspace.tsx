@@ -70,10 +70,12 @@ import {
 import type { StructuralResourceState } from '../state/structuralResource';
 import {
   programDraftPreviewActive,
+  sceneSourceIsDraft,
   programViewerMetadata,
   viewerPresentationDraftFromProgram,
   viewerPresentationDraftReducer,
 } from '../state/viewerPresentationDraft';
+import { viewerModelPresentation } from '../state/viewerModelReadiness';
 import type {
   JsonValue,
   FileBrowserResponse,
@@ -1486,10 +1488,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   active,
   source,
   sourceValue,
+  sourceModelState,
   controlBasePoseInCell,
   environmentValue,
   manifest,
   onRetry,
+  onRetrySourceModel,
   program,
   draftIdentity,
   viewer,
@@ -1533,10 +1537,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   active: boolean;
   source: HeadlessStateSource;
   sourceValue: SourceModelProjection | null;
+  sourceModelState: StructuralResourceState<SourceModelProjection>;
   controlBasePoseInCell: PoseTuple | null;
   environmentValue: NodeEnvironmentResponse | null;
   manifest: StructuralResourceState<SceneUrdfManifest>;
   onRetry: () => void;
+  onRetrySourceModel: () => void;
   program: ProgramDocument | ProgramAuthoringDocument | null;
   draftIdentity: { draftId: string; draftRevision: number } | null;
   viewer: ProgramViewerMetadata | undefined;
@@ -1589,6 +1595,31 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
 }) {
   const headlessState = useViewerHeadlessState(source, active);
   const observationTransport = useExecutionObservationTransport(source);
+  const modelPresentation = useMemo(() => viewerModelPresentation(
+    headlessState.snapshot,
+    headlessState.transportStatus,
+    headlessState.semanticStatus,
+    programController.state.transitionStatus === 'accepted',
+    sourceModelState,
+    manifest,
+  ), [
+    headlessState.semanticStatus,
+    headlessState.snapshot,
+    headlessState.transportStatus,
+    manifest,
+    programController.state.transitionStatus,
+    sourceModelState,
+  ]);
+  const viewerManifest = useMemo<StructuralResourceState<SceneUrdfManifest>>(
+    () => modelPresentation.status === 'ready'
+      ? { status: 'ready', data: modelPresentation.manifest }
+      : { status: 'loading' },
+    [modelPresentation],
+  );
+  const retryViewerModel = useCallback(() => {
+    onRetry();
+    onRetrySourceModel();
+  }, [onRetry, onRetrySourceModel]);
   const factsResult = useMemo(
     () => sceneOwnerFacts(
       headlessState.snapshot?.runtime ?? null,
@@ -1623,22 +1654,45 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       ));
     }
   }, [facts, productIdentity, resetPresentationHeld]);
-  const readyManifest = manifest.status === 'ready' ? manifest.data : null;
+  const readyManifest = modelPresentation.status === 'ready'
+    ? modelPresentation.manifest
+    : null;
   const objects = presentationFacts?.logicalScene.snapshot?.objects
     ?? EMPTY_LOGICAL_SCENE_OBJECTS;
   const ownerSceneKnown = presentationFacts !== null;
+  const [sceneSourceChoice, setSceneSourceChoice] = useState<'auto' | 'draft' | 'applied'>('auto');
   const draftPreviewObjects = useMemo(() => (
-    ownerSceneKnown && objects.length === 0
+    ownerSceneKnown
       ? (program?.scene ?? []).map(programScenePreviewObject).filter(
           (object): object is LogicalSceneObject => object !== null,
         )
       : EMPTY_LOGICAL_SCENE_OBJECTS
-  ), [objects.length, ownerSceneKnown, program?.scene]);
-  const programDraftPreview = programDraftPreviewActive(
-    ownerSceneKnown,
-    objects.length,
-    draftPreviewObjects.length,
+  ), [ownerSceneKnown, program?.scene]);
+  const draftSceneDifferent = ownerSceneKnown && draftIdentity !== null && (
+    draftPreviewObjects.length !== (program?.scene?.length ?? 0)
+    || draftPreviewObjects.length !== objects.length
+    || draftPreviewObjects.some((draftObject) => {
+      const appliedObject = objects.find(
+        (object) => object.scene_resource_id === draftObject.scene_resource_id,
+      );
+      return appliedObject === undefined
+        || appliedObject.provider_evidence !== null
+        || appliedObject.support_contacts.length > 0
+        || JSON.stringify(draftObject.collision_shapes)
+          !== JSON.stringify(appliedObject.collision_shapes)
+        || JSON.stringify(draftObject.placement.kind === 'cell_fixed'
+          ? draftObject.placement.pose_in_cell : null)
+          !== JSON.stringify(appliedObject.placement.kind === 'cell_fixed'
+            ? appliedObject.placement.pose_in_cell : null);
+    })
   );
+  const programDraftPreview = sceneSourceIsDraft(
+    sceneSourceChoice, ownerSceneKnown, draftIdentity !== null,
+    draftSceneDifferent,
+    programDraftPreviewActive(ownerSceneKnown, objects.length,
+      draftPreviewObjects.length),
+  );
+  const unresolvedDraftObjects = (program?.scene?.length ?? 0) - draftPreviewObjects.length;
   const selectedSceneResourceId = selection?.kind === 'owner_object'
     ? (programDraftPreview ? null : selection.id)
     : selection?.kind === 'program_resource'
@@ -1648,12 +1702,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     ? selection.linkName
     : null;
   const visibleObjects = useMemo(() => (
-    (objects.length === 0 ? draftPreviewObjects : objects).filter((object) => {
+    (programDraftPreview ? draftPreviewObjects : objects).filter((object) => {
       const sourceKind = programDraftPreview ? 'program_resource' : 'owner_object';
       if (hiddenSelectionKeys.has(`${sourceKind}:${object.scene_resource_id}`)) return false;
-      const resource = program?.scene?.find(
+      const resource = programDraftPreview ? program?.scene?.find(
         (candidate) => candidate.scene_resource_id === object.scene_resource_id,
-      );
+      ) : undefined;
       return !(resource?.resource_roles ?? []).some(
         (role) => viewer?.resource_role_visibility?.[role] === false,
       );
@@ -2019,10 +2073,30 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     )}>
     <StructuralViewer
       viewerActive={active}
-      manifest={manifest}
-      onRetry={onRetry}
+      manifest={viewerManifest}
+      modelPresentation={modelPresentation}
+      onRetry={retryViewerModel}
       sceneObjects={viewportObjects}
+      staleScenePreview={!programDraftPreview && presentationFacts !== null && (
+        facts === null
+        || headlessState.transportStatus !== 'connected'
+        || headlessState.semanticStatus !== 'current'
+      )}
       programDraftPreview={programDraftPreview}
+      sceneSourceControl={draftSceneDifferent ? (
+        <button type="button" className="viewer-scene-source-toggle"
+          aria-label={programDraftPreview
+            ? 'Showing Draft Scene object preview only. Robot models and observation status come from Applied Deployment. Switch to Applied Scene.'
+            : 'Showing Applied Scene. Robot models and observation status come from Applied Deployment. Switch to Draft Scene preview.'}
+          onClick={() => setSceneSourceChoice(programDraftPreview ? 'applied' : 'draft')}
+          title={programDraftPreview && unresolvedDraftObjects > 0
+            ? `${unresolvedDraftObjects} Program Draft objects need frame or asset resolution. This preview changes Scene objects only; robot models and observation status remain from Applied Deployment.`
+            : programDraftPreview
+              ? 'Program Draft Scene object preview only; robot models and observation status remain from Applied Deployment.'
+              : 'Applied Scene objects; robot models and observation status come from Applied Deployment.'}>
+          {programDraftPreview ? 'Draft Scene' : 'Applied Scene'} <span aria-hidden="true">⇄</span>
+        </button>
+      ) : null}
       programDraftIdentity={programDraftPreview
         ? draftIdentity ?? undefined
         : undefined}
@@ -2860,10 +2934,12 @@ export function SceneAuthoringWorkspace({
       active={viewerActive}
       source={headlessStateSource}
       sourceValue={sourceValue}
+      sourceModelState={sourceModel}
       controlBasePoseInCell={controlBasePoseInCell}
       environmentValue={environmentValue}
       manifest={manifest}
       onRetry={onRetryManifest}
+      onRetrySourceModel={onRetrySourceModel}
       program={program}
       draftIdentity={draftIdentity}
       viewer={viewer}

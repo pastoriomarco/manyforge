@@ -47,6 +47,7 @@ import type {
   AuthoritativeTransformTransition,
 } from '../state/authoritativeInterpolation';
 import type { StructuralResourceState } from '../state/structuralResource';
+import type { ViewerModelPresentation } from '../state/viewerModelReadiness';
 import type {
   AttachedObjectPresentation,
   CandidateRobotPresentation,
@@ -102,9 +103,12 @@ import {
 interface StructuralViewerProps {
   viewerActive: boolean;
   manifest: StructuralResourceState<SceneUrdfManifest>;
+  modelPresentation: ViewerModelPresentation;
   onRetry: () => void;
   sceneObjects?: readonly LogicalSceneObject[];
   programDraftPreview?: boolean;
+  staleScenePreview?: boolean;
+  sceneSourceControl?: ReactNode;
   programDraftIdentity?: {
     draftId: string;
     draftRevision: number;
@@ -2845,9 +2849,12 @@ const ViewerCanvas = memo(function ViewerCanvas({
 function StructuralViewerContent({
   viewerActive,
   manifest,
+  modelPresentation,
   onRetry,
   sceneObjects = [],
   programDraftPreview = false,
+  staleScenePreview = false,
+  sceneSourceControl,
   programDraftIdentity,
   selectedSceneResourceId = null,
   onSelectSceneResource = () => undefined,
@@ -3297,6 +3304,7 @@ function StructuralViewerContent({
               </>
             )}
           </div>
+          {sceneSourceControl}
           <div className="viewer-surface-launchers">
             <button
               type="button"
@@ -3334,6 +3342,54 @@ function StructuralViewerContent({
         data-scene-object-count={sceneObjects.length}
       >
         {runtimeOverlay}
+        <div className="viewer-notice-stack" aria-label="Viewer warnings">
+        {modelPresentation.status === 'synchronizing' && (
+          <div className="viewer-model-state synchronizing" role="status">
+            <strong>Synchronizing Applied robot model</strong>
+            <span>{modelPresentation.message}</span>
+          </div>
+        )}
+        {modelPresentation.status === 'unavailable' && (
+          <div className="viewer-model-state unavailable" role="alert">
+            <strong>Applied robot model unavailable</strong>
+            <span>{modelPresentation.message}</span>
+            <button type="button" onClick={retry}>Retry model projections</button>
+          </div>
+        )}
+        {staleScenePreview && (
+          <div className="viewer-scene-stale-state" role="status">
+            <strong>Stale Applied Scene</strong>
+            <span>The last coherent Scene preview is shown; its current Manager identity is not verified.</span>
+          </div>
+        )}
+        {assetWarning !== null && pointCloud.error === null
+          && modelPresentation.status === 'ready' && (
+          <div className="viewer-layer-warning" role="status">
+            One mesh is unavailable; the remaining scene is still usable. {assetWarning}
+          </div>
+        )}
+        {manifest.status === 'ready' && assetError !== null && (
+          <div className="viewer-state viewer-state-overlay error-state" role="alert">
+            <strong>
+              {classifyStructuralAssetFailure(assetError) === 'stale_model'
+                ? 'Active model changed'
+                : 'Structural asset unavailable'}
+            </strong>
+            <span>
+              {classifyStructuralAssetFailure(assetError) === 'stale_model'
+                ? 'A keyed mesh belongs to an inactive model. Reload the manifest.'
+                : assetError.message}
+            </span>
+            <button type="button" onClick={retry}>Reload active model</button>
+          </div>
+        )}
+        {pointCloudEnabled && pointCloud.error !== null && (
+          <div className="viewer-state viewer-state-overlay error-state" role="alert">
+            <strong>Point-cloud observer unavailable</strong>
+            <span>{pointCloud.error}</span>
+          </div>
+        )}
+        </div>
         {inspectorPanel === 'robot' && candidateTcpPose !== null && candidateTool === null && candidateRobot === null && (
           <div className="viewer-target-status" role="status">
             <span>Target marker only — mapped tool geometry unavailable. Target is unvalidated.</span>
@@ -3486,31 +3542,6 @@ function StructuralViewerContent({
           </div>
         )}
 
-        {manifest.status === 'loading' && visibleGeometryCount === 0 && !pointCloudEnabled && (
-          <div className="viewer-state" role="status">
-            <strong>Loading active model…</strong>
-            <span>Waiting for a complete retained-neutral projection.</span>
-          </div>
-        )}
-        {assetWarning !== null && pointCloud.error === null && (
-          <div className="viewer-layer-warning" role="status">
-            One mesh is unavailable; the remaining scene is still usable. {assetWarning}
-          </div>
-        )}
-        {manifest.status === 'absent' && visibleGeometryCount === 0 && !pointCloudEnabled && (
-          <div className="viewer-state">
-            <strong>No active retained deployment model</strong>
-            <span>{manifest.message}</span>
-            <span>No empty or placeholder robot is substituted.</span>
-          </div>
-        )}
-        {manifest.status === 'error' && visibleGeometryCount === 0 && !pointCloudEnabled && (
-          <div className="viewer-state error-state" role="alert">
-            <strong>Structural manifest unavailable</strong>
-            <span>{manifest.message}</span>
-            <button type="button" onClick={retry}>Retry manifest</button>
-          </div>
-        )}
         {visibleGeometryCount === 0 && manifest.status === 'ready' && !pointCloudEnabled && (
           <div className="viewer-state">
             <strong>No geometry selected for display</strong>
@@ -3522,28 +3553,6 @@ function StructuralViewerContent({
             <span>No placeholder geometry is substituted.</span>
           </div>
         )}
-        {manifest.status === 'ready' && assetError !== null && (
-          <div className="viewer-state viewer-state-overlay error-state" role="alert">
-            <strong>
-              {classifyStructuralAssetFailure(assetError) === 'stale_model'
-                ? 'Active model changed'
-                : 'Structural asset unavailable'}
-            </strong>
-            <span>
-              {classifyStructuralAssetFailure(assetError) === 'stale_model'
-                ? 'A keyed mesh belongs to an inactive model. Reload the manifest.'
-                : assetError.message}
-            </span>
-            <button type="button" onClick={retry}>Reload active model</button>
-          </div>
-        )}
-        {pointCloudEnabled && pointCloud.error !== null && (
-          <div className="viewer-state viewer-state-overlay error-state" role="alert">
-            <strong>Point-cloud observer unavailable</strong>
-            <span>{pointCloud.error}</span>
-          </div>
-        )}
-
         {typeof transportControls === 'function' ? transportControls(() => {
           setInspectorPanel('robot');
           onInspectorMinimizedChange?.(false);

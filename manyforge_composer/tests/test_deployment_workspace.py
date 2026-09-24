@@ -25,12 +25,16 @@ from manyforge_composer.backend.routes_deployment_draft import (
     create_deployment_draft_router,
 )
 from manyforge_composer.backend.authoring_admission import (
+    AuthoringAdmissionCoordinator,
     AuthoringOperationError,
     LocalAuthoringCommit,
 )
 from manyforge_composer.backend.authoring_workspace import AuthoringWorkspace
 from manyforge_composer.backend.routes_headless import create_headless_router
-from manyforge_composer.backend.state import ComposerState
+from manyforge_composer.backend.state import (
+    ComposerState,
+    _controllable_composition_change_kinds,
+)
 from manyforge_composer.backend.app import create_app
 
 
@@ -259,21 +263,18 @@ def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
         ],
     }
     client, state = _client(tmp_path)
-    # Keep the existing lightweight admission double, but use the real source
-    # compiler and actual workspace mutation/save/open routes.
-    _replace_deployment_session(state, DeploymentDraftSession())
+    # Exercise an ordinary runtime-configuration Draft edit on an existing
+    # component composition, without using Draft-only Open to add the robots.
     original = tmp_path / "original.deployment.yaml"
     original.write_text(json.dumps(source))
-    workspace = client.get("/api/deployment/workspace").json()
-    opened = client.post(
-        "/api/deployment/open-draft",
-        json=_request(workspace, path=str(original), confirmDiscard=False, kind="open"),
+    _seed_existing_deployment(
+        state, source, saved_path=str(original), compiler=compile_deployment_document
     )
-    assert opened.status_code == 200, opened.text
+    workspace = client.get("/api/deployment/workspace").json()
     changed = client.post(
         "/api/deployment/draft/mutations",
         json=_request(
-            opened.json(),
+            workspace,
             path=[
                 "graph",
                 "runtime_units",
@@ -618,7 +619,15 @@ def _document() -> dict[str, Any]:
         "deployment_revision": _DIGEST,
         "cell_id": "cell_a",
         "name": "Cell A",
-        "graph": {"runtime_units": []},
+        "capability_provider_bindings": [],
+        "graph": {
+            "component_attachments": [],
+            "controllable_components": [],
+            "control_bindings": [],
+            "control_domains": [],
+            "model_instances": [],
+            "runtime_units": [],
+        },
     }
 
 
@@ -650,6 +659,9 @@ def _focused_document() -> dict[str, Any]:
     document["graph"]["runtime_units"] = [
         {
             "runtime_unit_id": "robot.native_execution",
+            "runtime_profile_id": "manyforge.native_execution_runtime",
+            "runtime_profile_revision": _DIGEST,
+            "dependency_runtime_unit_ids": [],
             "configuration": {
                 "mode": "simulated",
                 "execution_tick_hz": 100,
@@ -832,6 +844,30 @@ def _replace_deployment_session(
     )
 
 
+def _seed_existing_deployment(
+    state: ComposerState,
+    document: dict[str, Any],
+    *,
+    saved_path: str | None = None,
+    compiler=_compile,
+) -> None:
+    """Seed a pre-existing live composition for Draft-only parameter tests."""
+
+    session = DeploymentDraftSession(compiler=compiler)
+    compiled = session.preview_source(json.dumps(document))
+    retained = session.retained_state()
+    retained.update(
+        {
+            "draft_revision": 1,
+            "document": compiled.document,
+            "saved_path": saved_path,
+            "saved_document": compiled.document,
+        }
+    )
+    session.restore_retained_state(retained)
+    _replace_deployment_session(state, session)
+
+
 def _client(tmp_path: Path) -> tuple[TestClient, ComposerState]:
     state = ComposerState()
     _replace_deployment_session(
@@ -899,13 +935,30 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     )
     workspace = response.json()
     assert applied is not None
-    state.applied_deployment_document = applied
-    state.current_scenario = lambda: {  # type: ignore[method-assign]
-        "ready": True,
-        "current_scenario": {
+    publication = {
+        "scenario_id": "cell_a",
+        "source_document_digest": _DIGEST,
+        "deployment_revision": applied_revision,
+        "retained_bundle_id": _DIGEST,
+        "graph_revision": _DIGEST,
+        "program_revision": _DIGEST,
+        "program_binding_id": _DIGEST,
+    }
+    captured = state._captured_deployment_context(
+        {
+            "deployment": applied,
+            "model_source_closure": {},
+            "program_role_assignment": {},
+            "typed_parameter_overrides": {},
+            "source_document_digest": _DIGEST,
             "scenario_id": "cell_a",
-            "deployment_revision": applied_revision,
         },
+        publication,
+    )
+    state._retain_submitted_deployment(captured)
+    state.published_scenario = lambda: {  # type: ignore[method-assign]
+        "ready": True,
+        "published_scenario": publication,
         "unavailable_reasons": [],
     }
     response = client.post(
@@ -918,6 +971,274 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
         state.authoring_retained_state()["schema_version"]
         == "manyforge.composer_authoring_workspace.v2"
     )
+
+
+def test_opening_new_controllable_composition_requires_activation_without_mutation(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    source = _document()
+    source["graph"]["controllable_components"] = [
+        {"controllable_component_id": "robot"}
+    ]
+    artifact = tmp_path / "new-composition.deployment.yaml"
+    artifact.write_text(json.dumps(source), encoding="utf-8")
+    before = client.get("/api/deployment/workspace").json()
+
+    rejected = client.post(
+        "/api/deployment/open-draft",
+        json=_request(
+            before,
+            path=str(artifact),
+            confirmDiscard=False,
+            kind="open-controllable-composition",
+        ),
+    )
+
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == "deployment_activation_required"
+    assert rejected.json()["detail"]["activationRequired"] is True
+    assert rejected.json()["detail"]["changedGraphKinds"] == [
+        "controllable_components"
+    ]
+    after = client.get("/api/deployment/workspace").json()
+    assert after["draft"] == before["draft"]
+    assert after["authoringWorkspace"] == before["authoringWorkspace"]
+    assert state.deployment_draft_session.retained_state()["document"] is None
+
+
+def test_generic_mutation_rejects_controllable_graph_change_without_mutation(
+    tmp_path: Path,
+) -> None:
+    client, _state = _client(tmp_path)
+    source = tmp_path / "empty-composition.deployment.yaml"
+    source.write_text(json.dumps(_document()), encoding="utf-8")
+    initial = client.get("/api/deployment/workspace").json()
+    opened = client.post(
+        "/api/deployment/open-draft",
+        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
+    ).json()
+
+    rejected = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(
+            opened,
+            path=["graph", "control_bindings"],
+            value=[{"control_binding_id": "robot.arm"}],
+            kind="add-control-binding",
+        ),
+    )
+
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == "deployment_activation_required"
+    assert rejected.json()["detail"]["activationRequired"] is True
+    assert "control_bindings" in rejected.json()["detail"]["changedGraphKinds"]
+    after = client.get("/api/deployment/workspace").json()
+    assert after["draft"] == opened["draft"]
+    assert after["authoringWorkspace"]["workspaceEpoch"] == opened[
+        "authoringWorkspace"
+    ]["workspaceEpoch"]
+    assert after["authoringWorkspace"]["workspaceRevision"] == opened[
+        "authoringWorkspace"
+    ]["workspaceRevision"]
+
+
+def test_pose_only_controllable_component_edit_remains_draftable(
+    tmp_path: Path,
+) -> None:
+    client, state = _client(tmp_path)
+    source = _document()
+    source["graph"]["controllable_components"] = [
+        {
+            "controllable_component_id": "robot",
+            "root_pose_in_cell": {
+                "position_m": [0.0, 0.0, 0.0],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            },
+        }
+    ]
+    source["graph"]["model_instances"] = [
+        {
+            "model_instance_id": "robot.model",
+            "model_asset_id": "robot_model",
+            "model_revision": _DIGEST,
+        }
+    ]
+    _seed_existing_deployment(state, source)
+    before = client.get("/api/deployment/workspace").json()
+    pose = {
+        "position_m": [1.0, 0.0, 0.0],
+        "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+    }
+
+    changed = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(
+            before,
+            path=["graph", "controllable_components", 0, "root_pose_in_cell"],
+            value=pose,
+            kind="placement-preview",
+        ),
+    )
+
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["draft"]["document"]["graph"][
+        "controllable_components"
+    ][0]["root_pose_in_cell"] == pose
+
+
+def test_draft_composition_classifier_uses_model_identity_not_placement_fields() -> None:
+    intent_before = {
+        "api_version": "manyforge.deployment_intent.v1",
+        "components": [
+            {
+                "component_id": "robot",
+                "component_profile_id": "robot_profile",
+                "model_source": {"urdf": "robot.urdf"},
+                "root_pose_in_cell": {"position_m": [0.0, 0.0, 0.0]},
+                "target_settings": {},
+                "configuration": {},
+            }
+        ],
+        "attachments": [],
+    }
+    intent_after = deepcopy(intent_before)
+    intent_after["components"][0]["root_pose_in_cell"] = {
+        "position_m": [1.0, 0.0, 0.0]
+    }
+    assert _controllable_composition_change_kinds(intent_before, intent_after) == ()
+
+    before = _document()
+    before["graph"]["model_instances"] = [
+        {
+            "model_instance_id": "robot.model",
+            "model_asset_id": "robot_model",
+            "model_revision": _DIGEST,
+            "root_pose_in_cell": {"position_m": [0.0, 0.0, 0.0]},
+        }
+    ]
+    after = deepcopy(before)
+    after["graph"]["model_instances"][0]["root_pose_in_cell"] = {
+        "position_m": [2.0, 0.0, 0.0]
+    }
+
+    assert _controllable_composition_change_kinds(before, after) == ()
+
+    after["graph"]["model_instances"][0]["model_asset_id"] = "other_model"
+    assert _controllable_composition_change_kinds(before, after) == (
+        "model_instances",
+    )
+
+
+def test_controllable_add_remove_and_replacement_are_activation_only() -> None:
+    def component(identity: str, model: str = "robot.urdf") -> dict[str, Any]:
+        return {
+            "component_id": identity,
+            "component_profile_id": "native_robot",
+            "model_source": {"urdf": model},
+            "target_settings": {},
+            "configuration": {},
+        }
+
+    def intent(*components: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "api_version": "manyforge.deployment_intent.v1",
+            "components": list(components),
+            "attachments": [],
+        }
+
+    empty = intent()
+    one = intent(component("robot-a"))
+    two = intent(component("robot-a"), component("robot-b"))
+    replacement = intent(component("robot-a", "replacement.urdf"))
+    for before, after, expected in (
+        (empty, one, "controllable_components"),
+        (one, two, "controllable_components"),
+        (two, one, "controllable_components"),
+        (one, replacement, "model_instances"),
+    ):
+        assert expected in _controllable_composition_change_kinds(before, after)
+
+
+def test_draft_composition_classifier_fails_closed_on_mixed_or_unknown_schema() -> None:
+    compiled = _document()
+    unknown = deepcopy(compiled)
+    unknown["api_version"] = "manyforge.deployment.v2"
+    intent = {
+        "api_version": "manyforge.deployment_intent.v1",
+        "components": [],
+        "attachments": [],
+    }
+
+    assert _controllable_composition_change_kinds(compiled, unknown) is None
+    assert _controllable_composition_change_kinds(compiled, intent) is None
+
+
+def test_opaque_runtime_or_controller_configuration_is_not_draft_classified() -> None:
+    intent = {
+        "api_version": "manyforge.deployment_intent.v1",
+        "components": [
+            {
+                "component_id": "robot",
+                "component_profile_id": "robot_profile",
+                "model_source": {"urdf": "robot.urdf"},
+                "target_settings": {},
+                "configuration": {"controller_endpoint": "controller-a"},
+            }
+        ],
+        "attachments": [],
+    }
+    changed_intent = deepcopy(intent)
+    changed_intent["components"][0]["configuration"]["controller_endpoint"] = (
+        "controller-b"
+    )
+    assert _controllable_composition_change_kinds(intent, changed_intent) is None
+
+    compiled = _focused_document()
+    changed_compiled = deepcopy(compiled)
+    changed_compiled["graph"]["runtime_units"][0]["configuration"][
+        "controller_endpoint"
+    ] = "controller-b"
+    assert _controllable_composition_change_kinds(compiled, changed_compiled) is None
+
+
+def test_unclassifiable_deployment_shape_rejects_without_mutation(
+    tmp_path: Path,
+) -> None:
+    client, _state = _client(tmp_path)
+    source = tmp_path / "classifiable.deployment.yaml"
+    source.write_text(json.dumps(_document()), encoding="utf-8")
+    initial = client.get("/api/deployment/workspace").json()
+    opened = client.post(
+        "/api/deployment/open-draft",
+        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
+    ).json()
+
+    rejected = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(
+            opened,
+            path=["graph", "model_instances"],
+            value="not-an-array",
+            kind="unknown-graph-shape",
+        ),
+    )
+
+    assert rejected.status_code == 409
+    assert (
+        rejected.json()["detail"]["code"]
+        == "deployment_activation_classification_unavailable"
+    )
+    assert rejected.json()["detail"]["activationRequired"] is True
+    assert rejected.json()["detail"]["classificationAvailable"] is False
+    after = client.get("/api/deployment/workspace").json()
+    assert after["draft"] == opened["draft"]
+    assert after["authoringWorkspace"]["workspaceEpoch"] == opened[
+        "authoringWorkspace"
+    ]["workspaceEpoch"]
+    assert after["authoringWorkspace"]["workspaceRevision"] == opened[
+        "authoringWorkspace"
+    ]["workspaceRevision"]
 
 
 def test_invalid_or_stale_deployment_mutation_never_changes_the_draft(
@@ -1122,8 +1443,12 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
                 "phases_ms": {"preparation_ms": 1.0},
                 "apply_id": None,
             }
-            prepared = {"result": result}
+            prepared = {
+                "result": result,
+                "confirmation_required": confirmation_required,
+            }
         if prepare_only:
+            assert _claim is None, "preparation must precede admission acquisition"
             return prepared
         effects.append((deepcopy(intent), apply))
         result = deepcopy(prepared["result"])
@@ -1145,8 +1470,6 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     )
     assert preview.status_code == 200, preview.text
     assert preview.json()["result"]["status"] == "previewed"
-    state.authoring_admission = coordinator
-
     confirmation = client.post(
         "/api/deployment/draft/apply",
         json=_request(edited, kind="apply", local=False),
@@ -1154,6 +1477,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     assert confirmation.status_code == 202, confirmation.text
     assert confirmation.json()["result"]["status"] == "confirmation_required"
     assert confirmation.json()["result"]["confirmation_token"] == confirmation_token
+    state.authoring_admission = coordinator
     assert current["deployment_revision"] == base_revision
     assert effects[-1][0]["program"] == program
     assert effects[-1][0]["deployment"] == edited["draft"]["document"]
@@ -1235,7 +1559,14 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
     state.headless_client = Headless()  # type: ignore[assignment]
     parent_claim = {"intent": {"owner_role": "authoring_owner"}}
     result = state.execute_authored_deployment_candidate(
-        {},
+        {
+            "deployment": {"api_version": "manyforge.deployment_intent.v1"},
+            "model_source_closure": {},
+            "program_role_assignment": {},
+            "typed_parameter_overrides": {},
+            "source_document_digest": prepared_activation["source_document_digest"],
+            "scenario_id": prepared_activation["scenario_id"],
+        },
         parent_claim,
         apply=True,
         prepared={
@@ -1272,14 +1603,12 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
 def test_focused_motion_target_limit_updates_one_exact_target_atomically(
     tmp_path: Path,
 ) -> None:
-    client, _state = _client(tmp_path)
+    client, state = _client(tmp_path)
     source = tmp_path / "cell_a.deployment.yaml"
-    source.write_text(json.dumps(_focused_document()), encoding="utf-8")
-    initial = client.get("/api/deployment/workspace").json()
-    opened = client.post(
-        "/api/deployment/open-draft",
-        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
-    ).json()
+    focused = _focused_document()
+    source.write_text(json.dumps(focused), encoding="utf-8")
+    _seed_existing_deployment(state, focused, saved_path=str(source))
+    opened = client.get("/api/deployment/workspace").json()
 
     updated = client.post(
         "/api/deployment/draft/motion-target-limit",
@@ -1323,7 +1652,7 @@ def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
     tmp_path: Path,
     natural_completion: bool,
 ) -> None:
-    client, _state = _client(tmp_path)
+    client, state = _client(tmp_path)
     source = tmp_path / "cell_a.deployment.yaml"
     document = _focused_document()
     other_binding = deepcopy(document["graph"]["control_bindings"][0])
@@ -1333,11 +1662,8 @@ def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
     other_stage["control_binding_id"] = "other_binding"
     document["policies"]["stop_stage_parameters"].append(other_stage)
     source.write_text(json.dumps(document), encoding="utf-8")
-    initial = client.get("/api/deployment/workspace").json()
-    opened = client.post(
-        "/api/deployment/open-draft",
-        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
-    ).json()
+    _seed_existing_deployment(state, document, saved_path=str(source))
+    opened = client.get("/api/deployment/workspace").json()
     profile = {
         "stop_mode": "spring_back_hold",
         "jerk_limits_enabled": False,
@@ -1549,15 +1875,32 @@ def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():
         confirm_discard=False,
     )
     state.draft_session.snapshot = lambda: {"program_revision": _DIGEST}  # type: ignore[method-assign]
-    state.current_scenario = lambda: {  # type: ignore[method-assign]
+    state.published_scenario = lambda: {  # type: ignore[method-assign]
         "ready": True,
-        "current_scenario": {"deployment_revision": "sha256:" + "2" * 64},
+        "published_scenario": {
+            "deployment_revision": "sha256:" + "2" * 64,
+            "program_revision": _DIGEST,
+        },
     }
+    state.applied_deployment_for_publication = lambda _current: {  # type: ignore[method-assign]
+        "different": "deployment"
+    }
+    # Editable Deployment intent does not carry a compiled revision. The
+    # former revision-based guard skipped the mismatch in this state.
+    original_snapshot = state.deployment_draft_session.snapshot
+
+    def intent_snapshot() -> dict[str, Any]:
+        snapshot = original_snapshot()
+        snapshot["draft"]["deploymentRevision"] = None
+        return snapshot
+
+    state.deployment_draft_session.snapshot = intent_snapshot  # type: ignore[method-assign]
 
     class Headless:
         def program_run_start(self, _body):
             raise AssertionError("Run must be rejected before transport")
 
+    state.authoring_admission = AuthoringAdmissionCoordinator(None)  # type: ignore[arg-type]
     app = FastAPI()
     app.include_router(create_headless_router(Headless(), state))  # type: ignore[arg-type]
     response = TestClient(app).post(
@@ -1577,7 +1920,7 @@ def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():
     assert response.status_code == 409
     assert (
         response.json()["detail"]["code"]
-        == "program_run_deployment_draft_applied_mismatch"
+        == "execution_deployment_draft_unapplied"
     )
 
 
@@ -1597,15 +1940,20 @@ def test_run_uses_the_existing_transport_when_deployment_draft_matches_applied()
         confirm_discard=False,
     )
     state.draft_session.snapshot = lambda: {"program_revision": _DIGEST}  # type: ignore[method-assign]
-    state.current_scenario = lambda: {  # type: ignore[method-assign]
+    state.published_scenario = lambda: {  # type: ignore[method-assign]
         "ready": True,
-        "current_scenario": {"deployment_revision": compiled.deployment_revision},
+        "published_scenario": {
+            "deployment_revision": compiled.deployment_revision,
+            "program_revision": _DIGEST,
+        },
     }
+    state.applied_deployment_for_publication = lambda _current: compiled.document  # type: ignore[method-assign]
 
     class Headless:
         def program_run_start(self, body):
             return {"accepted_request_id": body["request_id"]}
 
+    state.authoring_admission = AuthoringAdmissionCoordinator(None)  # type: ignore[arg-type]
     app = FastAPI()
     app.include_router(create_headless_router(Headless(), state))  # type: ignore[arg-type]
     response = TestClient(app).post(
@@ -1624,3 +1972,94 @@ def test_run_uses_the_existing_transport_when_deployment_draft_matches_applied()
     )
     assert response.status_code == 200
     assert response.json() == {"accepted_request_id": "run-1"}
+
+
+def test_run_rejects_unapplied_program_draft_before_transport() -> None:
+    state = ComposerState()
+    state.draft_session.snapshot = lambda: {"program_revision": _DIGEST}  # type: ignore[method-assign]
+    state.published_scenario = lambda: {  # type: ignore[method-assign]
+        "ready": True,
+        "published_scenario": {"program_revision": "sha256:" + "2" * 64},
+    }
+
+    class Headless:
+        def program_run_start(self, _body):
+            raise AssertionError("Run must be rejected before transport")
+
+    state.authoring_admission = AuthoringAdmissionCoordinator(None)  # type: ignore[arg-type]
+    app = FastAPI()
+    app.include_router(create_headless_router(Headless(), state))  # type: ignore[arg-type]
+    response = TestClient(app).post(
+        "/api/program/runs",
+        json={
+            "request_id": "run-1",
+            "request_owner_epoch": "browser-1",
+            "source_label": "test",
+            "correlation_id": None,
+            "scenario_id": "cell-a",
+            "source_document_digest": _DIGEST,
+            "expected_applied_record_digest": _DIGEST,
+            "draft_program_revision": _DIGEST,
+            "expected_admission_generation": 1,
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "execution_program_draft_unapplied"
+
+
+def test_manual_start_rejects_unapplied_deployment_before_transport() -> None:
+    state = ComposerState()
+    _replace_deployment_session(
+        state,
+        DeploymentDraftSession(compiler=_compile),
+    )
+    compiled = _compile(json.dumps(_document()))
+    retained = state.deployment_draft_session.retained_state()
+    state.deployment_draft_session.commit_open(
+        compiled,
+        "/workspace/cell_a.deployment.yaml",
+        draft_id=retained["draft_id"],
+        expected_revision=0,
+        confirm_discard=False,
+    )
+    state.published_scenario = lambda: {  # type: ignore[method-assign]
+        "ready": True,
+        "published_scenario": {"deployment_revision": compiled.deployment_revision},
+    }
+    state.applied_deployment_for_publication = lambda _current: {  # type: ignore[method-assign]
+        "different": "deployment"
+    }
+
+    class Headless:
+        def submit_control_command(self, _body):
+            raise AssertionError("manual Start must be rejected before transport")
+
+    state.authoring_admission = AuthoringAdmissionCoordinator(None)  # type: ignore[arg-type]
+    app = FastAPI()
+    app.include_router(create_headless_router(Headless(), state))  # type: ignore[arg-type]
+    response = TestClient(app).post(
+        "/api/control/commands",
+        json={
+            "command_envelope": {
+                "schema_version": "manyforge.execution_command.v1",
+                "command_kind": "program_motion_start",
+                "correlation_id": "manual-start-1",
+                "source_label": "test",
+                "control_session_id": None,
+                "client_sequence": None,
+                "freshness": {
+                    "context_id": "freshness-1",
+                    "receiver_incarnation": "headless-1",
+                    "semantic_owner_epoch": "program-1",
+                    "execution_control_revision": 1,
+                    "issued_server_sequence": "1",
+                    "valid_for_ns": 750_000_000,
+                },
+                "expected_semantic_owner_epoch": "program-1",
+                "expected_execution_control_revision": 1,
+            },
+            "payload": {},
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "execution_deployment_draft_unapplied"

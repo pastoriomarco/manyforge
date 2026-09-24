@@ -1,7 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { ComposerHeadlessState } from '../types/headless';
-import { nodeEnvironmentRefreshKey } from './nodeEnvironmentRefresh';
+import {
+  nodeEnvironmentRefreshKey,
+  refreshViewerModelsOnManagerChange,
+  viewerModelRefreshKey,
+} from './nodeEnvironmentRefresh';
 
 function snapshot(): ComposerHeadlessState {
   return {
@@ -85,6 +89,70 @@ describe('nodeEnvironmentRefreshKey', () => {
     degraded.componentOverview.components[0]!.reasonCode = 'owner_unavailable';
     expect(nodeEnvironmentRefreshKey(degraded)).not.toBe(
       nodeEnvironmentRefreshKey(current),
+    );
+  });
+});
+
+describe('viewerModelRefreshKey', () => {
+  it('re-reads source-model and manifest when a dual-robot composition becomes single-robot', () => {
+    const dualRobot = snapshot();
+    const dualActive = dualRobot.runtime.sections.manager.payload?.active as Record<string, unknown>;
+    dualActive.retained_bundle_id = 'sha256:dual-robot-bundle';
+    dualActive.graph_revision = 'sha256:dual-robot-graph';
+
+    const singleRobot = structuredClone(dualRobot);
+    const singleActive = singleRobot.runtime.sections.manager.payload?.active as Record<string, unknown>;
+    singleActive.retained_bundle_id = 'sha256:single-robot-bundle';
+    singleActive.graph_revision = 'sha256:single-robot-graph';
+
+    const refreshSourceModel = vi.fn();
+    const refreshManifest = vi.fn();
+    const previousKey = viewerModelRefreshKey(dualRobot);
+    const nextKey = viewerModelRefreshKey(singleRobot);
+    expect(nextKey).not.toBe(previousKey);
+
+    let wakeKey = refreshViewerModelsOnManagerChange(
+      null,
+      previousKey,
+      refreshSourceModel,
+      refreshManifest,
+    );
+    expect(refreshSourceModel).not.toHaveBeenCalled();
+    expect(refreshManifest).not.toHaveBeenCalled();
+
+    wakeKey = refreshViewerModelsOnManagerChange(
+      wakeKey,
+      nextKey,
+      refreshSourceModel,
+      refreshManifest,
+    );
+    expect(refreshSourceModel).toHaveBeenCalledOnce();
+    expect(refreshManifest).toHaveBeenCalledOnce();
+    expect(wakeKey).toBe(nextKey);
+
+    refreshViewerModelsOnManagerChange(
+      wakeKey,
+      nextKey,
+      refreshSourceModel,
+      refreshManifest,
+    );
+    expect(refreshSourceModel).toHaveBeenCalledOnce();
+    expect(refreshManifest).toHaveBeenCalledOnce();
+  });
+
+  it('refreshes for Manager readiness transitions even when the bundle identity stays put', () => {
+    const converged = snapshot();
+    const managerPayload = converged.runtime.sections.manager.payload as Record<string, unknown>;
+    managerPayload.manager_ready = true;
+    managerPayload.runtime = { converged: true };
+
+    const reconciling = structuredClone(converged);
+    const reconcilingPayload = reconciling.runtime.sections.manager.payload as Record<string, unknown>;
+    reconcilingPayload.manager_ready = false;
+    reconcilingPayload.runtime = { converged: false };
+
+    expect(viewerModelRefreshKey(reconciling)).not.toBe(
+      viewerModelRefreshKey(converged),
     );
   });
 });

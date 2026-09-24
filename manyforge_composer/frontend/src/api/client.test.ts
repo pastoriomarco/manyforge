@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
 import {
   ApiError,
   HISTORIAN_PAGE_LIMIT,
@@ -412,49 +411,30 @@ function appliedResultFixture(): Record<string, unknown> {
   const digestA = `sha256:${'a'.repeat(64)}`;
   const digestB = `sha256:${'b'.repeat(64)}`;
   const digestC = `sha256:${'c'.repeat(64)}`;
-  const binding = structuredClone(nativeBindingFixture) as Record<string, unknown>;
-  binding.program_binding_id = digestC;
-  binding.program_id = 'fixture';
-  binding.program_revision = digestA;
-  binding.retained_bundle_id = digestB;
-  binding.graph_revision = digestC;
-  (binding.node_environment as Record<string, unknown>).environment_digest = digestA;
   return {
-    schema_version: 'manyforge.program_apply_result.v2',
     status: 'applied',
-    preparation: {},
-    applied: {
-      assistant_mode: 'forbidden',
-      assistant_projection: null,
-      baseline_program_binding_id: digestA,
+    confirmation_token: null,
+    prepared_activation: {
+      schema_version: 'manyforge.prepared_activation_input.v2',
+      prepared_activation_id: digestC,
+      source_document_digest: digestA,
+      captured_input_digest: digestB,
       deployment_artifact_id: 'cell-a',
       deployment_revision: digestB,
+      retained_bundle_id: digestB,
       graph_revision: digestC,
-      node_environment_digest: digestA,
-      owner_identities: [{
-        owner_role: 'headless_projection',
-        owner_id: 'headless.program-apply',
-        owner_epoch: 'headless.epoch.1',
-      }],
-      preparation_digest: digestB,
-      program: (workspaceFixture().draft as Record<string, unknown>).program,
-      program_binding: binding,
-      program_binding_id: digestC,
       program_id: 'fixture',
       program_revision: digestA,
-      retained_bundle_id: digestB,
-      source_document_digest: digestA,
-      scenario_id: 'cell-pick',
-      schema_version: 'manyforge.applied_program_selection.v2',
-      source: {
-        record_digest: digestC,
-        semantic_content_digest: digestB,
-        source_generation: 1,
-        source_owner_epoch: 'headless.epoch.1',
-        source_owner_id: 'headless.program-apply',
-      },
+      program_binding_id: digestC,
+      node_environment_digest: digestA,
+      assistant_mode: 'forbidden',
       typed_parameter_overrides: {},
     },
+    candidate_preview: null,
+    manager_apply: null,
+    preparation: null,
+    phases_ms: {},
+    apply_id: null,
   };
 }
 
@@ -713,7 +693,7 @@ describe('structural API client', () => {
     ))).toEqual(revertFence);
   });
 
-  it('lists, saves, and loads editable Scenario documents with both Draft fences', async () => {
+  it('lists and saves Scenario documents, then loads through the fenced activation path', async () => {
     const index = {
       api_version: 'manyforge.scenario_document_index.v1',
       directory: '/workspace/examples',
@@ -729,11 +709,13 @@ describe('structural API client', () => {
         workspace: workspaceFixture(),
       }))
       .mockResolvedValueOnce(response({
-        status: 'opened',
+        status: 'accepted',
         path: '/workspace/examples/cell',
         scenario_id: 'cell',
         incomplete: false,
-        activation: null,
+        activation: {
+          status: 'accepted', apply_id: 'apply.1', apply_generation: 1,
+        },
         diagnostics: [],
         source_diagnostics: [],
         workspace: workspaceFixture(),

@@ -146,6 +146,56 @@ def _call(callback):
         raise _translate(error) from error
 
 
+def _require_applied_authoring_drafts(state: ComposerState) -> None:
+    """Refuse new execution while Program or Deployment edits are unapplied."""
+
+    draft = state.deployment_draft_session.snapshot()["draft"]["document"]
+    program_snapshot = state.draft_session.snapshot()
+    program_revision = program_snapshot["program_revision"]
+    if program_snapshot.get("program_loaded") is True and program_revision is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "execution_program_draft_unapplied",
+                "message": "Complete or discard Program edits before starting execution",
+            },
+        )
+    if draft is None and program_revision is None:
+        return
+    try:
+        projection = state.published_scenario()
+    except HeadlessClientError as error:
+        raise _translate(error) from error
+    published = projection.get("published_scenario")
+    if program_revision is not None and (
+        projection.get("ready") is not True
+        or not isinstance(published, dict)
+        or published.get("program_revision") != program_revision
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "execution_program_draft_unapplied",
+                "message": "Apply or discard Program edits before starting execution",
+            },
+        )
+    if draft is None:
+        return
+    applied = (
+        state.applied_deployment_for_publication(published)
+        if projection.get("ready") is True and isinstance(published, dict)
+        else None
+    )
+    if applied != draft:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "execution_deployment_draft_unapplied",
+                "message": "Apply or discard Deployment edits before starting execution",
+            },
+        )
+
+
 def _call_scene(callback, body: SceneTransactionRequest):
     try:
         return callback()
@@ -319,41 +369,22 @@ def create_headless_router(
 
     @router.post("/api/program/runs")
     async def program_run_start(body: ProgramRunStartRequest) -> dict[str, Any]:
-        draft = state.draft_session.snapshot()
-        if draft.get("program_revision") != body.draft_program_revision:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "program_run_draft_applied_mismatch",
-                    "message": "Run does not identify the current authoritative Draft",
-                },
-            )
-        deployment_revision = state.deployment_draft_session.snapshot()["draft"][
-            "deploymentRevision"
-        ]
-        if deployment_revision is not None:
-            try:
-                current_projection = state.current_scenario()
-            except HeadlessClientError as error:
-                raise _translate(error) from error
-            current = current_projection.get("current_scenario")
-            if (
-                current_projection.get("ready") is not True
-                or not isinstance(current, dict)
-                or current.get("deployment_revision") != deployment_revision
-            ):
+        def submit():
+            draft = state.draft_session.snapshot()
+            if draft.get("program_revision") != body.draft_program_revision:
                 raise HTTPException(
                     status_code=409,
                     detail={
-                        "code": "program_run_deployment_draft_applied_mismatch",
-                        "message": (
-                            "Run requires the current Deployment Draft to equal "
-                            "Manager Applied; Saved may differ"
-                        ),
+                        "code": "program_run_draft_applied_mismatch",
+                        "message": "Run does not identify the current authoritative Draft",
                     },
                 )
+            _require_applied_authoring_drafts(state)
+            return client.program_run_start(body.model_dump(mode="json"))
+
+        assert state.authoring_admission is not None
         return await control_call(
-            lambda: client.program_run_start(body.model_dump(mode="json"))
+            lambda: state.authoring_admission.submit_execution_start(submit)
         )
 
     @router.get("/api/cycle/status")
@@ -547,11 +578,15 @@ def create_headless_router(
                     "message": "Program-run identity in path and body must match",
                 },
             )
-        return await control_call(
-            lambda: client.program_run_motion_start(
-                program_run_id,
-                body.model_dump(mode="json"),
+        def submit():
+            _require_applied_authoring_drafts(state)
+            return client.program_run_motion_start(
+                program_run_id, body.model_dump(mode="json")
             )
+
+        assert state.authoring_admission is not None
+        return await control_call(
+            lambda: state.authoring_admission.submit_execution_start(submit)
         )
 
     @router.post("/api/program/runs/{program_run_id}/resume-motion")
@@ -567,11 +602,15 @@ def create_headless_router(
                     "message": "Program-run identity in path and body must match",
                 },
             )
-        return await control_call(
-            lambda: client.program_run_motion_resume(
-                program_run_id,
-                body.model_dump(mode="json"),
+        def submit():
+            _require_applied_authoring_drafts(state)
+            return client.program_run_motion_resume(
+                program_run_id, body.model_dump(mode="json")
             )
+
+        assert state.authoring_admission is not None
+        return await control_call(
+            lambda: state.authoring_admission.submit_execution_start(submit)
         )
 
     @router.post("/api/program/runs/{program_run_id}/full-stop")
@@ -608,11 +647,15 @@ def create_headless_router(
                     "message": ("Program-run identity in path and body must match"),
                 },
             )
-        return await control_call(
-            lambda: client.program_run_resume_full_stop(
-                program_run_id,
-                body.model_dump(mode="json"),
+        def submit():
+            _require_applied_authoring_drafts(state)
+            return client.program_run_resume_full_stop(
+                program_run_id, body.model_dump(mode="json")
             )
+
+        assert state.authoring_admission is not None
+        return await control_call(
+            lambda: state.authoring_admission.submit_execution_start(submit)
         )
 
     @router.post("/api/program/runs/{program_run_id}/reset")
@@ -683,14 +726,34 @@ def create_headless_router(
     async def submit_control_command(
         body: ExecutionCommandRequestDTO,
     ) -> JSONResponse:
+        start = body.command_envelope.command_kind in {
+            "program_run", "program_motion_start", "program_motion_resume",
+            "program_resume_full_stop", "operation_start", "operation_resume",
+        }
+        def submit():
+            if start:
+                _require_applied_authoring_drafts(state)
+            return client.submit_control_command(body.model_dump(mode="json"))
+
+        assert state.authoring_admission is not None
         return await control_call(
-            lambda: client.submit_control_command(body.model_dump(mode="json")),
+            lambda: (
+                state.authoring_admission.submit_execution_start(submit)
+                if start else submit()
+            ),
             stop=is_stop_command(body.command_envelope.command_kind),
         )
 
     @router.post("/api/execution/operations")
     async def execution_submit(body: OperationIntentRequest) -> dict[str, Any]:
-        return await control_call(lambda: client.execute(body.model_dump(mode="json")))
+        def submit():
+            _require_applied_authoring_drafts(state)
+            return client.execute(body.model_dump(mode="json"))
+
+        assert state.authoring_admission is not None
+        return await control_call(
+            lambda: state.authoring_admission.submit_execution_start(submit)
+        )
 
     @router.post("/api/execution/motion-previews")
     def execution_preview_motion(

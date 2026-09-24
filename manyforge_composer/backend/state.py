@@ -13,6 +13,7 @@ from copy import deepcopy
 import logging
 import hashlib
 from pathlib import Path
+from threading import Lock
 import time
 from typing import Any, TYPE_CHECKING
 
@@ -94,7 +95,273 @@ _PREPARED_ACTIVATION_FIELDS = (
     "assistant_mode",
     "typed_parameter_overrides",
 )
+_DEPLOYMENT_GRAPH_COMPOSITION_RECORDS = (
+    "component_attachments",
+    "controllable_components",
+    "control_bindings",
+    "control_domains",
+    "model_instances",
+)
 _LOGGER = logging.getLogger(__name__)
+
+
+def _runtime_composition_configuration(configuration: dict[str, Any]) -> dict[str, Any]:
+    """Ignore only the validated ordinary jerk setting, not runtime wiring.
+
+    The Deployment compiler validates this parameter before a Draft is installed.
+    Controller endpoints, route configuration and target identities remain part
+    of the comparison, so an unknown configuration edit cannot be draft-only.
+    """
+
+    result = deepcopy(configuration)
+    targets = result.get("motion_target_limits")
+    if isinstance(targets, list):
+        for target in targets:
+            if isinstance(target, dict):
+                target.pop("ordinary_motion_jerk", None)
+    return result
+
+
+def _controllable_composition_change_kinds(
+    before: dict[str, Any] | None, after: dict[str, Any]
+) -> tuple[str, ...] | None:
+    """Name known live-composition contracts changed by a Draft edit.
+
+    This deliberately uses the Deployment and graph record names owned by the
+    compiler. It does not infer robot identity from names or configuration
+    strings. Source-referenced intents expose only the fields that Composer can
+    classify locally; their profile-specific configuration remains opaque and
+    needs the prepared candidate/Manager preview before it can be classified.
+    """
+
+    if not isinstance(after, dict):
+        return None
+    after_schema = after.get("api_version")
+    if before is None:
+        if after_schema == "manyforge.deployment_intent.v1":
+            # The first Deployment Open is still a before/after comparison:
+            # every authored component compiles to a controllable component.
+            before = {
+                "api_version": "manyforge.deployment_intent.v1",
+                "components": [],
+                "attachments": [],
+            }
+        elif after_schema == "manyforge.deployment.v1":
+            before = {
+                "api_version": "manyforge.deployment.v1",
+                "graph": {
+                    **{kind: [] for kind in _DEPLOYMENT_GRAPH_COMPOSITION_RECORDS},
+                    "runtime_units": [],
+                },
+                "capability_provider_bindings": [],
+            }
+        else:
+            return None
+
+    if not isinstance(before, dict):
+        return None
+
+    before_schema = before.get("api_version")
+    if before_schema != after_schema:
+        return None
+
+    if after_schema == "manyforge.deployment_intent.v1":
+        def intent_components(
+            document: dict[str, Any],
+        ) -> dict[str, dict[str, Any]] | None:
+            rows = document.get("components")
+            if not isinstance(rows, list):
+                return None
+            indexed: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                if (
+                    not isinstance(row, dict)
+                    or not isinstance(row.get("component_id"), str)
+                    or not row["component_id"]
+                    or not isinstance(row.get("component_profile_id"), str)
+                    or not row["component_profile_id"]
+                    or not isinstance(row.get("model_source"), dict)
+                    or row["component_id"] in indexed
+                ):
+                    return None
+                indexed[row["component_id"]] = row
+            return indexed
+
+        def intent_attachments(
+            document: dict[str, Any],
+        ) -> list[dict[str, Any]] | None:
+            rows = document.get("attachments")
+            if not isinstance(rows, list) or any(
+                not isinstance(row, dict) for row in rows
+            ):
+                return None
+            return rows
+
+        old_by_id = intent_components(before)
+        new_by_id = intent_components(after)
+        old_attachments = intent_attachments(before)
+        new_attachments = intent_attachments(after)
+        if (
+            old_by_id is None
+            or new_by_id is None
+            or old_attachments is None
+            or new_attachments is None
+        ):
+            return None
+        changed: set[str] = set()
+        if old_by_id.keys() != new_by_id.keys():
+            changed.add("controllable_components")
+        for component_id in old_by_id.keys() & new_by_id.keys():
+            old = old_by_id[component_id]
+            new = new_by_id[component_id]
+            if old["component_profile_id"] != new["component_profile_id"]:
+                changed.add("controllable_components")
+            if old["model_source"] != new["model_source"]:
+                changed.add("model_instances")
+            # The authoring envelope leaves profile configuration and target
+            # extensions opaque. A generic Draft edit cannot prove that one of
+            # those values is only a motion parameter rather than a controller,
+            # route or endpoint change. The dedicated typed parameter routes
+            # remain available for the known draftable controls.
+            if old.get("configuration") != new.get("configuration"):
+                return None
+            old_targets = old.get("target_settings")
+            new_targets = new.get("target_settings")
+            if not isinstance(old_targets, dict) or not isinstance(new_targets, dict):
+                return None
+            if old_targets != new_targets:
+                return None
+
+        if old_attachments != new_attachments:
+            changed.add("component_attachments")
+        return tuple(
+            kind
+            for kind in (
+                "component_attachments",
+                "controllable_components",
+                "model_instances",
+            )
+            if kind in changed
+        )
+
+    if after_schema == "manyforge.deployment.v1":
+        record_ids = {
+            "component_attachments": "component_attachment_id",
+            "controllable_components": "controllable_component_id",
+            "control_bindings": "control_binding_id",
+            "control_domains": "control_domain_id",
+            "model_instances": "model_instance_id",
+        }
+
+        def index(rows: Any, identity_field: str) -> dict[str, dict[str, Any]] | None:
+            if not isinstance(rows, list):
+                return None
+            result: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                identity = row.get(identity_field) if isinstance(row, dict) else None
+                if not isinstance(identity, str) or not identity or identity in result:
+                    return None
+                result[identity] = row
+            return result
+
+        def composition(document: dict[str, Any]) -> dict[str, Any] | None:
+            graph = document.get("graph")
+            if not isinstance(graph, dict):
+                return None
+            result: dict[str, Any] = {}
+            for kind, identity_field in record_ids.items():
+                rows = index(graph.get(kind), identity_field)
+                if rows is None:
+                    return None
+                if kind == "model_instances":
+                    if any(
+                        not isinstance(row.get("model_asset_id"), str)
+                        or not row["model_asset_id"]
+                        or not isinstance(row.get("model_revision"), str)
+                        or not row["model_revision"]
+                        for row in rows.values()
+                    ):
+                        return None
+                    result[kind] = {
+                        identity: (row["model_asset_id"], row["model_revision"])
+                        for identity, row in rows.items()
+                    }
+                else:
+                    result[kind] = {
+                        identity: {
+                            key: value
+                            for key, value in row.items()
+                            if not (
+                                kind == "controllable_components"
+                                and key == "root_pose_in_cell"
+                            )
+                        }
+                        for identity, row in rows.items()
+                    }
+
+            runtime = index(graph.get("runtime_units"), "runtime_unit_id")
+            providers = index(
+                document.get("capability_provider_bindings"),
+                "capability_provider_binding_id",
+            )
+            if runtime is None or providers is None:
+                return None
+            for row in runtime.values():
+                dependencies = row.get("dependency_runtime_unit_ids")
+                if (
+                    not isinstance(row.get("runtime_profile_id"), str)
+                    or not isinstance(row.get("runtime_profile_revision"), str)
+                    or not isinstance(dependencies, list)
+                    or any(not isinstance(value, str) for value in dependencies)
+                    or not isinstance(row.get("configuration"), dict)
+                ):
+                    return None
+            result["runtime_units"] = {
+                identity: (
+                    row["runtime_profile_id"],
+                    row["runtime_profile_revision"],
+                    row["dependency_runtime_unit_ids"],
+                )
+                for identity, row in runtime.items()
+            }
+            result["capability_provider_bindings"] = providers
+            return result
+
+        old_shape = composition(before)
+        new_shape = composition(after)
+        if old_shape is None or new_shape is None:
+            return None
+        old_runtime_rows = before["graph"]["runtime_units"]
+        new_runtime_rows = after["graph"]["runtime_units"]
+        old_configurations = {
+            row["runtime_unit_id"]: row["configuration"]
+            for row in old_runtime_rows
+        }
+        new_configurations = {
+            row["runtime_unit_id"]: row["configuration"]
+            for row in new_runtime_rows
+        }
+        if {
+            identity: _runtime_composition_configuration(configuration)
+            for identity, configuration in old_configurations.items()
+        } != {
+            identity: _runtime_composition_configuration(configuration)
+            for identity, configuration in new_configurations.items()
+        }:
+            return None
+        changed = {kind for kind in old_shape if old_shape[kind] != new_shape[kind]}
+        return tuple(
+            kind
+            for kind in (
+                *_DEPLOYMENT_GRAPH_COMPOSITION_RECORDS,
+                "capability_provider_bindings",
+                "runtime_units",
+            )
+            if kind in changed
+        )
+
+    # Unknown or mixed document schemas cannot establish this relationship.
+    return None
 
 
 class ComposerState:
@@ -175,9 +442,88 @@ class ComposerState:
         # Headless/Manager; this value solely rejects an old browser mesh URL
         # after Composer has observed a successor viewer manifest.
         self.viewer_model_key: str | None = None
-        # Exact document last activated through this Composer process. It is
-        # an in-memory authoring baseline for Discard, never runtime truth.
+        # Keep only one pending candidate beside the last verified Applied
+        # authoring input. Manager/Program publication decides promotion.
+        self._applied_deployment_lock = Lock()
         self.applied_deployment_document: dict[str, Any] | None = None
+        self._applied_activation_context: dict[str, Any] | None = None
+        self._applied_deployment_identity: tuple[str, str, str, str, str] | None = None
+        self._pending_applied_deployment: tuple[
+            tuple[str, str, str, str, str], dict[str, Any]
+        ] | None = None
+
+    @staticmethod
+    def _deployment_publication_identity(
+        publication: dict[str, Any],
+    ) -> tuple[str, str, str, str, str]:
+        return (
+            publication["retained_bundle_id"],
+            publication["graph_revision"],
+            publication["deployment_revision"],
+            publication["program_revision"],
+            publication["program_binding_id"],
+        )
+
+    def applied_deployment_for_publication(
+        self, publication: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return authored input only after its exact Manager publication."""
+
+        context = self.applied_activation_for_publication(publication)
+        return context["deployment"] if context is not None else None
+
+    def applied_activation_for_publication(
+        self, publication: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return one captured activation input verified against publication."""
+
+        identity = self._deployment_publication_identity(publication)
+        with self._applied_deployment_lock:
+            pending = self._pending_applied_deployment
+            if pending is not None and pending[0] == identity:
+                self._applied_deployment_identity = identity
+                self._applied_activation_context = pending[1]
+                self.applied_deployment_document = pending[1]["deployment"]
+                self._pending_applied_deployment = None
+            if self._applied_deployment_identity != identity:
+                return None
+            return deepcopy(self._applied_activation_context)
+
+    def _captured_deployment_context(
+        self, intent: dict[str, Any], prepared_activation: dict[str, Any]
+    ) -> tuple[tuple[str, str, str, str, str], dict[str, Any]]:
+        deployment = intent.get("deployment")
+        if not isinstance(deployment, dict):
+            raise AuthoringOperationError(
+                "activation_deployment_missing",
+                "activation has no captured Deployment authoring input",
+            )
+        if (
+            prepared_activation.get("scenario_id") != intent.get("scenario_id")
+            or prepared_activation.get("source_document_digest")
+            != intent.get("source_document_digest")
+        ):
+            raise AuthoringOperationError(
+                "activation_authoring_capture_mismatch",
+                "prepared activation does not match its captured Scenario input",
+            )
+        identity = self._deployment_publication_identity(prepared_activation)
+        context = {
+            "deployment": deepcopy(deployment),
+            "model_source_closure": deepcopy(intent["model_source_closure"]),
+            "program_role_assignment": deepcopy(intent["program_role_assignment"]),
+            "typed_parameter_overrides": deepcopy(intent["typed_parameter_overrides"]),
+            "source_document_digest": intent["source_document_digest"],
+            "scenario_id": intent["scenario_id"],
+            "project_path": self.scenario_document_path,
+        }
+        return identity, context
+
+    def _retain_submitted_deployment(
+        self, captured: tuple[tuple[str, str, str, str, str], dict[str, Any]]
+    ) -> None:
+        with self._applied_deployment_lock:
+            self._pending_applied_deployment = captured
 
     @classmethod
     def from_paths(
@@ -835,9 +1181,25 @@ class ComposerState:
                 "phases_ms": phases,
                 "apply_id": None,
             }
+        # Validate and freeze all authoring facts before the Manager effect.
+        # Once Manager accepts, an unrelated Composer error must not turn an
+        # accepted operation into an apparently failed submission.
+        captured_deployment = self._captured_deployment_context(
+            intent, prepared_activation
+        )
+        # Before replacing the one pending capture, recognize a predecessor
+        # that Manager has already published. This matters for direct clients
+        # that submit the next Apply without first reading a workspace view.
+        with self._applied_deployment_lock:
+            has_pending_applied = self._pending_applied_deployment is not None
+        if has_pending_applied:
+            prior = self.published_scenario().get("published_scenario")
+            if isinstance(prior, dict):
+                self.applied_activation_for_publication(prior)
         if not isinstance(manager_apply, dict):
             # The exact prepared configuration is already active. Observing
             # that fact is not a second effect and needs no synthetic Apply.
+            self._retain_submitted_deployment(captured_deployment)
             return {
                 "status": "applied",
                 "confirmation_token": None,
@@ -851,6 +1213,7 @@ class ComposerState:
         manager_result = self.apply_manager_deployment_candidate(
             {"manager_apply": manager_apply}, claim
         )
+        self._retain_submitted_deployment(captured_deployment)
         return {
             "status": "accepted",
             "confirmation_token": None,

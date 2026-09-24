@@ -56,6 +56,24 @@ function transition(
 }
 
 describe('Program workspace lifecycle controls', () => {
+  it('places one conditional Scene source toggle after the camera controls', () => {
+    const viewer = readFileSync(
+      new URL('./StructuralViewer.tsx', import.meta.url), 'utf8',
+    );
+    const scene = readFileSync(
+      new URL('./SceneAuthoringWorkspace.tsx', import.meta.url), 'utf8',
+    );
+    const header = viewer.slice(viewer.indexOf('className="viewer-header-controls"'));
+    expect(header.indexOf('className="viewer-tool-strip"'))
+      .toBeLessThan(header.indexOf('{sceneSourceControl}'));
+    expect(scene).toContain('sceneSourceControl={draftSceneDifferent ? (');
+    expect(scene).toContain('className="viewer-scene-source-toggle"');
+    expect(scene).toContain("setSceneSourceChoice(programDraftPreview ? 'applied' : 'draft')");
+    expect(scene).toContain("programDraftPreview ? 'Draft Scene' : 'Applied Scene'");
+    expect(scene).toContain('robot models and observation status remain from Applied Deployment');
+    expect(scene).not.toContain('Draft objects · Applied robots');
+  });
+
   it('wires fenced New, Revert, and Discard with concrete prerequisites', () => {
     const source = readFileSync(
       new URL('./ProgramDocumentControls.tsx', import.meta.url),
@@ -150,19 +168,33 @@ describe('Program workspace lifecycle controls', () => {
     expect(result.message).toContain('Apply completed');
   });
 
-  it('keeps Program Apply separate while Load remains editor-only', () => {
+  it('reports an accepted Apply as pending with its exact identity', () => {
+    const result = programWorkspaceTransitionResult('apply', {
+      status: 'accepted',
+      headless: { apply_id: 'apply-42' },
+      workspace: workspace('pending-apply', 12),
+    });
+    expect(result.transitionStatus).toBe('accepted');
+    expect(result.message).toContain('apply-42');
+    expect(result.message).not.toContain('completed');
+  });
+
+  it('loads a Scenario through one activation operation with only conditional dirty-work confirmation', () => {
     const source = readFileSync(
       new URL('./ProgramDocumentControls.tsx', import.meta.url),
       'utf8',
     );
     expect(source).toContain('Apply this Program Draft to');
     expect(source).toContain('Its Deployment will not change.');
-    expect(source).toContain('Runtime state is not changed.');
     expect(source).toContain('loadScenarioDocument(');
     expect(source).not.toContain('loadScenario(');
     expect(source).toContain('currentScenarioProjection?.currentScenario');
     expect(source).not.toContain('applyDraft(selectedScenario');
     expect(source).not.toContain('Load and Apply Program');
+    expect(source).toContain('Load replaces the current Scenario and applies its Deployment, Scene and Program.');
+    expect(source).toContain('Replace current unsaved or unapplied Draft changes');
+    expect(source).not.toContain('Open as Draft only');
+    expect(source).not.toContain('confirmScenarioDeployment');
   });
 
   it('reflects backend idle admission instead of silently dropping UI actions', () => {

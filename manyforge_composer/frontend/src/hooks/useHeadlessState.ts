@@ -176,6 +176,10 @@ export interface HeadlessStateAdmission {
 
 const CONTROL_PROTOCOL_VERSION = 'manyforge.execution_control.v2';
 const EXECUTION_COMMAND_SCHEMA = 'manyforge.execution_command.v1';
+const HTTP_ADMITTED_COMMANDS = new Set<ExecutionControlCommandKind>([
+  'program_run', 'program_motion_start', 'program_motion_resume',
+  'program_resume_full_stop', 'operation_start', 'operation_resume',
+]);
 const CONTROL_HEARTBEAT_PERIOD_NS = 250_000_000;
 const CONTROL_HEARTBEAT_DELAYED_NS = 500_000_000;
 const CONTROL_HEARTBEAT_STALE_NS = 1_000_000_000;
@@ -628,6 +632,111 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       );
     } catch (error: unknown) {
       return Promise.reject(error);
+    }
+    if (HTTP_ADMITTED_COMMANDS.has(commandKind)) {
+      // Composer checks the shared Draft and submits under its authoring
+      // serialization lock. Stop and all observation remain on the WS lane.
+      this.ordinaryControlPending = correlationId;
+      return (async (): Promise<ExecutionCommandReceipt> => {
+        const abort = new AbortController();
+        const deadline = setTimeout(() => abort.abort(), 5_000);
+        let acknowledged = false;
+        try {
+          const response = await fetch(resolveStructuralAssetUrl('/api/control/commands'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            signal: abort.signal,
+            body: JSON.stringify({
+              command_envelope: {
+                schema_version: EXECUTION_COMMAND_SCHEMA,
+                command_kind: commandKind,
+                correlation_id: correlationId,
+                source_label: 'operator_ui',
+                control_session_id: null,
+                client_sequence: null,
+                freshness: control.freshness,
+                expected_semantic_owner_epoch: control.semantic_owner_epoch,
+                expected_execution_control_revision: control.execution_control_revision,
+              },
+              payload: fencedPayload,
+            }),
+          });
+          const body: unknown = await response.json();
+          if (!response.ok) {
+            // A definite client rejection has no submitted effect. A server
+            // error can occur after submission and remains uncertain.
+            acknowledged = response.status >= 400 && response.status < 500;
+            const detail = body !== null && typeof body === 'object'
+              && !Array.isArray(body) ? (body as Record<string, unknown>).detail : null;
+            const error = detail !== null && typeof detail === 'object'
+              && !Array.isArray(detail) ? detail as Record<string, unknown> : null;
+            throw new Error(
+              typeof error?.message === 'string' ? error.message
+                : typeof error?.code === 'string' ? error.code
+                  : `Execution command rejected (HTTP ${response.status}).`,
+            );
+          }
+          if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+            throw new Error('Execution command response is invalid.');
+          }
+          const record = body as Record<string, unknown>;
+          const receipt = record.receipt;
+          if (receipt === null || typeof receipt !== 'object' || Array.isArray(receipt)) {
+            throw new Error('Execution command receipt is missing.');
+          }
+          const value = receipt as Record<string, unknown>;
+          if (value.schema_version !== 'manyforge.execution_command_receipt.v1'
+            || value.correlation_id !== correlationId
+            || value.control_session_id !== null
+            || value.client_sequence !== null
+            || value.receiver_incarnation !== this.controlReceiverIncarnation
+            || (value.disposition !== 'rejected' && (
+              value.semantic_owner_epoch !== control.semantic_owner_epoch
+              || value.execution_control_revision !== control.execution_control_revision
+            ))
+            || !canonicalPositiveU64(value.received_server_sequence)
+            || !canonicalPositiveU64(value.received_monotonic_ns)
+            || !['received', 'rejected', 'joined', 'already_current', 'no_effect']
+              .includes(String(value.disposition))
+            || typeof value.code !== 'string') {
+            throw new Error('Execution command receipt identity is invalid.');
+          }
+          acknowledged = true;
+          if (value.disposition === 'rejected') {
+            const cause = record.result;
+            const detail = cause !== null && typeof cause === 'object'
+              && !Array.isArray(cause) ? cause as Record<string, unknown> : null;
+            throw new Error(`${value.code}: ${typeof detail?.message === 'string'
+              ? detail.message : value.code}`);
+          }
+          return {
+            correlationId,
+            disposition: value.disposition as ExecutionCommandReceipt['disposition'],
+            code: value.code as string,
+            result: record.result,
+            receivedServerSequence: value.received_server_sequence,
+            receivedMonotonicNs: value.received_monotonic_ns,
+            emittedMonotonicNs: value.received_monotonic_ns,
+          };
+        } catch (error: unknown) {
+          if (!acknowledged) {
+            this.controlTransportError = 'Command delivery is unconfirmed; commands are disabled.';
+            this.commandDeliveryFaultSessionId = sessionId;
+            this.reportClientIncident(
+              'command_delivery_unconfirmed', true, 'http_response_unconfirmed', 5_000_000_000,
+            );
+            this.refreshControlCondition();
+            socket.close(4002, 'command delivery unconfirmed');
+            throw new Error(this.controlTransportError, { cause: error });
+          }
+          throw error;
+        } finally {
+          clearTimeout(deadline);
+          if (this.ordinaryControlPending === correlationId) {
+            this.ordinaryControlPending = null;
+          }
+        }
+      })();
     }
     this.controlClientSequence += 1;
     const clientSequence = String(this.controlClientSequence);
@@ -1145,7 +1254,15 @@ export class HeadlessStateSource implements ExecutionObservationReader {
               emittedMonotonicNs: record.emitted_monotonic_ns,
             };
             if (parsed.disposition === 'rejected') {
-              pending.reject(new Error(code));
+              const cause = record.result;
+              const detail = cause !== null && typeof cause === 'object'
+                && !Array.isArray(cause)
+                && (cause as Record<string, unknown>).code === code
+                && (cause as Record<string, unknown>).correlation_id === correlationId
+                && typeof (cause as Record<string, unknown>).message === 'string'
+                ? (cause as Record<string, string>).message
+                : code;
+              pending.reject(new Error(`${code}: ${detail}`));
             } else {
               pending.resolve(parsed);
             }

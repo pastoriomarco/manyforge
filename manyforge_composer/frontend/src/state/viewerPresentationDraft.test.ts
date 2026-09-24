@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_VIEWER_PRESENTATION_DRAFT,
   programDraftPreviewActive,
+  sceneSourceIsDraft,
   programViewerMetadata,
   viewerPresentationDraftReducer,
   viewerPresentationDraftFromProgram,
@@ -12,6 +13,13 @@ describe('viewer presentation draft reducer', () => {
     expect(programDraftPreviewActive(false, 0, 3)).toBe(false);
     expect(programDraftPreviewActive(true, 0, 3)).toBe(true);
     expect(programDraftPreviewActive(true, 1, 3)).toBe(false);
+  });
+
+  it('shows a loaded Draft beside a nonempty Applied Scene without changing authority', () => {
+    expect(sceneSourceIsDraft('auto', true, true, true, false)).toBe(true);
+    expect(sceneSourceIsDraft('applied', true, true, true, false)).toBe(false);
+    expect(sceneSourceIsDraft('draft', true, true, false, false)).toBe(true);
+    expect(sceneSourceIsDraft('draft', false, true, true, false)).toBe(false);
   });
 
   it('retains independent frame and object-axis visibility edits', () => {

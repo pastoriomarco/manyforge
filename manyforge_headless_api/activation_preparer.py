@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import hashlib
+import logging
 from pathlib import Path
 import subprocess
 import tempfile
@@ -346,6 +347,12 @@ class ActivationPreparer:
                 output = stdout.read()
                 detail = stderr.read().decode("utf-8", errors="replace").strip()
             if completed.returncode != 0:
+                logging.getLogger(__name__).error(
+                    "Activation preparation failed: scenario=%s input=%s detail=%s",
+                    scenario_id,
+                    captured_input_digest,
+                    detail[:4096],
+                )
                 raise HeadlessApiError(
                     "activation_preparation_failed",
                     "Activation preparation failed",

@@ -281,13 +281,23 @@ def _status_response() -> dict[str, object]:
         "apply_id": "apply.3",
         "candidate_projection_revision": None,
         "error": None,
+        "failure": None,
         "last_progress": {
             "phase": "accepted",
             "record_digest": "sha256:" + "f" * 64,
         },
         "ok": True,
         "phase": "accepted",
-        "prepared_activation": _prepared_activation(),
+        "prepared_activation": {
+            field: _prepared_activation()[field]
+            for field in (
+                "captured_input_digest",
+                "deployment_artifact_id",
+                "deployment_revision",
+                "program_binding_id",
+                "prepared_activation_id",
+            )
+        },
         "request_id": "request.3",
         "request_owner_epoch": "client.epoch.3",
         "state": "pending",
@@ -375,8 +385,8 @@ def test_manager_client_keeps_a_terminal_success_replay_exact(
 ) -> None:
     client = ManagerCommandClient(tmp_path)
     projection = {
-        "retained_bundle_id": "bundle.2",
-        "graph_revision": "graph.2",
+        "retained_bundle_id": "sha256:" + "b" * 64,
+        "graph_revision": "sha256:" + "c" * 64,
         "scene_revision": {
             "scene_id": "sha256:" + "1" * 64,
             "revision_id": 4,
@@ -400,6 +410,29 @@ def test_manager_client_keeps_a_terminal_success_replay_exact(
     response = client.observe_apply("apply.3", 3)
     assert response["state"] == "succeeded"
     assert response["candidate_projection_revision"] == projection
+
+
+def test_manager_client_keeps_the_actual_terminal_failure_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+
+    def exchange(_command: dict[str, object]) -> dict[str, object]:
+        return {
+            **_status_response(),
+            "state": "failed",
+            "failure": {
+                "code": "planned_maintenance_refused",
+                "message": "the cell is not idle",
+                "phase": "accepted",
+                "effect_disposition": "known",
+            },
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    response = client.observe_apply("apply.3", 3)
+    assert response["phase"] == "accepted"
+    assert response["failure"]["code"] == "planned_maintenance_refused"
 
 
 def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(

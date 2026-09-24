@@ -36,7 +36,7 @@ _OWNER_ROLE_ORDER = (
     "intervention_or_recovery_owner",
 )
 PARTIAL_EFFECT_OBSERVATION_CODES = frozenset(
-    {"manager_apply_submission_uncertain"}
+    {"manager_apply_submission_uncertain", "manager_apply_acceptance_invalid"}
 )
 
 
@@ -49,9 +49,12 @@ class AuthoringOperationError(RuntimeError):
 
 
 def headless_client_http_exception(error: HeadlessClientError) -> HTTPException:
+    detail: dict[str, Any] = {"code": error.code, "message": str(error)}
+    if error.details:
+        detail["details"] = error.details
     return HTTPException(
         status_code=error.status_code or 503,
-        detail={"code": error.code, "message": str(error)},
+        detail=detail,
     )
 
 
@@ -295,6 +298,18 @@ class AuthoringAdmissionCoordinator:
                 project=project,
             )
 
+    def submit_execution_start(self, callback: Callable[[], Any]) -> Any:
+        """Serialize an execution start with Composer's local Draft commits.
+
+        The callback checks the current workspace and submits to Headless while
+        the same short lock used by local mutations is held. Headless/Kernel
+        still own the execution admission and return its authoritative receipt.
+        Stop uses its independent priority lane and never takes this lock.
+        """
+
+        with self._local_mutation_lock:
+            return callback()
+
     def execute_external_submission(
         self,
         envelope: AuthoringMutationEnvelope,
@@ -339,24 +354,37 @@ class AuthoringAdmissionCoordinator:
             try:
                 result = submit(claim)
             except Exception as error:
-                if getattr(error, "code", None) in PARTIAL_EFFECT_OBSERVATION_CODES:
-                    self._block("accepted Manager operation requires observation")
-                else:
+                if getattr(error, "code", None) == "manager_apply_rejected":
                     self._settle_pending_local_claim("proven_no_effect")
+                else:
+                    self._block("Manager submission outcome requires observation")
                 raise
             # An accepted Manager operation adopts this exact claim as its
             # parent admission.  Releasing it here would race the asynchronous
             # progression lane and reopen authoring during maintenance.  The
             # Manager releases the claim from durable terminal evidence.
-            transferred = (
+            if (
                 isinstance(result, Mapping)
                 and result.get("status") == "accepted"
                 and isinstance(result.get("apply_id"), str)
-            )
-            if transferred:
+                and bool(result["apply_id"])
+                and type(result.get("apply_generation")) is int
+                and result["apply_generation"] > 0
+            ):
                 self._forget_transferred_local_claim(claim)
-            else:
+            elif (
+                isinstance(result, Mapping)
+                and result.get("status") == "applied"
+                and result.get("apply_id") is None
+                and result.get("manager_apply") is None
+            ):
                 self._settle_pending_local_claim("owner_commit")
+            else:
+                self._block("Manager submission returned an unverified outcome")
+                raise self._unavailable(
+                    "manager_apply_acceptance_invalid",
+                    "Manager submission outcome cannot be safely classified",
+                )
             if after_release is not None:
                 after_release()
             return result

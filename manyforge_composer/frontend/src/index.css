@@ -1477,6 +1477,22 @@ code {
   gap: 0.4rem;
 }
 
+.viewer-scene-source-toggle {
+  flex: 0 0 auto;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid #a67a30;
+  border-radius: 0.42rem;
+  color: #f5d995;
+  background: #3b2e17;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.viewer-scene-source-toggle:hover {
+  border-color: #e4b659;
+  background: #51401e;
+}
+
 .viewer-options {
   position: relative;
   margin-left: auto;
@@ -1782,17 +1798,63 @@ svg.viewer-camera-icon {
 }
 
 .viewer-layer-warning {
-  position: absolute;
-  right: 0.65rem;
-  bottom: 0.65rem;
-  z-index: 3;
-  max-width: min(28rem, calc(100% - 1.3rem));
   padding: 0.45rem 0.65rem;
   border: 1px solid #74493f;
   border-radius: 0.45rem;
   color: #efb4a8;
   background: rgb(42 22 20 / 86%);
   font-size: 0.7rem;
+}
+
+.viewer-notice-stack {
+  position: absolute;
+  top: 0.65rem;
+  right: 0.65rem;
+  z-index: 4;
+  display: grid;
+  gap: 0.35rem;
+  width: min(30rem, calc(100% - 1.3rem));
+  max-height: 40%;
+  overflow: auto;
+}
+
+.viewer-model-state,
+.viewer-scene-stale-state {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid #9b7132;
+  border-radius: 0.45rem;
+  color: #e8c98e;
+  background: rgb(39 30 16 / 94%);
+  font-size: 0.68rem;
+  pointer-events: auto;
+}
+
+.viewer-model-state.unavailable {
+  border-color: #9b4e46;
+  color: #efb4a8;
+  background: rgb(42 22 20 / 94%);
+}
+
+.viewer-model-state strong,
+.viewer-scene-stale-state strong {
+  color: #f2d9a7;
+}
+
+.viewer-model-state.unavailable strong {
+  color: #ffd0c8;
+}
+
+.viewer-model-state button {
+  justify-self: start;
+  min-height: 1.8rem;
+  margin-top: 0.15rem;
+}
+
+.viewer-scene-stale-state {
+  border-color: #8d7850;
+  color: #d8c594;
 }
 
 .viewer-fallback-stage {
@@ -1819,8 +1881,7 @@ svg.viewer-camera-icon {
 }
 
 .viewer-state-overlay {
-  inset: auto 1rem 1rem;
-  z-index: 2;
+  position: static;
   align-items: flex-start;
   padding: 1rem;
   border: 1px solid #7f4c3b;

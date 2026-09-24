@@ -6,6 +6,7 @@ from pathlib import Path
 import threading
 from typing import Any
 
+import pytest
 from fastapi import WebSocketDisconnect
 
 from manyforge_composer.backend import headless_ws
@@ -190,6 +191,29 @@ def test_proxy_forwards_both_directions_and_releases_demand(
         assert browser.sent[0]["shell"]["receiver_epoch"] == "composer.epoch.1"
         assert connection_options["compression"] is None
         assert not source._local_subscriptions  # noqa: SLF001
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("command_kind", ["program_run", "program_resume_full_stop"])
+def test_proxy_refuses_execution_start_that_bypasses_composer_admission(
+    monkeypatch, command_kind: str,
+) -> None:
+    async def exercise() -> None:
+        upstream = _Upstream(wait_for_browser=True)
+        monkeypatch.setattr(
+            headless_ws, "connect_websocket", lambda *_args, **_kwargs: upstream
+        )
+        browser = _Browser(json.dumps({
+            "schema_version": "manyforge.execution_control.v2",
+            "message_kind": "command",
+            "command": {
+                "command_envelope": {"command_kind": command_kind},
+            },
+        }))
+        await asyncio.wait_for(serve_headless_state(browser, _source()), 0.5)  # type: ignore[arg-type]
+        assert browser.closed
+        assert upstream.sent == []
 
     asyncio.run(exercise())
 

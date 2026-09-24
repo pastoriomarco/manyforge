@@ -638,6 +638,26 @@ def test_external_submission_transfers_claim_after_manager_acceptance(tmp_path) 
     assert coordinator.local_claim_pending is False
 
 
+def test_external_submission_contains_unclassified_owner_response(tmp_path) -> None:
+    _workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+
+    with pytest.raises(HTTPException) as raised:
+        coordinator.execute_external_submission(
+            _envelope(),
+            operation_kind="apply_program",
+            draft_id=program.draft_id,
+            draft_revision=program.revision,
+            payload={},
+            validate_under_claim=lambda _claim: None,
+            submit=lambda _claim: {"status": "accepted", "apply_id": "apply.1"},
+        )
+
+    assert raised.value.detail["code"] == "manager_apply_acceptance_invalid"
+    assert coordinator.mutation_ready is False
+    assert coordinator.local_claim_pending is True
+    assert headless.settlements == []
+
+
 def test_authoritative_acquire_rejection_does_not_contain(tmp_path) -> None:
     _workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
     headless.acquire_error = HeadlessClientError(

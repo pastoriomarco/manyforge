@@ -338,6 +338,7 @@ def _error_status(code: str) -> int:
             "authoring_not_ready",
             "program_run_draft_applied_mismatch",
             "deployment_candidate_compiler_busy",
+            "deployment_candidate_cell_mismatch",
             "cclc_request_namespace_refreshed",
             "cclc_request_admission_deferred",
         }

@@ -494,6 +494,76 @@ afterEach(() => {
 });
 
 describe('HeadlessStateSource delivery scheduling', () => {
+  it('sends new execution through Composer admission without consuming a WS command sequence', async () => {
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void { this.readyState = 3; }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const sent = vi.fn(async (_url: string, _request: RequestInit) => ({
+      ok: true,
+      json: async () => ({
+        receipt: {
+          schema_version: 'manyforge.execution_command_receipt.v1',
+          correlation_id: 'run.http.1',
+          control_session_id: null,
+          client_sequence: null,
+          receiver_incarnation: 'headless.receiver.1',
+          received_server_sequence: '10',
+          received_monotonic_ns: '100',
+          disposition: 'received',
+          code: 'program_run_received',
+          semantic_owner_epoch: 'runner.epoch.1',
+          execution_control_revision: 1,
+        },
+        result: { accepted: true },
+      }),
+    }));
+    vi.stubGlobal('fetch', sent);
+
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
+    await expect(source.sendExecutionCommand(
+      'program_run', { scenario_id: 'lite6' }, 'run.http.1',
+    )).resolves.toMatchObject({ disposition: 'received', code: 'program_run_received' });
+    const [url, request] = sent.mock.calls[0]!;
+    expect(new URL(url, 'http://composer.test/').pathname).toBe('/api/control/commands');
+    const body = JSON.parse(String(request.body)) as {
+      command_envelope: { command_kind: string; control_session_id: null };
+    };
+    expect(body.command_envelope).toMatchObject({
+      command_kind: 'program_run', control_session_id: null,
+    });
+    expect(FakeWebSocket.shell.sent.every((frame) =>
+      (JSON.parse(frame) as { message_kind: string }).message_kind !== 'command',
+    )).toBe(true);
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('connection lost')));
+    await expect(source.sendExecutionCommand(
+      'program_run', { scenario_id: 'lite6' }, 'run.http.unknown',
+    )).rejects.toThrow('Command delivery is unconfirmed');
+    expect(FakeWebSocket.shell.readyState).toBe(3);
+    source.dispose();
+  });
+
   it('strictly parses compact execution observations', () => {
     expect(parseExecutionObservationFrame(wireObservation(2))).toMatchObject({
       sourceSequence: 2,
@@ -1726,8 +1796,8 @@ describe('HeadlessStateSource delivery scheduling', () => {
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
     const before = source.getShellSnapshot().snapshot?.programCycle.state;
     const receiptPromise = source.sendExecutionCommand(
-      'program_run',
-      { scenario_id: 'lite6' },
+      'program_reset',
+      {},
       'correlation.test-1',
     );
     const command = JSON.parse(FakeWebSocket.shell.sent.at(-1)!) as {
@@ -1776,7 +1846,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
         received_server_sequence: '10',
         received_monotonic_ns: '100',
         disposition: 'received',
-        code: 'program_run_received',
+        code: 'program_reset_received',
         semantic_owner_epoch: 'runner.epoch.1',
         execution_control_revision: 1,
         current_identity: { cycle_generation: 1 },
@@ -1837,7 +1907,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     (source as unknown as { clearControlHeartbeatWatch: () => void })
       .clearControlHeartbeatWatch();
     const pending = source.sendExecutionCommand(
-      'program_run', { scenario_id: 'lite6' }, 'correlation.unconfirmed-1',
+      'program_reset', {}, 'correlation.unconfirmed-1',
     );
     const rejection = expect(pending).rejects.toThrow(
       'Command delivery is unconfirmed',
@@ -1911,7 +1981,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     synchronizeControl(socket);
     receiveControlSnapshot(socket, wireState(1));
     const pending = source.sendExecutionCommand(
-      'program_run', { scenario_id: 'lite6' }, 'correlation.receipt-missing-1',
+      'program_reset', {}, 'correlation.receipt-missing-1',
     );
     const command = JSON.parse(socket.sent.at(-1)!) as { client_sequence: string };
     receiveHeartbeat(socket, 3, command.client_sequence);
@@ -1950,7 +2020,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
         received_server_sequence: '10',
         received_monotonic_ns: '100',
         disposition: 'received',
-        code: 'program_run_received',
+        code: 'program_reset_received',
         semantic_owner_epoch: 'runner.epoch.1',
         execution_control_revision: 2,
         current_identity: { cycle_generation: 1 },
@@ -2004,8 +2074,8 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const scale = source.sendExecutionCommand(
       'runtime_scale', { scale: 0.5 }, 'correlation.scale-1',
     );
-    const run = source.sendExecutionCommand(
-      'program_run', { scenario_id: 'lite6' }, 'correlation.run-1',
+    const reset = source.sendExecutionCommand(
+      'program_reset', {}, 'correlation.reset-1',
     );
     const commands = FakeWebSocket.shell.sent
       .map((value) => JSON.parse(value) as Record<string, unknown>)
@@ -2013,23 +2083,23 @@ describe('HeadlessStateSource delivery scheduling', () => {
         command: { command_envelope: { command_kind: string } };
       }>;
     expect(commands.map((value) => value.command.command_envelope.command_kind))
-      .toEqual(['runtime_scale', 'program_run']);
+      .toEqual(['runtime_scale', 'program_reset']);
     await expect(source.sendExecutionCommand(
       'runtime_scale', { scale: 0.6 }, 'correlation.scale-2',
     )).rejects.toThrow('runtime velocity update is pending');
     await expect(source.sendExecutionCommand(
-      'program_reset', {}, 'correlation.reset-1',
+      'program_reset', {}, 'correlation.reset-2',
     )).rejects.toThrow('ordinary control command is pending');
 
     const scaleRejected = expect(scale).rejects.toThrow(
       'Command delivery unconfirmed',
     );
-    const runRejected = expect(run).rejects.toThrow(
+    const resetRejected = expect(reset).rejects.toThrow(
       'Command delivery unconfirmed',
     );
     source.dispose();
     await scaleRejected;
-    await runRejected;
+    await resetRejected;
     expect(vi.getTimerCount()).toBe(0);
   });
 });

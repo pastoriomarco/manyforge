@@ -34,7 +34,7 @@ from .deployment_artifacts import (
 )
 from .deployment_draft import DeploymentDraftError
 from .draft_session import DraftSessionError
-from .state import ComposerState
+from .state import ComposerState, _controllable_composition_change_kinds
 from .authoring_workspace import (
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
@@ -69,6 +69,41 @@ def _capture_model_sources(
             str(error),
             status_code=409,
         ) from error
+
+
+def _require_draftable_composition(
+    before: dict[str, Any] | None,
+    after: dict[str, Any],
+) -> None:
+    changed_kinds = _controllable_composition_change_kinds(before, after)
+    if changed_kinds is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "deployment_activation_classification_unavailable",
+                "message": (
+                    "This Deployment shape cannot be safely classified for a "
+                    "Draft-only edit. Use an explicit Manager activation path."
+                ),
+                "activationRequired": True,
+                "classificationAvailable": False,
+            },
+        )
+    if not changed_kinds:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "deployment_activation_required",
+            "message": (
+                "This Deployment edit changes live controllable composition; "
+                "a Draft-only operation cannot apply it. Use an explicit "
+                "Manager activation path."
+            ),
+            "activationRequired": True,
+            "changedGraphKinds": list(changed_kinds),
+        },
+    )
 
 
 class _Fence(BaseModel):
@@ -320,7 +355,12 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
     applied_revision = (
         current.get("deployment_revision") if current is not None else None
     )
-    run_ready = draft_revision is None or draft_revision == applied_revision
+    applied_document = (
+        state.applied_deployment_for_publication(current)
+        if current is not None
+        else None
+    )
+    run_ready = applied_document is not None and document == applied_document
     # Catalog candidates were a legacy package-selection view. Authoring now
     # operates only on the open Scenario and its explicit Saved baseline.
     matching_scenarios: list[dict[str, Any]] = []
@@ -374,13 +414,28 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 )
             identity = state.authoring_workspace.identity()
             body.require_workspace_fence(identity)
+            # Preparation needs idle admission. Capture its immutable result
+            # before taking the claim; under the claim only recheck the input
+            # fence. Manager validates the original preview and parent claim.
+            validation = validate(None) if validate is not None else None
+            candidate = (
+                validation.get("prepared_deployment_candidate")
+                if isinstance(validation, dict)
+                else None
+            )
+            if isinstance(candidate, dict) and candidate.get("confirmation_required"):
+                return {
+                    "schemaVersion": "manyforge.composer_deployment_candidate_operation.v1",
+                    "workspace": _workspace(state),
+                    "result": effect(None),
+                }
 
             def validate_submission(claim: dict[str, Any]) -> None:
                 body.require_workspace_fence(state.authoring_workspace.identity())
                 if validate is not None:
                     validate(claim)
 
-            return coordinator.execute_external_submission(
+            result = coordinator.execute_external_submission(
                 body.admission_envelope(),
                 operation_kind=operation_kind,
                 draft_id=body.draft_id,
@@ -391,6 +446,11 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 commit_before_submit=commit_before_submit,
                 after_release=after_release,
             )
+            return {
+                "schemaVersion": "manyforge.composer_deployment_candidate_operation.v1",
+                "workspace": _workspace(state),
+                "result": result,
+            }
         except Exception as error:
             _raise(error)
 
@@ -413,6 +473,10 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 body.path, allowed_roots=state.allowed_fs_roots
             )
             compiled = state.deployment_draft_session.preview_source(source)
+            current_document = state.deployment_draft_session.retained_state().get(
+                "document"
+            )
+            _require_draftable_composition(current_document, compiled.document)
             commit = commit_local_authoring(
                 state,
                 body,
@@ -436,12 +500,23 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
     @router.post("/api/deployment/draft/mutations")
     def mutate_draft(body: UpdateDeploymentRequest) -> dict[str, Any]:
         try:
+            before = state.deployment_draft_session.retained_state()
+            if (
+                before.get("draft_id") != body.draft_id
+                or before.get("draft_revision") != body.expected_draft_revision
+            ):
+                state.deployment_draft_session.require_current(
+                    body.draft_id, body.expected_draft_revision
+                )
             compiled = state.deployment_draft_session.preview_update(
                 body.path,
                 body.value,
                 body.operation,
                 draft_id=body.draft_id,
                 expected_revision=body.expected_draft_revision,
+            )
+            _require_draftable_composition(
+                before.get("document"), compiled.document
             )
             commit = commit_local_authoring(
                 state,
@@ -604,22 +679,11 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
     @router.post("/api/deployment/discard")
     def discard(body: DiscardDeploymentRequest) -> dict[str, Any]:
         try:
-            # Discard only restores the local Draft from the authoritative
-            # Manager publication.  It must remain usable while the newly
-            # published runtime is still converging; requiring the strict
-            # execution-ready Scenario here made the cycle fail closed during
-            # the normal post-Apply settling window.  Keep a strict fallback
-            # for lightweight authoring doubles that expose no publication
-            # projection.
+            # Discard restores only the captured authoring input whose exact
+            # candidate was published by Manager and Program binding.
             def read_applied() -> tuple[dict[str, Any], str]:
                 current_projection = state.published_scenario()
-                current = current_projection.get("current_scenario")
-                if not isinstance(current, dict):
-                    current = current_projection.get("published_scenario")
-                if not isinstance(current, dict):
-                    strict_projection = state.current_scenario()
-                    current = strict_projection.get("current_scenario")
-                    current_projection = strict_projection
+                current = current_projection.get("published_scenario")
                 if current_projection.get("ready") is not True or not isinstance(
                     current, dict
                 ):
@@ -634,12 +698,8 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                         "Deployment Discard requires the configured Manager",
                         status_code=503,
                     )
-                applied = state.applied_deployment_document
-                if (
-                    not isinstance(applied, dict)
-                    or applied.get("deployment_revision")
-                    != current.get("deployment_revision")
-                ):
+                applied = state.applied_deployment_for_publication(current)
+                if applied is None:
                     raise DeploymentDraftError(
                         "deployment_applied_projection_mismatch",
                         "this Composer process has no exact Applied Deployment baseline",
@@ -791,22 +851,26 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "Deployment Draft changed before Revert",
                     status_code=409,
                 )
-            if _capture_model_sources(state, saved) != source_closure:
+            if (
+                _claim is not None
+                and _capture_model_sources(state, saved) != source_closure
+            ):
                 raise DeploymentDraftError(
                     "activation_model_source_changed",
                     "A model source changed during activation capture",
                     status_code=409,
                 )
-            prepared_candidate = state.execute_authored_deployment_candidate(
-                intent, _claim, apply=True, prepare_only=True
-            )
+            if _claim is None:
+                prepared_candidate = state.execute_authored_deployment_candidate(
+                    intent, None, apply=True, prepare_only=True
+                )
             return {"prepared_deployment_candidate": prepared_candidate}
 
         def effect(claim: dict[str, Any] | None) -> dict[str, Any]:
             if prepared_candidate is None:
                 raise DeploymentDraftError(
                     "deployment_revert_preparation_missing",
-                    "Deployment Revert was not prepared under its claim",
+                    "Deployment Revert has no captured preparation",
                     status_code=409,
                 )
             result = state.execute_authored_deployment_candidate(
@@ -815,16 +879,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 apply=True,
                 prepared=prepared_candidate,
             )
-            # Retain the exact submitted document. Discard will expose it only
-            # after Manager publication reports the same Deployment revision.
-            state.applied_deployment_document = deepcopy(saved)
-            return {
-                "schemaVersion": (
-                    "manyforge.composer_deployment_candidate_operation.v1"
-                ),
-                "workspace": _workspace(state),
-                "result": result,
-            }
+            return result
 
         def commit_saved_before_submit() -> None:
             identity = state.authoring_workspace.identity()
@@ -848,7 +903,12 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 body.require_workspace_fence(identity)
                 validate(None)
                 body.require_workspace_fence(state.authoring_workspace.identity())
-                return effect(None)
+                result = effect(None)
+                return {
+                    "schemaVersion": "manyforge.composer_deployment_candidate_operation.v1",
+                    "workspace": _workspace(state),
+                    "result": result,
+                }
             except Exception as error:
                 _raise(error)
 
@@ -1008,7 +1068,8 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 or state.scenario_source_document_digest != source_document_digest
                 or state.scenario_typed_parameter_overrides != overrides
                 or (
-                    _capture_model_sources(state, deployment) != source_closure
+                    _claim is not None
+                    and _capture_model_sources(state, deployment) != source_closure
                 )
                 or (latest_bundle, latest_graph) != (current_bundle, current_graph)
             ):
@@ -1021,6 +1082,8 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             # Compile or resolve the confirmation exactly once before Manager
             # mutation. Manager durably owns the accepted operation; Composer
             # retains no external-effect replay journal.
+            if _claim is not None:
+                return {"prepared_deployment_candidate": prepared["candidate"]}
             try:
                 prepared["candidate"] = (
                     state.execute_authored_deployment_candidate(
@@ -1049,10 +1112,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     apply=apply,
                     prepared=prepared.get("candidate"),
                 )
-                if apply:
-                    # This is a candidate baseline, not proof of activation;
-                    # Discard rechecks Manager publication before using it.
-                    state.applied_deployment_document = deepcopy(deployment)
             except Exception as error:
                 candidate = prepared.get("candidate")
                 phases = (
@@ -1087,19 +1146,18 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     },
                 )
                 raise
-            return {
-                "schemaVersion": (
-                    "manyforge.composer_deployment_candidate_operation.v1"
-                ),
-                "workspace": _workspace(state),
-                "result": result,
-            }
+            return result
 
         if not apply:
             try:
                 body.require_workspace_fence(state.authoring_workspace.identity())
                 validate(None)
-                return effect(None)
+                result = effect(None)
+                return {
+                    "schemaVersion": "manyforge.composer_deployment_candidate_operation.v1",
+                    "workspace": _workspace(state),
+                    "result": result,
+                }
             except Exception as error:
                 _raise(error)
 

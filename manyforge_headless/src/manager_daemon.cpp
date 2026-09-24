@@ -3936,10 +3936,22 @@ private:
                   candidate_bundle->retained_bundle_id() ==
                       *command.candidate_retained_bundle_id &&
                   candidate_bundle->value().cell_graph.graph_revision ==
-                      *command.candidate_graph_revision &&
-                  candidate_bundle->value().cell_graph.cell_id ==
-                      current_bundle->value().cell_graph.cell_id,
+                      *command.candidate_graph_revision,
               "candidate preview could not resolve exact compatible graphs");
+          if (candidate_bundle->value().cell_graph.cell_id !=
+              current_bundle->value().cell_graph.cell_id) {
+            TrySendResponse(
+                client.get(),
+                ErrorResponse(
+                    "deployment_candidate_cell_mismatch",
+                    "The selected Deployment belongs to cell '" +
+                        candidate_bundle->value().cell_graph.cell_id.value() +
+                        "', but this runtime owns cell '" +
+                        current_bundle->value().cell_graph.cell_id.value() +
+                        "'. Loading another cell requires an explicit cell "
+                        "handover, which is not currently supported."));
+            return false;
+          }
           DeploymentCandidateReceipt receipt{
               *command.deployment_artifact_id,
               *command.deployment_revision,

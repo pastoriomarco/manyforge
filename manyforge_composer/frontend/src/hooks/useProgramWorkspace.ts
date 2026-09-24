@@ -59,6 +59,15 @@ export function programWorkspaceTransitionResult(
   action: 'apply' | 'load' | 'revert',
   response: ProgramWorkspaceTransitionResponse,
 ): ProgramWorkspaceRunResult {
+  if (response.status === 'accepted'
+      && (action === 'apply' || action === 'revert')) {
+    const applyId = response.headless?.apply_id;
+    return {
+      workspace: response.workspace,
+      message: `${action === 'apply' ? 'Apply' : 'Revert'} accepted (${String(applyId)}). Check Runtime / history for completion.`,
+      transitionStatus: response.status,
+    };
+  }
   if (action === 'revert' && response.status === 'reverted') {
     return {
       workspace: response.workspace,
@@ -438,12 +447,19 @@ export function useProgramWorkspace(
         path,
         confirmDiscard,
       );
-      return workspaceResult(
-        response.workspace,
-        response.incomplete
-          ? 'Incomplete Scenario opened for editing; runtime state was not changed.'
-          : 'Scenario opened for editing; runtime state was not changed.',
-      );
+      if (response.status === 'applied') {
+        return {
+          workspace: response.workspace,
+          message: 'Scenario loaded; its Deployment and Program already match the Applied configuration. No activation was needed.',
+          transitionStatus: 'applied',
+        };
+      }
+      const applyId = response.activation.apply_id;
+      return {
+        workspace: response.workspace,
+        message: `Scenario Load accepted (${applyId}); activation is in progress. Check Runtime / history for completion; motion does not start automatically.`,
+        transitionStatus: 'accepted',
+      };
     });
   }, [run, scenarioFence]);
 

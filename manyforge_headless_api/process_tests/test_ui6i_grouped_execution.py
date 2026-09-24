@@ -212,6 +212,7 @@ def _save_and_reopen_current_scenario(
                         ],
                         "path": str(target),
                         "confirmDiscard": False,
+                        "activate": False,
                     },
                 )
                 break

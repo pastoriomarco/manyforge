@@ -127,7 +127,7 @@ describe('editable Scenario document transport', () => {
     expect(parsed.entries[0]?.displayStatus).toBe('changed');
   });
 
-  it('parses editor-only and explicitly activated Scenario Load outcomes', () => {
+  it('parses accepted and already-applied Scenario Load responses', () => {
     const saved = parseScenarioDocumentSaveResponse({
       status: 'saved',
       path: '/workspace/cell',
@@ -135,21 +135,7 @@ describe('editable Scenario document transport', () => {
       last_known_status: 'unknown',
       workspace: workspaceFixture(),
     });
-    const opened = parseScenarioDocumentLoadResponse({
-      status: 'opened',
-      path: '/workspace/cell',
-      scenario_id: 'cell',
-      activation: null,
-      incomplete: false,
-      diagnostics: [],
-      source_diagnostics: [],
-      workspace: workspaceFixture(),
-      authoringWorkspace: authoringWorkspaceFixture(),
-    });
-
     expect(saved.lastKnownStatus).toBe('unknown');
-    expect(opened.path).toBe('/workspace/cell');
-    expect(opened.activation).toBeNull();
     const accepted = parseScenarioDocumentLoadResponse({
       status: 'accepted',
       path: '/workspace/cell',
@@ -164,6 +150,54 @@ describe('editable Scenario document transport', () => {
     expect(accepted.activation).toEqual({
       status: 'accepted', apply_id: 'apply.1', apply_generation: 1,
     });
+    const alreadyApplied = parseScenarioDocumentLoadResponse({
+      status: 'applied',
+      path: '/workspace/cell',
+      scenario_id: 'cell',
+      activation: { status: 'applied', apply_id: null },
+      incomplete: false,
+      diagnostics: [],
+      source_diagnostics: [],
+      workspace: workspaceFixture(),
+      authoringWorkspace: authoringWorkspaceFixture(),
+    });
+    expect(alreadyApplied.status).toBe('applied');
+    expect(alreadyApplied.activation).toEqual({
+      status: 'applied', apply_id: null,
+    });
+    expect(() => parseScenarioDocumentLoadResponse({
+      status: 'accepted',
+      path: '/workspace/cell',
+      scenario_id: 'cell',
+      activation: { status: 'applied', apply_id: null },
+      incomplete: false,
+      diagnostics: [],
+      source_diagnostics: [],
+      workspace: workspaceFixture(),
+      authoringWorkspace: authoringWorkspaceFixture(),
+    })).toThrow('activation.status');
+    expect(() => parseScenarioDocumentLoadResponse({
+      status: 'opened',
+      path: '/workspace/cell',
+      scenario_id: 'cell',
+      activation: null,
+      incomplete: false,
+      diagnostics: [],
+      source_diagnostics: [],
+      workspace: workspaceFixture(),
+      authoringWorkspace: authoringWorkspaceFixture(),
+    })).toThrow('status');
+    expect(() => parseScenarioDocumentLoadResponse({
+      status: 'accepted',
+      path: '/workspace/cell',
+      scenario_id: 'cell',
+      activation: { status: 'accepted', apply_id: '', apply_generation: 1 },
+      incomplete: false,
+      diagnostics: [],
+      source_diagnostics: [],
+      workspace: workspaceFixture(),
+      authoringWorkspace: authoringWorkspaceFixture(),
+    })).toThrow('a non-empty string');
     expect(() => parseScenarioDocumentLoadResponse({
       status: 'loaded',
       path: '/workspace/cell',
@@ -1060,88 +1094,67 @@ describe('Program product projections', () => {
     })).toThrow(/exact advertised run projection/);
   });
 
-  it('parses Composer Apply, Load, and Revert wrappers without trusting headless details', () => {
+  it('parses accepted Program Apply and rejects a mismatched Manager identity', () => {
     const digestA = `sha256:${'a'.repeat(64)}`;
     const digestB = `sha256:${'b'.repeat(64)}`;
     const digestC = `sha256:${'c'.repeat(64)}`;
-    const applied = {
-      assistant_mode: 'forbidden',
-      assistant_projection: null,
-      baseline_program_binding_id: digestA,
-      deployment_artifact_id: 'cell-a',
-      deployment_revision: digestB,
-      graph_revision: digestC,
-      node_environment_digest: digestA,
-      owner_identities: [{
-        owner_role: 'headless_projection',
-        owner_id: 'headless.program-apply',
-        owner_epoch: 'headless.epoch.1',
-      }],
-      preparation_digest: digestB,
-      program: programFixture(),
-      program_binding: programBindingFixture('fixture', digestA, digestC),
-      program_binding_id: digestC,
-      program_id: 'fixture',
-      program_revision: digestA,
-      retained_bundle_id: digestB,
-      source_document_digest: digestA,
-      scenario_id: 'cell-pick',
-      schema_version: 'manyforge.applied_program_selection.v2',
-      source: {
-        record_digest: digestC,
-        semantic_content_digest: digestB,
-        source_generation: 1,
-        source_owner_epoch: 'headless.epoch.1',
-        source_owner_id: 'headless.program-apply',
-      },
-      typed_parameter_overrides: {},
-    };
     const headless = {
-      schema_version: 'manyforge.program_apply_result.v2',
-      status: 'applied',
-      preparation: {},
-      applied,
+      status: 'accepted',
+      confirmation_token: null,
+      prepared_activation: {
+        schema_version: 'manyforge.prepared_activation_input.v2',
+        prepared_activation_id: digestC,
+        source_document_digest: digestA,
+        captured_input_digest: digestB,
+        deployment_artifact_id: 'deployment.fixture',
+        deployment_revision: digestA,
+        retained_bundle_id: digestB,
+        graph_revision: digestC,
+        program_id: 'fixture-program',
+        program_revision: digestB,
+        program_binding_id: digestA,
+        node_environment_digest: digestC,
+        assistant_mode: 'forbidden',
+        typed_parameter_overrides: {},
+      },
+      candidate_preview: null,
+      manager_apply: {
+        api_version: 'manyforge.manager_command_response.v1',
+        apply_generation: 1, apply_id: 'apply-1',
+        candidate_projection_revision: null,
+        error: null, ok: true, replay_status: 'accepted_new',
+        request_id: 'request-1', request_owner_epoch: 'owner.1', state: 'pending',
+      },
+      preparation: null,
+      phases_ms: { preparation_ms: 1 },
+      apply_id: 'apply-1',
+      apply_generation: 1,
     };
     const response = parseProgramWorkspaceTransitionResponse({
-      status: 'applied',
+      status: 'accepted',
       headless,
       workspace: workspaceFixture(),
     });
 
-    expect(response.status).toBe('applied');
+    expect(response.status).toBe('accepted');
     expect(response.workspace.draft.programLoaded).toBe(true);
-    expect(() => parseProgramWorkspaceTransitionResponse({
-      status: 'pending_deployment',
-      headless: {
-        schema_version: 'manyforge.program_apply_result.v2',
-        status: 'pending_deployment',
-        preparation: {},
-        applied: null,
-      },
-      workspace: workspaceFixture(),
-    })).toThrow(/closed record|status/);
     expect(parseProgramWorkspaceTransitionResponse({
       status: 'reverted',
       headless: null,
       workspace: workspaceFixture(),
     }).status).toBe('reverted');
     expect(() => parseProgramWorkspaceTransitionResponse({
-      status: 'applied',
+      status: 'accepted',
       headless: null,
       workspace: workspaceFixture(),
     })).toThrow(/owner response/);
-    const malformed = structuredClone(applied);
-    (
-      (
-        malformed.program_binding
-          .target_role_bindings as Record<string, unknown>[]
-      )[0].frame_role_bindings as Record<string, unknown>[]
-    )[0].unknown = true;
+    const malformed = structuredClone(headless);
+    malformed.apply_id = 'another-apply';
     expect(() => parseProgramWorkspaceTransitionResponse({
-      status: 'applied',
-      headless: { ...headless, applied: malformed },
+      status: 'accepted',
+      headless: malformed,
       workspace: workspaceFixture(),
-    })).toThrow(/closed record/);
+    })).toThrow(/exact accepted Manager operation/);
   });
 });
 

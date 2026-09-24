@@ -990,11 +990,17 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 "Program activation requires the configured Manager",
                 status_code=503,
             )
-        deployment = state.deployment_draft_session.retained_state().get("document")
-        assignment = deepcopy(state.scenario_program_role_assignment)
-        source_digest = state.scenario_source_document_digest
-        scenario_id = state.scenario_document_id
-        project_path = state.scenario_document_path
+        publication = state.published_scenario().get("published_scenario")
+        context = (
+            state.applied_activation_for_publication(publication)
+            if isinstance(publication, dict)
+            else None
+        )
+        deployment = context.get("deployment") if context is not None else None
+        assignment = context.get("program_role_assignment") if context is not None else None
+        source_digest = context.get("source_document_digest") if context is not None else None
+        scenario_id = context.get("scenario_id") if context is not None else None
+        project_path = context.get("project_path") if context is not None else None
         if (
             not isinstance(deployment, dict)
             or not isinstance(assignment, dict)
@@ -1004,13 +1010,20 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         ):
             raise DraftSessionError(
                 "activation_input_incomplete",
-                "Program Apply requires a complete Scenario workspace",
+                "Program Apply requires captured authoring input for the active Deployment",
                 status_code=409,
             )
+        assert context is not None
         source_closure = capture_deployment_model_sources(
             deployment, project_root=Path(project_path)
         )
-        overrides = deepcopy(state.scenario_typed_parameter_overrides)
+        if source_closure != context["model_source_closure"]:
+            raise DraftSessionError(
+                "activation_model_source_changed",
+                "An active Deployment model source changed since Apply",
+                status_code=409,
+            )
+        overrides = deepcopy(context["typed_parameter_overrides"])
         captured_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
@@ -1439,9 +1452,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 ),
             )
             return JSONResponse(
-                status_code=202,
+                status_code=202 if result["status"] == "accepted" else 200,
                 content={
-                    "status": "accepted",
+                    "status": result["status"],
                     "headless": result,
                     "workspace": _workspace(state),
                 },
@@ -1604,9 +1617,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 after_release=state.authoring_workspace.publish_commit_wake,
             )
             return JSONResponse(
-                status_code=202,
+                status_code=202 if result["status"] == "accepted" else 200,
                 content={
-                    "status": "accepted",
+                    "status": result["status"],
                     "headless": result,
                     "workspace": _workspace(state),
                 },

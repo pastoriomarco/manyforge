@@ -230,6 +230,7 @@ def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("invalid_request") == 400
     assert _error_status("full_stack_restart_required") == 409
     assert _error_status("manual_handover_required") == 409
+    assert _error_status("deployment_candidate_cell_mismatch") == 409
     assert _error_status("manual_operation_scope_stale") == 409
 
 
@@ -1463,6 +1464,7 @@ class FakeActivationPreparer:
         return {
             "schema_version": "manyforge.prepared_activation_input.v2",
             "source_document_digest": kwargs["source_document_digest"],
+            "scenario_id": kwargs["scenario_id"],
             "captured_input_digest": kwargs["captured_input_digest"],
             "prepared_activation_id": "sha256:" + "6" * 64,
             "deployment_artifact_id": "cell_a",
@@ -1486,6 +1488,7 @@ def test_activation_preparation_requires_current_idle_generation() -> None:
         create_app(service=_service(core, manager, activation_preparer=preparer))
     )
     body = {
+        "scenario_id": "scenario_a",
         "source_document_digest": "sha256:" + "6" * 64,
         "captured_input_digest": "sha256:" + "8" * 64,
         "deployment": {"api_version": "manyforge.deployment.v1"},
@@ -1505,6 +1508,7 @@ def test_activation_preparation_requires_current_idle_generation() -> None:
     assert response.json()["prepared_activation"]["prepared_activation_id"]
     assert preparer.calls == [
         {
+            "scenario_id": "scenario_a",
             "source_document_digest": "sha256:" + "6" * 64,
             "captured_input_digest": "sha256:" + "8" * 64,
             "deployment": {"api_version": "manyforge.deployment.v1"},

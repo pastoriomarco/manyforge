@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,10 @@ from manyforge_composer.backend.routes_scenario_documents import (
     create_scenario_document_router,
 )
 from manyforge_composer.backend.authoring_admission import LocalAuthoringCommit
+from manyforge_composer.backend.authoring_forest import from_program
+from manyforge_behavior.node_environment import build_node_environment
+from manyforge_behavior.program import Program
+from manyforge_headless_api.client import HeadlessClientError
 from manyforge_composer.backend.scenario_artifacts import (
     ScenarioArtifactError,
     build_scenario_document,
@@ -28,6 +33,14 @@ from manyforge_composer.backend.scenario_artifacts import (
     save_scenario_artifact,
 )
 from manyforge_composer.backend.state import ComposerState
+
+
+_PROGRAM_FIXTURE = from_program(
+    Program(
+        Path(__file__).resolve().parents[2] / "examples/pick_and_place_minimal.program.yaml",
+        build_node_environment().catalog,
+    )
+)
 
 
 def _deployment_intent() -> dict:
@@ -62,7 +75,7 @@ def _document(*, version: str = "1.0.0", overrides: dict | None = None) -> dict:
         scenario_id="cell_fixture",
         name="Cell fixture",
         description="Editable Scenario fixture",
-        program_draft={"schema_version": "program-draft", "forest": []},
+        program_draft=deepcopy(_PROGRAM_FIXTURE),
         deployment_draft=_deployment_intent(),
         program_role_assignment={"component_roles": [], "target_roles": []},
         typed_parameter_overrides={} if overrides is None else overrides,
@@ -90,6 +103,9 @@ def _fixture_model_source(tmp_path: Path) -> None:
 
 
 class _PassThroughAdmission:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
     def execute(
         self,
         _envelope,
@@ -143,6 +159,32 @@ class _PassThroughAdmission:
                 install=install,
             )
         return LocalAuthoringCommit(snapshot=snapshot, admission_generation=2)
+
+    def execute_external_submission(
+        self,
+        _envelope,
+        *,
+        validate_under_claim,
+        submit,
+        commit_before_submit=None,
+        after_release=None,
+        **_kwargs,
+    ):
+        self.events.append("validate")
+        claim = {
+            "claim": "test",
+            "acquired_admission_generation": 2,
+        }
+        validate_under_claim(claim)
+        if commit_before_submit is not None:
+            self.events.append("commit")
+            commit_before_submit()
+        self.events.append("submit")
+        result = submit(claim)
+        if after_release is not None:
+            self.events.append("wake")
+            after_release()
+        return result
 
 
 def _scenario_client(state: ComposerState) -> TestClient:
@@ -340,7 +382,7 @@ def test_interrupted_overwrite_is_detected_without_rollback(
     assert reopened.value.code == "scenario_project_save_interrupted"
 
 
-def test_routes_save_incomplete_setup_and_reopen_it_without_runtime_effect(
+def test_routes_reject_loading_incomplete_scenario_without_workspace_mutation(
     tmp_path: Path,
 ) -> None:
     state = ComposerState(allowed_fs_roots=[str(tmp_path)])
@@ -362,11 +404,13 @@ def test_routes_save_incomplete_setup_and_reopen_it_without_runtime_effect(
     assert saved.status_code == 200
     assert saved.json()["status"] == "saved"
     assert saved.json()["last_known_status"] == "incomplete"
+    assert saved.json()["workspace"]["authoringWorkspace"]["workspaceEpoch"]
+    assert "authoringWorkspace" not in saved.json()
     assert target.is_dir()
     assert (target / "scenario.yaml").is_file()
 
-    state.headless_client = object()  # type: ignore[assignment]
-    opened = client.post(
+    before_load = state.authoring_workspace.snapshot().identity
+    rejected = client.post(
         "/api/scenario-documents/load",
         json={
             **_fence(state),
@@ -374,10 +418,9 @@ def test_routes_save_incomplete_setup_and_reopen_it_without_runtime_effect(
             "confirmDiscard": False,
         },
     )
-    assert opened.status_code == 200
-    assert opened.json()["status"] == "opened"
-    assert opened.json()["activation"] is None
-    assert opened.json()["workspace"]["draft"]["programLoaded"] is False
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == "scenario_activation_incomplete"
+    assert state.authoring_workspace.snapshot().identity == before_load
 
 
 def test_save_keeps_written_file_but_refuses_a_stale_saved_baseline(
@@ -423,6 +466,7 @@ def test_save_keeps_written_file_but_refuses_a_stale_saved_baseline(
     assert response.json()["detail"]["code"] == (
         "scenario_saved_baseline_not_adopted"
     )
+    assert response.json()["detail"]["path"] == str(target.resolve())
     written, _source = load_scenario_artifact(
         str(target), allowed_roots=[str(tmp_path)]
     )
@@ -431,6 +475,140 @@ def test_save_keeps_written_file_but_refuses_a_stale_saved_baseline(
     assert current["project"]["document_description"] == "concurrent edit"
     assert current["program"]["saved"]["available"] is False
     assert current["deployment"]["savedPath"] is None
+
+
+@pytest.mark.parametrize("preparation_fails", [False, True])
+def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preparation_fails: bool
+) -> None:
+    target = Path(
+        save_scenario_artifact(
+            _document(),
+            str(tmp_path / "loaded-project"),
+            allowed_roots=[str(tmp_path)],
+            overwrite=False,
+        )
+    )
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    admission = _PassThroughAdmission()
+    state.authoring_admission = admission  # type: ignore[assignment]
+    state.headless_client = type(
+        "ManagerStub", (), {"manager_status": lambda _self: {}}
+    )()  # type: ignore[assignment]
+    client = _scenario_client(state)
+
+    preview = {
+        "diff": {},
+        "candidate_receipt": {
+            "expected_current": {
+                "retained_bundle_id": "current-bundle",
+                "graph_revision": "current-graph",
+            }
+        },
+    }
+    confirmation_token = "sha256:" + "c" * 64
+    observed_generations: list[tuple[int, int | None]] = []
+    before = state.authoring_workspace.snapshot()
+    def prepare_or_apply(
+        intent,
+        claim,
+        *,
+        apply,
+        prepared=None,
+        prepare_only=False,
+    ):
+        if preparation_fails:
+            raise HeadlessClientError(
+                "activation_preparation_failed",
+                "Activation preparation failed",
+                status_code=409,
+                details={"preparer_detail": "invalid candidate geometry"},
+            )
+        acquired_generation = (
+            None
+            if claim is None
+            else claim.get("acquired_admission_generation")
+        )
+        observed_generations.append(
+            (intent["expected_admission_generation"], acquired_generation)
+        )
+        candidate = {
+            "schema_version": "manyforge.prepared_activation_input.v2",
+            "prepared_activation_id": "prepared-load-test",
+            "scenario_id": intent["scenario_id"],
+            "source_document_digest": intent["source_document_digest"],
+            "captured_input_digest": intent["captured_input_digest"],
+            "deployment_artifact_id": "fixture_deployment",
+            "deployment_revision": "deployment-revision",
+            "retained_bundle_id": "bundle-load-test",
+            "graph_revision": "graph-load-test",
+            "program_id": "program-load-test",
+            "program_revision": "program-revision",
+            "program_binding_id": "binding-load-test",
+            "node_environment_digest": "sha256:" + "a" * 64,
+            "assistant_mode": "forbidden",
+            "typed_parameter_overrides": {},
+        }
+        if prepare_only:
+            if intent["confirmation_token"] is not None:
+                assert intent["confirmation_token"] == confirmation_token
+            return {
+                "prepared_activation": candidate,
+                "candidate_preview": dict(preview),
+                "manager_apply": None,
+                "confirmation_required": intent["confirmation_token"] is None,
+                "confirmation_token": (
+                    confirmation_token
+                    if intent["confirmation_token"] is None
+                    else None
+                ),
+                "preparation": None,
+                "phases_ms": {},
+            }
+        assert claim == {
+            "claim": "test",
+            "acquired_admission_generation": 2,
+        }
+        assert apply is True
+        assert prepared["prepared_activation"] == candidate
+        return {"status": "applied", "apply_id": None}
+
+    monkeypatch.setattr(state, "_manager_current", lambda _status: (
+        "current-bundle", "current-graph", "manager-epoch"
+    ))
+    monkeypatch.setattr(
+        state, "execute_authored_deployment_candidate", prepare_or_apply
+    )
+    monkeypatch.setattr(
+        routes_scenario_documents,
+        "program_workspace",
+        lambda _state: {"authoringWorkspace": {"workspaceEpoch": "test"}},
+    )
+    response = client.post(
+        "/api/scenario-documents/load",
+        json={**_fence(state), "path": str(target), "confirmDiscard": False},
+    )
+
+    if preparation_fails:
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == {
+            "code": "activation_preparation_failed",
+            "message": "Activation preparation failed",
+            "details": {"preparer_detail": "invalid candidate geometry"},
+        }
+        assert admission.events == []
+        assert state.authoring_workspace.snapshot() == before
+        return
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "applied"
+    assert response.json()["activation"] == {
+        "status": "applied",
+        "apply_id": None,
+    }
+    assert admission.events == ["validate", "commit", "submit", "wake"]
+    assert observed_generations == [(1, None), (1, None), (1, 2)]
+    assert state.scenario_document_id == "cell_fixture"
 
 
 def test_capture_reads_one_source_identity(tmp_path: Path) -> None:

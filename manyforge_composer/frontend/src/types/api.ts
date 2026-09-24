@@ -387,17 +387,37 @@ export interface ScenarioDocumentSaveResponse {
   workspace: ProgramWorkspaceResponse;
 }
 
-export interface ScenarioDocumentLoadResponse {
-  status: 'opened' | 'accepted';
+export type ScenarioDocumentActivation =
+  | (Record<string, JsonValue> & {
+      status: 'accepted';
+      apply_id: string;
+      apply_generation: number;
+    })
+  | (Record<string, JsonValue> & {
+      status: 'applied';
+      apply_id: null;
+    });
+
+interface ScenarioDocumentLoadResponseBase {
   path: string;
   scenarioId: string;
-  activation: Record<string, JsonValue> | null;
   incomplete: boolean;
   diagnostics: ProgramAuthoringDiagnostic[];
   sourceDiagnostics: ScenarioSourceDiagnostic[];
   workspace: ProgramWorkspaceResponse;
   authoringWorkspace: AuthoringWorkspaceSnapshot;
 }
+
+export type ScenarioDocumentLoadResponse = ScenarioDocumentLoadResponseBase & (
+  | {
+      status: 'accepted';
+      activation: Extract<ScenarioDocumentActivation, { status: 'accepted' }>;
+    }
+  | {
+      status: 'applied';
+      activation: Extract<ScenarioDocumentActivation, { status: 'applied' }>;
+    }
+);
 
 /**
  * The retained Scenario project facts of the one shared authoring workspace.
@@ -887,6 +907,7 @@ export interface RuntimeOverrideMaterializationResponse {
 }
 
 export type ProgramWorkspaceTransitionStatus =
+  | 'accepted'
   | 'applied'
   | 'loaded'
   | 'reverted';
