@@ -260,6 +260,7 @@ class HeadlessCorePort(Protocol):
     def history(self, **kwargs: Any) -> dict[str, Any]: ...
     def history_export(self, **kwargs: Any) -> dict[str, Any]: ...
     def history_discovery(self, *, kind: str, after: str, limit: int) -> dict[str, Any]: ...
+    def history_captures(self, *, before_capture_id: int | None, limit: int) -> dict[str, Any]: ...
     def history_detail(self, sequence: int) -> dict[str, Any]: ...
     def record_client_incident(self, **kwargs: Any) -> dict[str, Any]: ...
 
@@ -666,6 +667,14 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("history_detail", sequence),
             method="history_detail",
+        )
+
+    def history_captures(self, *, before_capture_id: int | None, limit: int) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke(
+                "history_captures", before_capture_id=before_capture_id, limit=limit
+            ),
+            method="history_captures",
         )
 
     def history_discovery(self, *, kind: str, after: str, limit: int) -> dict[str, Any]:

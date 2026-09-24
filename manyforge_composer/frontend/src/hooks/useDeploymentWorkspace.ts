@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, isStaleWorkspaceError } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
+import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
   programLocalFence,
   publicationSupersedesDeployment,
@@ -38,6 +39,7 @@ export function useDeploymentWorkspace(
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [acceptedApply, setAcceptedApply] = useState<ManagerApplyIdentity | null>(null);
   const [pendingApplyConfirmation, setPendingApplyConfirmation] = useState<
     DeploymentCandidateOperationResponse | null
   >(null);
@@ -203,9 +205,16 @@ export function useDeploymentWorkspace(
           setFeedback(null);
         } else {
           setPendingApplyConfirmation(null);
+          const managerApply = response.result.managerApply;
+          if (response.result.status === 'accepted' && managerApply !== null) {
+            setAcceptedApply({
+              applyId: managerApply.applyId,
+              applyGeneration: managerApply.applyGeneration,
+            });
+          }
           setFeedback(
             response.result.status === 'accepted'
-              ? 'Deployment activation accepted; progress is shown in runtime status.'
+              ? 'Deployment activation accepted; progress is shown under Activity.'
               : message,
           );
         }
@@ -321,6 +330,7 @@ export function useDeploymentWorkspace(
     applying,
     error,
     feedback,
+    acceptedApply,
     pendingApplyConfirmation,
     mutationAvailable,
     mutationUnavailableReason,

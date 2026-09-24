@@ -103,6 +103,10 @@ ControlClientIncidentKind = Literal[
     "control_disconnected",
     "history_detail_request_failed",
     "history_request_failed",
+    "viewer_model_unavailable",
+    "viewer_scene_unverified",
+    "viewer_observation_stale",
+    "viewer_geometry_unavailable",
 ]
 
 _STOP_KINDS = frozenset(

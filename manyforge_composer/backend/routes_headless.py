@@ -53,6 +53,7 @@ from manyforge_headless_api.models import (
     SkillExpansionRequest,
 )
 from manyforge_headless_api.history_query import (
+    HistorianCaptureRequest,
     HistorianQueryRequest,
     HistorianDiscoveryRequest,
     HistorianDebugRequest,
@@ -1038,6 +1039,16 @@ def create_headless_router(
             headers={
                 "Content-Disposition": 'attachment; filename="manyforge-events.json"'
             },
+        )
+
+    @router.get("/api/execution/history/captures")
+    def history_captures(
+        query: Annotated[HistorianCaptureRequest, Query()]
+    ) -> dict[str, Any]:
+        return _call(
+            lambda: client.history_captures(
+                params=[(key, value) for key, value in query.model_dump(exclude_none=True).items()]
+            )
         )
 
     @router.get("/api/execution/history/discovery")

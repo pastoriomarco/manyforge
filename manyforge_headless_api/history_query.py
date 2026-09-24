@@ -54,6 +54,9 @@ class HistorianQueryRequest(BaseModel):
     source_owner_epoch: HistoryIdentity | None = None
     channel: HistoryIdentity | None = None
     phase: HistoryIdentity | None = None
+    # One retained failure capture's protected range; unknown or retired
+    # captures are reported as not found, never widened to all history.
+    capture_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)] | None = None
 
     @field_validator("components", "event_types")
     @classmethod
@@ -100,6 +103,14 @@ class HistorianQueryRequest(BaseModel):
     def query_parameters(self) -> list[tuple[str, str | int]]:
         return [(key, item) for key, value in self.model_dump(exclude_none=True).items()
                 for item in (value if isinstance(value, list) else [value])]
+
+
+class HistorianCaptureRequest(BaseModel):
+    """One bounded newest-first page of retained failure captures."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    before_capture_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)] | None = None
+    limit: Annotated[int, Field(ge=1, le=32)] = 32
 
 
 class HistorianDiscoveryRequest(BaseModel):

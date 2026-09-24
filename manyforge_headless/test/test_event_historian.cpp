@@ -15,6 +15,8 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <exception>
+#include <span>
 #include <vector>
 
 #include <manyforge_content_identity/content_identity.hpp>
@@ -74,7 +76,28 @@ HistorianEvent Event(const std::uint64_t index,
       }));
 }
 
+// Partition-retention tests isolate ordinary pruning: each error capture
+// protects only its trigger, closes at once and retires the previous one.
+HistorianCaptureLimits TriggerOnlyCaptureLimits() {
+  HistorianCaptureLimits limits;
+  limits.preceding_rows = 0U;
+  limits.tail_rows = 0U;
+  limits.live_captures = 1U;
+  return limits;
+}
+
+// Storage revision 4 adds only derived failure-capture protection.
+constexpr const char* kRestoreRevision3Schema = R"sql(
+  DROP TABLE historian_capture_triggers; DROP TABLE historian_captures;
+  DROP TABLE historian_capture_retention; DROP INDEX historian_events_prune_idx;
+  ALTER TABLE historian_events DROP COLUMN capture_refs;
+  UPDATE historian_metadata SET schema_version=3; PRAGMA user_version=3;
+)sql";
+
 constexpr const char* kRestoreLegacySchema = R"sql(
+  DROP TABLE historian_capture_triggers; DROP TABLE historian_captures;
+  DROP TABLE historian_capture_retention; DROP INDEX historian_events_prune_idx;
+  ALTER TABLE historian_events DROP COLUMN capture_refs;
   ALTER TABLE historian_events DROP COLUMN summary_json;
   ALTER TABLE historian_events DROP COLUMN summary_digest;
   DROP TABLE historian_search; DROP VIEW historian_search_content;
@@ -128,6 +151,14 @@ public:
     return AppendStatus::kStored;
   }
 
+  AppendBatchResult AppendBatch(std::span<const HistorianEvent> events) override {
+    {
+      std::lock_guard lock(mutex_);
+      batch_sizes_.push_back(events.size());
+    }
+    return IEventHistoryStore::AppendBatch(events);
+  }
+
   HistorianPage Query(const HistorianQuery &) override {
     return {{}, false, std::nullopt};
   }
@@ -161,12 +192,18 @@ public:
     return events_.size();
   }
 
+  [[nodiscard]] std::vector<std::size_t> BatchSizes() const {
+    std::lock_guard lock(mutex_);
+    return batch_sizes_;
+  }
+
 private:
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   bool blocked_{};
   bool failing_{};
   std::size_t append_calls_{};
+  std::vector<std::size_t> batch_sizes_;
   std::map<std::string, std::string> events_;
 };
 
@@ -428,7 +465,7 @@ TEST(EventHistorian, ImportantRetentionSurvivesRoutineChurnAndReportsPrunedCover
           {"message", CanonicalValue("retained gripper fault")},
       }));
   {
-    SqliteEventHistoryStore store(path, 2U);
+    SqliteEventHistoryStore store(path, 2U, TriggerOnlyCaptureLimits());
     ASSERT_EQ(store.Append(important), IEventHistoryStore::AppendStatus::kStored);
     for (std::uint64_t index = 1; index <= 20; ++index) {
       ASSERT_EQ(store.Append(Event(index, "manyforge.runtime", "operation_progressed")), IEventHistoryStore::AppendStatus::kStored);
@@ -447,7 +484,7 @@ TEST(EventHistorian, ImportantRetentionSurvivesRoutineChurnAndReportsPrunedCover
     query.search = "gripper fault";
     ASSERT_EQ(store.Query(query).events.size(), 1U);
   }
-  SqliteEventHistoryStore restarted(path, 2U);
+  SqliteEventHistoryStore restarted(path, 2U, TriggerOnlyCaptureLimits());
   EXPECT_TRUE(restarted.Read(1U));
   EXPECT_NE(content_identity::canonical_json(restarted.Query(HistorianQuery{}).retention)
       .find("\"pruned_count\":\"18\""), std::string::npos);
@@ -616,7 +653,9 @@ TEST(EventHistorian, NearCapacityLegacyMigrationReusesPrunedPagesBeforeIndexing)
   EXPECT_NE(text.find("\"pruned_count\":\"1933\""), std::string::npos);
   EXPECT_NE(text.find("\"prior_pruning_known\":false"), std::string::npos);
   EXPECT_LE(std::filesystem::file_size(path), 512U * 1024U * 1024U);
-  EXPECT_FALSE(std::filesystem::exists(path.string() + "-wal"));
+  // The migration's write-ahead log is reclaimed before the store is used.
+  const auto wal = std::filesystem::path(path.string() + "-wal");
+  EXPECT_TRUE(!std::filesystem::exists(wal) || std::filesystem::file_size(wal) == 0U);
 }
 
 TEST(EventHistorian, DiscoveryAndExportUseBoundedExactContinuations) {
@@ -705,6 +744,81 @@ TEST(EventHistorian, BusyAndReadonlyStorageNeverClaimsSuccessfulPersistence) {
   EXPECT_TRUE(recovered.Read(1U));
 }
 
+TEST(EventHistorian, BatchCommitsTheEventsBeforeAFailureAndRollsBackOnlyTheFailingEvent) {
+  TemporaryDirectory directory;
+  SqliteEventHistoryStore store(directory.path() / "batch.sqlite3", 100U);
+  ASSERT_EQ(store.Append(Event(1U)), IEventHistoryStore::AppendStatus::kStored);
+  auto conflicting = Event(1U);
+  conflicting.payload = CanonicalValue(CanonicalValue::Object{{"index", CanonicalValue("other")}});
+  const std::vector<HistorianEvent> batch{Event(2U), Event(1U), conflicting, Event(3U)};
+  const auto result = store.AppendBatch(batch);
+  ASSERT_EQ(result.statuses, (std::vector<IEventHistoryStore::AppendStatus>{
+                                 IEventHistoryStore::AppendStatus::kStored,
+                                 IEventHistoryStore::AppendStatus::kDuplicate}));
+  ASSERT_TRUE(result.failure);
+  ExpectHistorianError([&] { std::rethrow_exception(result.failure); },
+                       "historian_event_identity_conflict");
+  EXPECT_EQ(store.Read(2U)->event.event_id, Event(2U).event_id);
+  EXPECT_FALSE(store.Read(3U));
+  EXPECT_EQ(store.Append(Event(3U)), IEventHistoryStore::AppendStatus::kStored);
+  EXPECT_EQ(store.Read(3U)->event.event_id, Event(3U).event_id);
+}
+
+TEST(EventHistorian, OneTransactionTakesABoundedAmountOfRecordBytes) {
+  TemporaryDirectory directory;
+  SqliteEventHistoryStore store(directory.path() / "batch-bytes.sqlite3", 100000U);
+  std::vector<HistorianEvent> batch;
+  for (std::int64_t index = 1; index <= 40; ++index) {
+    batch.push_back(MakeHistorianEvent("manyforge.runtime", "observation", "INFO", index,
+                                       "2026-09-24T12:00:00Z",
+                                       CanonicalValue(CanonicalValue::Object{
+                                           {"blob", CanonicalValue(std::string(200000U, 'x'))}})));
+  }
+  const auto first = store.AppendBatch(batch);
+  EXPECT_FALSE(first.failure);
+  // 4 MiB of records: the event that reaches the bound is the last one taken.
+  EXPECT_EQ(first.statuses.size(), 21U);
+  const auto rest = store.AppendBatch(std::span<const HistorianEvent>(batch).subspan(first.statuses.size()));
+  EXPECT_FALSE(rest.failure);
+  EXPECT_EQ(rest.statuses.size(), 19U);
+  EXPECT_TRUE(store.Read(40U));
+}
+
+TEST(EventHistorian, PinnedWriteAheadLogStopsWritesAtItsBoundInsteadOfGrowing) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "pinned.sqlite3";
+  const auto wal = std::filesystem::path(path.string() + "-wal");
+  const auto large = [](const std::int64_t index) {
+    return MakeHistorianEvent("manyforge.runtime", "observation", "INFO", index,
+                              "2026-09-06T12:00:00Z",
+                              CanonicalValue(CanonicalValue::Object{
+                                  {"blob", CanonicalValue(std::string(200000U, 'x'))}}));
+  };
+  SqliteEventHistoryStore store(path, 100000U);
+  ASSERT_EQ(store.Append(large(1)), IEventHistoryStore::AppendStatus::kStored);
+  // A foreign reader holding a snapshot prevents reclaiming the log.
+  sqlite3 *reader = nullptr;
+  ASSERT_EQ(sqlite3_open(path.c_str(), &reader), SQLITE_OK);
+  ASSERT_EQ(sqlite3_exec(reader, "BEGIN; SELECT count(*) FROM historian_events;", nullptr, nullptr, nullptr),
+            SQLITE_OK);
+  bool refused = false;
+  for (std::int64_t index = 2; index <= 2000 && !refused; ++index) {
+    try {
+      static_cast<void>(store.Append(large(index)));
+    } catch (const EventHistorianError &error) {
+      EXPECT_EQ(error.code(), "historian_storage_busy");
+      refused = true;
+    }
+  }
+  EXPECT_TRUE(refused);
+  // Bounded: 64 MiB of unreclaimed log plus at most one batch.
+  EXPECT_LE(std::filesystem::file_size(wal), 72U * 1024U * 1024U);
+  ASSERT_EQ(sqlite3_exec(reader, "COMMIT", nullptr, nullptr, nullptr), SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(reader), SQLITE_OK);
+  EXPECT_EQ(store.Append(large(5000)), IEventHistoryStore::AppendStatus::kStored);
+  EXPECT_LE(std::filesystem::file_size(wal), 8U * 1024U * 1024U);
+}
+
 TEST(EventHistorian, SummaryPageSelectsListFieldsWithoutPublishingPayload) {
   const auto event = MakeHistorianEvent(
       "manyforge.composer", "client_incident_activated", "ERROR",
@@ -775,8 +889,10 @@ TEST(EventHistorian, SummaryMigrationPreservesEscapedValuesLossAndStickyClockFac
       SqliteEventHistoryStore store(path, 1U);
       for (int i = 1; i <= 2; ++i) {
         const std::string escaped(1024, '\1');
+        // WARN keeps this migration test about ordinary pruning: an ERROR
+        // would open a failure capture that protects the pruned row.
         const auto event = MakeHistorianEvent(
-            escaped, escaped, "ERROR", i, i == 1 ? "2026-09-08T00:00:01Z" : "2026-09-08T00:00:00Z",
+            escaped, escaped, "WARN", i, i == 1 ? "2026-09-08T00:00:01Z" : "2026-09-08T00:00:00Z",
             CanonicalValue(CanonicalValue::Object{{"clock_owner", CanonicalValue(escaped)},
                                                   {"program_run_id", CanonicalValue(escaped)},
                                                   {"operation_id", CanonicalValue(escaped)},
@@ -793,6 +909,9 @@ TEST(EventHistorian, SummaryMigrationPreservesEscapedValuesLossAndStickyClockFac
     sqlite3* database = nullptr;
     ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
     ASSERT_EQ(sqlite3_exec(database,
+                           "DROP TABLE historian_capture_triggers; DROP TABLE historian_captures;"
+                           "DROP TABLE historian_capture_retention; DROP INDEX historian_events_prune_idx;"
+                           "ALTER TABLE historian_events DROP COLUMN capture_refs;"
                            "ALTER TABLE historian_events DROP COLUMN summary_json;"
                            "ALTER TABLE historian_events DROP COLUMN summary_digest;"
                            "UPDATE historian_metadata SET schema_version=2; PRAGMA "
@@ -871,6 +990,9 @@ TEST(EventHistorian, V2DiagnosticIndexMigratesOnlyAfterItsHistoricalDerivationIs
     sqlite3* database = nullptr;
     ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
     ASSERT_EQ(sqlite3_exec(database,
+                           "DROP TABLE historian_capture_triggers; DROP TABLE historian_captures;"
+                           "DROP TABLE historian_capture_retention; DROP INDEX historian_events_prune_idx;"
+                           "ALTER TABLE historian_events DROP COLUMN capture_refs;"
                            "ALTER TABLE historian_events DROP COLUMN summary_json;"
                            "ALTER TABLE historian_events DROP COLUMN summary_digest;"
                            "UPDATE historian_metadata SET schema_version=2; PRAGMA "
@@ -1058,6 +1180,28 @@ TEST(EventHistorian,
   EXPECT_EQ(historian.Health().duplicate_count, 1U);
 }
 
+TEST(EventHistorian, WriterCommitsWhatArrivesWithinTheGapTogether) {
+  auto store = std::make_shared<ControllableStore>();
+  AsyncEventHistorian historian(store, 64U, 200ms);
+  ASSERT_TRUE(historian.TryEnqueue(Event(1U)));
+  ASSERT_TRUE(historian.WaitUntilIdle(2s));
+  for (std::uint64_t index = 2U; index <= 11U; ++index) {
+    ASSERT_TRUE(historian.TryEnqueue(Event(index)));
+  }
+  // A repeated identity still waiting in the queue is recognized by content.
+  ASSERT_TRUE(historian.TryEnqueue(Event(11U)));
+  auto conflicting = Event(11U);
+  conflicting.payload = CanonicalValue(CanonicalValue::Object{{"index", CanonicalValue("other")}});
+  EXPECT_THROW(static_cast<void>(historian.TryEnqueue(conflicting)), EventHistorianError);
+  ASSERT_TRUE(historian.WaitUntilIdle(2s));
+  EXPECT_EQ(store->BatchSizes(), (std::vector<std::size_t>{1U, 10U}));
+  EXPECT_EQ(store->StoredCount(), 11U);
+  const auto health = historian.Health();
+  EXPECT_EQ(health.delivered_count, 11U);
+  EXPECT_EQ(health.duplicate_count, 1U);
+  EXPECT_TRUE(health.available);
+}
+
 TEST(EventHistorian, ProjectionFailureUsesTheSameWriteAndGenerationRecoveryFence) {
   auto store = std::make_shared<ControllableStore>();
   AsyncEventHistorian historian(store, 2U);
@@ -1127,6 +1271,350 @@ TEST(EventHistorian, AlarmLifecycleEnvelopeRetainsOwnerCallerAndSubject) {
   EXPECT_NE(encoded.find("resource.arm.a"), std::string::npos);
   EXPECT_NE(encoded.find("principal.operator"), std::string::npos);
   EXPECT_NE(encoded.find("alarm.owner.epoch.1"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Failure capture: bounded protection of already-durable rows around errors.
+
+HistorianEvent RoutineEvent(const std::uint64_t index) {
+  return Event(index, "manyforge.runtime", "operation_progressed");
+}
+
+HistorianEvent ErrorEvent(const std::uint64_t index) {
+  return MakeHistorianEvent(
+      "manyforge.runtime", "execute_failed", "ERROR",
+      static_cast<std::int64_t>(100U + index), "2026-08-05T00:00:00Z",
+      CanonicalValue(CanonicalValue::Object{
+          {"index", CanonicalValue(static_cast<double>(index))},
+          {"message", CanonicalValue("controller rejected trajectory")},
+      }));
+}
+
+HistorianCaptureLimits SmallCaptureLimits() {
+  HistorianCaptureLimits limits;
+  limits.preceding_rows = 3U;
+  limits.preceding_bytes = 1024LL * 1024LL;
+  limits.tail_rows = 2U;
+  limits.tail_duration = 1000ms;
+  limits.capture_bytes = 2LL * 1024LL * 1024LL;
+  limits.live_captures = 2U;
+  limits.protected_bytes = 8LL * 1024LL * 1024LL;
+  limits.recorded_triggers = 2U;
+  return limits;
+}
+
+struct FakeWriterClock {
+  std::int64_t now_ns{1'000'000'000};
+  HistorianWriterClock Clock() {
+    return [this] { return now_ns; };
+  }
+};
+
+const CanonicalValue &Field(const CanonicalValue &value, std::string_view name) {
+  const auto *field = value.find_object_member(name);
+  if (field == nullptr) throw std::runtime_error("missing field " + std::string(name));
+  return *field;
+}
+
+std::vector<CanonicalValue> CaptureList(SqliteEventHistoryStore &store) {
+  const auto page = store.Captures(std::nullopt, 32U);
+  return Field(page, "captures").as_array();
+}
+
+std::string CaptureState(const std::filesystem::path &path, std::int64_t capture_id) {
+  sqlite3 *database = nullptr;
+  if (sqlite3_open_v2(path.c_str(), &database, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+    throw std::runtime_error("capture state read failed");
+  }
+  sqlite3_stmt *statement = nullptr;
+  sqlite3_prepare_v2(database, "SELECT state FROM historian_captures WHERE capture_id=?", -1, &statement, nullptr);
+  sqlite3_bind_int64(statement, 1, capture_id);
+  std::string state = sqlite3_step(statement) == SQLITE_ROW
+      ? reinterpret_cast<const char *>(sqlite3_column_text(statement, 0)) : "absent";
+  sqlite3_finalize(statement);
+  sqlite3_close(database);
+  return state;
+}
+
+TEST(EventHistorian, FailureCaptureRetainsItsCauseAndBoundedContextAcrossPartitions) {
+  TemporaryDirectory directory;
+  FakeWriterClock clock;
+  SqliteEventHistoryStore store(directory.path() / "capture.sqlite3", 4U, SmallCaptureLimits(),
+                                clock.Clock());
+  for (std::uint64_t index = 1; index <= 6; ++index) ASSERT_EQ(store.Append(RoutineEvent(index)), IEventHistoryStore::AppendStatus::kStored);
+  ASSERT_EQ(store.Append(ErrorEvent(7)), IEventHistoryStore::AppendStatus::kStored);
+  for (std::uint64_t index = 8; index <= 30; ++index) ASSERT_EQ(store.Append(RoutineEvent(index)), IEventHistoryStore::AppendStatus::kStored);
+
+  const auto captures = CaptureList(store);
+  ASSERT_EQ(captures.size(), 1U);
+  const auto &capture = captures.front();
+  EXPECT_EQ(Field(capture, "capture_id").as_string(), "1");
+  EXPECT_EQ(Field(capture, "state").as_string(), "closed");
+  EXPECT_EQ(Field(capture, "close_reason").as_string(), "tail_rows");
+  EXPECT_EQ(Field(capture, "first_sequence").as_number(), 4.0);
+  EXPECT_EQ(Field(capture, "trigger_sequence").as_number(), 7.0);
+  EXPECT_EQ(Field(capture, "last_sequence").as_number(), 9.0);
+  EXPECT_EQ(Field(capture, "preceding_limit").as_string(), "rows");
+  EXPECT_EQ(Field(capture, "retained_rows").as_number(), 6.0);
+  EXPECT_EQ(Field(capture, "coverage").as_string(), "complete");
+  EXPECT_EQ(Field(Field(capture, "trigger"), "event_type").as_string(), "execute_failed");
+
+  // Routine churn pruned everything else but never the protected window or
+  // its (important-partition) cause.
+  for (std::uint64_t sequence = 4; sequence <= 9; ++sequence) EXPECT_TRUE(store.Read(sequence)) << sequence;
+  EXPECT_FALSE(store.Read(3U));
+  EXPECT_FALSE(store.Read(10U));
+  HistorianQuery query;
+  query.capture_id = 1U;
+  const auto page = store.Query(query);
+  ASSERT_EQ(page.events.size(), 6U);
+  EXPECT_EQ(page.events.front().sequence, 9U);
+  EXPECT_EQ(page.events.back().sequence, 4U);
+  const auto exported = content_identity::canonical_json(HistorianExportPageValue(store.QueryExport(query)));
+  EXPECT_NE(exported.find("\"contents\":\"retained_event_context\""), std::string::npos);
+  EXPECT_NE(exported.find("\"capture_id\":\"1\""), std::string::npos);
+  const auto retention = content_identity::canonical_json(page.retention);
+  EXPECT_NE(retention.find("\"schema_version\":\"manyforge.historian_retention.v2\""), std::string::npos);
+  EXPECT_NE(retention.find("\"protected_count\":\"6\""), std::string::npos);
+  query.capture_id = 99U;
+  ExpectHistorianError([&] { static_cast<void>(store.Query(query)); }, "historian_capture_not_found");
+}
+
+TEST(EventHistorian, FailureBurstJoinsTheOpenCaptureWithoutExtendingItsLimits) {
+  TemporaryDirectory directory;
+  FakeWriterClock clock;
+  SqliteEventHistoryStore store(directory.path() / "burst.sqlite3", 100U, SmallCaptureLimits(),
+                                clock.Clock());
+  ASSERT_EQ(store.Append(RoutineEvent(1)), IEventHistoryStore::AppendStatus::kStored);
+  for (std::uint64_t index = 2; index <= 5; ++index) ASSERT_EQ(store.Append(ErrorEvent(index)), IEventHistoryStore::AppendStatus::kStored);
+  const auto captures = CaptureList(store);
+  ASSERT_EQ(captures.size(), 2U);  // Newest first.
+  const auto &first = captures.back();
+  // Trigger 2 opened it; 3 and 4 joined and filled the two-row tail.
+  EXPECT_EQ(Field(first, "trigger_sequence").as_number(), 2.0);
+  EXPECT_EQ(Field(first, "last_sequence").as_number(), 4.0);
+  EXPECT_EQ(Field(first, "trigger_count").as_number(), 3.0);
+  EXPECT_EQ(Field(first, "recorded_triggers").as_array().size(), 2U);
+  EXPECT_EQ(Field(first, "unrecorded_trigger_count").as_number(), 1.0);
+  EXPECT_EQ(Field(first, "state").as_string(), "closed");
+  // The next error opened a new, overlapping capture after closure.
+  const auto &second = captures.front();
+  EXPECT_EQ(Field(second, "trigger_sequence").as_number(), 5.0);
+  EXPECT_EQ(Field(second, "first_sequence").as_number(), 2.0);
+  EXPECT_EQ(Field(second, "state").as_string(), "open");
+  const auto retention = content_identity::canonical_json(store.Query(HistorianQuery{}).retention);
+  // Five rows are protected once each even though rows 2..4 are shared.
+  EXPECT_NE(retention.find("\"protected_count\":\"5\""), std::string::npos);
+}
+
+TEST(EventHistorian, IncidentResolutionKeepsItsConditionSeverityButIsNotAFailureTrigger) {
+  TemporaryDirectory directory;
+  FakeWriterClock clock;
+  SqliteEventHistoryStore store(directory.path() / "resolution.sqlite3", 100U, SmallCaptureLimits(),
+                                clock.Clock());
+  const auto incident = [](const std::uint64_t index, const std::string &phase) {
+    return MakeHistorianEvent(
+        "manyforge.composer", "client_incident_" + phase, phase == "resolved" ? "INFO" : "ERROR",
+        static_cast<std::int64_t>(100U + index), "2026-09-24T12:00:00Z",
+        CanonicalValue(CanonicalValue::Object{
+            {"incident_kind", CanonicalValue("viewer_scene_unverified")},
+            {"original_severity", CanonicalValue("ERROR")},
+            {"phase", CanonicalValue(phase)},
+            {"schema_version", CanonicalValue("manyforge.client_incident_event.v1")},
+        }));
+  };
+  // A resolution alone opens nothing.
+  ASSERT_EQ(store.Append(incident(1, "resolved")), IEventHistoryStore::AppendStatus::kStored);
+  EXPECT_TRUE(CaptureList(store).empty());
+  EXPECT_EQ(HistorianConditionSeverity(incident(1, "resolved")), "ERROR");
+  // Activation opens a capture; the resolution enters its tail, not its triggers.
+  ASSERT_EQ(store.Append(incident(2, "activated")), IEventHistoryStore::AppendStatus::kStored);
+  ASSERT_EQ(store.Append(incident(3, "resolved")), IEventHistoryStore::AppendStatus::kStored);
+  const auto captures = CaptureList(store);
+  ASSERT_EQ(captures.size(), 1U);
+  EXPECT_EQ(Field(captures.front(), "trigger_sequence").as_number(), 2.0);
+  EXPECT_EQ(Field(captures.front(), "trigger_count").as_number(), 1.0);
+  EXPECT_EQ(Field(captures.front(), "last_sequence").as_number(), 3.0);
+}
+
+TEST(EventHistorian, FullCaptureClosesBeforeARowThatDoesNotFitAndNeverBlocksTheWriter) {
+  TemporaryDirectory directory;
+  FakeWriterClock clock;
+  HistorianCaptureLimits limits;
+  limits.preceding_rows = 0U;
+  limits.preceding_bytes = 1;
+  limits.tail_rows = 1000U;
+  limits.tail_duration = 1h;
+  limits.capture_bytes = 600LL * 1024LL;
+  limits.live_captures = 2U;
+  limits.protected_bytes = limits.capture_bytes;  // Combined budget equal to one capture.
+  SqliteEventHistoryStore store(directory.path() / "full.sqlite3", 1000U, limits, clock.Clock());
+  const auto large = [](const std::uint64_t index, const std::string &severity) {
+    return MakeHistorianEvent("manyforge.runtime", "observation", severity,
+                              static_cast<std::int64_t>(index), "2026-09-24T12:00:00Z",
+                              CanonicalValue(CanonicalValue::Object{
+                                  {"blob", CanonicalValue(std::string(100000U, 'x'))}}));
+  };
+  ASSERT_EQ(store.Append(large(1, "ERROR")), IEventHistoryStore::AppendStatus::kStored);
+  for (std::uint64_t index = 2; index <= 8; ++index) {
+    ASSERT_EQ(store.Append(large(index, "INFO")), IEventHistoryStore::AppendStatus::kStored);
+  }
+  auto captures = CaptureList(store);
+  ASSERT_EQ(captures.size(), 1U);
+  EXPECT_EQ(Field(captures.front(), "state").as_string(), "truncated");
+  EXPECT_EQ(Field(captures.front(), "close_reason").as_string(), "capture_bytes");
+  EXPECT_EQ(Field(captures.front(), "last_sequence").as_number(), 6.0);
+  EXPECT_LE(std::stoll(Field(captures.front(), "capture_bytes").as_string()), limits.capture_bytes);
+  // A failure after truncation opens the next capture; the budget retires the
+  // older one instead of failing the append.
+  ASSERT_EQ(store.Append(large(9, "ERROR")), IEventHistoryStore::AppendStatus::kStored);
+  captures = CaptureList(store);
+  ASSERT_EQ(captures.size(), 1U);
+  EXPECT_EQ(Field(captures.front(), "trigger_sequence").as_number(), 9.0);
+  const auto retention = content_identity::canonical_json(store.Query(HistorianQuery{}).retention);
+  EXPECT_NE(retention.find("\"retired_count\":\"1\""), std::string::npos);
+}
+
+TEST(EventHistorian, LossAfterTheLastRowMakesAnExpiredCaptureUncertain) {
+  TemporaryDirectory directory;
+  FakeWriterClock clock;
+  SqliteEventHistoryStore store(directory.path() / "late-loss.sqlite3", 100U, SmallCaptureLimits(),
+                                clock.Clock());
+  ASSERT_EQ(store.Append(ErrorEvent(1)), IEventHistoryStore::AppendStatus::kStored);
+  store.ObserveDeliveryLoss(1U);  // Lost within the tail, after the last retained row.
+  clock.now_ns += 2'000'000'000;
+  const auto derived = CaptureList(store).front();
+  EXPECT_EQ(Field(derived, "coverage").as_string(), "uncertain");
+  ASSERT_EQ(store.Append(RoutineEvent(2)), IEventHistoryStore::AppendStatus::kStored);
+  const auto recorded = CaptureList(store).front();
+  EXPECT_TRUE(Field(recorded, "closure_recorded").as_bool());
+  EXPECT_EQ(Field(recorded, "coverage").as_string(), "uncertain");
+  EXPECT_EQ(Field(recorded, "writer_delivery_loss_during").as_number(), 1.0);
+  bool loss_named = false;
+  for (const auto &item : Field(recorded, "uncertainty").as_array()) {
+    loss_named = loss_named || item.as_string() == "writer_delivery_loss_during_capture";
+  }
+  EXPECT_TRUE(loss_named);
+}
+
+TEST(EventHistorian, QuietTailClosesOnTheWriterWhileReadsNeverWriteCaptureState) {
+  TemporaryDirectory directory;
+  FakeWriterClock clock;
+  const auto path = directory.path() / "quiet.sqlite3";
+  SqliteEventHistoryStore store(path, 100U, SmallCaptureLimits(), clock.Clock());
+  ASSERT_EQ(store.Append(ErrorEvent(1)), IEventHistoryStore::AppendStatus::kStored);
+  clock.now_ns += 2'000'000'000;  // Past the one-second tail without any event.
+  const auto derived = CaptureList(store).front();
+  EXPECT_EQ(Field(derived, "state").as_string(), "closed");
+  EXPECT_EQ(Field(derived, "close_reason").as_string(), "tail_duration");
+  EXPECT_FALSE(Field(derived, "closure_recorded").as_bool());
+  EXPECT_EQ(CaptureState(path, 1), "open");  // The query wrote nothing.
+  ASSERT_EQ(store.Append(RoutineEvent(2)), IEventHistoryStore::AppendStatus::kStored);
+  EXPECT_EQ(CaptureState(path, 1), "closed");
+  const auto recorded = CaptureList(store).front();
+  EXPECT_TRUE(Field(recorded, "closure_recorded").as_bool());
+  // The late event was not admitted into the expired tail.
+  EXPECT_EQ(Field(recorded, "last_sequence").as_number(), 1.0);
+}
+
+TEST(EventHistorian, CombinedCaptureBudgetRetiresTheOldestAndReturnsRowsToOrdinaryPruning) {
+  TemporaryDirectory directory;
+  FakeWriterClock clock;
+  SqliteEventHistoryStore store(directory.path() / "budget.sqlite3", 3U, SmallCaptureLimits(),
+                                clock.Clock());
+  std::uint64_t index = 0;
+  for (int capture = 0; capture < 3; ++capture) {
+    for (int routine = 0; routine < 4; ++routine) ASSERT_EQ(store.Append(RoutineEvent(++index)), IEventHistoryStore::AppendStatus::kStored);
+    ASSERT_EQ(store.Append(ErrorEvent(++index)), IEventHistoryStore::AppendStatus::kStored);
+    for (int routine = 0; routine < 2; ++routine) ASSERT_EQ(store.Append(RoutineEvent(++index)), IEventHistoryStore::AppendStatus::kStored);
+  }
+  const auto captures = CaptureList(store);
+  ASSERT_EQ(captures.size(), 2U);
+  EXPECT_EQ(Field(captures.back(), "capture_id").as_string(), "2");
+  const auto retention = Field(store.Query(HistorianQuery{}).retention, "captures");
+  EXPECT_EQ(Field(retention, "retired_count").as_string(), "1");
+  EXPECT_EQ(Field(retention, "last_retired_capture_id").as_string(), "1");
+  EXPECT_EQ(Field(retention, "released_rows").as_string(), "6");
+  // Released routine rows are ordinary rows again: the three-row routine cap
+  // has already pruned them, while the retained captures stay intact.
+  EXPECT_FALSE(store.Read(2U));
+  HistorianQuery retired;
+  retired.capture_id = 1U;
+  ExpectHistorianError([&] { static_cast<void>(store.Query(retired)); }, "historian_capture_not_found");
+  // Row 15 was ordinary routine history pruned before the third capture
+  // opened; a capture never restores what was already pruned.
+  EXPECT_FALSE(store.Read(15U));
+  for (std::uint64_t sequence = 9; sequence <= 21; ++sequence) {
+    if (sequence != 15U) {
+      EXPECT_TRUE(store.Read(sequence)) << sequence;
+    }
+  }
+}
+
+TEST(EventHistorian, RestartClosesTheOpenTailAndValidatesDerivedProtection) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "restart.sqlite3";
+  {
+    FakeWriterClock clock;
+    SqliteEventHistoryStore store(path, 100U, SmallCaptureLimits(), clock.Clock());
+    ASSERT_EQ(store.Append(RoutineEvent(1)), IEventHistoryStore::AppendStatus::kStored);
+    store.ObserveDeliveryLoss(2U);
+    ASSERT_EQ(store.Append(ErrorEvent(2)), IEventHistoryStore::AppendStatus::kStored);
+    store.ObserveDeliveryLoss(3U);
+    ASSERT_EQ(store.Append(RoutineEvent(3)), IEventHistoryStore::AppendStatus::kStored);
+  }
+  {
+    FakeWriterClock clock;
+    SqliteEventHistoryStore restarted(path, 100U, SmallCaptureLimits(), clock.Clock());
+    const auto capture = CaptureList(restarted).front();
+    EXPECT_EQ(Field(capture, "state").as_string(), "closed_by_restart");
+    EXPECT_EQ(Field(capture, "coverage").as_string(), "uncertain");
+    const auto uncertainty = content_identity::canonical_json(Field(capture, "uncertainty"));
+    EXPECT_NE(uncertainty.find("tail_interrupted_by_restart"), std::string::npos);
+    EXPECT_NE(uncertainty.find("writer_delivery_loss_before_capture"), std::string::npos);
+    EXPECT_NE(uncertainty.find("writer_delivery_loss_during_capture"), std::string::npos);
+    // A new error in the next process whose context reaches rows of the
+    // previous writer reports that boundary instead of claiming coverage.
+    ASSERT_EQ(restarted.Append(ErrorEvent(4)), IEventHistoryStore::AppendStatus::kStored);
+    const auto after = CaptureList(restarted).front();
+    EXPECT_NE(content_identity::canonical_json(Field(after, "uncertainty")).find("context_spans_writer_restart"),
+              std::string::npos);
+  }
+  sqlite3 *database = nullptr;
+  ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+  ASSERT_EQ(sqlite3_exec(database, "UPDATE historian_events SET capture_refs=0 WHERE sequence=2", nullptr, nullptr, nullptr), SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+  ExpectHistorianError([&] { SqliteEventHistoryStore rejected(path, 100U, SmallCaptureLimits()); },
+                       "historian_storage_corrupt");
+}
+
+TEST(EventHistorian, Revision3MigrationAddsOnlyDerivedProtectionAndKeepsDigests) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "revision3.sqlite3";
+  std::string original;
+  {
+    SqliteEventHistoryStore store(path, 100U, SmallCaptureLimits());
+    ASSERT_EQ(store.Append(RoutineEvent(1)), IEventHistoryStore::AppendStatus::kStored);
+    ASSERT_EQ(store.Append(RoutineEvent(2)), IEventHistoryStore::AppendStatus::kStored);
+    original = content_identity::canonical_json(HistorianPersistenceValue(store.Read(2U)->event));
+  }
+  sqlite3 *database = nullptr;
+  ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+  ASSERT_EQ(sqlite3_exec(database, kRestoreRevision3Schema, nullptr, nullptr, nullptr), SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+  SqliteEventHistoryStore migrated(path, 100U, SmallCaptureLimits());
+  EXPECT_EQ(content_identity::canonical_json(HistorianPersistenceValue(migrated.Read(2U)->event)), original);
+  EXPECT_TRUE(CaptureList(migrated).empty());
+  ASSERT_EQ(migrated.Append(ErrorEvent(3)), IEventHistoryStore::AppendStatus::kStored);
+  EXPECT_EQ(Field(CaptureList(migrated).front(), "first_sequence").as_number(), 1.0);
+}
+
+TEST(EventHistorian, InconsistentCaptureLimitsAreRejected) {
+  TemporaryDirectory directory;
+  auto limits = SmallCaptureLimits();
+  limits.protected_bytes = limits.capture_bytes - 1;
+  ExpectHistorianError([&] { SqliteEventHistoryStore rejected(directory.path() / "limits.sqlite3", 100U, limits); },
+                       "historian_configuration_invalid");
 }
 
 } // namespace

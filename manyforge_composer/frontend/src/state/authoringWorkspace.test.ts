@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  authoringUnavailableCause,
   authoringUnavailableReason,
   authoringWorkspaceIdentity,
   programLocalFence,
@@ -142,6 +143,24 @@ describe('authoringWorkspace', () => {
       publicationIsCurrent(installed, headlessState(5, { workspaceEpoch: 'other' })),
     ).toBe(false);
     expect(publicationIsCurrent(installed, null)).toBe(false);
+  });
+
+  it('types the authoring gate cause alongside its stable reason', () => {
+    const installed = published(workspaceSnapshot(5, 3, 4));
+    expect(authoringUnavailableCause(installed, headlessState(5))).toBeNull();
+    expect(authoringUnavailableCause(null, null)).toBe('disconnected');
+    expect(authoringUnavailableCause(null, headlessState(5))).toBe('not_read');
+    expect(authoringUnavailableCause(installed, headlessState(6))).toBe('synchronizing');
+    expect(authoringUnavailableCause(
+      installed,
+      headlessState(5, {}, { programCycle: { state: 'terminal_awaiting_reset' } as never }),
+    )).toBe('execution_active');
+    expect(authoringUnavailableCause(
+      installed,
+      headlessState(5, {}, {
+        authoringAdmission: { authoringAllowed: false, admissionGeneration: 7 },
+      }),
+    )).toBe('not_admitted');
   });
 
   it('gates authoring with one stable reason per cause', () => {

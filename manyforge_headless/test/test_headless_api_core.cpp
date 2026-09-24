@@ -1559,6 +1559,44 @@ TEST(HeadlessApiCore,
   }
 }
 
+TEST(HeadlessApiCore, ViewerClientIncidentsAreErrorsWithTheirClosedKinds) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const std::vector<std::string> kinds{
+      "viewer_model_unavailable", "viewer_scene_unverified",
+      "viewer_observation_stale", "viewer_geometry_unavailable"};
+  std::uint64_t observed = 100U;
+  for (const auto &kind : kinds) {
+    const auto receipt = core.RecordClientIncident(
+        "client-incident." + kind, kind, "activated", "control-session.one",
+        "client.one", "operator_ui", kind, 1U, std::nullopt, observed,
+        observed);
+    EXPECT_TRUE(std::get<bool>(Member(receipt, "recorded").storage())) << kind;
+    ++observed;
+  }
+
+  HistorianQuery query;
+  query.components.insert("manyforge.composer");
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (Array(page, "events").size() == kinds.size()) {
+      break;
+    }
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), kinds.size());
+  for (const auto &stored : Array(page, "events")) {
+    const auto &event = Member(stored, "event");
+    // An unavailable or unverified view of the applied cell is an error, so
+    // its activation is retained with the important partition's evidence.
+    EXPECT_EQ(Text(event, "event_type"), "client_incident_activated");
+    EXPECT_EQ(Text(event, "severity"), "ERROR");
+    EXPECT_EQ(Text(Member(event, "payload"), "original_severity"), "ERROR");
+  }
+}
+
 TEST(HeadlessApiCore,
      GripperConfirmationTraceIsBoundedAttributedAndNeverLiveProof) {
   TemporaryDirectory directory;

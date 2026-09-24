@@ -103,6 +103,7 @@ function controller(): DeploymentWorkspaceController {
     applying: false,
     error: null,
     feedback: null,
+    acceptedApply: null,
     pendingApplyConfirmation: null,
     mutationAvailable: true,
     mutationUnavailableReason: null,

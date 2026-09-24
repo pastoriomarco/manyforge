@@ -376,18 +376,26 @@ public:
                              const std::optional<std::string> &alarm_phase,
                              const std::string &search,
                              const std::optional<std::string> &clock_owner,
-                             const bool full_records) {
+                             const bool full_records,
+                             const std::optional<std::uint64_t> capture_id) {
     HistorianQuery query{
         start_ns,
         end_ns,
         std::set<std::string>(components.begin(), components.end()),
         std::set<std::string>(event_types.begin(), event_types.end()),
         before_sequence,
-        limit, start_utc_ns, end_utc_ns, std::set<std::string>(severities.begin(), severities.end()), correlations, alarm_phase, search, clock_owner};
+        limit, start_utc_ns, end_utc_ns, std::set<std::string>(severities.begin(), severities.end()), correlations, alarm_phase, search, clock_owner,
+        capture_id};
     py::gil_scoped_release release;
     return Invoke([this, query = std::move(query), full_records]() {
       return core_->HistoryQueryPage(query, full_records);
     });
+  }
+
+  std::string HistoryCaptures(const std::optional<std::uint64_t> before_capture_id,
+                              const std::size_t limit) {
+    py::gil_scoped_release release;
+    return Invoke([&] { return core_->HistoryCapturePage(before_capture_id, limit); });
   }
 
   std::string HistoryDiscovery(const std::string &kind, const std::string &after, std::size_t limit) {
@@ -713,7 +721,10 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("correlations") = std::map<std::string, std::string>{},
            py::arg("alarm_phase") = std::nullopt, py::arg("search") = "",
            py::arg("clock_owner") = std::nullopt,
-           py::arg("full_records") = false)
+           py::arg("full_records") = false,
+           py::arg("capture_id") = std::nullopt)
+      .def("history_captures", &HeadlessApiBridge::HistoryCaptures,
+           py::arg("before_capture_id") = std::nullopt, py::arg("limit") = 32U)
       .def("history_detail", &HeadlessApiBridge::HistoryDetail,
            py::arg("sequence"))
       .def("history_discovery", &HeadlessApiBridge::HistoryDiscovery,

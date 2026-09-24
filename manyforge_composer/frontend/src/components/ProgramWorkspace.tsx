@@ -108,7 +108,6 @@ export function ProgramWorkspace({
     refresh,
     mutate,
     updateNodePolicies,
-    clearFeedback,
   } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [paletteCollapsed, setPaletteCollapsed] = useState(false);
@@ -187,8 +186,7 @@ export function ProgramWorkspace({
       noticeIdsByKey.current = new Map(retained.map((notice) => [notice.key, notice.id]));
       return retained;
     });
-    clearFeedback();
-  }, [clearFeedback]);
+  }, []);
   useEffect(() => () => {
     for (const timeout of noticeTimeouts.current.values()) window.clearTimeout(timeout);
     noticeTimeouts.current.clear();
@@ -236,15 +234,6 @@ export function ProgramWorkspace({
     onInvalidEditChange?.(invalidLocalEdit);
     return () => onInvalidEditChange?.(false);
   }, [invalidLocalEdit, onInvalidEditChange]);
-  useEffect(() => {
-    const message = state.error ?? state.message;
-    if (!message || workspace === null) return;
-    reportNotice({
-      key: state.error ? `workspace-error:${message}` : `workspace-message:${message}`,
-      message,
-      kind: state.error ? 'error' : 'info',
-    });
-  }, [reportNotice, state.error, state.message, workspace]);
 
   const validNodeIds = useMemo(
     () => new Set(authoring ? flattenProgramForest(authoring.forest)
@@ -355,27 +344,10 @@ export function ProgramWorkspace({
     setPaletteWidth((current) => clamp(current, PROGRAM_TOOL_MIN, paletteWidthMax));
   }, [paletteWidthMax]);
 
-  const canvasNotices = useMemo(() => {
-    const statusNotices: ProgramNotice[] = [];
-    if (runtime.active) {
-      statusNotices.push({
-        id: 'program-runtime-active',
-        key: 'program-runtime-active',
-        kind: 'info',
-        message: 'Run active. Draft inspection remains available; authoring waits for Idle.',
-        dismissible: false,
-      });
-    } else if (workspace !== null && !mutationAvailable) {
-      statusNotices.push({
-        id: 'program-authoring-unavailable',
-        key: 'program-authoring-unavailable',
-        kind: 'info',
-        message: `Authoring unavailable. ${mutationUnavailableReason}`,
-        dismissible: false,
-      });
-    }
-    return [...statusNotices, ...notices];
-  }, [mutationAvailable, mutationUnavailableReason, notices, runtime.active, workspace]);
+  // Workspace command results, failures and authoring availability belong to
+  // the workbench notification rows; this rail keeps only canvas-gesture
+  // feedback that is meaningful beside the canvas.
+  const canvasNotices = notices;
 
   const gridClassName = [
     'program-authoring-grid',
@@ -541,12 +513,7 @@ export function ProgramWorkspace({
             onMutate={mutate}
             notices={canvasNotices}
             onNotice={reportNotice}
-            onDismissNotice={(id) => {
-              const ownerFeedback = notices.find((notice) => notice.id === id)
-                ?.key.startsWith('workspace-') === true;
-              dismissNotice(id);
-              if (ownerFeedback) clearFeedback();
-            }}
+            onDismissNotice={dismissNotice}
             onDismissAllNotices={dismissAllNotices}
           />
         ) : (

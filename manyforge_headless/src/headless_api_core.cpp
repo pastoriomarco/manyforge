@@ -966,6 +966,20 @@ CanonicalValue HeadlessApiCore::HistoryDiscovery(const std::string &kind,
   return store->Discover(kind, after, limit);
 }
 
+CanonicalValue HeadlessApiCore::HistoryCapturePage(
+    const std::optional<std::uint64_t> before_capture_id, const std::size_t limit) {
+  std::shared_ptr<SqliteEventHistoryStore> store;
+  {
+    std::lock_guard lock(mutex_);
+    Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+    SynchronizeHistorianHealthLocked();
+    store = history_store_;
+  }
+  // Read-only projection outside the coordination lock; capture state is
+  // written only by the asynchronous Historian writer.
+  return store->Captures(before_capture_id, limit);
+}
+
 CanonicalValue HeadlessApiCore::HistoryDetail(const std::uint64_t sequence) {
   std::shared_ptr<SqliteEventHistoryStore> store;
   {
@@ -997,7 +1011,11 @@ CanonicalValue HeadlessApiCore::RecordClientIncident(
       "browser_render_delayed", "command_delivery_unconfirmed",
       "control_delayed",        "control_disconnected",
       "control_stale",          "history_detail_request_failed",
-      "history_request_failed", "control_source_unavailable"};
+      "history_request_failed", "control_source_unavailable",
+      // Browser-only viewer conditions presented as errors (spec 450 §5.0.1):
+      // an unavailable/unverified view of the applied robot or Scene.
+      "viewer_model_unavailable", "viewer_scene_unverified",
+      "viewer_observation_stale", "viewer_geometry_unavailable"};
   Require(bounded_text(incident_id, 256U) &&
               bounded_text(control_session_id, 256U) &&
               bounded_text(client_incarnation, 256U) &&

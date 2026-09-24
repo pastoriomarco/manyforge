@@ -99,6 +99,8 @@ import {
   type ViewerPresentationProfile,
   type ViewerRendererInspection,
 } from '../utils/viewerPerformance';
+import { usePublishWorkbenchNotices } from '../state/workbenchNotices';
+import { viewerNotices } from '../state/viewerNotices';
 
 interface StructuralViewerProps {
   viewerActive: boolean;
@@ -2385,12 +2387,30 @@ export function viewerContextWasDragged({
     > VIEWER_CONTEXT_DRAG_THRESHOLD_PX;
 }
 
+/**
+ * Commits only together with the whole model subtree of its Suspense
+ * boundary: its effect means that load finished, after any mesh boundary in
+ * the same commit has already reported its error.
+ */
+function ModelLoadedSignal({ generation, onLoaded }: {
+  generation: number;
+  onLoaded: (generation: number) => void;
+}) {
+  useEffect(() => {
+    onLoaded(generation);
+  }, [generation, onLoaded]);
+  return null;
+}
+
 const ViewerCanvas = memo(function ViewerCanvas({
   manifest,
   collisionsVisible,
   wireframeVisible,
+  retryGeneration,
+  onModelLoaded,
   onAssetError,
   onIsolatedAssetError,
+  onPreviewAssetError,
   sceneObjects,
   programDraftPreview,
   selectedSceneResourceId,
@@ -2432,8 +2452,12 @@ const ViewerCanvas = memo(function ViewerCanvas({
   manifest: SceneUrdfManifest | null;
   collisionsVisible: boolean;
   wireframeVisible: boolean;
+  /** Incremented by Retry/Reload: remounts the model subtree to load again. */
+  retryGeneration: number;
+  onModelLoaded: (generation: number) => void;
   onAssetError: (error: Error) => void;
   onIsolatedAssetError: (error: Error) => void;
+  onPreviewAssetError: (error: Error) => void;
   sceneObjects: readonly LogicalSceneObject[];
   programDraftPreview: boolean;
   selectedSceneResourceId: string | null;
@@ -2719,10 +2743,11 @@ const ViewerCanvas = memo(function ViewerCanvas({
       <group name="viewer-frame-content">
         {manifest !== null && (
           <AssetErrorBoundary
-            resetKey={manifest.model_key}
+            resetKey={`${manifest.model_key}:${retryGeneration}`}
             onError={onAssetError}
           >
-            <Suspense fallback={null}>
+            <Suspense key={retryGeneration} fallback={null}>
+              <ModelLoadedSignal generation={retryGeneration} onLoaded={onModelLoaded} />
               {runtimePresentation?.measuredRobot === null
                 || runtimePresentation?.measuredRobot === undefined ? (
                   <RetainedNeutralModel
@@ -2818,7 +2843,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
             robot={candidateRobot}
             tool={candidateTool}
             rejected={candidateRejected}
-            onAssetError={onIsolatedAssetError}
+            onAssetError={onPreviewAssetError}
             onEdit={onEditCandidateTcpPose}
             onTransformDraggingChange={setTransformDragging}
           />
@@ -2828,7 +2853,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
             manifest={manifest}
             presentation={candidateRobot}
             stale={candidateStale}
-            onAssetError={onIsolatedAssetError}
+            onAssetError={onPreviewAssetError}
           />
         )}
         {pointCloudFrame !== null && <PointCloudPoints frame={pointCloudFrame} />}
@@ -2919,6 +2944,21 @@ function StructuralViewerContent({
   );
   const [assetError, setAssetError] = useState<Error | null>(null);
   const [assetWarning, setAssetWarning] = useState<string | null>(null);
+  const [previewAssetWarning, setPreviewAssetWarning] = useState<string | null>(null);
+  // Retry/Reload keeps the geometry errors until the reload verifiably
+  // succeeds: a remounted model that commits with no new error.
+  const [geometryRetryGeneration, setGeometryRetryGeneration] = useState(0);
+  /** Generation of the reload still being awaited, if any. */
+  const [pendingGeometryRetry, setPendingGeometryRetry] = useState<number | null>(null);
+  const [loadedGeometryGeneration, setLoadedGeometryGeneration] = useState(0);
+  const geometryRetrying = pendingGeometryRetry !== null;
+  if (pendingGeometryRetry !== null && loadedGeometryGeneration === pendingGeometryRetry) {
+    // That exact reload committed with no new error: the conditions resolve.
+    setPendingGeometryRetry(null);
+    setAssetError(null);
+    setAssetWarning(null);
+    setPreviewAssetWarning(null);
+  }
   const [materializationGeneration, setMaterializationGeneration] = useState(0);
   const localGizmo = useGizmoSettings();
   const gizmo = sharedGizmo ?? localGizmo;
@@ -3114,14 +3154,25 @@ function StructuralViewerContent({
     .map((object) => object.scene_resource_id)
     .sort()
     .join(',')}`;
+  // A new error ends a pending retry as failed; its condition stays.
+  const endFailedRetry = useCallback(() => setPendingGeometryRetry(null), []);
   const reportAssetError = useCallback((error: Error) => {
     reportViewerQualificationError(error);
+    endFailedRetry();
     setAssetError(error);
-  }, [setAssetError]);
+  }, [endFailedRetry, setAssetError]);
   const reportIsolatedAssetError = useCallback((error: Error) => {
     reportViewerQualificationError(error);
+    endFailedRetry();
     setAssetWarning(error.message || 'One viewer mesh could not be rendered.');
-  }, [setAssetWarning]);
+  }, [endFailedRetry, setAssetWarning]);
+  const reportPreviewAssetError = useCallback((error: Error) => {
+    reportViewerQualificationError(error);
+    setPreviewAssetWarning(error.message || 'One preview mesh could not be rendered.');
+  }, [setPreviewAssetWarning]);
+  const reportModelLoaded = useCallback((generation: number) => {
+    setLoadedGeometryGeneration(generation);
+  }, []);
   const reportViewerCommit = useCallback((
     _id: string,
     _phase: 'mount' | 'update' | 'nested-update',
@@ -3223,10 +3274,31 @@ function StructuralViewerContent({
         }
       }
     }
-    setAssetError(null);
-    setAssetWarning(null);
+    const generation = geometryRetryGeneration + 1;
+    // Only a mounted model can be reloaded; without one there is nothing to
+    // wait for, and the next model mount reports its own result.
+    if (manifest.status === 'ready') setPendingGeometryRetry(generation);
+    setGeometryRetryGeneration(generation);
     onRetry();
   };
+  usePublishWorkbenchNotices('viewer', viewerNotices({
+    modelPresentation,
+    staleScenePreview,
+    robotMeshFailure: assetWarning,
+    assetFailure: manifest.status === 'ready' && assetError !== null
+      ? {
+          kind: classifyStructuralAssetFailure(assetError) === 'stale_model'
+            ? 'stale_model'
+            : 'unavailable',
+          message: assetError.message,
+        }
+      : null,
+    previewMeshFailure: previewAssetWarning,
+    pointCloudFailure: pointCloudEnabled ? pointCloud.error : null,
+    geometryRetrying,
+    retryModel: retry,
+    reloadModel: retry,
+  }));
 
   return (
     <section className="panel viewer-panel" aria-labelledby="viewer-title">
@@ -3342,54 +3414,6 @@ function StructuralViewerContent({
         data-scene-object-count={sceneObjects.length}
       >
         {runtimeOverlay}
-        <div className="viewer-notice-stack" aria-label="Viewer warnings">
-        {modelPresentation.status === 'synchronizing' && (
-          <div className="viewer-model-state synchronizing" role="status">
-            <strong>Synchronizing Applied robot model</strong>
-            <span>{modelPresentation.message}</span>
-          </div>
-        )}
-        {modelPresentation.status === 'unavailable' && (
-          <div className="viewer-model-state unavailable" role="alert">
-            <strong>Applied robot model unavailable</strong>
-            <span>{modelPresentation.message}</span>
-            <button type="button" onClick={retry}>Retry model projections</button>
-          </div>
-        )}
-        {staleScenePreview && (
-          <div className="viewer-scene-stale-state" role="status">
-            <strong>Stale Applied Scene</strong>
-            <span>The last coherent Scene preview is shown; its current Manager identity is not verified.</span>
-          </div>
-        )}
-        {assetWarning !== null && pointCloud.error === null
-          && modelPresentation.status === 'ready' && (
-          <div className="viewer-layer-warning" role="status">
-            One mesh is unavailable; the remaining scene is still usable. {assetWarning}
-          </div>
-        )}
-        {manifest.status === 'ready' && assetError !== null && (
-          <div className="viewer-state viewer-state-overlay error-state" role="alert">
-            <strong>
-              {classifyStructuralAssetFailure(assetError) === 'stale_model'
-                ? 'Active model changed'
-                : 'Structural asset unavailable'}
-            </strong>
-            <span>
-              {classifyStructuralAssetFailure(assetError) === 'stale_model'
-                ? 'A keyed mesh belongs to an inactive model. Reload the manifest.'
-                : assetError.message}
-            </span>
-            <button type="button" onClick={retry}>Reload active model</button>
-          </div>
-        )}
-        {pointCloudEnabled && pointCloud.error !== null && (
-          <div className="viewer-state viewer-state-overlay error-state" role="alert">
-            <strong>Point-cloud observer unavailable</strong>
-            <span>{pointCloud.error}</span>
-          </div>
-        )}
-        </div>
         {inspectorPanel === 'robot' && candidateTcpPose !== null && candidateTool === null && candidateRobot === null && (
           <div className="viewer-target-status" role="status">
             <span>Target marker only — mapped tool geometry unavailable. Target is unvalidated.</span>
@@ -3404,8 +3428,11 @@ function StructuralViewerContent({
               manifest={manifest.status === 'ready' ? manifest.data : null}
               collisionsVisible={collisionsVisible}
               wireframeVisible={wireframeVisible}
+              retryGeneration={geometryRetryGeneration}
+              onModelLoaded={reportModelLoaded}
               onAssetError={reportAssetError}
               onIsolatedAssetError={reportIsolatedAssetError}
+              onPreviewAssetError={reportPreviewAssetError}
               sceneObjects={sceneObjects}
               programDraftPreview={programDraftPreview}
               selectedSceneResourceId={selectedSceneResourceId}

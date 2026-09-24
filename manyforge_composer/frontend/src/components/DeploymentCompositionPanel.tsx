@@ -49,6 +49,9 @@ interface DeploymentCompositionPanelProps {
   sourceModel: StructuralResourceState<SourceModelProjection>;
   motionDescriptors: ManualControlMotionDescriptor[];
   gripperDescriptors: ManualControlGripperDescriptor[];
+  /** The workbench's single observation of the advertised maintenance
+   * operation; this panel observes only an inventory-selected operation. */
+  maintenanceStatus: ReturnType<typeof useManagerApplyStatus>;
 }
 
 interface DeploymentReadModel {
@@ -89,6 +92,7 @@ export function DeploymentCompositionPanel({
   sourceModel,
   motionDescriptors,
   gripperDescriptors,
+  maintenanceStatus: advertisedStatus,
 }: DeploymentCompositionPanelProps) {
   const refreshDeploymentWorkspace = deploymentController.refresh;
   const [readModel, setReadModel] = useState<DeploymentReadModel | null>(null);
@@ -104,16 +108,11 @@ export function DeploymentCompositionPanel({
   const inventoryApply = readModel === null
     ? null
     : selectManagerApplyInventoryIdentity(readModel.status.status.apply.records);
-  const observedApply = maintenance === null
-    ? inventoryApply
-    : {
-      applyId: maintenance.applyId,
-      applyGeneration: maintenance.applyGeneration,
-    };
-  const maintenanceStatus = useManagerApplyStatus(
-    observedApply,
+  const inventoryStatus = useManagerApplyStatus(
+    maintenance === null ? inventoryApply : null,
     snapshot?.snapshotSequence ?? null,
   );
+  const maintenanceStatus = maintenance === null ? inventoryStatus : advertisedStatus;
   const [reloadToken, setReloadToken] = useState(0);
 
   const refresh = useCallback(() => {

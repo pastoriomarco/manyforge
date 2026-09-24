@@ -683,6 +683,7 @@ describe('Program authoring panels', () => {
   it('keeps the complete authoring geometry when no Draft is open', () => {
     const controller = {
       mutationAvailable: true,
+      acceptedApply: null,
       mutationUnavailableReason: null,
       admissionObserved: true,
       state: {
@@ -905,6 +906,7 @@ describe('Program authoring panels', () => {
     };
     const controller = {
       mutationAvailable: true,
+      acceptedApply: null,
       mutationUnavailableReason: null,
       admissionObserved: true,
       state: {

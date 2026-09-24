@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-09-23 05:29:42 UTC
+  Last regenerated: 2026-09-24 09:16:56 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -156,6 +156,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/execution/diagnostics` |  | Execution Diagnostics |
 | `POST` | `/api/execution/full-stop` |  | Execution Full Stop |
 | `GET` | `/api/execution/history` |  | History |
+| `GET` | `/api/execution/history/captures` |  | History Captures |
 | `GET` | `/api/execution/history/discovery` |  | History Discovery |
 | `GET` | `/api/execution/history/export` |  | History Export |
 | `GET` | `/api/execution/history/health` |  | Historian Health |

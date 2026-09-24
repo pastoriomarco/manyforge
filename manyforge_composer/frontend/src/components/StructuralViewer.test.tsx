@@ -487,22 +487,37 @@ describe('viewer failure isolation', () => {
     expect(source).toContain('<AssetErrorBoundary resetKey={visual.mesh_url}');
     expect(source).toContain('<AssetErrorBoundary resetKey={collision.mesh_url}');
     expect(source).toContain('<AssetErrorBoundary resetKey={url} onError={isolateError}>');
-    expect(source).toContain('One mesh is unavailable; the remaining scene is still usable.');
+    expect(source).toContain('onIsolatedAssetError={reportIsolatedAssetError}');
+    expect(source).toContain('onPreviewAssetError={reportPreviewAssetError}');
   });
 
-  it('stacks model and Scene warnings outside the bottom execution controls', () => {
+  it('keeps geometry errors until a retried model load verifiably succeeds', () => {
+    const source = readFileSync(new URL('./StructuralViewer.tsx', import.meta.url), 'utf8');
+    const retry = source.match(/const retry = \(\) => \{([\s\S]*?)\n {2}\};/)?.[1] ?? '';
+    // Retry remounts the model and waits; it never clears the conditions itself.
+    expect(retry).toContain('setGeometryRetryGeneration(generation)');
+    expect(retry).not.toContain('setAssetError(null)');
+    expect(retry).not.toContain('setAssetWarning(null)');
+    expect(source).toContain('resetKey={`${manifest.model_key}:${retryGeneration}`}');
+    expect(source).toContain('<Suspense key={retryGeneration} fallback={null}>');
+    // Only the loaded signal of that exact retry clears them; a new error ends it as failed.
+    expect(source).toContain(
+      'if (pendingGeometryRetry !== null && loadedGeometryGeneration === pendingGeometryRetry) {',
+    );
+    expect(source).toContain('endFailedRetry();\n    setAssetError(error);');
+  });
+
+  it('publishes viewer conditions to the one notification stack above the controls', () => {
     const source = readFileSync(new URL('./StructuralViewer.tsx', import.meta.url), 'utf8');
     const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
-    const stack = source.slice(source.indexOf('className="viewer-notice-stack"'),
-      source.indexOf("{inspectorPanel === 'robot'", source.indexOf('className="viewer-notice-stack"')));
-    expect(stack).toContain('viewer-model-state synchronizing');
-    expect(stack).toContain('viewer-model-state unavailable');
-    expect(stack).toContain('viewer-scene-stale-state');
-    const layout = css.match(/\.viewer-notice-stack\s*\{([^}]+)\}/)?.[1];
-    expect(layout).toContain('display: grid');
-    expect(layout).toContain('top: 0.65rem');
-    expect(layout).toContain('overflow: auto');
-    expect(css).not.toMatch(/\.viewer-model-state\s*\{[^}]*bottom:/);
+    expect(source).toContain("usePublishWorkbenchNotices('viewer', viewerNotices({");
+    expect(source).not.toContain('viewer-notice-stack');
+    expect(css).not.toContain('.viewer-notice-stack');
+    expect(css).not.toContain('.viewer-model-state');
+    const layout = css.match(/\.workbench-notification-stack\s*\{([^}]+)\}/)?.[1];
+    expect(layout).toContain('top: 0.55rem');
+    expect(layout).toContain('max-height: calc(100% - 5.5rem)');
+    expect(layout).toContain('pointer-events: none');
   });
 
   it('shares disposable object, link, and frame selection with camera tools', () => {

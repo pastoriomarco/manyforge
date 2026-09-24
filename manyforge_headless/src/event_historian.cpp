@@ -1,12 +1,22 @@
 #include "manyforge_headless/event_historian.hpp"
 
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <exception>
+#include <iostream>
 #include <cstdint>
 #include <limits>
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <manyforge_content_identity/content_identity.hpp>
 
@@ -504,13 +514,17 @@ CanonicalValue HistorianExportPageValue(const HistorianPage &page) {
     events.push_back(std::move(value));
   }
   const bool truncated = page.truncated || events.size() < page.events.size();
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object envelope{
       {"schema_version", CanonicalValue("manyforge.historian_export_page.v1")},
       {"events", CanonicalValue(std::move(events))},
       {"truncated", CanonicalValue(truncated)},
       {"next_before_sequence", OptionalNumber(truncated ? last : std::nullopt, "next_before_sequence")},
       {"retention", page.retention},
-  });
+  };
+  // A capture export states its range, contents and known limits with the
+  // records it pages; it is retained context, not a complete state dump.
+  if (!page.capture.is_null()) envelope.emplace_back("capture", page.capture);
+  return CanonicalValue(std::move(envelope));
 }
 
 CanonicalValue HistorianDetailValue(const HistorianStoredEvent &stored) {
@@ -642,15 +656,69 @@ CanonicalValue AsyncHistorianHealthValue(const AsyncHistorianHealth &health) {
   });
 }
 
+IEventHistoryStore::AppendBatchResult
+IEventHistoryStore::AppendBatch(const std::span<const HistorianEvent> events) {
+  AppendBatchResult result;
+  for (const auto &event : events) {
+    try {
+      result.statuses.push_back(Append(event));
+    } catch (...) {
+      result.failure = std::current_exception();
+      break;
+    }
+  }
+  return result;
+}
+
+namespace {
+
+/// The writer is background work: never a realtime thread, and below normal
+/// priority, so it only uses capacity that realtime and control work leave.
+/// Lowering priority needs no privilege; a refusal leaves the writer at the
+/// inherited priority, which is still correct, only less polite.
+void LowerWriterThreadPriority() {
+  sched_param normal{};
+  normal.sched_priority = 0;
+  bool lowered = pthread_setschedparam(pthread_self(), SCHED_OTHER, &normal) == 0;
+  const auto thread = static_cast<id_t>(::syscall(SYS_gettid));
+  errno = 0;
+  const auto current = getpriority(PRIO_PROCESS, thread);
+  lowered = lowered && errno == 0 &&
+            setpriority(PRIO_PROCESS, thread, std::min(19, current + 10)) == 0;
+  if (!lowered) {
+    // Not a persistence failure: the writer still works at the inherited
+    // priority. Reported once so a deployment can see it.
+    std::cerr << "historian writer priority could not be lowered; it runs at the inherited priority\n";
+  }
+}
+
+std::pair<std::string, std::string> StoreFailure(const std::exception_ptr &failure) {
+  try {
+    std::rethrow_exception(failure);
+  } catch (const EventHistorianError &error) {
+    return {error.code(), error.what()};
+  } catch (const std::exception &error) {
+    return {"historian_store_failure", error.what()};
+  } catch (...) {
+    return {"historian_store_failure", "historian store raised a non-standard exception"};
+  }
+}
+
+} // namespace
+
 AsyncEventHistorian::AsyncEventHistorian(
-    std::shared_ptr<IEventHistoryStore> store, const std::size_t queue_capacity)
-    : store_(std::move(store)), queue_capacity_(queue_capacity) {
+    std::shared_ptr<IEventHistoryStore> store, const std::size_t queue_capacity,
+    const std::chrono::milliseconds commit_gap)
+    : store_(std::move(store)), queue_capacity_(queue_capacity), commit_gap_(commit_gap) {
   Require(store_ != nullptr, "historian_configuration_invalid",
           "historian store is required");
   Require(queue_capacity_ != 0U &&
               queue_capacity_ <= kMaximumHistorianQueueCapacity,
           "historian_configuration_invalid",
           "historian queue capacity must be between 1 and 65536");
+  Require(commit_gap_.count() >= 0 && commit_gap_ <= std::chrono::seconds(1),
+          "historian_configuration_invalid",
+          "historian commit gap must be between 0 and 1000 ms");
   worker_ = std::thread([this]() { Run(); });
 }
 
@@ -660,11 +728,14 @@ bool AsyncEventHistorian::TryEnqueue(HistorianEvent event) {
   ValidateEvent(event);
   std::lock_guard lock(mutex_);
   Require(accepting_, "historian_closed", "historian no longer accepts events");
-  const auto duplicate =
-      std::find_if(queue_.begin(), queue_.end(), [&event](const auto &queued) {
-        return queued.event_id == event.event_id;
-      });
-  if (duplicate != queue_.end()) {
+  if (queued_ids_.contains(event.event_id)) {
+    // Rare path: only a repeated identity walks the queue to compare content.
+    const auto duplicate =
+        std::find_if(queue_.begin(), queue_.end(), [&event](const auto &queued) {
+          return queued.event_id == event.event_id;
+        });
+    Require(duplicate != queue_.end(), "historian_internal_failure",
+            "queued historian identity index is inconsistent");
     Require(content_identity::canonical_json(HistorianEventValue(*duplicate)) ==
                 content_identity::canonical_json(HistorianEventValue(event)),
             "historian_event_identity_conflict",
@@ -678,6 +749,7 @@ bool AsyncEventHistorian::TryEnqueue(HistorianEvent event) {
                       "bounded historian delivery queue is full");
     return false;
   }
+  queued_ids_.insert(event.event_id);
   queue_.push_back(std::move(event));
   Advance(accepted_count_);
   condition_.notify_one();
@@ -788,6 +860,7 @@ void AsyncEventHistorian::MarkFailureLocked(std::string code,
 }
 
 void AsyncEventHistorian::Run() {
+  LowerWriterThreadPriority();
   std::unique_lock lock(mutex_);
   while (true) {
     condition_.wait(lock,
@@ -798,51 +871,67 @@ void AsyncEventHistorian::Run() {
       }
       continue;
     }
+    // At most one commit per gap: events arriving meanwhile join this batch.
+    // Shutdown skips the wait so the queue drains promptly.
+    if (last_commit_ && !stop_requested_) {
+      condition_.wait_until(lock, *last_commit_ + commit_gap_,
+                            [this]() { return stop_requested_; });
+    }
     write_in_flight_ = true;
-    const auto event = queue_.front();
+    const auto count = std::min(queue_.size(), kMaximumHistorianBatchEvents);
+    const std::vector<HistorianEvent> batch(
+        queue_.begin(), queue_.begin() + static_cast<std::ptrdiff_t>(count));
+    // Losses are counted when they happen, before later events are written;
+    // the store may use the cumulative value only to mark coverage uncertain.
+    const auto delivery_loss = overflow_count_ + delivery_failure_count_;
+    last_commit_ = std::chrono::steady_clock::now();
     lock.unlock();
 
-    std::optional<IEventHistoryStore::AppendStatus> status;
-    std::string error_code;
-    std::string error_message;
+    IEventHistoryStore::AppendBatchResult result;
     try {
-      status = store_->Append(event);
-    } catch (const EventHistorianError &error) {
-      error_code = error.code();
-      error_message = error.what();
-    } catch (const std::exception &error) {
-      error_code = "historian_store_failure";
-      error_message = error.what();
+      store_->ObserveDeliveryLoss(delivery_loss);
+      result = store_->AppendBatch(batch);
+      // Without a failure a store may commit a leading part of the batch
+      // (its transaction bound); the rest waits for the next commit.
+      if (result.statuses.size() > batch.size() ||
+          (!result.failure && result.statuses.empty())) {
+        throw EventHistorianError("historian_store_failure",
+                                  "historian store reported an inconsistent batch result");
+      }
     } catch (...) {
-      error_code = "historian_store_failure";
-      error_message = "historian store raised a non-standard exception";
+      result = {{}, std::current_exception()};
     }
 
     lock.lock();
     write_in_flight_ = false;
-    if (status.has_value()) {
-      if (!queue_.empty() && queue_.front().event_id == event.event_id) {
+    for (std::size_t index = 0; index < result.statuses.size(); ++index) {
+      if (!queue_.empty() && queue_.front().event_id == batch[index].event_id) {
+        queued_ids_.erase(queue_.front().event_id);
         queue_.pop_front();
       }
-      if (*status == IEventHistoryStore::AppendStatus::kStored) {
+      if (result.statuses[index] == IEventHistoryStore::AppendStatus::kStored) {
         Advance(delivered_count_);
       } else {
         Advance(duplicate_count_);
       }
-      if (failure_active_) {
-        recovery_write_observed_ = true;
-      }
+    }
+    if (!result.statuses.empty() && failure_active_) {
+      recovery_write_observed_ = true;
+    }
+    if (!result.failure) {
       if (queue_.empty()) {
         idle_condition_.notify_all();
       }
       continue;
     }
 
+    auto [error_code, error_message] = StoreFailure(result.failure);
     Advance(delivery_failure_count_);
     MarkFailureLocked(std::move(error_code), std::move(error_message));
     idle_condition_.notify_all();
     if (stop_requested_) {
       queue_.clear();
+      queued_ids_.clear();
       idle_condition_.notify_all();
       break;
     }

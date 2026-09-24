@@ -144,9 +144,11 @@ describe('viewerModelPresentation', () => {
   it('hides cached robot models while a Scenario Load or Manager Apply is pending', () => {
     expect(select(snapshot(), sourceModel(), manifest(), true)).toMatchObject({
       status: 'synchronizing',
+      reason: 'transition',
     });
     expect(select(snapshot({ applyRecords: [{ incomplete: true }] }))).toMatchObject({
       status: 'synchronizing',
+      reason: 'transition',
     });
   });
 
@@ -159,7 +161,8 @@ describe('viewerModelPresentation', () => {
       sourceModel('sha256:dual-robot-bundle', 'sha256:dual-robot-graph'),
       manifest('sha256:dual-robot-bundle', 'sha256:dual-robot-graph'),
     );
-    expect(result).toMatchObject({ status: 'synchronizing' });
+    // Outside a transition this mismatch is an error (viewerNotices).
+    expect(result).toMatchObject({ status: 'synchronizing', reason: 'identity_mismatch' });
     expect(result).not.toHaveProperty('manifest');
   });
 
@@ -172,6 +175,7 @@ describe('viewerModelPresentation', () => {
     });
     expect(select(snapshot({ freshness: 'stale' }))).toMatchObject({
       status: 'synchronizing',
+      reason: 'projection_stale',
     });
     expect(select(snapshot({ available: false }))).toMatchObject({
       status: 'unavailable',

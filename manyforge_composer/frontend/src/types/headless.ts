@@ -218,8 +218,70 @@ export interface HistorianPage {
   retention: HistorianRetention | null;
 }
 
+export interface HistorianCaptureRetention {
+  liveCount: string;
+  openCount: string;
+  protectedCount: string;
+  protectedBytes: string;
+  liveCaptureLimit: string;
+  protectedByteLimit: string;
+  retiredCount: string;
+  releasedRows: string;
+  releasedBytes: string;
+  lastRetiredCaptureId: string | null;
+}
+
+export type HistorianCaptureUncertainty =
+  | 'context_pruned_before_capture'
+  | 'writer_delivery_loss_before_capture'
+  | 'writer_delivery_loss_during_capture'
+  | 'context_spans_writer_restart'
+  | 'tail_interrupted_by_restart';
+
+/** One failure capture: protected retained context, never a state dump. */
+export interface HistorianCapture {
+  captureId: string;
+  state: 'open' | 'closed' | 'truncated' | 'closed_by_restart';
+  closeReason: 'tail_rows' | 'tail_duration' | 'capture_bytes' | 'restart' | null;
+  closureRecorded: boolean;
+  firstSequence: number;
+  triggerSequence: number;
+  lastSequence: number;
+  triggerEventId: string;
+  trigger: {
+    eventType: string | null;
+    component: string | null;
+    conditionSeverity: string | null;
+    message: string | null;
+  } | null;
+  openedAtUtcNs: string | null;
+  precedingRows: number;
+  precedingLimit: 'rows' | 'bytes' | 'history_start' | 'pruned';
+  tailRows: number;
+  captureBytes: string;
+  triggerCount: number;
+  recordedTriggers: Array<{ sequence: number; eventId: string }>;
+  unrecordedTriggerCount: number;
+  retainedRows: number;
+  missingSequences: number;
+  writerDeliveryLossBefore: number;
+  writerDeliveryLossDuring: number;
+  coverage: 'complete' | 'uncertain';
+  uncertainty: HistorianCaptureUncertainty[];
+  contents: 'retained_event_context';
+}
+
+export interface HistorianCapturePage {
+  schemaVersion: 'manyforge.historian_capture_page.v1';
+  captures: HistorianCapture[];
+  truncated: boolean;
+  nextBeforeCaptureId: string | null;
+  retention: HistorianRetention;
+}
+
 export interface HistorianRetention {
-  schemaVersion: 'manyforge.historian_retention.v1';
+  schemaVersion: 'manyforge.historian_retention.v2';
+  captures: HistorianCaptureRetention;
   partitionRowLimit: string;
   partitionRecordByteLimit: string;
   databasePageByteLimit: string;

@@ -5,16 +5,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <manyforge_content_identity/canonical_value.hpp>
@@ -33,7 +37,14 @@ inline constexpr std::string_view kHistorianEventSummarySchemaVersion =
     "manyforge.historian_event_summary.v2";
 inline constexpr std::string_view kHistorianDetailSchemaVersion =
     "manyforge.historian_detail.v2";
+inline constexpr std::string_view kHistorianCapturePageSchemaVersion =
+    "manyforge.historian_capture_page.v1";
 inline constexpr std::size_t kDefaultHistorianQueueCapacity = 1024U;
+/// Minimum interval between the starts of two writer commits. Events that
+/// arrive meanwhile wait in memory and share the next transaction.
+inline constexpr std::chrono::milliseconds kDefaultHistorianCommitGap{50};
+/// Upper bound of events in one writer transaction.
+inline constexpr std::size_t kMaximumHistorianBatchEvents = 128U;
 inline constexpr std::size_t kDefaultHistorianRecordRetention = 100000U;
 inline constexpr std::size_t kMaximumHistorianPageSize = 10000U;
 inline constexpr std::size_t kMaximumHistorianPayloadBytes = 256U * 1024U;
@@ -99,6 +110,8 @@ struct HistorianQuery final {
   std::optional<std::string> alarm_phase{};
   std::string search{};
   std::optional<std::string> clock_owner{};
+  /// Restrict to one failure capture's protected sequence range.
+  std::optional<std::uint64_t> capture_id{};
 };
 
 struct HistorianPage final {
@@ -106,7 +119,27 @@ struct HistorianPage final {
   bool truncated;
   std::optional<std::uint64_t> next_before_sequence;
   manyforge::content_identity::CanonicalValue retention{};
+  /// The capture's evidence statement when the query selected one capture.
+  manyforge::content_identity::CanonicalValue capture{};
 };
+
+/// Bounds of failure capture: protection of already-durable rows around an
+/// ERROR/CRITICAL event, never a copied dump. Values are measured hypotheses;
+/// the combined protection budget stays inside the page-image cap.
+struct HistorianCaptureLimits final {
+  std::size_t preceding_rows{1000U};
+  std::int64_t preceding_bytes{2LL * 1024LL * 1024LL};
+  std::size_t tail_rows{200U};
+  std::chrono::milliseconds tail_duration{30000};
+  std::int64_t capture_bytes{4LL * 1024LL * 1024LL};
+  std::size_t live_captures{64U};
+  std::int64_t protected_bytes{32LL * 1024LL * 1024LL};
+  std::size_t recorded_triggers{32U};
+};
+
+/// Monotonic nanoseconds of the writer process. Capture tails are timed only
+/// on this clock; it is never compared across processes.
+using HistorianWriterClock = std::function<std::int64_t()>;
 
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 HistorianPageValue(const HistorianPage &page);
@@ -134,8 +167,29 @@ public:
     kDuplicate,
   };
 
+  /// Result of a batch append: one status per committed leading event.
+  /// When ``failure`` is set, ``events[statuses.size()]`` failed and was not
+  /// committed; no later event of the batch was attempted. Without a failure,
+  /// fewer statuses than events means the store's transaction bound deferred
+  /// the rest (at least one event is always committed).
+  struct AppendBatchResult {
+    std::vector<AppendStatus> statuses;
+    std::exception_ptr failure;
+  };
+
   virtual ~IEventHistoryStore() = default;
+  /// Cumulative events this writer could not deliver (queue overflow and
+  /// store failures). Dropped events have no sequence; a store may only use
+  /// this to mark coverage uncertain, never to place a loss exactly.
+  virtual void ObserveDeliveryLoss(std::uint64_t cumulative_losses) {
+    static_cast<void>(cumulative_losses);
+  }
   [[nodiscard]] virtual AppendStatus Append(const HistorianEvent &event) = 0;
+  /// Append events in order. The default appends them one by one; a store
+  /// may commit them together. A failure of the whole write may also be
+  /// thrown, in which case nothing of the batch was committed.
+  [[nodiscard]] virtual AppendBatchResult
+  AppendBatch(std::span<const HistorianEvent> events);
   [[nodiscard]] virtual HistorianPage Query(const HistorianQuery &query) = 0;
   [[nodiscard]] virtual std::optional<HistorianStoredEvent>
   Read(std::uint64_t sequence) = 0;
@@ -145,14 +199,24 @@ class SqliteEventHistoryStore final : public IEventHistoryStore {
 public:
   explicit SqliteEventHistoryStore(
       std::filesystem::path database_path,
-      std::size_t record_retention = kDefaultHistorianRecordRetention);
+      std::size_t record_retention = kDefaultHistorianRecordRetention,
+      HistorianCaptureLimits capture_limits = {},
+      HistorianWriterClock writer_clock = {});
   ~SqliteEventHistoryStore() override;
 
   SqliteEventHistoryStore(const SqliteEventHistoryStore &) = delete;
   SqliteEventHistoryStore &operator=(const SqliteEventHistoryStore &) = delete;
 
+  void ObserveDeliveryLoss(std::uint64_t cumulative_losses) override;
   [[nodiscard]] AppendStatus Append(const HistorianEvent &event) override;
+  /// One transaction for the whole batch, one savepoint per event. A batch
+  /// holding an ERROR or CRITICAL condition is also synced to disk.
+  [[nodiscard]] AppendBatchResult
+  AppendBatch(std::span<const HistorianEvent> events) override;
   [[nodiscard]] HistorianPage Query(const HistorianQuery &query) override;
+  /// Bounded newest-first list of failure captures (at most 32 per page).
+  [[nodiscard]] manyforge::content_identity::CanonicalValue Captures(
+      std::optional<std::uint64_t> before_capture_id, std::size_t limit);
   [[nodiscard]] manyforge::content_identity::CanonicalValue QuerySummaries(
       const HistorianQuery& query);
   /// Apply the export byte budget before decoding full retained records.
@@ -194,7 +258,8 @@ class AsyncEventHistorian final {
 public:
   explicit AsyncEventHistorian(
       std::shared_ptr<IEventHistoryStore> store,
-      std::size_t queue_capacity = kDefaultHistorianQueueCapacity);
+      std::size_t queue_capacity = kDefaultHistorianQueueCapacity,
+      std::chrono::milliseconds commit_gap = kDefaultHistorianCommitGap);
   ~AsyncEventHistorian();
 
   AsyncEventHistorian(const AsyncEventHistorian &) = delete;
@@ -222,10 +287,14 @@ private:
 
   std::shared_ptr<IEventHistoryStore> store_;
   std::size_t queue_capacity_;
+  std::chrono::milliseconds commit_gap_;
   mutable std::mutex mutex_;
   mutable std::condition_variable condition_;
   mutable std::condition_variable idle_condition_;
   std::deque<HistorianEvent> queue_;
+  /// Identities of the queued events: the duplicate check is one lookup.
+  std::unordered_set<std::string> queued_ids_;
+  std::optional<std::chrono::steady_clock::time_point> last_commit_;
   bool accepting_{true};
   bool stop_requested_{};
   bool write_in_flight_{};

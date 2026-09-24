@@ -12,6 +12,8 @@ import type { ManagerApplyStatus } from '../types/api';
 interface ManagerApplyStatusResult {
   status: ManagerApplyStatus | null;
   synchronizing: boolean;
+  /** The operation's status could not be read; it is neither confirmed nor failed. */
+  unavailable: boolean;
   reason: string | null;
 }
 
@@ -26,6 +28,7 @@ export function useManagerApplyStatus(
   const [status, setStatus] = useState<ManagerApplyStatus | null>(null);
   const [synchronizing, setSynchronizing] = useState(advertised !== null);
   const [reason, setReason] = useState<string | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
   const observedIdentity = useRef<ManagerApplyIdentity | null>(null);
   const target = selectManagerApplyObservationIdentity(advertised, status);
   const applyId = target?.applyId ?? null;
@@ -54,10 +57,12 @@ export function useManagerApplyStatus(
           : acceptManagerApplyStatus(current, candidate)
       ));
       setSynchronizing(false);
+      setUnavailable(false);
       setReason(null);
     }).catch(() => {
       if (controller.signal.aborted) return;
       setSynchronizing(false);
+      setUnavailable(true);
       setReason('Deployment transition status is unavailable.');
     });
     return () => controller.abort();
@@ -67,5 +72,5 @@ export function useManagerApplyStatus(
     snapshotSequence,
   ]);
 
-  return { status, synchronizing, reason };
+  return { status, synchronizing, unavailable, reason };
 }

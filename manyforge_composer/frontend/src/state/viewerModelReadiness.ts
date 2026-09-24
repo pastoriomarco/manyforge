@@ -2,9 +2,27 @@ import type { SceneUrdfManifest, SourceModelProjection } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { StructuralResourceState } from './structuralResource';
 
+/**
+ * Why the previous model is hidden while synchronizing. ``transition`` and
+ * ``loading`` are expected (an accepted activation or an initial/refresh read);
+ * ``connecting`` follows the separately reported control connection; the
+ * remaining reasons mean the current identity cannot be verified and are
+ * errors unless a known controlled transition explains them.
+ */
+export type ViewerModelSynchronizingReason =
+  | 'transition'
+  | 'connecting'
+  | 'loading'
+  | 'projection_stale'
+  | 'identity_mismatch';
+
 export type ViewerModelPresentation =
   | { status: 'ready'; manifest: SceneUrdfManifest }
-  | { status: 'synchronizing'; message: string }
+  | {
+      status: 'synchronizing';
+      reason: ViewerModelSynchronizingReason;
+      message: string;
+    }
   | { status: 'unavailable'; message: string };
 
 type ControlTransportStatus =
@@ -56,6 +74,7 @@ export function viewerModelPresentation(
   if (acceptedTransitionPending) {
     return {
       status: 'synchronizing',
+      reason: 'transition',
       message: 'Scenario activation is pending. The previous robot model is hidden until Manager publication settles.',
     };
   }
@@ -63,6 +82,7 @@ export function viewerModelPresentation(
       || semanticStatus === 'synchronizing') {
     return {
       status: 'synchronizing',
+      reason: 'connecting',
       message: 'Synchronizing with Manager. The previous robot model is hidden until its active identity is verified.',
     };
   }
@@ -83,6 +103,7 @@ export function viewerModelPresentation(
   if (!snapshot.runtime.complete || manager.freshness === 'stale') {
     return {
       status: 'synchronizing',
+      reason: 'projection_stale',
       message: 'The Manager projection is stale. The previous robot model is hidden while it synchronizes.',
     };
   }
@@ -106,6 +127,7 @@ export function viewerModelPresentation(
   if (pending) {
     return {
       status: 'synchronizing',
+      reason: 'transition',
       message: 'A Manager Apply is in progress. The previous robot model is hidden until publication settles.',
     };
   }
@@ -135,6 +157,7 @@ export function viewerModelPresentation(
     return message === null
       ? {
           status: 'synchronizing',
+      reason: 'loading',
           message: 'Synchronizing the active source-model projection; the previous robot model is hidden.',
         }
       : { status: 'unavailable', message: `The active source-model projection is unavailable: ${message}` };
@@ -145,6 +168,7 @@ export function viewerModelPresentation(
       || source.graph_revision !== graphRevision) {
     return {
       status: 'synchronizing',
+      reason: 'identity_mismatch',
       message: 'The source-model identity does not match Manager. The previous robot model is hidden while it refreshes.',
     };
   }
@@ -154,6 +178,7 @@ export function viewerModelPresentation(
     return message === null
       ? {
           status: 'synchronizing',
+      reason: 'loading',
           message: 'Synchronizing the active robot model; the previous model is hidden.',
         }
       : { status: 'unavailable', message: `The active robot model is unavailable: ${message}` };
@@ -166,6 +191,7 @@ export function viewerModelPresentation(
       || manifest.data.graph_revision !== source.graph_revision) {
     return {
       status: 'synchronizing',
+      reason: 'identity_mismatch',
       message: 'The robot model identity does not match the active Manager composition. The previous model is hidden while it refreshes.',
     };
   }

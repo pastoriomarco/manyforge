@@ -211,6 +211,9 @@ public:
   HistoryDiscovery(const std::string &kind, const std::string &after,
                    std::size_t limit);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
+  HistoryCapturePage(std::optional<std::uint64_t> before_capture_id,
+                     std::size_t limit);
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
   HistoryDetail(std::uint64_t sequence);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RecordClientIncident(std::string incident_id, std::string incident_kind,

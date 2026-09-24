@@ -684,6 +684,12 @@ def headless_client() -> (
                 "schema_version": "manyforge.historian_summary_page.v2",
                 "events": [],
             }
+        elif path == "/api/execution/history/captures":
+            payload = {
+                "schema_version": "manyforge.historian_capture_page.v1",
+                "captures": [],
+                "query": dict(request.url.params),
+            }
         elif path == "/api/execution/history/health":
             payload = {
                 "schema_version": "manyforge.historian_health.v1",
@@ -968,6 +974,9 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
             == _alarms()
         )
         assert composer.get("/api/execution/history").status_code == 200
+        captures = composer.get("/api/execution/history/captures?limit=4")
+        assert captures.status_code == 200, captures.text
+        assert captures.json()["query"] == {"limit": "4"}
 
     assert all(
         item["method"] == "GET" for item in _without_authoring_owner_calls(requests)

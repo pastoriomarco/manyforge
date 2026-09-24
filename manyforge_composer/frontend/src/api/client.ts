@@ -10,6 +10,7 @@ import {
   parseHealthResponse,
   parseHistorianPage,
   parseHistorianDetail,
+  parseHistorianCapturePage,
   parseHistorianDiscovery,
   parseExecutionIdentity,
   parseManagerApplyStatus,
@@ -90,6 +91,7 @@ import type {
   AlarmMembership,
   HistorianPage,
   HistorianDetail,
+  HistorianCapturePage,
   HistorianDiscovery,
   OperatorAlarmRecord,
 } from '../types/headless';
@@ -141,6 +143,8 @@ export interface HistorianListQuery {
   channel?: string;
   alarmPhase?: 'all' | 'activated' | 'returned' | 'acknowledged' | 'raw';
   search?: string;
+  /** Restrict to one retained failure capture's protected range. */
+  captureId?: number;
 }
 
 export const HISTORIAN_PAGE_LIMIT = 32;
@@ -182,6 +186,12 @@ export function historianListPath(query: HistorianListQuery = {}): string {
     ['alarm_phase', query.alarmPhase], ['search', query.search],
   ] as const) {
     if (value !== undefined) parameters.set(key, String(value));
+  }
+  if (query.captureId !== undefined) {
+    if (!Number.isSafeInteger(query.captureId) || query.captureId < 1) {
+      throw new Error('Failure capture id must be a positive safe integer');
+    }
+    parameters.set('capture_id', String(query.captureId));
   }
   for (const severity of query.severities ?? []) parameters.append('severities', severity);
   if (query.beforeSequence !== undefined) {
@@ -1259,6 +1269,23 @@ export const api = {
     exportUrl: (query: HistorianListQuery = {}, normalizedTrace = false): string => resolveStructuralAssetUrl(
       historianListPath(query).replace('/api/execution/history?', `/api/debug/export${normalizedTrace ? '/ros2-medkit' : ''}?`),
     ),
+    // One failure capture's retained records and evidence statement, as a
+    // direct bounded download; never parsed into React state.
+    captureExportUrl: (captureId: number): string => resolveStructuralAssetUrl(
+      historianListPath({ captureId }).replace('/api/execution/history?', '/api/execution/history/export?'),
+    ),
+    captures: (
+      beforeCaptureId: string | null = null,
+      signal?: AbortSignal,
+    ): Promise<HistorianCapturePage> => {
+      const parameters = new URLSearchParams({ limit: '32' });
+      if (beforeCaptureId !== null) parameters.set('before_capture_id', beforeCaptureId);
+      return requestJson(
+        `/api/execution/history/captures?${parameters.toString()}`,
+        parseHistorianCapturePage,
+        signal,
+      );
+    },
     list: (
       query: HistorianListQuery = {},
       signal?: AbortSignal,

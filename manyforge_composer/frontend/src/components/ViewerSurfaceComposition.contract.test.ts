@@ -18,7 +18,8 @@ describe('UI4 application and viewport composition', () => {
     expect(app).toContain('global-attention-count');
     expect(app).toContain('>AI</button>');
     expect(app).not.toContain('className="live-controls-scroll"');
-    expect(app).toContain("runtimeOverlay={globalPanel === 'runtime'");
+    expect(app).toContain('<WorkbenchNotificationStack');
+    expect(app).toContain("errorRow={globalPanel === 'runtime' || errorItemCount > 0 ? (");
     expect(app).not.toContain('<details className="workbench-disclosure"');
     expect(viewer).toContain('>Robot</button>');
     expect(viewer).toContain('>Object</button>');
@@ -51,7 +52,8 @@ describe('UI4 application and viewport composition', () => {
     expect(styles).toMatch(/\.central-inspector-section \.program-property \{[\s\S]*?padding: var\(--inspector-row-padding\) 0;/);
     expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-joint \{[\s\S]*?padding: var\(--inspector-row-padding\) 0;/);
     expect(styles).toContain('.central-inspector-notice-warning');
-    expect(styles).toMatch(/\.viewer-stage > \.runtime-observability-surface \{[\s\S]*?top: 0\.55rem;[\s\S]*?left: 50%;/);
+    expect(styles).toMatch(/\.workbench-notification-stack \{[\s\S]*?top: 0\.55rem;[\s\S]*?left: 50%;/);
+    expect(styles).toMatch(/\.workbench-notification-stack > \.runtime-observability-surface \{[^}]*position: static;/);
     expect(styles).not.toContain('.viewer-slot > .runtime-observability-surface');
   });
 
@@ -89,7 +91,10 @@ describe('UI4 application and viewport composition', () => {
     expect(transport).toContain('Scale current and subsequent moves');
     expect(styles).toMatch(/\.viewer-transport \{[^}]*grid-template-columns:[^;]*var\(--viewer-transport-motion-panel-width\)[^;]*minmax\(0, 1fr\)[^;]*var\(--viewer-transport-column-width\);/s);
     expect(styles).toMatch(/\.transport-control-layout \{[^}]*display: contents;/s);
-    expect(styles).toMatch(/\.transport-guidance \{[^}]*position: absolute;[^}]*right: calc\(var\(--viewer-transport-column-width\) \+ 1\.25rem\);[^}]*bottom: 0;[^}]*left: calc\(var\(--viewer-transport-motion-panel-width\) \+ 1\.25rem\);/s);
+    // Guidance and recovery moved to the one notification stack; nothing is
+    // positioned between the Motion and Program panels any more.
+    expect(styles).not.toContain('.transport-guidance');
+    expect(transport).not.toContain('transport-guidance');
     expect(styles).toMatch(/\.viewer-transport \{[^}]*padding: 0;[^}]*overflow: visible;/s);
     expect(styles).not.toMatch(/\.viewer-transport \{[^}]*(?:border|background):/s);
     expect(styles).toMatch(/\.transport-motion-panel \{[^}]*border: 1px solid #365463;[^}]*background: rgb\(8 23 32 \/ 94%\);/s);

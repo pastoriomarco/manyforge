@@ -4,10 +4,12 @@ import {
   useMemo,
   useReducer,
   useRef,
+  useState,
 } from 'react';
 
 import { api, isStaleWorkspaceError } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
+import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
   programLocalFence,
   publicationSupersedesProgram,
@@ -46,6 +48,18 @@ interface ProgramWorkspaceRunResult {
   workspace: ProgramWorkspaceResponse;
   message: string | null;
   transitionStatus: ProgramWorkspaceTransitionStatus | null;
+  /** Exact Manager operation accepted by this request, when one was. */
+  acceptedApply?: ManagerApplyIdentity | null;
+}
+
+function acceptedApplyIdentity(
+  applyId: unknown,
+  applyGeneration: unknown,
+): ManagerApplyIdentity | null {
+  return typeof applyId === 'string' && applyId.length > 0
+    && typeof applyGeneration === 'number' && Number.isSafeInteger(applyGeneration)
+    ? { applyId, applyGeneration }
+    : null;
 }
 
 function workspaceResult(
@@ -64,8 +78,9 @@ export function programWorkspaceTransitionResult(
     const applyId = response.headless?.apply_id;
     return {
       workspace: response.workspace,
-      message: `${action === 'apply' ? 'Apply' : 'Revert'} accepted (${String(applyId)}). Check Runtime / history for completion.`,
+      message: `${action === 'apply' ? 'Apply' : 'Revert'} accepted (${String(applyId)}); activation progress is shown under Activity.`,
       transitionStatus: response.status,
+      acceptedApply: acceptedApplyIdentity(applyId, response.headless?.apply_generation),
     };
   }
   if (action === 'revert' && response.status === 'reverted') {
@@ -102,6 +117,7 @@ export function useProgramWorkspace(
     programWorkspaceReducer,
     INITIAL_PROGRAM_WORKSPACE_STATE,
   );
+  const [acceptedApply, setAcceptedApply] = useState<ManagerApplyIdentity | null>(null);
   const generation = useRef(0);
   const mounted = useRef(true);
   const workspaceRead = useRef<Promise<ProgramWorkspaceResponse> | null>(null);
@@ -159,6 +175,9 @@ export function useProgramWorkspace(
     dispatch({ type: 'request_started', generation: current, action });
     try {
       const result = await request();
+      if (mounted.current && result.acceptedApply) {
+        setAcceptedApply(result.acceptedApply);
+      }
       if (mounted.current) {
         dispatch({
           type: 'request_succeeded',
@@ -457,8 +476,12 @@ export function useProgramWorkspace(
       const applyId = response.activation.apply_id;
       return {
         workspace: response.workspace,
-        message: `Scenario Load accepted (${applyId}); activation is in progress. Check Runtime / history for completion; motion does not start automatically.`,
+        message: `Scenario Load accepted (${applyId}); activation progress is shown under Activity. Motion does not start automatically.`,
         transitionStatus: 'accepted',
+        acceptedApply: acceptedApplyIdentity(
+          applyId,
+          response.activation.apply_generation,
+        ),
       };
     });
   }, [run, scenarioFence]);
@@ -504,6 +527,7 @@ export function useProgramWorkspace(
 
   return useMemo(() => ({
     state,
+    acceptedApply,
     mutationAvailable,
     mutationUnavailableReason,
     admissionObserved,
@@ -527,6 +551,7 @@ export function useProgramWorkspace(
     updateNodePolicies,
     clearFeedback,
   }), [
+    acceptedApply,
     admissionObserved,
     apply,
     clearFeedback,

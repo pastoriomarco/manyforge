@@ -584,7 +584,10 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       true,
     );
     expect(latest?.state.message).toContain('Scenario Load accepted');
-    expect(latest?.state.message).toContain('motion does not start automatically');
+    expect(latest?.state.message).toContain('Motion does not start automatically');
+    expect(latest?.state.message).not.toContain('Check Runtime / history');
+    // Activity follows the exact accepted Manager operation, not any newer one.
+    expect(latest?.acceptedApply?.applyId).toBe('apply.1');
 
     apiMock.scenarioDocuments.load.mockResolvedValueOnce({
       status: 'applied',

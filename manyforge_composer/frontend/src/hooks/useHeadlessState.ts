@@ -280,7 +280,11 @@ export type ControlClientIncidentKind =
   | 'command_delivery_unconfirmed'
   | 'control_disconnected'
   | 'history_detail_request_failed'
-  | 'history_request_failed';
+  | 'history_request_failed'
+  | 'viewer_model_unavailable'
+  | 'viewer_scene_unverified'
+  | 'viewer_observation_stale'
+  | 'viewer_geometry_unavailable';
 
 interface ClientIncidentState {
   id: string;
@@ -824,6 +828,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     active: boolean,
     reasonCode: string,
     observedDelayNs: number | null = null,
+    /** performance.now() when the condition began, if before this report. */
+    startedMs?: number,
   ): void => {
     const existing = this.clientIncidents.get(kind);
     if (active) {
@@ -839,7 +845,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`}`,
         kind,
         reasonCode,
-        startedMs: performance.now(),
+        startedMs: startedMs !== undefined && startedMs <= performance.now()
+          ? startedMs
+          : performance.now(),
         occurrenceCount: 1,
         maximumDelayNs: observedDelayNs,
         activationSent: false,

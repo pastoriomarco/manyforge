@@ -89,6 +89,30 @@ export function authoringUnavailableReason(
   return null;
 }
 
+/**
+ * The typed cause behind :func:`authoringUnavailableReason`, so presentation
+ * can distinguish normal execution/synchronization (information) from lost
+ * authoritative state or refused admission (error) without parsing text.
+ */
+export type AuthoringUnavailableCause =
+  | 'disconnected'
+  | 'not_read'
+  | 'synchronizing'
+  | 'execution_active'
+  | 'not_admitted';
+
+export function authoringUnavailableCause(
+  published: PublishedAuthoringWorkspace | null,
+  snapshot: ComposerHeadlessState | null,
+): AuthoringUnavailableCause | null {
+  if (snapshot === null) return 'disconnected';
+  if (published === null) return 'not_read';
+  if (!publicationIsCurrent(published, snapshot)) return 'synchronizing';
+  if (snapshot.programCycle.state !== 'idle_after_reset') return 'execution_active';
+  if (!snapshot.authoringAdmission.authoringAllowed) return 'not_admitted';
+  return null;
+}
+
 export function programLocalFence(
   published: PublishedAuthoringWorkspace,
   snapshot: ComposerHeadlessState,

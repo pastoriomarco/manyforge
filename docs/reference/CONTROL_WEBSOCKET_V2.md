@@ -99,11 +99,17 @@ changing semantic state.
 
 Client message kinds are `client_hello`, `heartbeat_echo`, `state_applied`,
 `command`, and `client_incident`. `client_incident` accepts only the small
-published enum of browser-only transport/render/history failures; Headless
-supplies time and attribution and cannot be used as a general event writer.
-The v2 client enum is `browser_render_delayed`,
+published enum of browser-only transport/render/history/viewer failures;
+Headless supplies time and attribution and cannot be used as a general event
+writer. The v2 client enum is `browser_render_delayed`,
 `command_delivery_unconfirmed`, `control_disconnected`,
-`history_request_failed`, and `history_detail_request_failed`. Headless itself
+`history_request_failed`, `history_detail_request_failed`,
+`viewer_model_unavailable`, `viewer_scene_unverified`,
+`viewer_observation_stale`, and `viewer_geometry_unavailable`. The viewer kinds
+record an unavailable or unverifiable view of the applied robot model, Scene,
+live poses or required geometry while the browser presents it as an error;
+they are reported once on activation and once on resolution, and the expected
+gap of a known controlled Load/Apply transition is not reported. Headless itself
 records `control_delayed` and `control_stale` from measured challenge RTT.
 Each threshold has one bounded incident episode across consecutive delayed
 challenges. A late echo proves liveness but does not resolve delay; one round

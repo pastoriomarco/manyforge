@@ -27,7 +27,7 @@ from manyforge_behavior.program import Program, ProgramValidationError
 
 from .execution import ExecutionPort
 from .manager import ManagerPort
-from .history_query import HistorianQueryRequest
+from .history_query import HistorianCaptureRequest, HistorianQueryRequest
 from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
@@ -1982,6 +1982,23 @@ class HeadlessService:
 
     def history_detail(self, sequence: int) -> dict[str, Any]:
         return self.core.history_detail(sequence)
+
+    def history_captures(self, query: HistorianCaptureRequest) -> dict[str, Any]:
+        page = self.core.history_captures(
+            before_capture_id=query.before_capture_id, limit=query.limit
+        )
+        captures = page.get("captures")
+        if (
+            page.get("schema_version") != "manyforge.historian_capture_page.v1"
+            or not isinstance(captures, list)
+            or len(captures) > query.limit
+            or type(page.get("truncated")) is not bool
+        ):
+            raise HeadlessApiError(
+                "historian_response_invalid",
+                "native historian returned an invalid capture page",
+            )
+        return page
 
     def history_export(self, query: HistorianQueryRequest) -> dict[str, Any]:
         arguments = query.native_arguments(now_utc_ns=time.time_ns())

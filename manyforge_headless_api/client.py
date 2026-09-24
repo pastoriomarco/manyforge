@@ -1130,6 +1130,13 @@ class HeadlessHttpClient:
     ) -> bytes:
         return self.get_json_payload("/api/execution/history", params=params)
 
+    def history_captures(
+        self,
+        *,
+        params: Sequence[tuple[str, str | int]] = (),
+    ) -> dict[str, Any]:
+        return self.request("GET", "/api/execution/history/captures", params=params)
+
     def history_detail(self, sequence: int) -> dict[str, Any]:
         if not 1 <= sequence <= 9_007_199_254_740_991:
             raise ValueError("history sequence must be a positive safe integer")

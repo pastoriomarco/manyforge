@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-09-23 05:34:51 UTC
+  Last regenerated: 2026-09-24 09:17:11 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -3413,6 +3413,19 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 ],
                 "title": "Before Sequence"
               },
+              "capture_id": {
+                "anyOf": [
+                  {
+                    "maximum": 9007199254740991,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Capture Id"
+              },
               "channel": {
                 "anyOf": [
                   {
@@ -3842,6 +3855,19 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 ],
                 "title": "Before Sequence"
               },
+              "capture_id": {
+                "anyOf": [
+                  {
+                    "maximum": 9007199254740991,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Capture Id"
+              },
               "channel": {
                 "anyOf": [
                   {
@@ -4270,6 +4296,19 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                   }
                 ],
                 "title": "Before Sequence"
+              },
+              "capture_id": {
+                "anyOf": [
+                  {
+                    "maximum": 9007199254740991,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Capture Id"
               },
               "channel": {
                 "anyOf": [

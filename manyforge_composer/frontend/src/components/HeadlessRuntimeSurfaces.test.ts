@@ -35,18 +35,24 @@ describe('headless Composer presentation adapters', () => {
       title: 'Program command failed',
       message: 'Exact response mismatch.',
       active: true,
-      acknowledgementRequired: false,
-    }])).toBe('Program command failed');
+      acknowledgementRequired: false, severity: 'error' as const,
+    }])).toBe('Program command failed — Exact response mismatch.');
     expect(runtimeAttentionSummary([], [
       {
         id: 'composer.error.1', title: 'First', message: 'First detail',
-        active: true, acknowledgementRequired: false,
+        active: true, acknowledgementRequired: false, severity: 'error' as const,
       },
       {
         id: 'composer.error.2', title: 'Second', message: 'Second detail',
-        active: false, acknowledgementRequired: true,
+        active: false, acknowledgementRequired: true, severity: 'error' as const,
       },
-    ])).toBe('2 messages require attention');
+    ])).toBe('2 errors require attention · First');
+    // Unresolved conditions lead the summary and count, but never enter the
+    // acknowledgement fence (see the rendered rail below).
+    expect(runtimeAttentionSummary([], [], [{
+      id: 'recovery.cell', severity: 'error', domain: 'recovery',
+      title: 'Cell recovery required', message: 'physical rest unproven.',
+    }])).toBe('Cell recovery required — physical rest unproven.');
   });
 
   it('maps only the four-state owner record into alarm presentation', () => {
@@ -297,7 +303,7 @@ describe('headless Composer presentation adapters', () => {
         title: 'Program command or response failed',
         message: 'Invalid response from /api/program/runs/program-run.1',
         active: false,
-        acknowledgementRequired: true,
+        acknowledgementRequired: true, severity: 'error' as const,
       }],
       onAcknowledgeClientError: vi.fn(),
     }));
@@ -330,14 +336,49 @@ describe('headless Composer presentation adapters', () => {
         title: 'Program command or response failed',
         message: 'Invalid response from /api/program/runs/program-run.1',
         active: false,
-        acknowledgementRequired: true,
+        acknowledgementRequired: true, severity: 'error' as const,
       }],
       expanded: false,
       onExpandedChange: vi.fn(),
       onClose: vi.fn(),
     }));
-    expect(collapsed).toContain('2 messages require attention');
+    expect(collapsed).toContain('2 errors require attention');
     expect(collapsed).toContain('Acknowledge all');
+
+    // An unresolved condition is shown and counted with its source action,
+    // but it is never acknowledged/dismissed and never enters the fence.
+    const recover = vi.fn();
+    const withCondition = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
+      enabled: true,
+      headlessState: {
+        snapshot: {
+          ...snapshot,
+          alarms: {
+            ...snapshot.alarms,
+            alarms: [],
+            unacknowledgedCount: 0,
+            unacknowledgedMembership: [],
+          },
+        },
+        error: null,
+        transportStatus: 'connected',
+        transportError: null,
+        semanticStatus: 'current',
+        semanticReason: null,
+        reconnect,
+      },
+      conditions: [{
+        id: 'recovery.cell', severity: 'error', domain: 'recovery',
+        title: 'Cell recovery required', message: 'physical rest unproven.',
+        actions: [{ id: 'recover-cell', label: 'Retry recovery', run: recover }],
+      }],
+      expanded: false,
+      onExpandedChange: vi.fn(),
+    }));
+    expect(withCondition).toContain('Cell recovery required — physical rest unproven.');
+    expect(withCondition).toContain('>Retry recovery</button>');
+    expect(withCondition).not.toMatch(/>(Acknowledge|Dismiss|Acknowledge all)</);
+    expect(withCondition).toContain('attention-error');
     expect(collapsed).not.toContain('Runtime observability sections');
     expect(collapsed).not.toContain('Planner unavailable');
 
@@ -368,7 +409,7 @@ describe('headless Composer presentation adapters', () => {
         title: 'Viewer source-model response failed',
         message: 'Projection contract mismatch.',
         active: true,
-        acknowledgementRequired: false,
+        acknowledgementRequired: false, severity: 'error' as const,
       }],
       onAcknowledgeClientError: vi.fn(),
       expanded: false,

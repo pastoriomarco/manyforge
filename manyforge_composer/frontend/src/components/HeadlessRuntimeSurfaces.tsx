@@ -28,8 +28,11 @@ import type {
   HistoryAlarmPhase,
 } from './ExecutionHistoryPanel';
 import { KernelErrorPanel } from './KernelErrorPanel';
+import { FailureCapturePanel } from './FailureCapturePanel';
 import { useOperationalErrorMirror } from '../state/operationalErrors';
+import type { WorkbenchNotice } from '../state/workbenchNotices';
 import { OverlayPanel } from './OverlayPanel';
+import { NoticeActions, NoticeItem, NotificationRail } from './WorkbenchNotifications';
 
 export interface ClientOperationalError {
   id: string;
@@ -37,7 +40,9 @@ export interface ClientOperationalError {
   message: string;
   active: boolean;
   acknowledgementRequired: boolean;
-  severity?: 'warning' | 'error';
+  /** Composer messages in the registry are errors; acknowledgement never
+   * applies to warnings or information. */
+  severity: 'error';
 }
 
 
@@ -141,6 +146,7 @@ interface HeadlessRuntimeSurfacesProps {
   enabled: boolean;
   headlessStateSource: HeadlessStateSource;
   clientErrors?: ClientOperationalError[];
+  conditions?: WorkbenchNotice[];
   onAcknowledgeClientError?: (id: string) => void;
   attentionRequest?: string | null;
   expanded?: boolean;
@@ -152,6 +158,9 @@ interface HeadlessRuntimeSurfacesViewProps {
   enabled: boolean;
   headlessState: HeadlessStateResult;
   clientErrors?: ClientOperationalError[];
+  /** Current unresolved error conditions. They have source actions but no
+   * acknowledgement or dismissal and stay until their source resolves. */
+  conditions?: WorkbenchNotice[];
   onAcknowledgeClientError?: (id: string) => void;
   attentionRequest?: string | null;
   expanded?: boolean;
@@ -179,17 +188,26 @@ function sameIdentities(left: string[], right: string[]): boolean {
 export function runtimeAttentionSummary(
   alarms: OperatorAlarmRecord[],
   clientErrors: ClientOperationalError[],
+  conditions: readonly WorkbenchNotice[] = [],
 ): string {
-  const count = alarms.length + clientErrors.length;
+  const count = alarms.length + clientErrors.length + conditions.length;
   if (count === 0) return 'No messages require attention';
-  if (count > 1) return `${count} messages require attention`;
-  return clientErrors[0]?.title ?? alarms[0]?.title ?? 'Attention required';
+  if (count > 1) return `${count} errors require attention · ${
+    conditions[0]?.title ?? clientErrors[0]?.title ?? alarms[0]?.title}`;
+  const condition = conditions[0];
+  if (condition !== undefined) {
+    return condition.message ? `${condition.title} — ${condition.message}` : condition.title;
+  }
+  const clientError = clientErrors[0];
+  if (clientError !== undefined) return `${clientError.title} — ${clientError.message}`;
+  return alarms[0]?.title ?? 'Attention required';
 }
 
 export function HeadlessRuntimeSurfacesView({
   enabled,
   headlessState,
   clientErrors = [],
+  conditions = [],
   onAcknowledgeClientError,
   attentionRequest = null,
   expanded = true,
@@ -202,7 +220,7 @@ export function HeadlessRuntimeSurfacesView({
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkFence, setBulkFence] = useState<RuntimeAttentionFence | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [mode, setMode] = useState<'attention' | 'active' | 'history'>('attention');
+  const [mode, setMode] = useState<'attention' | 'active' | 'history' | 'captures'>('attention');
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historyEvents, setHistoryEvents] = useState<ExecutionHistoryEventView[]>([]);
@@ -275,11 +293,16 @@ export function HeadlessRuntimeSurfacesView({
   );
   const standing = snapshot?.alarms.alarms.filter((alarm) =>
     alarm.lifecycleState === 'active_acknowledged') ?? [];
+  // Acknowledgeable/dismissible items keep their exact fence; conditions are
+  // counted and shown but never enter acknowledgement.
   const attentionCount = attention.length + clientErrors.length;
-  const attentionSummary = runtimeAttentionSummary(attention, clientErrors);
-  const singleClientError = attentionCount === 1 ? clientErrors[0] : undefined;
-  const singleAlarm = attentionCount === 1 ? attention[0] : undefined;
-  const attentionSeverity = clientErrors.some((item) => item.severity !== 'warning')
+  const itemCount = attentionCount + conditions.length;
+  const attentionSummary = runtimeAttentionSummary(attention, clientErrors, conditions);
+  const singleClientError = itemCount === 1 ? clientErrors[0] : undefined;
+  const singleAlarm = itemCount === 1 ? attention[0] : undefined;
+  const singleCondition = itemCount === 1 ? conditions[0] : undefined;
+  const attentionSeverity = conditions.length > 0
+    || clientErrors.length > 0
     || attention.some(
     (alarm) => alarm.priority === 'critical' || alarm.priority === 'high',
   ) ? 'error' : 'warning';
@@ -437,18 +460,25 @@ export function HeadlessRuntimeSurfacesView({
   return (
     <section
       className={`runtime-observability-surface ${expanded ? 'expanded' : 'collapsed'}${
-        attentionCount > 0 ? ` has-attention attention-${attentionSeverity}` : ''
+        itemCount > 0 ? ` has-attention attention-${attentionSeverity}` : ''
       }`}
       role="dialog"
       aria-modal="false"
-      aria-label="Runtime, alarms, and history"
+      aria-label="Errors, alarms, and runtime history"
     >
-      <header className="runtime-observability-rail">
-        <strong>Runtime / history</strong>
-        <span className="runtime-observability-rail-summary" aria-live="polite">
-          {attentionSummary}
-        </span>
-        <div className="runtime-observability-rail-actions">
+      <NotificationRail
+        className="runtime-observability-rail"
+        label={itemCount > 0 ? 'Errors' : 'Runtime / history'}
+        summary={attentionSummary}
+        expanded={expanded}
+        onToggle={() => onExpandedChange?.(!expanded)}
+        expandLabel="runtime details"
+        onClose={onClose}
+        closeLabel="Close runtime messages"
+        actions={<>
+          {singleCondition !== undefined && !expanded && (
+            <NoticeActions notice={singleCondition} />
+          )}
           {singleClientError !== undefined && onAcknowledgeClientError !== undefined && (
             <button
               type="button"
@@ -476,33 +506,14 @@ export function HeadlessRuntimeSurfacesView({
               ref={acknowledgeAllButton}
               type="button"
               disabled={bulkBusy || busyActivation !== null}
-              title="Acknowledge the exact current alarm set and dismiss the exact current Composer messages. This does not change execution."
+              title="Acknowledge the exact current alarm set and dismiss the exact current Composer messages. Unresolved error conditions remain. This does not change execution."
               onClick={requestBulkConfirmation}
             >
               Acknowledge all
             </button>
           )}
-          <button
-            type="button"
-            className="icon-button"
-            aria-label={expanded ? 'Collapse runtime details' : 'Expand runtime details'}
-            aria-expanded={expanded}
-            title={expanded ? 'Collapse runtime details' : 'Expand runtime details'}
-            onClick={() => onExpandedChange?.(!expanded)}
-          >
-            {expanded ? '⌃' : '⌄'}
-          </button>
-          {onClose && (
-            <button
-              type="button"
-              className="icon-button"
-              aria-label="Close runtime messages"
-              title="Close runtime messages"
-              onClick={onClose}
-            >×</button>
-          )}
-        </div>
-      </header>
+        </>}
+      />
       {expanded && (
       <div className="runtime-observability-details">
       <nav className="runtime-observability-tabs" aria-label="Runtime observability sections">
@@ -512,7 +523,7 @@ export function HeadlessRuntimeSurfacesView({
           aria-pressed={mode === 'attention'}
           onClick={() => setMode('attention')}
         >
-          Attention{attentionCount > 0 ? ` ${attentionCount}` : ''}
+          Attention{itemCount > 0 ? ` ${itemCount}` : ''}
         </button>
         <button
           type="button"
@@ -531,25 +542,36 @@ export function HeadlessRuntimeSurfacesView({
             if (historyEvents.length === 0 && !historyLoading) void loadHistory();
           }}
         >History</button>
+        <button
+          type="button"
+          className={mode === 'captures' ? 'active' : ''}
+          aria-pressed={mode === 'captures'}
+          onClick={() => setMode('captures')}
+        >Captures</button>
       </nav>
+
+      <FailureCapturePanel open={enabled && expanded && mode === 'captures'} />
 
       {mode === 'attention' && (
         <div className="runtime-observability-section" aria-label="Attention required">
           <header className="runtime-observability-section-header">
             <div>
               <strong>Attention required</strong>
-              <small>Exact backend alarms and current Composer-session errors.</small>
+              <small>Unresolved error conditions, exact backend alarms and current Composer-session errors.</small>
             </div>
           </header>
-          {attentionCount === 0 && <p className="muted">Nothing currently requires acknowledgement.</p>}
+          {itemCount === 0 && <p className="muted">Nothing currently requires attention.</p>}
+          {conditions.map((condition) => (
+            <NoticeItem key={condition.id} notice={condition} />
+          ))}
           {clientErrors.map((clientError) => (
           <div
-            className={`operator-alarm-panel severity-${clientError.severity ?? 'error'}`}
+            className={`operator-alarm-panel severity-${clientError.severity}`}
             key={clientError.id}
           >
             <details>
               <summary>
-                COMPOSER {(clientError.severity ?? 'error').toUpperCase()}{
+                COMPOSER {clientError.severity.toUpperCase()}{
                   clientError.acknowledgementRequired
                   ? ` — ${clientError.active ? '' : 'RESOLVED · '}DISMISSAL REQUIRED`
                   : ''} · {clientError.title}
@@ -559,7 +581,7 @@ export function HeadlessRuntimeSurfacesView({
                 presentation={{
                   headline: clientError.title,
                   hint: clientError.message,
-                  severity: clientError.severity ?? 'error',
+                  severity: clientError.severity,
                 }}
                 presentationKey={clientError.id}
                 eyebrow="Composer client error"
@@ -693,6 +715,7 @@ export function HeadlessRuntimeSurfaces({
   enabled,
   headlessStateSource,
   clientErrors = [],
+  conditions = [],
   onAcknowledgeClientError,
   attentionRequest = null,
   expanded = true,
@@ -715,6 +738,7 @@ export function HeadlessRuntimeSurfaces({
       enabled={enabled}
       headlessState={headlessState}
       clientErrors={clientErrors}
+      conditions={conditions}
       onAcknowledgeClientError={onAcknowledgeClientError}
       attentionRequest={attentionRequest}
       expanded={expanded}

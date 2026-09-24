@@ -287,6 +287,11 @@ export function ExecutionHistoryPanel({
           {' → '}{part.lastRecordedUtcNs === null ? 'unavailable' : new Date(Number(BigInt(part.lastRecordedUtcNs) / 1_000_000n)).toISOString()}.
           {' '}{part.unknownTimeCount} unknown times; {part.regressedTimeCount} clock regressions.
         </p>)}
+        <p>
+          <strong>failure captures</strong>: {retention.captures.liveCount} of {retention.captures.liveCaptureLimit} retained
+          {' '}protecting {retention.captures.protectedCount} events ({retention.captures.protectedBytes} of {retention.captures.protectedByteLimit} bytes);
+          {' '}{retention.captures.retiredCount} retired, releasing {retention.captures.releasedRows} events to ordinary pruning.
+        </p>
       </details>}
       <div className="history-events">
         {loading && <p className="muted">Loading history…</p>}

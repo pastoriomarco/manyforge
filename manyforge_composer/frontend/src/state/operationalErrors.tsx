@@ -84,10 +84,7 @@ export function reduceOperationalErrors(
       active: true,
       acknowledgementRequired:
         action.attentionPolicy === 'acknowledgement_required',
-      severity: action.source === 'composer.control_transport'
-        && action.message.startsWith('Control connection is delayed')
-        ? 'warning'
-        : 'error',
+      severity: 'error',
       attentionPolicy: action.attentionPolicy,
       dismissSource: action.dismissSource,
     };
@@ -123,10 +120,11 @@ export function reduceOperationalErrors(
 const OperationalErrorContext = createContext<OperationalErrorRegistry>(EMPTY_REGISTRY);
 
 /**
- * One session-local registry for actionable Composer failures. It is only a
- * presentation source: backend alarms and runtime authority stay with their
- * owners, while local response/transport failures become dismissible in the
- * same Runtime/history surface instead of creating private toast systems.
+ * One session-local registry for dismissible Composer failures (red row).
+ * It is only a presentation source: backend alarms and runtime authority stay
+ * with their owners. Every record is an error by construction; warnings and
+ * current conditions are derived notices, never registry entries, so no
+ * severity is ever inferred from message text.
  */
 export function OperationalErrorProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<OperationalErrorState>(

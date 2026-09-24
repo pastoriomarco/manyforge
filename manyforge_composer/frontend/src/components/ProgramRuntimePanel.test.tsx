@@ -10,7 +10,11 @@ import type {
   RuntimeScaleControlStatus,
 } from '../types/robotControl';
 import { statusFixture } from '../testFixtures/robotControl';
-import { ProgramRuntimePanel, ProgramTransportControls } from './ProgramRuntimePanel';
+import {
+  deriveTransportGuidance,
+  ProgramRuntimePanel,
+  ProgramTransportControls,
+} from './ProgramRuntimePanel';
 
 function ordinaryMotionStopOffer(): CycleRecoveryOffer {
   return {
@@ -686,14 +690,12 @@ describe('Program runtime projection', () => {
     expect(transport).not.toMatch(/\.viewer-transport \{[^}]*(?:border|background):/s);
     expect(transport).toMatch(/\.viewer-transport \{[^}]*pointer-events: none;/s);
     expect(css).toMatch(
-      /\.viewer-transport \.transport-motion-panel,[\s\S]*\.transport-unique-column,[\s\S]*\.transport-guidance \{[^}]*pointer-events: auto;/s,
+      /\.viewer-transport \.transport-motion-panel,[\s\S]*\.transport-unique-column \{[^}]*pointer-events: auto;/s,
     );
     expect(transport).toMatch(
       /\.viewer-transport \{[^}]*grid-template-columns:[^;]*var\(--viewer-transport-motion-panel-width\)[^;]*minmax\(0, 1fr\)[^;]*var\(--viewer-transport-column-width\);[^}]*column-gap: 1\.25rem;/s,
     );
-    expect(transport).toMatch(
-      /\.transport-guidance \{[^}]*position: absolute;[^}]*right: calc\(var\(--viewer-transport-column-width\) \+ 1\.25rem\);[^}]*bottom: 0;[^}]*left: calc\(var\(--viewer-transport-motion-panel-width\) \+ 1\.25rem\);/s,
-    );
+    expect(css).not.toContain('.transport-guidance');
     expect(transport).toMatch(/\.transport-control-layout \{[^}]*display: contents;/s);
     expect(transport).toMatch(
       /\.transport-motion-panel \{[^}]*border: 1px solid #365463;[^}]*background: rgb\(8 23 32 \/ 94%\);/s,
@@ -780,27 +782,41 @@ describe('Program runtime projection', () => {
     robot.state.status.manualOperations = [operation];
     const idle = controller('succeeded', 'idle_after_reset');
     idle.commandAllowed = vi.fn(() => false);
-    const render = (enabled = true) => renderToStaticMarkup(<ProgramTransportControls
-      enabled={enabled} program={idle} robot={robot} onOpenRobotControls={vi.fn()} />);
-    const markup = render();
-    expect(markup).toContain('Manual gripper recovery required');
-    expect(markup).toContain('Execution timeout exceeded');
-    expect(markup).toContain('Open gripper recovery');
-    expect(markup).toContain('Robot control → Reset operation');
+    const openRecovery = vi.fn();
+    const guidance = (enabled = true) => deriveTransportGuidance({
+      enabled, program: idle, robot, motionActive: false,
+      onOpenManualRecovery: openRecovery, onReviewProgramRecovery: vi.fn(),
+    });
+    const [manual] = guidance();
+    expect(manual).toMatchObject({
+      id: 'recovery.manual.faulted-gripper',
+      severity: 'error',
+      domain: 'recovery',
+      title: 'Manual gripper recovery required',
+    });
+    expect(manual.message).toContain('Execution timeout exceeded');
+    expect(manual.message).toContain('Robot control → Reset operation');
+    // The existing guarded action travels with its message; there is no
+    // acknowledgement and no second copy beside the transport controls.
+    expect(manual.actions?.map((action) => action.label)).toEqual(['Open gripper recovery']);
+    manual.actions?.[0].run();
+    expect(openRecovery).toHaveBeenCalledWith(operation);
+    const markup = renderToStaticMarkup(<ProgramTransportControls
+      enabled program={idle} robot={robot} onOpenRobotControls={vi.fn()} />);
+    expect(markup).not.toContain('Open gripper recovery');
+    expect(markup).not.toContain('transport-guidance');
     expect(markup).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""/);
-    expect(render(false)).toContain('Control status unavailable.');
-    expect(render(false)).not.toContain('Manual gripper recovery required');
+    // Without a current control connection the connection condition reports
+    // once; recovery facts are not presented as current.
+    expect(guidance(false)).toEqual([]);
     robot.currentStatus = null;
-    expect(render()).toContain('Robot status unavailable.');
-    expect(render()).not.toContain('Manual gripper recovery required');
-    expect(render()).not.toContain('Open gripper recovery');
+    expect(guidance().map((notice) => notice.title)).toEqual(['Robot status unavailable']);
     robot.currentStatus = robot.state.status;
     operation.resident = false;
-    expect(render()).not.toContain('recovery required');
-    expect(render()).not.toContain('Open gripper recovery');
+    expect(guidance()).toEqual([]);
     for (const state of ['completed', 'stopped', 'cancelled_pre_dispatch'] as const) {
       robot.state.status.manualOperations = [{ ...operation, resident: true, state, terminalError: null }];
-      expect(render()).not.toContain('Manual gripper recovery required');
+      expect(guidance()).toEqual([]);
     }
   });
 
@@ -812,17 +828,29 @@ describe('Program runtime projection', () => {
       command_kind: 'resume_motion',
       message: 'The Resume Motion outcome could not be confirmed. Reset is required.',
     };
-    const render = () => renderToStaticMarkup(<ProgramTransportControls
-      enabled program={program} robot={robotController()} />);
-    expect(render()).toContain('Program recovery required.');
-    expect(render()).toContain('The Resume Motion outcome could not be confirmed. Reset is required.');
-    expect(render()).not.toContain('Participant requires reconciliation');
-    expect(render()).toContain('Program recovery required.');
-    expect(render()).toContain('Review Program recovery');
-    expect(render()).toMatch(/class="transport-reset transport-unique-control meaningful"(?![^>]*disabled)/);
+    const robot = robotController();
+    robot.currentStatus = statusFixture();
+    const review = vi.fn();
+    const guidance = () => deriveTransportGuidance({
+      enabled: true, program, robot, motionActive: false,
+      onReviewProgramRecovery: review,
+    });
+    const [recovery] = guidance();
+    expect(recovery).toMatchObject({
+      id: 'recovery.program', severity: 'error', title: 'Program recovery required',
+      message: 'The Resume Motion outcome could not be confirmed. Reset is required.',
+    });
+    expect(recovery.actions?.map((action) => action.label)).toEqual(['Review Program recovery']);
+    recovery.actions?.[0].run();
+    expect(review).toHaveBeenCalledOnce();
+    expect(renderToStaticMarkup(<ProgramTransportControls
+      enabled program={program} robot={robot} />))
+      .toMatch(/class="transport-reset transport-unique-control meaningful"(?![^>]*disabled)/);
     program.cycleState = 'terminal_awaiting_reset';
-    expect(render()).toContain('Program finished. Use <strong>Reset</strong>');
-    expect(render()).not.toContain('Program recovery required.');
+    // A normal finished run is information, not a warning or error.
+    expect(guidance()).toEqual([expect.objectContaining({
+      id: 'program.reset-required', severity: 'info', title: 'Program finished',
+    })]);
   });
 
   it('surfaces a cell-wide latch but never treats a cleared historical latch as blocking', () => {
@@ -835,13 +863,37 @@ describe('Program runtime projection', () => {
       reasonCode: 'physical_rest_unproven', certificate: null,
     };
     robot.state.status.cellStopAction.fault = fault;
-    const render = () => renderToStaticMarkup(<ProgramTransportControls
-      enabled program={controller()} robot={robot} />);
-    expect(render()).toContain('Cell recovery required.');
-    expect(render()).toContain('waiting for observation');
-    expect(render()).toContain('>Retry recovery</button>');
-    expect(render()).not.toMatch(/class="runtime-detail-button"[^>]*disabled[^>]*>Retry recovery/);
+    const guidance = () => deriveTransportGuidance({
+      enabled: true, program: controller(), robot, motionActive: false,
+      onReviewProgramRecovery: vi.fn(),
+    });
+    const [cell] = guidance();
+    expect(cell).toMatchObject({ id: 'recovery.cell', severity: 'error', title: 'Cell recovery required' });
+    expect(cell.message).toContain('waiting for observation');
+    expect(cell.actions?.[0]).toMatchObject({ label: 'Retry recovery', disabled: false });
     robot.state.status.cellStopAction.fault = { ...fault, state: 'cleared' };
-    expect(render()).not.toContain('Cell recovery required.');
+    expect(guidance()).toEqual([]);
+  });
+
+  it('classifies live-view observation by what the operator can rely on', () => {
+    const robot = robotController();
+    robot.currentStatus = statusFixture();
+    const guidance = (phase: 'synchronizing' | 'waiting' | 'reconnecting' | 'live') => (
+      deriveTransportGuidance({
+        enabled: true, program: controller(), robot, motionActive: false,
+        observationTransport: { phase, message: null },
+        onReviewProgramRecovery: vi.fn(),
+      }).filter((notice) => notice.id === 'observation.live-view')
+    );
+    expect(guidance('synchronizing')[0]).toMatchObject({ severity: 'info', busy: true });
+    expect(guidance('waiting')[0]).toMatchObject({ severity: 'info' });
+    // Stale poses are an error; only a known controlled transition may
+    // present them as information (see classifyWorkbenchNotices).
+    expect(guidance('reconnecting')[0]).toMatchObject({
+      severity: 'error',
+      expectedDuringTransition: true,
+      incidentKind: 'viewer_observation_stale',
+    });
+    expect(guidance('live')).toEqual([]);
   });
 });

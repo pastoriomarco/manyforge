@@ -49,6 +49,7 @@ from .execution_control import (
 )
 from .manager import ManagerCommandClient
 from .history_query import (
+    HistorianCaptureRequest,
     HistorianQueryRequest,
     HistorianDiscoveryRequest,
     HistorianDebugRequest,
@@ -1829,6 +1830,12 @@ def create_app(
                 "Content-Disposition": 'attachment; filename="manyforge-events.json"'
             },
         )
+
+    @app.get("/api/execution/history/captures")
+    def history_captures(
+        query: Annotated[HistorianCaptureRequest, Query()]
+    ) -> JSONResponse:
+        return JSONResponse(content=service.history_captures(query))
 
     @app.get("/api/execution/history/discovery")
     def history_discovery(

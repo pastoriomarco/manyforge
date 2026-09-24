@@ -120,15 +120,6 @@ export function DeploymentDocumentControls({
               : 'Validate and apply this Deployment Draft to runtime.'}
             onClick={() => { void controller.applyDraft(); }}
           >{controller.applying ? 'Applying Deployment' : 'Apply'}</button>
-          {(controller.busy || controller.error !== null || controller.feedback !== null) && (
-            <span
-              className={`document-operation-status${controller.error !== null ? ' error' : ''}`}
-              role={controller.error !== null ? 'alert' : 'status'}
-              aria-live="polite"
-            >
-              {controller.error ?? controller.feedback ?? (controller.applying ? 'Applying Deployment…' : 'Working…')}
-            </span>
-          )}
         </div>
       </div>
 

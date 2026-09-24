@@ -215,6 +215,54 @@ def test_native_http_owner_works_without_composer_and_fences_replay(
     assert "manyforge_composer" not in sys.modules
 
 
+def test_native_failure_capture_protects_context_and_reports_its_limits(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path, "capture.epoch.1"), historian_queue_capacity=64)
+    core = NativeHeadlessCore(config)
+    origin = 31 * 365 * 86400 * 1_000_000_000
+
+    def incident(index: int, kind: str) -> None:
+        result = core.record_client_incident(
+            incident_id=f"incident.{index}", incident_kind=kind, phase="activated",
+            control_session_id="session.1", client_incarnation="client.1",
+            source_label="operator_ui", reason_code=kind, occurrence_count=1,
+            maximum_delay_ns=None, first_observed_ns=origin + index,
+            last_observed_ns=origin + index,
+        )
+        assert result["recorded"] is True
+
+    try:
+        for index in range(3):
+            incident(index, "control_delayed")  # routine WARN context
+        incident(3, "viewer_model_unavailable")  # ERROR opens one capture
+        incident(4, "control_delayed")  # enters its tail
+    finally:
+        core.shutdown()
+
+    with TestClient(create_app(replace(config, owner_epoch="capture.epoch.2"))) as client:
+        page = client.get("/api/execution/history/captures")
+        assert page.status_code == 200, page.text
+        capture, = page.json()["captures"]
+        assert capture["capture_id"] == "1"
+        assert capture["first_sequence"] == 1
+        assert capture["trigger_sequence"] == 4
+        assert capture["last_sequence"] == 5
+        # The writer restarted inside the tail: the capture says so.
+        assert capture["state"] == "closed_by_restart"
+        assert capture["coverage"] == "uncertain"
+        assert "tail_interrupted_by_restart" in capture["uncertainty"]
+        assert capture["trigger"]["event_type"] == "client_incident_activated"
+        assert page.json()["retention"]["schema_version"] == "manyforge.historian_retention.v2"
+        rows = client.get("/api/execution/history", params={"capture_id": 1})
+        assert rows.status_code == 200, rows.text
+        assert [row["sequence"] for row in rows.json()["events"]] == [5, 4, 3, 2, 1]
+        exported = client.get("/api/execution/history/export", params={"capture_id": 1})
+        assert exported.status_code == 200, exported.text
+        assert exported.json()["capture"]["contents"] == "retained_event_context"
+        missing = client.get("/api/execution/history", params={"capture_id": 99})
+        assert missing.status_code == 404, missing.text
+        assert client.get("/api/execution/history/captures?limit=33").status_code == 422
+
+
 def test_native_history_discovery_exports_and_exact_context_survive_restart(tmp_path: Path) -> None:
     config = replace(_config(tmp_path, "history.epoch.1"), historian_queue_capacity=64)
     core = NativeHeadlessCore(config)

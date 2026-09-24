@@ -209,10 +209,13 @@ describe('Program workspace lifecycle controls', () => {
     expect(workspaceSource).toContain(
       'busy || authoringUnavailable || !mutationAvailable',
     );
-    expect(workspaceSource).toContain(
-      'workspace !== null && !mutationAvailable',
-    );
-    expect(workspaceSource).toContain('{mutationUnavailableReason}');
+    // Authoring availability is presented once, classified by its typed
+    // cause, in the workbench notification rows rather than the canvas rail.
+    const appSource = readFileSync(new URL('../App.tsx', import.meta.url), 'utf8');
+    expect(appSource).toContain('authoringUnavailableCause(authoringWorkspace.published, headlessSnapshot)');
+    expect(appSource).toContain("authoringCause === 'not_admitted'");
+    expect(workspaceSource).not.toContain('Authoring unavailable. ${mutationUnavailableReason}');
+    expect(workspaceSource).toContain('? mutationUnavailableReason');
     expect(controlsSource).toContain('busy || !mutationAvailable');
     expect(workspaceSource).not.toContain('affect only later runs');
   });

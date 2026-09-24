@@ -19,12 +19,14 @@ import { PaneDivider } from './components/PaneDivider';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
 import { runtimeStatusPresentation } from './components/runtimeStatus';
 import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
+import { WorkbenchNotificationStack } from './components/WorkbenchNotifications';
 import {
   useHeadlessStateSource,
   useShellHeadlessState,
 } from './hooks/useHeadlessState';
 import { useAuthoringWorkspace } from './hooks/useAuthoringWorkspace';
 import { useDeploymentWorkspace } from './hooks/useDeploymentWorkspace';
+import { useManagerApplyStatus } from './hooks/useManagerApplyStatus';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
@@ -39,6 +41,19 @@ import {
   useOperationalErrorMirror,
   useOperationalErrors,
 } from './state/operationalErrors';
+import { authoringUnavailableCause } from './state/authoringWorkspace';
+import { sameManagerApply, type ManagerApplyIdentity } from './state/managerApply';
+import {
+  activeViewerIncidentKinds,
+  classifyWorkbenchNotices,
+  useTransitionScope,
+  useViewerConditionHold,
+  noticesOfSeverity,
+  usePublishedWorkbenchNotices,
+  type ViewerIncidentKind,
+  type WorkbenchNotice,
+} from './state/workbenchNotices';
+import type { ProgramWorkspaceActionName } from './state/programWorkspace';
 import {
   INSPECTOR_WIDTH_MIN,
   WORKBENCH_DIVIDER_WIDTH,
@@ -50,6 +65,77 @@ function isNotFound(error: unknown): boolean {
 }
 
 const INSPECTOR_SECTION_MIN_HEIGHT = 140;
+const BRIEF_NOTICE_MS = 8_000;
+
+const PROGRAM_ACTION_LABELS: Partial<Record<ProgramWorkspaceActionName, string>> = {
+  new: 'Creating a new Program Draft',
+  open_draft: 'Opening Program as Draft',
+  apply: 'Submitting Program Apply',
+  discard: 'Discarding Program changes',
+  revert: 'Submitting Program Revert',
+  load: 'Loading Program',
+  load_scenario_document: 'Submitting Scenario Load',
+  convert_legacy_scenario_document: 'Converting legacy Scenario',
+  export_scenario_document: 'Exporting Scenario',
+  save: 'Saving Program',
+  save_as: 'Saving Program as',
+  save_scenario_document: 'Saving Scenario',
+};
+
+/**
+ * Presents one completed-operation message briefly, then removes it from
+ * presentation. The backend keeps the durable record; nothing is stored here.
+ */
+function useBriefNotice(notice: WorkbenchNotice | null): WorkbenchNotice | null {
+  const [visible, setVisible] = useState<string | null>(null);
+  const key = notice === null ? null : `${notice.id}\n${notice.message}`;
+  useEffect(() => {
+    setVisible(key);
+    if (key === null) return undefined;
+    const timer = window.setTimeout(() => setVisible(null), BRIEF_NOTICE_MS);
+    return () => window.clearTimeout(timer);
+  }, [key]);
+  return notice !== null && visible === key ? notice : null;
+}
+
+/** Report browser-only viewer errors once on activation and once on resolution. */
+function useViewerIncidentReporting(
+  errorConditions: readonly WorkbenchNotice[],
+  report: ((
+    kind: ViewerIncidentKind,
+    active: boolean,
+    reasonCode: string,
+    observedDelayNs?: number | null,
+    startedMs?: number,
+  ) => void) | undefined,
+) {
+  const reported = useRef(new Set<ViewerIncidentKind>());
+  const kinds = activeViewerIncidentKinds(errorConditions);
+  const signature = kinds.join(',');
+  // When each kind began (the held condition's onset), so the record's delay
+  // covers the whole occurrence, not only the part after the hold.
+  const onsets = JSON.stringify(kinds.map((kind) => errorConditions
+    .find((notice) => notice.incidentKind === kind)?.firstObservedMs ?? null));
+  useEffect(() => {
+    if (report === undefined) return;
+    const active = signature === '' ? [] : signature.split(',') as ViewerIncidentKind[];
+    const startedAt = JSON.parse(onsets) as Array<number | null>;
+    active.forEach((kind, index) => {
+      if (!reported.current.has(kind)) {
+        reported.current.add(kind);
+        report(kind, true, kind, null, startedAt[index] ?? undefined);
+      }
+    });
+    for (const kind of [...reported.current]) {
+      if (!active.includes(kind)) {
+        reported.current.delete(kind);
+        report(kind, false, kind);
+      }
+    }
+    // Onsets only matter when a kind first activates.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [report, signature]);
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -247,12 +333,6 @@ export default function App() {
   );
   const operationalErrors = useOperationalErrors();
   useOperationalErrorMirror({
-    source: 'composer.control_transport',
-    title: 'Control connection became unavailable',
-    message: headlessState.transportError,
-    onDismiss: headlessState.reconnect,
-  });
-  useOperationalErrorMirror({
     source: 'composer.deployment_workspace',
     title: 'Deployment command or response failed',
     message: deploymentController.error,
@@ -294,27 +374,305 @@ export default function App() {
     message: robotOperationalError,
     onDismiss: robotControl.dismissError,
   });
-  useOperationalErrorMirror({
-    source: 'composer.structural_manifest',
-    title: 'Viewer model response failed',
-    message: manifest.status === 'error' ? manifest.message : null,
-    onDismiss: retryManifest,
-  });
-  useOperationalErrorMirror({
-    source: 'composer.source_model',
-    title: 'Viewer source-model response failed',
-    message: sourceModel.status === 'error' ? sourceModel.message : null,
-    onDismiss: retrySourceModel,
-  });
   const clientErrors = operationalErrors.errors;
+
+  // --- One notification model: current conditions, activity and messages. ---
+  // Viewer model/source-model read failures are reported once, as the red
+  // viewer condition with its Retry action, not also as a dismissible message.
+  const controlNotices = useMemo<WorkbenchNotice[]>(() => {
+    if (!headlessEnabled) return [];
+    if (headlessState.transportStatus === 'delayed') {
+      return [{
+        id: 'control.connection',
+        severity: 'warning',
+        domain: 'transport',
+        title: 'Control connection delayed',
+        message: headlessState.transportError ?? 'Commands are disabled until the connection recovers.',
+      }];
+    }
+    if (headlessState.transportError !== null) {
+      return [{
+        id: 'control.connection',
+        severity: 'error',
+        domain: 'transport',
+        title: 'Control connection unavailable',
+        message: headlessState.transportError,
+        actions: [{
+          id: 'reconnect',
+          label: 'Reconnect',
+          title: 'Open a new control session. No earlier command is replayed.',
+          run: headlessState.reconnect,
+        }],
+      }];
+    }
+    if (headlessSnapshot !== null && headlessState.semanticStatus === 'unavailable') {
+      return [{
+        id: 'control.state',
+        severity: 'error',
+        domain: 'transport',
+        title: 'Control status unavailable',
+        message: `${headlessState.semanticReason ?? 'The owner projection is unavailable.'} Commands are disabled.`,
+      }];
+    }
+    if (headlessSnapshot !== null && headlessState.semanticStatus === 'synchronizing') {
+      return [{
+        id: 'control.state',
+        severity: 'info',
+        domain: 'transport',
+        title: 'Control status synchronizing',
+        message: headlessState.semanticReason ?? 'Waiting for a current owner projection.',
+        busy: true,
+      }];
+    }
+    return [];
+  }, [
+    headlessEnabled,
+    headlessSnapshot,
+    headlessState.reconnect,
+    headlessState.semanticReason,
+    headlessState.semanticStatus,
+    headlessState.transportError,
+    headlessState.transportStatus,
+  ]);
+
+  // Activity follows the exact accepted Manager operation: the advertised
+  // maintenance operation (also after a browser reload) or the identity this
+  // browser's accepted Load/Apply/Revert returned. A different or older
+  // operation's status never clears it.
+  const [trackedApply, setTrackedApply] = useState<ManagerApplyIdentity | null>(null);
+  useEffect(() => {
+    if (programController.acceptedApply !== null) setTrackedApply(programController.acceptedApply);
+  }, [programController.acceptedApply]);
+  useEffect(() => {
+    if (deploymentController.acceptedApply !== null) setTrackedApply(deploymentController.acceptedApply);
+  }, [deploymentController.acceptedApply]);
+  const maintenance = headlessSnapshot?.componentOverview.maintenanceOperation ?? null;
+  const observedApply = useMemo<ManagerApplyIdentity | null>(() => (
+    maintenance !== null
+      ? { applyId: maintenance.applyId, applyGeneration: maintenance.applyGeneration }
+      : trackedApply
+  ), [maintenance, trackedApply]);
+  const activation = useManagerApplyStatus(
+    observedApply,
+    headlessSnapshot?.snapshotSequence ?? null,
+  );
+  const activationStatus = activation.status !== null
+    && sameManagerApply(activation.status, observedApply)
+    ? activation.status
+    : null;
+  const activationUnobservable = activation.unavailable;
+  // Only owner evidence scopes a transition: the observed activation's status
+  // read as pending. An advertised, submitted or unobservable (lost) operation
+  // is not evidence, so it never downgrades an error.
+  const transitionKey = observedApply !== null
+    && !activationUnobservable
+    && activationStatus?.state === 'pending'
+    ? `${observedApply.applyId}:${observedApply.applyGeneration}`
+    : null;
+  const activationNotices = useMemo<WorkbenchNotice[]>(() => {
+    if (observedApply === null) return [];
+    const id = `activation.${observedApply.applyId}:${observedApply.applyGeneration}`;
+    if (activationStatus?.state === 'failed' || activationStatus?.state === 'unknown_effect') {
+      return [{
+        id,
+        severity: 'error',
+        domain: 'activation',
+        title: activationStatus.state === 'failed'
+          ? 'Activation failed'
+          : 'Activation outcome unknown',
+        message: `${activationStatus.failure?.message ?? 'Manager reported a terminal failure.'} Applied state was not confirmed (${observedApply.applyId}).`,
+      }];
+    }
+    if (activationStatus?.state === 'succeeded') return [];
+    if (activationUnobservable) {
+      return [{
+        id,
+        severity: 'error',
+        domain: 'activation',
+        title: 'Activation status unavailable',
+        message: `Completion of ${observedApply.applyId} cannot currently be observed; it is neither confirmed nor failed.`,
+      }];
+    }
+    const phase = activationStatus?.phase ?? maintenance?.phase ?? 'accepted';
+    return [{
+      id,
+      severity: 'info',
+      domain: 'activation',
+      title: 'Activation in progress',
+      message: `Manager phase: ${String(phase).replaceAll('_', ' ')} (${observedApply.applyId}). Motion does not start automatically.`,
+      busy: true,
+    }];
+  }, [activationStatus, activationUnobservable, maintenance, observedApply]);
+  const activationCompleted = useBriefNotice(
+    observedApply !== null && activationStatus?.state === 'succeeded'
+      ? {
+          id: `activation.completed.${observedApply.applyId}`,
+          severity: 'info',
+          domain: 'activation',
+          title: 'Activation completed',
+          message: `Manager confirmed ${observedApply.applyId}.`,
+        }
+      : null,
+  );
+
+  const pendingProgramAction = programController.state.pendingAction;
+  const programMessage = useBriefNotice(
+    programController.state.message === null
+      ? null
+      : {
+          id: 'program.operation.result',
+          severity: 'info',
+          domain: 'program_authoring',
+          title: 'Program',
+          message: programController.state.message,
+        },
+  );
+  const deploymentMessage = useBriefNotice(
+    deploymentController.feedback === null
+      ? null
+      : {
+          id: 'deployment.operation.result',
+          severity: 'info',
+          domain: 'program_authoring',
+          title: 'Deployment',
+          message: deploymentController.feedback,
+        },
+  );
+  const authoringCause = headlessEnabled
+    ? authoringUnavailableCause(authoringWorkspace.published, headlessSnapshot)
+    : null;
+  const operationNotices = useMemo<WorkbenchNotice[]>(() => {
+    const notices: WorkbenchNotice[] = [];
+    const label = pendingProgramAction === null
+      ? undefined
+      : PROGRAM_ACTION_LABELS[pendingProgramAction];
+    if (label !== undefined) {
+      notices.push({
+        id: 'program.operation',
+        severity: 'info',
+        domain: 'program_authoring',
+        title: `${label}…`,
+        message: 'Waiting for the backend response.',
+        busy: true,
+      });
+    }
+    if (deploymentController.busy) {
+      notices.push({
+        id: 'deployment.operation',
+        severity: 'info',
+        domain: 'program_authoring',
+        title: deploymentController.applying
+          ? 'Submitting Deployment Apply…'
+          : 'Deployment request in progress…',
+        message: 'Waiting for the backend response.',
+        busy: true,
+      });
+    }
+    const reason = authoringWorkspace.unavailableReason ?? '';
+    if (authoringCause === 'execution_active') {
+      notices.push({
+        id: 'authoring.unavailable',
+        severity: 'info',
+        domain: 'program_authoring',
+        title: 'Authoring waits for Idle',
+        message: `${reason} Draft inspection remains available.`,
+      });
+    } else if (authoringCause === 'synchronizing' || authoringCause === 'not_read') {
+      notices.push({
+        id: 'authoring.unavailable',
+        severity: 'info',
+        domain: 'program_authoring',
+        title: 'Authoring synchronizing',
+        message: reason,
+        busy: true,
+      });
+    } else if (authoringCause === 'not_admitted') {
+      notices.push({
+        id: 'authoring.unavailable',
+        severity: 'error',
+        domain: 'program_authoring',
+        title: 'Authoring not admitted',
+        message: reason,
+        expectedDuringTransition: true,
+      });
+    } else if (authoringCause === 'disconnected' && controlNotices.length === 0) {
+      notices.push({
+        id: 'authoring.unavailable',
+        severity: 'error',
+        domain: 'program_authoring',
+        title: 'Authoring unavailable',
+        message: reason,
+      });
+    }
+    return notices;
+  }, [
+    authoringCause,
+    authoringWorkspace.unavailableReason,
+    controlNotices.length,
+    deploymentController.applying,
+    deploymentController.busy,
+    pendingProgramAction,
+  ]);
+  const publishedNotices = usePublishedWorkbenchNotices();
+  const workbenchNotices = useMemo(() => [
+    ...controlNotices,
+    ...activationNotices,
+    ...publishedNotices,
+    ...operationNotices,
+    ...(activationCompleted === null ? [] : [activationCompleted]),
+    ...(programMessage === null ? [] : [programMessage]),
+    ...(deploymentMessage === null ? [] : [deploymentMessage]),
+  ], [
+    activationCompleted,
+    activationNotices,
+    controlNotices,
+    deploymentMessage,
+    operationNotices,
+    programMessage,
+    publishedNotices,
+  ]);
+  const transitionScope = useTransitionScope(transitionKey, workbenchNotices);
+  const transitionClassified = useMemo(
+    () => classifyWorkbenchNotices(workbenchNotices, transitionScope),
+    [transitionScope, workbenchNotices],
+  );
+  // Viewer conditions become errors (and are reported) only after the hold;
+  // re-sort because held ones are presented as information meanwhile.
+  const heldNotices = useViewerConditionHold(transitionClassified);
+  const classifiedNotices = useMemo(
+    () => classifyWorkbenchNotices(heldNotices, null),
+    [heldNotices],
+  );
+  const errorConditions = useMemo(
+    () => noticesOfSeverity(classifiedNotices, 'error'),
+    [classifiedNotices],
+  );
+  const warningNotices = useMemo(
+    () => noticesOfSeverity(classifiedNotices, 'warning'),
+    [classifiedNotices],
+  );
+  const activityNotices = useMemo(
+    () => noticesOfSeverity(classifiedNotices, 'info'),
+    [classifiedNotices],
+  );
+  useViewerIncidentReporting(
+    errorConditions,
+    headlessEnabled ? headlessStateSource.reportClientIncident : undefined,
+  );
+  const unacknowledgedAlarmCount = headlessSnapshot?.alarms.unacknowledgedCount ?? 0;
+  const errorItemCount = clientErrors.length + unacknowledgedAlarmCount
+    + errorConditions.length;
   const runtimeAttentionItems = useMemo(() => [
+    ...errorConditions.map((condition) => ({
+      identity: `condition:${condition.id}`,
+    })),
     ...attentionAlarmsNewestFirst(headlessSnapshot?.alarms.alarms ?? []).map((alarm) => ({
       identity: `backend:${alarm.activationId}`,
     })),
     ...clientErrors.map((error) => ({
       identity: `composer:${error.id}`,
     })),
-  ], [clientErrors, headlessSnapshot]);
+  ], [clientErrors, errorConditions, headlessSnapshot]);
   const openRuntimeAttention = useCallback((identity: string) => {
     setRuntimeAttentionRequest(identity);
     // Automatic attention may choose the initial compact presentation, but it
@@ -586,9 +944,9 @@ export default function App() {
             }}
           >
             Runtime / history
-            {clientErrors.length + (headlessSnapshot?.alarms.unacknowledgedCount ?? 0) > 0 && (
+            {errorItemCount > 0 && (
               <span className="global-attention-count">
-                {clientErrors.length + (headlessSnapshot?.alarms.unacknowledgedCount ?? 0)}
+                {errorItemCount}
               </span>
             )}
           </button>
@@ -652,6 +1010,7 @@ export default function App() {
                 gripperDescriptors={robotControl.gripperTargets.map(
                   (target) => target.targetDescriptor,
                 )}
+                maintenanceStatus={activation}
                 componentOverview={{
                   request: componentOverviewRequest,
                   status: runtimeView,
@@ -760,18 +1119,31 @@ export default function App() {
                 onViewerInspectorMaximize={maximizeViewerInspector}
                 onViewerInspectorPanelChange={setViewerInspectorPanel}
                 onOpenRuntimeHistory={openRuntimeDetails}
-                runtimeOverlay={globalPanel === 'runtime' ? (
-                  <HeadlessRuntimeSurfaces
-                    enabled={headlessEnabled}
-                    headlessStateSource={headlessStateSource}
-                    clientErrors={clientErrors}
-                    onAcknowledgeClientError={operationalErrors.dismiss}
-                    attentionRequest={runtimeAttentionRequest}
-                    expanded={runtimePanelExpanded}
-                    onExpandedChange={setRuntimePanelExpansion}
-                    onClose={closeRuntimePanel}
+                runtimeOverlay={(
+                  <WorkbenchNotificationStack
+                    // Every row is visible whenever it holds active items.
+                    // Runtime/history is the error row's expandable view:
+                    // closing it collapses to the row and never hides an
+                    // unresolved error, recovery condition or alarm.
+                    errorRow={globalPanel === 'runtime' || errorItemCount > 0 ? (
+                      <HeadlessRuntimeSurfaces
+                        enabled={headlessEnabled
+                          || errorConditions.length > 0
+                          || clientErrors.length > 0}
+                        headlessStateSource={headlessStateSource}
+                        clientErrors={clientErrors}
+                        conditions={errorConditions}
+                        onAcknowledgeClientError={operationalErrors.dismiss}
+                        attentionRequest={runtimeAttentionRequest}
+                        expanded={runtimePanelExpanded}
+                        onExpandedChange={setRuntimePanelExpansion}
+                        onClose={errorItemCount === 0 ? closeRuntimePanel : undefined}
+                      />
+                    ) : null}
+                    warnings={warningNotices}
+                    activity={activityNotices}
                   />
-                ) : undefined}
+                )}
               />
             </div>
           </div>

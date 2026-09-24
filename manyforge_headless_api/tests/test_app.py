@@ -2720,6 +2720,37 @@ def test_program_diagnostic_route_is_bounded_attributed_evidence_only():
         assert records == [payload]
 
 
+def test_capture_page_is_a_bounded_validated_read() -> None:
+    client, core, _manager = _client()
+    calls: list[dict[str, Any]] = []
+
+    def history_captures(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "schema_version": "manyforge.historian_capture_page.v1",
+            "captures": [],
+            "truncated": False,
+            "next_before_capture_id": None,
+            "retention": {},
+        }
+
+    core.history_captures = history_captures  # type: ignore[attr-defined]
+    with client:
+        response = client.get("/api/execution/history/captures?before_capture_id=7&limit=5")
+        assert response.status_code == 200, response.text
+        assert calls == [{"before_capture_id": 7, "limit": 5}]
+        assert client.get("/api/execution/history/captures?limit=0").status_code == 422
+        core.history_captures = lambda **_kwargs: {  # type: ignore[attr-defined]
+            "schema_version": "manyforge.historian_capture_page.v1",
+            "captures": [{}] * 6,
+            "truncated": False,
+        }
+        invalid = client.get("/api/execution/history/captures?limit=5")
+    # Same mapping as every historian page read: the typed code, not 200.
+    assert invalid.status_code == 400
+    assert "historian_response_invalid" in invalid.text
+
+
 def test_history_list_is_summary_only_and_keeps_exact_detail_on_demand() -> None:
     client, core, _manager = _client()
     large_payload = {
