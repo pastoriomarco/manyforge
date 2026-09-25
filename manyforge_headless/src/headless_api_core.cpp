@@ -734,11 +734,14 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
       program_repository_.get_verified(program_id, program_revision, *bundle);
   const auto binding =
       binding_repository_.get_verified(binding_id, *bundle, model_map);
-  Require(program != nullptr && binding != nullptr &&
-              binding->value().program_id == program_id &&
+  Require(program != nullptr, "program_applied_selection_invalid",
+          "active Program is unavailable");
+  Require(binding != nullptr, "program_applied_selection_invalid",
+          "active Program binding is unavailable");
+  Require(binding->value().program_id == program_id &&
               binding->value().program_revision == program_revision,
           "program_applied_selection_invalid",
-          "active Program or binding is unavailable or divergent");
+          "active Program and binding are divergent");
 
   CanonicalValue assistant_projection(nullptr);
   if (bundle->value().assistant.has_value()) {

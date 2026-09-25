@@ -226,7 +226,19 @@ def create_app(
     async def lifespan(_app: FastAPI):
         try:
             if state.authoring_admission is not None:
-                await asyncio.to_thread(state.authoring_admission.recover)
+                try:
+                    await asyncio.to_thread(state.authoring_admission.recover)
+                except HTTPException as error:
+                    if error.status_code != 503:
+                        raise
+                    # The authoring owner has already failed closed. Keep
+                    # read-only Composer projections available while its
+                    # required execution owner is absent; startup is not an
+                    # implicit recovery or a grant of edit authority.
+                    logger.warning(
+                        "Composer authoring remains unavailable at startup: %s",
+                        error.detail,
+                    )
             yield
         finally:
             if state.execution_observation_source is not None:

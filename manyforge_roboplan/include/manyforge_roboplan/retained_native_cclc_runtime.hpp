@@ -95,6 +95,7 @@ CreateRetainedNativeCCLCRuntime(
     const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
     const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
+    std::vector<core::RuntimeParticipantBinding> physical_bindings,
     RetainedNativeRuntime &runtime,
     core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,

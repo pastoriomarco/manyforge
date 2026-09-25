@@ -18,6 +18,8 @@ import pytest
 from scripts.qualification.control_client_fixture import composer_snapshot_stream
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.manager import ManagerCommandClient
+from manyforge_headless_api.models import ManagerDeploymentCandidatePreviewRequest
 from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
 
 
@@ -231,6 +233,18 @@ class ProcessStack:
                     "8",
                 )
             )
+        activation_preparer = os.environ.get("MANYFORGE_ACTIVATION_PREPARER")
+        if activation_preparer:
+            command.extend(
+                (
+                    "--activation-preparer",
+                    str(_required_path("MANYFORGE_ACTIVATION_PREPARER")),
+                    "--activation-preparer-capability-root",
+                    str(Path(__file__).parents[2]),
+                    "--activation-preparer-activation-root",
+                    str(self.artifact_root),
+                )
+            )
         self.api = subprocess.Popen(
             command,
             stdout=self.log,
@@ -400,7 +414,14 @@ class ProcessStack:
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             if self.composer is not None and self.composer.poll() is not None:
-                raise RuntimeError(f"Composer exited with {self.composer.returncode}")
+                self.log.flush()
+                recent = (self.root / "process-stack.log").read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()[-20:]
+                raise RuntimeError(
+                    f"Composer exited with {self.composer.returncode}: "
+                    + " | ".join(recent)
+                )
             try:
                 with HeadlessHttpClient(
                     self.composer_url,
@@ -546,6 +567,14 @@ def _assistant_stack(
             metadata_environment=metadata_environment,
             package_environment=package_environment,
         )
+        # The synthetic process fixture was produced into one package tree,
+        # whereas Headless owns Program and binding repositories under its
+        # separate artifact root. Install those immutable fixture values into
+        # that repository before any owner starts.
+        for repository in ("programs", "program-bindings"):
+            source = selected_package_root / repository
+            if source.is_dir():
+                shutil.copytree(source, stack.artifact_root / repository)
         assert stack.manager_package_root == stack.package_root
         stack.start_manager()
         stack.start_program_runner()
@@ -555,10 +584,38 @@ def _assistant_stack(
         initial_admission = stack.wait_authoring_admission(expected_allowed=True)
         assert stack.fixture_metadata is not None
         metadata = stack.fixture_metadata
+        environment_manifests = sorted(
+            (selected_package_root / "build-manifests" / "node_environment").glob("*.json")
+        )
+        assert len(environment_manifests) == 1
+        environment_digest = json.loads(
+            environment_manifests[0].read_text(encoding="utf-8")
+        )["environment_digest"]
         assert initial["status"]["active"]["retained_bundle_id"] == (
             metadata["predecessor_retained_bundle_id"]
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=20.0) as client:
+            fixture_program = json.loads(stack.program_path.read_text(encoding="utf-8"))
+            prepared_activation = {
+                "schema_version": "manyforge.prepared_activation_input.v2",
+                "scenario_id": startup_scenario or "assistant_native_process_fixture",
+                "source_document_digest": "sha256:" + "2" * 64,
+                "captured_input_digest": "sha256:" + "e" * 64,
+                "deployment_artifact_id": metadata["physical_deployment_artifact_id"],
+                "deployment_revision": metadata["physical_deployment_revision"],
+                "retained_bundle_id": metadata["physical_candidate_retained_bundle_id"],
+                "graph_revision": metadata["physical_graph_revision"],
+                "program_id": fixture_program["program_id"],
+                "program_revision": metadata["program_revision"],
+                "program_binding_id": metadata["program_binding_id"],
+                "node_environment_digest": environment_digest,
+                "assistant_mode": "optional",
+                "typed_parameter_overrides": {},
+                "prepared_activation_id": "sha256:" + "f" * 64,
+            }
+            metadata["source_document_digest"] = prepared_activation[
+                "source_document_digest"
+            ]
             apply_body = {
                 "request_id": "assistant-native.process.apply",
                 "request_owner_epoch": initial["source"]["source_owner_epoch"],
@@ -572,15 +629,23 @@ def _assistant_stack(
                 },
                 "reject_if_affected_busy": True,
                 "expected_admission_generation": initial_admission["admission_generation"],
+                "prepared_activation": prepared_activation,
             }
-            preview = client.manager_deployment_candidate_preview(
-                {
+            # This legacy process fixture supplies a synthetic, exact retained
+            # Apply identity rather than using the authored-preparation owner.
+            # Request its preview from Manager's private boundary; the public
+            # Headless preview correctly requires a registered preparation.
+            preview = ManagerCommandClient(stack.manager_run_root).preview_deployment_candidate(
+                ManagerDeploymentCandidatePreviewRequest.model_validate({
                     "deployment_artifact_id": apply_body["deployment_artifact_id"],
                     "deployment_revision": apply_body["deployment_revision"],
+                    "candidate_retained_bundle_id": prepared_activation["retained_bundle_id"],
+                    "candidate_graph_revision": prepared_activation["graph_revision"],
+                    "prepared_activation_id": prepared_activation["prepared_activation_id"],
                     "expected_current": apply_body["expected_current"],
                     "expected_admission_generation": apply_body["expected_admission_generation"],
                     "request_owner_epoch": apply_body["request_owner_epoch"],
-                }
+                })
             )
             apply_result = client.manager_apply(
                 {**apply_body, "candidate_receipt": preview["candidate_receipt"]}
@@ -692,55 +757,36 @@ def _matching_assistant_context(
     raise RuntimeError("Headless did not publish a coherent assistant context")
 
 
-def _apply_body(
+def _unavailable_candidate_preview(
     client: HeadlessHttpClient,
+    manager_run_root: Path,
     owner_epoch: str,
-    request_id: str,
     admission_generation: int,
-    *,
-    preview_owner_epoch: str | None = None,
 ) -> dict:
     active = client.manager_status()["status"]["active"]
-    body = {
-        "request_id": request_id,
-        "request_owner_epoch": owner_epoch,
-        "source_label": "process_test",
-        "correlation_id": "correlation.1",
-        "deployment_artifact_id": "candidate",
-        "deployment_revision": "sha256:" + "a" * 64,
-        "expected_current": {
-            "graph_revision": active["graph_revision"],
-            "retained_bundle_id": active["retained_bundle_id"],
-        },
-        "reject_if_affected_busy": True,
-        # The UA2A prepared activation is a caller-asserted identity owned by
-        # the existing prepared-value owner; the Manager records it without
-        # reopening a mutable Scenario/catalog selection. This process fixture
-        # supplies one exact, self-consistent identity for the Apply it submits.
-        "prepared_activation": {
-            "captured_input_digest": "sha256:" + "e" * 64,
+    # The private preview itself must reject a nonexistent candidate before
+    # any public Apply can obtain a candidate receipt.
+    return ManagerCommandClient(manager_run_root).preview_deployment_candidate(
+        ManagerDeploymentCandidatePreviewRequest.model_validate({
             "deployment_artifact_id": "candidate",
             "deployment_revision": "sha256:" + "a" * 64,
-            "program_binding_id": "sha256:" + "9" * 64,
+            "candidate_retained_bundle_id": "sha256:" + "b" * 64,
+            "candidate_graph_revision": "sha256:" + "c" * 64,
             "prepared_activation_id": "sha256:" + "f" * 64,
-        },
-        "expected_admission_generation": admission_generation,
-    }
-    preview = client.manager_deployment_candidate_preview(
-        {
-            "deployment_artifact_id": body["deployment_artifact_id"],
-            "deployment_revision": body["deployment_revision"],
-            "expected_current": body["expected_current"],
+            "expected_current": {
+                "graph_revision": active["graph_revision"],
+                "retained_bundle_id": active["retained_bundle_id"],
+            },
             "expected_admission_generation": admission_generation,
-            "request_owner_epoch": preview_owner_epoch or owner_epoch,
-        }
+            "request_owner_epoch": owner_epoch,
+        })
     )
-    return {**body, "candidate_receipt": preview["candidate_receipt"]}
 
 
 def _assistant_callback_body(
     *,
     draft: dict,
+    workspace: dict,
     node_environment: dict,
     source_model: dict,
     assistant_mode: dict,
@@ -766,6 +812,8 @@ def _assistant_callback_body(
         "inputSchemaHash": tool["input_schema_hash"],
         "draftId": draft["draft_id"],
         "expectedDraftRevision": draft["draft_revision"],
+        "expectedWorkspaceEpoch": workspace["workspaceEpoch"],
+        "expectedWorkspaceRevision": workspace["workspaceRevision"],
         "expectedAdmissionGeneration": admission_generation,
         "requestOwnerEpoch": "composer.process.epoch.1",
         "requestId": request_id,
@@ -880,6 +928,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 source_model = source_context["source_model"]
                 accepted_body = _assistant_callback_body(
                     draft=draft,
+                    workspace=composer.request("GET", "/api/program/workspace")["authoringWorkspace"],
                     node_environment=node_environment,
                     source_model=source_model,
                     assistant_mode=assistant_mode,
@@ -929,6 +978,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 stale_context, stale_mode = _matching_assistant_context(stack, composer)
                 stale_identity = _assistant_callback_body(
                     draft=after_accepted,
+                    workspace=composer.request("GET", "/api/program/workspace")["authoringWorkspace"],
                     node_environment=stale_context["node_environment"],
                     source_model=stale_context["source_model"],
                     assistant_mode=stale_mode,
@@ -962,6 +1012,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 invalid_context, invalid_mode = _matching_assistant_context(stack, composer)
                 invalid_edit = _assistant_callback_body(
                     draft=after_accepted,
+                    workspace=composer.request("GET", "/api/program/workspace")["authoringWorkspace"],
                     node_environment=invalid_context["node_environment"],
                     source_model=invalid_context["source_model"],
                     assistant_mode=invalid_mode,
@@ -1007,6 +1058,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                     )
                     read_body = _assistant_callback_body(
                         draft=after_accepted,
+                        workspace=composer.request("GET", "/api/program/workspace")["authoringWorkspace"],
                         node_environment=read_context["node_environment"],
                         source_model=read_context["source_model"],
                         assistant_mode=read_mode,
@@ -1053,7 +1105,12 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             HeadlessHttpClient(stack.composer_url) as replacement,
             HeadlessHttpClient(stack.base_url) as headless,
         ):
-            assert replacement.request("GET", "/api/program/draft") == after_accepted
+            replacement_draft = replacement.request("GET", "/api/program/draft")
+            assert replacement_draft["draft_id"] != after_accepted["draft_id"]
+            assert "assistant_workpiece" not in {
+                row["scene_resource_id"]
+                for row in replacement_draft["program"]["scene"]
+            }
 
             def invoke(body: dict) -> tuple[str, str]:
                 try:
@@ -1071,7 +1128,8 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             concurrent_generation = _current_authoring_generation(headless)
             concurrent_bodies = [
                 _assistant_callback_body(
-                    draft=after_accepted,
+                    draft=replacement_draft,
+                    workspace=replacement.request("GET", "/api/program/workspace")["authoringWorkspace"],
                     node_environment=replacement_context["node_environment"],
                     source_model=replacement_context["source_model"],
                     assistant_mode=replacement_mode,
@@ -1114,7 +1172,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             }
             assert len(concurrent_ids) == accepted_count
             assert final_draft["draft_revision"] == (
-                after_accepted["draft_revision"] + accepted_count
+                replacement_draft["draft_revision"] + accepted_count
             )
             assert final_draft["saved"] is False
             assert final_draft["applied"] is False
@@ -1197,16 +1255,11 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             assert client.manager_diff()["converged"] is True
             assert client.scene()["scene_runtime"]["payload"]["state"]["state"] == ("open")
 
-            with pytest.raises(HeadlessClientError) as unavailable:
-                client.manager_apply(
-                    _apply_body(
-                        client,
-                        first_epoch,
-                        "request.1",
-                        1,
-                    )
-                )
-            assert unavailable.value.code == "deployment_candidate_rejected"
+            unavailable = _unavailable_candidate_preview(
+                client, stack.manager_run_root, first_epoch, 1
+            )
+            assert unavailable["ok"] is False
+            assert unavailable["error"]["code"] == "deployment_candidate_rejected"
 
         stack.start_composer()
         assert stack.wait_composer()["projection_owner_epoch"] == owner_identity[0]
@@ -1296,6 +1349,9 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
                 "sha256:" + "a" * 64,
                 "current-graph",
                 "current-bundle",
+                "sha256:" + "e" * 64,
+                "sha256:" + "9" * 64,
+                "sha256:" + "f" * 64,
                 "--request-id",
                 "request.cli.1",
                 "--request-owner-epoch",
@@ -1328,22 +1384,17 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             replacement_epoch = replacement["source"]["source_owner_epoch"]
             assert replacement_epoch != first_epoch
 
-            with pytest.raises(HeadlessClientError) as stale:
-                _apply_body(
-                    client,
-                    first_epoch,
-                    "request.stale",
-                    1,
-                )
-            assert stale.value.code == "stale_request_owner_epoch"
+            stale = _unavailable_candidate_preview(
+                client, stack.manager_run_root, first_epoch, 1
+            )
+            assert stale["ok"] is False
+            assert stale["error"]["code"] == "stale_request_owner_epoch"
 
-            with pytest.raises(HeadlessClientError) as unavailable:
-                client.manager_apply(
-                    _apply_body(
-                        client,
-                        replacement_epoch,
-                        "request.replacement",
-                        1,
-                    )
-                )
-            assert unavailable.value.code == "deployment_candidate_rejected"
+            unavailable = _unavailable_candidate_preview(
+                client,
+                stack.manager_run_root,
+                replacement_epoch,
+                1,
+            )
+            assert unavailable["ok"] is False
+            assert unavailable["error"]["code"] == "deployment_candidate_rejected"

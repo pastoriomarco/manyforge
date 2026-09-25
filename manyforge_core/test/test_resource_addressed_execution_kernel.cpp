@@ -1766,12 +1766,20 @@ class FakeResourceAdmissionGate final : public IResourceOperationAdmissionGate {
   }
 
   [[nodiscard]] bool exact_fence_covers(const ConfigurationFenceId& fence_id,
-                                        const std::vector<ResourceId>&) const override {
-    return reject_reservation && held_fence_id.has_value() && *held_fence_id == fence_id;
+                                        const std::vector<ResourceId>& resources) const override {
+    if (!reject_reservation || !held_fence_id.has_value() || *held_fence_id != fence_id) {
+      return false;
+    }
+    return !held_fence_resources.has_value() ||
+           std::all_of(resources.begin(), resources.end(), [&](const auto& resource) {
+             return std::find(held_fence_resources->begin(), held_fence_resources->end(),
+                              resource) != held_fence_resources->end();
+           });
   }
 
   bool reject_reservation{true};
   std::optional<ConfigurationFenceId> held_fence_id;
+  std::optional<std::vector<ResourceId>> held_fence_resources;
   int reserve_calls{};
 
  private:
@@ -15899,6 +15907,48 @@ TEST(ResourceAddressedExecutionKernelTest,
        ConfigurationFenceId("fence.parent-apply"), component, generation, false});
   ASSERT_FALSE(released.ok());
   EXPECT_EQ(released.error().details.at("reason"), "component_readiness_apply_fence_not_held");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ApplyReadinessRejectsAnExactFenceThatCoversOnlyPartOfTheComponent) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeResourceAdmissionGate gate;
+  gate.held_fence_id = ConfigurationFenceId("fence.parent-apply");
+  const auto binding = make_binding(
+      "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular,
+      std::nullopt, true);
+  const auto registered = registration(binding, engine);
+  ResourceAddressedExecutionKernel kernel(
+      {registered}, clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U, {}, &gate});
+  ASSERT_TRUE(kernel.publish_runtime_route_configuration(
+                  route_configuration_for(registered), {registered}).ok());
+  const auto component = binding.value().controllable_component_id;
+  const auto generation =
+      registered.stop_readiness->value().component_lifecycle_generation;
+  ASSERT_EQ(binding.value().resources.size(), 2U);
+  gate.held_fence_resources =
+      std::vector<ResourceId>{binding.value().resources.front().resource_id};
+
+  const auto partial = kernel.publish_component_command_readiness(
+      {ComponentReadinessAuthorityDTO::kParentApplyFence, std::nullopt,
+       ConfigurationFenceId("fence.parent-apply"), component, generation, true});
+  ASSERT_FALSE(partial.ok());
+  EXPECT_EQ(partial.error().details.at("reason"),
+            "component_readiness_apply_fence_not_held");
+  const auto closed = kernel.component_command_readiness(component);
+  ASSERT_TRUE(closed.ok());
+  EXPECT_FALSE(closed.value().command_eligible);
+
+  gate.held_fence_resources->push_back(binding.value().resources.back().resource_id);
+  const auto complete = kernel.publish_component_command_readiness(
+      {ComponentReadinessAuthorityDTO::kParentApplyFence, std::nullopt,
+       ConfigurationFenceId("fence.parent-apply"), component, generation, true});
+  ASSERT_TRUE(complete.ok()) << complete.error().message;
+  EXPECT_TRUE(complete.value().command_eligible);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

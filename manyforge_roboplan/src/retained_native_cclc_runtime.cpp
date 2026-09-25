@@ -147,20 +147,18 @@ adopt_durable_route_configurations(
     const deployment::CCLCRuntimeCompositionConfig &config,
     const deployment::RetainedBundle &retained_bundle,
     const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
+    const std::vector<core::RuntimeParticipantBinding> &physical_bindings,
     RetainedNativeRuntime &runtime) {
   try {
     const auto &bundle = retained_bundle.value();
     std::set<core::ControllableComponentId> component_ids;
     std::set<core::ControlDomainId> domain_ids;
-    for (const auto *binding :
-         {&runtime.motion_binding, runtime.gripper_binding.has_value()
-                                       ? &*runtime.gripper_binding
-                                       : nullptr}) {
-      if (binding == nullptr || !binding->value().control_path.has_value()) {
+    for (const auto &binding : physical_bindings) {
+      if (!binding.value().control_path.has_value()) {
         continue;
       }
-      component_ids.insert(binding->value().controllable_component_id);
-      domain_ids.insert(binding->value().control_path->control_domain_id);
+      component_ids.insert(binding.value().controllable_component_id);
+      domain_ids.insert(binding.value().control_path->control_domain_id);
     }
     if (component_ids.empty() || domain_ids.empty()) {
       return reject<std::vector<RuntimeEpochRouteReconciliation>>(
@@ -1106,6 +1104,7 @@ CreateRetainedNativeCCLCRuntime(
     const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
     const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
     std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
+    std::vector<core::RuntimeParticipantBinding> physical_bindings,
     RetainedNativeRuntime &runtime,
     core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
     core::IKernelCellAdmissionPort &kernel_cell_admission_port,
@@ -1126,7 +1125,8 @@ CreateRetainedNativeCCLCRuntime(
         "scheduler");
   }
   auto adopted = adopt_durable_route_configurations(
-      config.composition, *retained_bundle, artifact_source, runtime);
+      config.composition, *retained_bundle, artifact_source,
+      physical_bindings, runtime);
   if (!adopted.ok()) {
     return core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>::
         Err(adopted.error());
@@ -1155,7 +1155,6 @@ CreateRetainedNativeCCLCRuntime(
         Err(reconstructed.error());
   }
   auto observation_bundle = retained_bundle;
-  auto physical_bindings = runtime.control_binding_representatives;
   std::function<
       core::Result<std::optional<core::ActiveControlConfigurationDTO>>(
           const core::ControlDomainId &)>

@@ -2200,6 +2200,14 @@ TEST(ManagerDaemonProcess,
     }
     ASSERT_NE(applied.find("\"state\":\"succeeded\""), std::string::npos)
         << applied;
+    const auto status = deployment::parse_strict_json_model_yaml(applied).root();
+    const auto &prepared = RequiredMember(status, "prepared_activation");
+    ASSERT_TRUE(prepared.is_object());
+    EXPECT_EQ(prepared.as_object().size(), 5U);
+    const auto requested = deployment::parse_strict_json_model_yaml(request).root();
+    EXPECT_EQ(RequiredText(prepared, "prepared_activation_id"),
+              RequiredText(RequiredMember(requested, "prepared_activation"),
+                           "prepared_activation_id"));
     ASSERT_NE(applied.find(fixture_a.physical_candidate_retained_bundle_id),
               std::string::npos)
         << applied;

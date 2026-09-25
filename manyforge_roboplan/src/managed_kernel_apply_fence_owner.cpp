@@ -2879,12 +2879,13 @@ private:
             "active publication cannot be independently verified");
     auto bundle = bundle_source_.get_verified(
         result.value().request.candidate_retained_bundle_id);
-    Require(bundle != nullptr &&
-                bundle->value().cell_graph.cell_id == config_.cell_id &&
-                bundle->value().cell_graph.graph_revision ==
-                    result.value().request.candidate_graph_revision,
-            "active publication does not resolve to its exact retained "
-            "bundle");
+    Require(bundle != nullptr,
+            "active publication's exact retained bundle is unavailable");
+    Require(bundle->value().cell_graph.cell_id == config_.cell_id,
+            "active publication's retained bundle names another cell");
+    Require(bundle->value().cell_graph.graph_revision ==
+                result.value().request.candidate_graph_revision,
+            "active publication's retained bundle has another graph revision");
     return {std::move(result.value()), std::move(bundle)};
   }
 

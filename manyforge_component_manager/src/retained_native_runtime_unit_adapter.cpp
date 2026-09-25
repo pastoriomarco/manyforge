@@ -1700,9 +1700,16 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
 
     const int selected_package_root_fd =
         PackageRootFd(bundle.retained_bundle_id());
+    // The managed child needs both verified package roots: the selected bundle
+    // can be authored while the active predecessor is still installed (or vice
+    // versa). Keep the selected root first and pass the other root as its exact
+    // read-only fallback for publication/fence reconciliation.
     const int selected_program_artifact_root_fd =
-        activation_root_path.empty() ? selected_package_root_fd
-                                            : activation_root_fd.get();
+        activation_root_path.empty()
+            ? selected_package_root_fd
+            : (selected_package_root_fd == activation_root_fd.get()
+                   ? package_root_fd.get()
+                   : activation_root_fd.get());
     const pid_t parent = ::getpid();
     const pid_t pid = ::fork();
     if (pid < 0) {

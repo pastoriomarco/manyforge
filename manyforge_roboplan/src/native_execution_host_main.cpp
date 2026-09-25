@@ -9141,7 +9141,8 @@ void AttachRetainedNativeCCLC(Composition &composition,
       composition.bundle, *active_publication_reader,
       std::move(active_publication.value()), *artifact_source,
       lifecycle_product.value()->catalog_source(),
-      lifecycle_product.value()->brand_ports(), *composition.runtime,
+      lifecycle_product.value()->brand_ports(),
+      CellControlBindingRepresentatives(composition), *composition.runtime,
       fence_owner, *composition.runtime->addressed_kernel, fence_owner
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
       ,

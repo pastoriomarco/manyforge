@@ -1928,18 +1928,23 @@ ApplyResponse(const ManagerCommand &command,
   });
 }
 
-/// Exact UA2A prepared activation accepted by one named Apply.
+/// Compact immutable identity of the UA2A preparation accepted by one Apply.
+/// The complete receipt remains in the Manager journal; observation does not
+/// expand that private input into a second public status shape.
 CanonicalValue ApplyPreparedActivationValue(
     const component_manager::ManagerApplyPreparedActivationDTO &activation) {
-  try {
-    return content_identity::parse_canonical_json(
-        activation.canonical_receipt_json,
-        {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
-         4096U});
-  } catch (const std::exception &error) {
-    Fail("stored Apply prepared activation is invalid: " +
-         std::string(error.what()));
-  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"captured_input_digest",
+       CanonicalValue(activation.captured_input_digest.value())},
+      {"deployment_artifact_id",
+       CanonicalValue(activation.deployment_artifact_id.value())},
+      {"deployment_revision",
+       CanonicalValue(activation.deployment_revision.value())},
+      {"program_binding_id",
+       CanonicalValue(activation.program_binding_id.value())},
+      {"prepared_activation_id",
+       CanonicalValue(activation.prepared_activation_id.value())},
+  });
 }
 
 /// One bounded lifecycle status for one durable Apply generation.

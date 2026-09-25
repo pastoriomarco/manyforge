@@ -42,12 +42,6 @@ def test_qualified_operator_confirmation_uses_current_native_command(tmp_path: P
             ("Headless", stack.api),
             ("Composer", stack.composer),
         ]
-        workbench._converge_control_management(
-            headless,
-            ["lite6_arm"],
-            scenario_id="program_apply_fixture",
-            processes=processes,
-        )
         client = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=2.0)
         owner = client.identity()["identity"]["owner_epoch"]
         query = TargetObservationQuery.model_validate(

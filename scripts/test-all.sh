@@ -401,7 +401,7 @@ prepare_ui6i_cell_bootstrap() {
     configure_manyforge_deployment "$build" ON
     set_build_keep_going_args "$build" || return 1
     if ! cmake --build "$build" --parallel "$BUILD_PARALLEL_LEVEL" \
-        --target manyforge_ui6i_cell_bootstrap -- "${BUILD_KEEP_GOING_ARGS[@]}"; then
+        --target manyforge_ui6i_cell_bootstrap manyforge_prepare_activation -- "${BUILD_KEEP_GOING_ARGS[@]}"; then
         echo -e "${RED}  FAIL: UI6-I cell bootstrap generation failed${NC}"
         return 1
     fi
@@ -491,6 +491,7 @@ run_headless_python_tests() {
         MANYFORGE_MANAGER_APPLY_PACKAGE_ROOT="$build/manager-apply-test-fixture/retained-package" \
         MANYFORGE_MANAGER_APPLY_METADATA="$build/manager-apply-test-fixture/metadata.json" \
         MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT="$BUILD_DIR/deployment/ui6i-dual-scenario-fixture/retained-package" \
+        MANYFORGE_ACTIVATION_PREPARER="$BUILD_DIR/deployment/manyforge_prepare_activation" \
         MANYFORGE_EXAMPLE_SCENARIO_ROOT="$WORKSPACE/examples" \
         MANYFORGE_NATIVE_EXECUTION_HOST="$BUILD_DIR/roboplan/manyforge_native_execution_host" \
         MANYFORGE_ROBOPLAN_CANDIDATE_WORKER="$BUILD_DIR/roboplan/manyforge_roboplan_candidate_worker" \
@@ -659,6 +660,27 @@ run_qualification_tests() {
     manyforge_fail_composable_cell_runtime_unavailable
 }
 
+run_deployment_composition_tests() {
+    section "Deployment CCLC and Stop-plan composition"
+    local build="$BUILD_DIR/ua7wl-deployment-qualification"
+    cmake -S "$WORKSPACE/verification/ua7wl_deployment" -B "$build" \
+        -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
+        -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S"
+    cmake --build "$build" \
+        --target test_resolved_stop_base_plan_resolver test_cclc_runtime_composition \
+        --parallel "$BUILD_PARALLEL_LEVEL"
+    cd "$build"
+    if ! require_ctest_tests "Deployment composition" \
+        "ResolvedStopBasePlanResolverTest" "CCLCRuntimeComposition"; then
+        FAIL=$((FAIL + 1))
+    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S" \
+        -R 'ResolvedStopBasePlanResolverTest|CCLCRuntimeComposition'; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 run_qualification_native_tests() {
     section "Native live-evaluation qualification matrix"
     manyforge_fail_composable_cell_runtime_unavailable
@@ -700,6 +722,9 @@ case "$FILTER" in
     bridge)
         run_bridge_tests
         ;;
+    deployment-composition)
+        run_deployment_composition_tests
+        ;;
     qualification)
         run_qualification_tests
         ;;
@@ -734,7 +759,7 @@ case "$FILTER" in
         run_composer_frontend_tests
         ;;
     *)
-        echo "Usage: $0 [retained|cpp|headless|roboplan|bindings|python|composer|bridge|qualification|qualification-native|qualification-soak|qualification-all|integration|ros]"
+        echo "Usage: $0 [retained|cpp|headless|roboplan|bindings|python|composer|bridge|deployment-composition|qualification|qualification-native|qualification-soak|qualification-all|integration|ros]"
         exit 1
         ;;
 esac

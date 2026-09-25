@@ -102,7 +102,6 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
                         ],
                         "path": rows[scenario_id]["path"],
                         "confirmDiscard": False,
-                        "activate": True,
                     },
                 )
                 break
@@ -126,13 +125,14 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
                     activation["apply_id"], activation["apply_generation"]
                 )
                 if status["state"] != "pending":
-                    assert status["state"] == "succeeded"
+                    assert status["state"] == "succeeded", (scenario_id, status)
                     break
                 if time.monotonic() >= deadline:
                     raise AssertionError(
                         f"Scenario activation did not settle: {status!r}"
                     )
                 time.sleep(0.02)
+        stack.wait_authoring_admission(expected_allowed=True)
         deployment = composer.request("GET", "/api/deployment/workspace")
         assert deployment["draft"]["document"]["deployment_artifact_id"] == (
             "ur5e_lite6_wall"
@@ -141,7 +141,7 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
         assert applied["scenario_id"] == scenario_id
         return (
             applied,
-            loaded["authoringWorkspace"]["project"]["source_document_digest"],
+            applied["source_document_digest"],
         )
 
 
@@ -212,7 +212,6 @@ def _save_and_reopen_current_scenario(
                         ],
                         "path": str(target),
                         "confirmDiscard": False,
-                        "activate": False,
                     },
                 )
                 break
