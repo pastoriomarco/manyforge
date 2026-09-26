@@ -62,6 +62,17 @@ class RuntimeParticipantStopReadiness final {
 rebind_runtime_participant_stop_readiness_generation(const RuntimeParticipantStopReadiness& verified,
                                                      ComponentLifecycleGeneration generation);
 
+/// Re-seal the same verified Stop mechanism to a successor Program/Scene
+/// product while retaining its controller, route and lifecycle generation.
+/// The independently verified controller domain must still be identical;
+/// changing physical Stop facts requires a component replacement instead.
+[[nodiscard]] Result<RuntimeParticipantStopReadiness>
+rebind_runtime_participant_stop_readiness_product(
+    const RuntimeParticipantStopReadiness& verified,
+    const RuntimeParticipantBinding& predecessor,
+    const RuntimeParticipantBinding& candidate,
+    const ControllerLifecycleExpectedDomain& expected_domain);
+
 /// Verify one CCLC-produced readiness value against a sealed runtime
 /// participant. The verified base-plan bytes remain authoritative; this
 /// function performs no repository read, endpoint lookup, or live mutation.

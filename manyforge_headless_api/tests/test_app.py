@@ -39,7 +39,7 @@ from manyforge_headless_api.models import (
 )
 from manyforge_headless_api.native import HeadlessApiError, ViewerModelAsset
 from manyforge_headless_api.program_runner_client import ProgramRunnerClientError
-from manyforge_headless_api.service import HeadlessService
+from manyforge_headless_api.service import HeadlessService, TrustedAttribution
 
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -247,6 +247,61 @@ def test_full_native_applied_program_projection_is_accepted() -> None:
     assert response.json() == projection
 
 
+def _applied_program_status_projection() -> dict[str, Any]:
+    return {
+        "deployment_artifact_id": "cell_a",
+        "deployment_revision": "sha256:" + "1" * 64,
+        "executable": True,
+        "graph_revision": "sha256:" + "9" * 64,
+        "message": None,
+        "non_executable": None,
+        "program": None,
+        "program_binding_id": "sha256:" + "0" * 64,
+        "program_id": "program_a",
+        "program_revision": "sha256:" + "4" * 64,
+        "record_digest": "sha256:" + "5" * 64,
+        "retained_bundle_id": "sha256:" + "8" * 64,
+        "scenario_id": "cell-pick",
+        "schema_version": "manyforge.applied_program_status.v1",
+        "source_document_digest": "sha256:" + "6" * 64,
+    }
+
+
+def test_applied_program_status_preserves_deployment_identity() -> None:
+    core = FakeCore()
+    status = _applied_program_status_projection()
+    core.applied_program_status_projection = copy.deepcopy(status)
+    client = TestClient(create_app(service=_service(core, FakeManager())))
+
+    response = client.get("/api/program/applied/status")
+
+    assert response.status_code == 200
+    assert response.json() == status
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        lambda value: value.pop("deployment_artifact_id"),
+        lambda value: value.__setitem__("deployment_revision", "not-a-digest"),
+        lambda value: value.__setitem__("unexpected", True),
+    ],
+)
+def test_applied_program_status_rejects_invalid_deployment_identity(
+    malformation,
+) -> None:
+    core = FakeCore()
+    status = _applied_program_status_projection()
+    malformation(status)
+    core.applied_program_status_projection = status
+    client = TestClient(create_app(service=_service(core, FakeManager())))
+
+    response = client.get("/api/program/applied/status")
+
+    assert response.status_code != 200
+    assert response.json()["detail"]["code"] == "program_applied_selection_invalid"
+
+
 @pytest.mark.parametrize(
     "break_projection",
     [
@@ -402,6 +457,7 @@ class FakeCore:
             tuple[str, str], tuple[tuple[object, ...], dict[str, Any]]
         ] = {}
         self.applied_program: dict[str, Any] | None = None
+        self.applied_program_status_projection: dict[str, Any] | None = None
         self.program_target_bundle = "bundle.1"
         self.program_target_graph = "graph.1"
         self.model_attempts: list[dict[str, Any]] = []
@@ -491,6 +547,14 @@ class FakeCore:
                 "no Program has been authoritatively Applied",
             )
         return copy.deepcopy(self.applied_program)
+
+    def applied_program_status(self) -> dict[str, Any]:
+        if self.applied_program_status_projection is None:
+            raise HeadlessApiError(
+                "program_applied_selection_not_found",
+                "no Program has been authoritatively Applied",
+            )
+        return copy.deepcopy(self.applied_program_status_projection)
 
     def commit_program_model_attempt(
         self,
@@ -688,7 +752,7 @@ class FakeManager:
             "ok": True,
             "phase": "accepted",
             "prepared_activation": {
-                "schema_version": "manyforge.prepared_activation_input.v2",
+                "schema_version": "manyforge.prepared_activation_input.v3",
                 "scenario_id": "scenario.1",
                 "source_document_digest": "sha256:" + "1" * 64,
                 "captured_input_digest": "sha256:" + "d" * 64,
@@ -698,7 +762,7 @@ class FakeManager:
                 "graph_revision": "sha256:" + "3" * 64,
                 "program_id": "program.1",
                 "program_revision": "sha256:" + "4" * 64,
-                "program_binding_id": "sha256:" + "9" * 64,
+                "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
                 "node_environment_digest": "sha256:" + "5" * 64,
                 "assistant_mode": "optional",
                 "typed_parameter_overrides": {},
@@ -781,7 +845,7 @@ class FakeExecution:
             "api_version": "manyforge.execution_command_response.v1",
             "ok": True,
             "command": "observation",
-            "observation": {"schema_version": "manyforge.execution_observation.v2"},
+            "observation": {"schema_version": "manyforge.execution_observation.v3"},
         }
 
     def submit(
@@ -1463,7 +1527,7 @@ class FakeActivationPreparer:
     def prepare(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(copy.deepcopy(kwargs))
         return {
-            "schema_version": "manyforge.prepared_activation_input.v2",
+            "schema_version": "manyforge.prepared_activation_input.v3",
             "source_document_digest": kwargs["source_document_digest"],
             "scenario_id": kwargs["scenario_id"],
             "captured_input_digest": kwargs["captured_input_digest"],
@@ -1474,7 +1538,7 @@ class FakeActivationPreparer:
             "graph_revision": "sha256:" + "3" * 64,
             "program_id": "program_a",
             "program_revision": "sha256:" + "4" * 64,
-            "program_binding_id": "sha256:" + "5" * 64,
+            "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "5" * 64},
             "node_environment_digest": "sha256:" + "7" * 64,
             "assistant_mode": "forbidden",
             "typed_parameter_overrides": kwargs["typed_parameter_overrides"],
@@ -1975,6 +2039,56 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
     ]
 
 
+def test_non_executable_program_refuses_execute_but_not_manual_control() -> None:
+    """Program Execute depends only on its own binding outcome (H1a).
+
+    A Program whose referenced target was removed is refused by name for
+    Execute, while manual control of an installed component is unaffected.
+    """
+
+    class NonExecutableCore(FakeCore):
+        def applied_program_selection(self) -> dict[str, Any]:
+            raise HeadlessApiError(
+                "program_applied_non_executable",
+                "Applied Program is not executable in the active Deployment: "
+                "target role 'gripper' (component 'lite6_gripper', target "
+                "'gripper') is component_absent",
+            )
+
+    core = NonExecutableCore()
+    runner = FakeProgramRunner()
+    execution = FakeExecution()
+    service = _service(
+        core, FakeManager(), execution=execution, program_runner=runner
+    )
+    client = TestClient(create_app(service=service))
+    start_body = {
+        **_caller(),
+        "scenario_id": "cell-pick",
+        "source_document_digest": "sha256:" + "6" * 64,
+        "expected_applied_record_digest": "sha256:" + "5" * 64,
+        "draft_program_revision": "sha256:" + "7" * 64,
+        "expected_admission_generation": _ADMISSION_GENERATION,
+    }
+
+    with client:
+        refused = client.post("/api/program/runs", json=start_body)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "program_applied_non_executable"
+    assert "'gripper'" in refused.json()["detail"]["message"]
+    assert [call[0] for call in runner.calls if call[0] == "start"] == []
+
+    # Manual control never consults the Applied Program outcome.
+    manual_request = object()
+    accepted = service.execution_submit(
+        manual_request,  # type: ignore[arg-type]
+        TrustedAttribution(principal_id="operator.1"),
+    )
+    assert accepted["ok"] is True
+    assert execution.requests == [("submit", manual_request)]
+
+
 def test_program_run_captures_current_environment_not_package_provenance() -> None:
     current_environment = "sha256:" + "e" * 64
     core = FakeCore()
@@ -2254,7 +2368,7 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                 },
                 "reject_if_affected_busy": True,
                 "prepared_activation": {
-                    "schema_version": "manyforge.prepared_activation_input.v2",
+                    "schema_version": "manyforge.prepared_activation_input.v3",
                     "scenario_id": "scenario.1",
                     "source_document_digest": "sha256:" + "1" * 64,
                     "captured_input_digest": "sha256:" + "d" * 64,
@@ -2264,7 +2378,7 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                     "graph_revision": "sha256:" + "3" * 64,
                     "program_id": "program.1",
                     "program_revision": "sha256:" + "4" * 64,
-                    "program_binding_id": "sha256:" + "9" * 64,
+                    "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
                     "node_environment_digest": "sha256:" + "5" * 64,
                     "assistant_mode": "optional",
                     "typed_parameter_overrides": {},
@@ -2272,7 +2386,7 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                 },
                 "expected_admission_generation": 7,
                 "candidate_receipt": {
-                    "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+                    "schema_version": "manyforge.manager_deployment_candidate_receipt.v2",
                     "deployment_artifact_id": "deployment.1",
                     "deployment_revision": "sha256:" + "b" * 64,
                     "prepared_activation_id": "sha256:" + "e" * 64,
@@ -2284,6 +2398,8 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                     },
                     "expected_admission_generation": 7,
                     "manager_owner_epoch": "client.epoch.1",
+                    "impact_digest": "sha256:" + "c" * 64,
+                    "destructive_impact": False,
                     "receipt_digest": "sha256:" + "d" * 64,
                 },
             },
@@ -2310,7 +2426,10 @@ def test_apply_status_is_a_read_only_durable_identity_observation() -> None:
     # neither is derived from responsiveness or a heartbeat.
     assert body["phase"] == body["last_progress"]["phase"] == "accepted"
     assert body["request_id"] == "request.1"
-    assert body["prepared_activation"]["program_binding_id"] == "sha256:" + "9" * 64
+    assert body["prepared_activation"]["program_outcome"] == {
+        "kind": "bound",
+        "program_binding_id": "sha256:" + "9" * 64,
+    }
     assert manager.apply_observations == [("apply/7", 7)]
 
 
@@ -2887,23 +3006,17 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     assert all("condition" not in path or "acknowledge" in path for path in paths)
 
 
-def test_execution_diagnostics_is_explicit_and_status_is_only_compatibility() -> None:
+def test_execution_diagnostics_is_explicit_and_status_alias_is_retired() -> None:
+    # H1a-IF.2 cutover: the deprecated motion-centred status alias is gone.
     execution = FakeExecution()
     app = create_app(service=_service(FakeCore(), FakeManager(), execution))
     with TestClient(app) as client:
         diagnostics = client.get("/api/execution/diagnostics")
-        compatibility = client.get("/api/execution/status")
+        retired = client.get("/api/execution/status")
 
     assert diagnostics.status_code == 200
-    assert (
-        diagnostics.json()
-        == compatibility.json()
-        == {
-            "ok": True,
-            "command": "status",
-            "status": {},
-        }
-    )
+    assert diagnostics.json() == {"ok": True, "command": "status", "status": {}}
+    assert retired.status_code == 404
 
 
 def test_control_diagnostics_are_bounded_and_do_not_start_source_work() -> None:
@@ -2950,7 +3063,7 @@ def test_execution_observation_websocket_proxies_one_persistent_credited_session
                 "api_version": "manyforge.execution_command_response.v1",
                 "command": "observation",
                 "observation": {
-                    "schema_version": "manyforge.execution_observation.v2",
+                    "schema_version": "manyforge.execution_observation.v3",
                     "source_sequence": len(self.cursors),
                 },
                 "ok": True,

@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <limits>
 #include <manyforge_core/bounded_operation_control_executor.hpp>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -41,6 +43,7 @@ class BoundedOperationControlExecutor::Impl final {
       slot->engine = engine;
       slots_.push_back(std::move(slot));
     }
+    active_slots_ = slots_.size();
     try {
       for (std::size_t index = 0U; index < slots_.size(); ++index) {
         auto& slot = slots_[index];
@@ -91,18 +94,120 @@ class BoundedOperationControlExecutor::Impl final {
     }
   }
 
-  [[nodiscard]] std::size_t capacity() const noexcept { return slots_.size(); }
+  [[nodiscard]] std::size_t capacity() const noexcept {
+    std::shared_lock lock(slots_mutex_);
+    return active_slots_;
+  }
   [[nodiscard]] bool has_active_calls() const noexcept {
     return active_calls_.load(std::memory_order_acquire) != 0U;
   }
 
   [[nodiscard]] bool prequalified_ready() const noexcept {
+    std::shared_lock lock(slots_mutex_);
     return accepting_.load(std::memory_order_acquire) &&
-           ready_workers_.load(std::memory_order_acquire) == slots_.size();
+           ready_workers_.load(std::memory_order_acquire) == active_slots_;
+  }
+
+  [[nodiscard]] OperationControlLaneUpdateStatus ReconfigureEngines(
+      const std::vector<IResolvedParticipantExecutionEngine*>& engines) noexcept {
+    if (engines.empty() || engines.size() > kMaximumOperationControlLanes ||
+        std::any_of(engines.begin(), engines.end(), [](auto* engine) { return engine == nullptr; })) {
+      return OperationControlLaneUpdateStatus::kInvalid;
+    }
+    for (std::size_t index = 0; index < engines.size(); ++index) {
+      if (std::find(engines.begin(), engines.begin() + index, engines[index]) !=
+          engines.begin() + index) {
+        return OperationControlLaneUpdateStatus::kInvalid;
+      }
+    }
+    try {
+      std::unique_lock slots_lock(slots_mutex_);
+      if (!accepting_.load(std::memory_order_acquire)) {
+        return OperationControlLaneUpdateStatus::kClosed;
+      }
+      if (has_active_calls()) {
+        return OperationControlLaneUpdateStatus::kBusy;
+      }
+      for (const auto& slot : slots_) {
+        std::lock_guard lock(slot->mutex);
+        if (slot->state != State::kFree) {
+          return OperationControlLaneUpdateStatus::kBusy;
+        }
+      }
+
+      std::vector<std::size_t> retired;
+      std::vector<std::size_t> vacant;
+      for (std::size_t index = 0; index < slots_.size(); ++index) {
+        auto* engine = slots_[index]->engine;
+        if (engine == nullptr) {
+          vacant.push_back(index);
+        } else if (std::find(engines.begin(), engines.end(), engine) == engines.end()) {
+          retired.push_back(index);
+          vacant.push_back(index);
+        }
+      }
+      std::vector<std::pair<std::size_t, std::unique_ptr<Slot>>> additions;
+      additions.reserve(engines.size());
+      std::size_t vacant_index = 0;
+      std::size_t next_index = slots_.size();
+      for (auto* engine : engines) {
+        const bool retained = std::any_of(slots_.begin(), slots_.end(),
+                                          [&](const auto& slot) { return slot->engine == engine; });
+        if (retained) continue;
+        const auto index = vacant_index < vacant.size() ? vacant[vacant_index++] : next_index++;
+        auto slot = std::make_unique<Slot>();
+        slot->engine = engine;
+        if (index < slots_.size()) slot->generation = slots_[index]->generation;
+        additions.emplace_back(index, std::move(slot));
+      }
+      slots_.reserve(next_index);
+      const auto ready_before = ready_workers_.load(std::memory_order_acquire);
+      try {
+        for (auto& [index, slot] : additions) {
+          slot->worker = std::jthread([this, pointer = slot.get(), index](std::stop_token token) {
+            Run(*pointer, static_cast<std::uint32_t>(index), token);
+          });
+        }
+      } catch (...) {
+        for (auto& [index, slot] : additions) {
+          (void)index;
+          if (slot->worker.joinable()) {
+            { std::lock_guard lock(slot->mutex); slot->worker.request_stop(); }
+            slot->changed.notify_all();
+            slot->worker.join();
+          }
+        }
+        return OperationControlLaneUpdateStatus::kCapacityUnavailable;
+      }
+      auto ready = ready_workers_.load(std::memory_order_acquire);
+      while (ready < ready_before + additions.size()) {
+        ready_workers_.wait(ready, std::memory_order_acquire);
+        ready = ready_workers_.load(std::memory_order_acquire);
+      }
+      for (const auto index : retired) {
+        auto& slot = slots_[index];
+        { std::lock_guard lock(slot->mutex); slot->worker.request_stop(); }
+        slot->changed.notify_all();
+        if (slot->worker.joinable()) slot->worker.join();
+        slot->engine = nullptr;
+      }
+      for (auto& [index, slot] : additions) {
+        if (index == slots_.size()) {
+          slots_.push_back(std::move(slot));
+        } else {
+          slots_[index] = std::move(slot);
+        }
+      }
+      active_slots_ = engines.size();
+      return OperationControlLaneUpdateStatus::kApplied;
+    } catch (...) {
+      return OperationControlLaneUpdateStatus::kCapacityUnavailable;
+    }
   }
 
   [[nodiscard]] OperationControlEffectStartResult TryStart(
       OperationControlEffectRequest request) noexcept {
+    std::shared_lock slots_lock(slots_mutex_);
     if (request.engine == nullptr || request.operation_id.empty() ||
         request.participant_id.empty() || !request.operation_revision.nonzero() ||
         (request.control != OperationControlKind::kPause &&
@@ -123,7 +228,7 @@ class BoundedOperationControlExecutor::Impl final {
     if (!accepting_.load(std::memory_order_acquire)) {
       return {OperationControlEffectStartStatus::kClosed, std::nullopt};
     }
-    if (!prequalified_ready()) {
+    if (ready_workers_.load(std::memory_order_acquire) != active_slots_) {
       return {OperationControlEffectStartStatus::kNotPrequalified, std::nullopt};
     }
     for (std::size_t index = 0U; index < slots_.size(); ++index) {
@@ -153,6 +258,7 @@ class BoundedOperationControlExecutor::Impl final {
 
   [[nodiscard]] OperationControlEffectTakeResult TryTake(
       const OperationControlEffectHandle handle) noexcept {
+    std::shared_lock slots_lock(slots_mutex_);
     auto* slot = Resolve(handle);
     if (slot == nullptr) {
       return {OperationControlEffectTakeStatus::kStaleHandle, std::nullopt};
@@ -181,6 +287,7 @@ class BoundedOperationControlExecutor::Impl final {
 
   [[nodiscard]] OperationControlEffectReleaseStatus Release(
       const OperationControlEffectHandle handle) noexcept {
+    std::shared_lock slots_lock(slots_mutex_);
     auto* slot = Resolve(handle);
     if (slot == nullptr) {
       return OperationControlEffectReleaseStatus::kStaleHandle;
@@ -203,6 +310,7 @@ class BoundedOperationControlExecutor::Impl final {
   }
 
   void CloseIngress() noexcept {
+    std::shared_lock slots_lock(slots_mutex_);
     accepting_.store(false, std::memory_order_release);
     for (auto& slot : slots_) {
       // Handshake with the mutex protecting the worker wait predicate so a
@@ -401,7 +509,9 @@ class BoundedOperationControlExecutor::Impl final {
 
   BoundedOperationControlExecutor& owner_;
   IOperationControlEffectCompletionReceiver& receiver_;
+  mutable std::shared_mutex slots_mutex_;
   std::vector<std::unique_ptr<Slot>> slots_;
+  std::size_t active_slots_{};
   std::atomic<bool> accepting_{true};
   std::atomic<std::size_t> ready_workers_{0U};
   std::atomic<std::size_t> active_calls_{0U};
@@ -427,6 +537,11 @@ bool BoundedOperationControlExecutor::prequalified_ready() const noexcept {
 
 bool BoundedOperationControlExecutor::has_active_calls() const noexcept {
   return impl_->has_active_calls();
+}
+
+OperationControlLaneUpdateStatus BoundedOperationControlExecutor::ReconfigureEngines(
+    std::vector<IResolvedParticipantExecutionEngine*> engines) noexcept {
+  return impl_->ReconfigureEngines(engines);
 }
 
 OperationControlEffectStartResult BoundedOperationControlExecutor::TryStart(

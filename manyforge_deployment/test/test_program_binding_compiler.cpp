@@ -12,10 +12,14 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_core/types/program_contract.hpp>
+#include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/initial_scene_projection.hpp>
+#include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
@@ -42,6 +46,10 @@ using manyforge::deployment::compile_direct_control_gripper_program_binding;
 using manyforge::deployment::compile_direct_control_motion_program_binding;
 using manyforge::deployment::compile_direct_control_program_binding_inventory;
 using manyforge::deployment::compile_program_binding;
+using manyforge::deployment::compile_program_binding_outcome;
+using manyforge::deployment::DecodeProgramNonExecutableOutcome;
+using manyforge::deployment::EncodeProgramNonExecutableOutcome;
+using manyforge::deployment::ProgramBindingUnresolvedReason;
 using manyforge::deployment::FilesystemCatalogArtifactStore;
 using manyforge::deployment::FilesystemVerifiedRetainedBundleSource;
 using manyforge::deployment::FilesystemVerifiedRetainedModelMapSource;
@@ -702,6 +710,382 @@ TEST(ProgramBindingCompilerTest, RejectsIncompleteAndUnknownRoleAssignments) {
                    *contract, std::move(unknown), *context.bundle,
                    context.model_map, catalog_store)),
                ProgramBindingCompilerError);
+}
+
+TEST(ProgramBindingCompilerTest,
+     OutcomeBindsExactlyLikeTheCompilerWhenEveryRoleResolves) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path());
+  const auto contract = verify_program_binding_contract(
+      make_program_bytes(*context.bundle), *context.bundle);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+
+  const auto outcome = compile_program_binding_outcome(
+      *contract, valid_assignment(), *context.bundle, context.model_map,
+      catalog_store);
+  const auto binding =
+      compile_program_binding(*contract, valid_assignment(), *context.bundle,
+                              context.model_map, catalog_store);
+
+  ASSERT_NE(outcome.binding, nullptr);
+  EXPECT_FALSE(outcome.non_executable.has_value());
+  EXPECT_EQ(outcome.binding->canonical_bytes(), binding->canonical_bytes());
+}
+
+TEST(ProgramBindingCompilerTest,
+     MissingCandidateTargetMakesTheProgramNamedNonExecutable) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path());
+  const auto contract = verify_program_binding_contract(
+      make_program_bytes(*context.bundle), *context.bundle);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  auto missing_target = valid_assignment();
+  missing_target.target_roles.front().command_target_id =
+      manyforge::core::CommandTargetId("removed_target");
+
+  const auto outcome = compile_program_binding_outcome(
+      *contract, missing_target, *context.bundle, context.model_map,
+      catalog_store);
+
+  EXPECT_EQ(outcome.binding, nullptr);
+  ASSERT_TRUE(outcome.non_executable.has_value());
+  const auto &value = *outcome.non_executable;
+  EXPECT_TRUE(value.valid());
+  EXPECT_EQ(value.program_id, contract->value().program_id);
+  EXPECT_EQ(value.program_revision, contract->value().program_revision);
+  EXPECT_EQ(value.retained_bundle_id, context.bundle->retained_bundle_id());
+  ASSERT_EQ(value.unresolved_roles.size(), 1U);
+  const auto &row = value.unresolved_roles.front();
+  EXPECT_EQ(row.component_role_id, ComponentRoleId("robot"));
+  EXPECT_EQ(row.target_role_id, TargetRoleId("arm"));
+  EXPECT_EQ(row.command_target_id,
+            manyforge::core::CommandTargetId("removed_target"));
+  EXPECT_EQ(row.reason, ProgramBindingUnresolvedReason::kTargetMissing);
+  // No authored node uses the role, but the Program still cannot bind.
+  EXPECT_TRUE(value.affected_nodes.empty());
+  EXPECT_EQ(DecodeProgramNonExecutableOutcome(
+                EncodeProgramNonExecutableOutcome(value)),
+            value);
+}
+
+TEST(ProgramBindingCompilerTest,
+     MissingComponentNamesItsRoleAndEveryDependentTarget) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path());
+  const auto contract = verify_program_binding_contract(
+      make_program_bytes(*context.bundle), *context.bundle);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  auto missing_component = valid_assignment();
+  missing_component.component_roles.front().controllable_component_id =
+      manyforge::core::ControllableComponentId("removed_robot");
+
+  const auto outcome = compile_program_binding_outcome(
+      *contract, missing_component, *context.bundle, context.model_map,
+      catalog_store);
+
+  ASSERT_TRUE(outcome.non_executable.has_value());
+  const auto &rows = outcome.non_executable->unresolved_roles;
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_FALSE(rows[0].target_role_id.has_value());
+  EXPECT_EQ(rows[0].reason, ProgramBindingUnresolvedReason::kComponentMissing);
+  EXPECT_EQ(rows[0].controllable_component_id,
+            manyforge::core::ControllableComponentId("removed_robot"));
+  EXPECT_EQ(rows[1].target_role_id, TargetRoleId("arm"));
+  EXPECT_EQ(rows[1].reason,
+            ProgramBindingUnresolvedReason::kComponentRoleUnresolved);
+  // The ordinary compiler keeps failing exactly as before.
+  EXPECT_THROW(static_cast<void>(compile_program_binding(
+                   *contract, missing_component, *context.bundle,
+                   context.model_map, catalog_store)),
+               ProgramBindingCompilerError);
+}
+
+TEST(ProgramBindingCompilerTest,
+     MalformedAssignmentStillAbortsInsteadOfBecomingNonExecutable) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path());
+  const auto contract = verify_program_binding_contract(
+      make_program_bytes(*context.bundle), *context.bundle);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  auto incomplete = valid_assignment();
+  incomplete.target_roles.clear();
+
+  EXPECT_THROW(static_cast<void>(compile_program_binding_outcome(
+                   *contract, std::move(incomplete), *context.bundle,
+                   context.model_map, catalog_store)),
+               ProgramBindingCompilerError);
+}
+
+// -- Prepared-activation outcome readback (H1a) ------------------------------
+
+[[nodiscard]] CanonicalValue assignment_value(std::string_view command_target) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"component_roles",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+           {"component_role_id", CanonicalValue("robot")},
+           {"controllable_component_id",
+            CanonicalValue(std::string(kLite6ControllableComponentId))},
+       })})},
+      {"target_roles",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+           {"command_target_id", CanonicalValue(std::string(command_target))},
+           {"target_role_id", CanonicalValue("arm")},
+       })})},
+  });
+}
+
+[[nodiscard]] manyforge::deployment::PreparedActivationInput
+prepare(const std::filesystem::path &root, const BindingCompilerContext &context,
+        std::string_view command_target) {
+  const auto contract = verify_program_binding_contract(
+      make_program_bytes(*context.bundle), *context.bundle);
+  FilesystemCatalogArtifactStore catalog_store(root);
+  manyforge::deployment::FilesystemRawArtifactStore raw_store(root);
+  return manyforge::deployment::assemble_prepared_activation(
+      {manyforge::core::ContentDigest("sha256:" + std::string(64U, '1')),
+       "scenario.readback",
+       manyforge::core::ContentDigest("sha256:" + std::string(64U, '2')),
+       "optional", CanonicalValue(CanonicalValue::Object{})},
+      *context.bundle, context.model_map, *contract,
+      assignment_value(command_target), catalog_store, raw_store);
+}
+
+[[nodiscard]] CanonicalValue with_member(const CanonicalValue &object,
+                                         std::string_view name,
+                                         CanonicalValue value) {
+  CanonicalValue::Object members = object.as_object();
+  for (auto &[member, current] : members) {
+    if (member == name) {
+      current = std::move(value);
+      return CanonicalValue(std::move(members));
+    }
+  }
+  throw std::logic_error("test member is absent");
+}
+
+/// Re-derive the content identity so identity and structural parsing pass:
+/// only recompilation can then detect the forged outcome.
+[[nodiscard]] CanonicalValue reidentify(const CanonicalValue &root) {
+  CanonicalValue::Object identity;
+  for (const auto &[name, value] : root.as_object()) {
+    if (name != "prepared_activation_id") identity.emplace_back(name, value);
+  }
+  const auto id = manyforge::deployment::sha256_digest(
+      canonical_json(CanonicalValue(identity)));
+  identity.emplace_back("prepared_activation_id", CanonicalValue(id));
+  return CanonicalValue(std::move(identity));
+}
+
+TEST(ProgramBindingCompilerTest,
+     ReadbackRecompilesANonExecutableOutcomeAndRejectsATamperedResult) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path());
+  const auto honest = prepare(root.path(), context, "removed_target");
+  ASSERT_TRUE(honest.program_outcome().has_value());
+  EXPECT_FALSE(honest.program_binding_id().has_value());
+  EXPECT_NO_THROW(manyforge::deployment::verify_prepared_program_outcome(honest));
+
+  // Another valid named reason, same Program/bundle/graph: identity and
+  // parsing pass, but it is not what the preserved assignment compiles to.
+  const auto &outcome_value = honest.normalized_root()
+                                  .find_object_member("program_outcome")
+                                  ->find_object_member("outcome");
+  auto rows = outcome_value->find_object_member("unresolved_roles")->as_array();
+  rows.front() = with_member(rows.front(), "reason",
+                             CanonicalValue("target_incompatible"));
+  const auto tampered_outcome = with_member(
+      *outcome_value, "unresolved_roles", CanonicalValue(std::move(rows)));
+  const auto tampered = manyforge::deployment::parse_prepared_activation_input(
+      reidentify(with_member(
+          honest.normalized_root(), "program_outcome",
+          with_member(*honest.normalized_root().find_object_member("program_outcome"),
+                      "outcome", tampered_outcome))));
+  EXPECT_THROW(manyforge::deployment::verify_prepared_program_outcome(tampered),
+               manyforge::deployment::PreparedActivationInputError);
+
+  // The Manager's admission path refuses it; the honest value reads back.
+  ScopedTrustedRoot store;
+  const manyforge::deployment::FilesystemPreparedActivationRepository repository(
+      store.path());
+  ASSERT_TRUE(repository.put_if_absent(honest));
+  ASSERT_TRUE(repository.put_if_absent(tampered));
+  EXPECT_NE(repository.get_verified(honest.prepared_activation_id()), nullptr);
+  EXPECT_THROW(static_cast<void>(
+                   repository.get_verified(tampered.prepared_activation_id())),
+               manyforge::deployment::PreparedActivationInputError);
+}
+
+TEST(ProgramBindingCompilerTest,
+     ReadbackRejectsANonExecutableOutcomeForgedOverABindableProgram) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path());
+  const auto bound = prepare(root.path(), context, kLite6ArmTargetId);
+  ASSERT_TRUE(bound.program_binding_id().has_value());
+  const auto honest_unbound = prepare(root.path(), context, "removed_target");
+
+  // Claim "non-executable" (and drop the binding) for a Program whose
+  // carried assignment actually binds.
+  auto payload = with_member(
+      *bound.normalized_root().find_object_member("activation_payload"),
+      "program_binding", CanonicalValue(nullptr));
+  const auto forged_root = with_member(
+      with_member(bound.normalized_root(), "activation_payload", std::move(payload)),
+      "program_outcome",
+      *honest_unbound.normalized_root().find_object_member("program_outcome"));
+  const auto forged =
+      manyforge::deployment::parse_prepared_activation_input(reidentify(forged_root));
+  EXPECT_THROW(manyforge::deployment::verify_prepared_program_outcome(forged),
+               manyforge::deployment::PreparedActivationInputError);
+}
+
+[[nodiscard]] CanonicalValue scene_box(std::string id, CanonicalValue frame_ref) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"pose",
+       CanonicalValue(CanonicalValue::Object{
+           {"frame_ref", std::move(frame_ref)},
+           {"orientation",
+            CanonicalValue(CanonicalValue::Object{
+                {"rpy_deg", CanonicalValue(CanonicalValue::Array{
+                                CanonicalValue(0.0), CanonicalValue(0.0),
+                                CanonicalValue(0.0)})},
+            })},
+           {"position_m", CanonicalValue(CanonicalValue::Array{
+                              CanonicalValue(0.1), CanonicalValue(0.0),
+                              CanonicalValue(0.05)})},
+       })},
+      {"scene_resource_id", CanonicalValue(std::move(id))},
+      {"shape",
+       CanonicalValue(CanonicalValue::Object{
+           {"box_dimensions_m", CanonicalValue(CanonicalValue::Array{
+                                    CanonicalValue(0.02), CanonicalValue(0.02),
+                                    CanonicalValue(0.02)})},
+           {"type", CanonicalValue("box")},
+       })},
+  });
+}
+
+/// The aggregate arm+gripper Program with an authored initial Scene: one
+/// object on the robot's arm-model `tcp` frame and one in the cell frame.
+[[nodiscard]] std::string aggregate_program_with_scene(const RetainedBundle &bundle) {
+  CanonicalValue::Object members = make_aggregate_program_root(bundle).as_object();
+  CanonicalValue scene(CanonicalValue::Array{
+      scene_box("on_arm_tcp",
+                CanonicalValue(CanonicalValue::Object{
+                    {"component_role", CanonicalValue("robot")},
+                    {"frame_role", CanonicalValue("tcp")},
+                    {"kind", CanonicalValue("component_frame")},
+                    {"model_role", CanonicalValue("arm_model")},
+                })),
+      scene_box("table_marker", CanonicalValue(CanonicalValue::Object{
+                                    {"kind", CanonicalValue("cell_frame")},
+                                })),
+  });
+  bool replaced = false;
+  for (auto &[name, value] : members) {
+    if (name == "scene") {
+      value = scene;
+      replaced = true;
+    }
+  }
+  if (!replaced) members.emplace_back("scene", std::move(scene));
+  const CanonicalValue root(std::move(members));
+  const std::string revision =
+      compute_content_identity(root, ContentIdentitySpec{
+                                         .identity_domain = "program-revision",
+                                         .api_version = "manyforge.program.v2",
+                                         .own_field = "program_revision",
+                                     });
+  CanonicalValue::Object identified = root.as_object();
+  for (auto &[name, value] : identified) {
+    if (name == "program_revision") value = CanonicalValue(revision);
+  }
+  return canonical_json(CanonicalValue(std::move(identified)));
+}
+
+TEST(ProgramBindingCompilerTest,
+     NonExecutableSceneKeepsObjectsOnSurvivingFramesAndRefusesUnresolvedOnes) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path(), true);
+  const auto contract = verify_program_binding_contract(
+      aggregate_program_with_scene(*context.bundle), *context.bundle);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  const auto cell_id = context.bundle->value().cell_graph.cell_id;
+
+  // The gripper target is gone; the arm and its tcp frame still resolve.
+  auto gripper_removed = valid_assignment(true);
+  gripper_removed.target_roles.back().command_target_id =
+      manyforge::core::CommandTargetId("removed_gripper_target");
+  const auto without_gripper = compile_program_binding_outcome(
+      *contract, gripper_removed, *context.bundle, context.model_map,
+      catalog_store);
+  ASSERT_TRUE(without_gripper.non_executable.has_value());
+  ASSERT_TRUE(without_gripper.resolved_roles.has_value());
+  const auto scene = manyforge::deployment::project_resolved_initial_scene(
+      *contract, *without_gripper.resolved_roles, cell_id);
+  ASSERT_EQ(scene.size(), 2U);
+  const auto *arm_frame =
+      std::get_if<manyforge::core::ComponentSceneFrameRefDTO>(&scene.front().frame_ref);
+  ASSERT_NE(arm_frame, nullptr);
+  EXPECT_EQ(arm_frame->controllable_component_id.value(),
+            kLite6ControllableComponentId);
+
+  // The whole component is gone: its frame cannot be verified, so the object
+  // is refused by name instead of being dropped from planning.
+  auto component_removed = valid_assignment(true);
+  component_removed.component_roles.front().controllable_component_id =
+      manyforge::core::ControllableComponentId("removed_robot");
+  const auto without_robot = compile_program_binding_outcome(
+      *contract, component_removed, *context.bundle, context.model_map,
+      catalog_store);
+  ASSERT_TRUE(without_robot.resolved_roles.has_value());
+  EXPECT_THROW(static_cast<void>(manyforge::deployment::project_resolved_initial_scene(
+                   *contract, *without_robot.resolved_roles, cell_id)),
+               manyforge::deployment::ProgramBindingError);
+}
+
+TEST(ProgramBindingCompilerTest,
+     NonExecutableCapabilityDoesNotDiscardVerifiedSceneFrames) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path(), true);
+  auto program = manyforge::deployment::parse_strict_json_model_yaml(
+                     aggregate_program_with_scene(*context.bundle)).root();
+  const auto &targets = *program.find_object_member("target_roles");
+  auto arm = *targets.find_object_member("arm");
+  // A valid capability exists in the catalog but not on this arm target.
+  // Its missing provider must block execution without invalidating tcp.
+  arm = with_member(arm, "required_capabilities",
+      CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+          {"capability_id", CanonicalValue("tool.gripper.command")},
+          {"parameters", CanonicalValue(CanonicalValue::Object{})},
+          {"disposition", CanonicalValue("required")},
+      })}));
+  program = with_member(program, "target_roles", with_member(targets, "arm", arm));
+  program = with_member(program, "program_revision", CanonicalValue(
+      compute_content_identity(program, ContentIdentitySpec{
+          .identity_domain = "program-revision",
+          .api_version = "manyforge.program.v2",
+          .own_field = "program_revision"})));
+  const auto contract = verify_program_binding_contract(
+      canonical_json(program), *context.bundle);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  const auto outcome = compile_program_binding_outcome(
+      *contract, valid_assignment(true), *context.bundle, context.model_map,
+      catalog_store);
+  EXPECT_EQ(outcome.binding, nullptr);
+  ASSERT_TRUE(outcome.non_executable.has_value());
+  ASSERT_EQ(outcome.non_executable->unresolved_roles.size(), 1U);
+  EXPECT_EQ(outcome.non_executable->unresolved_roles.front().reason,
+            ProgramBindingUnresolvedReason::kCapabilityUnavailable);
+  ASSERT_TRUE(outcome.resolved_roles.has_value());
+  const auto scene = manyforge::deployment::project_resolved_initial_scene(
+      *contract, *outcome.resolved_roles,
+      context.bundle->value().cell_graph.cell_id);
+  ASSERT_EQ(scene.size(), 2U);
+  EXPECT_TRUE(std::holds_alternative<manyforge::core::ComponentSceneFrameRefDTO>(
+      scene.front().frame_ref));
+  for (const auto &target : outcome.resolved_roles->target_roles) {
+    EXPECT_TRUE(target.capability_bindings.empty());
+  }
 }
 
 TEST(ProgramBindingCompilerTest,

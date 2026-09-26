@@ -153,7 +153,7 @@ def _execution_observation() -> dict[str, Any]:
         "command": "observation",
         "ok": True,
         "observation": {
-            "schema_version": "manyforge.execution_observation.v2",
+            "schema_version": "manyforge.execution_observation.v3",
             "owner_epoch": "execution.epoch.1",
             "cell_id": "cell-a",
             "retained_bundle_id": "bundle.1",
@@ -164,6 +164,7 @@ def _execution_observation() -> dict[str, Any]:
                 {
                     "controllable_component_id": "robot-a",
                     "command_target_id": "arm",
+                    "operation_capability_id": "execution.trajectory.execute",
                     "source_epoch": "arm-source.1",
                     "source_sequence": 7,
                     "source_joint_names": ["joint1"],

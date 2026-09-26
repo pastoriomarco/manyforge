@@ -232,6 +232,8 @@ class HeadlessCorePort(Protocol):
 
     def applied_program_selection(self) -> dict[str, Any]: ...
 
+    def applied_program_status(self) -> dict[str, Any]: ...
+
     def viewer_model_urdf(self) -> ViewerModelAsset: ...
 
     def viewer_model_resource(
@@ -591,6 +593,12 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("applied_program_selection"),
             method="applied_program_selection",
+        )
+
+    def applied_program_status(self) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("applied_program_status"),
+            method="applied_program_status",
         )
 
     def viewer_model_urdf(self) -> ViewerModelAsset:

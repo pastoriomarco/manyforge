@@ -131,6 +131,7 @@ class _PassThroughAdmission:
         install=None,
         expected_identity=None,
         project=None,
+        prepare_project_under_claim=None,
         **_kwargs,
     ):
         """Commit through the real composite owner; only the Kernel is stubbed."""
@@ -142,6 +143,8 @@ class _PassThroughAdmission:
                 project=project,
             )
         elif session == "project":
+            if prepare_project_under_claim is not None:
+                project = prepare_project_under_claim()
             snapshot = workspace.commit_project(
                 expected_identity=expected_identity,
                 facts=project,
@@ -533,7 +536,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
             (intent["expected_admission_generation"], acquired_generation)
         )
         candidate = {
-            "schema_version": "manyforge.prepared_activation_input.v2",
+            "schema_version": "manyforge.prepared_activation_input.v3",
             "prepared_activation_id": "prepared-load-test",
             "scenario_id": intent["scenario_id"],
             "source_document_digest": intent["source_document_digest"],
@@ -544,7 +547,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
             "graph_revision": "graph-load-test",
             "program_id": "program-load-test",
             "program_revision": "program-revision",
-            "program_binding_id": "binding-load-test",
+            "program_outcome": {"kind": "bound", "program_binding_id": "binding-load-test"},
             "node_environment_digest": "sha256:" + "a" * 64,
             "assistant_mode": "forbidden",
             "typed_parameter_overrides": {},

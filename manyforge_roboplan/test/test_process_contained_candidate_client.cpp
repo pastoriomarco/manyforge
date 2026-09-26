@@ -98,6 +98,32 @@ private:
   int saved_flags_{-1};
 };
 
+class ScopedDuplicatePackageRootDescriptor final {
+public:
+  explicit ScopedDuplicatePackageRootDescriptor(const int source_descriptor) {
+    descriptor_ = ::fcntl(source_descriptor, F_DUPFD, 9);
+    if (descriptor_ < 0) {
+      throw std::runtime_error("could not duplicate test package root");
+    }
+  }
+
+  ~ScopedDuplicatePackageRootDescriptor() {
+    if (descriptor_ >= 0) {
+      static_cast<void>(::close(descriptor_));
+    }
+  }
+
+  ScopedDuplicatePackageRootDescriptor(
+      const ScopedDuplicatePackageRootDescriptor &) = delete;
+  ScopedDuplicatePackageRootDescriptor &
+  operator=(const ScopedDuplicatePackageRootDescriptor &) = delete;
+
+  [[nodiscard]] int get() const noexcept { return descriptor_; }
+
+private:
+  int descriptor_{-1};
+};
+
 [[nodiscard]] std::vector<double> values(const Eigen::VectorXd &vector) {
   return {vector.data(), vector.data() + vector.size()};
 }
@@ -583,6 +609,52 @@ TEST(ProcessContainedCandidateClientTest,
   process_config.require_retained_projection = true;
   process_config.scene_asset_root = std::filesystem::path("/proc/self/fd/6");
   process_config.retained_package_root_fd = 6;
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      std::move(process_config));
+
+  const auto selected = client.select_retained_projection(
+      projection(1U, 1U, false, "examples/scene/meshes/fixture.obj"));
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+
+  const auto displaced = root_parent / "package-a-displaced";
+  std::filesystem::rename(package_a, displaced);
+  std::filesystem::rename(package_b, package_a);
+  ASSERT_TRUE(std::filesystem::is_directory(package_a));
+  const auto planned = client.compute(request(fixture));
+  ASSERT_TRUE(planned.ok()) << planned.error().message;
+  std::filesystem::remove_all(root_parent, ignored);
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     RetainedWorkerMapsAlternateSourceDescriptorToReservedWorkerFd) {
+  auto fixture = make_fixture();
+  const auto root_parent =
+      std::filesystem::temp_directory_path() /
+      ("manyforge-worker-fd-alt-" + std::to_string(::getpid()));
+  const auto package_a = root_parent / "package-a";
+  const auto package_b = root_parent / "package-b";
+  const auto mesh = package_a / "examples/scene/meshes/fixture.obj";
+  std::error_code ignored;
+  std::filesystem::remove_all(root_parent, ignored);
+  ASSERT_TRUE(std::filesystem::create_directories(mesh.parent_path()));
+  {
+    std::ofstream stream(mesh, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(stream.good());
+    stream << "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    stream.flush();
+    ASSERT_TRUE(stream.good());
+  }
+  ASSERT_TRUE(std::filesystem::create_directory(package_b));
+  ScopedPackageRootDescriptor package_root(package_a);
+  ScopedDuplicatePackageRootDescriptor alternate_root(6);
+
+  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
+  process_config.require_retained_projection = true;
+  process_config.scene_asset_root = std::filesystem::path(
+      "/proc/self/fd/" + std::to_string(alternate_root.get()));
+  process_config.retained_package_root_fd = alternate_root.get();
   ProcessContainedRoboPlanCandidateClient client(
       fixture.model, fixture.binding,
       RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},

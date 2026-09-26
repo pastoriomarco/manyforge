@@ -3,6 +3,7 @@
 #include <manyforge_core/ports/iplanner_backend.hpp>
 #include <manyforge_roboplan/roboplan_candidate_computer.hpp>
 #include <memory>
+#include <shared_mutex>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
@@ -76,15 +77,24 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
   /// Construction-time structural/scene-lineage anchor. Individual planning
   /// calls carry their own exact current projection lease; the adapter must
   /// not freeze the logical-scene revision at process startup.
-  [[nodiscard]] const core::ProjectionLeaseBindingDTO& projection_binding() const noexcept {
+  [[nodiscard]] core::ProjectionLeaseBindingDTO projection_binding() const {
+    std::shared_lock lock(projection_mutex_);
     return projection_binding_;
   }
+
+  /// Re-anchor an unchanged planner/controller to the candidate Scene product
+  /// under the Manager's Apply fence. An in-flight plan/IK query finishes on
+  /// its predecessor lease before the new lease becomes visible.
+  [[nodiscard]] core::Result<void> RebindProjection(
+      const core::ProjectionLeaseBindingDTO& expected_predecessor,
+      core::ProjectionLeaseBindingDTO candidate);
 
   [[nodiscard]] const RoboPlanCandidateBindingDTO& candidate_binding() const noexcept {
     return candidate_binding_;
   }
 
  private:
+  mutable std::shared_mutex projection_mutex_;
   core::ProjectionLeaseBindingDTO projection_binding_;
   RoboPlanCandidateBindingDTO candidate_binding_;
   std::unique_ptr<IRoboPlanCandidateClient> candidate_client_;

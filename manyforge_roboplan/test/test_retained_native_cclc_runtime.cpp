@@ -20,6 +20,8 @@
 #include <manyforge_deployment/retained_runtime_policy.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/retained_native_cclc_runtime.hpp>
+#include <manyforge_roboplan/retained_native_cell_command_readiness_port.hpp>
+#include <manyforge_roboplan/retained_native_cell_runtime.hpp>
 #include <manyforge_roboplan/retained_native_brand_lifecycle_port.hpp>
 #include <map>
 #include <memory>
@@ -127,6 +129,8 @@ TEST(RetainedNativeCCLCRuntime, NativeAdapterOwnsProviderReadinessButNeverComman
   const auto still_prepared = port.value()->Observe(query);
   ASSERT_TRUE(still_prepared.ok()) << still_prepared.error().message;
   EXPECT_EQ(still_prepared.value().observed_state, State::kPrepared);
+  EXPECT_EQ(still_prepared.value().observation_generation,
+            prepared_observation.value().observation_generation);
 
   route_open = true;
   const auto on =
@@ -783,6 +787,46 @@ private:
   mutable std::optional<core::CellAdmissionClaimReleaseDTO> release_;
   core::RetainedBundleId active_bundle_id_{"unset"};
   core::GraphRevision active_graph_revision_{"unset"};
+};
+
+class CountingActivePublicationReader final
+    : public core::IActiveBundlePublicationReader {
+public:
+  [[nodiscard]] core::Result<core::ActiveBundlePublicationReceiptDTO>
+  ReadActiveBundlePublication(
+      core::ActiveBundlePublicationGeneration) const override {
+    ++read_calls;
+    return core::Result<core::ActiveBundlePublicationReceiptDTO>::Err(
+        {"unexpected_publication_read", "stale-binding preflight read the Manager",
+         {}});
+  }
+
+  mutable std::size_t read_calls{};
+};
+
+class CountingRoutePublicationOwner final
+    : public deployment::IRouteConfigurationKernelPublicationOwner {
+public:
+  [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
+  ReadCurrentPhysicalParticipants(
+      const core::ActiveControlConfigurationDTO &) const override {
+    ++physical_reads;
+    return core::Result<std::vector<core::RuntimeParticipantBinding>>::Err(
+        {"unexpected_physical_read", "stale-binding preflight read routes", {}});
+  }
+
+  [[nodiscard]] core::Result<core::RuntimeRouteConfigurationReadbackDTO>
+  PublishAndReadBackRouteConfiguration(
+      const core::ActiveControlConfigurationDTO &,
+      std::vector<deployment::VerifiedRouteReadinessParticipant>) override {
+    ++publications;
+    return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+        {"unexpected_route_publication",
+         "stale-binding preflight published a route", {}});
+  }
+
+  mutable std::size_t physical_reads{};
+  std::size_t publications{};
 };
 
 class AdmissionEngine final
@@ -1791,6 +1835,111 @@ TEST(RetainedNativeCCLCRuntime,
       *prepared->fault_stop_plan, runtime.binding.value().resources,
       core::ParticipantStopProfilePurposeDTO::kFault, "fault_spring_back_hold",
       core::MotionInterruptStopMode::kSpringBackHold, false, std::nullopt);
+}
+
+TEST(RetainedNativeCCLCRuntime,
+     RecoveredCellRejectsStalePhysicalBindingBeforeReadingOrPublishingRoutes) {
+  const std::filesystem::path fixture_root =
+      MANYFORGE_CCLC_READINESS_FIXTURE_ROOT;
+  auto bundle = load_fixture_bundle(fixture_root);
+  auto runtime = make_runtime_context(*bundle);
+  auto stale_value = runtime.binding.value();
+  stale_value.graph_revision = core::GraphRevision(Sha('8'));
+  auto stale_binding =
+      core::verify_runtime_participant_binding(std::move(stale_value));
+  ASSERT_TRUE(stale_binding.ok()) << stale_binding.error().message;
+  ASSERT_NE(stale_binding.value().value().graph_revision,
+            bundle->value().cell_graph.graph_revision);
+
+  ScopedTrustedRoot state;
+  const auto state_root = state.path() / "state";
+  const auto run_root = state.path() / "runs";
+  ASSERT_TRUE(std::filesystem::create_directory(state_root));
+  ASSERT_TRUE(std::filesystem::create_directory(run_root));
+  const core::RequestOwnerEpoch owner("cclc.native.stale-binding");
+  RetainedNativeCCLCRuntimeConfig config{
+      {state_root,
+       run_root,
+       bundle->value().cell_graph.cell_id,
+       {owner, 128U, 2U, 2U, 1'000'000LL, 1'000'000'000LL,
+        1'000'000'000LL}},
+      1'000'000'000LL};
+  const deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(
+      fixture_root / "retained-package");
+  CountingActivePublicationReader publication_reader;
+  FixedCatalogSource catalogs(make_prepare_catalog(*runtime.control_binding));
+  CountingRoutePublicationOwner route_owner;
+  KernelPorts kernel_ports;
+  core::FakeClock clock;
+  clock.set(100);
+  core::ManualScheduler scheduler;
+
+  const auto empty_graph = core::GraphRevision("graph.empty.stale-binding-test");
+  core::ResourceAddressedExecutionKernelConfig kernel_config{
+      core::RequestOwnerEpoch("kernel.native.stale-binding"),
+      bundle->value().cell_graph.cell_id, 32U, {}, nullptr, empty_graph};
+  kernel_config.empty_runtime_retained_bundle_id =
+      core::RetainedBundleId("bundle.empty.stale-binding-test");
+  kernel_config.empty_runtime_graph_revision = empty_graph;
+  RetainedNativeCellRuntimeInput cell_input{
+      .clock = std::make_shared<WallClock>(),
+      .scheduler = std::make_shared<SimpleScheduler>(),
+      .operation_journal_path = state_root / "cell-operation-journal.sqlite3",
+      .participant_registrations = {},
+      .kernel_config = std::move(kernel_config),
+      .stop_sources = {}};
+  {
+    RetainedNativeCellRuntime cell(std::move(cell_input));
+    RetainedNativeCellCommandReadinessPort readiness_owner(
+        cell, [](const core::ComponentCommandReadinessPublicationDTO &,
+                 const std::vector<
+                     core::RuntimeParticipantExecutionRegistration> &current) {
+          RetainedNativeCellReadinessCandidate candidate;
+          candidate.registrations = current;
+          candidate.adopt_component_owners = []() noexcept {};
+          return core::Result<RetainedNativeCellReadinessCandidate>::Ok(
+              std::move(candidate));
+        });
+    std::function<core::Result<void>()> reconcile_after_start;
+    std::size_t predecessor_adoption_calls = 0U;
+    const core::ProjectionRevisionDTO projection{
+        bundle->retained_bundle_id(),
+        bundle->value().cell_graph.graph_revision,
+        {core::SceneId("scene.native.stale-binding"), 1U,
+         core::ContentDigest(Sha('7'))}};
+    const core::ActiveBundlePublicationReceiptDTO expected_publication{
+        {core::BootstrapPublicationTransactionDTO{
+             core::BootstrapId("bootstrap.native.stale-binding"),
+             core::BootstrapGeneration(1U)},
+         projection, bundle->retained_bundle_id(),
+         bundle->value().cell_graph.graph_revision, std::nullopt,
+         core::ContentDigest(Sha('6'))},
+        core::ActiveBundlePublicationGeneration(1U),
+        core::ContentDigest(Sha('5'))};
+    auto recovered = CreateRecoveredRetainedNativeCellCCLCRuntime(
+        std::move(config), bundle, publication_reader,
+        expected_publication, artifacts, catalogs, {},
+        {std::move(stale_binding.value())}, kernel_ports, kernel_ports,
+        kernel_ports, route_owner, readiness_owner, cell.addressed_kernel(),
+        clock, scheduler,
+        [&predecessor_adoption_calls](
+            const core::ActiveControlConfigurationDTO &) {
+          ++predecessor_adoption_calls;
+          return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+              {"unexpected_predecessor_adoption",
+               "stale-binding preflight adopted a route", {}});
+        },
+        [] { return core::Result<void>::Ok(); }, reconcile_after_start);
+
+    ASSERT_FALSE(recovered.ok());
+    EXPECT_EQ(recovered.error().details.at("reason"),
+              "native_cell_restart_binding_invalid");
+    EXPECT_EQ(publication_reader.read_calls, 0U);
+    EXPECT_EQ(route_owner.physical_reads, 0U);
+    EXPECT_EQ(route_owner.publications, 0U);
+    EXPECT_EQ(predecessor_adoption_calls, 0U);
+    EXPECT_FALSE(reconcile_after_start);
+  }
 }
 
 } // namespace

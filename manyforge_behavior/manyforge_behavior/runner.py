@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import math
 from typing import Any, Literal
 
@@ -10,40 +10,81 @@ from .kernel_client import ActionSpan, KernelClient, KernelClientResponseError
 
 
 class OrchestratorRunner:
-    """Submit one source-joint goal without owning runtime or planner state."""
+    """Submit one source-joint goal without owning runtime or planner state.
 
-    def __init__(self, kernel: KernelClient) -> None:
+    Program execution identity comes from the Applied Program binding this
+    run was admitted with, never from the execution owner's status: the
+    owner reports runtime identity only (execution_identity.v2, H1a-IF.2).
+    """
+
+    def __init__(
+        self, kernel: KernelClient, applied_program_binding: Mapping[str, Any]
+    ) -> None:
         if not isinstance(kernel, KernelClient):
             raise TypeError("kernel must be the bounded addressed KernelClient")
+        if not isinstance(applied_program_binding, Mapping):
+            raise TypeError("applied_program_binding must be a Program binding")
+        for field in (
+            "program_id",
+            "program_revision",
+            "program_binding_id",
+            "graph_revision",
+            "retained_bundle_id",
+        ):
+            value = applied_program_binding.get(field)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"applied Program binding has no {field}")
+        targets = applied_program_binding.get("target_role_bindings")
+        if not isinstance(targets, list):
+            raise ValueError("applied Program binding has no target role bindings")
         self._kernel = kernel
+        self._binding = applied_program_binding
 
-    def _selected_status(
-        self, *, target_role_field: str, target_role_id: str
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _bound_capability(
+        self, *, component_role_id: str, target_role_id: str, capability_id: str
+    ) -> Mapping[str, Any]:
+        """The Program-bound capability of one authored target role."""
+
+        matches = [
+            capability
+            for target in self._binding["target_role_bindings"]
+            if isinstance(target, Mapping)
+            and target.get("target_role_id") == target_role_id
+            and target.get("component_role_id") == component_role_id
+            for capability in target.get("capability_bindings", [])
+            if isinstance(capability, Mapping)
+            and capability.get("capability_id") == capability_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "target_role_id is not bound to this capability in the "
+                "applied Program"
+            )
+        return matches[0]
+
+    def _selected_status(self) -> tuple[dict[str, Any], dict[str, Any]]:
         status_envelope = self._kernel.identity()
         status = status_envelope.get("identity")
         if not isinstance(status, dict):
             raise KernelClientResponseError(
                 "headless execution status has no selected-owner projection"
             )
-        required_text = (
-            "owner_epoch",
-            "program_id",
-            "program_revision",
-            "program_binding_id",
-            "graph_revision",
-            "retained_bundle_id",
-            target_role_field,
-        )
         if any(
             not isinstance(status.get(field), str) or not status[field]
-            for field in required_text
+            for field in ("owner_epoch", "graph_revision", "retained_bundle_id")
         ):
             raise KernelClientResponseError(
-                "headless execution status has an incomplete selected-owner identity"
+                "headless execution status has an incomplete runtime identity"
             )
-        if status[target_role_field] != target_role_id:
-            raise ValueError("target_role_id is not the selected execution target")
+        # The run's binding executes only against the publication it was
+        # compiled for; a changed owner product is refused, never rebound.
+        if (
+            status["graph_revision"] != self._binding["graph_revision"]
+            or status["retained_bundle_id"] != self._binding["retained_bundle_id"]
+        ):
+            raise KernelClientResponseError(
+                "execution owner product differs from the applied Program binding"
+            )
         scene_revision = status.get("scene_revision")
         if (
             not isinstance(scene_revision, dict)
@@ -75,10 +116,12 @@ class OrchestratorRunner:
     ) -> dict[str, Any]:
         """Resolve selection from owner status and submit one portable goal."""
 
-        status, scene_revision = self._selected_status(
-            target_role_field="motion_target_role_id",
+        self._bound_capability(
+            component_role_id=component_role_id,
             target_role_id=target_role_id,
+            capability_id="execution.trajectory.execute",
         )
+        status, scene_revision = self._selected_status()
         span = ActionSpan(
             action_source="program_node",
             action_span_id=node_attempt_id,
@@ -93,9 +136,9 @@ class OrchestratorRunner:
                 "source_label": "manyforge_behavior",
                 "correlation_id": correlation_id,
             },
-            "program_id": status["program_id"],
-            "program_revision": status["program_revision"],
-            "program_binding_id": status["program_binding_id"],
+            "program_id": self._binding["program_id"],
+            "program_revision": self._binding["program_revision"],
+            "program_binding_id": self._binding["program_binding_id"],
             "program_run_id": program_run_id,
             "expected_graph_revision": status["graph_revision"],
             "expected_retained_bundle_id": status["retained_bundle_id"],
@@ -177,20 +220,29 @@ class OrchestratorRunner:
         if not math.isfinite(completion_timeout_s) or completion_timeout_s <= 0.0:
             raise ValueError("completion_timeout_s must be finite and positive")
 
-        status, scene_revision = self._selected_status(
-            target_role_field="gripper_target_role_id",
+        capability = self._bound_capability(
+            component_role_id=component_role_id,
             target_role_id=target_role_id,
+            capability_id="tool.gripper.command",
         )
-        schema_id = status.get("gripper_command_schema_id")
-        schema_revision = status.get("gripper_command_schema_revision")
+        command_schema = capability.get("command_schema")
+        schema_id = (
+            command_schema.get("command_schema_id")
+            if isinstance(command_schema, Mapping)
+            else None
+        )
+        schema_revision = (
+            command_schema.get("command_schema_revision")
+            if isinstance(command_schema, Mapping)
+            else None
+        )
         if not isinstance(schema_id, str) or not schema_id:
-            raise KernelClientResponseError(
-                "headless execution status has no selected gripper command schema"
-            )
+            raise ValueError("applied Program binding has no gripper command schema")
         if not isinstance(schema_revision, str) or not schema_revision:
-            raise KernelClientResponseError(
-                "headless execution status has no selected gripper schema revision"
+            raise ValueError(
+                "applied Program binding has no gripper command schema revision"
             )
+        status, scene_revision = self._selected_status()
 
         if position_kind == "angular_rad":
             position_value: dict[str, Any] = {
@@ -227,9 +279,9 @@ class OrchestratorRunner:
                 "source_label": "manyforge_behavior",
                 "correlation_id": correlation_id,
             },
-            "program_id": status["program_id"],
-            "program_revision": status["program_revision"],
-            "program_binding_id": status["program_binding_id"],
+            "program_id": self._binding["program_id"],
+            "program_revision": self._binding["program_revision"],
+            "program_binding_id": self._binding["program_binding_id"],
             "program_run_id": program_run_id,
             "expected_graph_revision": status["graph_revision"],
             "expected_retained_bundle_id": status["retained_bundle_id"],

@@ -222,7 +222,8 @@ function ManualMotionSettingsControls({ controller, disabled }: {
   disabled: boolean;
 }) {
   const { state, editMotionSettings } = controller;
-  const descriptor = controller.selectedStatus!.directControl.targetDescriptor;
+  // Rendered only for a selected motion target (never in Gripper mode).
+  const descriptor = controller.selectedStatus!.directControl!.targetDescriptor;
   const settings = state.motionSettings;
   const cartesian = state.mode === 'cartesian_path';
   type MotionSettingField = {
@@ -366,11 +367,16 @@ export function RobotControlPanelView({
   // controller keeps the complete owner projection separately so changing
   // this selection never creates a second browser-side ownership model.
   const status = controller.selectedStatus;
+  // Null for an arm-only component; gripper controls then never render.
+  const gripper = status?.directControlGripper ?? null;
+  // Null for a component without motion (gripper-only, H1a-IF.2).
+  const motion = status?.directControl ?? null;
+  const observedMotion = status?.observedMotion ?? null;
   const programActive = program?.cycleState !== null
     && program?.cycleState !== undefined
     && program.cycleState !== 'idle_after_reset';
-  const inputResetKey = [status?.ownerEpoch, status?.directControl.programBindingId,
-    status?.directControlGripper.programBindingId, status?.sceneRevision.scene_id,
+  const inputResetKey = [status?.ownerEpoch, motion?.programBindingId,
+    gripper?.programBindingId, status?.sceneRevision.scene_id,
     status?.sceneRevision.revision_id, status?.sceneRevision.content_hash,
     status?.retainedBundleId, status?.graphRevision, programActive,
     state.selectedComponentId, state.selectedMotionTargetId, state.selectedGripperTargetId,
@@ -407,30 +413,30 @@ export function RobotControlPanelView({
     ?.observationOverrideCandidate ?? null;
   const overridePending = program?.state.controlPending
     === 'override:stage-observation';
-  const presentedPose = robotControlHasLocalDraft(state) || status === null
-    ? state.draftPose : status.observedMotion.currentTcpPose;
+  const presentedPose = robotControlHasLocalDraft(state) || observedMotion === null
+    ? state.draftPose : observedMotion.currentTcpPose;
   const rpy = rpyDegreesFromQuaternion(presentedPose.orientation);
   const authoring = draft?.state.workspace?.draft.authoring ?? null;
   const appliedBinding = program?.state.applied?.programBinding ?? null;
   const moveSources = useMemo<MoveToSource[]>(() => {
-    if (status === null) return [];
-    const planningCapabilities = status.directControl.targetDescriptor.contracts
+    if (status === null || motion === null || observedMotion === null) return [];
+    const planningCapabilities = motion.targetDescriptor.contracts
       .supportingProviders.map((provider) => provider.capabilityId);
     const poseAvailable = planningCapabilities.includes('planning.motion.pose_goal');
     const jointAvailable = planningCapabilities.includes('planning.motion.joint_goal');
     const sources: MoveToSource[] = [];
     const boundTargetRoles = new Set(boundProgramTargetRoleIds(
       appliedBinding,
-      status.directControl.controllableComponentId,
-      status.directControl.commandTargetId,
+      motion.controllableComponentId,
+      motion.commandTargetId,
     ));
     const frameRolePoses = new Map<string, PoseTuple>([
-      [status.directControl.baseFrameRoleId, {
+      [motion.baseFrameRoleId, {
         position: [0, 0, 0],
         quaternion: [0, 0, 0, 1],
       }],
-      [status.directControl.tcpFrameRoleId, observedPose(
-        status.observedMotion.currentTcpPose,
+      [motion.tcpFrameRoleId, observedPose(
+        observedMotion.currentTcpPose,
       )],
     ]);
     const sceneResourcePoses = new Map<string, PoseTuple>();
@@ -448,19 +454,19 @@ export function RobotControlPanelView({
     if (poseAvailable) {
       sources.push({
         id: 'observed:tcp',
-        label: `Current ${status.directControl.commandTargetId} TCP`,
+        label: `Current ${motion.commandTargetId} TCP`,
         kind: 'pose',
         group: 'current',
-        pose: observedPose(status.observedMotion.currentTcpPose),
+        pose: observedPose(observedMotion.currentTcpPose),
       });
-      for (const frame of status.directControl.targetDescriptor.frames) {
-        const pose = frame.frameRoleId === status.directControl.baseFrameRoleId
+      for (const frame of motion.targetDescriptor.frames) {
+        const pose = frame.frameRoleId === motion.baseFrameRoleId
           ? {
               position: [0, 0, 0] as [number, number, number],
               quaternion: [0, 0, 0, 1] as [number, number, number, number],
             }
-          : frame.frameRoleId === status.directControl.tcpFrameRoleId
-            ? observedPose(status.observedMotion.currentTcpPose)
+          : frame.frameRoleId === motion.tcpFrameRoleId
+            ? observedPose(observedMotion.currentTcpPose)
             : null;
         if (pose !== null) sources.push({
           id: `frame:${frame.frameRoleId}`,
@@ -489,7 +495,7 @@ export function RobotControlPanelView({
       if (poseAvailable && node.node_id === 'motion.move_to_pose') {
         const pose = resolveStoredProgramPose(node.parameters, {
           programTargetRoleId: programTargetRole,
-          baseFrameRoleId: status.directControl.baseFrameRoleId,
+          baseFrameRoleId: motion.baseFrameRoleId,
           sceneResourcePoses,
           frameRolePoses,
         });
@@ -506,12 +512,12 @@ export function RobotControlPanelView({
         if (
           !Array.isArray(goal)
           || goal.length === 0
-          || !status.observedMotion.complete
-          || status.observedMotion.positionsRad.length
-            !== status.directControl.targetDescriptor.joints.length
+          || !observedMotion.complete
+          || observedMotion.positionsRad.length
+            !== motion.targetDescriptor.joints.length
         ) continue;
-        const positions = [...status.observedMotion.positionsRad];
-        const inventory = new Map(status.directControl.targetDescriptor.joints.map(
+        const positions = [...observedMotion.positionsRad];
+        const inventory = new Map(motion.targetDescriptor.joints.map(
           (joint, index) => [joint.sourceJointName, index] as const,
         ));
         const selected = new Set<string>();
@@ -549,6 +555,8 @@ export function RobotControlPanelView({
     appliedBinding,
     authoring,
     controlBasePoseInCell,
+    motion,
+    observedMotion,
     sourceFrameNames,
     status,
   ]);
@@ -613,13 +621,11 @@ export function RobotControlPanelView({
 
   const modeAvailable = (mode: RobotControlMode): boolean => {
     if (status === null) return false;
-    if (mode === 'gripper') {
-      return controller.gripperTargets.some((target) => (
-        target.controllableComponentId === status.directControl.controllableComponentId
-      ));
-    }
+    if (mode === 'gripper') return gripper !== null;
+    // Motion modes need a selected motion target (none for gripper-only).
+    if (motion === null) return false;
     if (mode === 'move_to') {
-      return status.directControl.targetDescriptor.contracts.supportingProviders.some((provider) => (
+      return motion.targetDescriptor.contracts.supportingProviders.some((provider) => (
         provider.capabilityId === 'planning.motion.pose_goal'
         || provider.capabilityId === 'planning.motion.joint_goal'
       ));
@@ -627,7 +633,7 @@ export function RobotControlPanelView({
     const capability = mode === 'joint'
       ? 'planning.motion.joint_goal'
       : `planning.motion.${mode}`;
-    return status.directControl.targetDescriptor.contracts.supportingProviders
+    return motion.targetDescriptor.contracts.supportingProviders
       .some((provider) => provider.capabilityId === capability);
   };
 
@@ -652,9 +658,9 @@ export function RobotControlPanelView({
     });
   };
 
-  const displayedTarget = state.mode === 'gripper'
-    ? status?.directControlGripper
-    : status?.directControl;
+  const displayedTarget = state.mode === 'gripper' && gripper !== null
+    ? gripper
+    : motion;
   const observedGripperPosition = status?.observedGripper?.position ?? null;
   const gripperTargetPending = observedGripperPosition !== null
     && state.draftGripperPosition !== null
@@ -668,7 +674,8 @@ export function RobotControlPanelView({
     : observedGripperPosition ?? state.draftGripperPosition;
   const selectedTools = controller.gripperTargets.filter((target) => (
     status !== null
-      && target.controllableComponentId === status.directControl.controllableComponentId
+      && target.controllableComponentId
+        === (motion ?? gripper)?.controllableComponentId
   ));
   const targetLabel = (target: { commandTargetId: string; controllableComponentId: string }) =>
     `${target.controllableComponentId} · ${target.commandTargetId}`;
@@ -679,7 +686,7 @@ export function RobotControlPanelView({
       className="panel robot-control-panel"
       aria-label="Robot Control"
       data-testid="robot-control-panel"
-      title={displayedTarget === undefined
+      title={displayedTarget === undefined || displayedTarget === null
         ? undefined
         : `Control route: ${displayedTarget.controllableComponentId} / ${displayedTarget.commandTargetId}`}
     >
@@ -702,7 +709,7 @@ export function RobotControlPanelView({
         </div>
       )}
 
-      {enabled && status !== null && displayedTarget !== undefined && (
+      {enabled && status !== null && displayedTarget !== undefined && displayedTarget !== null && (
         <>
           {programActive && !controller.manualControlAllowed && !state.operation?.resident && (
             <p className="central-inspector-notice" role="status">
@@ -760,7 +767,7 @@ export function RobotControlPanelView({
               {controller.motionTargets.length === 1 && (
                 <span className="robot-control-target-identity" title="The only addressed robot currently offered by the execution owner.">
                   <span>Robot</span>
-                  <code>{targetLabel(status.directControl)}</code>
+                  <code>{(motion ?? gripper) === null ? '' : targetLabel((motion ?? gripper)!)}</code>
                 </span>
               )}
               {state.mode === 'gripper' && selectedTools.length > 1 && (
@@ -829,10 +836,10 @@ export function RobotControlPanelView({
               || state.mode === 'cartesian_path') && (
               <GizmoSteps gizmo={gizmo} disabled={authoringBlocked || state.poseDragging} />
             )}
-            {state.mode === 'gripper' && (
+            {state.mode === 'gripper' && gripper !== null && (
               <StepSelect
                 label="Step"
-                unit={status.directControlGripper.targetDescriptor.unit}
+                unit={gripper.targetDescriptor.unit}
                 options={COORDINATE_STEP_OPTIONS}
                 value={coordinateStep}
                 disabled={authoringBlocked}
@@ -848,7 +855,7 @@ export function RobotControlPanelView({
                     aria-label="TCP target frame"
                     title="The current direct-control contract permits this logical base frame."
                   >
-                    {status.directControl.baseFrameRoleId}
+                    {motion?.baseFrameRoleId}
                   </code>
                 </span>
                 <div className="robot-control-tool-group">
@@ -894,11 +901,11 @@ export function RobotControlPanelView({
               className="robot-control-editor"
               data-testid="robot-control-editor-scroll"
             >
-              {state.mode !== 'gripper' && <ManualMotionSettingsControls controller={controller} disabled={authoringBlocked} />}
-              {state.mode === 'joint' && (
+              {state.mode !== 'gripper' && motion !== null && <ManualMotionSettingsControls controller={controller} disabled={authoringBlocked} />}
+              {state.mode === 'joint' && motion !== null && observedMotion !== null && (
                 <div className="robot-control-joints">
-                  {status.directControl.targetDescriptor.joints.map((joint, index) => {
-                    const live = status.observedMotion.positionsRad[index] ?? 0;
+                  {motion.targetDescriptor.joints.map((joint, index) => {
+                    const live = observedMotion.positionsRad[index] ?? 0;
                     const draft = state.draftPositionsRad[index] ?? live;
                     const pending = targetIsTemporary(state.phase, draft, live);
                     const presented = pending ? draft : live;
@@ -1082,7 +1089,7 @@ export function RobotControlPanelView({
                       </button>}
                       {selectedMoveSource !== undefined && (
                         <details className="robot-control-resolved-target">
-                          <summary>Resolved target · {status.directControl.baseFrameRoleId}</summary>
+                          <summary>Resolved target · {motion?.baseFrameRoleId}</summary>
                           {selectedMoveSource.kind === 'pose' ? <>
                             <dl>
                               <div><dt>Position (m)</dt><dd>{Object.values(presentedPose.position_m).map((v) => v.toFixed(4)).join(', ')}</dd></div>
@@ -1093,7 +1100,7 @@ export function RobotControlPanelView({
                               editPose(presentedPose);
                             }}>Edit target as pose</button>
                           </> : <dl>
-                            {status.directControl.targetDescriptor.joints.map((joint, index) => (
+                            {(motion?.targetDescriptor.joints ?? []).map((joint, index) => (
                               <div key={joint.sourceJointName}><dt>{joint.sourceJointName}</dt><dd>{formatDegrees(state.draftPositionsRad[index])}°</dd></div>
                             ))}
                           </dl>}
@@ -1135,11 +1142,12 @@ export function RobotControlPanelView({
                   <p className="robot-control-limits robot-control-pose-note">
                     Absolute TCP target in{' '}
                     <code>{(() => {
-                      const base = status.directControl.targetDescriptor.frames.find(
-                        (frame) => frame.frameRoleId === status.directControl.baseFrameRoleId,
+                      if (motion === null) return '';
+                      const base = motion.targetDescriptor.frames.find(
+                        (frame) => frame.frameRoleId === motion.baseFrameRoleId,
                       );
                       return base === undefined
-                        ? status.directControl.baseFrameRoleId
+                        ? motion.baseFrameRoleId
                         : `${base.frameRoleId} · ${
                             sourceFrameNames[base.compiledFrameName] ?? 'source name unavailable'
                           }`;
@@ -1152,26 +1160,26 @@ export function RobotControlPanelView({
                 </div>
               )}
 
-              {state.mode === 'gripper' && (
+              {state.mode === 'gripper' && gripper !== null && (
                 <div className="robot-control-gripper-editor">
                 <p className="robot-control-pose-note">
                   Completion confirms the observed coordinate, not an object grasp.
                 </p>
-                {status.directControlGripper.targetDescriptor.namedPresets.length > 0 && (
+                {gripper.targetDescriptor.namedPresets.length > 0 && (
                   <label className="robot-control-preset">
                     <span>Named preset</span>
                     <select
                       defaultValue=""
                       disabled={authoringBlocked}
                       onChange={(event) => {
-                        const preset = status.directControlGripper.targetDescriptor
+                        const preset = gripper.targetDescriptor
                           .namedPresets.find((candidate) => candidate.name === event.target.value);
                         if (preset) editGripper(preset.masterPosition);
                         event.target.value = '';
                       }}
                     >
                       <option value="">Choose retained preset…</option>
-                      {status.directControlGripper.targetDescriptor.namedPresets.map((preset) => (
+                      {gripper.targetDescriptor.namedPresets.map((preset) => (
                         <option key={preset.name} value={preset.name}>{preset.name}</option>
                       ))}
                     </select>
@@ -1180,25 +1188,25 @@ export function RobotControlPanelView({
                 <label className="robot-control-joint robot-control-gripper">
                   <span className="robot-control-joint-heading">
                     <strong>
-                      {status.directControlGripper.targetDescriptor.sourceCoordinateName}
+                      {gripper.targetDescriptor.sourceCoordinateName}
                     </strong>
                     <span className="robot-control-limits">
-                      {status.directControlGripper.targetDescriptor.minPosition === null
-                        || status.directControlGripper.targetDescriptor.maxPosition === null
+                      {gripper.targetDescriptor.minPosition === null
+                        || gripper.targetDescriptor.maxPosition === null
                         ? 'Enter the initial target'
-                        : `${status.directControlGripper.targetDescriptor.minPosition.toFixed(4)} to ${
-                          status.directControlGripper.targetDescriptor.maxPosition.toFixed(4)
-                        } ${status.directControlGripper.targetDescriptor.unit}`}
+                        : `${gripper.targetDescriptor.minPosition.toFixed(4)} to ${
+                          gripper.targetDescriptor.maxPosition.toFixed(4)
+                        } ${gripper.targetDescriptor.unit}`}
                     </span>
                   </span>
                   <span className="robot-control-joint-inputs">
-                    {status.directControlGripper.targetDescriptor.minPosition !== null
-                      && status.directControlGripper.targetDescriptor.maxPosition !== null && (
+                    {gripper.targetDescriptor.minPosition !== null
+                      && gripper.targetDescriptor.maxPosition !== null && (
                       <input
                         aria-label="Gripper target"
                         type="range"
-                        min={status.directControlGripper.targetDescriptor.minPosition}
-                        max={status.directControlGripper.targetDescriptor.maxPosition}
+                        min={gripper.targetDescriptor.minPosition}
+                        max={gripper.targetDescriptor.maxPosition}
                         step="any"
                         value={presentedGripperPosition ?? ''}
                         disabled={authoringBlocked}
@@ -1211,8 +1219,8 @@ export function RobotControlPanelView({
                     <span className="robot-control-number">
                       <RobotNumberInput
                         label="Gripper target value"
-                        min={status.directControlGripper.targetDescriptor.minPosition ?? undefined}
-                        max={status.directControlGripper.targetDescriptor.maxPosition ?? undefined}
+                        min={gripper.targetDescriptor.minPosition ?? undefined}
+                        max={gripper.targetDescriptor.maxPosition ?? undefined}
                         step={coordinateStep}
                         value={presentedGripperPosition}
                         disabled={authoringBlocked}
@@ -1220,7 +1228,7 @@ export function RobotControlPanelView({
                         onCommit={editGripper}
                       />
                       <span>
-                        {status.directControlGripper.targetDescriptor.unit}
+                        {gripper.targetDescriptor.unit}
                       </span>
                     </span>
                   </span>
@@ -1430,7 +1438,7 @@ export function RobotControlPanelView({
             returnFocusRef={previewInfoButton}
           >
             <p>The preview is owner-validated and does not move the robot. Only Approve submits the exact validated target.</p>
-            <p>Target coordinates are relative to <code>{status.directControl.baseFrameRoleId}</code>. Local/World selects gizmo axes, not the target reference frame.</p>
+            <p>Target coordinates are relative to <code>{motion?.baseFrameRoleId}</code>. Local/World selects gizmo axes, not the target reference frame.</p>
             <p>A red tool marks an unvalidated TCP target, not a solved robot configuration or proof of collision. Preview rejection does not mean the Program or robot has faulted.</p>
             <p>Joint velocity/acceleration caps and the TCP speed ceiling are configured in Deployment → Robot model and target limits. The runtime Velocity slider is separate from those limits.</p>
             {state.mode === 'cartesian_path' && <p>Cartesian preview currently requests 0.1 m/s linear speed, 0.5 m/s² linear acceleration, 0.5 rad/s angular speed and 2.5 rad/s² angular acceleration, subject to the backend limits. Per-move editing of these values is not yet available.</p>}
@@ -1452,8 +1460,8 @@ export function RobotControlPanelView({
               <summary>Target and owner contract</summary>
               <pre>{JSON.stringify({
                 ownerEpoch: status.ownerEpoch,
-                bindingId: state.mode === 'gripper' ? status.directControlGripper.programBindingId : status.directControl.programBindingId,
-                target: state.mode === 'gripper' ? status.directControlGripper.targetDescriptor : status.directControl.targetDescriptor,
+                bindingId: state.mode === 'gripper' && gripper !== null ? gripper.programBindingId : motion?.programBindingId,
+                target: state.mode === 'gripper' && gripper !== null ? gripper.targetDescriptor : motion?.targetDescriptor,
               }, null, 2)}</pre>
             </details>
           </OverlayPanel>}

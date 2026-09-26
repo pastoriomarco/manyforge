@@ -454,7 +454,7 @@ def test_running_program_controls_only_exact_native_manual_operation(kind, case)
                     "owner_epoch": "old" if case == "old_owner" else "kernel.1"
                 },
                 "control_state": {
-                    "schema_version": "manyforge.execution_control_state.v4",
+                    "schema_version": "manyforge.execution_control_state.v6",
                     "manual_operations": [
                         {
                             "resident": case != "retired",

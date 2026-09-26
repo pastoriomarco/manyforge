@@ -1879,7 +1879,7 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.native_execution.v1",
-            "sha256:49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5702c61a9828c62035",
+            "sha256:6b540dac39434e05a2cb5da209206e2105b824b9f56704a74f0d88f327944689",
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",

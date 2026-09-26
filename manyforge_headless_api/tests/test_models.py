@@ -123,7 +123,7 @@ def _caller() -> dict[str, object]:
 def _prepared_activation() -> dict[str, object]:
     activation = ManagerApplyPreparedActivation.model_validate(
         {
-            "schema_version": "manyforge.prepared_activation_input.v2",
+            "schema_version": "manyforge.prepared_activation_input.v3",
             "scenario_id": "scenario.1",
             "source_document_digest": "sha256:" + "1" * 64,
             "captured_input_digest": "sha256:" + "d" * 64,
@@ -133,7 +133,7 @@ def _prepared_activation() -> dict[str, object]:
             "graph_revision": "sha256:" + "3" * 64,
             "program_id": "program.1",
             "program_revision": "sha256:" + "4" * 64,
-            "program_binding_id": "sha256:" + "9" * 64,
+            "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
             "node_environment_digest": "sha256:" + "5" * 64,
             "assistant_mode": "optional",
             "typed_parameter_overrides": {},
@@ -674,7 +674,7 @@ def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
         "prepared_activation": _prepared_activation(),
         "expected_admission_generation": 7,
         "candidate_receipt": {
-            "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+            "schema_version": "manyforge.manager_deployment_candidate_receipt.v2",
             "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
             "prepared_activation_id": "sha256:" + "e" * 64,
@@ -686,6 +686,8 @@ def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
             },
             "expected_admission_generation": 7,
             "manager_owner_epoch": "owner.1",
+            "impact_digest": "sha256:" + "c" * 64,
+            "destructive_impact": False,
             "receipt_digest": "sha256:" + "c" * 64,
         },
     }
@@ -713,7 +715,7 @@ def test_apply_requires_one_exact_ua2a_prepared_activation() -> None:
         "prepared_activation": _prepared_activation(),
         "expected_admission_generation": 7,
         "candidate_receipt": {
-            "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+            "schema_version": "manyforge.manager_deployment_candidate_receipt.v2",
             "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
             "prepared_activation_id": "sha256:" + "e" * 64,
@@ -725,11 +727,16 @@ def test_apply_requires_one_exact_ua2a_prepared_activation() -> None:
             },
             "expected_admission_generation": 7,
             "manager_owner_epoch": "owner.1",
+            "impact_digest": "sha256:" + "c" * 64,
+            "destructive_impact": False,
             "receipt_digest": "sha256:" + "c" * 64,
         },
     }
     request = ManagerApplyRequest.model_validate(body)
-    assert request.prepared_activation.program_binding_id == "sha256:" + "9" * 64
+    assert request.prepared_activation.program_outcome == {
+        "kind": "bound",
+        "program_binding_id": "sha256:" + "9" * 64,
+    }
 
     # The accepted operation must name the input it accepted, so the exact
     # prepared activation is mandatory rather than optional.
@@ -769,11 +776,27 @@ def test_apply_requires_one_exact_ua2a_prepared_activation() -> None:
                 **body,
                 "prepared_activation": {
                     **_prepared_activation(),
-                    "program_binding_id": "not-a-content-digest",
+                    "program_outcome": {
+                        "kind": "bound",
+                        "program_binding_id": "not-a-content-digest",
+                    },
                 },
             }
         )
-    assert "program_binding_id" in str(captured.value)
+    assert "program_outcome" in str(captured.value)
+
+    # A non-executable outcome must name its unresolved references (H1a).
+    with pytest.raises(ValidationError) as captured:
+        ManagerApplyRequest.model_validate(
+            {
+                **body,
+                "prepared_activation": {
+                    **_prepared_activation(),
+                    "program_outcome": {"kind": "non_executable", "outcome": {}},
+                },
+            }
+        )
+    assert "program_outcome" in str(captured.value)
 
     # The prepared activation cannot name a different candidate Deployment than
     # the request it is submitted with.
@@ -798,14 +821,16 @@ def _status_body() -> dict[str, object]:
         "request_id": "request.3",
         "request_owner_epoch": "client.epoch.3",
         "prepared_activation": {
-            key: prepared[key]
-            for key in (
-                "captured_input_digest",
-                "deployment_artifact_id",
-                "deployment_revision",
-                "program_binding_id",
-                "prepared_activation_id",
-            )
+            **{
+                key: prepared[key]
+                for key in (
+                    "captured_input_digest",
+                    "deployment_artifact_id",
+                    "deployment_revision",
+                    "prepared_activation_id",
+                )
+            },
+            "program_binding_id": prepared["program_outcome"]["program_binding_id"],
         },
         "phase": "accepted",
         "last_progress": {
@@ -929,6 +954,30 @@ def test_apply_status_reports_one_exact_failure_disposition(
             )
         with pytest.raises(ValidationError, match="only a terminal failure"):
             ManagerApplyStatus.model_validate(other)
+
+
+def test_apply_status_reports_a_succeeded_apply_with_a_non_executable_program() -> None:
+    # H1a: the runtime transition succeeded; the preserved Program no longer
+    # binds. Binding validity is reported separately from the terminal state.
+    body = _status_body()
+    body["prepared_activation"] = {
+        **body["prepared_activation"],  # type: ignore[dict-item]
+        "program_binding_id": None,
+    }
+    status = ManagerApplyStatus.model_validate(
+        {
+            **body,
+            "phase": "settled",
+            "last_progress": {
+                "phase": "settled",
+                "record_digest": "sha256:" + "f" * 64,
+            },
+            "state": "succeeded",
+            "candidate_projection_revision": _candidate_projection_revision(),
+        }
+    )
+    assert status.state == "succeeded"
+    assert status.prepared_activation.program_binding_id is None
 
 
 def test_apply_status_is_one_closed_bounded_lifecycle() -> None:

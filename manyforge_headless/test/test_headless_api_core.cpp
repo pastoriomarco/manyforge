@@ -746,6 +746,58 @@ TEST(HeadlessApiCore,
 }
 
 TEST(HeadlessApiCore,
+     AppliedStatusAndSelectionRejectDivergentPublicationBeforeEitherOutcome) {
+  for (const auto kind : {"bound", "non_executable"}) {
+    SCOPED_TRACE(kind);
+    TemporaryDirectory directory;
+    PublishHealthySources(directory, "open");
+    auto payload = ManagerPayload();
+    auto active = Member(payload, "active");
+    active = WithField(active, "publication", CanonicalValue(CanonicalValue::Object{
+        {"transaction", CanonicalValue(CanonicalValue::Object{
+            {"kind", CanonicalValue("named_apply")},
+            {"apply_id", CanonicalValue("apply.divergent")},
+            {"apply_generation", CanonicalValue(1.0)},
+        })},
+    }));
+    payload = WithField(payload, "active", active);
+    payload = WithField(payload, "apply", CanonicalValue(CanonicalValue::Object{
+        {"records", CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+            {"apply_id", CanonicalValue("apply.divergent")},
+            {"apply_generation", CanonicalValue(1.0)},
+            {"terminal_state", CanonicalValue("succeeded")},
+            {"incomplete", CanonicalValue(false)},
+            {"prepared_activation", CanonicalValue(CanonicalValue::Object{
+                {"retained_bundle_id", CanonicalValue(Digest('f'))},
+                {"graph_revision", Member(active, "graph_revision")},
+                {"program_outcome", CanonicalValue(CanonicalValue::Object{
+                    {"kind", CanonicalValue(kind)},
+                })},
+            })},
+        })})},
+    }));
+    AtomicSourceSnapshotChannel manager(directory.publications(),
+                                        "manager-source.json");
+    static_cast<void>(manager.Publish(
+        "component_manager", "component-manager." + std::string(kCellId),
+        "manager.epoch.1", 2, payload));
+    HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+    for (const bool status : {false, true}) {
+      try {
+        static_cast<void>(status ? core.AppliedProgramStatus()
+                                 : core.AppliedProgramSelection());
+        FAIL() << "divergent publication was reported as applied";
+      } catch (const OperatorAlarmError &error) {
+        EXPECT_EQ(error.code(), "program_applied_selection_invalid") << error.what();
+        EXPECT_NE(std::string(error.what()).find(
+                      "active Manager publication and prepared activation disagree"),
+                  std::string::npos);
+      }
+    }
+  }
+}
+
+TEST(HeadlessApiCore,
      IdleOperationSnapshotReconcilesOnlyImplementedAlarmDomains) {
   TemporaryDirectory directory;
   PublishHealthySources(directory, "open");

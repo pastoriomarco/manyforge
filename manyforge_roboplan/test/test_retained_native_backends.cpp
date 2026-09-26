@@ -1,15 +1,22 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <future>
 #include <limits>
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/resource_addressed_execution_kernel.hpp>
+#include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_roboplan/retained_execution_state_sink.hpp>
 #include <manyforge_roboplan/retained_gripper_command_backend.hpp>
+#include <manyforge_roboplan/retained_native_component_owner.hpp>
+#include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
+#include <manyforge_roboplan/retained_native_gripper_route_publication_owner.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <manyforge_roboplan/roboplan_execution_backend.hpp>
 #include <memory>
@@ -1899,6 +1906,665 @@ TEST(RoboPlanExecutionBackendTest,
       std::get<AngularPositionDTO>(state.value().positions[0]).value_rad, 0.2);
   EXPECT_GT(channel->publish_calls(), 0);
   EXPECT_GT(backend.scene_projection_metrics().misses_total, 0U);
+}
+
+class GripperRuntimeOwnerTestBackend final : public IGripperCommandBackend {
+ public:
+  explicit GripperRuntimeOwnerTestBackend(std::string gripper_id) {
+    status.gripper_id = std::move(gripper_id);
+  }
+
+  GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO&) override { return {}; }
+
+  GripperCommandStatusDTO get_gripper_status(const std::string&) const override {
+    std::lock_guard lock(mutex);
+    return status;
+  }
+
+  GripperCommandResultDTO mark_gripper_grasp_lost(const std::string&, std::uint64_t, std::uint64_t,
+                                                  const std::string&, const std::string&,
+                                                  const std::string&) override {
+    return {};
+  }
+
+  void invalidate_gripper_commands(GripperInvalidationReason) noexcept override {
+    std::lock_guard lock(mutex);
+    status.state = GripperCommandState::kIdle;
+  }
+
+  void authorize_gripper_commands() noexcept override {}
+
+  void set_state(const GripperCommandState state) {
+    std::lock_guard lock(mutex);
+    status.state = state;
+  }
+
+  void set_gripper_id(std::string gripper_id) {
+    std::lock_guard lock(mutex);
+    status.gripper_id = std::move(gripper_id);
+  }
+
+ private:
+  mutable std::mutex mutex;
+  GripperCommandStatusDTO status;
+};
+
+[[nodiscard]] RuntimeParticipantBinding make_next_publication_gripper_binding(
+    const RuntimeParticipantBinding& predecessor) {
+  auto candidate = predecessor.value();
+  candidate.program_revision = ProgramRevision("program-revision.next");
+  candidate.program_binding_id = ProgramBindingId("program-binding.next");
+  candidate.retained_bundle_id = RetainedBundleId("bundle.next");
+  candidate.graph_revision = GraphRevision("graph.next");
+  auto sealed = verify_runtime_participant_binding(std::move(candidate));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
+[[nodiscard]] RuntimeParticipantBinding make_restarted_gripper_binding(
+    const RuntimeParticipantBinding& predecessor) {
+  auto candidate = predecessor.value();
+  candidate.control_path->control_route_id = ControlRouteId("route.successor");
+  candidate.control_path->active_control_configuration_id =
+      ActiveControlConfigurationId("active.native.successor");
+  candidate.control_path->active_control_configuration_generation =
+      ActiveControlConfigurationGeneration(2U);
+  candidate.control_path->provider_runtime_epoch = RuntimeEpoch("runtime-epoch.2");
+  for (auto& runtime : candidate.runtime_unit_epochs) {
+    runtime.runtime_epoch = RuntimeEpoch("runtime-epoch.2");
+  }
+  auto sealed = verify_runtime_participant_binding(std::move(candidate));
+  if (!sealed.ok()) {
+    throw std::logic_error(sealed.error().message);
+  }
+  return std::move(sealed.value());
+}
+
+[[nodiscard]] ActiveControlConfigurationDTO gripper_route_configuration(
+    const RuntimeParticipantBinding& binding) {
+  const auto& path = *binding.value().control_path;
+  return ActiveControlConfigurationDTO{
+      path.active_control_configuration_id,
+      path.control_domain_id,
+      path.control_domain_revision,
+      {{path.control_binding_id, path.control_binding_revision,
+        path.control_route_id}},
+      path.activation_set_id,
+      path.controller_topology_id,
+      path.topology_revision,
+      path.provider_runtime_unit_id,
+      path.provider_runtime_epoch,
+      1U,
+      {},
+      path.active_control_configuration_generation,
+      ActiveControlConfigurationStateDTO::kReconciled};
+}
+
+[[nodiscard]] std::shared_ptr<RetainedObservedStateChannel>
+make_gripper_restart_state_channel(const RuntimeParticipantBinding& binding,
+                                   IClock& clock) {
+  auto channel = std::make_shared<RetainedObservedStateChannel>(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState,
+          "native.gripper.restart",
+          1'000'000'000,
+          1U},
+      &clock);
+  const std::array<double, 1U> position{0.0};
+  const std::array<double, 1U> velocity{0.0};
+  if (!channel->publish_state(position, velocity, clock.now(), clock.now())
+           .applied()) {
+    throw std::logic_error("could not seed the restarted gripper state channel");
+  }
+  return channel;
+}
+
+TEST(RetainedNativeGripperRuntimeTest,
+     RegistrationOwnsOnlyTheGripperEngineAndRouteRebindPreservesIt) {
+  auto binding = make_binding(CoordinateKind::kLinear);
+  auto backend =
+      std::make_shared<GripperRuntimeOwnerTestBackend>(binding.value().command_target_id.value());
+  auto clock = std::make_shared<FakeClock>();
+  auto state_channel =
+      std::make_shared<FakeRetainedStateChannel>(binding, std::vector<double>{0.0});
+  int rebind_calls = 0;
+  std::optional<RuntimeParticipantBinding> rebound_binding;
+  std::shared_ptr<IRetainedObservedStateChannel> rebound_channel;
+  RetainedNativeGripperRuntime owner(RetainedNativeGripperRuntimeInput{
+      binding, backend, clock, state_channel, nullptr, std::nullopt, true,
+      [&](const RuntimeParticipantBinding& candidate,
+          const std::shared_ptr<IRetainedObservedStateChannel>& candidate_channel,
+          const std::optional<RuntimeParticipantStopReadiness>& readiness) {
+        ++rebind_calls;
+        EXPECT_FALSE(readiness.has_value());
+        rebound_binding = candidate;
+        rebound_channel = candidate_channel;
+        return Result<void>::Ok();
+      }, {}, std::nullopt});
+
+  const auto before = owner.registration();
+  ASSERT_NE(before.engine, nullptr);
+  EXPECT_NE(dynamic_cast<GripperParticipantEngine*>(before.engine), nullptr);
+  EXPECT_EQ(before.stop_execution_port, nullptr);
+  EXPECT_FALSE(before.stop_readiness.has_value());
+  EXPECT_FALSE(before.runtime_policy.has_value());
+  EXPECT_TRUE(before.intrinsic_direct_control);
+  EXPECT_EQ(owner.backend(), backend.get());
+  EXPECT_EQ(owner.state_channel(), state_channel);
+
+  const auto candidate = make_next_publication_gripper_binding(binding);
+  auto candidate_channel =
+      std::make_shared<FakeRetainedStateChannel>(candidate, std::vector<double>{0.0});
+  const auto other_binding = make_binding(CoordinateKind::kLinear, "another.gripper");
+  auto mismatched_channel =
+      std::make_shared<FakeRetainedStateChannel>(other_binding, std::vector<double>{0.0});
+  const auto mismatched = owner.RebindRoute(candidate, mismatched_channel, std::nullopt);
+  ASSERT_FALSE(mismatched.ok());
+  EXPECT_EQ(mismatched.error().code, "native_gripper_state_channel_binding_mismatch");
+  EXPECT_EQ(rebind_calls, 0);
+  EXPECT_EQ(owner.binding().value(), binding.value());
+  EXPECT_EQ(owner.state_channel(), state_channel);
+
+  ASSERT_TRUE(owner.RebindRoute(candidate, candidate_channel, std::nullopt).ok());
+  const auto after = owner.registration();
+  EXPECT_EQ(rebind_calls, 1);
+  ASSERT_TRUE(rebound_binding.has_value());
+  EXPECT_EQ(rebound_binding->value(), candidate.value());
+  EXPECT_EQ(rebound_channel, candidate_channel);
+  EXPECT_EQ(after.binding.value(), candidate.value());
+  EXPECT_EQ(owner.state_channel(), candidate_channel);
+  EXPECT_EQ(after.engine, before.engine);
+  EXPECT_EQ(owner.participant_engine(), before.engine);
+  EXPECT_EQ(owner.backend(), backend.get());
+}
+
+TEST(RetainedNativeGripperRuntimeTest, FailedOrUnverifiedRebindKeepsThePredecessorRegistration) {
+  auto binding = make_binding(CoordinateKind::kLinear);
+  auto backend =
+      std::make_shared<GripperRuntimeOwnerTestBackend>(binding.value().command_target_id.value());
+  auto clock = std::make_shared<FakeClock>();
+  auto state_channel =
+      std::make_shared<FakeRetainedStateChannel>(binding, std::vector<double>{0.0});
+  RetainedNativeGripperRuntime owner(RetainedNativeGripperRuntimeInput{
+      binding, backend, clock, state_channel, nullptr, std::nullopt, false,
+      [](const RuntimeParticipantBinding&, const std::shared_ptr<IRetainedObservedStateChannel>&,
+         const std::optional<RuntimeParticipantStopReadiness>&) {
+        return Result<void>::Err(ErrorDTO{
+            "native_route_readback_mismatch", "candidate gripper route did not verify", {}});
+      }, {}, std::nullopt});
+  const auto before = owner.registration();
+  const auto candidate = make_next_publication_gripper_binding(binding);
+  auto candidate_channel =
+      std::make_shared<FakeRetainedStateChannel>(candidate, std::vector<double>{0.0});
+
+  const auto refused = owner.RebindRoute(candidate, candidate_channel, std::nullopt);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "native_route_readback_mismatch");
+  EXPECT_EQ(owner.registration().binding.value(), before.binding.value());
+  EXPECT_EQ(owner.registration().engine, before.engine);
+  EXPECT_EQ(owner.state_channel(), state_channel);
+
+  RetainedNativeGripperRuntime no_rebinder(RetainedNativeGripperRuntimeInput{
+      binding, backend, clock, state_channel, nullptr, std::nullopt, false, {},
+      {}, std::nullopt});
+  const auto unverified = no_rebinder.RebindRoute(candidate, candidate_channel, std::nullopt);
+  ASSERT_FALSE(unverified.ok());
+  EXPECT_EQ(unverified.error().code, "native_gripper_route_rebind_unverified");
+  EXPECT_EQ(no_rebinder.registration().binding.value(), binding.value());
+  EXPECT_EQ(no_rebinder.state_channel(), state_channel);
+}
+
+TEST(RetainedNativeGripperRuntimeTest, ConstructionRequiresAnExactObservedStateChannel) {
+  auto binding = make_binding(CoordinateKind::kLinear);
+  auto other_binding = make_binding(CoordinateKind::kLinear, "other.gripper");
+  auto backend =
+      std::make_shared<GripperRuntimeOwnerTestBackend>(binding.value().command_target_id.value());
+  auto clock = std::make_shared<FakeClock>();
+  auto mismatched_channel =
+      std::make_shared<FakeRetainedStateChannel>(other_binding, std::vector<double>{0.0});
+
+  EXPECT_THROW(
+      {
+        RetainedNativeGripperRuntime owner(RetainedNativeGripperRuntimeInput{
+            binding, backend, clock, mismatched_channel, nullptr, std::nullopt,
+            false, {}, {}, std::nullopt});
+      },
+      std::invalid_argument);
+  EXPECT_THROW(
+      {
+        RetainedNativeGripperRuntime owner(RetainedNativeGripperRuntimeInput{
+            binding, backend, clock, {}, nullptr, std::nullopt, false, {},
+            {}, std::nullopt});
+      },
+      std::invalid_argument);
+}
+
+TEST(RetainedNativeGripperRuntimeTest, RouteRebindRefusesAnActiveOrMismatchedGripperStatus) {
+  auto binding = make_binding(CoordinateKind::kLinear);
+  auto backend =
+      std::make_shared<GripperRuntimeOwnerTestBackend>(binding.value().command_target_id.value());
+  auto clock = std::make_shared<FakeClock>();
+  auto state_channel =
+      std::make_shared<FakeRetainedStateChannel>(binding, std::vector<double>{0.0});
+  int rebind_calls = 0;
+  RetainedNativeGripperRuntime owner(RetainedNativeGripperRuntimeInput{
+      binding, backend, clock, state_channel, nullptr, std::nullopt, false,
+      [&](const RuntimeParticipantBinding&, const std::shared_ptr<IRetainedObservedStateChannel>&,
+          const std::optional<RuntimeParticipantStopReadiness>&) {
+        ++rebind_calls;
+        return Result<void>::Ok();
+      }, {}, std::nullopt});
+  const auto candidate = make_next_publication_gripper_binding(binding);
+  auto candidate_channel =
+      std::make_shared<FakeRetainedStateChannel>(candidate, std::vector<double>{0.0});
+
+  backend->set_state(GripperCommandState::kExecuting);
+  const auto active = owner.RebindRoute(candidate, candidate_channel, std::nullopt);
+  ASSERT_FALSE(active.ok());
+  EXPECT_EQ(active.error().code, "native_gripper_route_rebind_busy");
+  EXPECT_EQ(rebind_calls, 0);
+  EXPECT_EQ(owner.registration().binding.value(), binding.value());
+
+  backend->set_state(GripperCommandState::kIdle);
+  backend->set_gripper_id("another.gripper");
+  const auto mismatched = owner.RebindRoute(candidate, candidate_channel, std::nullopt);
+  ASSERT_FALSE(mismatched.ok());
+  EXPECT_EQ(mismatched.error().code, "native_gripper_route_rebind_busy");
+  EXPECT_EQ(rebind_calls, 0);
+
+  backend->set_gripper_id(binding.value().command_target_id.value());
+  ASSERT_TRUE(owner.RebindRoute(candidate, candidate_channel, std::nullopt).ok());
+  EXPECT_EQ(rebind_calls, 1);
+  EXPECT_EQ(owner.state_channel(), candidate_channel);
+}
+
+TEST(RetainedNativeGripperRuntimeTest, NativeFactoryOwnsGripperBackendSchedulerAndStopPort) {
+  auto binding = make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  auto state_channel =
+      std::make_shared<FakeRetainedStateChannel>(binding, std::vector<double>{0.0});
+  auto clock = std::make_shared<FakeClock>();
+  auto scheduler = std::make_shared<ManualScheduler>();
+
+  auto owner = RetainedNativeGripperRuntime::CreateNative(binding, state_channel, clock, scheduler,
+                                                          std::nullopt, std::nullopt);
+
+  ASSERT_NE(owner, nullptr);
+  auto* backend = dynamic_cast<RetainedGripperCommandBackend*>(owner->backend());
+  ASSERT_NE(backend, nullptr);
+  ASSERT_NE(owner->participant_engine(), nullptr);
+  EXPECT_NE(dynamic_cast<GripperParticipantEngine*>(owner->registration().engine), nullptr);
+  EXPECT_EQ(owner->state_channel(), state_channel);
+  EXPECT_EQ(owner->stop_execution_port(), static_cast<IControlDomainExecutionPort*>(backend));
+  EXPECT_EQ(owner->registration().stop_execution_port, owner->stop_execution_port());
+
+  const auto candidate = make_next_publication_gripper_binding(binding);
+  auto candidate_channel =
+      std::make_shared<FakeRetainedStateChannel>(candidate, std::vector<double>{0.0});
+  ASSERT_TRUE(owner->RebindRoute(candidate, candidate_channel, std::nullopt).ok());
+  EXPECT_EQ(owner->backend(), backend);
+  EXPECT_EQ(owner->binding().value(), candidate.value());
+  EXPECT_EQ(owner->state_channel(), candidate_channel);
+  EXPECT_EQ(owner->stop_execution_port(), static_cast<IControlDomainExecutionPort*>(backend));
+
+  auto shared_owner = std::shared_ptr<RetainedNativeGripperRuntime>(std::move(owner));
+  RetainedNativeComponentOwner component_owner(shared_owner);
+  EXPECT_EQ(component_owner.motion_runtime(), nullptr);
+  EXPECT_EQ(component_owner.gripper_runtime(), shared_owner.get());
+  EXPECT_EQ(component_owner.component_id(), binding.value().controllable_component_id);
+  const auto physical_bindings = component_owner.physical_bindings();
+  ASSERT_EQ(physical_bindings.size(), 1U);
+  EXPECT_EQ(physical_bindings.front().value(), candidate.value());
+  const auto registrations = component_owner.registrations();
+  ASSERT_EQ(registrations.size(), 1U);
+  EXPECT_EQ(registrations.front().binding.value(), candidate.value());
+  EXPECT_EQ(registrations.front().engine, shared_owner->participant_engine());
+}
+
+TEST(RetainedNativeGripperRoutePublicationOwnerTest,
+     PublishesClosedUnreconciledFactsAndRequiresCompleteCellBuilderForReconcile) {
+  using namespace core;
+
+  auto binding = make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
+      binding.value().command_target_id.value());
+  auto clock = std::make_shared<FakeClock>();
+  auto scheduler = std::make_shared<ManualScheduler>();
+  auto state_channel = std::make_shared<FakeRetainedStateChannel>(
+      binding, std::vector<double>{0.0});
+  auto gripper = std::make_shared<RetainedNativeGripperRuntime>(
+      RetainedNativeGripperRuntimeInput{binding, backend, clock, state_channel,
+                                        nullptr, std::nullopt, false, {},
+                                        scheduler, std::nullopt});
+
+  const auto cell_id = CellId("cell.native.gripper.route");
+  const auto graph_revision = binding.value().graph_revision;
+  const auto journal_path = std::filesystem::temp_directory_path() /
+                            ("manyforge-gripper-route-" +
+                             std::to_string(
+                                 std::chrono::steady_clock::now()
+                                     .time_since_epoch()
+                                     .count()) +
+                             ".sqlite");
+  {
+    SqliteOperationJournal journal(journal_path, cell_id, 16U);
+    ResourceAddressedExecutionKernel kernel(
+        {gripper->registration()}, *clock, *scheduler, journal,
+        ResourceAddressedExecutionKernelConfig{
+            RequestOwnerEpoch("owner.native.gripper.route"), cell_id, 16U,
+            {}, nullptr, graph_revision});
+    RetainedNativeGripperRoutePublicationOwner owner(gripper, *clock, kernel);
+
+    const auto& path = *binding.value().control_path;
+    ActiveControlConfigurationDTO reconciled{
+        ActiveControlConfigurationId("active.native.gripper.reconciled"),
+        path.control_domain_id,
+        path.control_domain_revision,
+        {{path.control_binding_id, path.control_binding_revision,
+          path.control_route_id}},
+        ActivationSetId("activation.native.gripper"),
+        path.controller_topology_id,
+        path.topology_revision,
+        RuntimeUnitId("runtime.native.gripper"),
+        RuntimeEpoch("runtime.native.gripper.1"),
+        1U,
+        {},
+        ActiveControlConfigurationGeneration(1U),
+        ActiveControlConfigurationStateDTO::kReconciled};
+    const auto current = owner.ReadCurrentPhysicalParticipants(reconciled);
+    ASSERT_TRUE(current.ok()) << current.error().message;
+    ASSERT_EQ(current.value().size(), 1U);
+    EXPECT_EQ(current.value().front().value(), binding.value());
+
+    auto unreconciled = reconciled;
+    unreconciled.active_control_configuration_id =
+        ActiveControlConfigurationId("active.native.gripper.external");
+    unreconciled.active_control_configuration_generation =
+        ActiveControlConfigurationGeneration(2U);
+    unreconciled.binding_routes.front().control_route_id =
+        ControlRouteId("route.external.gripper");
+    unreconciled.state =
+        ActiveControlConfigurationStateDTO::kExternalOrUnknownUnreconciled;
+
+    const auto published = owner.PublishAndReadBackRouteConfiguration(
+        unreconciled, {});
+    ASSERT_TRUE(published.ok()) << published.error().message;
+    EXPECT_EQ(published.value().active_configuration, unreconciled);
+    EXPECT_TRUE(published.value().readiness_rows.empty());
+    EXPECT_FALSE(published.value().operation_admission_open);
+
+    auto unsupported_reconciled = unreconciled;
+    unsupported_reconciled.state =
+        ActiveControlConfigurationStateDTO::kReconciled;
+    unsupported_reconciled.active_control_configuration_generation =
+        ActiveControlConfigurationGeneration(3U);
+    const auto refused = owner.PublishAndReadBackRouteConfiguration(
+        unsupported_reconciled, {});
+    ASSERT_FALSE(refused.ok());
+    ASSERT_EQ(refused.error().details.size(), 1U);
+    EXPECT_EQ(refused.error().details.at("reason"),
+              "route_publication_gripper_cell_builder_missing");
+
+    const auto readback = kernel.runtime_route_configuration_readback(
+        unreconciled.control_domain_id,
+        unreconciled.active_control_configuration_id,
+        unreconciled.active_control_configuration_generation);
+    ASSERT_TRUE(readback.ok()) << readback.error().message;
+    EXPECT_EQ(readback.value(), published.value());
+  }
+  std::error_code ignored;
+  std::filesystem::remove(journal_path, ignored);
+  std::filesystem::remove(journal_path.string() + "-wal", ignored);
+  std::filesystem::remove(journal_path.string() + "-shm", ignored);
+}
+
+TEST(RetainedNativeGripperRoutePublicationOwnerTest,
+     AdoptsDurablePredecessorAfterRuntimeRestartAndKeepsAdmissionClosed) {
+  using namespace core;
+
+  const auto durable_binding =
+      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  const auto predecessor = gripper_route_configuration(durable_binding);
+  const auto current_binding = make_restarted_gripper_binding(durable_binding);
+  auto clock = std::make_shared<FakeClock>();
+  clock->set(100);
+  auto scheduler = std::make_shared<ManualScheduler>();
+  auto state_channel = make_gripper_restart_state_channel(current_binding, *clock);
+  auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
+      current_binding.value().command_target_id.value());
+  std::vector<ControlRouteId> rebound_routes;
+  auto gripper = std::make_shared<RetainedNativeGripperRuntime>(
+      RetainedNativeGripperRuntimeInput{
+          current_binding,
+          backend,
+          clock,
+          state_channel,
+          nullptr,
+          std::nullopt,
+          false,
+          [&](const RuntimeParticipantBinding& candidate,
+              const std::shared_ptr<IRetainedObservedStateChannel>& channel,
+              const std::optional<RuntimeParticipantStopReadiness>& readiness) {
+            EXPECT_EQ(channel, state_channel);
+            EXPECT_FALSE(readiness.has_value());
+            rebound_routes.push_back(candidate.value().control_path->control_route_id);
+            return Result<void>::Ok();
+          }, scheduler, std::nullopt});
+
+  const auto cell_id = CellId("cell.native.gripper.restart");
+  const auto journal_path = std::filesystem::temp_directory_path() /
+                            ("manyforge-gripper-restart-" +
+                             std::to_string(std::chrono::steady_clock::now()
+                                                .time_since_epoch()
+                                                .count()) +
+                             ".sqlite");
+  {
+    SqliteOperationJournal journal(journal_path, cell_id, 16U);
+    ResourceAddressedExecutionKernel kernel(
+        {gripper->registration()}, *clock, *scheduler, journal,
+        ResourceAddressedExecutionKernelConfig{
+            RequestOwnerEpoch("owner.native.gripper.restart"), cell_id, 16U,
+            {}, nullptr, current_binding.value().graph_revision});
+    RetainedNativeGripperRoutePublicationOwner owner(
+        gripper, *clock, kernel,
+        [](const ActiveControlConfigurationDTO&,
+           const RuntimeParticipantExecutionRegistration& registration) {
+          RetainedNativeGripperRoutePublicationOwner::KernelCandidate candidate;
+          candidate.registrations.push_back(registration);
+          return Result<RetainedNativeGripperRoutePublicationOwner::KernelCandidate>::Ok(
+              std::move(candidate));
+        });
+
+    ASSERT_TRUE(kernel.SetRouteRecoveryPending(true).ok());
+    const auto adopted =
+        owner.AdoptAndReadBackRouteConfigurationPredecessor(predecessor);
+    ASSERT_TRUE(adopted.ok()) << adopted.error().message;
+    EXPECT_EQ(adopted.value().active_configuration, predecessor);
+    EXPECT_TRUE(adopted.value().readiness_rows.empty());
+    EXPECT_FALSE(adopted.value().operation_admission_open);
+    EXPECT_EQ(rebound_routes, (std::vector<ControlRouteId>{
+                                  predecessor.binding_routes.front().control_route_id}));
+    EXPECT_EQ(gripper->binding().value().control_path->provider_runtime_epoch,
+              RuntimeEpoch("runtime-epoch.2"));
+    EXPECT_EQ(gripper->binding().value().control_path->control_route_id,
+              predecessor.binding_routes.front().control_route_id);
+    EXPECT_FALSE(gripper->stop_readiness().has_value());
+
+    const auto readback = kernel.runtime_route_configuration_readback(
+        predecessor.control_domain_id,
+        predecessor.active_control_configuration_id,
+        predecessor.active_control_configuration_generation);
+    ASSERT_TRUE(readback.ok()) << readback.error().message;
+    EXPECT_EQ(readback.value(), adopted.value());
+    EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
+  }
+  std::error_code ignored;
+  std::filesystem::remove(journal_path, ignored);
+  std::filesystem::remove(journal_path.string() + "-wal", ignored);
+  std::filesystem::remove(journal_path.string() + "-shm", ignored);
+}
+
+TEST(RetainedNativeGripperRoutePublicationOwnerTest,
+     FailedPredecessorRecoveryRollsBackAndPreservesRecoveryExclusion) {
+  using namespace core;
+
+  const auto durable_binding =
+      make_binding(CoordinateKind::kLinear, "gripper.target", true);
+  const auto predecessor = gripper_route_configuration(durable_binding);
+  const auto current_binding = make_restarted_gripper_binding(durable_binding);
+  auto clock = std::make_shared<FakeClock>();
+  clock->set(100);
+  auto scheduler = std::make_shared<ManualScheduler>();
+  auto state_channel = make_gripper_restart_state_channel(current_binding, *clock);
+  auto backend = std::make_shared<GripperRuntimeOwnerTestBackend>(
+      current_binding.value().command_target_id.value());
+  std::vector<ControlRouteId> rebound_routes;
+  int builder_calls = 0;
+  auto gripper = std::make_shared<RetainedNativeGripperRuntime>(
+      RetainedNativeGripperRuntimeInput{
+          current_binding,
+          backend,
+          clock,
+          state_channel,
+          nullptr,
+          std::nullopt,
+          false,
+          [&](const RuntimeParticipantBinding& candidate,
+              const std::shared_ptr<IRetainedObservedStateChannel>& channel,
+              const std::optional<RuntimeParticipantStopReadiness>& readiness) {
+            EXPECT_EQ(channel, state_channel);
+            EXPECT_FALSE(readiness.has_value());
+            rebound_routes.push_back(candidate.value().control_path->control_route_id);
+            return Result<void>::Ok();
+          }, scheduler, std::nullopt});
+
+  const auto cell_id = CellId("cell.native.gripper.restart.failure");
+  const auto journal_path = std::filesystem::temp_directory_path() /
+                            ("manyforge-gripper-restart-failure-" +
+                             std::to_string(std::chrono::steady_clock::now()
+                                                .time_since_epoch()
+                                                .count()) +
+                             ".sqlite");
+  {
+    SqliteOperationJournal journal(journal_path, cell_id, 16U);
+    ResourceAddressedExecutionKernel kernel(
+        {gripper->registration()}, *clock, *scheduler, journal,
+        ResourceAddressedExecutionKernelConfig{
+            RequestOwnerEpoch("owner.native.gripper.restart.failure"), cell_id,
+            16U, {}, nullptr, current_binding.value().graph_revision});
+    RetainedNativeGripperRoutePublicationOwner owner(
+        gripper, *clock, kernel,
+        [&builder_calls](const ActiveControlConfigurationDTO&,
+           const RuntimeParticipantExecutionRegistration&) {
+          ++builder_calls;
+          return Result<RetainedNativeGripperRoutePublicationOwner::KernelCandidate>::Err(
+              ErrorDTO{"test_builder_failed", "injected cell candidate failure", {}});
+        });
+
+    ASSERT_TRUE(kernel.SetRouteRecoveryPending(true).ok());
+    const auto refused =
+        owner.AdoptAndReadBackRouteConfigurationPredecessor(predecessor);
+    ASSERT_FALSE(refused.ok());
+    ASSERT_TRUE(refused.error().details.contains("reason"));
+    EXPECT_EQ(refused.error().details.at("reason"),
+              "route_predecessor_gripper_builder_failed");
+    EXPECT_EQ(rebound_routes,
+              (std::vector<ControlRouteId>{
+                  predecessor.binding_routes.front().control_route_id,
+                  current_binding.value().control_path->control_route_id}));
+    EXPECT_EQ(builder_calls, 1);
+    EXPECT_EQ(gripper->binding().value(), current_binding.value());
+    EXPECT_EQ(gripper->state_channel(), state_channel);
+    EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
+
+    auto changed_activation = predecessor;
+    changed_activation.activation_set_id = ActivationSetId("activation.foreign");
+    const auto refused_activation =
+        owner.AdoptAndReadBackRouteConfigurationPredecessor(changed_activation);
+    ASSERT_FALSE(refused_activation.ok());
+    ASSERT_TRUE(refused_activation.error().details.contains("reason"));
+    EXPECT_EQ(refused_activation.error().details.at("reason"),
+              "route_predecessor_gripper_rebind_failed");
+    EXPECT_EQ(builder_calls, 1);
+    EXPECT_EQ(rebound_routes,
+              (std::vector<ControlRouteId>{
+                  predecessor.binding_routes.front().control_route_id,
+                  current_binding.value().control_path->control_route_id,
+                  current_binding.value().control_path->control_route_id}));
+    EXPECT_EQ(gripper->binding().value(), current_binding.value());
+    EXPECT_EQ(state_channel->query_context(),
+              make_observed_state_query_context(
+                  current_binding,
+                  state_channel->query_context().freshness_budget_ns)
+                  .value());
+    EXPECT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
+  }
+  std::error_code ignored;
+  std::filesystem::remove(journal_path, ignored);
+  std::filesystem::remove(journal_path.string() + "-wal", ignored);
+  std::filesystem::remove(journal_path.string() + "-shm", ignored);
+}
+
+TEST(RetainedNativeGripperRuntimeTest,
+     OwnedChannelLeavesComponentLocalObservationUnavailableUntilPublished) {
+  auto binding = make_binding(CoordinateKind::kLinear, "gripper.local", true);
+  auto clock = std::make_shared<FakeClock>();
+  clock->set(100);
+  auto scheduler = std::make_shared<ManualScheduler>();
+  auto wake = std::make_shared<RetainedObservationWake>();
+
+  auto owner = RetainedNativeGripperRuntime::CreateNativeWithOwnedStateChannel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kPredictedState, "native.gripper.local",
+          1'000, 1U},
+      clock, scheduler, wake, std::nullopt, std::nullopt);
+
+  ASSERT_NE(owner, nullptr);
+  auto channel =
+      std::dynamic_pointer_cast<RetainedObservedStateChannel>(
+          owner->state_channel());
+  ASSERT_NE(channel, nullptr);
+  auto shared_owner = std::shared_ptr<RetainedNativeGripperRuntime>(
+      std::move(owner));
+  RetainedNativeComponentOwner component_owner(shared_owner);
+  const auto observed_channels = component_owner.observed_channels();
+  ASSERT_EQ(observed_channels.size(), 1U);
+  EXPECT_EQ(observed_channels.front(), channel);
+  EXPECT_EQ(channel->query_context(),
+            make_observed_state_query_context(binding, 1'000).value());
+  EXPECT_FALSE(channel->current_state(clock->now()).ok());
+
+  const std::array<double, 1U> positions{0.025};
+  const std::array<double, 1U> velocities{0.0};
+  EXPECT_TRUE(channel
+                  ->publish_state(positions, velocities, clock->now(),
+                                  clock->now())
+                  .applied());
+  const auto observed = channel->current_state(clock->now());
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  EXPECT_DOUBLE_EQ(
+      std::get<LinearPositionDTO>(observed.value().positions.front()).value_m,
+      positions.front());
+}
+
+TEST(RetainedNativeGripperRuntimeTest,
+     OwnedChannelRejectsModelBackedBindingWithoutProjector) {
+  auto binding = make_binding(CoordinateKind::kLinear, "gripper.model", false);
+  auto clock = std::make_shared<FakeClock>();
+  auto scheduler = std::make_shared<ManualScheduler>();
+  auto wake = std::make_shared<RetainedObservationWake>();
+
+  EXPECT_THROW(
+      RetainedNativeGripperRuntime::CreateNativeWithOwnedStateChannel(
+          binding, nullptr,
+          RetainedObservedStateChannelConfig{
+              ObservedStateSourceKind::kPredictedState,
+              "native.gripper.model", 1'000, 1U},
+          clock, scheduler, wake, std::nullopt, std::nullopt),
+      std::invalid_argument);
 }
 
 } // namespace

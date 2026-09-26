@@ -33,7 +33,7 @@ const RECONNECT_DELAY_MS = 1000;
 // execution-control settlement.
 export const HEADLESS_SHELL_PUBLICATION_MS = 50;
 
-const EXECUTION_OBSERVATION_SCHEMA = 'manyforge.execution_observation_frame.v2';
+const EXECUTION_OBSERVATION_SCHEMA = 'manyforge.execution_observation_frame.v3';
 const EXECUTION_OBSERVATION_CREDIT_SCHEMA = 'manyforge.execution_observation_credit.v1';
 const EXECUTION_OBSERVATION_RENEWAL_MS = 15_000;
 const observationTextEncoder = new TextEncoder();
@@ -114,12 +114,14 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
   if (record.schema_version !== EXECUTION_OBSERVATION_SCHEMA) {
     throw new Error('Execution observation schema is unsupported.');
   }
-  if (!Array.isArray(record.targets) || record.targets.length === 0 || record.targets.length > 64) {
+  // H1a-IF.2: a cell may have no observable coordinate at all.
+  if (!Array.isArray(record.targets) || record.targets.length > 64) {
     throw new Error('Execution observation target count is invalid.');
   }
   const targets: ExecutionObservationTarget[] = record.targets.map((rawTarget) => {
-    const target = object(rawTarget, ['controllable_component_id', 'command_target_id', 'source_epoch',
-      'source_sequence', 'source_joint_names', 'compiled_joint_names', 'coordinate_kinds', 'positions_si']);
+    const target = object(rawTarget, ['controllable_component_id', 'command_target_id',
+      'operation_capability_id', 'source_epoch', 'source_sequence', 'source_joint_names',
+      'compiled_joint_names', 'coordinate_kinds', 'positions_si']);
     const sourceJointNames = strings('source_joint_names', target);
     const compiledJointNames = strings('compiled_joint_names', target);
     const kinds = target.coordinate_kinds;
@@ -134,6 +136,7 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
     return Object.freeze({
       controllableComponentId: text('controllable_component_id', target),
       commandTargetId: text('command_target_id', target),
+      operationCapabilityId: text('operation_capability_id', target),
       sourceEpoch: text('source_epoch', target),
       sourceSequence: integer('source_sequence', target),
       sourceJointNames, compiledJointNames,

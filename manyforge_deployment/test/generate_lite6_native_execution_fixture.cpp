@@ -43,6 +43,9 @@ enum class FixtureKind {
   kCCLCProduct,
   kCCLCOperatorConfirmation,
   kCCLCReadiness,
+  kProjectionSuccessor,
+  // A native cell whose one unit hosts only the gripper (no motion owner).
+  kGripperOnly,
 };
 
 struct GeneratorArguments final {
@@ -56,7 +59,8 @@ struct GeneratorArguments final {
         "usage: generate_lite6_native_execution_fixture "
         "--output-root PATH "
         "[--fixture-kind "
-        "cclc-product|cclc-operator-confirmation|cclc-readiness]");
+        "cclc-product|cclc-operator-confirmation|cclc-readiness|"
+        "projection-successor|gripper-only]");
   }
 
   std::map<std::string, std::filesystem::path, std::less<>> values;
@@ -92,6 +96,10 @@ struct GeneratorArguments final {
       selected_kind = FixtureKind::kCCLCOperatorConfirmation;
     } else if (fixture_kind->string() == "cclc-readiness") {
       selected_kind = FixtureKind::kCCLCReadiness;
+    } else if (fixture_kind->string() == "projection-successor") {
+      selected_kind = FixtureKind::kProjectionSuccessor;
+    } else if (fixture_kind->string() == "gripper-only") {
+      selected_kind = FixtureKind::kGripperOnly;
     } else {
       throw std::invalid_argument(
           "native execution fixture kind is unsupported");
@@ -122,10 +130,12 @@ void write_exact_file(const std::filesystem::path &path,
 }
 
 [[nodiscard]] CanonicalValue make_program_root(const deployment::RetainedBundle& bundle,
+                                               const bool include_arm,
                                                const bool include_gripper,
                                                const bool operator_confirmation) {
-  CanonicalValue::Object target_roles{
-      {"arm",
+  CanonicalValue::Object target_roles;
+  if (include_arm) target_roles.emplace_back(
+      "arm",
        CanonicalValue(CanonicalValue::Object{
            {"component_role", CanonicalValue("robot")},
            {"required_capabilities",
@@ -153,8 +163,7 @@ void write_exact_file(const std::filesystem::path &path,
                 CanonicalValue::Array{CanonicalValue("arm_collision")})},
            {"required_model_roles",
             CanonicalValue(CanonicalValue::Array{CanonicalValue("arm_model")})},
-       })},
-  };
+       }));
   if (include_gripper) {
     CanonicalValue::Array gripper_capabilities{CanonicalValue(CanonicalValue::Object{
         {"capability_id", CanonicalValue("tool.gripper.command")},
@@ -222,9 +231,11 @@ void write_exact_file(const std::filesystem::path &path,
 }
 
 [[nodiscard]] std::string make_program_bytes(const deployment::RetainedBundle& bundle,
+                                             const bool include_arm,
                                              const bool include_gripper,
                                              const bool operator_confirmation) {
-  CanonicalValue root = make_program_root(bundle, include_gripper, operator_confirmation);
+  CanonicalValue root =
+      make_program_root(bundle, include_arm, include_gripper, operator_confirmation);
   const std::string revision = deployment::detail::compute_content_identity(
       root, deployment::detail::ContentIdentitySpec{
                 .identity_domain = "program-revision",
@@ -288,6 +299,7 @@ int main(int argc, char **argv) {
     std::filesystem::create_directories(package_root);
     std::filesystem::create_directories(manager_state_root);
 
+    const bool gripper_only = arguments.fixture_kind == FixtureKind::kGripperOnly;
     auto materialized = [&]() {
       if (arguments.fixture_kind != FixtureKind::kCCLCReadiness) {
         // The native host initializes every component through CCLC with the
@@ -303,14 +315,31 @@ int main(int argc, char **argv) {
           }
           return digest.value().value();
         };
+        if (gripper_only) {
+          return deployment::test::
+              materialize_lite6_native_gripper_only_cclc_product_retained_consumer_fixture(
+                  package_root, anchor("lite6_arm_provider"),
+                  anchor("lite6_gripper_provider"));
+        }
         return deployment::test::materialize_lite6_native_cclc_product_retained_consumer_fixture(
             package_root, anchor("lite6_arm_provider"), anchor("lite6_gripper_provider"),
-            arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation);
+            arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation,
+            // Runtime configuration changes the exact graph/model-map binding
+            // without changing component types, providers or host infrastructure.
+            arguments.fixture_kind == FixtureKind::kProjectionSuccessor
+                ? std::optional<double>(0.1)
+                : std::nullopt);
       }
       if (arguments.fixture_kind == FixtureKind::kCCLCReadiness) {
+        const auto plans = core::MakeNativeControlLifecyclePlans();
+        const auto digest = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+            core::ProviderManifestId("lite6_arm_provider"), plans);
+        if (!digest.ok()) {
+          throw std::logic_error("arm-only native lifecycle anchor is unavailable");
+        }
         return deployment::test::
-            materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
-                package_root);
+            materialize_lite6_native_arm_only_cclc_product_retained_consumer_fixture(
+                package_root, digest.value().value());
       }
       throw std::logic_error("native execution fixture kind is unhandled");
     }();
@@ -333,15 +362,19 @@ int main(int argc, char **argv) {
 
     const bool include_gripper =
         arguments.fixture_kind != FixtureKind::kCCLCReadiness;
+    const bool include_arm = !gripper_only;
     const std::string program_bytes = make_program_bytes(
-        bundle, include_gripper, arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation);
+        bundle, include_arm, include_gripper,
+        arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation);
     const auto program =
         deployment::verify_program_binding_contract(program_bytes, bundle);
     deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
-    std::vector<core::ProgramTargetRoleAssignmentDTO> target_assignments{
-        {core::TargetRoleId("arm"), core::CommandTargetId(std::string(
-                                        deployment::test::kLite6ArmTargetId))},
-    };
+    std::vector<core::ProgramTargetRoleAssignmentDTO> target_assignments;
+    if (include_arm) {
+      target_assignments.push_back(
+          {core::TargetRoleId("arm"),
+           core::CommandTargetId(std::string(deployment::test::kLite6ArmTargetId))});
+    }
     if (include_gripper) {
       target_assignments.push_back(
           {core::TargetRoleId("gripper"),
@@ -396,11 +429,13 @@ int main(int argc, char **argv) {
     write_exact_file(program_path, program_bytes);
     write_exact_file(output_root / "program_binding.json",
                      std::string(binding->canonical_bytes()));
-    const CanonicalValue manifest(CanonicalValue::Object{
+    CanonicalValue::Object manifest_members{
         {"api_version", CanonicalValue("manyforge.i6.native-execution-fixture.v1")},
         {"cclc_product",
          CanonicalValue(arguments.fixture_kind == FixtureKind::kCCLCProduct ||
-                        arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation)},
+                        arguments.fixture_kind == FixtureKind::kCCLCOperatorConfirmation ||
+                        arguments.fixture_kind == FixtureKind::kProjectionSuccessor ||
+                        gripper_only)},
         {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
         {"retained_bundle_id", CanonicalValue(bundle.retained_bundle_id().value())},
         {"graph_revision", CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
@@ -411,24 +446,34 @@ int main(int argc, char **argv) {
         {"program_revision", CanonicalValue(program->value().program_revision.value())},
         {"program_binding_id", CanonicalValue(binding->program_binding_id().value())},
         {"component_role_id", CanonicalValue("robot")},
-        {"target_role_id", CanonicalValue("arm")},
         {"gripper_target_role_id", CanonicalValue("gripper")},
-        {"execution_capability_id", CanonicalValue("execution.trajectory.execute")},
-        {"planning_capability_ids", CanonicalValue(CanonicalValue::Array{
-                                        CanonicalValue("planning.motion.cartesian_path"),
-                                        CanonicalValue("planning.motion.joint_goal"),
-                                        CanonicalValue("planning.motion.pose_goal"),
-                                    })},
         {"gripper_capability_id", CanonicalValue("tool.gripper.command")},
         {"gripper_command_schema_id",
          CanonicalValue(std::string(core::kGripperPositionCommandSchemaId))},
         {"gripper_command_schema_revision",
          CanonicalValue(std::string(core::kGripperPositionCommandSchemaRevision))},
-        {"source_joint_names",
-         CanonicalValue(CanonicalValue::Array{CanonicalValue("joint1"), CanonicalValue("joint2"),
-                                              CanonicalValue("joint3"), CanonicalValue("joint4"),
-                                              CanonicalValue("joint5"), CanonicalValue("joint6")})},
-    });
+    };
+    if (gripper_only) {
+      // No motion identity exists anywhere in a gripper-only cell.
+      manifest_members.emplace_back("gripper_only", CanonicalValue(true));
+    } else {
+      manifest_members.emplace_back("target_role_id", CanonicalValue("arm"));
+      manifest_members.emplace_back("execution_capability_id",
+                                    CanonicalValue("execution.trajectory.execute"));
+      manifest_members.emplace_back(
+          "planning_capability_ids",
+          CanonicalValue(CanonicalValue::Array{
+              CanonicalValue("planning.motion.cartesian_path"),
+              CanonicalValue("planning.motion.joint_goal"),
+              CanonicalValue("planning.motion.pose_goal"),
+          }));
+      manifest_members.emplace_back(
+          "source_joint_names",
+          CanonicalValue(CanonicalValue::Array{
+              CanonicalValue("joint1"), CanonicalValue("joint2"), CanonicalValue("joint3"),
+              CanonicalValue("joint4"), CanonicalValue("joint5"), CanonicalValue("joint6")}));
+    }
+    const CanonicalValue manifest(std::move(manifest_members));
     write_exact_file(output_root / "manifest.json",
                      deployment::canonical_json(manifest));
     std::cout << (output_root / "manifest.json").string() << '\n';

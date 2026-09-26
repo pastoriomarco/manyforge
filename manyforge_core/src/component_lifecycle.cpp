@@ -29,27 +29,6 @@ template <typename StrongId>
   });
 }
 
-[[nodiscard]] bool portable_token(std::string_view value) noexcept {
-  if (value.empty() || value.size() > kMaxLifecycleFactTokenBytes) {
-    return false;
-  }
-  const auto alpha_numeric = [](const unsigned char character) noexcept {
-    return (character >= static_cast<unsigned char>('A') &&
-            character <= static_cast<unsigned char>('Z')) ||
-           (character >= static_cast<unsigned char>('a') &&
-            character <= static_cast<unsigned char>('z')) ||
-           (character >= static_cast<unsigned char>('0') &&
-            character <= static_cast<unsigned char>('9'));
-  };
-  if (!alpha_numeric(static_cast<unsigned char>(value.front()))) {
-    return false;
-  }
-  return std::all_of(value.begin() + 1, value.end(), [&](const char character) {
-    const auto byte = static_cast<unsigned char>(character);
-    return alpha_numeric(byte) || character == '.' || character == '_' || character == '-';
-  });
-}
-
 template <typename Value, typename Less>
 [[nodiscard]] bool sorted_unique(const std::vector<Value>& values, Less less) noexcept {
   return std::is_sorted(values.begin(), values.end(), less) &&
@@ -892,51 +871,6 @@ bool ComponentLifecycleAcceptedDTO::locally_valid() const noexcept {
          timeout_duration_ns > 0 && timeout_duration_ns <= kMaxLifecycleTransactionTimeoutNs;
 }
 
-bool LifecycleFactValueDTO::locally_valid() const noexcept {
-  switch (kind) {
-    case LifecycleFactValueKindDTO::kUnknown:
-      return !boolean_value.has_value() && !integer_value.has_value() && !token_value.has_value();
-    case LifecycleFactValueKindDTO::kBoolean:
-      return boolean_value.has_value() && !integer_value.has_value() && !token_value.has_value();
-    case LifecycleFactValueKindDTO::kInteger:
-      return !boolean_value.has_value() && integer_value.has_value() && !token_value.has_value();
-    case LifecycleFactValueKindDTO::kToken:
-      return !boolean_value.has_value() && !integer_value.has_value() && token_value.has_value() &&
-             portable_token(*token_value);
-  }
-  return false;
-}
-
-bool LifecycleFactDTO::locally_valid() const noexcept {
-  return bounded_identity(lifecycle_fact_id) && value.locally_valid();
-}
-
-bool LifecycleFactPredicateDTO::locally_valid() const noexcept {
-  return bounded_identity(lifecycle_fact_id) && expected_value.locally_valid() &&
-         expected_value.kind != LifecycleFactValueKindDTO::kUnknown;
-}
-
-bool LifecyclePredicateDTO::locally_valid() const noexcept {
-  if (allowed_states.empty() ||
-      allowed_states.size() >
-          static_cast<std::size_t>(ComponentLifecycleStateDTO::kDisabled) + 1U ||
-      fact_predicates.size() > kMaxLifecyclePredicateFacts ||
-      !std::is_sorted(allowed_states.begin(), allowed_states.end()) ||
-      std::adjacent_find(allowed_states.begin(), allowed_states.end()) != allowed_states.end() ||
-      std::any_of(allowed_states.begin(), allowed_states.end(),
-                  [](ComponentLifecycleStateDTO state) { return !known(state); })) {
-    return false;
-  }
-  const auto less = [](const LifecycleFactPredicateDTO& left,
-                       const LifecycleFactPredicateDTO& right) {
-    return left.lifecycle_fact_id < right.lifecycle_fact_id;
-  };
-  return sorted_unique(fact_predicates, less) &&
-         std::all_of(
-             fact_predicates.begin(), fact_predicates.end(),
-             [](const LifecycleFactPredicateDTO& predicate) { return predicate.locally_valid(); });
-}
-
 LifecyclePostconditionResultDTO EvaluateLifecyclePredicate(
     const LifecyclePredicateDTO& predicate,
     const BrandLifecycleObservationDTO& observation) noexcept {
@@ -962,78 +896,6 @@ LifecyclePostconditionResultDTO EvaluateLifecyclePredicate(
     }
   }
   return LifecyclePostconditionResultDTO::kSatisfied;
-}
-
-bool LifecyclePrimitiveTransitionDTO::locally_valid() const noexcept {
-  return bounded_identity(lifecycle_primitive_id) && eligibility_predicate.locally_valid() &&
-         postcondition_predicate.locally_valid();
-}
-
-bool LifecycleIntentPlanDTO::locally_valid() const noexcept {
-  if (!known(intent) || !known(requested_state) || !requested_postcondition.locally_valid() ||
-      timeout_duration_ns <= 0 || timeout_duration_ns > kMaxLifecycleTransactionTimeoutNs ||
-      transitions.size() > kMaxLifecycleTransitionsPerPlan ||
-      (recover_target_eligibility.has_value() && !recover_target_eligibility->locally_valid())) {
-    return false;
-  }
-  const bool target_valid = [&]() {
-    switch (intent) {
-      case ComponentLifecycleIntentKindDTO::kPrepare:
-        return requested_state == ComponentLifecycleStateDTO::kPrepared &&
-               !recover_target_eligibility.has_value();
-      case ComponentLifecycleIntentKindDTO::kEnable:
-        return requested_state == ComponentLifecycleStateDTO::kActive &&
-               !recover_target_eligibility.has_value();
-      case ComponentLifecycleIntentKindDTO::kDisable:
-        return requested_state == ComponentLifecycleStateDTO::kDisabled &&
-               !recover_target_eligibility.has_value();
-      case ComponentLifecycleIntentKindDTO::kRecover:
-        return recover_target_eligibility.has_value() &&
-               (requested_state == ComponentLifecycleStateDTO::kDeclared ||
-                requested_state == ComponentLifecycleStateDTO::kPrepared ||
-                requested_state == ComponentLifecycleStateDTO::kDisabled);
-    }
-    return false;
-  }();
-  if (!target_valid) {
-    return false;
-  }
-  std::set<LifecyclePrimitiveId> primitive_ids;
-  return std::all_of(transitions.begin(), transitions.end(),
-                     [&](const LifecyclePrimitiveTransitionDTO& transition) {
-                       return transition.locally_valid() &&
-                              primitive_ids.insert(transition.lifecycle_primitive_id).second;
-                     });
-}
-
-bool BrandLifecyclePlanCatalogDTO::locally_valid() const noexcept {
-  if (!bounded_identity(provider_manifest_id) || !bounded_identity(provider_manifest_revision) ||
-      !bounded_identity(catalog_digest) || plans.empty() ||
-      plans.size() > kMaxLifecycleCatalogPlans) {
-    return false;
-  }
-  const auto less = [](const LifecycleIntentPlanDTO& left, const LifecycleIntentPlanDTO& right) {
-    if (left.intent != right.intent) {
-      return left.intent < right.intent;
-    }
-    return left.requested_state < right.requested_state;
-  };
-  if (!sorted_unique(plans, less)) {
-    return false;
-  }
-  std::size_t transition_count = 0U;
-  std::size_t recover_count = 0U;
-  for (const auto& plan : plans) {
-    if (!plan.locally_valid() ||
-        transition_count > kMaxLifecycleTransitionsPerCatalog - plan.transitions.size()) {
-      return false;
-    }
-    transition_count += plan.transitions.size();
-    if (plan.intent == ComponentLifecycleIntentKindDTO::kRecover && ++recover_count > 3U) {
-      return false;
-    }
-  }
-  return true;
 }
 
 bool BrandLifecycleObservationQueryDTO::locally_valid() const noexcept {
@@ -1882,17 +1744,20 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
            !disable_fence_released.has_value();
   }
 
+  // Fresh ordinary Disable is an idle-claim lifecycle mutation. Only durable
+  // pre-cutover transactions carry the Stop-handoff/fence fields below.
+  if (!disable_handoff.has_value()) {
+    return (phase != ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown ||
+            reconciliation_required) &&
+           !configuration_fence.has_value() &&
+           !disable_fence_released.has_value();
+  }
+
   if (phase == ComponentLifecycleTransactionPhaseDTO::kAccepted ||
       phase == ComponentLifecycleTransactionPhaseDTO::kAcquiringDomains) {
-    return !configuration_fence.has_value() && !disable_handoff.has_value() &&
-           !disable_fence_released.has_value();
+    return false;
   }
-  if (phase == ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown &&
-      !disable_handoff.has_value()) {
-    return reconciliation_required && !configuration_fence.has_value() &&
-           !disable_fence_released.has_value();
-  }
-  if (!disable_handoff.has_value() || !disable_handoff->locally_valid() ||
+  if (!disable_handoff->locally_valid() ||
       disable_handoff->lifecycle_transaction_id != acceptance.lifecycle_transaction_id ||
       disable_handoff->lifecycle_transaction_generation !=
           acceptance.lifecycle_transaction_generation ||

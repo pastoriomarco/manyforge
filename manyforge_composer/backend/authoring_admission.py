@@ -275,12 +275,18 @@ class AuthoringAdmissionCoordinator:
         session: str = "program",
         expected_identity: "AuthoringWorkspaceIdentity | None" = None,
         project: Mapping[str, Any] | None = None,
+        prepare_project_under_claim: Callable[[], Mapping[str, Any]] | None = None,
     ) -> LocalAuthoringCommit:
         if session not in _LOCAL_MUTATION_SESSIONS:
             raise ValueError("local mutation session is not supported")
         if session == "project":
-            if not isinstance(project, Mapping):
-                raise TypeError("a project commit requires prepared project facts")
+            if (project is None) == (prepare_project_under_claim is None):
+                raise TypeError(
+                    "a project commit requires exactly one prepared project value "
+                    "or under-claim project preparer"
+                )
+        elif project is not None or prepare_project_under_claim is not None:
+            raise TypeError("project facts are only valid for a project commit")
         elif not callable(install):
             raise TypeError("local mutation install must be callable")
         with self._local_mutation_lock:
@@ -296,6 +302,7 @@ class AuthoringAdmissionCoordinator:
                 session=session,
                 expected_identity=expected_identity,
                 project=project,
+                prepare_project_under_claim=prepare_project_under_claim,
             )
 
     def submit_execution_start(self, callback: Callable[[], Any]) -> Any:
@@ -416,6 +423,7 @@ class AuthoringAdmissionCoordinator:
         session: str,
         expected_identity: "AuthoringWorkspaceIdentity | None",
         project: Mapping[str, Any] | None,
+        prepare_project_under_claim: Callable[[], Mapping[str, Any]] | None,
     ) -> LocalAuthoringCommit:
         if workspace.failed_closed is not None:
             raise self._unavailable(
@@ -456,6 +464,12 @@ class AuthoringAdmissionCoordinator:
             self._require_mutation_ready()
             if validate_under_claim is not None:
                 validate_under_claim()
+            if prepare_project_under_claim is not None:
+                project = prepare_project_under_claim()
+                if not isinstance(project, Mapping):
+                    raise TypeError(
+                        "under-claim project preparation returned invalid facts"
+                    )
         except Exception:
             self._settle_pending_local_claim("proven_no_effect")
             raise

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -10,13 +11,14 @@
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/program_binding.hpp>
+#include <manyforge_deployment/program_binding_outcome.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 namespace manyforge::deployment {
 
 inline constexpr std::string_view kPreparedActivationInputSchemaVersion =
-    "manyforge.prepared_activation_input.v2";
+    "manyforge.prepared_activation_input.v3";
 
 class PreparedActivationInputError final : public std::invalid_argument {
 public:
@@ -31,8 +33,12 @@ struct PreparedActivationArtifact final {
 
 struct VerifiedPreparedActivationClosure final {
   std::shared_ptr<const RetainedBundle> retained_bundle;
-  VerifiedRetainedModelMap retained_model_map;
+  /// A candidate with no retained model products has no symbol-role map.
+  /// This is permitted only for a non-executable Program whose authored
+  /// references are all unresolved against that empty candidate.
+  std::optional<VerifiedRetainedModelMap> retained_model_map;
   std::shared_ptr<const ProgramBindingContract> program;
+  /// Null exactly when the Program outcome is non-executable.
   std::shared_ptr<const ProgramBinding> program_binding;
   std::vector<PreparedActivationArtifact> raw_artifacts;
   std::vector<PreparedActivationArtifact> catalog_artifacts;
@@ -79,9 +85,22 @@ public:
   [[nodiscard]] const core::ProgramRevision &program_revision() const noexcept {
     return program_revision_;
   }
-  [[nodiscard]] const core::ProgramBindingId &program_binding_id() const
-      noexcept {
+  /// The candidate binding identity; absent exactly when
+  /// `program_outcome()` names a non-executable Program (H1a).
+  [[nodiscard]] const std::optional<core::ProgramBindingId> &
+  program_binding_id() const noexcept {
     return program_binding_id_;
+  }
+  [[nodiscard]] const std::optional<ProgramNonExecutableOutcomeDTO> &
+  program_outcome() const noexcept {
+    return program_outcome_;
+  }
+  /// The authored role assignment the outcome was compiled from, carried so
+  /// the outcome can be recompiled on readback (see
+  /// `verify_prepared_program_outcome`).
+  [[nodiscard]] const core::ProgramRoleAssignmentDTO &
+  program_role_assignment() const noexcept {
+    return program_role_assignment_;
   }
   [[nodiscard]] const core::ContentDigest &node_environment_digest() const
       noexcept {
@@ -113,7 +132,9 @@ private:
       core::RetainedBundleId retained_bundle_id,
       core::GraphRevision graph_revision, core::ProgramId program_id,
       core::ProgramRevision program_revision,
-      core::ProgramBindingId program_binding_id,
+      std::optional<core::ProgramBindingId> program_binding_id,
+      std::optional<ProgramNonExecutableOutcomeDTO> program_outcome,
+      core::ProgramRoleAssignmentDTO program_role_assignment,
       core::ContentDigest node_environment_digest, std::string assistant_mode,
       CanonicalValue typed_parameter_overrides, CanonicalValue normalized_root,
       VerifiedPreparedActivationClosure closure);
@@ -128,7 +149,9 @@ private:
   core::GraphRevision graph_revision_;
   core::ProgramId program_id_;
   core::ProgramRevision program_revision_;
-  core::ProgramBindingId program_binding_id_;
+  std::optional<core::ProgramBindingId> program_binding_id_;
+  std::optional<ProgramNonExecutableOutcomeDTO> program_outcome_;
+  core::ProgramRoleAssignmentDTO program_role_assignment_;
   core::ContentDigest node_environment_digest_;
   std::string assistant_mode_;
   CanonicalValue typed_parameter_overrides_;
@@ -141,6 +164,14 @@ private:
 
 /// Parse the closed prepared-input schema and independently verify its content
 /// identity. Unknown, missing, empty, or incorrectly typed fields fail closed.
+///
+/// This structural verifier cannot depend on the binding compiler, so a parsed
+/// Program outcome is consistent but not yet proven. Admission evidence must
+/// come from `verify_prepared_program_outcome` (prepared_activation_repository
+/// .hpp), which recompiles the outcome from the carried Program, role
+/// assignment and candidate bundle and requires the exact binding or named
+/// non-executable result; `FilesystemPreparedActivationRepository::get_verified`
+/// always applies it.
 [[nodiscard]] PreparedActivationInput
 parse_prepared_activation_input(const CanonicalValue &value);
 

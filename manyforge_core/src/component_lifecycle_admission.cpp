@@ -300,32 +300,10 @@ Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
       reserved_domains.push_back(domain.control_domain_id);
     }
 
-    if (intent.intent == ComponentLifecycleIntentKindDTO::kDisable) {
-      const auto expectation = BuildDisableHandoffComponentScopeExpectation(snapshot);
-      if (!expectation.ok() || !candidate.disable_handoff_admission.has_value() ||
-          !candidate.disable_handoff_admission->locally_valid() ||
-          candidate.disable_handoff_admission->query.controllable_component_id !=
-              intent.controllable_component_id ||
-          candidate.disable_handoff_admission->query.request_kind !=
-              DisableHandoffScopeRequestKindDTO::kResolvedComponentScope ||
-          candidate.disable_handoff_admission->query.component_expectation !=
-              std::optional(expectation.value())) {
-        return reject("component_lifecycle_disable_admission_mismatch",
-                      "the Kernel Disable admission snapshot does not match the component snapshot",
-                      "disable_admission_expectation_mismatch");
-      }
-      lifecycle_mutation_eligible =
-          candidate.disable_handoff_admission->scope_resolution ==
-              DisableHandoffScopeResolutionDTO::kExact;
-      if (!lifecycle_mutation_eligible) {
-        return reject("component_lifecycle_disable_admission_mismatch",
-                      "ordinary Disable cannot promote to Stop or an uncertain scope",
-                      "disable_scope_not_exact");
-      }
-    } else if (candidate.disable_handoff_admission.has_value()) {
+    if (candidate.disable_handoff_admission.has_value()) {
       return reject("component_lifecycle_admission_invalid",
-                    "a non-Disable lifecycle admission cannot carry a Kernel handoff snapshot",
-                    "unexpected_disable_admission");
+                    "ordinary lifecycle admission cannot carry a Kernel Stop handoff snapshot",
+                    "unexpected_disable_handoff_admission");
     } else {
       lifecycle_mutation_eligible = true;
     }

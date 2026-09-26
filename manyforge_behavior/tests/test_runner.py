@@ -19,19 +19,17 @@ class RecordingTransport:
         self.controls: list[tuple[str, str, Mapping[str, Any]]] = []
 
     def identity(self) -> dict[str, Any]:
+        # execution_identity.v2: runtime identity only (H1a-IF.2).
         return {
             "ok": True,
             "identity": {
+                "schema_version": "manyforge.execution_identity.v2",
                 "owner_epoch": "owner-epoch-7",
-                "program_id": "program-1",
-                "program_revision": "sha256:" + "1" * 64,
-                "program_binding_id": "binding-1",
+                "cell_id": "cell-1",
+                "active_publication_generation": 1,
+                "control_management_mode": "component_lifecycle",
                 "graph_revision": "sha256:" + "2" * 64,
                 "retained_bundle_id": "sha256:" + "3" * 64,
-                "motion_target_role_id": "arm",
-                "gripper_target_role_id": "gripper",
-                "gripper_command_schema_id": "gripper.command_position",
-                "gripper_command_schema_revision": "sha256:" + "5" * 64,
                 "scene_revision": {
                     "scene_id": "scene-1",
                     "revision_id": 1,
@@ -83,9 +81,60 @@ class RecordingTransport:
         return self._control("stop", operation_id, body)
 
 
+def _capability(capability_id: str, command_schema: dict[str, str] | None) -> dict:
+    return {
+        "capability_id": capability_id,
+        "capability_definition_revision": "sha256:" + "6" * 64,
+        "control_binding": {
+            "control_binding_id": f"{capability_id}.binding",
+            "control_binding_revision": "sha256:" + "7" * 64,
+        },
+        "capability_provider_binding": None,
+        "command_schema": command_schema,
+    }
+
+
+def _applied_binding() -> dict[str, Any]:
+    """The Applied Program binding a run was admitted with (subset)."""
+
+    return {
+        "program_id": "program-1",
+        "program_revision": "sha256:" + "1" * 64,
+        "program_binding_id": "binding-1",
+        "graph_revision": "sha256:" + "2" * 64,
+        "retained_bundle_id": "sha256:" + "3" * 64,
+        "target_role_bindings": [
+            {
+                "target_role_id": "arm",
+                "component_role_id": "robot",
+                "controllable_component_id": "lite6_arm",
+                "command_target_id": "arm",
+                "capability_bindings": [
+                    _capability("execution.trajectory.execute", None)
+                ],
+            },
+            {
+                "target_role_id": "gripper",
+                "component_role_id": "robot",
+                "controllable_component_id": "lite6_gripper",
+                "command_target_id": "gripper",
+                "capability_bindings": [
+                    _capability(
+                        "tool.gripper.command",
+                        {
+                            "command_schema_id": "gripper.command_position",
+                            "command_schema_revision": "sha256:" + "5" * 64,
+                        },
+                    )
+                ],
+            },
+        ],
+    }
+
+
 def test_runner_submits_source_joint_names_against_exact_owner_selection() -> None:
     transport = RecordingTransport()
-    runner = OrchestratorRunner(KernelClient(transport))
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
 
     accepted = runner.submit_joint_goal(
         request_id="request-1",
@@ -118,7 +167,7 @@ def test_runner_submits_source_joint_names_against_exact_owner_selection() -> No
 
 
 def test_runner_reads_owner_projection_without_reducing_it() -> None:
-    runner = OrchestratorRunner(KernelClient(RecordingTransport()))
+    runner = OrchestratorRunner(KernelClient(RecordingTransport()), _applied_binding())
     assert runner.operation("operation-1")["operation"] == {
         "operation_id": "operation-1",
         "state": "completed",
@@ -127,7 +176,7 @@ def test_runner_reads_owner_projection_without_reducing_it() -> None:
 
 def test_runner_submits_unit_tagged_gripper_command_to_selected_target() -> None:
     transport = RecordingTransport()
-    runner = OrchestratorRunner(KernelClient(transport))
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
 
     accepted = runner.submit_gripper_position(
         request_id="request-gripper-1",
@@ -168,7 +217,7 @@ def test_runner_submits_unit_tagged_gripper_command_to_selected_target() -> None
 
 def test_runner_stop_is_attributed_fenced_and_exactly_replayable() -> None:
     transport = RecordingTransport()
-    runner = OrchestratorRunner(KernelClient(transport))
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
 
     first = runner.stop_operation(
         request_id="request-stop-1",
@@ -217,7 +266,7 @@ def test_runner_rejects_an_incomplete_owner_projection_before_submission() -> No
             return {"ok": True, "identity": {"owner_epoch": "owner-epoch-7"}}
 
     transport = IncompleteIdentityTransport()
-    runner = OrchestratorRunner(KernelClient(transport))
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
 
     with pytest.raises(KernelClientResponseError, match="incomplete"):
         runner.submit_joint_goal(
@@ -233,3 +282,46 @@ def test_runner_rejects_an_incomplete_owner_projection_before_submission() -> No
         )
 
     assert transport.submitted is None
+
+
+def test_runner_takes_program_identity_from_the_applied_binding_only() -> None:
+    transport = RecordingTransport()
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+    arguments = {
+        "request_id": "request-1",
+        "program_run_id": "run-1",
+        "node_instance_id": "root/move[0]",
+        "node_attempt_id": "run-1/move[0]/attempt-1",
+        "move_id": "move-1",
+        "joint_names": ("joint1",),
+        "positions_rad": (0.1,),
+    }
+
+    # A role the applied Program does not bind to motion is refused.
+    with pytest.raises(ValueError, match="not bound"):
+        runner.submit_joint_goal(
+            component_role_id="robot", target_role_id="gripper", **arguments
+        )
+    with pytest.raises(ValueError, match="not bound"):
+        runner.submit_joint_goal(
+            component_role_id="other", target_role_id="arm", **arguments
+        )
+    assert transport.submitted is None
+
+    # The binding runs only against the publication it was compiled for.
+    stale = _applied_binding()
+    stale["retained_bundle_id"] = "sha256:" + "9" * 64
+    stale_runner = OrchestratorRunner(KernelClient(transport), stale)
+    with pytest.raises(KernelClientResponseError, match="differs"):
+        stale_runner.submit_joint_goal(
+            component_role_id="robot", target_role_id="arm", **arguments
+        )
+    assert transport.submitted is None
+
+    runner.submit_joint_goal(
+        component_role_id="robot", target_role_id="arm", **arguments
+    )
+    assert transport.submitted is not None
+    assert transport.submitted["program_id"] == "program-1"
+    assert transport.submitted["program_revision"] == "sha256:" + "1" * 64
+    assert "motion_target_role_id" not in repr(transport.submitted)

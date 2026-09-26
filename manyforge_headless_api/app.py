@@ -337,6 +337,8 @@ def _error_status(code: str) -> int:
             "program_run_admission_failed",
             "program_run_already_active",
             "program_required_component_not_active",
+            "program_applied_non_executable",
+            "prepared_activation_unverified",
             "authoring_not_ready",
             "program_run_draft_applied_mismatch",
             "deployment_candidate_compiler_busy",
@@ -366,6 +368,7 @@ def _error_status(code: str) -> int:
         return 400
     if code in {
         "cclc_confirmation_required",
+        "confirmation_required",
         "operator_alarm_acknowledgement_confirmation_required",
         "operator_alarm_acknowledgement_reason_required",
         "operator_alarm_acknowledge_all_confirmation_required",
@@ -886,6 +889,10 @@ def create_app(
     def program_applied() -> dict[str, Any]:
         return service.program_applied()
 
+    @app.get("/api/program/applied/status")
+    def program_applied_status() -> dict[str, Any]:
+        return service.program_applied_status()
+
     @app.post("/api/program/model-attempts")
     def program_model_attempt(
         request: ProgramModelAttemptRequest,
@@ -1376,10 +1383,6 @@ def create_app(
     @app.get("/api/execution/diagnostics")
     def execution_diagnostics() -> JSONResponse:
         return execution_response(service.execution_diagnostics())
-
-    @app.get("/api/execution/status", deprecated=True)
-    def execution_status() -> JSONResponse:
-        return execution_response(service.execution_status())
 
     @app.get("/api/execution/identity")
     def execution_identity() -> JSONResponse:

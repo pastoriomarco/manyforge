@@ -331,6 +331,8 @@ TEST(ManagerSourcePublication,
           intent.intent.apply_generation,
           {},
           core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+          deployment::derive_apply_component_delta(
+              admission.retained_bundle(), admission.retained_bundle()),
       }));
 
   const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(

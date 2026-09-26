@@ -536,7 +536,24 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> reconfigure_runtime_product(
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver,
-      std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget);
+      std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget,
+      std::function<Result<void>()> commit_publication = {});
+
+  /// Install an exact component-set transition beneath one held Manager Apply
+  /// fence. Unchanged registrations retain their engines and route facts. An
+  /// optional prevalidated commit callback runs at the inventory/registration
+  /// publication boundary while admission and state remain locked; it must not
+  /// call back into the Kernel.
+  [[nodiscard]] Result<void> reconfigure_runtime_component_set(
+      std::vector<RuntimeParticipantExecutionRegistration> registrations,
+      RuntimeParticipantAdmissionResolver participant_resolver,
+      std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget,
+      RetainedBundleId candidate_retained_bundle_id,
+      GraphRevision candidate_graph_revision,
+      const ConfigurationFenceId& apply_fence_id,
+      const ConfigurationFenceScopeDTO& scope,
+      const std::vector<ControllableComponentId>& retained_components = {},
+      std::function<Result<void>()> commit_publication = {});
 
   /// Publish the candidate-side active-configuration identities already
   /// declared by the installed registrations while the exact durable Apply
@@ -740,7 +757,13 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver,
       bool retain_unready_configuration_facts,
-      const std::optional<StopDeadlineBudgetDTO>* replacement_stop_deadline_budget = nullptr);
+      const std::optional<StopDeadlineBudgetDTO>* replacement_stop_deadline_budget = nullptr,
+      const ConfigurationFenceId* apply_fence_id = nullptr,
+      const ConfigurationFenceScopeDTO* apply_scope = nullptr,
+      const std::vector<ControllableComponentId>* retained_components = nullptr,
+      const RetainedBundleId* candidate_retained_bundle_id = nullptr,
+      const GraphRevision* candidate_graph_revision = nullptr,
+      const std::function<Result<void>()>* commit_publication = nullptr);
   [[nodiscard]] StopIntentDTO internal_control_stop_intent_locked(
       const ActiveOperation& operation, const OperationControlAcceptedDTO& accepted,
       std::string_view reason) const;

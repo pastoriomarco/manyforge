@@ -70,6 +70,7 @@ class PreparedDeploymentReplacement:
     successor_revision: int | None
     saved_path: str | None
     saved_document: Mapping[str, Any] | None
+    source_project_root: str | None
     preserve_saved: bool = False
 
     def __post_init__(self) -> None:
@@ -900,6 +901,7 @@ class DeploymentDraftSession:
         self._compiled: CompiledDeploymentDocument | None = None
         self._saved_path: str | None = None
         self._saved_document: dict[str, Any] | None = None
+        self._source_project_root: str | None = None
 
     @property
     def draft_id(self) -> str:
@@ -915,6 +917,13 @@ class DeploymentDraftSession:
     def loaded(self) -> bool:
         with self._lock:
             return self._compiled is not None
+
+    @property
+    def source_project_root(self) -> str | None:
+        """Directory against which this Draft's project-relative assets resolve."""
+
+        with self._lock:
+            return self._source_project_root
 
     def _require_current(self, draft_id: str, expected_revision: int) -> None:
         if draft_id != self._draft_id or expected_revision != self._revision:
@@ -1067,7 +1076,10 @@ class DeploymentDraftSession:
         self.install_prepared_replacement(self.prepare_load_replacement(state))
 
     def prepare_load_replacement(
-        self, state: dict[str, Any]
+        self,
+        state: dict[str, Any],
+        *,
+        source_project_root: str | None = None,
     ) -> PreparedDeploymentReplacement:
         """Validate one retained Deployment Draft state without installing it.
 
@@ -1116,6 +1128,13 @@ class DeploymentDraftSession:
         )
         if state["saved_document"] is not None:
             self._compiler(_source(state["saved_document"]))
+        if source_project_root is None and isinstance(state["saved_path"], str):
+            saved_path = Path(state["saved_path"]).resolve()
+            source_project_root = str(
+                saved_path if saved_path.is_dir() else saved_path.parent
+            )
+        elif source_project_root is not None:
+            source_project_root = str(Path(source_project_root).resolve())
         return PreparedDeploymentReplacement(
             kind="load",
             compiled=compiled,
@@ -1123,6 +1142,7 @@ class DeploymentDraftSession:
             successor_revision=state["draft_revision"],
             saved_path=state["saved_path"],
             saved_document=deepcopy(state["saved_document"]),
+            source_project_root=source_project_root,
         )
 
     def prepare_open_replacement(
@@ -1140,6 +1160,7 @@ class DeploymentDraftSession:
             successor_revision=None,
             saved_path=resolved_source_path,
             saved_document=deepcopy(compiled.document),
+            source_project_root=str(Path(resolved_source_path).parent),
         )
 
     def install_prepared_replacement(
@@ -1192,6 +1213,10 @@ class DeploymentDraftSession:
                 and successor_document == current_document
                 and successor_saved_path == self._saved_path
                 and successor_saved_document == self._saved_document
+                and (
+                    prepared.preserve_saved
+                    or prepared.source_project_root == self._source_project_root
+                )
             )
             successor_revision = prepared.successor_revision
             if successor_revision is None:
@@ -1216,6 +1241,7 @@ class DeploymentDraftSession:
             if not prepared.preserve_saved:
                 self._saved_path = prepared.saved_path
                 self._saved_document = successor_saved_document
+                self._source_project_root = prepared.source_project_root
             return True
 
     def commit_open(

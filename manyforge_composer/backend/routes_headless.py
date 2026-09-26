@@ -356,6 +356,11 @@ def create_headless_router(
     def program_applied() -> dict[str, Any]:
         return _call(client.program_applied)
 
+    @router.get("/api/program/applied/status")
+    def program_applied_status() -> dict[str, Any]:
+        # Derived executable/non-executable status of the Applied Program.
+        return _call(client.program_applied_status)
+
     @router.get("/api/program/runs")
     def program_runs(
         active_only: bool = False,
@@ -702,10 +707,6 @@ def create_headless_router(
     @router.get("/api/execution/diagnostics")
     def execution_diagnostics() -> dict[str, Any]:
         return _call(client.execution_diagnostics)
-
-    @router.get("/api/execution/status", deprecated=True)
-    def execution_status() -> dict[str, Any]:
-        return _call(client.execution_status)
 
     @router.get("/api/execution/identity")
     def execution_identity() -> dict[str, Any]:

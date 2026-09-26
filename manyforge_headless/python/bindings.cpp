@@ -247,6 +247,11 @@ public:
     return Invoke([this]() { return core_->AppliedProgramSelection(); });
   }
 
+  std::string AppliedProgramStatus() {
+    py::gil_scoped_release release;
+    return Invoke([this]() { return core_->AppliedProgramStatus(); });
+  }
+
   py::dict ViewerModelUrdf() {
     return InvokeAsset([this]() { return core_->ViewerModelUrdf(); });
   }
@@ -675,6 +680,8 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("mode_id"))
       .def("applied_program_selection",
            &HeadlessApiBridge::AppliedProgramSelection)
+      .def("applied_program_status",
+           &HeadlessApiBridge::AppliedProgramStatus)
       .def("viewer_model_urdf", &HeadlessApiBridge::ViewerModelUrdf)
       .def("viewer_model_resource", &HeadlessApiBridge::ViewerModelResource,
            py::arg("expected_retained_bundle_id"), py::arg("logical_uri"))

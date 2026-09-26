@@ -2,11 +2,13 @@
 
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_deployment/program_binding.hpp>
+#include <manyforge_deployment/program_binding_outcome.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -49,6 +51,41 @@ struct DirectControlProgramBindingInventory final {
     core::ProgramRoleAssignmentDTO role_assignment,
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactSource& catalog_artifact_store);
+
+/// Exactly one of a sealed binding for the candidate cell or a named
+/// non-executable result.
+struct ProgramBindingOutcome final {
+  std::shared_ptr<const ProgramBinding> binding;
+  std::optional<ProgramNonExecutableOutcomeDTO> non_executable;
+  /// Present exactly with `non_executable`.
+  std::optional<ProgramResolvedRolesDTO> resolved_roles;
+};
+
+/// Bind one preserved authored Program to one candidate cell (H1a).
+///
+/// Identical to `compile_program_binding` when every role resolves. When a
+/// role does not resolve only because of candidate-dependent facts (a missing
+/// component or target, an incompatible type, an unavailable capability),
+/// every such role is reported with the Program nodes and execution groups it
+/// affects, and no binding is produced. Malformed input, corrupt or ambiguous
+/// retained facts and unexpected failures still throw
+/// ProgramBindingCompilerError: they never become a non-executable Program.
+[[nodiscard]] ProgramBindingOutcome compile_program_binding_outcome(
+    const ProgramBindingContract& program_contract,
+    core::ProgramRoleAssignmentDTO role_assignment,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactSource& catalog_artifact_store);
+
+/// As above, with no model map for an empty candidate cell. This overload
+/// can only return a named non-executable outcome when all assigned component
+/// roles are absent; it never creates a binding without verified model data.
+[[nodiscard]] ProgramBindingOutcome compile_program_binding_outcome(
+    const ProgramBindingContract& program_contract,
+    core::ProgramRoleAssignmentDTO role_assignment,
+    const RetainedBundle& retained_bundle,
+    const std::optional<VerifiedRetainedModelMap>& retained_model_map,
     const ICatalogArtifactSource& catalog_artifact_store);
 
 /// Compile the build-owned direct Robot Control motion contract for one exact

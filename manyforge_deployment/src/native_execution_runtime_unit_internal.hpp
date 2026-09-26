@@ -18,8 +18,11 @@ namespace detail {
 [[nodiscard]] native_execution_runtime_contract::OrdinaryMotionJerkSettings
 decode_ordinary_motion_jerk_settings(const core::JsonObjectDTO& source);
 
+// The artifact-role/media contract is unchanged. This payload version pins the
+// infrastructure-only projection; candidate controller settings stay in the
+// retained graph and are independently qualified before installation.
 inline constexpr std::string_view kNativeExecutionRuntimeManifestApiVersion =
-    "manyforge.native_execution_runtime_manifest.v1";
+    "manyforge.native_execution_runtime_manifest.v2";
 inline constexpr std::string_view kNativeExecutionRuntimeProductContractId =
     native_execution_runtime_contract::kProductContractId;
 inline constexpr std::string_view kNativeExecutionRuntimeManifestArtifactRole =
@@ -37,7 +40,7 @@ inline constexpr std::string_view kNativeExecutionRuntimeConfigurationSchemaId =
     "manyforge.value_schema.runtime.native_execution.v1";
 inline constexpr std::string_view kNativeExecutionRuntimeConfigurationSchemaRevision =
     "sha256:"
-    "49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5702c61a9828c62035";
+    "6b540dac39434e05a2cb5da209206e2105b824b9f56704a74f0d88f327944689";
 inline constexpr std::string_view kNativeExecutionRuntimeRoleId =
     native_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view kNativeExecutionRuntimeStatusEndpointRoleId =
@@ -105,6 +108,24 @@ void require_native_execution_runtime_manifest_matches(
     std::string_view canonical_bytes,
     const CompilerQualifiedCellIr &compiler_ir,
     const core::RuntimeUnitId &runtime_unit_id);
+/// The typed configuration of native runtime unit `runtime_unit_id`, checked
+/// against the control bindings that unit hosts in `graph`: motion-only
+/// fields exist exactly when it hosts motion execution, and every motion
+/// limit or gripper configuration names a target it hosts. Callers establish
+/// bundle identity and closed-schema qualification first.
+[[nodiscard]] native_execution_runtime_contract::Configuration
+decode_native_execution_runtime_configuration(
+    const core::JsonObjectDTO &configuration, const core::CellGraphDTO &graph,
+    const core::RuntimeUnitId &runtime_unit_id);
+/// Shared controller selection for runtime construction, retention and fence
+/// derivation. Inputs have already passed native configuration decoding and
+/// graph verification. The native adapter supports at most one motion target
+/// per component; additional non-motion capabilities remain independent.
+[[nodiscard]] native_execution_runtime_contract::Configuration
+select_native_component_configuration(
+    native_execution_runtime_contract::Configuration configuration,
+    const core::CellGraphDTO &graph, const core::RuntimeUnitId &runtime_unit_id,
+    const core::ControllableComponentId &component_id);
 void require_native_execution_runtime_product_matches_retained_bundle(
     std::string_view manifest_bytes, std::string_view launch_descriptor_bytes,
     const core::RetainedBundleDTO &retained_bundle,

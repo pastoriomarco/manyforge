@@ -571,7 +571,7 @@ def _assistant_stack(
         # whereas Headless owns Program and binding repositories under its
         # separate artifact root. Install those immutable fixture values into
         # that repository before any owner starts.
-        for repository in ("programs", "program-bindings"):
+        for repository in ("programs", "program-bindings", "prepared-activations"):
             source = selected_package_root / repository
             if source.is_dir():
                 shutil.copytree(source, stack.artifact_root / repository)
@@ -596,23 +596,13 @@ def _assistant_stack(
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=20.0) as client:
             fixture_program = json.loads(stack.program_path.read_text(encoding="utf-8"))
-            prepared_activation = {
-                "schema_version": "manyforge.prepared_activation_input.v2",
-                "scenario_id": startup_scenario or "assistant_native_process_fixture",
-                "source_document_digest": "sha256:" + "2" * 64,
-                "captured_input_digest": "sha256:" + "e" * 64,
-                "deployment_artifact_id": metadata["physical_deployment_artifact_id"],
-                "deployment_revision": metadata["physical_deployment_revision"],
-                "retained_bundle_id": metadata["physical_candidate_retained_bundle_id"],
-                "graph_revision": metadata["physical_graph_revision"],
-                "program_id": fixture_program["program_id"],
-                "program_revision": metadata["program_revision"],
-                "program_binding_id": metadata["program_binding_id"],
-                "node_environment_digest": environment_digest,
-                "assistant_mode": "optional",
-                "typed_parameter_overrides": {},
-                "prepared_activation_id": "sha256:" + "f" * 64,
-            }
+            # The fixture generator published real, reverified prepared
+            # activations for each Scenario it serves; Manager admits only
+            # stored values whose summary equals the request exactly.
+            scenario_id = startup_scenario or "assistant_native_process_fixture"
+            prepared_activation = dict(metadata["prepared_activations"][scenario_id])
+            assert prepared_activation["program_id"] == fixture_program["program_id"]
+            assert prepared_activation["node_environment_digest"] == environment_digest
             metadata["source_document_digest"] = prepared_activation[
                 "source_document_digest"
             ]
@@ -648,7 +638,14 @@ def _assistant_stack(
                 })
             )
             apply_result = client.manager_apply(
-                {**apply_body, "candidate_receipt": preview["candidate_receipt"]}
+                {
+                    **apply_body,
+                    "candidate_receipt": preview["candidate_receipt"],
+                    # The test caller explicitly accepts the previewed impact.
+                    "accepted_impact_digest": preview["candidate_receipt"][
+                        "impact_digest"
+                    ],
+                }
             )
             assert apply_result["ok"] is True
         deadline = time.monotonic() + 20

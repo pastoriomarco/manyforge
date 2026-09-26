@@ -847,6 +847,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   }
 
   SubscriptionHandle subscribe_events(EventCallback callback) override {
+    if (subscribe_hook) subscribe_hook();
     std::lock_guard lock(callbacks_mutex_);
     const auto id = next_subscription_id++;
     callbacks.emplace(id, std::move(callback));
@@ -971,6 +972,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   }
 
   std::atomic<int> execute_calls{};
+  std::function<void()> subscribe_hook;
   std::function<void()> unsubscribe_hook;
   std::atomic<int> prepare_motion_calls{};
   std::atomic<int> prepare_resume_motion_calls{};
@@ -1762,7 +1764,19 @@ class FakeResourceAdmissionGate final : public IResourceOperationAdmissionGate {
 
   [[nodiscard]] std::vector<ResourceId> current_fenced_resources(
       const std::vector<ResourceId>& resources) const override {
-    return reject_reservation ? resources : std::vector<ResourceId>{};
+    if (!reject_reservation) return {};
+    if (!other_fence_resources.has_value()) return resources;
+    std::vector<ResourceId> fenced;
+    for (const auto& resource : resources) {
+      const auto in_parent = held_fence_resources.has_value() &&
+          std::find(held_fence_resources->begin(), held_fence_resources->end(),
+                    resource) != held_fence_resources->end();
+      const auto in_other = std::find(other_fence_resources->begin(),
+                                      other_fence_resources->end(), resource) !=
+                            other_fence_resources->end();
+      if (in_parent || in_other) fenced.push_back(resource);
+    }
+    return fenced;
   }
 
   [[nodiscard]] bool exact_fence_covers(const ConfigurationFenceId& fence_id,
@@ -1776,10 +1790,19 @@ class FakeResourceAdmissionGate final : public IResourceOperationAdmissionGate {
                               resource) != held_fence_resources->end();
            });
   }
+  [[nodiscard]] bool exact_fence_is_held(
+      const ConfigurationFenceId& fence_id,
+      const ConfigurationFenceScopeDTO& scope) const override {
+    return reject_reservation && held_fence_id.has_value() &&
+           *held_fence_id == fence_id && held_scope.has_value() &&
+           *held_scope == scope;
+  }
 
   bool reject_reservation{true};
   std::optional<ConfigurationFenceId> held_fence_id;
+  std::optional<ConfigurationFenceScopeDTO> held_scope;
   std::optional<std::vector<ResourceId>> held_fence_resources;
+  std::optional<std::vector<ResourceId>> other_fence_resources;
   int reserve_calls{};
 
  private:
@@ -10792,6 +10815,14 @@ TEST(ResourceAddressedExecutionKernelTest, RetiringUnusedEnginePreservesResident
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine retired_engine, unused_engine, current_engine;
+  std::mutex worker_mutex;
+  std::vector<std::thread::id> cleanup_workers;
+  const auto record_worker = [&] {
+    std::lock_guard lock(worker_mutex);
+    cleanup_workers.push_back(std::this_thread::get_id());
+  };
+  retired_engine.acknowledge_effect_hook = record_worker;
+  retired_engine.reset_effect_hook = record_worker;
   FakeOperationJournal journal;
   const auto original =
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
@@ -10840,6 +10871,12 @@ TEST(ResourceAddressedExecutionKernelTest, RetiringUnusedEnginePreservesResident
   }));
   EXPECT_EQ(retired_engine.certified_reset_calls.load(), 1);
   EXPECT_EQ(current_engine.certified_reset_calls.load(), 0);
+  {
+    std::lock_guard lock(worker_mutex);
+    ASSERT_EQ(cleanup_workers.size(), 2U);
+    EXPECT_EQ(cleanup_workers.front(), cleanup_workers.back())
+        << "retiring an unrelated engine must preserve the resident cleanup worker";
+  }
   ASSERT_TRUE(wait_until([&] { return kernel.release_retired_engine(&retired_engine).ok(); }));
   EXPECT_EQ(retired_engine.subscription_count(), 0U);
   EXPECT_EQ(current_engine.subscription_count(), 1U);
@@ -15867,6 +15904,83 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     GripperOnlyComponentInstallsUnderItsApplyFenceAndStaysClosedUntilEligible) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine gripper_engine;
+  FakeOperationJournal journal;
+  FakeResourceAdmissionGate gate;
+  gate.held_fence_id = ConfigurationFenceId("fence.gripper-only-apply");
+
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto binding = make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                    CoordinateKind::kLinear, schema);
+  auto gripper_registration = registration(binding, gripper_engine);
+  // A gripper-only capability command has no arm motion policy requirement.
+  gripper_registration.runtime_policy.reset();
+
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U, {}, &gate};
+  config.empty_runtime_retained_bundle_id = RetainedBundleId(test_digest('4'));
+  config.empty_runtime_graph_revision = GraphRevision(test_digest('5'));
+  config.prequalified_max_live_stop_participants = 1U;
+  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal, std::move(config));
+
+  const auto& component = binding.value().controllable_component_id;
+  const auto& path = *binding.value().control_path;
+  const ConfigurationFenceScopeDTO scope{
+      {component},
+      {{path.control_domain_id, std::nullopt, path.control_domain_revision}},
+      {{path.control_binding_id, std::nullopt, path.control_binding_revision}},
+      {binding.value().resources.front().resource_id}};
+  ASSERT_TRUE(scope.valid());
+  gate.held_scope = scope;
+  gate.held_fence_resources = scope.resources;
+
+  const auto installed = kernel.reconfigure_runtime_component_set(
+      {gripper_registration}, {}, std::nullopt, binding.value().retained_bundle_id,
+      binding.value().graph_revision, *gate.held_fence_id, scope);
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+  EXPECT_TRUE(kernel.participant_engine_in_use(&gripper_engine));
+  const auto installed_resources = kernel.resource_table_snapshot();
+  ASSERT_EQ(installed_resources.slots.size(), 1U);
+  EXPECT_EQ(installed_resources.slots.front().resource_id,
+            binding.value().resources.front().resource_id);
+
+  const auto route = kernel.publish_runtime_route_configuration(
+      route_configuration_for(gripper_registration), {gripper_registration});
+  ASSERT_TRUE(route.ok()) << route.error().message;
+  const auto initially_ineligible = kernel.execute(command_operation("request.gripper.disabled"));
+  ASSERT_FALSE(initially_ineligible.ok());
+  EXPECT_EQ(initially_ineligible.error().details.at("reason"),
+            "component_command_not_eligible");
+  EXPECT_EQ(gripper_engine.prepare_command_calls, 0);
+
+  const auto eligible = kernel.publish_component_command_readiness(
+      {ComponentReadinessAuthorityDTO::kParentApplyFence, std::nullopt,
+       *gate.held_fence_id, component,
+       gripper_registration.stop_readiness->value().component_lifecycle_generation, true});
+  ASSERT_TRUE(eligible.ok()) << eligible.error().message;
+  EXPECT_TRUE(eligible.value().command_eligible);
+
+  // Even an explicitly eligible component cannot dispatch until the exact
+  // Apply fence is released.
+  const auto fenced = kernel.execute(command_operation("request.gripper.fenced"));
+  ASSERT_FALSE(fenced.ok());
+  EXPECT_EQ(fenced.error().details.at("reason"), "configuration_fence_held");
+  EXPECT_EQ(gripper_engine.prepare_command_calls, 0);
+
+  gate.reject_reservation = false;
+  const auto admitted = kernel.execute(command_operation("request.gripper.enabled"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+  EXPECT_EQ(gripper_engine.prepare_command_calls, 1);
+  EXPECT_EQ(gripper_engine.dispatch_prepared_command_calls, 1);
+  EXPECT_EQ(gripper_engine.command_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      ApplyReadinessRequiresThatExactParentFenceNotAnyFence) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -15932,6 +16046,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_EQ(binding.value().resources.size(), 2U);
   gate.held_fence_resources =
       std::vector<ResourceId>{binding.value().resources.front().resource_id};
+  gate.other_fence_resources =
+      std::vector<ResourceId>{binding.value().resources.back().resource_id};
+  const std::vector<ResourceId> all_resources{
+      binding.value().resources.front().resource_id,
+      binding.value().resources.back().resource_id};
+  // Aggregate fencing of every resource is not authority for this Apply.
+  EXPECT_EQ(gate.current_fenced_resources(all_resources), all_resources);
 
   const auto partial = kernel.publish_component_command_readiness(
       {ComponentReadinessAuthorityDTO::kParentApplyFence, std::nullopt,
@@ -16096,6 +16217,123 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     EmptyComponentSetApplyKeepsTheCandidateProductIdentity) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine engine;
+  FakeResourceAdmissionGate gate;
+  gate.held_fence_id = ConfigurationFenceId("fence.empty-candidate");
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U, {}, &gate};
+  config.empty_runtime_retained_bundle_id = RetainedBundleId(test_digest('6'));
+  config.empty_runtime_graph_revision = GraphRevision(test_digest('7'));
+  ResourceAddressedExecutionKernel kernel({}, clock, scheduler, journal,
+                                          std::move(config));
+
+  const ConfigurationFenceScopeDTO scope{};
+  ASSERT_TRUE(scope.valid());
+  gate.held_scope = scope;
+  const RetainedBundleId candidate_bundle(test_digest('8'));
+  const GraphRevision candidate_graph(test_digest('9'));
+  const auto installed = kernel.reconfigure_runtime_component_set(
+      {}, {}, std::nullopt, candidate_bundle, candidate_graph,
+      *gate.held_fence_id, scope);
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+
+  auto next = make_binding("arm", "arm", "execution.trajectory.execute",
+                           CoordinateKind::kAngular).value();
+  next.retained_bundle_id = candidate_bundle;
+  next.graph_revision = candidate_graph;
+  auto next_binding = verify_runtime_participant_binding(std::move(next));
+  ASSERT_TRUE(next_binding.ok()) << next_binding.error().message;
+  const auto selected = kernel.reconfigure_runtime_participants(
+      {unqualified_registration(next_binding.value(), engine)});
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ComponentSetRejectsMixedCandidateProductIdentityWithoutReplacingCurrentRegistrations) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeOperationJournal journal;
+  FakeParticipantEngine first_engine, second_engine;
+  FakeResourceAdmissionGate gate;
+  gate.held_fence_id = ConfigurationFenceId("fence.mixed-candidate-product");
+  const auto first_binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second_binding = coordinated_occurrence(first_binding, "2");
+  const auto first = registration(first_binding, first_engine);
+  const auto second = registration(second_binding, second_engine);
+  ResourceAddressedExecutionKernel kernel(
+      {first, second}, clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+  const auto current_slots = kernel.resource_table_snapshot();
+
+  const ConfigurationFenceScopeDTO no_controller_change{};
+  ASSERT_TRUE(no_controller_change.valid());
+  gate.held_scope = no_controller_change;
+  const RetainedBundleId candidate_bundle(test_digest('8'));
+  const GraphRevision candidate_graph(test_digest('9'));
+  const std::vector<ControllableComponentId> retained_components{
+      first_binding.value().controllable_component_id,
+      second_binding.value().controllable_component_id};
+  ASSERT_TRUE(std::is_sorted(retained_components.begin(), retained_components.end()));
+  ASSERT_TRUE(gate.exact_fence_is_held(*gate.held_fence_id, no_controller_change));
+
+  auto candidate_first_value = first_binding.value();
+  candidate_first_value.retained_bundle_id = candidate_bundle;
+  candidate_first_value.graph_revision = candidate_graph;
+  auto candidate_first = verify_runtime_participant_binding(std::move(candidate_first_value));
+  ASSERT_TRUE(candidate_first.ok()) << candidate_first.error().message;
+
+  auto candidate_second_graph_value = second_binding.value();
+  candidate_second_graph_value.retained_bundle_id = candidate_bundle;
+  candidate_second_graph_value.graph_revision = GraphRevision(test_digest('a'));
+  auto candidate_second_graph =
+      verify_runtime_participant_binding(std::move(candidate_second_graph_value));
+  ASSERT_TRUE(candidate_second_graph.ok()) << candidate_second_graph.error().message;
+  const auto graph_mixed = kernel.reconfigure_runtime_component_set(
+      {registration(candidate_first.value(), first_engine),
+       registration(candidate_second_graph.value(), second_engine)},
+      {}, std::nullopt, candidate_bundle, candidate_graph, *gate.held_fence_id,
+      no_controller_change, retained_components);
+  ASSERT_FALSE(graph_mixed.ok());
+  EXPECT_EQ(graph_mixed.error().details.at("reason"),
+            "runtime_component_set_product_mismatch");
+  EXPECT_EQ(kernel.resource_table_snapshot(), current_slots);
+
+  auto candidate_second_bundle_value = second_binding.value();
+  candidate_second_bundle_value.retained_bundle_id = RetainedBundleId(test_digest('b'));
+  candidate_second_bundle_value.graph_revision = candidate_graph;
+  auto candidate_second_bundle =
+      verify_runtime_participant_binding(std::move(candidate_second_bundle_value));
+  ASSERT_TRUE(candidate_second_bundle.ok()) << candidate_second_bundle.error().message;
+  const auto bundle_mixed = kernel.reconfigure_runtime_component_set(
+      {registration(candidate_first.value(), first_engine),
+       registration(candidate_second_bundle.value(), second_engine)},
+      {}, std::nullopt, candidate_bundle, candidate_graph, *gate.held_fence_id,
+      no_controller_change, retained_components);
+  ASSERT_FALSE(bundle_mixed.ok());
+  EXPECT_EQ(bundle_mixed.error().details.at("reason"),
+            "runtime_component_set_product_mismatch");
+  EXPECT_EQ(kernel.resource_table_snapshot(), current_slots);
+  EXPECT_TRUE(kernel.participant_engine_in_use(&first_engine));
+  EXPECT_TRUE(kernel.participant_engine_in_use(&second_engine));
+  EXPECT_EQ(first_engine.subscription_count(), 1U);
+  EXPECT_EQ(second_engine.subscription_count(), 1U);
+
+  gate.reject_reservation = false;
+  const auto dispatched = kernel.execute(
+      coordinated_motion_operation("request.motion.mixed-candidate-original"));
+  ASSERT_TRUE(dispatched.ok()) << dispatched.error().message;
+  ASSERT_EQ(dispatched.value().participant_assignments.size(), 2U);
+  EXPECT_EQ(first_engine.execute_calls, 1);
+  EXPECT_EQ(second_engine.execute_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      PhysicalProductReconfigurationInstallsStopDeadlineBeforeRouteReadiness) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -16111,9 +16349,14 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto binding = select_candidate_product(
       make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular));
   const StopDeadlineBudgetDTO product_budget{3'000'000'000, 100'000'000, {}};
+  int commit_calls = 0;
   const auto installed = kernel.reconfigure_runtime_product(
-      {unqualified_registration(binding, engine)}, {}, product_budget);
+      {unqualified_registration(binding, engine)}, {}, product_budget, [&]() {
+        ++commit_calls;
+        return Result<void>::Ok();
+      });
   ASSERT_TRUE(installed.ok()) << installed.error().message;
+  EXPECT_EQ(commit_calls, 1);
 
   const auto stopped = kernel.full_stop(
       FullStopIntentDTO{{RequestId("request.product-before-readiness.stop"),
@@ -16336,6 +16579,330 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_FALSE(unavailable.ok());
   EXPECT_EQ(unavailable.error().details.at("reason"), "runtime_participant_unavailable");
   EXPECT_EQ(predecessor_engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ComponentSetRemovalRequiresItsExactFenceAndRetainsTheOtherEngine) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine retained_engine, removed_engine;
+  FakeOperationJournal journal;
+  FakeResourceAdmissionGate gate;
+  gate.held_fence_id = ConfigurationFenceId("fence.component-removal");
+  const auto retained_binding = make_binding(
+      "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto removed_binding = coordinated_occurrence(retained_binding, "2");
+  const auto retained = registration(retained_binding, retained_engine);
+  const auto removed = registration(removed_binding, removed_engine);
+  ResourceAddressedExecutionKernel kernel(
+      {retained, removed}, clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+
+  const auto& removed_path = *removed_binding.value().control_path;
+  const ConfigurationFenceScopeDTO scope{
+      {removed_binding.value().controllable_component_id},
+      {{removed_path.control_domain_id, removed_path.control_domain_revision, std::nullopt}},
+      {{removed_path.control_binding_id, removed_path.control_binding_revision, std::nullopt}},
+      {removed_binding.value().resources.front().resource_id}};
+  ASSERT_TRUE(scope.valid());
+  gate.held_scope = scope;
+  const auto wrong_fence = kernel.reconfigure_runtime_component_set(
+      {retained}, {}, std::nullopt, retained_binding.value().retained_bundle_id,
+      retained_binding.value().graph_revision,
+      ConfigurationFenceId("fence.other"), scope);
+  ASSERT_FALSE(wrong_fence.ok());
+  EXPECT_EQ(wrong_fence.error().details.at("reason"),
+            "runtime_component_set_fence_missing");
+  EXPECT_TRUE(kernel.participant_engine_in_use(&retained_engine));
+  EXPECT_TRUE(kernel.participant_engine_in_use(&removed_engine));
+
+  auto incomplete = scope;
+  incomplete.controllable_component_ids.front() =
+      retained_binding.value().controllable_component_id;
+  ASSERT_TRUE(incomplete.valid());
+  const auto wrong_scope = kernel.reconfigure_runtime_component_set(
+      {retained}, {}, std::nullopt, retained_binding.value().retained_bundle_id,
+      retained_binding.value().graph_revision, *gate.held_fence_id, incomplete);
+  ASSERT_FALSE(wrong_scope.ok());
+  EXPECT_EQ(wrong_scope.error().details.at("reason"),
+            "runtime_component_set_fence_missing");
+  gate.held_scope = incomplete;
+  const auto unfenced = kernel.reconfigure_runtime_component_set(
+      {retained}, {}, std::nullopt, retained_binding.value().retained_bundle_id,
+      retained_binding.value().graph_revision, *gate.held_fence_id, incomplete);
+  ASSERT_FALSE(unfenced.ok());
+  EXPECT_EQ(unfenced.error().details.at("reason"),
+            "runtime_component_set_scope_incomplete");
+
+  gate.held_scope = scope;
+  const auto removed_result = kernel.reconfigure_runtime_component_set(
+      {retained}, {}, std::nullopt, retained_binding.value().retained_bundle_id,
+      retained_binding.value().graph_revision, *gate.held_fence_id, scope);
+  ASSERT_TRUE(removed_result.ok()) << removed_result.error().message;
+  EXPECT_TRUE(kernel.participant_engine_in_use(&retained_engine));
+  EXPECT_FALSE(kernel.participant_engine_in_use(&removed_engine));
+  EXPECT_EQ(retained_engine.subscription_count(), 1U);
+  ASSERT_TRUE(kernel.release_retired_engine(&removed_engine).ok());
+  EXPECT_EQ(removed_engine.subscription_count(), 0U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ComponentSetRejectsCandidateRevisionsOutsideItsExactFence) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine predecessor_engine, candidate_engine;
+  FakeOperationJournal journal;
+  FakeResourceAdmissionGate gate;
+  gate.held_fence_id = ConfigurationFenceId("fence.candidate-revision-mismatch");
+  const auto predecessor_binding = make_binding(
+      "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto candidate_value = predecessor_binding.value();
+  candidate_value.retained_bundle_id = RetainedBundleId(test_digest('8'));
+  candidate_value.graph_revision = GraphRevision(test_digest('9'));
+  candidate_value.control_path->control_domain_revision = ControlDomainRevision(test_digest('a'));
+  auto candidate_binding = verify_runtime_participant_binding(std::move(candidate_value));
+  ASSERT_TRUE(candidate_binding.ok()) << candidate_binding.error().message;
+  const auto predecessor = registration(predecessor_binding, predecessor_engine);
+  const auto candidate = registration(candidate_binding.value(), candidate_engine);
+  ResourceAddressedExecutionKernel kernel(
+      {predecessor}, clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+  const auto previous_slots = kernel.resource_table_snapshot();
+
+  const auto& old_path = *predecessor_binding.value().control_path;
+  const auto& new_path = *candidate_binding.value().value().control_path;
+  const ConfigurationFenceScopeDTO scope{
+      {predecessor_binding.value().controllable_component_id},
+      {{old_path.control_domain_id, old_path.control_domain_revision,
+        ControlDomainRevision(test_digest('b'))}},
+      {{old_path.control_binding_id, old_path.control_binding_revision,
+        new_path.control_binding_revision}},
+      {predecessor_binding.value().resources.front().resource_id}};
+  ASSERT_TRUE(scope.valid());
+  gate.held_scope = scope;
+
+  const auto rejected = kernel.reconfigure_runtime_component_set(
+      {candidate}, {}, std::nullopt, candidate_binding.value().value().retained_bundle_id,
+      candidate_binding.value().value().graph_revision, *gate.held_fence_id, scope);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            "runtime_component_set_scope_incomplete");
+  EXPECT_EQ(kernel.resource_table_snapshot(), previous_slots);
+  EXPECT_TRUE(kernel.participant_engine_in_use(&predecessor_engine));
+  EXPECT_FALSE(kernel.participant_engine_in_use(&candidate_engine));
+  EXPECT_EQ(predecessor_engine.subscription_count(), 1U);
+  EXPECT_EQ(candidate_engine.subscription_count(), 0U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RetainedControllerCanResealAProductWithoutAnUnrelatedResourceFence) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine, replacement_engine;
+  FakeOperationJournal journal;
+  FakeResourceAdmissionGate gate;
+  gate.held_fence_id = ConfigurationFenceId("fence.product-reseal");
+  const auto predecessor = make_binding(
+      "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto candidate_value = predecessor.value();
+  candidate_value.retained_bundle_id = RetainedBundleId(test_digest('8'));
+  candidate_value.graph_revision = GraphRevision(test_digest('9'));
+  candidate_value.program_revision = ProgramRevision(test_digest('a'));
+  auto candidate = verify_runtime_participant_binding(std::move(candidate_value));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  const auto predecessor_registration = registration(predecessor, engine);
+  const auto candidate_registration = registration(candidate.value(), engine);
+  ResourceAddressedExecutionKernel kernel(
+      {predecessor_registration}, clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+
+  const ConfigurationFenceScopeDTO no_physical_change{};
+  gate.held_scope = no_physical_change;
+  const auto wrong_fence = kernel.reconfigure_runtime_component_set(
+      {candidate_registration}, {}, std::nullopt,
+      candidate.value().value().retained_bundle_id,
+      candidate.value().value().graph_revision,
+      ConfigurationFenceId("fence.wrong"), no_physical_change,
+      {predecessor.value().controllable_component_id});
+  ASSERT_FALSE(wrong_fence.ok());
+  EXPECT_EQ(wrong_fence.error().details.at("reason"),
+            "runtime_component_set_fence_missing");
+  auto changed_safety_ceiling = candidate_registration;
+  changed_safety_ceiling.deployment_maximum_tcp_linear_speed_mps = 0.25;
+  const auto changed_runtime = kernel.reconfigure_runtime_component_set(
+      {changed_safety_ceiling}, {}, std::nullopt,
+      candidate.value().value().retained_bundle_id,
+      candidate.value().value().graph_revision, *gate.held_fence_id,
+      no_physical_change, {predecessor.value().controllable_component_id});
+  ASSERT_FALSE(changed_runtime.ok());
+  EXPECT_EQ(changed_runtime.error().details.at("reason"),
+            "runtime_component_set_scope_incomplete");
+  EXPECT_TRUE(kernel.participant_engine_in_use(&engine));
+  EXPECT_EQ(engine.subscription_count(), 1U);
+
+  const auto resealed = kernel.reconfigure_runtime_component_set(
+      {candidate_registration}, {}, std::nullopt,
+      candidate.value().value().retained_bundle_id,
+      candidate.value().value().graph_revision, *gate.held_fence_id,
+      no_physical_change, {predecessor.value().controllable_component_id});
+  ASSERT_TRUE(resealed.ok()) << resealed.error().message;
+  EXPECT_TRUE(kernel.participant_engine_in_use(&engine));
+  EXPECT_EQ(engine.subscription_count(), 1U);
+
+  const auto replacement_registration = registration(candidate.value(), replacement_engine);
+  const auto changed_engine = kernel.reconfigure_runtime_component_set(
+      {replacement_registration}, {}, std::nullopt,
+      candidate.value().value().retained_bundle_id,
+      candidate.value().value().graph_revision, *gate.held_fence_id,
+      no_physical_change, {predecessor.value().controllable_component_id});
+  ASSERT_FALSE(changed_engine.ok());
+  EXPECT_EQ(changed_engine.error().details.at("reason"),
+            "runtime_component_set_scope_incomplete");
+  EXPECT_TRUE(kernel.participant_engine_in_use(&engine));
+  EXPECT_EQ(engine.subscription_count(), 1U);
+  EXPECT_FALSE(kernel.participant_engine_in_use(&replacement_engine));
+  EXPECT_EQ(replacement_engine.subscription_count(), 0U);
+
+  auto changed_route = candidate.value().value();
+  changed_route.control_path->control_route_id = ControlRouteId("route.unfenced");
+  if (changed_route.control_path->runtime_scale_qualification.has_value()) {
+    changed_route.control_path->runtime_scale_qualification->control_route_id =
+        ControlRouteId("route.unfenced");
+  }
+  auto changed_binding = verify_runtime_participant_binding(std::move(changed_route));
+  ASSERT_TRUE(changed_binding.ok()) << changed_binding.error().message;
+  const auto rejected = kernel.reconfigure_runtime_component_set(
+      {registration(changed_binding.value(), engine)}, {}, std::nullopt,
+      candidate.value().value().retained_bundle_id,
+      candidate.value().value().graph_revision,
+      *gate.held_fence_id, no_physical_change,
+      {predecessor.value().controllable_component_id});
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            "runtime_component_set_scope_incomplete");
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ComponentSetRechecksFenceAfterPreparingCandidateSubscriptions) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine predecessor_engine, candidate_engine;
+  FakeOperationJournal journal;
+  FakeResourceAdmissionGate gate;
+  const auto binding = make_binding(
+      "arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto& path = *binding.value().control_path;
+  const ConfigurationFenceScopeDTO scope{
+      {binding.value().controllable_component_id},
+      {{path.control_domain_id, path.control_domain_revision, path.control_domain_revision}},
+      {{path.control_binding_id, path.control_binding_revision, path.control_binding_revision}},
+      {binding.value().resources.front().resource_id}};
+  ASSERT_TRUE(scope.valid());
+  const ConfigurationFenceId fence_id("fence.released-during-preparation");
+  gate.held_fence_id = fence_id;
+  gate.held_scope = scope;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(binding, predecessor_engine)}, clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+  const auto previous_slots = kernel.resource_table_snapshot();
+  // The subscription is prepared after the initial authority check and before
+  // mutation admission. Inject release at this exact boundary, without sleeps.
+  candidate_engine.subscribe_hook = [&] {
+    std::lock_guard lock(*gate.shared_admission_mutex());
+    gate.reject_reservation = false;
+    gate.held_fence_id.reset();
+  };
+  int commits = 0;
+  const auto result = kernel.reconfigure_runtime_component_set(
+      {registration(binding, candidate_engine)}, {}, std::nullopt,
+      binding.value().retained_bundle_id, binding.value().graph_revision,
+      fence_id, scope, {}, [&] {
+        ++commits;
+        return Result<void>::Ok();
+      });
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "runtime_component_set_fence_missing");
+  EXPECT_EQ(commits, 0);
+  EXPECT_EQ(kernel.resource_table_snapshot(), previous_slots);
+  EXPECT_TRUE(kernel.participant_engine_in_use(&predecessor_engine));
+  EXPECT_FALSE(kernel.participant_engine_in_use(&candidate_engine));
+  EXPECT_EQ(predecessor_engine.subscription_count(), 1U);
+  EXPECT_EQ(candidate_engine.subscription_count(), 0U);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ComponentSetPublicationCommitRunsOnlyAfterCorePreflightAndFailsClosed) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  FakeResourceAdmissionGate gate;
+  gate.held_fence_id = ConfigurationFenceId("fence.component-set-commit");
+  const auto predecessor =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  auto candidate_value = predecessor.value();
+  candidate_value.retained_bundle_id = RetainedBundleId(test_digest('8'));
+  candidate_value.graph_revision = GraphRevision(test_digest('9'));
+  candidate_value.program_revision = ProgramRevision(test_digest('a'));
+  auto candidate = verify_runtime_participant_binding(std::move(candidate_value));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  const auto predecessor_registration = registration(predecessor, engine);
+  const auto candidate_registration = registration(candidate.value(), engine);
+  ResourceAddressedExecutionKernel kernel(
+      {predecessor_registration}, clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{
+          RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U, {}, &gate});
+
+  const ConfigurationFenceScopeDTO unchanged_resources{};
+  gate.held_scope = unchanged_resources;
+  int commit_calls = 0;
+  const auto observe_commit = [&]() {
+    ++commit_calls;
+    return Result<void>::Ok();
+  };
+
+  const auto preflight_refusal = kernel.reconfigure_runtime_component_set(
+      {candidate_registration}, {}, std::nullopt, candidate.value().value().retained_bundle_id,
+      candidate.value().value().graph_revision, ConfigurationFenceId("fence.wrong"),
+      unchanged_resources, {predecessor.value().controllable_component_id}, observe_commit);
+  ASSERT_FALSE(preflight_refusal.ok());
+  EXPECT_EQ(preflight_refusal.error().details.at("reason"), "runtime_component_set_fence_missing");
+  EXPECT_EQ(commit_calls, 0);
+  EXPECT_TRUE(kernel.participant_engine_in_use(&engine));
+
+  const auto installed = kernel.reconfigure_runtime_component_set(
+      {candidate_registration}, {}, std::nullopt, candidate.value().value().retained_bundle_id,
+      candidate.value().value().graph_revision, *gate.held_fence_id, unchanged_resources,
+      {predecessor.value().controllable_component_id}, observe_commit);
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+  EXPECT_EQ(commit_calls, 1);
+  EXPECT_TRUE(kernel.participant_engine_in_use(&engine));
+
+  const auto failed_commit = kernel.reconfigure_runtime_component_set(
+      {candidate_registration}, {}, std::nullopt, candidate.value().value().retained_bundle_id,
+      candidate.value().value().graph_revision, *gate.held_fence_id, unchanged_resources,
+      {predecessor.value().controllable_component_id}, [&]() {
+        ++commit_calls;
+        return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvariantViolation)),
+                                          "injected observer update failure",
+                                          {}});
+      });
+  ASSERT_FALSE(failed_commit.ok());
+  EXPECT_EQ(failed_commit.error().details.at("reason"),
+            "runtime_component_set_publication_commit_failed");
+  EXPECT_EQ(commit_calls, 2);
+  EXPECT_TRUE(gate.reject_reservation);
+
+  // Even if an outer caller mistakenly opens the external fence after this
+  // partial publication, the Kernel remains closed against command admission.
+  gate.reject_reservation = false;
+  const auto refused = kernel.execute(motion_operation("request.commit-failure-closed"));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "motion_admission_closed");
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

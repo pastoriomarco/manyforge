@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from typing import Annotated, Any, Literal
 
@@ -37,6 +38,7 @@ MAX_STOP_SELECTOR_TARGETS = 4096
 MAX_OPERATION_PARTICIPANTS = 4096
 MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES = 2 * 1024 * 1024
 SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
+_SHA256_RE = re.compile(SHA256_PATTERN)
 
 
 def _bounded_nfc(value: str, *, label: str, maximum_bytes: int) -> str:
@@ -391,7 +393,7 @@ class ExpectedCurrentRequest(StrictRequest):
 
 
 class ManagerDeploymentCandidateReceipt(StrictRequest):
-    schema_version: Literal["manyforge.manager_deployment_candidate_receipt.v1"]
+    schema_version: Literal["manyforge.manager_deployment_candidate_receipt.v2"]
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
@@ -400,6 +402,10 @@ class ManagerDeploymentCandidateReceipt(StrictRequest):
     expected_current: ExpectedCurrentRequest
     expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     manager_owner_epoch: str
+    # Digest of the Manager's authoritative preview impact (H1a); a
+    # destructive impact must be accepted via ``accepted_impact_digest``.
+    impact_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    destructive_impact: bool
     receipt_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
     @field_validator(
@@ -489,7 +495,7 @@ class ManagerApplyPreparedActivation(StrictRequest):
     """
 
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    schema_version: Literal["manyforge.prepared_activation_input.v2"]
+    schema_version: Literal["manyforge.prepared_activation_input.v3"]
     scenario_id: str
     source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     deployment_artifact_id: str
@@ -498,11 +504,39 @@ class ManagerApplyPreparedActivation(StrictRequest):
     graph_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     program_id: str
     program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    # Exactly one typed outcome (H1a): {"kind": "bound", "program_binding_id"}
+    # or {"kind": "non_executable", "outcome"}; the Manager verifies it.
+    program_outcome: dict[str, Any]
     node_environment_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     assistant_mode: Literal["required", "optional", "forbidden"]
     typed_parameter_overrides: dict[str, Any]
     prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+
+    @field_validator("program_outcome")
+    @classmethod
+    def validate_program_outcome(cls, value: dict[str, Any]) -> dict[str, Any]:
+        kind = value.get("kind")
+        if kind == "bound":
+            binding_id = value.get("program_binding_id")
+            if set(value) != {"kind", "program_binding_id"} or not (
+                isinstance(binding_id, str) and _SHA256_RE.fullmatch(binding_id)
+            ):
+                raise ValueError("bound Program outcome must name one binding")
+        elif kind == "non_executable":
+            outcome = value.get("outcome")
+            if (
+                set(value) != {"kind", "outcome"}
+                or not isinstance(outcome, dict)
+                or outcome.get("api_version")
+                != "manyforge.program-binding-outcome.v1"
+                or not outcome.get("unresolved_roles")
+            ):
+                raise ValueError(
+                    "non-executable Program outcome must name its references"
+                )
+        else:
+            raise ValueError("Program outcome kind is unsupported")
+        return value
 
     @field_validator("deployment_artifact_id", "scenario_id", "program_id")
     @classmethod
@@ -525,6 +559,12 @@ class ManagerApplyRequest(CallerAttributionRequest):
     ] = None
     parent_authoring_claim: dict[str, Any] | None = None
     candidate_receipt: ManagerDeploymentCandidateReceipt
+    # Explicit acceptance of the receipt's exact destructive impact. The
+    # Manager revalidates the impact and refuses a stale or missing acceptance
+    # for every caller, so this is not a GUI-only guard.
+    accepted_impact_digest: Annotated[
+        str | None, Field(pattern=SHA256_PATTERN)
+    ] = None
 
     @field_validator("deployment_artifact_id")
     @classmethod
@@ -1109,7 +1149,9 @@ class ManagerApplyStatusPreparedActivation(StrictRequest):
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    # Null exactly when the preserved Program is non-executable in the
+    # candidate (H1a); a succeeded Apply may still report null here.
+    program_binding_id: Annotated[str | None, Field(pattern=SHA256_PATTERN)]
     prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
     @field_validator("deployment_artifact_id")

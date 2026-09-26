@@ -36,6 +36,8 @@ class ParsedArtifactCandidate final {
   CanonicalValue root_;
 
   friend ParsedArtifactCandidate parse_strict_json_model_yaml(std::string_view);
+  friend ParsedArtifactCandidate parse_strict_json_model_yaml(
+      std::string_view, std::size_t max_encoded_bytes);
 };
 
 /// Decodes exactly one UTF-8 YAML document into the closed I-JSON value model.
@@ -45,5 +47,13 @@ class ParsedArtifactCandidate final {
 /// unsafe integer literals, invalid UTF-8, non-NFC text, and inputs exceeding
 /// the fixed v1 byte/depth/node/scalar bounds are rejected.
 [[nodiscard]] ParsedArtifactCandidate parse_strict_json_model_yaml(std::string_view yaml_bytes);
+
+/// Decode one strict JSON/YAML value under an explicit aggregate transport
+/// bound. Structural, node-count, nesting, scalar and numeric limits remain
+/// unchanged. Use this only for bounded operation envelopes that carry
+/// multiple individually bounded artifacts; stored artifacts must use the
+/// fixed v1 overload above.
+[[nodiscard]] ParsedArtifactCandidate parse_strict_json_model_yaml(
+    std::string_view yaml_bytes, std::size_t max_encoded_bytes);
 
 }  // namespace manyforge::deployment

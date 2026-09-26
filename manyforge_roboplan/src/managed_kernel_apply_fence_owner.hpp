@@ -59,6 +59,9 @@ public:
   [[nodiscard]] bool exact_fence_covers(
       const manyforge::core::ConfigurationFenceId &fence_id,
       const std::vector<manyforge::core::ResourceId> &resources) const override;
+  [[nodiscard]] bool exact_fence_is_held(
+      const manyforge::core::ConfigurationFenceId &fence_id,
+      const manyforge::core::ConfigurationFenceScopeDTO &scope) const override;
 
   /// Attach the exact table owned by the currently composed addressed Kernel.
   /// The gate keeps only a weak reference and owns no duplicate operation or

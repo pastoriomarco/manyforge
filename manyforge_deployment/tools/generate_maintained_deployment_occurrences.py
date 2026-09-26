@@ -45,7 +45,7 @@ NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.native_execution.v1"
 )
 NATIVE_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5702c61a9828c62035"
+    "sha256:6b540dac39434e05a2cb5da209206e2105b824b9f56704a74f0d88f327944689"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
@@ -2238,7 +2238,7 @@ def graph_and_applicability(
     runtime_unit_id = (
         f"{occurrence}.ros2_control_execution"
         if ros2_control
-        else f"{occurrence}.native_execution"
+        else "robot_cell.native_execution"
     )
     physical_provider_instance_id = (
         f"{occurrence}.ros2_control" if ros2_control else f"{occurrence}.native_control"

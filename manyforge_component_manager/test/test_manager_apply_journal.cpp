@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "manyforge_component_manager/manager_apply_journal.hpp"
+#include <manyforge_deployment/apply_component_delta.hpp>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 
 namespace manyforge::component_manager {
@@ -256,7 +257,30 @@ ManagerApplyAffectedScopeDTO AffectedScope(
       fence_intent.owner_transaction.apply_generation,
       fence_intent.scope,
       fence_intent.busy_disposition,
+      manyforge::deployment::ApplyComponentDeltaDTO{},
   };
+}
+
+// A mixed decision inside FenceIntent()'s scope: robot-1 is rebuilt because
+// its bindings changed, tool-1 owns no domain and keeps its runtime.
+manyforge::deployment::ApplyComponentDeltaDTO ReplacingDelta() {
+  const manyforge::deployment::ApplyComponentChangeDTO robot{
+      ControllableComponentId("robot-1"),
+      manyforge::deployment::ApplyComponentDisposition::kReplace,
+      ContentDigest(std::string(kDigestOne)),
+      ContentDigest(std::string(kDigestTwo)),
+      {ControlDomainId("arm")},
+      {ControlDomainId("arm")},
+      {std::string(manyforge::deployment::kApplyComponentReasonBindings)}};
+  const manyforge::deployment::ApplyComponentChangeDTO tool{
+      ControllableComponentId("tool-1"),
+      manyforge::deployment::ApplyComponentDisposition::kRetain,
+      ContentDigest(std::string(kDigestOne)),
+      ContentDigest(std::string(kDigestOne)),
+      {},
+      {},
+      {}};
+  return {{robot, tool}, true, {ControllableComponentId("tool-1")}};
 }
 
 ManagerApplyFenceAttemptWriteResult EnsureAttempt(
@@ -1375,6 +1399,10 @@ TEST(ManagerApplyJournalIntegrity,
     value.prepared_activation.program_binding_id =
         core::ProgramBindingId(std::string(kDigestThree));
   });
+  // A non-executable Program outcome is its own durable identity (H1a).
+  add([](auto &value) {
+    value.prepared_activation.program_binding_id = std::nullopt;
+  });
   add([](auto &value) {
     value.prepared_activation.prepared_activation_id =
         ContentDigest(std::string(kDigestTwo));
@@ -1398,6 +1426,29 @@ TEST(ManagerApplyJournalIntegrity,
     EXPECT_TRUE(digests.insert(result.record.intent_digest.value()).second);
   }
   EXPECT_EQ(digests.size(), variants.size());
+}
+
+TEST(ManagerApplyJournal,
+     PersistsANonExecutableProgramIntentWithoutABindingAcrossRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "apply.sqlite3";
+  auto intent = Intent();
+  intent.prepared_activation.program_binding_id = std::nullopt;
+  ASSERT_TRUE(intent.valid());
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto inserted = journal.EnsureIntent(intent);
+    EXPECT_TRUE(inserted.inserted);
+    EXPECT_EQ(inserted.record.intent, intent);
+    // The same Apply with a bound Program is a different, conflicting intent.
+    EXPECT_THROW(static_cast<void>(journal.EnsureIntent(Intent())),
+                 ManagerApplyJournalConflictError);
+  }
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  const auto read = reopened.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(read.has_value());
+  EXPECT_FALSE(read->intent.prepared_activation.program_binding_id.has_value());
+  EXPECT_EQ(read->intent, intent);
 }
 
 TEST(ManagerApplyJournal, PersistsExactIntentAndReplaysAcrossRestart) {
@@ -2022,6 +2073,80 @@ TEST(ManagerApplyFenceJournal,
                ManagerApplyJournalConflictError);
   EXPECT_EQ(journal.VerifyIntegrity().affected_scope_count, 1);
   EXPECT_EQ(journal.VerifyIntegrity().fence_attempt_count, 0);
+}
+
+TEST(ManagerApplyFenceJournal,
+     PersistsTheExactComponentDeltaWithTheScopeAcrossRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "apply.sqlite3";
+  auto affected_scope = AffectedScope();
+  affected_scope.component_delta = ReplacingDelta();
+  ASSERT_TRUE(affected_scope.valid());
+  ContentDigest intent_digest{std::string(kDigestOne)};
+  ContentDigest scope_digest{std::string(kDigestOne)};
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    intent_digest = journal.EnsureIntent(Intent()).record.intent_digest;
+    const auto written =
+        journal.EnsureAffectedScope(intent_digest, affected_scope);
+    ASSERT_TRUE(written.inserted);
+    scope_digest = written.record.affected_scope_digest;
+    // The same scope with another decision is a conflicting record.
+    auto retained_only = affected_scope;
+    retained_only.component_delta = {};
+    EXPECT_THROW(journal.EnsureAffectedScope(intent_digest, retained_only),
+                 ManagerApplyJournalConflictError);
+  }
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  const auto read =
+      reopened.ReadAffectedScope(ApplyId("apply-1"), ApplyGeneration(1U));
+  ASSERT_TRUE(read.has_value());
+  EXPECT_EQ(read->affected_scope, affected_scope);
+  EXPECT_EQ(read->affected_scope.component_delta, ReplacingDelta());
+  EXPECT_EQ(read->affected_scope_digest, scope_digest);
+  EXPECT_FALSE(reopened.EnsureAffectedScope(intent_digest, affected_scope)
+                   .inserted);
+}
+
+TEST(ManagerApplyFenceJournal, RefusesAComponentDeltaOutsideTheFenceScope) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "apply.sqlite3",
+                                    CellId("cell-1"));
+  const auto intent = journal.EnsureIntent(Intent()).record;
+  auto affected_scope = AffectedScope();
+  affected_scope.component_delta = ReplacingDelta();
+  // robot-1 is rebuilt, so it must be fenced.
+  affected_scope.scope.controllable_component_ids.clear();
+  EXPECT_FALSE(affected_scope.valid());
+  EXPECT_THROW(journal.EnsureAffectedScope(intent.intent_digest, affected_scope),
+               std::invalid_argument);
+  EXPECT_EQ(journal.VerifyIntegrity().affected_scope_count, 0);
+}
+
+TEST(ManagerApplyFenceJournal, DetectsComponentDeltaCorruptionOnRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "affected-delta.sqlite3";
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto intent = journal.EnsureIntent(Intent()).record;
+    auto affected_scope = AffectedScope();
+    affected_scope.component_delta = ReplacingDelta();
+    static_cast<void>(
+        journal.EnsureAffectedScope(intent.intent_digest, affected_scope));
+  }
+  ExecSql(path,
+          "DROP TRIGGER manager_apply_affected_scopes_no_update;"
+          // Still a valid delta, but a different decision than was sealed.
+          "UPDATE manager_apply_affected_scopes SET component_delta_encoding="
+          "replace(component_delta_encoding,"
+          "'\"shared_scene_projection_changed\":true',"
+          "'\"shared_scene_projection_changed\":false');"
+          "CREATE TRIGGER manager_apply_affected_scopes_no_update "
+          "BEFORE UPDATE ON manager_apply_affected_scopes BEGIN "
+          "SELECT RAISE(ABORT, 'manager_apply_affected_scopes is immutable'); "
+          "END;");
+  EXPECT_THROW(SqliteManagerApplyJournal(path, CellId("cell-1")),
+               ManagerApplyJournalIntegrityError);
 }
 
 TEST(ManagerApplyFenceJournal, DetectsAffectedScopePayloadCorruptionOnRestart) {

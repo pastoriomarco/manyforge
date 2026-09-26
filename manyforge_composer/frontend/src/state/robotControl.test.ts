@@ -21,25 +21,30 @@ import { computeCartesianMoveDraft } from '../utils/moveTo';
 describe('addressed Robot Control state', () => {
   it('keeps one stable addressed selection and fences the previous robot draft', () => {
     const status = statusFixture();
-    const secondMotion = structuredClone(status.directControl);
+    const primaryMotion = status.directControl;
+    const primaryObservation = status.observedMotion;
+    if (primaryMotion === null || primaryObservation === null) {
+      throw new Error('motion fixture must contain a motion target and observation');
+    }
+    const secondMotion = structuredClone(primaryMotion);
     secondMotion.controllableComponentId = 'robot-b';
     secondMotion.programBindingId = 'sha256:robot-b-motion-binding';
     secondMotion.targetDescriptor.controllableComponentId = 'robot-b';
-    const secondGripper = structuredClone(status.directControlGripper);
+    const secondGripper = structuredClone(status.directControlGripper!);
     secondGripper.controllableComponentId = 'robot-b';
     secondGripper.programBindingId = 'sha256:robot-b-gripper-binding';
     secondGripper.targetDescriptor.controllableComponentId = 'robot-b';
     const secondObservedMotion = {
-      ...structuredClone(status.observedMotion),
+      ...structuredClone(primaryObservation),
       controllableComponentId: 'robot-b',
       positionsRad: [0.4, 0.5],
       sequence: 8,
     };
-    status.directControlTargets = [status.directControl, secondMotion];
-    status.directControlGripperTargets = [status.directControlGripper, secondGripper];
-    status.observedMotions = [status.observedMotion, secondObservedMotion];
+    status.directControlTargets = [primaryMotion, secondMotion];
+    status.directControlGripperTargets = [status.directControlGripper!, secondGripper];
+    status.observedMotions = [primaryObservation, secondObservedMotion];
     status.observedGrippers = [{
-      ...status.observedGripper!, targetRoleId: status.directControlGripper.targetRoleId,
+      ...status.observedGripper!, targetRoleId: status.directControlGripper!.targetRoleId,
       controllableComponentId: 'robot-a', commandTargetId: 'gripper',
     }, {
       ...status.observedGripper!, targetRoleId: secondGripper.targetRoleId,
@@ -149,9 +154,21 @@ describe('addressed Robot Control state', () => {
     expect(draft.options.offsetXyzM[1]).toBeCloseTo(-0.15);
     expect(draft.source.kind === 'pose' && samePose(poseTupleFromValue(authored.draftPose),
       computeCartesianMoveDraft(draft.source.pose, draft.currentTcpPose, draft.options)!)).toBe(true);
-    const refreshed = robotControlReducer(authored, { type: 'status_refreshed', status: { ...authored.status!, observedMotion: {
-      ...authored.status!.observedMotion, sequence: 999,
-    } } });
+    const currentObservation = authored.status!.observedMotion;
+    if (currentObservation === null) throw new Error('motion fixture observation is missing');
+    const refreshedStatus = {
+      ...authored.status!,
+      observedMotion: { ...currentObservation, sequence: 999 },
+      observedMotions: authored.status!.observedMotions.map((row) => (
+        row.controllableComponentId === currentObservation.controllableComponentId
+          && row.commandTargetId === currentObservation.commandTargetId
+          ? { ...row, sequence: 999 }
+          : row
+      )),
+    };
+    const refreshed = robotControlReducer(authored, {
+      type: 'status_refreshed', status: refreshedStatus,
+    });
     expect(refreshed.moveToDraft).toBe(draft);
     expect(robotControlReducer(authored, { type: 'revert' }).moveToDraft).toBeNull();
   });
@@ -204,19 +221,27 @@ describe('addressed Robot Control state', () => {
   it.each([false, true])('seeds only the first edit from current observation, retained result=%s', (retained) => {
     let status = statusFixture();
     if (retained) status.manualOperations = [{
-      programRunId: status.directControl.programRunId, operationId: 'completed-1',
+      programRunId: status.directControl!.programRunId, operationId: 'completed-1',
       operationRevision: 2, resident: false, state: 'completed', progress: 1,
       activeStopGeneration: null, activeStopId: null, terminalError: null,
     }];
     let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
     const oldDraft = state.draftPositionsRad;
-    status = { ...status, observedMotion: { ...status.observedMotion, positionsRad: [0.5, 0.5] } };
+    const firstObservation = status.observedMotions[0];
+    if (firstObservation === undefined) throw new Error('motion observation fixture is missing');
+    status = {
+      ...status,
+      observedMotion: { ...status.observedMotion!, positionsRad: [0.5, 0.5] },
+      observedMotions: [{ ...firstObservation, positionsRad: [0.5, 0.5] }],
+    };
     state = robotControlReducer(state, { type: 'status_refreshed', status });
     expect(state.draftPositionsRad).toBe(oldDraft); // No observation-driven draft copy.
     state = robotControlReducer(state, { type: 'edit_joint', jointIndex: 0, positionRad: 0.6 });
     expect(state.draftPositionsRad).toEqual([0.6, 0.5]);
     state = robotControlReducer(state, { type: 'status_refreshed', status: {
-      ...status, observedMotion: { ...status.observedMotion, positionsRad: [0.2, 0.3] },
+      ...status,
+      observedMotion: { ...status.observedMotion!, positionsRad: [0.2, 0.3] },
+      observedMotions: [{ ...firstObservation, positionsRad: [0.2, 0.3] }],
     } });
     state = robotControlReducer(state, { type: 'edit_joint', jointIndex: 1, positionRad: 0.7 });
     expect(state.draftPositionsRad).toEqual([0.6, 0.7]);
@@ -366,7 +391,7 @@ describe('addressed Robot Control state', () => {
 
   it('bounds defaults by the Deployment TCP maximum and rejects larger requests before preview', () => {
     const status = statusFixture();
-    status.directControl.targetDescriptor.operationalLimit = {
+    status.directControl!.targetDescriptor.operationalLimit = {
       maximumTcpLinearSpeedMps: 0.05,
     };
     const loaded = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
@@ -590,12 +615,13 @@ describe('addressed Robot Control state', () => {
     expect(state.ghostStale).toBe(false);
 
     const observed = statusFixture();
-    observed.observedMotion.positionsRad = [0.24, 0.49];
+    observed.observedMotion!.positionsRad = [0.24, 0.49];
     observed.observedGripper = {
       ...observed.observedGripper!,
       position: 0.031,
     };
-    observed.manualOperations = [{ ...state.operation!, programRunId: observed.directControl.programRunId }];
+    observed.observedGrippers = [{ ...observed.observedGrippers[0], position: 0.031 }];
+    observed.manualOperations = [{ ...state.operation!, programRunId: observed.directControl!.programRunId }];
     state = robotControlReducer(state, {
       type: 'status_refreshed',
       status: observed,
@@ -604,7 +630,7 @@ describe('addressed Robot Control state', () => {
     expect(state.draftGripperPosition).toBe(0.031);
 
     const settledStatus = statusFixture();
-    settledStatus.observedMotion.positionsRad = [0.24, 0.49];
+    settledStatus.observedMotion!.positionsRad = [0.24, 0.49];
     state = robotControlReducer(state, {
       type: 'status_refreshed',
       status: settledStatus,
@@ -617,7 +643,7 @@ describe('addressed Robot Control state', () => {
   it('recovers the exact resident operation on a fresh client load', () => {
     const status = statusFixture();
     status.manualOperations = [{
-      programRunId: status.directControl.programRunId,
+      programRunId: status.directControl!.programRunId,
       operationId: 'operation-recovered',
       operationRevision: 4,
       resident: true,
@@ -639,7 +665,7 @@ describe('addressed Robot Control state', () => {
     let state = robotControlReducer(readyState(), { type: 'approve_started' });
     const status = statusFixture();
     status.manualOperations = [{
-      ...executingState().operation!, programRunId: status.directControl.programRunId,
+      ...executingState().operation!, programRunId: status.directControl!.programRunId,
       operationId: 'short-move', state: 'completed', progress: 1, resident: false,
     }];
     state = robotControlReducer(state, { type: 'status_refreshed', status });
@@ -657,7 +683,7 @@ describe('addressed Robot Control state', () => {
     const state = executingState();
     const status = statusFixture();
     status.manualOperations = [{
-      ...state.operation!, programRunId: status.directControl.programRunId,
+      ...state.operation!, programRunId: status.directControl!.programRunId,
       operationId: 'next-move-from-another-client', resident,
       state: resident ? 'executing' : 'completed',
     }];
@@ -670,7 +696,7 @@ describe('addressed Robot Control state', () => {
   it('does not resurrect a settled result on mode switch, but recovers new owner evidence', () => {
     const status = statusFixture();
     status.manualOperations = [{
-      ...executingState().operation!, programRunId: status.directControlGripper.programRunId,
+      ...executingState().operation!, programRunId: status.directControlGripper!.programRunId,
       state: 'completed', resident: false,
     }];
     let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
@@ -688,7 +714,7 @@ describe('addressed Robot Control state', () => {
   it.each(['completed', 'stopped'] as const)('does not label a new editor with a previous %s move', (terminal) => {
     const status = statusFixture();
     status.manualOperations = [{
-      ...executingState().operation!, programRunId: status.directControl.programRunId,
+      ...executingState().operation!, programRunId: status.directControl!.programRunId,
       state: terminal, progress: 0.43, resident: false,
     }];
     let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
@@ -703,7 +729,7 @@ describe('addressed Robot Control state', () => {
   it('a mode switch cannot hide a still-resident stopped operation', () => {
     const status = statusFixture();
     status.manualOperations = [{
-      ...executingState().operation!, programRunId: status.directControl.programRunId,
+      ...executingState().operation!, programRunId: status.directControl!.programRunId,
       state: 'stopped', progress: 0.43, resident: true,
     }];
     let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status });
@@ -728,12 +754,12 @@ describe('addressed Robot Control state', () => {
   it.each([false, true])('revalidates scene changes, not observations; retained result=%s', (retained) => {
     const ready = readyState();
     if (retained) ready.status!.manualOperations = [{
-      programRunId: ready.status!.directControl.programRunId, operationId: 'completed-1',
+      programRunId: ready.status!.directControl!.programRunId, operationId: 'completed-1',
       operationRevision: 2, resident: false, state: 'completed', progress: 1,
       activeStopGeneration: null, activeStopId: null, terminalError: null,
     }];
     const fresh = structuredClone(ready.status!);
-    fresh.observedMotion.positionsRad = [0.01, 0.02];
+    fresh.observedMotion!.positionsRad = [0.01, 0.02];
     const stillReady = robotControlReducer(ready, { type: 'status_refreshed', status: fresh });
     expect(stillReady.phase).toBe('ready');
     expect(stillReady.generation).toBe(ready.generation);
@@ -760,7 +786,7 @@ describe('addressed Robot Control state', () => {
   it('fails closed instead of choosing among multiple resident operations', () => {
     const status = statusFixture();
     status.manualOperations = ['one', 'two'].map((operationId) => ({
-      programRunId: status.directControl.programRunId,
+      programRunId: status.directControl!.programRunId,
       operationId,
       operationRevision: 1,
       resident: true,
@@ -816,7 +842,7 @@ describe('addressed Robot Control state', () => {
 
     expect(rebased.phase).toBe('idle');
     expect(rebased.draftPositionsRad).toEqual(
-      ready.status?.observedMotion.positionsRad,
+      ready.status?.observedMotion?.positionsRad,
     );
     expect(rebased.intent).toBeNull();
     expect(rebased.preview).toBeNull();
@@ -873,7 +899,7 @@ describe('addressed Robot Control state', () => {
     expect(posePayload.motion).toEqual({ kind: 'pose_goal', goal: target });
     expect(cartesianPayload.motion).toMatchObject({
       kind: 'cartesian_path',
-      waypoints: [status.observedMotion.currentTcpPose, target],
+      waypoints: [status.observedMotion!.currentTcpPose, target],
       fallback_policy: 'fail_closed',
     });
   });
@@ -907,7 +933,7 @@ describe('addressed Robot Control state', () => {
     expect(changed.ghost).toBeNull();
     expect(changed.ghostStale).toBe(false);
     expect(changed.draftPositionsRad).toEqual(
-      changed.status?.observedMotion.positionsRad,
+      changed.status?.observedMotion?.positionsRad,
     );
   });
 
@@ -1015,16 +1041,40 @@ describe('addressed Robot Control state', () => {
     );
   });
 
+  it('offers no gripper control for an arm-only component', () => {
+    const status = statusFixture();
+    status.directControlGripper = null;
+    status.observedGripper = null;
+    status.directControlGripperTargets = [];
+    status.observedGrippers = [];
+
+    let state = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved',
+      status,
+    });
+    expect(state.draftGripperPosition).toBeNull();
+    // Gripper mode and gripper edits are refused; the arm keeps its mode.
+    const before = state.mode;
+    state = robotControlReducer(state, { type: 'select_mode', mode: 'gripper' });
+    expect(state.mode).toBe(before);
+    state = robotControlReducer(state, { type: 'edit_gripper', position: 0.01 });
+    expect(state.mode).toBe(before);
+    expect(() => buildGripperCommandIntent(status, 0.01, 'arm-only'))
+      .toThrow(/no gripper target/);
+  });
+
   it('authors the first component-local command without inventing state or limits', () => {
     const status = statusFixture();
     status.directControlGripper = {
-      ...status.directControlGripper,
+      ...status.directControlGripper!,
       sourceCoordinateName: 'gripper_position',
       sourceKind: 'component_local',
       minPosition: null,
       maxPosition: null,
     };
     status.observedGripper = null;
+    status.directControlGripperTargets = [status.directControlGripper];
+    status.observedGrippers = [];
 
     let state = robotControlReducer(initialRobotControlState, {
       type: 'status_resolved',

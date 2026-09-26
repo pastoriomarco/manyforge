@@ -285,14 +285,14 @@ public:
 }
 
 /// One complete planned-transition fixture. The runtime starts with every
-/// affected content present so that a transition has something to stop.
+/// managed content present so Apply can prove those epochs are retained.
 class MaintenanceFixture final {
 public:
   MaintenanceFixture()
       : plan_(ThreeUnitPlan()), source_(plan_),
         runtime_(source_, ports_, ports_, [this] { return ++now_; }),
         gate_(ManagementIdleState::kIdle),
-        coordinator_(source_, runtime_, gate_) {
+        coordinator_(source_, gate_) {
     gate_.events = &events;
     static_cast<void>(runtime_.Initialize());
     source_.read_calls = 0;
@@ -325,31 +325,19 @@ public:
   std::uint64_t now_{0};
 };
 
-/// The runtime is already converged when the fixture is constructed, so a
-/// transition must stop all three contents in reverse dependency order.
+/// The runtime is already converged when the fixture is constructed. An Apply
+/// closes admission but leaves the shared host and component owners in place.
 TEST(ManagerPlannedMaintenanceCoordinator,
-     IdleTransitionStopsInReverseDependencyOrderAndProvesAbsence) {
+     IdleTransitionClosesAdmissionWithoutStoppingRetainedRuntime) {
   MaintenanceFixture fixture;
 
   const auto result = fixture.Enter();
 
   EXPECT_TRUE(result.entered_idle_maintenance());
   EXPECT_TRUE(result.valid());
-  ASSERT_EQ(result.final_process_observations.size(), 3U);
-  for (const auto &observation : result.final_process_observations) {
-    EXPECT_EQ(observation.state(), ProcessPresenceState::kAbsent);
-  }
-  EXPECT_TRUE(fixture.ports_.epochs.empty());
-  EXPECT_EQ(fixture.events, (std::vector<std::string>{
-                               "close_admission",
-                               "observe:runtime.c",
-                               "stop:runtime.c",
-                               "observe:runtime.b",
-                               "stop:runtime.b",
-                               "observe:runtime.a",
-                               "stop:runtime.a",
-                           }));
-  // Planned teardown never constructs a replacement on its own.
+  EXPECT_EQ(fixture.ports_.epochs.size(), 3U);
+  EXPECT_EQ(fixture.events, (std::vector<std::string>{"close_admission"}));
+  EXPECT_TRUE(fixture.ports_.stop_calls.empty());
   EXPECT_TRUE(fixture.ports_.start_calls.empty());
   EXPECT_EQ(fixture.gate_.close_calls, 1);
 }
@@ -367,7 +355,6 @@ TEST(ManagerPlannedMaintenanceCoordinator,
   // Nothing happened, so every effect of the attempt is known.
   EXPECT_EQ(result.effect_disposition, ManagerApplyEffectDisposition::kKnown);
   EXPECT_TRUE(result.valid());
-  EXPECT_TRUE(result.final_process_observations.empty());
   EXPECT_TRUE(fixture.events.empty());
   EXPECT_TRUE(fixture.ports_.stop_calls.empty());
   EXPECT_TRUE(fixture.ports_.start_calls.empty());
@@ -433,14 +420,12 @@ TEST(ManagerPlannedMaintenanceCoordinator,
   const auto result = fixture.Enter();
 
   ASSERT_TRUE(result.entered_idle_maintenance());
-  // The exact ordering: idle refusal, predecessor recheck, admission close,
-  // then teardown. Each step completes before the next begins.
-  ASSERT_GE(fixture.events.size(), 7U);
+  // The exact ordering ends after idle refusal, predecessor recheck and
+  // admission closure. Component-delta convergence follows separately.
+  ASSERT_EQ(fixture.events.size(), 1U);
   EXPECT_EQ(fixture.events[0], "close_admission");
-  EXPECT_EQ(fixture.events[1], "observe:runtime.c");
   EXPECT_EQ(fixture.gate_.idle_reads, 1);
-  // Preflight reads once; Shutdown reads at entry and verifies at exit.
-  EXPECT_EQ(fixture.source_.read_calls, 3);
+  EXPECT_EQ(fixture.source_.read_calls, 1);
 }
 
 TEST(ManagerPlannedMaintenanceCoordinator,
@@ -459,7 +444,7 @@ TEST(ManagerPlannedMaintenanceCoordinator,
   changing.UseChangedPlan();
   ScriptedGate gate(ManagementIdleState::kIdle);
   gate.events = &fixture.events;
-  ManagerPlannedMaintenanceCoordinator coordinator(changing, runtime, gate);
+  ManagerPlannedMaintenanceCoordinator coordinator(changing, gate);
   fixture.events.clear();
   fixture.ports_.events.clear();
 
@@ -515,44 +500,34 @@ TEST(ManagerPlannedMaintenanceCoordinator,
 }
 
 TEST(ManagerPlannedMaintenanceCoordinator,
-     UncertainStopIsReportedAsUnknownEffectWithoutRetry) {
+     AdmissionClosureDoesNotInvokeRuntimeStopOrReplacement) {
   MaintenanceFixture fixture;
-  fixture.ports_.throw_after_stop_effect_for = "runtime.c";
 
   const auto result = fixture.Enter();
 
-  EXPECT_EQ(result.outcome,
-            ManagerPlannedMaintenanceOutcome::kUnknownEffect);
-  EXPECT_EQ(result.failure_code, "planned_maintenance_stop_uncertain");
-  EXPECT_EQ(result.effect_disposition,
-            ManagerApplyEffectDisposition::kUnknown);
   EXPECT_TRUE(result.valid());
-  // The stop may have taken effect, so absence is not claimed and no second
-  // attempt, rollback or replacement is performed.
-  EXPECT_TRUE(result.final_process_observations.empty());
-  EXPECT_EQ(fixture.ports_.stop_calls.at("runtime.c"), 1);
-  EXPECT_EQ(fixture.ports_.stop_calls.count("runtime.b"), 0);
+  EXPECT_TRUE(result.entered_idle_maintenance());
+  EXPECT_TRUE(fixture.ports_.stop_calls.empty());
+  EXPECT_EQ(fixture.ports_.epochs.size(), 3U);
   EXPECT_TRUE(fixture.ports_.start_calls.empty());
 }
 
 TEST(ManagerPlannedMaintenanceCoordinator,
-     FailedTeardownIsReportedAsUnknownEffect) {
+     StopFailuresCannotAffectAnApplyThatDoesNotRequestStop) {
   MaintenanceFixture fixture;
   fixture.ports_.refuse_stop_for = "runtime.c";
 
   const auto result = fixture.Enter();
 
-  EXPECT_EQ(result.outcome,
-            ManagerPlannedMaintenanceOutcome::kUnknownEffect);
-  EXPECT_EQ(result.failure_code, "planned_maintenance_stop_uncertain");
-  EXPECT_EQ(result.effect_disposition,
-            ManagerApplyEffectDisposition::kUnknown);
-  EXPECT_EQ(fixture.ports_.stop_calls.at("runtime.c"), 1);
+  EXPECT_TRUE(result.entered_idle_maintenance());
+  EXPECT_TRUE(result.valid());
+  EXPECT_TRUE(fixture.ports_.stop_calls.empty());
+  EXPECT_EQ(fixture.ports_.epochs.size(), 3U);
   EXPECT_TRUE(fixture.ports_.start_calls.empty());
 }
 
 TEST(ManagerPlannedMaintenanceCoordinator,
-     PlannedTeardownDoesNotInvokeCrashRecoveryOrReplacement) {
+     PlannedAdmissionDoesNotInvokeCrashRecoveryOrReplacement) {
   MaintenanceFixture fixture;
   // A content observed absent outside a planned transition is contained fault
   // evidence: the read surface must report it and must never restart it.
@@ -565,33 +540,35 @@ TEST(ManagerPlannedMaintenanceCoordinator,
       ManagedRow("runtime.c"),
   }));
   fixture.ports_.events.clear();
+  fixture.ports_.stop_calls.clear();
 
   const auto observed = fixture.runtime_.Observe();
   EXPECT_EQ(observed.state, ManagerActiveRuntimeConvergenceState::kPending);
   EXPECT_TRUE(fixture.ports_.start_calls.empty());
 
-  // And the planned transition itself only ever stops: it never reaches crash
+  // And the planned transition only closes admission: it never reaches crash
   // reconciliation, retry, rollback or replacement.
   const auto result = fixture.Enter();
   EXPECT_TRUE(result.entered_idle_maintenance());
   EXPECT_TRUE(fixture.ports_.start_calls.empty());
+  EXPECT_TRUE(fixture.ports_.stop_calls.empty());
 }
 
 TEST(ManagerPlannedMaintenanceCoordinator,
-     ReplacementConstructionUsesTheInitializationPath) {
+     CandidateInitializationReusesExistingRuntimeEpochs) {
   MaintenanceFixture fixture;
 
   const auto entered = fixture.Enter();
   ASSERT_TRUE(entered.entered_idle_maintenance());
 
-  // After the transition proved absence, the replacement contents are
-  // constructed through the effectful initialization path.
+  // Candidate convergence may verify a retained process, but must not rebuild
+  // it when its exact runtime identity remains current.
   const auto initialized = fixture.runtime_.Initialize();
   EXPECT_EQ(initialized.state,
             ManagerActiveRuntimeConvergenceState::kConverged);
-  EXPECT_EQ(fixture.ports_.start_calls.at("runtime.a"), 1);
-  EXPECT_EQ(fixture.ports_.start_calls.at("runtime.b"), 1);
-  EXPECT_EQ(fixture.ports_.start_calls.at("runtime.c"), 1);
+  EXPECT_TRUE(fixture.ports_.start_calls.empty());
+  EXPECT_TRUE(fixture.ports_.stop_calls.empty());
+  EXPECT_EQ(fixture.ports_.epochs.size(), 3U);
 }
 
 TEST(ManagerPlannedMaintenanceCoordinator,
@@ -627,19 +604,6 @@ TEST(ManagerPlannedMaintenanceCoordinator,
   succeeded.failure_code = "unexpected";
   succeeded.failure_message = "unexpected";
   EXPECT_FALSE(succeeded.valid());
-
-  // Success is evidence that every retired predecessor process is absent,
-  // not merely that Shutdown returned a syntactically complete observation.
-  auto predecessor_still_present = entered;
-  ASSERT_FALSE(predecessor_still_present.final_process_observations.empty());
-  const auto &observed =
-      predecessor_still_present.final_process_observations.front();
-  predecessor_still_present.final_process_observations.front() =
-      ProcessPresenceObservation(
-          observed.runtime_unit_id(), observed.observer_instance_id(),
-          observed.observation_sequence(), ProcessPresenceState::kPresent,
-          "predecessor-epoch");
-  EXPECT_FALSE(predecessor_still_present.valid());
 
   EXPECT_EQ(std::string(ToString(ManagementIdleState::kIdle)), "idle");
   EXPECT_EQ(std::string(ToString(ManagementIdleState::kPaused)), "paused");

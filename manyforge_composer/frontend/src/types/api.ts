@@ -538,7 +538,7 @@ export interface DeploymentWorkspaceResponse {
 }
 
 export interface PreparedActivationInput {
-  schemaVersion: 'manyforge.prepared_activation_input.v2';
+  schemaVersion: 'manyforge.prepared_activation_input.v3';
   preparedActivationId: string;
   sourceDocumentDigest: string;
   capturedInputDigest: string;
@@ -548,7 +548,9 @@ export interface PreparedActivationInput {
   graphRevision: string;
   programId: string;
   programRevision: string;
-  programBindingId: string;
+  /** Null exactly when the preserved Program is non-executable in this
+   * candidate; the named references are in the preview impact (H1a). */
+  programBindingId: string | null;
   nodeEnvironmentDigest: string;
   assistantMode: 'required' | 'optional' | 'forbidden';
   typedParameterOverrides: Record<string, JsonValue>;
@@ -1408,7 +1410,7 @@ export interface ScenarioDocumentFenceRequest extends LocalWorkspaceFenceRequest
 }
 
 export interface ManagerDeploymentCandidateReceipt {
-  schema_version: 'manyforge.manager_deployment_candidate_receipt.v1';
+  schema_version: 'manyforge.manager_deployment_candidate_receipt.v2';
   deployment_artifact_id: string;
   deployment_revision: string;
   prepared_activation_id: string;
@@ -1420,7 +1422,62 @@ export interface ManagerDeploymentCandidateReceipt {
   };
   expected_admission_generation: number;
   manager_owner_epoch: string;
+  /** Digest of the Manager's authoritative impact; a destructive impact is
+   * accepted only by echoing it. */
+  impact_digest: string;
+  destructive_impact: boolean;
   receipt_digest: string;
+}
+
+/** One component's runtime decision in a Deployment Apply (H1a). */
+export interface ManagerDeploymentImpactComponent {
+  controllable_component_id: string;
+  disposition: 'retain' | 'add' | 'remove' | 'replace';
+  replacement_reasons: string[];
+}
+
+/** One authored Program role that no longer resolves in the candidate. */
+export interface ProgramUnresolvedReference {
+  component_role_id: string;
+  target_role_id: string | null;
+  controllable_component_id: string;
+  command_target_id: string | null;
+  reason: string;
+  detail: string;
+}
+
+/** The Applied Program's derived status (H1a). A non-executable Program is
+ * preserved as authored; the backend refuses Execute by these references. */
+export interface AppliedProgramStatus {
+  deploymentArtifactId: string;
+  deploymentRevision: string;
+  executable: boolean;
+  programId: string;
+  programRevision: string;
+  scenarioId: string;
+  message: string | null;
+  unresolvedReferences: ProgramUnresolvedReference[];
+  affectedNodes: string[];
+  affectedExecutionGroups: string[];
+}
+
+/** Derived, never stored: the Manager's one authoritative Apply impact. */
+export interface ManagerDeploymentImpact {
+  destructive: boolean;
+  components: ManagerDeploymentImpactComponent[];
+  attachmentChangedComponents: string[];
+  /** Kept in the cell, detached at their authored root pose. */
+  detachedComponents: string[];
+  sharedSceneProjectionChanged: boolean;
+  componentDeltaDigest: string;
+  program: {
+    executable: boolean;
+    programId: string;
+    programRevision: string;
+    unresolvedReferences: ProgramUnresolvedReference[];
+    affectedNodes: string[];
+    affectedExecutionGroups: string[];
+  };
 }
 
 export interface ManagerDeploymentRecordDiff {
@@ -1434,6 +1491,7 @@ export interface ManagerDeploymentCandidatePreviewResponse {
   candidateReceipt: ManagerDeploymentCandidateReceipt;
   converged: boolean;
   diff: Record<string, ManagerDeploymentRecordDiff>;
+  impact: ManagerDeploymentImpact;
 }
 
 export interface ManagerSourceMetadata {
@@ -1566,7 +1624,9 @@ export interface ManagerApplyPreparedActivation {
   capturedInputDigest: string;
   deploymentArtifactId: string;
   deploymentRevision: string;
-  programBindingId: string;
+  /** Null exactly when the Apply left the preserved Program non-executable;
+   * reported separately from the runtime outcome in `state` (H1a). */
+  programBindingId: string | null;
   preparedActivationId: string;
 }
 

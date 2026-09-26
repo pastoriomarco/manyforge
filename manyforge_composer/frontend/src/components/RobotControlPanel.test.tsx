@@ -185,7 +185,7 @@ vi.mock('../hooks/useRobotControl', () => ({
     motionTargets: controller.motionTargets.length === 0
       ? [controller.state.status.directControl] : controller.motionTargets,
     gripperTargets: controller.gripperTargets.length === 0
-      ? [controller.state.status.directControlGripper] : controller.gripperTargets,
+      ? [controller.state.status.directControlGripper!] : controller.gripperTargets,
     manualControlAllowed: true, manualControlUnavailableReason: null }),
 }));
 

@@ -415,7 +415,7 @@ function appliedResultFixture(): Record<string, unknown> {
     status: 'applied',
     confirmation_token: null,
     prepared_activation: {
-      schema_version: 'manyforge.prepared_activation_input.v2',
+      schema_version: 'manyforge.prepared_activation_input.v3',
       prepared_activation_id: digestC,
       source_document_digest: digestA,
       captured_input_digest: digestB,
@@ -425,7 +425,7 @@ function appliedResultFixture(): Record<string, unknown> {
       graph_revision: digestC,
       program_id: 'fixture',
       program_revision: digestA,
-      program_binding_id: digestC,
+      program_outcome: { kind: 'bound', program_binding_id: digestC },
       node_environment_digest: digestA,
       assistant_mode: 'forbidden',
       typed_parameter_overrides: {},

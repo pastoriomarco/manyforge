@@ -14,8 +14,9 @@ namespace {
 
 namespace core = manyforge::core;
 
+// Version 4 carries the per-component delta and receipts (H1a-IF.1).
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'S',
-                                              'R', 'C', '3', 0};
+                                              'R', 'C', '4', 0};
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
 constexpr std::uint8_t kRequestTag = 1U;
 constexpr std::uint8_t kPreparingTag = 2U;
@@ -289,6 +290,9 @@ void WriteRequest(Writer &writer,
   WriteGeneration(writer, request.configuration_fence_generation);
   WriteScope(writer, request.configuration_fence_scope);
   writer.Byte(static_cast<std::uint8_t>(request.phase));
+  writer.String(
+      manyforge::deployment::EncodeApplyComponentDelta(request.component_delta));
+  WriteProjectionRevision(writer, request.predecessor_projection_revision);
 }
 
 [[nodiscard]] ManagerSelectedRuntimeCompositionRequestDTO
@@ -309,7 +313,52 @@ ReadRequest(Reader &reader) {
       ReadGeneration<core::ConfigurationFenceGeneration>(reader),
       ReadScope(reader),
       static_cast<ManagerSelectedRuntimeCompositionPhase>(reader.Byte()),
+      manyforge::deployment::DecodeApplyComponentDelta(reader.String()),
+      ReadProjectionRevision(reader),
   };
+}
+
+void WriteReceipts(Writer &writer,
+                   const std::vector<ManagerRuntimeComponentReceiptDTO> &receipts) {
+  WriteVector(writer, receipts, [](Writer &output, const auto &receipt) {
+    WriteStrong(output, receipt.controllable_component_id);
+    output.Byte(static_cast<std::uint8_t>(receipt.disposition));
+    WriteOptionalStrong(output, receipt.installed_runtime_identity);
+    WriteVector(output, receipt.runtime_unit_epochs,
+                [](Writer &epoch_output, const auto &epoch) {
+                  WriteStrong(epoch_output, epoch.runtime_unit_id);
+                  WriteStrong(epoch_output, epoch.runtime_epoch);
+                });
+    output.Boolean(receipt.predecessor_runtime_retained);
+    output.Boolean(receipt.product_binding_resealed);
+  });
+}
+
+[[nodiscard]] std::vector<ManagerRuntimeComponentReceiptDTO>
+ReadReceipts(Reader &reader) {
+  return ReadVector<ManagerRuntimeComponentReceiptDTO>(reader, [](Reader &input) {
+    ManagerRuntimeComponentReceiptDTO receipt{
+        ReadStrong<core::ControllableComponentId>(input),
+        manyforge::deployment::ApplyComponentDisposition::kRetain,
+        std::nullopt, {}, false, false};
+    const auto disposition = input.Byte();
+    if (disposition > static_cast<std::uint8_t>(
+                          manyforge::deployment::ApplyComponentDisposition::kReplace)) {
+      Fail("receipt disposition is unknown");
+    }
+    receipt.disposition =
+        static_cast<manyforge::deployment::ApplyComponentDisposition>(disposition);
+    receipt.installed_runtime_identity = ReadOptionalStrong<core::ContentDigest>(input);
+    receipt.runtime_unit_epochs = ReadVector<core::RuntimeUnitEpochBindingDTO>(
+        input, [](Reader &epoch_input) {
+          return core::RuntimeUnitEpochBindingDTO{
+              ReadStrong<core::RuntimeUnitId>(epoch_input),
+              ReadStrong<core::RuntimeEpoch>(epoch_input)};
+        });
+    receipt.predecessor_runtime_retained = input.Boolean();
+    receipt.product_binding_resealed = input.Boolean();
+    return receipt;
+  });
 }
 
 void WriteError(Writer &writer, const core::ErrorDTO &error) {
@@ -399,6 +448,7 @@ std::string EncodeSelectedRuntimeCompositionRpcResponse(
                   ? kPreparingTag
                   : kInstalledTag);
           WriteRequest(writer, value.request);
+          WriteReceipts(writer, value.component_receipts);
           return std::move(writer).Finish();
         } else {
           Writer writer(kFailureTag);
@@ -421,11 +471,14 @@ DecodeSelectedRuntimeCompositionRpcResponse(const std::string_view bytes) {
   if (tag != kPreparingTag && tag != kInstalledTag) {
     Fail("packet is not a response");
   }
+  auto request = ReadRequest(reader);
+  auto receipts = ReadReceipts(reader);
   ManagerSelectedRuntimeCompositionResultDTO result{
-      ReadRequest(reader),
+      std::move(request),
       tag == kPreparingTag
           ? ManagerSelectedRuntimeCompositionState::kPreparing
-          : ManagerSelectedRuntimeCompositionState::kInstalled};
+          : ManagerSelectedRuntimeCompositionState::kInstalled,
+      std::move(receipts)};
   reader.Finish();
   if (!result.valid()) {
     Fail("decoded result is invalid");

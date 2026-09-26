@@ -13,7 +13,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kCCLCJournalSchemaId = "manyforge.internal.cclc.journal.v5";
-inline constexpr std::int64_t kCCLCJournalSchemaVersion = 11;
+inline constexpr std::int64_t kCCLCJournalSchemaVersion = 12;
 inline constexpr std::int64_t kCCLCJournalSqliteApplicationId = 0x4D464C4A;
 inline constexpr std::string_view kCCLCJournalFilename = "cclc-journal.sqlite3";
 inline constexpr std::size_t kDefaultCCLCExactResultHistory = 128U;
@@ -44,6 +44,16 @@ struct NativeApplyPlanRequestDTO final {
   /// Every native control domain with the generation compiled into its
   /// runtime bindings (the floor for its planned generation).
   std::vector<NativeApplyRouteGenerationDTO> compiled_routes;
+  /// Components of `components` whose runtime the Apply keeps (the Manager
+  /// delta's kRetain rows). Each keeps its exact current lifecycle fact.
+  std::vector<ControllableComponentId> retained_components;
+  /// Predecessor components the Apply removes; never in `components`.
+  std::vector<ControllableComponentId> removed_components;
+  /// Live-readback current routes of retained domains (a subset of
+  /// `compiled_routes`). Each must equal the journal's current fact exactly.
+  std::vector<ActiveControlConfigurationDTO> retained_routes;
+  /// Predecessor domains the Apply removes; never in `compiled_routes`.
+  std::vector<ControlDomainId> removed_domains;
 };
 
 /// CCLC's recorded decision for one native Apply: which components keep an
@@ -51,12 +61,21 @@ struct NativeApplyPlanRequestDTO final {
 /// candidate routes and component facts use. Generations continue from the
 /// journal's watermarks and every earlier plan, so an A->B->A sequence never
 /// reuses or falls behind a generation.
+///
+/// Retained components and routes carry their exact predecessor facts: no
+/// generation advances, nothing is reserved. Only changed ones advance.
+/// Removed components/domains lose their current facts at adoption while
+/// their watermarks stay, so a later re-add always gets a newer generation.
 struct NativeApplyPlanDTO final {
   NamedApplyPublicationTransactionDTO apply;
   RetainedBundleId candidate_retained_bundle_id;
   GraphRevision candidate_graph_revision;
   std::vector<NativeApplyComponentFactDTO> components;
   std::vector<NativeApplyRouteGenerationDTO> routes;
+  std::vector<ControllableComponentId> retained_components;
+  std::vector<ControlDomainId> retained_domains;
+  std::vector<ControllableComponentId> removed_components;
+  std::vector<ControlDomainId> removed_domains;
 };
 
 /// Private promotion of the planned facts after the matching Manager Apply

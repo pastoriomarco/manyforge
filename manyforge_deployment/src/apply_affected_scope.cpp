@@ -1,6 +1,7 @@
 #include "manyforge_deployment/apply_affected_scope.hpp"
 
 #include "apply_affected_scope_internal.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 
 #include <algorithm>
 #include <map>
@@ -54,6 +55,33 @@ template <typename Record, typename Id, typename Key>
   return changed;
 }
 
+/// Keys whose group of records differs, for tables that may hold several
+/// records per key.
+template <typename Record, typename Id, typename Key>
+[[nodiscard]] std::set<Id> ChangedGroupedIds(const std::vector<Record> &predecessor,
+                                             const std::vector<Record> &candidate,
+                                             Key key) {
+  std::map<Id, std::vector<const Record *>> old_groups;
+  std::map<Id, std::vector<const Record *>> new_groups;
+  for (const auto &record : predecessor) old_groups[key(record)].push_back(&record);
+  for (const auto &record : candidate) new_groups[key(record)].push_back(&record);
+  const auto same = [](const std::vector<const Record *> &lhs,
+                       const std::vector<const Record *> &rhs) {
+    return lhs.size() == rhs.size() &&
+           std::equal(lhs.begin(), lhs.end(), rhs.begin(),
+                      [](const Record *a, const Record *b) { return *a == *b; });
+  };
+  std::set<Id> changed;
+  for (const auto &[id, records] : old_groups) {
+    const auto found = new_groups.find(id);
+    if (found == new_groups.end() || !same(records, found->second)) changed.insert(id);
+  }
+  for (const auto &[id, records] : new_groups) {
+    if (!old_groups.contains(id)) changed.insert(id);
+  }
+  return changed;
+}
+
 [[nodiscard]] bool ClaimsAny(const core::ControlBindingDTO &binding,
                              const std::set<core::ResourceId> &resources) {
   return std::any_of(binding.resource_bindings.begin(),
@@ -95,6 +123,66 @@ void MarkComponent(const core::CellGraphDTO &graph,
       MarkBinding(binding, resources);
     }
   }
+}
+
+using NativeComponentConfigurations =
+    std::map<core::ControllableComponentId,
+             native_execution_runtime_contract::Configuration>;
+
+struct NativeHostConfigurations final {
+  native_execution_runtime_contract::Configuration shared;
+  NativeComponentConfigurations components;
+};
+
+[[nodiscard]] NativeHostConfigurations
+NativeConfigurations(const core::CellGraphDTO &graph,
+                     const core::RuntimeUnitDTO &unit) {
+  // Sealed inputs already passed bundle/schema verification. Decode once per
+  // host, then use the same ownership/coordinate selection as construction
+  // and retained component identity.
+  const auto configuration =
+      detail::decode_native_execution_runtime_configuration(
+          unit.configuration, graph, unit.runtime_unit_id);
+  NativeHostConfigurations result{configuration, {}};
+  result.shared.initial_joint_positions_rad.clear();
+  result.shared.motion_target_limits.clear();
+  result.shared.direct_control_joint_limits.clear();
+  result.shared.gripper_target_configurations.clear();
+  for (const auto &component : graph.controllable_components) {
+    if (std::find(component.runtime_unit_ids.begin(),
+                  component.runtime_unit_ids.end(), unit.runtime_unit_id) !=
+        component.runtime_unit_ids.end()) {
+      result.components.emplace(
+          component.controllable_component_id,
+          detail::select_native_component_configuration(
+              configuration, graph, unit.runtime_unit_id,
+              component.controllable_component_id));
+    }
+  }
+  return result;
+}
+
+[[nodiscard]] bool MarkNativeConfigurationChanges(
+    const core::CellGraphDTO &old_graph, const core::RuntimeUnitDTO &old_unit,
+    const core::CellGraphDTO &new_graph, const core::RuntimeUnitDTO &new_unit,
+    std::set<core::ResourceId> &resources) {
+  const auto old_configurations = NativeConfigurations(old_graph, old_unit);
+  const auto new_configurations = NativeConfigurations(new_graph, new_unit);
+  for (const auto &[component, configuration] : old_configurations.components) {
+    const auto found = new_configurations.components.find(component);
+    if (found == new_configurations.components.end() ||
+        found->second != configuration) {
+      MarkComponent(old_graph, component, resources);
+      MarkComponent(new_graph, component, resources);
+    }
+  }
+  for (const auto &[component, configuration] : new_configurations.components) {
+    static_cast<void>(configuration);
+    if (!old_configurations.components.contains(component)) {
+      MarkComponent(new_graph, component, resources);
+    }
+  }
+  return old_configurations.shared != new_configurations.shared;
 }
 
 void MarkDomain(const core::CellGraphDTO &graph,
@@ -234,13 +322,16 @@ derive_apply_configuration_fence_scope_verified_values(
   const auto &new_graph = new_bundle.cell_graph;
   std::set<core::ResourceId> affected_resources;
 
+  // Retained policy records are a runtime dependency of every component
+  // (see apply_component_delta.hpp), so their change fences the whole cell.
   const bool cell_wide_product_changed =
       old_bundle.compiled_products.planning_collision_model !=
           new_bundle.compiled_products.planning_collision_model ||
       old_bundle.compiled_products.symbol_role_maps !=
           new_bundle.compiled_products.symbol_role_maps ||
       old_graph.model_instances != new_graph.model_instances ||
-      old_graph.component_attachments != new_graph.component_attachments;
+      old_graph.component_attachments != new_graph.component_attachments ||
+      old_bundle.retained_policy_records != new_bundle.retained_policy_records;
   if (cell_wide_product_changed) {
     MarkAllBindings(old_graph, affected_resources);
     MarkAllBindings(new_graph, affected_resources);
@@ -275,6 +366,17 @@ derive_apply_configuration_fence_scope_verified_values(
             return binding.control_binding_id;
           });
   for (const auto &id : changed_bindings) {
+    MarkBindingId(old_graph, id, affected_resources);
+    MarkBindingId(new_graph, id, affected_resources);
+  }
+  // Stop-timing selections are part of a binding's runtime identity.
+  const auto changed_stop_timing =
+      ChangedGroupedIds<core::StopTimingSelectionDTO, core::ControlBindingId>(
+          old_bundle.stop_timing_parameters, new_bundle.stop_timing_parameters,
+          [](const core::StopTimingSelectionDTO &selection) {
+            return selection.control_binding_id;
+          });
+  for (const auto &id : changed_stop_timing) {
     MarkBindingId(old_graph, id, affected_resources);
     MarkBindingId(new_graph, id, affected_resources);
   }
@@ -338,6 +440,34 @@ derive_apply_configuration_fence_scope_verified_values(
           [](const core::RuntimeUnitDTO &runtime_unit) {
             return runtime_unit.runtime_unit_id;
           });
+  std::set<core::RuntimeUnitId> stable_native_hosts;
+  const auto new_runtime_units = IndexBy<core::RuntimeUnitDTO, core::RuntimeUnitId>(
+      new_graph.runtime_units,
+      [](const auto &unit) { return unit.runtime_unit_id; });
+  for (const auto &old_unit : old_graph.runtime_units) {
+    const auto found = new_runtime_units.find(old_unit.runtime_unit_id);
+    if (old_unit.runtime_profile_id.value() !=
+            native_execution_runtime_contract::kRuntimeProfileId ||
+        found == new_runtime_units.end()) {
+      continue;
+    }
+    const auto &new_unit = *found->second;
+    if (old_unit.runtime_profile_id != new_unit.runtime_profile_id ||
+        old_unit.runtime_profile_revision != new_unit.runtime_profile_revision ||
+        old_unit.dependency_runtime_unit_ids != new_unit.dependency_runtime_unit_ids) {
+      continue;
+    }
+    // A stable native host carries the union of controller settings. Only
+    // changed owners are affected by that union; shared settings remain in
+    // every selected configuration. Infrastructure products are handled below.
+    stable_native_hosts.insert(old_unit.runtime_unit_id);
+    if (!MarkNativeConfigurationChanges(old_graph, old_unit, new_graph, new_unit,
+                                        affected_resources)) {
+      affected_runtime_units.erase(old_unit.runtime_unit_id);
+    }
+    // Shared settings also affect runtime/domain/provider consumers of the
+    // host; retain ordinary dependency closure for those changes.
+  }
   const auto changed_runtime_products =
       ChangedIds<core::RetainedRuntimeUnitProductsDTO, core::RuntimeUnitId>(
           old_bundle.compiled_products.runtime_unit_products,
@@ -347,6 +477,21 @@ derive_apply_configuration_fence_scope_verified_values(
           });
   affected_runtime_units.insert(changed_runtime_products.begin(),
                                 changed_runtime_products.end());
+  const auto changed_runtime_contracts =
+      ChangedGroupedIds<core::RetainedRuntimeContractRequirementDTO, core::RuntimeUnitId>(
+          old_bundle.runtime_contract_requirements,
+          new_bundle.runtime_contract_requirements,
+          [](const core::RetainedRuntimeContractRequirementDTO &requirement) {
+            return requirement.runtime_unit_id;
+          });
+  for (const auto &unit : changed_runtime_contracts) {
+    // Native requirements are the verified aggregate of the installed
+    // bindings/providers, whose own changes are already included above.
+    // Generic runtimes retain whole-unit dependency closure.
+    if (!stable_native_hosts.contains(unit)) {
+      affected_runtime_units.insert(unit);
+    }
+  }
   ExpandRuntimeDependents(old_graph, affected_runtime_units);
   ExpandRuntimeDependents(new_graph, affected_runtime_units);
   MarkRuntimeUnitDependents(old_bundle, affected_runtime_units,

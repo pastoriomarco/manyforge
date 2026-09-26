@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -29,7 +30,7 @@ struct PreparedActivationMaterialization final {
   core::DeploymentRevision deployment_revision;
   ScenarioDeploymentCompatibilityDTO deployment_compatibility;
   std::shared_ptr<const RetainedBundle> bundle;
-  VerifiedRetainedModelMap model_map;
+  std::optional<VerifiedRetainedModelMap> model_map;
   std::shared_ptr<const RetainedBundle> canonical_empty_bundle;
   std::vector<PreparedActivationArtifact> raw_artifacts;
   std::vector<PreparedActivationArtifact> catalog_artifacts;

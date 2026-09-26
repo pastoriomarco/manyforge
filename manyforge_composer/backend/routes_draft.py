@@ -238,6 +238,60 @@ def _active_catalog(state: ComposerState):
     return read_active_node_environment(state).catalog
 
 
+def _non_executable_applied_context(
+    state: ComposerState,
+) -> tuple[_AppliedContext | None, dict[str, Any] | None]:
+    assert state.headless_client is not None
+    try:
+        status = state.headless_client.program_applied_status()
+    except HeadlessClientError as error:
+        return None, {
+            "code": error.code,
+            "message": str(error),
+            "restorationGates": [],
+        }
+    program = status.get("program") if isinstance(status, dict) else None
+    try:
+        program_identity = Program.from_dict(
+            program,
+            _active_catalog(state),
+            path="<headless-applied-program>",
+        ).program_revision
+    except (
+        ProgramValidationError,
+        ActiveNodeEnvironmentProjectionError,
+        HeadlessClientError,
+        TypeError,
+        ValueError,
+        StrictArtifactError,
+    ):
+        program_identity = None
+    if (
+        not isinstance(status, dict)
+        or status.get("executable") is not False
+        or not isinstance(program, dict)
+        or program.get("program_id") != status.get("program_id")
+        or program_identity != status.get("program_revision")
+    ):
+        return None, {
+            "code": "program_applied_selection_invalid",
+            "message": "headless API returned an invalid Applied Program status",
+            "restorationGates": [],
+        }
+    return (
+        _AppliedContext(
+            scenario_id=status["scenario_id"],
+            source_document_digest=status["source_document_digest"],
+            program_revision=status["program_revision"],
+            record_digest=status["record_digest"],
+            program_document=program,
+            binding_document={},
+            projection_document=status,
+        ),
+        None,
+    )
+
+
 def _applied_context(
     state: ComposerState,
 ) -> tuple[_AppliedContext | None, dict[str, Any] | None]:
@@ -250,6 +304,10 @@ def _applied_context(
     try:
         applied = state.headless_client.program_applied()
     except HeadlessClientError as error:
+        if error.code == "program_applied_non_executable":
+            # H1a: the preserved Program stays the authoring base so the
+            # operator can edit and re-Apply it; it has no current binding.
+            return _non_executable_applied_context(state)
         return None, {
             "code": error.code,
             "message": str(error),
@@ -422,20 +480,27 @@ def _observed_move_arguments(
         raise headless_client_http_exception(error) from error
     targets = targets_projection.get("targets")
     control = control_projection.get("control_state")
-    direct = targets.get("direct_control") if isinstance(targets, dict) else None
-    direct_rows = (
-        [row for row in targets.get("direct_control_targets", []) if isinstance(row, dict)]
-        if isinstance(targets, dict) and isinstance(targets.get("direct_control_targets"), list)
-        else []
-    )
-    if not direct_rows and isinstance(direct, dict):
-        direct_rows = [direct]
+    # execution_targets.v3 / execution_control_state.v6 (H1a-IF.2): motion
+    # targets are component-owned rows; observations join by the full key.
+    direct_rows = [
+        {
+            "controllable_component_id": component.get("controllable_component_id"),
+            "command_target_id": target.get("command_target_id"),
+            "operation_capability_id": target.get("operation_capability_id"),
+            "target_role_id": target["command"].get("target_role_id"),
+        }
+        for component in (targets.get("components", []) if isinstance(targets, dict) else [])
+        if isinstance(component, dict)
+        for target in component.get("targets", [])
+        if isinstance(target, dict)
+        and target.get("presentation") == "motion"
+        and isinstance(target.get("command"), dict)
+    ]
     observed_rows = (
-        [row for row in control.get("observed_target_states", []) if isinstance(row, dict)]
-        if isinstance(control, dict) and isinstance(control.get("observed_target_states"), list)
+        [row for row in control.get("observed_targets", []) if isinstance(row, dict)]
+        if isinstance(control, dict) and isinstance(control.get("observed_targets"), list)
         else []
     )
-    observed = control.get("observed_motion") if isinstance(control, dict) else None
     authoring = state.draft_session.snapshot().get("authoring")
     if not isinstance(authoring, dict):
         raise DraftSessionError(
@@ -464,18 +529,14 @@ def _observed_move_arguments(
         )
     direct = matching_direct[0]
     matching_observed = [
-        row.get("motion") for row in observed_rows
-        if row.get("motion_target_role_id") == node_target_role
+        row.get("observed") for row in observed_rows
+        if row.get("controllable_component_id") == direct.get("controllable_component_id")
         and row.get("command_target_id") == direct.get("command_target_id")
-        and row.get("controllable_component_id") == direct.get("controllable_component_id")
-        and isinstance(row.get("motion"), dict)
+        and row.get("operation_capability_id") == direct.get("operation_capability_id")
+        and isinstance(row.get("observed"), dict)
+        and row["observed"].get("kind") == "joint_positions"
     ]
-    if observed_rows:
-        observed = matching_observed[0] if len(matching_observed) == 1 else None
-    elif len(direct_rows) == 1:
-        observed = control.get("observed_motion") if isinstance(control, dict) else None
-    else:
-        observed = None
+    observed = matching_observed[0] if len(matching_observed) == 1 else None
     if (
         targets_projection.get("ok") is not True
         or control_projection.get("ok") is not True

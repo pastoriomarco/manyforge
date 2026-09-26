@@ -217,7 +217,9 @@ def _submit_native_cclc_lifecycle(
     )
 
 
-def _qualify_native_cclc_product(execution_run_root: Path) -> None:
+def _qualify_native_cclc_product(
+    execution_run_root: Path, *, gripper_only: bool = False
+) -> None:
     _submit_native_cclc_lifecycle(
         execution_run_root,
         intent_kind="prepare",
@@ -225,7 +227,14 @@ def _qualify_native_cclc_product(execution_run_root: Path) -> None:
     )
     # This fixture was published without Manager Apply. Establish its routes
     # through ordinary CCLC before Enable opens command admission.
-    _submit_native_cclc_routes(execution_run_root)
+    _submit_native_cclc_routes(
+        execution_run_root,
+        expected_domain_ids=(
+            ["lite6_gripper_domain"]
+            if gripper_only
+            else ["lite6_arm_domain", "lite6_gripper_domain"]
+        ),
+    )
     _submit_native_cclc_lifecycle(
         execution_run_root,
         intent_kind="enable",
@@ -244,6 +253,7 @@ def _submit_native_cclc_routes(
     execution_run_root: Path,
     *,
     request_prefix: str = "process.route",
+    expected_domain_ids: list[str] | None = None,
 ) -> None:
     client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=5.0)
     admission = CellAdmissionClient(execution_run_root, timeout_seconds=5.0)
@@ -260,7 +270,9 @@ def _submit_native_cclc_routes(
         row["desired_configuration"]["control_domain_id"]
         for row in template_set["templates"]
     )
-    if domain_ids != ["lite6_arm_domain", "lite6_gripper_domain"]:
+    if expected_domain_ids is None:
+        expected_domain_ids = ["lite6_arm_domain", "lite6_gripper_domain"]
+    if domain_ids != expected_domain_ids:
         raise RuntimeError(
             f"native CCLC product has an unexpected route set: {domain_ids}"
         )
@@ -405,6 +417,7 @@ def _start_host(
     reconciliation_test_throw: str | None = None,
     host_environment: str = "MANYFORGE_NATIVE_EXECUTION_HOST",
     qualify_cclc: bool = True,
+    include_gripper_target: bool = True,
 ) -> subprocess.Popen[bytes]:
     environment = os.environ.copy()
     if fake_worker_marker is not None:
@@ -423,31 +436,38 @@ def _start_host(
         )
     if reconciliation_test_throw is not None:
         environment["MANYFORGE_RECONCILIATION_TEST_THROW"] = reconciliation_test_throw
+    command = [
+        str(_required_path(host_environment)),
+        "--package-root",
+        str(fixture_root / "retained-package"),
+        "--manager-state-root",
+        str(fixture_root / "manager-state"),
+        "--execution-state-root",
+        str(execution_state_root),
+        "--execution-run-root",
+        str(execution_run_root),
+        "--program-binding-id",
+        manifest["program_binding_id"],
+        "--candidate-worker",
+        str(
+            candidate_worker
+            or _required_path("MANYFORGE_ROBOPLAN_CANDIDATE_WORKER")
+        ),
+        "--cell-id",
+        manifest["cell_id"],
+    ]
+    motion_target_role_id = manifest.get("motion_target_role_id")
+    if motion_target_role_id is None:
+        motion_target_role_id = manifest.get("target_role_id")
+    if motion_target_role_id is not None:
+        command.extend(["--motion-target-role-id", motion_target_role_id])
+    gripper_target_role_id = manifest.get("gripper_target_role_id")
+    if include_gripper_target and gripper_target_role_id is not None:
+        command.extend(
+            ["--gripper-target-role-id", gripper_target_role_id]
+        )
     process = subprocess.Popen(
-        [
-            str(_required_path(host_environment)),
-            "--package-root",
-            str(fixture_root / "retained-package"),
-            "--manager-state-root",
-            str(fixture_root / "manager-state"),
-            "--execution-state-root",
-            str(execution_state_root),
-            "--execution-run-root",
-            str(execution_run_root),
-            "--program-binding-id",
-            manifest["program_binding_id"],
-            "--motion-target-role-id",
-            manifest["target_role_id"],
-            "--gripper-target-role-id",
-            manifest["gripper_target_role_id"],
-            "--candidate-worker",
-            str(
-                candidate_worker
-                or _required_path("MANYFORGE_ROBOPLAN_CANDIDATE_WORKER")
-            ),
-            "--cell-id",
-            manifest["cell_id"],
-        ],
+        command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         env=environment,
@@ -460,7 +480,10 @@ def _start_host(
             detail = (process.stderr.read() if process.stderr else b"").decode(
                 errors="replace"
             )
-            raise RuntimeError(f"native execution host exited during startup: {detail}")
+            raise RuntimeError(
+                "native execution host exited during startup "
+                f"(status {process.returncode}): {detail}"
+            )
         try:
             response = client.identity()
             if response.get("ok") is True:
@@ -478,16 +501,24 @@ def _start_host(
                             ):
                                 assert time.monotonic() < deadline
                                 time.sleep(0.01)
-                            _qualify_native_cclc_product(execution_run_root)
+                            _qualify_native_cclc_product(
+                                execution_run_root,
+                                gripper_only=manifest.get("gripper_only") is True,
+                            )
                             _wait_for_current_cclc_routes(execution_run_root)
                     except Exception as error:
                         _stop_host(process)
                         detail = (
                             process.stderr.read() if process.stderr else b""
                         ).decode(errors="replace")
+                        structured_error = (
+                            f" [{error.code}: {error.details}]"
+                            if isinstance(error, HeadlessApiError)
+                            else ""
+                        )
                         raise RuntimeError(
                             "native CCLC product qualification failed: "
-                            f"{error}; host stderr: {detail}"
+                            f"{error}{structured_error}; host stderr: {detail}"
                         ) from error
                 return process
         except HeadlessApiError as error:
@@ -602,7 +633,9 @@ def _run_native_benchmark_move(
     identity = client.identity()["identity"]
     targets = client.targets()
     assert targets["identity"] == identity
-    direct = targets["targets"]["direct_control"]
+    _, direct = _execution_target(
+        targets["targets"], presentation="motion"
+    )
     operation = _direct_control_joint_operation(
         identity,
         direct,
@@ -866,14 +899,62 @@ def _planning_operation(
     }
 
 
+def _execution_target(
+    targets: Mapping[str, Any], *, presentation: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    matches = [
+        (component, target)
+        for component in targets["components"]
+        for target in component["targets"]
+        if target["presentation"] == presentation
+    ]
+    assert len(matches) == 1, (presentation, matches)
+    component, target = matches[0]
+    assert target["command"] is not None
+    return component, target
+
+
+def _status_target(
+    status: Mapping[str, Any], *, presentation: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return _execution_target(status["targets"], presentation=presentation)
+
+
+def _status_observation(
+    status: Mapping[str, Any], *, presentation: str
+) -> dict[str, Any]:
+    component, target = _status_target(status, presentation=presentation)
+    target_key = (
+        component["controllable_component_id"],
+        target["command_target_id"],
+        target["operation_capability_id"],
+    )
+    matching = [
+        row["observed"]
+        for row in status["control_state"]["observed_targets"]
+        if (
+            row["controllable_component_id"],
+            row["command_target_id"],
+            row["operation_capability_id"],
+        )
+        == target_key
+    ]
+    assert len(matching) == 1, (target_key, matching)
+    observed = matching[0]
+    assert observed is not None
+    return observed
+
+
 def _direct_control_joint_operation(
-    identity: dict[str, Any],
-    direct: dict[str, Any],
+    identity: Mapping[str, Any],
+    target: dict[str, Any],
     *,
     request_id: str,
     positions_rad: list[float],
 ) -> dict[str, Any]:
-    joint_names = [joint["source_joint_name"] for joint in direct["joints"]]
+    command = target["command"]
+    manual_control = command["manual_control"]
+    joint_names = [joint["source_joint_name"] for joint in command["joints"]]
     assert len(joint_names) == len(positions_rad)
     return {
         "request_context": {
@@ -882,18 +963,18 @@ def _direct_control_joint_operation(
             "source_label": "composer_ui",
             "correlation_id": None,
         },
-        "program_id": direct["program_id"],
-        "program_revision": direct["program_revision"],
-        "program_binding_id": direct["program_binding_id"],
-        "program_run_id": direct["program_run_id"],
+        "program_id": manual_control["program_id"],
+        "program_revision": manual_control["program_revision"],
+        "program_binding_id": manual_control["program_binding_id"],
+        "program_run_id": manual_control["program_run_id"],
         "expected_graph_revision": identity["graph_revision"],
         "expected_retained_bundle_id": identity["retained_bundle_id"],
         "expected_scene_revision": identity["scene_revision"],
         "participants": [
             {
-                "component_role_id": direct["component_role_id"],
-                "target_role_id": direct["target_role_id"],
-                "required_capability_id": direct["operation_capability_id"],
+                "component_role_id": command["component_role_id"],
+                "target_role_id": command["target_role_id"],
+                "required_capability_id": target["operation_capability_id"],
                 "action_span": None,
                 "payload": _planning_motion(
                     f"robot-control-{request_id}",
@@ -904,8 +985,8 @@ def _direct_control_joint_operation(
                     },
                 )
                 | {
-                    "base_frame_role_id": direct["base_frame_role_id"],
-                    "tcp_frame_role_id": direct["tcp_frame_role_id"],
+                    "base_frame_role_id": command["base_frame_role_id"],
+                    "tcp_frame_role_id": command["tcp_frame_role_id"],
                     "planning_profile": "balanced",
                     "speed_profile": {
                         "velocity_scale": 1.0,
@@ -926,7 +1007,10 @@ def _direct_control_joint_operation(
 def _direct_control_gripper_operation(
     status: dict[str, Any], *, request_id: str, position: float
 ) -> dict[str, Any]:
-    direct = status["direct_control_gripper"]
+    identity = status["identity"]
+    _, direct_target = _status_target(status, presentation="gripper")
+    direct = direct_target["command"]
+    manual_control = direct["manual_control"]
     position_value = (
         {"kind": "angular_rad", "value_rad": position}
         if direct["resource"]["coordinate_kind"] == "angular_rad"
@@ -935,22 +1019,24 @@ def _direct_control_gripper_operation(
     return {
         "request_context": {
             "request_id": request_id,
-            "request_owner_epoch": status["owner_epoch"],
+            "request_owner_epoch": identity["owner_epoch"],
             "source_label": "composer_ui",
             "correlation_id": None,
         },
-        "program_id": direct["program_id"],
-        "program_revision": direct["program_revision"],
-        "program_binding_id": direct["program_binding_id"],
-        "program_run_id": direct["program_run_id"],
-        "expected_graph_revision": status["graph_revision"],
-        "expected_retained_bundle_id": status["retained_bundle_id"],
-        "expected_scene_revision": status["scene_revision"],
+        "program_id": manual_control["program_id"],
+        "program_revision": manual_control["program_revision"],
+        "program_binding_id": manual_control["program_binding_id"],
+        "program_run_id": manual_control["program_run_id"],
+        "expected_graph_revision": identity["graph_revision"],
+        "expected_retained_bundle_id": identity["retained_bundle_id"],
+        "expected_scene_revision": identity["scene_revision"],
         "participants": [
             {
                 "component_role_id": direct["component_role_id"],
                 "target_role_id": direct["target_role_id"],
-                "required_capability_id": direct["operation_capability_id"],
+                "required_capability_id": direct_target[
+                    "operation_capability_id"
+                ],
                 "action_span": None,
                 "payload": {
                     "kind": "capability_command",
@@ -978,13 +1064,15 @@ def _direct_control_gripper_operation(
 def _direct_control_motion_operation(
     status: dict[str, Any], *, request_id: str, motion: dict[str, Any]
 ) -> dict[str, Any]:
+    identity = status["identity"]
+    _, target = _status_target(status, presentation="motion")
+    observed = _status_observation(status, presentation="motion")
     operation = _direct_control_joint_operation(
-        status,
-        status["direct_control"],
+        identity,
+        target,
         request_id=request_id,
         positions_rad=[
-            float(value)
-            for value in status["direct_control"]["observed_state"]["positions_rad"]
+            float(value) for value in observed["positions_rad"]
         ],
     )
     payload = operation["participants"][0]["payload"]
@@ -1138,6 +1226,101 @@ def test_production_standalone_cclc_remains_closed_without_manager_liveness(
         _stop_host(process)
 
 
+def test_arm_only_native_process_publishes_component_based_status(
+    tmp_path: Path,
+) -> None:
+    # CMake generates this sibling fixture specifically without the independent
+    # gripper domain. It is already published and does not require managed Apply.
+    built_fixture = _required_path("MANYFORGE_I6_NATIVE_FIXTURE_ROOT")
+    arm_only_fixture = built_fixture.parent / "lite6_native_cclc_readiness_fixture"
+    assert arm_only_fixture.is_dir(), (
+        "the native process test requires CMake's generated arm-only CCLC "
+        f"readiness fixture beside {built_fixture}"
+    )
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(arm_only_fixture, fixture_root)
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    state_root, run_root = tmp_path / "state", tmp_path / "run"
+    state_root.mkdir()
+    run_root.mkdir()
+    process = _start_host(
+        fixture_root,
+        state_root,
+        run_root,
+        manifest,
+        include_gripper_target=False,
+        qualify_cclc=False,
+    )
+    client = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+    try:
+        identity = client.identity()["identity"]
+        targets = client.targets()["targets"]
+        control_state = client.control_state()["control_state"]
+        observation = client.observation()["observation"]
+
+        assert identity["schema_version"] == "manyforge.execution_identity.v2"
+        assert set(identity) == {
+            "active_publication_generation",
+            "cell_id",
+            "control_management_mode",
+            "graph_revision",
+            "owner_epoch",
+            "retained_bundle_id",
+            "scene_revision",
+            "schema_version",
+        }
+        assert targets["schema_version"] == "manyforge.execution_targets.v3"
+        supported = [
+            (component, target)
+            for component in targets["components"]
+            for target in component["targets"]
+            if target["presentation"] != "unsupported"
+        ]
+        assert len(supported) == 1
+        component, target = supported[0]
+        assert target["presentation"] == "motion"
+        assert target["command"] is not None
+        target_key = (
+            component["controllable_component_id"],
+            target["command_target_id"],
+            target["operation_capability_id"],
+        )
+
+        assert control_state["schema_version"] == (
+            "manyforge.execution_control_state.v6"
+        )
+        assert set(control_state) == {
+            "cell_stop_action",
+            "manual_operations",
+            "observed_targets",
+            "runtime_scale_control",
+            "schema_version",
+        }
+        assert control_state["runtime_scale_control"] is not None
+        control_rows = control_state["observed_targets"]
+        assert len(control_rows) == 1
+        control_row = control_rows[0]
+        assert (
+            control_row["controllable_component_id"],
+            control_row["command_target_id"],
+            control_row["operation_capability_id"],
+        ) == target_key
+        assert control_row["observed"]["kind"] == "joint_positions"
+
+        assert observation["schema_version"] == "manyforge.execution_observation.v3"
+        observation_rows = observation["targets"]
+        assert len(observation_rows) == 1
+        observation_row = observation_rows[0]
+        assert (
+            observation_row["controllable_component_id"],
+            observation_row["command_target_id"],
+            observation_row["operation_capability_id"],
+        ) == target_key
+        assert len(observation_row["positions_si"]) == 6
+    finally:
+        _stop_host(process)
+
+
 def test_native_disable_closes_arm_and_gripper_dispatch(
     tmp_path: Path,
 ) -> None:
@@ -1175,14 +1358,14 @@ def test_native_disable_closes_arm_and_gripper_dispatch(
         )
 
         before_positions = list(
-            before["direct_control"]["observed_state"]["positions_rad"]
+            _status_observation(before, presentation="motion")["positions_rad"]
         )
         arm_positions = list(before_positions)
         arm_positions[0] += 0.05
         for operation in (
             _direct_control_joint_operation(
-                before,
-                before["direct_control"],
+                before["identity"],
+                _status_target(before, presentation="motion")[1],
                 request_id="disabled.arm",
                 positions_rad=arm_positions,
             ),
@@ -1199,7 +1382,7 @@ def test_native_disable_closes_arm_and_gripper_dispatch(
         # No dispatch or motion: the observed arm is exactly where it was.
         after_refusal = headless.execution_diagnostics()["status"]
         assert (
-            after_refusal["direct_control"]["observed_state"]["positions_rad"]
+            _status_observation(after_refusal, presentation="motion")["positions_rad"]
             == before_positions
         )
 
@@ -1222,8 +1405,8 @@ def test_native_disable_closes_arm_and_gripper_dispatch(
         with pytest.raises(HeadlessClientError) as refused_after_restart:
             headless.execute(
                 _direct_control_joint_operation(
-                    restarted,
-                    restarted["direct_control"],
+                    restarted["identity"],
+                    _status_target(restarted, presentation="motion")[1],
                     request_id="disabled.arm.after-restart",
                     positions_rad=arm_positions,
                 )
@@ -1250,13 +1433,13 @@ def test_native_disable_closes_arm_and_gripper_dispatch(
         # now execute to completion on both arm and gripper.
         current = headless.execution_diagnostics()["status"]
         reenabled_positions = list(
-            current["direct_control"]["observed_state"]["positions_rad"]
+            _status_observation(current, presentation="motion")["positions_rad"]
         )
         reenabled_positions[0] += 0.05
         arm = headless.execute(
             _direct_control_joint_operation(
-                current,
-                current["direct_control"],
+                current["identity"],
+                _status_target(current, presentation="motion")[1],
                 request_id="reenabled.arm",
                 positions_rad=reenabled_positions,
             )
@@ -1266,9 +1449,9 @@ def test_native_disable_closes_arm_and_gripper_dispatch(
         gripper = _manual_gripper_submission(
             headless,
             request_id="reenabled.gripper",
-            position_kind=headless.execution_diagnostics()["status"][
-                "direct_control_gripper"
-            ]["resource"]["coordinate_kind"],
+            position_kind=_status_target(
+                headless.execution_diagnostics()["status"], presentation="gripper"
+            )[1]["command"]["resource"]["coordinate_kind"],
             position=0.007,
         )
         gripper_terminal = _wait_terminal(headless, gripper["accepted"]["operation_id"])
@@ -1282,13 +1465,13 @@ def test_native_disable_closes_arm_and_gripper_dispatch(
         _wait_for_current_cclc_routes(run_root)
         after_restart = headless.execution_diagnostics()["status"]
         after_restart_positions = list(
-            after_restart["direct_control"]["observed_state"]["positions_rad"]
+            _status_observation(after_restart, presentation="motion")["positions_rad"]
         )
         after_restart_positions[0] -= 0.05
         restarted_arm = headless.execute(
             _direct_control_joint_operation(
-                after_restart,
-                after_restart["direct_control"],
+                after_restart["identity"],
+                _status_target(after_restart, presentation="motion")[1],
                 request_id="reenabled.arm.after-restart",
                 positions_rad=after_restart_positions,
             )
@@ -1343,7 +1526,10 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         )
     )
     headless = HeadlessHttpClient("http://headless.test", client=raw_api)
-    runner = OrchestratorRunner(KernelClient(RecordingTransport(headless)))
+    runner = OrchestratorRunner(
+        KernelClient(RecordingTransport(headless)),
+        json.loads((fixture_root / "program_binding.json").read_text("utf-8")),
+    )
 
     try:
         deadline = time.monotonic() + 2.0
@@ -1378,47 +1564,94 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         assert status["ok"] is True
         assert identity["command"] == "identity"
         assert identity["identity"]["schema_version"] == (
-            "manyforge.execution_identity.v1"
+            "manyforge.execution_identity.v2"
         )
+        assert set(identity["identity"]) == {
+            "active_publication_generation",
+            "cell_id",
+            "control_management_mode",
+            "graph_revision",
+            "owner_epoch",
+            "retained_bundle_id",
+            "scene_revision",
+            "schema_version",
+        }
         assert identity["identity"]["control_management_mode"] == (
             "component_lifecycle"
         )
         assert targets["command"] == "targets"
         assert targets["targets"]["schema_version"] == (
-            "manyforge.execution_targets.v2"
+            "manyforge.execution_targets.v3"
         )
-        assert targets["targets"]["direct_control_targets"] == [
-            targets["targets"]["direct_control"]
+        target_components = targets["targets"]["components"]
+        target_component_ids = [
+            component["controllable_component_id"]
+            for component in target_components
         ]
-        assert targets["targets"]["direct_control_gripper_targets"] == [
-            targets["targets"]["direct_control_gripper"]
-        ]
+        assert target_component_ids == sorted(set(target_component_ids))
+        target_keys: set[tuple[str, str, str]] = set()
+        for component in target_components:
+            assert set(component) == {
+                "availability",
+                "controllable_component_id",
+                "targets",
+            }
+            availability = component["availability"]
+            assert set(availability) == {"command_eligible", "reason"}
+            assert availability["command_eligible"] is (
+                availability["reason"] is None
+            )
+            target_pairs = [
+                (target["command_target_id"], target["operation_capability_id"])
+                for target in component["targets"]
+            ]
+            assert target_pairs == sorted(set(target_pairs))
+            for target in component["targets"]:
+                assert set(target) == {
+                    "command",
+                    "command_target_id",
+                    "operation_capability_id",
+                    "presentation",
+                }
+                if target["presentation"] == "unsupported":
+                    assert target["command"] is None
+                    continue
+                command = target["command"]
+                target_keys.add(
+                    (
+                        component["controllable_component_id"],
+                        target["command_target_id"],
+                        target["operation_capability_id"],
+                    )
+                )
+                assert "observed_state" not in command
+                assert "controllable_component_id" not in command
+                assert "command_target_id" not in command
+                assert "operation_capability_id" not in command
+                assert set(command["manual_control"]) == {
+                    "program_binding_id",
+                    "program_id",
+                    "program_revision",
+                    "program_run_id",
+                }
         assert control_state["command"] == "control_state"
         assert control_state["control_state"]["schema_version"] == (
-            "manyforge.execution_control_state.v5"
+            "manyforge.execution_control_state.v6"
         )
-        observed_target_states = control_state["control_state"][
-            "observed_target_states"
-        ]
-        assert [
-            (row["controllable_component_id"], row["command_target_id"])
-            for row in observed_target_states
-        ] == [
+        observed_targets = control_state["control_state"]["observed_targets"]
+        observed_target_keys = [
             (
-                targets["targets"]["direct_control"]["controllable_component_id"],
-                targets["targets"]["direct_control"]["command_target_id"],
-            ),
-            (
-                targets["targets"]["direct_control_gripper"][
-                    "controllable_component_id"
-                ],
-                targets["targets"]["direct_control_gripper"]["command_target_id"],
-            ),
+                row["controllable_component_id"],
+                row["command_target_id"],
+                row["operation_capability_id"],
+            )
+            for row in observed_targets
         ]
-        assert observed_target_states[0]["motion"] is not None
-        assert observed_target_states[0]["gripper"] is None
-        assert observed_target_states[1]["motion"] is None
-        assert observed_target_states[1]["gripper"] is not None
+        assert sorted(observed_target_keys) == sorted(target_keys)
+        assert [row["observed"]["kind"] for row in observed_targets] == [
+            "joint_positions",
+            "coordinate",
+        ]
         assert control_state["control_state"]["manual_operations"] == []
         manual_operations = resident_control_state["control_state"]["manual_operations"]
         # This is a real manual operation, not a fabricated captured Program.
@@ -1426,11 +1659,21 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
             operation_id
         ]
         assert targets["identity"] == control_state["identity"] == identity["identity"]
-        assert observation["ok"] is True
+        assert observation["ok"] is True, observation
         assert observation["command"] == "observation"
         assert observation["observation"]["schema_version"] == (
-            "manyforge.execution_observation.v2"
+            "manyforge.execution_observation.v3"
         )
+        observation_targets = observation["observation"]["targets"]
+        observation_target_keys = [
+            (
+                row["controllable_component_id"],
+                row["command_target_id"],
+                row["operation_capability_id"],
+            )
+            for row in observation_targets
+        ]
+        assert sorted(observation_target_keys) == sorted(observed_target_keys)
         assert observation["observation"]["targets"][0]["source_joint_names"] == [
             "joint1",
             "joint2",
@@ -1646,7 +1889,9 @@ def test_private_program_capture_is_claim_bound_and_cannot_mint_node_effects(
         )
         assert released["held_node_indices"] == []
 
-        direct = client.targets()["targets"]["direct_control"]
+        _, direct = _execution_target(
+            client.targets()["targets"], presentation="motion"
+        )
         observation = client.observation()["observation"]["targets"][0]
         operation = _direct_control_joint_operation(
             identity,
@@ -1820,7 +2065,9 @@ def test_internal_program_run_stop_uses_one_exact_priority_request(
 
     try:
         identity = client.identity()["identity"]
-        direct = client.targets()["targets"]["direct_control"]
+        _, direct = _execution_target(
+            client.targets()["targets"], presentation="motion"
+        )
         current = [
             float(value)
             for value in client.observation()["observation"]["targets"][0][
@@ -1828,7 +2075,7 @@ def test_internal_program_run_stop_uses_one_exact_priority_request(
             ]
         ]
         goal = list(current)
-        first_joint = direct["joints"][0]
+        first_joint = direct["command"]["joints"][0]
         goal[0] = min(
             float(first_joint["max_position_rad"]),
             max(
@@ -2160,11 +2407,11 @@ def test_manual_motion_malformed_stop_recovers_with_durable_evidence(
     headless = HeadlessHttpClient("http://headless.test", client=raw_api)
     try:
         status = headless.execution_diagnostics()["status"]
-        positions = list(status["direct_control"]["observed_state"]["positions_rad"])
+        positions = list(_status_observation(status, presentation="motion")["positions_rad"])
         positions[0] = 0.55
         request = _direct_control_joint_operation(
-            status,
-            status["direct_control"],
+            status["identity"],
+            _status_target(status, presentation="motion")[1],
             request_id="manual-malformed-stop-operation",
             positions_rad=positions,
         )
@@ -2244,7 +2491,7 @@ def test_manual_motion_malformed_stop_recovers_with_durable_evidence(
             headless,
             execution,
             state_root,
-            status["owner_epoch"],
+            status["identity"]["owner_epoch"],
             operation_id,
             restart_before_recovery if restart_with_fault else None,
         )
@@ -2269,7 +2516,10 @@ def test_manual_motion_malformed_stop_recovers_with_durable_evidence(
             journal_path.stat().st_ino,
         ) == journal_identity
         restarted = headless.execution_diagnostics()["status"]
-        assert restarted["owner_epoch"] != status["owner_epoch"]
+        assert (
+            restarted["identity"]["owner_epoch"]
+            != status["identity"]["owner_epoch"]
+        )
         with pytest.raises(HeadlessClientError) as stale:
             headless.execute(request)
         assert stale.value.code == "stale_request_owner_epoch"
@@ -2315,7 +2565,10 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
     )
     headless = HeadlessHttpClient("http://headless.test", client=raw_api)
     recording = RecordingTransport(headless)
-    runner = OrchestratorRunner(KernelClient(recording))
+    runner = OrchestratorRunner(
+        KernelClient(recording),
+        json.loads((fixture_root / "program_binding.json").read_text("utf-8")),
+    )
 
     composer_app = FastAPI()
     composer_app.include_router(
@@ -2329,46 +2582,48 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
 
     try:
         first_status = headless.execution_diagnostics()["status"]
-        assert first_status["program_binding_id"] == manifest["program_binding_id"]
-        assert first_status["retained_bundle_id"] == manifest["retained_bundle_id"]
-        assert first_status["gripper_target_role_id"] == "gripper"
-        assert (
-            first_status["gripper_command_schema_id"]
-            == manifest["gripper_command_schema_id"]
-        )
-        assert (
-            first_status["gripper_command_schema_revision"]
-            == manifest["gripper_command_schema_revision"]
-        )
-        assert first_status["cell_stop_action"] == {
+        assert first_status["schema_version"] == "manyforge.execution_status.v2"
+        identity = first_status["identity"]
+        assert identity["retained_bundle_id"] == manifest["retained_bundle_id"]
+        assert first_status["control_state"]["cell_stop_action"] == {
             "available": True,
             "expected_stop_generation": 0,
             "fault": None,
             "latest_terminal": None,
             "unavailable_reason": None,
         }
-        observed = {
-            target["target_role_id"]: target
-            for target in first_status["observed_targets"]
+        motion_component, motion_target = _status_target(
+            first_status, presentation="motion"
+        )
+        direct = motion_target["command"]
+        direct_manual_control = direct["manual_control"]
+        motion_observed = _status_observation(
+            first_status, presentation="motion"
+        )
+        gripper_component, gripper_target = _status_target(
+            first_status, presentation="gripper"
+        )
+        direct_gripper = gripper_target["command"]
+        gripper_observed = _status_observation(
+            first_status, presentation="gripper"
+        )
+        assert motion_observed["kind"] == "joint_positions"
+        assert len(motion_observed["positions_rad"]) == len(
+            motion_observed["source_joint_names"]
+        )
+        assert gripper_observed["position"] == {
+            "kind": "linear_m",
+            "value_m": pytest.approx(0.0),
         }
-        assert set(observed) == {"arm", "gripper"}
-        assert all(
-            position["kind"] == "angular_rad"
-            for position in observed["arm"]["positions"]
-        )
-        assert observed["gripper"]["positions"] == [
-            {"kind": "linear_m", "value_m": 0.0}
-        ]
-        assert observed["arm"]["resources"] != observed["gripper"]["resources"]
-
-        direct = first_status["direct_control"]
-        assert direct["program_id"] == "manyforge.direct_control.motion"
-        assert direct["program_binding_id"] != manifest["program_binding_id"]
+        # This fixture models one Lite6 component with an integrated gripper;
+        # independent arm/gripper ownership is covered by the component-set
+        # transition tests and the gripper-only managed-process fixture.
         assert (
-            direct["controllable_component_id"]
-            == observed["arm"]["controllable_component_id"]
+            motion_component["controllable_component_id"]
+            == gripper_component["controllable_component_id"]
         )
-        assert direct["command_target_id"] == observed["arm"]["command_target_id"]
+        assert direct_manual_control["program_id"] == "manyforge.direct_control.motion"
+        assert direct_manual_control["program_binding_id"] != manifest["program_binding_id"]
         assert direct["base_frame_role_id"] == "base"
         assert direct["tcp_frame_role_id"] == "tcp"
         assert direct["planning_capability_ids"] == [
@@ -2379,13 +2634,8 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         assert [joint["source_joint_name"] for joint in direct["joints"]] == (
             manifest["source_joint_names"]
         )
-        assert (
-            direct["observed_state"]["source_joint_names"]
-            == manifest["source_joint_names"]
-        )
-        current_orientation = direct["observed_state"]["current_tcp_pose"][
-            "orientation"
-        ]
+        assert motion_observed["source_joint_names"] == manifest["source_joint_names"]
+        current_orientation = motion_observed["current_tcp_pose"]["orientation"]
         assert sum(value * value for value in current_orientation.values()) == (
             pytest.approx(1.0)
         )
@@ -2401,9 +2651,9 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         )
         assert (
             motion_descriptor["controllable_component_id"]
-            == direct["controllable_component_id"]
+            == motion_component["controllable_component_id"]
         )
-        assert motion_descriptor["command_target_id"] == direct["command_target_id"]
+        assert motion_descriptor["command_target_id"] == motion_target["command_target_id"]
         assert [
             joint["source_joint_name"] for joint in motion_descriptor["joints"]
         ] == manifest["source_joint_names"]
@@ -2451,7 +2701,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             "tcp",
         }
         assert motion_descriptor["contracts"]["operation_capability_id"] == (
-            direct["operation_capability_id"]
+            motion_target["operation_capability_id"]
         )
         assert motion_descriptor["contracts"]["supporting_providers"]
         assert (
@@ -2459,9 +2709,12 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             == "lite6_motion_controlled_stop"
         )
 
-        direct_gripper = first_status["direct_control_gripper"]
-        assert direct_gripper["program_id"] == ("manyforge.direct_control.gripper")
-        assert direct_gripper["program_binding_id"] != manifest["program_binding_id"]
+        assert direct_gripper["manual_control"]["program_id"] == (
+            "manyforge.direct_control.gripper"
+        )
+        assert direct_gripper["manual_control"]["program_binding_id"] != (
+            manifest["program_binding_id"]
+        )
         assert (
             direct_gripper["command_schema_id"] == manifest["gripper_command_schema_id"]
         )
@@ -2533,9 +2786,9 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         )
 
         native = ExecutionCommandClient(execution_run_root, timeout_seconds=2.0)
-        before_preview_events = native.events(first_status["owner_epoch"], 0)["events"]
-        before_preview_state = copy.deepcopy(observed["arm"]["positions"])
-        before_gripper_preview_state = copy.deepcopy(observed["gripper"]["positions"])
+        before_preview_events = native.events(identity["owner_epoch"], 0)["events"]
+        before_preview_state = copy.deepcopy(motion_observed["positions_rad"])
+        before_gripper_preview_state = copy.deepcopy(gripper_observed["position"])
         gripper_preview_target = (
             direct_gripper["resource"]["min_position"]
             + direct_gripper["resource"]["max_position"]
@@ -2554,25 +2807,23 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         assert gripper_receipt["coordinate_kind"] == "linear_m"
         assert (
             gripper_receipt["program_binding_id"]
-            == direct_gripper["program_binding_id"]
+            == direct_gripper["manual_control"]["program_binding_id"]
         )
-        assert native.events(first_status["owner_epoch"], 0)["events"] == (
+        assert native.events(identity["owner_epoch"], 0)["events"] == (
             before_preview_events
         )
         after_gripper_preview = headless.execution_diagnostics()["status"]
-        after_gripper_observed = next(
-            target
-            for target in after_gripper_preview["observed_targets"]
-            if target["target_role_id"] == "gripper"
+        after_gripper_observed = _status_observation(
+            after_gripper_preview, presentation="gripper"
         )
-        assert after_gripper_observed["positions"] == (before_gripper_preview_state)
+        assert after_gripper_observed["position"] == before_gripper_preview_state
         direct_positions = [
-            float(position) for position in direct["observed_state"]["positions_rad"]
+            float(position) for position in motion_observed["positions_rad"]
         ]
         direct_positions[0] = 0.03
         direct_intent = _direct_control_joint_operation(
-            first_status,
-            first_status["direct_control"],
+            identity,
+            motion_target,
             request_id="composer-direct-preview",
             positions_rad=direct_positions,
         )
@@ -2581,7 +2832,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         assert receipt["commit_eligible"] is True
         assert receipt["source_joint_names"] == manifest["source_joint_names"]
         assert receipt["final_positions_rad"] == pytest.approx(direct_positions)
-        assert receipt["program_binding_id"] == direct["program_binding_id"]
+        assert receipt["program_binding_id"] == direct_manual_control["program_binding_id"]
         assert "trajectory" not in receipt
         assert "compiled" not in receipt
         assert "providers" not in receipt
@@ -2631,7 +2882,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             motion={
                 "kind": "cartesian_path",
                 "waypoints": [
-                    direct["observed_state"]["current_tcp_pose"],
+                    motion_observed["current_tcp_pose"],
                     receipt["final_tcp_pose"],
                 ],
                 "max_translation_step_m": 0.005,
@@ -2645,16 +2896,14 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         )
         cartesian_preview = composer.preview_motion(cartesian_intent)["preview_receipt"]
         assert cartesian_preview["commit_eligible"] is True
-        assert native.events(first_status["owner_epoch"], 0)["events"] == (
+        assert native.events(identity["owner_epoch"], 0)["events"] == (
             before_preview_events
         )
         after_preview_status = headless.execution_diagnostics()["status"]
-        after_preview_arm = next(
-            target
-            for target in after_preview_status["observed_targets"]
-            if target["target_role_id"] == "arm"
+        after_preview_arm = _status_observation(
+            after_preview_status, presentation="motion"
         )
-        assert after_preview_arm["positions"] == before_preview_state
+        assert after_preview_arm["positions_rad"] == before_preview_state
 
         stale_scene_intent = copy.deepcopy(direct_intent)
         stale_scene_intent["request_context"][
@@ -2669,12 +2918,17 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         direct_operation_id = direct_accepted["accepted"]["operation_id"]
         direct_terminal = _wait_terminal(runner, direct_operation_id)["operation"]
         assert direct_terminal["state"] == "completed", direct_terminal
-        assert direct_terminal["program_binding_id"] == direct["program_binding_id"]
+        assert direct_terminal["program_binding_id"] == direct_manual_control[
+            "program_binding_id"
+        ]
         _wait_retired(native, direct_operation_id)
 
         relative_status = headless.execution_diagnostics()["status"]
-        relative_direct = relative_status["direct_control"]
-        relative_start_pose = relative_direct["observed_state"]["current_tcp_pose"]
+        _, relative_target = _status_target(relative_status, presentation="motion")
+        relative_direct = relative_target["command"]
+        relative_start_pose = _status_observation(
+            relative_status, presentation="motion"
+        )["current_tcp_pose"]
         relative_pose_intent = _direct_control_motion_operation(
             relative_status,
             request_id="composer-direct-relative-pose-execution",
@@ -2694,9 +2948,9 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         relative_operation_id = relative_accepted["accepted"]["operation_id"]
         relative_terminal = _wait_terminal(runner, relative_operation_id)["operation"]
         assert relative_terminal["state"] == "completed", relative_terminal
-        relative_end_pose = headless.execution_diagnostics()["status"][
-            "direct_control"
-        ]["observed_state"]["current_tcp_pose"]
+        relative_end_pose = _status_observation(
+            headless.execution_diagnostics()["status"], presentation="motion"
+        )["current_tcp_pose"]
         assert (
             _translation_error_m(
                 relative_end_pose["position_m"], relative_start_pose["position_m"]
@@ -2720,7 +2974,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         ]
         assert direct_gripper_terminal["state"] == "completed"
         assert direct_gripper_terminal["program_binding_id"] == (
-            direct_gripper["program_binding_id"]
+            direct_gripper["manual_control"]["program_binding_id"]
         )
         _wait_retired(native, direct_gripper_operation_id)
 
@@ -2774,7 +3028,9 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             "value_rad": 0.004,
         }
         assert wrong_unit_intent["program_binding_id"] == (
-            gripper_status["direct_control_gripper"]["program_binding_id"]
+            _status_target(gripper_status, presentation="gripper")[1]["command"][
+                "manual_control"
+            ]["program_binding_id"]
         )
         with pytest.raises(HeadlessClientError) as wrong_unit:
             composer.execute(wrong_unit_intent)
@@ -2792,7 +3048,9 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             gripper_status, request_id="reject-gripper-limit", position=0.02
         )
         assert beyond_limit_intent["program_binding_id"] == (
-            gripper_status["direct_control_gripper"]["program_binding_id"]
+            _status_target(gripper_status, presentation="gripper")[1]["command"][
+                "manual_control"
+            ]["program_binding_id"]
         )
         with pytest.raises(HeadlessClientError) as beyond_limit:
             composer.execute(beyond_limit_intent)
@@ -2829,8 +3087,8 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         current_projection = headless.operation(operation_id)
         assert composer_projection == current_projection
         assert composer_projection["operation"]["state"] == "completed"
-        assert composer.execution_diagnostics()["status"]["owner_epoch"] == (
-            first_status["owner_epoch"]
+        assert composer.execution_diagnostics()["status"]["identity"]["owner_epoch"] == (
+            identity["owner_epoch"]
         )
 
         _wait_retired(native, operation_id)
@@ -2874,14 +3132,13 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             gripper_terminal.pop(bookkeeping_field)
         assert durable_gripper == gripper_terminal
         gripper_status = headless.execution_diagnostics()["status"]
-        gripper_observed = next(
-            target
-            for target in gripper_status["observed_targets"]
-            if target["target_role_id"] == "gripper"
+        gripper_observed = _status_observation(
+            gripper_status, presentation="gripper"
         )
-        assert gripper_observed["positions"] == [
-            {"kind": "linear_m", "value_m": pytest.approx(0.004)}
-        ]
+        assert gripper_observed["position"] == {
+            "kind": "linear_m",
+            "value_m": pytest.approx(0.004),
+        }
         _wait_retired(native, gripper_id)
 
         cancellable_intent = _direct_control_gripper_operation(
@@ -2914,7 +3171,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         # or require a second recovery command for the same physical Stop.
         gripper_recovery = _recover_active_stop_fault(
             headless,
-            owner_epoch=first_status["owner_epoch"],
+            owner_epoch=identity["owner_epoch"],
             request_prefix="recover-linear-gripper-stop",
             correlation_id="n5-process-test",
             reason="operator verified post-Stop gripper truth",
@@ -2942,7 +3199,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         ]
         scale_selector = projected_scale_control["selector"]
         assert scale_selector == {
-            "program_binding_id": first_status["program_binding_id"],
+            "program_binding_id": manifest["program_binding_id"],
             "component_role_id": "robot",
             "target_role_id": "arm",
         }
@@ -2954,7 +3211,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             {
                 "request_context": {
                     "request_id": "scale-controlled-scope",
-                    "request_owner_epoch": first_status["owner_epoch"],
+                    "request_owner_epoch": identity["owner_epoch"],
                     "source_label": "composer_ui",
                     "correlation_id": "n4-public-control-test",
                 },
@@ -2988,7 +3245,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             {
                 "request_context": {
                     "request_id": "pause-controlled-operation",
-                    "request_owner_epoch": first_status["owner_epoch"],
+                    "request_owner_epoch": identity["owner_epoch"],
                     "source_label": "composer_ui",
                     "correlation_id": "n4-public-control-test",
                 },
@@ -3008,7 +3265,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             {
                 "request_context": {
                     "request_id": "resume-controlled-operation",
-                    "request_owner_epoch": first_status["owner_epoch"],
+                    "request_owner_epoch": identity["owner_epoch"],
                     "source_label": "headless_process_test",
                     "correlation_id": "n4-public-control-test",
                 },
@@ -3051,7 +3308,9 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         assert stopped["state"] == "stopped", json.dumps(stopped, sort_keys=True)
         assert stopped["active_stop_id"] == stop_accepted["accepted"]["stop_id"]
         assert stop_acceptance_elapsed_s < 0.5
-        projected_stop = headless.execution_diagnostics()["status"]["cell_stop_action"]
+        projected_stop = headless.execution_diagnostics()["status"]["control_state"][
+            "cell_stop_action"
+        ]
         assert 0.9 <= stop_settlement_elapsed_s < 1.75, json.dumps(
             {
                 "before_stop": before_controlled_stop,
@@ -3111,7 +3370,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             "transport": "http",
         }
         durable_stop_page = native.events(
-            first_status["owner_epoch"], durable_stop_sequence - 1, limit=1
+            identity["owner_epoch"], durable_stop_sequence - 1, limit=1
         )
         assert len(durable_stop_page["events"]) == 1
         durable_stop_event = durable_stop_page["events"][0]
@@ -3122,7 +3381,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         assert durable_stop_event["payload"] == durable_stop_payload
         assert durable_terminal is not None
         terminal_page = native.events(
-            first_status["owner_epoch"], int(durable_terminal[0]) - 1, limit=1
+            identity["owner_epoch"], int(durable_terminal[0]) - 1, limit=1
         )
         assert len(terminal_page["events"]) == 1
         terminal_event = terminal_page["events"][0]
@@ -3186,7 +3445,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         # second recovery acknowledgement for the same physical Stop.
         controlled_recovery = _recover_active_stop_fault(
             headless,
-            owner_epoch=first_status["owner_epoch"],
+            owner_epoch=identity["owner_epoch"],
             request_prefix="recover-controlled-stop",
             correlation_id="n4-public-control-test",
             reason="operator verified post-Stop motion truth",
@@ -3222,7 +3481,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         assert (execution_run_root / "execution-command.sock").is_socket()
         assert (execution_run_root / "execution-observation.sock").is_socket()
         restarted = headless.execution_diagnostics()["status"]
-        assert restarted["owner_epoch"] != first_status["owner_epoch"]
+        assert restarted["identity"]["owner_epoch"] != identity["owner_epoch"]
         with pytest.raises(HeadlessClientError) as stale:
             headless.execute(stale_submission)
         assert stale.value.code == "stale_request_owner_epoch"
@@ -3347,8 +3606,20 @@ def test_gripper_only_motion_updates_the_shared_native_observation_stream(
     timeout = threading.Timer(10.0, cancelled.set)
     try:
         status = client.diagnostics()["status"]
-        direct = status["direct_control_gripper"]
+        _, gripper_target = _status_target(status, presentation="gripper")
+        direct = gripper_target["command"]
         resource = direct["resource"]
+        observed_targets = client.control_state()["control_state"][
+            "observed_targets"
+        ]
+        observed_target_keys = sorted(
+            (
+                row["controllable_component_id"],
+                row["command_target_id"],
+                row["operation_capability_id"],
+            )
+            for row in observed_targets
+        )
         timeout.start()
         # No Composer/browser owns these commands or performs terminal release.
         # Repeat both ends of travel to prove the next operation stays usable.
@@ -3357,7 +3628,17 @@ def test_gripper_only_motion_updates_the_shared_native_observation_stream(
         ):
             with client.open_observation_session() as observation_session:
                 first = observation_session.next(None, cancelled)["observation"]
-                assert first["schema_version"] == "manyforge.execution_observation.v2"
+                assert first["schema_version"] == (
+                    "manyforge.execution_observation.v3"
+                )
+                assert sorted(
+                    (
+                        row["controllable_component_id"],
+                        row["command_target_id"],
+                        row["operation_capability_id"],
+                    )
+                    for row in first["targets"]
+                ) == observed_target_keys
                 motion, gripper = first["targets"]
                 assert motion["coordinate_kinds"] == ["angular"] * 6
                 assert gripper["coordinate_kinds"] == ["linear"]
@@ -3387,8 +3668,8 @@ def test_gripper_only_motion_updates_the_shared_native_observation_stream(
                     )
                     arm_preview = OperationIntentRequest.model_validate(
                         _direct_control_joint_operation(
-                            status,
-                            status["direct_control"],
+                            status["identity"],
+                            _status_target(status, presentation="motion")[1],
                             request_id="preview.independent.arm",
                             positions_rad=list(motion["positions_si"]),
                         )
@@ -3431,7 +3712,15 @@ def test_gripper_only_motion_updates_the_shared_native_observation_stream(
             assert terminal["operation"]["state"] == "completed", terminal
             assert terminal["resident"] is False, terminal
             control = client.control_state()["control_state"]
-            assert control["schema_version"] == "manyforge.execution_control_state.v5"
+            assert control["schema_version"] == "manyforge.execution_control_state.v6"
+            assert sorted(
+                (
+                    row["controllable_component_id"],
+                    row["command_target_id"],
+                    row["operation_capability_id"],
+                )
+                for row in control["observed_targets"]
+            ) == observed_target_keys
             results = control["manual_operations"]
             assert len(results) == 1
             assert results[0]["resident"] is False
@@ -3440,6 +3729,162 @@ def test_gripper_only_motion_updates_the_shared_native_observation_stream(
     finally:
         cancelled.set()
         timeout.cancel()
+        _stop_host(process)
+
+
+def test_managed_gripper_only_cell_has_no_motion_target_and_refuses_disabled_command(
+    tmp_path: Path,
+) -> None:
+    fixture_root = tmp_path / "fixture"
+    shutil.copytree(
+        _required_path("MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT"),
+        fixture_root,
+    )
+    manifest = json.loads((fixture_root / "manifest.json").read_text("utf-8"))
+    assert manifest["gripper_only"] is True
+    state_root, run_root = tmp_path / "state", tmp_path / "run"
+    state_root.mkdir()
+    run_root.mkdir()
+    process = _start_host(fixture_root, state_root, run_root, manifest)
+    client = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+    try:
+        status = client.diagnostics()["status"]
+        assert status["control_state"]["runtime_scale_control"] is None
+        assert [
+            target["presentation"]
+            for component in status["targets"]["components"]
+            for target in component["targets"]
+        ] == ["gripper"]
+        _, target = _status_target(status, presentation="gripper")
+        goal = target["command"]["resource"]["max_position"]
+        accepted = client.submit(
+            OperationIntentRequest.model_validate(
+                _direct_control_gripper_operation(
+                    status, request_id="gripper-only.command", position=goal
+                )
+            ),
+            trusted_principal_id=None,
+        )
+        assert accepted["ok"] is True, accepted
+        operation_id = accepted["accepted"]["operation_id"]
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            terminal = client.read(operation_id)
+            if terminal["resident"] is False:
+                break
+            time.sleep(0.005)
+        assert terminal["operation"]["state"] == "completed", terminal
+
+        # A motion-less cell still has a real Stop path for its gripper.
+        stop_intent = _direct_control_gripper_operation(
+            status,
+            request_id="gripper-only.stop-command",
+            position=target["command"]["resource"]["min_position"],
+        )
+        stop_payload = stop_intent["participants"][0]["payload"]
+        stop_payload["completion_timeout_s"] = 3.0
+        stop_payload["caller_options"][0]["value_s"] = 2.0
+        started = client.submit(
+            OperationIntentRequest.model_validate(stop_intent),
+            trusted_principal_id=None,
+        )
+        assert started["ok"] is True, started
+        stopped_operation_id = started["accepted"]["operation_id"]
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            in_flight = client.read(stopped_operation_id)
+            if in_flight["operation"]["state"] == "executing":
+                break
+            time.sleep(0.005)
+        assert in_flight["operation"]["state"] == "executing", in_flight
+        stopped = client.stop(
+            StopIntentRequest.model_validate(
+                {
+                    "request_context": {
+                        "request_id": "gripper-only.stop",
+                        "request_owner_epoch": status["identity"]["owner_epoch"],
+                        "source_label": "native-gripper-only-test",
+                    },
+                    "operations": [
+                        {
+                            "operation_id": stopped_operation_id,
+                            "expected_operation_revision": in_flight["operation"][
+                                "operation_revision"
+                            ],
+                            "expected_stop_generation": 0,
+                        }
+                    ],
+                }
+            ),
+            trusted_principal_id=None,
+        )
+        assert stopped["ok"] is True, stopped
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            stopped_status = client.read(stopped_operation_id)
+            if (
+                stopped_status["operation"]["state"] == "stopped"
+                and stopped_status["resident"] is False
+            ):
+                break
+            time.sleep(0.005)
+        assert stopped_status["operation"]["state"] == "stopped", stopped_status
+        assert stopped_status["resident"] is False, stopped_status
+
+        disabled = _submit_native_cclc_lifecycle(
+            run_root, intent_kind="disable", request_id="gripper-only.disable"
+        )
+        assert disabled["current_state"] == "disabled", disabled
+        after = client.diagnostics()["status"]
+        assert [
+            target["presentation"]
+            for component in after["targets"]["components"]
+            for target in component["targets"]
+        ] == ["gripper"]
+        operations_before_refusal = after["control_state"]["manual_operations"]
+        refused = client.submit(
+            OperationIntentRequest.model_validate(
+                _direct_control_gripper_operation(
+                    after,
+                    request_id="gripper-only.disabled-command",
+                    position=target["command"]["resource"]["min_position"],
+                )
+            ),
+            trusted_principal_id=None,
+        )
+        assert refused["ok"] is False, refused
+        assert refused["error"]["details"]["reason"] == (
+            "component_command_not_eligible"
+        ), refused
+        assert client.diagnostics()["status"]["control_state"][
+            "manual_operations"
+        ] == operations_before_refusal
+        _submit_native_cclc_lifecycle(
+            run_root, intent_kind="prepare", request_id="gripper-only.prepare-again"
+        )
+        _submit_native_cclc_lifecycle(
+            run_root, intent_kind="enable", request_id="gripper-only.enable-again"
+        )
+        enabled = client.diagnostics()["status"]
+        retried = client.submit(
+            OperationIntentRequest.model_validate(
+                _direct_control_gripper_operation(
+                    enabled,
+                    request_id="gripper-only.command-after-enable",
+                    position=target["command"]["resource"]["max_position"],
+                )
+            ),
+            trusted_principal_id=None,
+        )
+        assert retried["ok"] is True, retried
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            retried_status = client.read(retried["accepted"]["operation_id"])
+            if retried_status["operation"]["state"] == "completed":
+                break
+            time.sleep(0.005)
+        assert retried_status["operation"]["state"] == "completed", retried_status
+    finally:
         _stop_host(process)
 
 
@@ -3475,12 +3920,13 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
         assert first["command"] == "cell_admission_get"
 
         status = client.diagnostics()["status"]
-        direct = status["direct_control"]
+        motion_component, direct = _status_target(status, presentation="motion")
+        observed = _status_observation(status, presentation="motion")
         operation = _direct_control_joint_operation(
-            status,
+            status["identity"],
             direct,
             request_id="handover.query",
-            positions_rad=list(direct["observed_state"]["positions_rad"]),
+            positions_rad=list(observed["positions_rad"]),
         )
         proof = client.read_manual_handover(
             OperationIntentRequest.model_validate(operation),
@@ -3577,12 +4023,39 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
         assert wrong_observation_command["error"]["code"] == (
             "execution_observation_command_unsupported"
         )
-        assert client.observation()["command"] == "observation"
+        observation = client.observation()
+        assert observation.get("ok") is True, observation
+        assert observation["command"] == "observation"
 
         # UI6 uses one persistent private session. A second credited request
         # must cross the same accepted socket instead of reconnecting or
         # falling back to the legacy one-request observation exchange.
-        before_motion = client.control_state()["control_state"]["observed_motion"]
+        motion_target_key = (
+            motion_component["controllable_component_id"],
+            direct["command_target_id"],
+            direct["operation_capability_id"],
+        )
+
+        def observed_motion_state() -> dict[str, Any]:
+            control = client.control_state()["control_state"]
+            assert control["schema_version"] == (
+                "manyforge.execution_control_state.v6"
+            )
+            matching = [
+                row["observed"]
+                for row in control["observed_targets"]
+                if (
+                    row["controllable_component_id"],
+                    row["command_target_id"],
+                    row["operation_capability_id"],
+                )
+                == motion_target_key
+            ]
+            assert len(matching) == 1
+            assert matching[0]["kind"] == "joint_positions"
+            return matching[0]
+
+        before_motion = observed_motion_state()
         with client.open_observation_session() as observation_session:
             first_observation = observation_session.next(
                 None,
@@ -3598,7 +4071,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
                 threading.Event(),
             )
         repeated_frame = repeated_current["observation"]
-        after_motion = client.control_state()["control_state"]["observed_motion"]
+        after_motion = observed_motion_state()
         # Idle render identity is unchanged, while actual source sequences are
         # bracketed by exact owner observations, not ignored in this assertion.
         assert repeated_frame["source_sequence"] == first_frame["source_sequence"]
@@ -3776,9 +4249,11 @@ def test_addressed_native_benchmark_preserves_historical_measurements(
     ]
 
     try:
+        initial_observation = native.observation()
+        assert initial_observation.get("ok") is True, initial_observation
         origin = [
             float(value)
-            for value in native.observation()["observation"]["targets"][0][
+            for value in initial_observation["observation"]["targets"][0][
                 "positions_si"
             ]
         ]
@@ -3906,12 +4381,14 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
         status = headless.execution_diagnostics()["status"]
         positions = [
             float(position)
-            for position in status["direct_control"]["observed_state"]["positions_rad"]
+            for position in _status_observation(
+                status, presentation="motion"
+            )["positions_rad"]
         ]
         positions[0] = 0.03
         intent = _direct_control_joint_operation(
-            status,
-            status["direct_control"],
+            status["identity"],
+            _status_target(status, presentation="motion")[1],
             request_id="blocked-direct-preview",
             positions_rad=positions,
         )
@@ -3940,7 +4417,7 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
         stop_request = {
             "request_context": {
                 "request_id": "stop-while-preview-blocked",
-                "request_owner_epoch": status["owner_epoch"],
+                "request_owner_epoch": status["identity"]["owner_epoch"],
                 "source_label": "headless_process_test",
                 "correlation_id": "n6-c1-stop-isolation",
             },
@@ -3983,9 +4460,9 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(tmp_path: Path) -> Non
             "principal_id": "operator.process-test",
             "transport": "http",
         }
-        events = execution.events(status["owner_epoch"], sequence - 1, limit=1)[
-            "events"
-        ]
+        events = execution.events(
+            status["identity"]["owner_epoch"], sequence - 1, limit=1
+        )["events"]
         assert len(events) == 1
         assert events[0]["sequence"] == sequence
         assert events[0]["record_kind"] == "stop_acceptance_projected"
@@ -4014,19 +4491,23 @@ def test_native_manual_arm_and_gripper_are_exclusive_and_recover_independently(
     client = ExecutionCommandClient(run_root, timeout_seconds=2.0)
     try:
         status = client.diagnostics()["status"]
-        positions = list(status["direct_control"]["observed_state"]["positions_rad"])
+        positions = list(
+            _status_observation(status, presentation="motion")["positions_rad"]
+        )
         positions[0] += 0.4
         intents = {
             "arm": _direct_control_joint_operation(
-                status,
-                status["direct_control"],
+                status["identity"],
+                _status_target(status, presentation="motion")[1],
                 request_id="independent-arm",
                 positions_rad=positions,
             ),
             "gripper": _direct_control_gripper_operation(
                 status,
                 request_id="independent-gripper",
-                position=status["direct_control_gripper"]["resource"]["max_position"],
+                position=_status_target(status, presentation="gripper")[1][
+                    "command"
+                ]["resource"]["max_position"],
             ),
         }
         intents["arm"]["participants"][0]["payload"]["speed_profile"][
@@ -4066,7 +4547,7 @@ def test_native_manual_arm_and_gripper_are_exclusive_and_recover_independently(
 
         context = {
             "request_id": f"stop-manual-{active_target}",
-            "request_owner_epoch": status["owner_epoch"],
+            "request_owner_epoch": status["identity"]["owner_epoch"],
             "source_label": "native-manual-exclusion-test",
         }
         stopped = client.stop(
@@ -4106,12 +4587,18 @@ def test_native_manual_arm_and_gripper_are_exclusive_and_recover_independently(
         assert all(row["terminal_error"] is None for row in completed["participants"])
         assert completed["active_stop_id"] is None
         with client.open_observation_session() as stream:
-            observed = stream.next(None, threading.Event())["observation"]
+            observed_frame = stream.next(None, threading.Event())
+            assert observed_frame.get("ok") is True, observed_frame
+            observed = observed_frame["observation"]
         if other == "arm":
             assert observed["targets"][0]["positions_si"] == pytest.approx(positions)
         else:
             assert observed["targets"][1]["positions_si"] == pytest.approx(
-                [status["direct_control_gripper"]["resource"]["max_position"]]
+                [
+                    _status_target(status, presentation="gripper")[1]["command"][
+                        "resource"
+                    ]["max_position"]
+                ]
             )
     finally:
         _stop_host(process)
@@ -4151,10 +4638,15 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
     )
     headless = HeadlessHttpClient("http://headless.test", client=raw_api)
     recording = RecordingTransport(headless)
-    runner = OrchestratorRunner(KernelClient(recording))
+    runner = OrchestratorRunner(
+        KernelClient(recording),
+        json.loads((fixture_root / "program_binding.json").read_text("utf-8")),
+    )
 
     try:
-        first_epoch = headless.execution_diagnostics()["status"]["owner_epoch"]
+        first_epoch = headless.execution_diagnostics()["status"]["identity"][
+            "owner_epoch"
+        ]
         cclc_owner_before_loss = CCLCOpenRequestClient(
             execution_run_root, timeout_seconds=5.0
         ).owner_identity()["request_owner_epoch"]
@@ -4217,7 +4709,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
             qualify_cclc=False,
         )
         restarted = headless.execution_diagnostics()["status"]
-        assert restarted["owner_epoch"] != first_epoch
+        assert restarted["identity"]["owner_epoch"] != first_epoch
         cclc_after_loss = _wait_for_current_cclc_routes(execution_run_root)
         assert cclc_after_loss["component_lifecycle_state"] == "active"
         assert (
@@ -4282,7 +4774,7 @@ def test_planning_stop_and_active_host_replacement_are_bounded(
         )
 
         native = ExecutionCommandClient(execution_run_root, timeout_seconds=2.0)
-        page = native.events(restarted["owner_epoch"], 0)
+        page = native.events(restarted["identity"]["owner_epoch"], 0)
         assert [event["record_kind"] for event in page["events"]] == ["host_replaced"]
         assert page["events"][0]["operation_id"] == orphan_id
         assert page["events"][0]["occurred_at_wall"].endswith("Z")
@@ -4374,10 +4866,15 @@ def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
     )
     headless = HeadlessHttpClient("http://headless.test", client=raw_api)
     recording = RecordingTransport(headless)
-    runner = OrchestratorRunner(KernelClient(recording))
+    runner = OrchestratorRunner(
+        KernelClient(recording),
+        json.loads((fixture_root / "program_binding.json").read_text("utf-8")),
+    )
 
     try:
-        first_epoch = headless.execution_diagnostics()["status"]["owner_epoch"]
+        first_epoch = headless.execution_diagnostics()["status"]["identity"][
+            "owner_epoch"
+        ]
         native = ExecutionCommandClient(execution_run_root, timeout_seconds=2.0)
         accepted = _manual_gripper_submission(
             headless,
@@ -4398,7 +4895,7 @@ def test_active_gripper_host_replacement_reconciles_and_reopens_inventory(
             manifest,
         )
         restarted = headless.execution_diagnostics()["status"]
-        assert restarted["owner_epoch"] != first_epoch
+        assert restarted["identity"]["owner_epoch"] != first_epoch
         orphan = runner.operation(operation_id)["operation"]
         assert orphan["state"] == "intervention_required"
         terminal_error = orphan["participants"][0]["terminal_error"]

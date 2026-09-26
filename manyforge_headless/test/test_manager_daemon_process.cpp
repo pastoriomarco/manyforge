@@ -25,6 +25,9 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/prepared_activation_repository.hpp>
+#include <manyforge_deployment/program_contract.hpp>
+#include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <memory>
@@ -265,6 +268,7 @@ struct ManagerApplyFixtureMetadata final {
   std::string program_revision;
   std::string predecessor_graph_revision;
   std::string predecessor_retained_bundle_id;
+  content_identity::CanonicalValue program_role_assignment;
 };
 
 ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
@@ -277,7 +281,7 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
   const std::string bytes{std::istreambuf_iterator<char>(stream),
                           std::istreambuf_iterator<char>()};
   const auto root = deployment::parse_strict_json_model_yaml(bytes).root();
-  if (!root.is_object() || root.as_object().size() != 13U ||
+  if (!root.is_object() || root.as_object().size() != 14U ||
       content_identity::canonical_json(root) != bytes) {
     throw std::runtime_error("Manager Apply fixture metadata is invalid");
   }
@@ -295,8 +299,57 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
       RequiredText(root, "program_revision"),
       RequiredText(root, "predecessor_graph_revision"),
       RequiredText(root, "predecessor_retained_bundle_id"),
+      RequiredMember(root, "program_role_assignment"),
   };
 }
+
+struct GripperOnlyManagerApplyFixtureMetadata final {
+  std::string admission_filename;
+  std::string cell_id;
+  std::string prepared_activation_id;
+  std::string physical_candidate_retained_bundle_id;
+  std::string physical_deployment_artifact_id;
+  std::string physical_deployment_revision;
+  std::string predecessor_graph_revision;
+  std::string predecessor_retained_bundle_id;
+};
+
+GripperOnlyManagerApplyFixtureMetadata ReadGripperOnlyManagerApplyFixtureMetadata(
+    const std::filesystem::path &metadata_path =
+        MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA) {
+  std::ifstream stream(metadata_path, std::ios::binary);
+  if (!stream) {
+    throw std::runtime_error("gripper-only Manager Apply fixture metadata is absent");
+  }
+  const std::string bytes{std::istreambuf_iterator<char>(stream),
+                          std::istreambuf_iterator<char>()};
+  const auto root = deployment::parse_strict_json_model_yaml(bytes).root();
+  if (!root.is_object() || root.as_object().size() != 11U ||
+      content_identity::canonical_json(root) != bytes) {
+    throw std::runtime_error(
+        "gripper-only Manager Apply fixture metadata is invalid");
+  }
+  const auto &prepared = RequiredMember(root, "prepared_activations");
+  if (!prepared.is_object() || prepared.as_object().empty()) {
+    throw std::runtime_error(
+        "gripper-only Manager Apply fixture has no prepared activations");
+  }
+  static_cast<void>(RequiredText(root, "physical_graph_revision"));
+  static_cast<void>(RequiredText(root, "program_binding_id"));
+  static_cast<void>(RequiredText(root, "program_revision"));
+  const auto &apply_activation = RequiredMember(prepared, "program_apply_fixture");
+  return {
+      RequiredText(root, "admission_filename"),
+      RequiredText(root, "cell_id"),
+      RequiredText(apply_activation, "prepared_activation_id"),
+      RequiredText(root, "physical_candidate_retained_bundle_id"),
+      RequiredText(root, "physical_deployment_artifact_id"),
+      RequiredText(root, "physical_deployment_revision"),
+      RequiredText(root, "predecessor_graph_revision"),
+      RequiredText(root, "predecessor_retained_bundle_id"),
+  };
+}
+
 
 #endif
 
@@ -318,6 +371,7 @@ public:
     std::filesystem::create_directory(execution_state_root());
     std::filesystem::create_directory(execution_run_root());
     std::filesystem::create_directory(publication_root());
+    std::filesystem::create_directory(activation_root());
   }
 
   ~DaemonDirectory() {
@@ -368,6 +422,11 @@ public:
   [[nodiscard]] std::filesystem::path apply_package_root() const {
     return root_ / "apply-package";
   }
+  /// Trusted activation store: the Manager admits only prepared values
+  /// published here (disjoint from every install/runtime root).
+  [[nodiscard]] std::filesystem::path activation_root() const {
+    return root_ / "activation";
+  }
 
 private:
   std::vector<char> buffer_;
@@ -400,6 +459,7 @@ public:
                                       ? directory.publication_root().string()
                                       : projection_root;
     const auto startup_stderr = directory.startup_stderr().string();
+    const auto activation_root = directory.activation_root().string();
     pid_ = ::fork();
     if (pid_ < 0) {
       throw std::runtime_error("Manager daemon test fork failed");
@@ -414,7 +474,8 @@ public:
       static_cast<void>(::close(stderr_fd));
       if (program_runner_liveness_socket.empty()) {
         ::execl(executable.c_str(), executable.c_str(), "--install-root",
-                package_root.c_str(), "--canonical-empty-admission-filename",
+                package_root.c_str(), "--activation-root",
+                activation_root.c_str(), "--canonical-empty-admission-filename",
                 admission_filename.c_str(), "--manager-state-root",
                 manager_root.c_str(), "--manager-run-root",
                 manager_run_root.c_str(), "--execution-state-root",
@@ -427,7 +488,8 @@ public:
       } else {
         ::execl(
             executable.c_str(), executable.c_str(), "--install-root",
-            package_root.c_str(), "--canonical-empty-admission-filename",
+            package_root.c_str(), "--activation-root", activation_root.c_str(),
+            "--canonical-empty-admission-filename",
             admission_filename.c_str(), "--manager-state-root",
             manager_root.c_str(), "--manager-run-root",
             manager_run_root.c_str(), "--execution-state-root",
@@ -985,6 +1047,72 @@ ReadAuthoringAdmissionProjection(const DaemonDirectory &directory) {
                                 : std::string{}));
 }
 
+/// Assemble and publish one real prepared activation for the exact candidate
+/// this test applies, and return its Apply summary. The fixture Program is
+/// re-verified against that candidate; if its roles do not resolve there the
+/// value is honestly non-executable (H1a).
+content_identity::CanonicalValue PublishTestPreparedActivation(
+    const DaemonDirectory &directory,
+    const deployment::RetainedBundle &candidate,
+    const ManagerApplyFixtureMetadata &fixture) {
+  const auto package_root = directory.apply_package_root();
+  const deployment::FilesystemVerifiedRetainedBundleSource bundles(package_root);
+  const auto physical = bundles.get_verified(
+      core::RetainedBundleId(fixture.physical_candidate_retained_bundle_id));
+  if (physical == nullptr) {
+    throw std::runtime_error("Manager Apply fixture lost its physical bundle");
+  }
+  const auto authored = deployment::FilesystemVerifiedProgramSource(package_root)
+                            .get_verified(core::ProgramId(fixture.program_id),
+                                          core::ProgramRevision(fixture.program_revision),
+                                          *physical);
+  if (authored == nullptr) {
+    throw std::runtime_error("Manager Apply fixture Program is unavailable");
+  }
+  const auto program = deployment::verify_program_binding_contract(
+      authored->canonical_program_bytes(), candidate);
+  const auto &map_products =
+      candidate.value().compiled_products.symbol_role_maps;
+  if (map_products.size() > 1U) {
+    throw std::runtime_error(
+        "Manager Apply fixture candidate has multiple model maps");
+  }
+  std::optional<deployment::VerifiedRetainedModelMap> model_map;
+  if (!map_products.empty()) {
+    model_map =
+        deployment::FilesystemVerifiedRetainedModelMapSource(package_root)
+            .get_verified({candidate.retained_bundle_id(),
+                           map_products.front().product_id});
+  } else if (!candidate.value().cell_graph.controllable_components.empty() ||
+             !candidate.value().cell_graph.model_instances.empty()) {
+    throw std::runtime_error(
+        "Manager Apply fixture candidate omits required model data");
+  }
+  if (program == nullptr) {
+    throw std::runtime_error("Manager Apply fixture Program is unavailable");
+  }
+  deployment::FilesystemCatalogArtifactStore catalogs(package_root);
+  deployment::FilesystemRawArtifactStore raw_artifacts(package_root);
+  const auto prepared = deployment::assemble_prepared_activation(
+      {core::ContentDigest("sha256:2020202020202020202020202020202020202020202020"
+                           "202020202020202020"),
+       "scenario.test",
+       core::ContentDigest("sha256:1414141414141414141414141414141414141414141414"
+                           "141414141414141414"),
+       "optional", content_identity::CanonicalValue(
+                       content_identity::CanonicalValue::Object{})},
+      candidate, model_map, *program, fixture.program_role_assignment,
+      catalogs, raw_artifacts);
+  static_cast<void>(
+      deployment::FilesystemPreparedActivationRepository(directory.activation_root())
+          .put_if_absent(prepared));
+  content_identity::CanonicalValue::Object summary;
+  for (const auto &[name, value] : prepared.normalized_root().as_object()) {
+    if (name != "activation_payload") summary.emplace_back(name, value);
+  }
+  return content_identity::CanonicalValue(std::move(summary));
+}
+
 std::string ApplyRequest(
     const DaemonDirectory &directory,
     const std::string_view manager_owner_epoch,
@@ -995,7 +1123,11 @@ std::string ApplyRequest(
     const std::string_view expected_retained_bundle_id = "current-bundle",
     const std::string_view request_id = "request-1",
     const std::string_view preview_owner_epoch = {},
-    const bool preview_only = false) {
+    const bool preview_only = false,
+    // "receipt" echoes the previewed impact digest (explicit acceptance), an
+    // empty value accepts nothing, anything else is sent verbatim.
+    const std::string_view accepted_impact = "receipt",
+    const std::string_view prepared_activation_id_override = {}) {
   using content_identity::CanonicalValue;
   std::string resolved_graph_revision(expected_graph_revision);
   std::string resolved_retained_bundle_id(expected_retained_bundle_id);
@@ -1027,6 +1159,11 @@ std::string ApplyRequest(
   // fixture lookup, reports the expected rejection.
   std::string candidate_bundle = "sha256:" + std::string(64U, '1');
   std::string candidate_graph = "sha256:" + std::string(64U, '2');
+  // Negative previews never reach impact derivation; they keep a
+  // well-formed absent identity.
+  std::string prepared_activation_id =
+      "sha256:1616161616161616161616161616161616161616161616161616161616161616";
+  CanonicalValue prepared_summary(nullptr);
   if (!preview_only) {
     candidate_bundle.clear();
     candidate_graph.clear();
@@ -1045,6 +1182,30 @@ std::string ApplyRequest(
           bundle->value().deployment_revision.value() == deployment_revision) {
         candidate_bundle = bundle->retained_bundle_id().value();
         candidate_graph = bundle->value().cell_graph.graph_revision.value();
+        if (prepared_activation_id_override.empty()) {
+          prepared_summary = PublishTestPreparedActivation(
+              directory, *bundle, ReadManagerApplyFixtureMetadata());
+          prepared_activation_id =
+              RequiredText(prepared_summary, "prepared_activation_id");
+        } else {
+          prepared_activation_id = prepared_activation_id_override;
+          const auto prepared =
+              deployment::FilesystemPreparedActivationRepository(
+                  directory.activation_root())
+                  .get_verified(core::ContentDigest(prepared_activation_id));
+          if (prepared == nullptr) {
+            throw std::runtime_error(
+                "Manager Apply fixture prepared activation is unavailable");
+          }
+          CanonicalValue::Object summary;
+          for (const auto &[name, value] :
+               prepared->normalized_root().as_object()) {
+            if (name != "activation_payload") {
+              summary.emplace_back(name, value);
+            }
+          }
+          prepared_summary = CanonicalValue(std::move(summary));
+        }
         break;
       }
     }
@@ -1065,9 +1226,7 @@ std::string ApplyRequest(
           {"expected_admission_generation",
            CanonicalValue(static_cast<double>(expected_admission_generation))},
           {"expected_current", expected},
-          {"prepared_activation_id",
-           CanonicalValue("sha256:1616161616161616161616161616161616161616161616"
-                          "161616161616161616")},
+          {"prepared_activation_id", CanonicalValue(prepared_activation_id)},
           {"request_owner_epoch", CanonicalValue(std::string(owner))},
       }));
   const auto preview_response =
@@ -1075,7 +1234,6 @@ std::string ApplyRequest(
   if (preview_only) {
     return preview_response;
   }
-  const auto fixture = ReadManagerApplyFixtureMetadata();
   const auto preview =
       deployment::parse_strict_json_model_yaml(preview_response).root();
   const auto *ok = std::get_if<bool>(&RequiredMember(preview, "ok").storage());
@@ -1090,6 +1248,13 @@ std::string ApplyRequest(
             CanonicalValue(static_cast<double>(expected_admission_generation))},
            {"kind", CanonicalValue("direct")},
        })},
+      {"accepted_impact_digest",
+       accepted_impact == "receipt"
+           ? RequiredMember(RequiredMember(preview, "candidate_receipt"),
+                            "impact_digest")
+           : accepted_impact.empty()
+                 ? CanonicalValue(nullptr)
+                 : CanonicalValue(std::string(accepted_impact))},
       {"api_version", CanonicalValue("manyforge.manager_command.v1")},
       {"candidate_receipt", RequiredMember(preview, "candidate_receipt")},
       {"command", CanonicalValue("apply")},
@@ -1098,38 +1263,7 @@ std::string ApplyRequest(
        CanonicalValue(std::string(deployment_artifact_id))},
       {"deployment_revision", CanonicalValue(std::string(deployment_revision))},
       {"expected_current", expected},
-      {"prepared_activation",
-       CanonicalValue(CanonicalValue::Object{
-           {"assistant_mode", CanonicalValue("optional")},
-           {"captured_input_digest",
-            CanonicalValue("sha256:1414141414141414141414141414141414141414141414"
-                           "141414141414141414")},
-           {"deployment_artifact_id",
-            CanonicalValue(std::string(deployment_artifact_id))},
-           {"deployment_revision",
-            CanonicalValue(std::string(deployment_revision))},
-           {"graph_revision", CanonicalValue(candidate_graph)},
-           {"node_environment_digest",
-            CanonicalValue("sha256:1818181818181818181818181818181818181818181818"
-                           "181818181818181818")},
-           {"prepared_activation_id",
-            CanonicalValue("sha256:1616161616161616161616161616161616161616161616"
-                           "161616161616161616")},
-           {"program_binding_id",
-            CanonicalValue(fixture.program_binding_id)},
-           {"program_id", CanonicalValue(fixture.program_id)},
-           {"program_revision",
-            CanonicalValue(fixture.program_revision)},
-           {"retained_bundle_id", CanonicalValue(candidate_bundle)},
-           {"scenario_id", CanonicalValue("scenario.test")},
-           {"schema_version",
-            CanonicalValue("manyforge.prepared_activation_input.v2")},
-           {"source_document_digest",
-            CanonicalValue("sha256:2020202020202020202020202020202020202020202020"
-                           "202020202020202020")},
-           {"typed_parameter_overrides",
-            CanonicalValue(CanonicalValue::Object{})},
-       })},
+      {"prepared_activation", prepared_summary},
       {"reject_if_affected_busy", CanonicalValue(true)},
       {"request_id", CanonicalValue(std::string(request_id))},
       {"request_owner_epoch", CanonicalValue(std::string(manager_owner_epoch))},
@@ -2133,6 +2267,71 @@ TEST(ManagerDaemonProcess,
 
 #if defined(MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST)
 TEST(ManagerDaemonProcess,
+     GripperOnlyNativeApplyPublishesAControllableCellWithoutMotion) {
+  const auto fixture = ReadGripperOnlyManagerApplyFixtureMetadata();
+  DaemonDirectory directory;
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT,
+                        directory.apply_package_root(),
+                        std::filesystem::copy_options::recursive);
+  const deployment::FilesystemPreparedActivationRepository package_activations(
+      directory.apply_package_root());
+  const auto prepared = package_activations.get_verified(
+      core::ContentDigest(fixture.prepared_activation_id));
+  ASSERT_NE(prepared, nullptr);
+  const deployment::FilesystemPreparedActivationRepository daemon_activations(
+      directory.activation_root());
+  ASSERT_TRUE(daemon_activations.put_if_absent(*prepared));
+  const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
+  ProgramRunnerProcess program_runner(directory, fixture.cell_id);
+  ManagerProcess manager(directory, directory.apply_package_root().string(),
+                         fixture.admission_filename,
+                         installed_manager.string(),
+                         program_runner.socket_path().string());
+  manager.WaitReady(directory);
+
+  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
+                                             "manager-source.json");
+  const auto initial = manager_source.Read();
+  ASSERT_TRUE(initial.has_value());
+  const auto request = ApplyRequest(
+      directory, initial->source_owner_epoch,
+      WaitForAuthoringAdmission(directory).admission_generation,
+      fixture.physical_deployment_artifact_id,
+      fixture.physical_deployment_revision,
+      fixture.predecessor_graph_revision,
+      fixture.predecessor_retained_bundle_id,
+      "manager-gripper-only-apply.1", {}, false, "receipt",
+      fixture.prepared_activation_id);
+  const auto submitted = SendCommand(directory.socket_path(), request);
+  ASSERT_NE(submitted.find("\"apply_id\""), std::string::npos)
+      << submitted;
+  auto applied = submitted;
+  const auto status_request = ApplyStatusRequest(submitted);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  while (applied.find("\"state\":\"succeeded\"") ==
+             std::string::npos &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    applied = SendCommand(directory.socket_path(), status_request);
+  }
+  ASSERT_NE(applied.find("\"state\":\"succeeded\""),
+            std::string::npos)
+      << applied;
+  const auto ready = WaitForExecutionReady(
+      directory, fixture.physical_candidate_retained_bundle_id);
+  EXPECT_FALSE(ready.owner_epoch.empty());
+  const auto status = SendCommand(
+      directory.execution_socket_path(),
+      R"({"api_version":"manyforge.execution_command.v1","command":"status"})");
+  ASSERT_NE(status.find("\"ok\":true"), std::string::npos) << status;
+  EXPECT_NE(status.find("tool.gripper.command"), std::string::npos)
+      << status;
+  EXPECT_EQ(status.find("execution.trajectory.execute"), std::string::npos)
+      << status;
+}
+
+TEST(ManagerDaemonProcess,
      CompatibleNativeReplacementUsesFreshEpochAfterCleanStop) {
   const auto fixture_a = ReadManagerApplyFixtureMetadata();
   const auto fixture_b = ReadManagerApplyFixtureMetadata(
@@ -2307,6 +2506,65 @@ TEST(ManagerDaemonProcess,
 }
 
 TEST(ManagerDaemonProcess,
+     DestructiveApplyImpactRequiresExplicitAcceptanceOfItsExactDigest) {
+  const auto fixture = ReadManagerApplyFixtureMetadata();
+  DaemonDirectory directory;
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
+                        directory.apply_package_root(),
+                        std::filesystem::copy_options::recursive);
+  const auto package_root = directory.apply_package_root().string();
+  const auto installed_manager = PrepareManagerApplyInstalledTargets(directory);
+  ProgramRunnerProcess program_runner(directory, fixture.cell_id);
+  ManagerProcess manager(directory, package_root, fixture.admission_filename,
+                         installed_manager.string(),
+                         program_runner.socket_path().string());
+  manager.WaitReady(directory);
+  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
+                                             "manager-source.json");
+  const auto before = manager_source.Read();
+  ASSERT_TRUE(before.has_value());
+  const auto admission =
+      WaitForAuthoringAdmission(directory).admission_generation;
+  // The runtime-only candidate has none of the fixture Program's components:
+  // the Program becomes non-executable, a destructive impact (H1a).
+  const auto submit = [&](const std::string_view request_id,
+                          const std::string_view accepted) {
+    const auto request =
+        ApplyRequest(directory, before->source_owner_epoch, admission,
+                     fixture.deployment_artifact_id, fixture.deployment_revision,
+                     fixture.predecessor_graph_revision,
+                     fixture.predecessor_retained_bundle_id, request_id, {},
+                     false, accepted);
+    const auto response = SendCommand(directory.socket_path(), request);
+    return response;
+  };
+
+  const auto unaccepted = submit("impact-unaccepted", "");
+  EXPECT_NE(unaccepted.find("\"code\":\"confirmation_required\""),
+            std::string::npos)
+      << unaccepted;
+  const auto wrong = submit(
+      "impact-wrong",
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000");
+  EXPECT_NE(wrong.find("\"code\":\"confirmation_required\""),
+            std::string::npos)
+      << wrong;
+  // Neither refusal recorded an operation or changed the active selection.
+  const auto unchanged = manager_source.Read();
+  ASSERT_TRUE(unchanged.has_value());
+  const auto unchanged_payload =
+      content_identity::canonical_json(unchanged->payload);
+  EXPECT_EQ(unchanged_payload.find("impact-unaccepted"), std::string::npos);
+  EXPECT_EQ(unchanged_payload.find("impact-wrong"), std::string::npos);
+
+  const auto accepted = submit("impact-accepted", "receipt");
+  EXPECT_EQ(accepted.find("\"code\":\"confirmation_required\""),
+            std::string::npos)
+      << accepted;
+  EXPECT_NE(accepted.find("\"ok\":true"), std::string::npos) << accepted;
+}
+
+TEST(ManagerDaemonProcess,
      NamedApplyUsesTheRealManagedFenceAndSurvivesReplacement) {
   const auto fixture = ReadManagerApplyFixtureMetadata();
   DaemonDirectory directory;
@@ -2387,6 +2645,29 @@ TEST(ManagerDaemonProcess,
                 std::string::npos) {
           break;
         }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    // Apply status, the logical Scene, and the Scene-runtime identity are
+    // separate owner publications. The Apply worker may publish its terminal
+    // record before the Manager's bounded observation cycle has refreshed the
+    // latter two projections. Wait for that exact candidate identity instead
+    // of sampling the Scene-runtime source in the small publication window.
+    const auto projection_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < projection_deadline) {
+      const auto observed_scene = scene_source.Read();
+      const auto observed_scene_runtime = scene_runtime_source.Read();
+      if (observed_scene.has_value() && observed_scene_runtime.has_value() &&
+          content_identity::canonical_json(observed_scene->payload)
+                  .find(fixture.physical_candidate_retained_bundle_id) !=
+              std::string::npos &&
+          content_identity::canonical_json(observed_scene->payload)
+                  .find("apply_fixture_marker") != std::string::npos &&
+          content_identity::canonical_json(observed_scene_runtime->payload)
+                  .find(fixture.physical_candidate_retained_bundle_id) !=
+              std::string::npos) {
+        break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }

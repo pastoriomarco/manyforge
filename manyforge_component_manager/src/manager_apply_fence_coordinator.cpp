@@ -1,6 +1,7 @@
 #include "manyforge_component_manager/manager_apply_fence_coordinator.hpp"
 
 #include <manyforge_deployment/apply_affected_scope.hpp>
+#include <manyforge_deployment/apply_component_delta.hpp>
 
 #include <limits>
 #include <optional>
@@ -80,11 +81,28 @@ PrepareFence(const SqliteManagerApplyJournal &apply_journal,
   const auto scope =
       manyforge::deployment::derive_apply_configuration_fence_scope(predecessor,
                                                                     candidate);
+  // The per-component decision is fixed with the scope, before any fence or
+  // runtime effect: later phases execute it, they never re-derive it.
+  auto component_delta =
+      manyforge::deployment::derive_apply_component_delta(predecessor, candidate);
+  if (!manyforge::deployment::apply_component_delta_is_fenced(component_delta,
+                                                              scope)) {
+    Fail("Apply changes a component runtime outside its derived fence scope");
+  }
+  // A child detached from a removed or changed parent must stay placed at a
+  // verified candidate pose; this refuses before any fence or effect.
+  try {
+    static_cast<void>(manyforge::deployment::detached_attachment_children(
+        old_value.cell_graph, new_value.cell_graph));
+  } catch (const manyforge::deployment::ApplyComponentDeltaError &error) {
+    Fail(error.what());
+  }
   ManagerApplyAffectedScopeDTO affected_scope{
       apply_intent.apply_id,
       apply_intent.apply_generation,
       scope,
       core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+      std::move(component_delta),
   };
   core::ApplyConfigurationFenceIntentDTO fence_intent{
       apply_intent.request_context,

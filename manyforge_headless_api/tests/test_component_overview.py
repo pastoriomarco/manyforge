@@ -107,11 +107,19 @@ def _facts() -> dict[str, Any]:
     targets = {
         "ok": True,
         "targets": {
-            "direct_control": {
+            "schema_version": "manyforge.execution_targets.v3",
+            "components": [{
                 "controllable_component_id": "robot-a",
-                "command_target_id": "arm",
-                "planning_capability_ids": ["planning.motion.joint_goal"],
-            }
+                "availability": {"command_eligible": True, "reason": None},
+                "targets": [{
+                    "command_target_id": "arm",
+                    "operation_capability_id": "execution.trajectory.execute",
+                    "presentation": "motion",
+                    "command": {
+                        "planning_capability_ids": ["planning.motion.joint_goal"],
+                    },
+                }],
+            }],
         },
     }
     control = {

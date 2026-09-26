@@ -10,6 +10,7 @@
 #include <future>
 #include <limits>
 #include <manyforge_deployment/apply_affected_scope.hpp>
+#include <manyforge_deployment/apply_component_delta.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <memory>
@@ -440,6 +441,8 @@ SeedAttempt(SqliteManagerApplyJournal &journal,
                                 apply_intent.apply_generation,
                                 fence_intent.scope,
                                 fence_intent.busy_disposition,
+                                manyforge::deployment::derive_apply_component_delta(
+                                    TestBundle(), TestBundle()),
                             });
   return journal
       .EnsureFenceAttempt(intent.intent_digest,
@@ -478,6 +481,18 @@ TEST(ManagerApplyFenceCoordinator,
             ExpectedFenceIntent(apply_intent));
   EXPECT_EQ(first.durable_acceptance.record.accepted_fence,
             kernel.acquire_response);
+  // The per-component decision is persisted with the scope, before the
+  // fence. This runtime-only fixture has no controllable components, so its
+  // canonical decision is an empty delta.
+  const auto &delta = first.durable_affected_scope.record.affected_scope
+                          .component_delta;
+  EXPECT_EQ(delta, manyforge::deployment::derive_apply_component_delta(
+                       TestBundle(), TestBundle()));
+  for (const auto &change : delta.components) {
+    EXPECT_EQ(change.disposition,
+              manyforge::deployment::ApplyComponentDisposition::kRetain);
+  }
+  EXPECT_FALSE(delta.shared_scene_projection_changed);
   EXPECT_EQ(kernel.acquire_calls.load(), 1);
   EXPECT_EQ(kernel.reconcile_calls.load(), 0);
   EXPECT_EQ(kernel.rehydrate_calls.load(), 1);

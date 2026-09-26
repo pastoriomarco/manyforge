@@ -52,8 +52,8 @@ struct ProcessContainedCandidateClientConfig final {
   /// root before the worker is created. Model-local asset:// values continue
   /// to resolve only through the retained planning-model stage.
   std::optional<std::filesystem::path> scene_asset_root;
-  /// When set, the native managed child intentionally carries this exact
-  /// descriptor into the candidate worker as reserved FD 6.
+  /// When set, this inherited directory descriptor is the retained package
+  /// root used for managed scene assets. The worker receives it as FD 6.
   std::optional<int> retained_package_root_fd;
 };
 

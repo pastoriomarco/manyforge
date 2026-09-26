@@ -230,7 +230,9 @@ PreparedActivationInput::PreparedActivationInput(
     core::RetainedBundleId retained_bundle_id,
     core::GraphRevision graph_revision, core::ProgramId program_id,
     core::ProgramRevision program_revision,
-    core::ProgramBindingId program_binding_id,
+    std::optional<core::ProgramBindingId> program_binding_id,
+    std::optional<ProgramNonExecutableOutcomeDTO> program_outcome,
+    core::ProgramRoleAssignmentDTO program_role_assignment,
     core::ContentDigest node_environment_digest, std::string assistant_mode,
     CanonicalValue typed_parameter_overrides, CanonicalValue normalized_root,
     VerifiedPreparedActivationClosure closure)
@@ -244,6 +246,8 @@ PreparedActivationInput::PreparedActivationInput(
       graph_revision_(std::move(graph_revision)), program_id_(std::move(program_id)),
       program_revision_(std::move(program_revision)),
       program_binding_id_(std::move(program_binding_id)),
+      program_outcome_(std::move(program_outcome)),
+      program_role_assignment_(std::move(program_role_assignment)),
       node_environment_digest_(std::move(node_environment_digest)),
       assistant_mode_(std::move(assistant_mode)),
       typed_parameter_overrides_(std::move(typed_parameter_overrides)),
@@ -256,7 +260,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
       {"activation_payload", "assistant_mode", "captured_input_digest",
        "deployment_artifact_id", "deployment_revision", "graph_revision",
        "node_environment_digest", "prepared_activation_id",
-       "program_binding_id", "program_id", "program_revision",
+       "program_id", "program_outcome", "program_revision",
        "retained_bundle_id", "scenario_id", "schema_version",
        "source_document_digest",
        "typed_parameter_overrides"},
@@ -283,8 +287,30 @@ parse_prepared_activation_input(const CanonicalValue &value) {
       text(member(value, "graph_revision"), "graph_revision");
   const auto &program_revision =
       text(member(value, "program_revision"), "program_revision");
-  const auto &program_binding_id =
-      text(member(value, "program_binding_id"), "program_binding_id");
+  // Exactly one typed Program outcome: a candidate binding, or a named
+  // non-executable result for the preserved authored Program (H1a).
+  const auto &outcome_value = member(value, "program_outcome");
+  const auto &outcome_kind =
+      text(member(outcome_value, "kind"), "program_outcome.kind");
+  std::optional<std::string> program_binding_id;
+  std::optional<ProgramNonExecutableOutcomeDTO> program_outcome;
+  if (outcome_kind == "bound") {
+    require_exact_fields(outcome_value, {"kind", "program_binding_id"},
+                         "program_outcome");
+    program_binding_id = text(member(outcome_value, "program_binding_id"),
+                              "program_outcome.program_binding_id");
+  } else if (outcome_kind == "non_executable") {
+    require_exact_fields(outcome_value, {"kind", "outcome"}, "program_outcome");
+    try {
+      program_outcome = DecodeProgramNonExecutableOutcome(
+          canonical_json(member(outcome_value, "outcome")));
+    } catch (const ProgramBindingOutcomeError &error) {
+      fail(std::string("prepared activation Program outcome is invalid: ") +
+           error.what());
+    }
+  } else {
+    fail("prepared activation Program outcome kind is unsupported");
+  }
   const auto &node_environment_digest =
       text(member(value, "node_environment_digest"), "node_environment_digest");
   require_digest(prepared_id, "prepared_activation_id");
@@ -294,7 +320,9 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   require_digest(retained_bundle_id, "retained_bundle_id");
   require_digest(graph_revision, "graph_revision");
   require_digest(program_revision, "program_revision");
-  require_digest(program_binding_id, "program_binding_id");
+  if (program_binding_id.has_value()) {
+    require_digest(*program_binding_id, "program_binding_id");
+  }
   require_digest(node_environment_digest, "node_environment_digest");
   const auto &assistant_mode = text(member(value, "assistant_mode"), "assistant_mode");
   if (assistant_mode != "required" && assistant_mode != "optional" &&
@@ -316,7 +344,8 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   const auto &payload = member(value, "activation_payload");
   require_exact_fields(payload,
                        {"catalog_artifacts", "program", "program_binding",
-                        "raw_artifacts", "retained_bundle"},
+                        "program_role_assignment", "raw_artifacts",
+                        "retained_bundle"},
                        "activation_payload");
   auto bundle = detail::RetainedBundleReloadAuthority::reload(
       canonical_json(member(payload, "retained_bundle")));
@@ -327,7 +356,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
       bundle->value().cell_graph.graph_revision.value() != graph_revision ||
       bundle->value().catalogs.node_environment.environment_digest.value() !=
           node_environment_digest ||
-      bundle->value().compiled_products.symbol_role_maps.size() != 1U) {
+      bundle->value().compiled_products.symbol_role_maps.size() > 1U) {
     fail("prepared activation retained bundle differs from its summary");
   }
   std::size_t artifact_bytes_total = 0U;
@@ -337,31 +366,70 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   auto catalog_artifacts = parse_artifacts(
       member(payload, "catalog_artifacts"),
       "activation_payload.catalog_artifacts", artifact_bytes_total);
-  const auto &map_product =
-      bundle->value().compiled_products.symbol_role_maps.front();
-  if (map_product.artifact_refs.size() != 1U) {
-    fail("prepared activation retained model map is incoherent");
-  }
-  const RetainedModelMapQuery map_query{bundle->retained_bundle_id(),
-                                        map_product.product_id};
-  auto model_map = detail::RetainedModelMapVerificationAuthority::verify(
-      *bundle, map_query,
-      artifact_bytes(raw_artifacts, map_product.artifact_refs.front()));
-  if (!model_map.has_value()) {
-    fail("prepared activation retained model map is unverifiable");
+  std::optional<VerifiedRetainedModelMap> model_map;
+  if (!bundle->value().compiled_products.symbol_role_maps.empty()) {
+    const auto &map_product =
+        bundle->value().compiled_products.symbol_role_maps.front();
+    if (map_product.artifact_refs.size() != 1U) {
+      fail("prepared activation retained model map is incoherent");
+    }
+    const RetainedModelMapQuery map_query{bundle->retained_bundle_id(),
+                                          map_product.product_id};
+    model_map = detail::RetainedModelMapVerificationAuthority::verify(
+        *bundle, map_query,
+        artifact_bytes(raw_artifacts, map_product.artifact_refs.front()));
+    if (!model_map.has_value()) {
+      fail("prepared activation retained model map is unverifiable");
+    }
+  } else if (!bundle->value().cell_graph.controllable_components.empty() ||
+             !bundle->value().cell_graph.model_instances.empty() ||
+             program_binding_id.has_value() || !program_outcome.has_value() ||
+             !raw_artifacts.empty()) {
+    fail("prepared activation may omit model data only for a non-executable "
+         "Program on an empty candidate");
   }
   auto program = verify_program_binding_contract(
       canonical_json(member(payload, "program")), *bundle);
-  auto binding = reload_verified_program_binding(
-      canonical_json(member(payload, "program_binding")), *bundle, *model_map);
-  if (program == nullptr || binding == nullptr ||
+  if (program == nullptr ||
       program->value().program_id.value() !=
           text(member(value, "program_id"), "program_id") ||
-      program->value().program_revision.value() != program_revision ||
-      binding->program_binding_id().value() != program_binding_id ||
-      binding->value().program_id != program->value().program_id ||
-      binding->value().program_revision != program->value().program_revision) {
-    fail("prepared activation Program or binding differs from its summary");
+      program->value().program_revision.value() != program_revision) {
+    fail("prepared activation Program differs from its summary");
+  }
+  const auto &binding_value = member(payload, "program_binding");
+  std::shared_ptr<const ProgramBinding> binding;
+  if (program_binding_id.has_value()) {
+    if (!model_map.has_value()) {
+      fail("prepared activation binding has no retained model map");
+    }
+    binding = reload_verified_program_binding(canonical_json(binding_value),
+                                              *bundle, *model_map);
+    if (binding == nullptr ||
+        binding->program_binding_id().value() != *program_binding_id ||
+        binding->value().program_id != program->value().program_id ||
+        binding->value().program_revision != program->value().program_revision) {
+      fail("prepared activation Program binding differs from its summary");
+    }
+  } else if (!binding_value.is_null() ||
+             program_outcome->program_id != program->value().program_id ||
+             program_outcome->program_revision !=
+                 program->value().program_revision ||
+             program_outcome->retained_bundle_id !=
+                 bundle->retained_bundle_id() ||
+             program_outcome->graph_revision !=
+                 bundle->value().cell_graph.graph_revision) {
+    // A non-executable outcome is bound to this exact Program and candidate
+    // and never carries (or substitutes) a binding.
+    fail("prepared activation non-executable Program outcome differs from "
+         "its summary");
+  }
+  core::ProgramRoleAssignmentDTO role_assignment;
+  try {
+    role_assignment =
+        parse_program_role_assignment(member(payload, "program_role_assignment"));
+  } catch (const ProgramBindingOutcomeError &error) {
+    fail(std::string("prepared activation role assignment is invalid: ") +
+         error.what());
   }
   const bool assistant_available = bundle->value().assistant.has_value();
   if ((assistant_mode == "required" && !assistant_available) ||
@@ -370,7 +438,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   }
 
   VerifiedPreparedActivationClosure closure{
-      bundle, std::move(*model_map), std::move(program), std::move(binding),
+      bundle, std::move(model_map), std::move(program), std::move(binding),
       std::move(raw_artifacts), std::move(catalog_artifacts)};
   return PreparedActivationInput(
       core::ContentDigest(prepared_id), core::ContentDigest(source_digest),
@@ -383,7 +451,10 @@ parse_prepared_activation_input(const CanonicalValue &value) {
       core::GraphRevision(graph_revision),
       core::ProgramId(text(member(value, "program_id"), "program_id")),
       core::ProgramRevision(program_revision),
-      core::ProgramBindingId(program_binding_id),
+      program_binding_id.has_value()
+          ? std::optional(core::ProgramBindingId(*program_binding_id))
+          : std::nullopt,
+      std::move(program_outcome), std::move(role_assignment),
       core::ContentDigest(node_environment_digest), assistant_mode, overrides,
       value, std::move(closure));
 }

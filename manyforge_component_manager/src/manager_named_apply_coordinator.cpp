@@ -341,6 +341,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     ApplyProgressObserver apply_progress_observer)
     : apply_journal_(apply_journal), active_plan_source_(active_plan_source),
       retained_bundle_source_(retained_bundle_source),
+      artifact_source_(artifact_source),
       scene_owner_(scene_owner),
       kernel_fence_(kernel_fence), cell_admission_(cell_admission),
       manager_runtime_epoch_(std::move(manager_runtime_epoch)),
@@ -572,7 +573,6 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   }
 
   std::optional<ManagerActiveRuntimePlanDTO> active_plan;
-  std::optional<ManagerApplyFenceExpectationDTO> expectation;
   try {
     active_plan.emplace(active_plan_source_.ReadCurrentPlan());
     Require(active_plan->valid() &&
@@ -581,6 +581,23 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
                         .candidate_projection_revision,
                     intent.expected_active_projection_revision),
             "predecessor publication changed before initialization");
+  } catch (const std::exception &error) {
+    return RetainTerminalFailure(
+        apply_journal_, durable_intent, "apply_fence_evidence_failed",
+        error.what(), ManagerApplyEffectDisposition::kUnknown,
+        request_replayed);
+  }
+
+  const auto host_continuity = VerifyNativeExecutionHostContinuity(
+      predecessor, candidate, artifact_source_);
+  if (!host_continuity.ok()) {
+    return retain_pre_effect_failure(
+        host_continuity.error().code, host_continuity.error().message,
+        ManagerApplyEffectDisposition::kKnown);
+  }
+
+  std::optional<ManagerApplyFenceExpectationDTO> expectation;
+  try {
     expectation.emplace(FenceExpectation(
         intent, predecessor, candidate, *active_plan, apply_journal_,
         kernel_fence_, manager_runtime_epoch_));

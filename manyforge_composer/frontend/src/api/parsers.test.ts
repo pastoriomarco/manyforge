@@ -4,6 +4,7 @@ import {
   StructuralContractError,
   parseAuthoringWorkspaceSnapshot,
   parseAppliedProgramSelection,
+  parseAppliedProgramStatus,
   parseCapabilityCommandPreviewResponse,
   parseCatalogResponse,
   parseCurrentScenarioResponse,
@@ -1102,7 +1103,7 @@ describe('Program product projections', () => {
       status: 'accepted',
       confirmation_token: null,
       prepared_activation: {
-        schema_version: 'manyforge.prepared_activation_input.v2',
+        schema_version: 'manyforge.prepared_activation_input.v3',
         prepared_activation_id: digestC,
         source_document_digest: digestA,
         captured_input_digest: digestB,
@@ -1112,7 +1113,7 @@ describe('Program product projections', () => {
         graph_revision: digestC,
         program_id: 'fixture-program',
         program_revision: digestB,
-        program_binding_id: digestA,
+        program_outcome: { kind: 'bound', program_binding_id: digestA },
         node_environment_digest: digestC,
         assistant_mode: 'forbidden',
         typed_parameter_overrides: {},
@@ -1158,6 +1159,64 @@ describe('Program product projections', () => {
   });
 });
 
+describe('Applied Program status parser', () => {
+  const digest = `sha256:${'a'.repeat(64)}`;
+  const executable = {
+    deployment_artifact_id: 'deployment-a',
+    deployment_revision: digest,
+    executable: true,
+    graph_revision: digest,
+    message: null,
+    non_executable: null,
+    program: null,
+    program_binding_id: digest,
+    program_id: 'pick',
+    program_revision: digest,
+    record_digest: digest,
+    retained_bundle_id: digest,
+    scenario_id: 'scenario-a',
+    schema_version: 'manyforge.applied_program_status.v1',
+    source_document_digest: digest,
+  };
+
+  it('reports an executable Program with no references', () => {
+    const parsed = parseAppliedProgramStatus(executable);
+    expect(parsed.executable).toBe(true);
+    expect(parsed.unresolvedReferences).toEqual([]);
+  });
+
+  it('names the references of a preserved non-executable Program', () => {
+    const parsed = parseAppliedProgramStatus({
+      ...executable,
+      executable: false,
+      message: 'Applied Program is not executable in the active Deployment',
+      program: { program_id: 'pick' },
+      program_binding_id: null,
+      non_executable: {
+        affected_execution_groups: ['grasp'],
+        affected_nodes: ['close_gripper'],
+        unresolved_roles: [{
+          command_target_id: 'jaw',
+          component_role_id: 'gripper',
+          controllable_component_id: 'gripper-1',
+          detail: 'target role depends on an unresolved component role',
+          reason: 'component_role_unresolved',
+          target_role_id: 'jaw',
+        }],
+      },
+    });
+    expect(parsed.executable).toBe(false);
+    expect(parsed.unresolvedReferences[0].target_role_id).toBe('jaw');
+    expect(parsed.affectedNodes).toEqual(['close_gripper']);
+    // A binding alongside named references is contradictory.
+    expect(() => parseAppliedProgramStatus({
+      ...executable,
+      executable: false,
+      non_executable: { affected_execution_groups: [], affected_nodes: [], unresolved_roles: [] },
+    })).toThrow(/binding exactly when executable/);
+  });
+});
+
 describe('Deployment workspace parser', () => {
   it('binds a candidate receipt to one prepared activation identity', () => {
     const digestA = `sha256:${'a'.repeat(64)}`;
@@ -1165,7 +1224,7 @@ describe('Deployment workspace parser', () => {
     const preview = {
       api_version: 'manyforge.manager_command_response.v1',
       candidate_receipt: {
-        schema_version: 'manyforge.manager_deployment_candidate_receipt.v1',
+        schema_version: 'manyforge.manager_deployment_candidate_receipt.v2',
         deployment_artifact_id: 'deployment.fixture',
         deployment_revision: digestA,
         prepared_activation_id: digestB,
@@ -1177,6 +1236,8 @@ describe('Deployment workspace parser', () => {
         },
         expected_admission_generation: 7,
         manager_owner_epoch: 'manager.epoch.1',
+        impact_digest: digestB,
+        destructive_impact: true,
         receipt_digest: digestA,
       },
       converged: false,
@@ -1188,13 +1249,59 @@ describe('Deployment workspace parser', () => {
         'model_instances',
         'runtime_units',
       ].map((kind) => [kind, { added: [], changed: [], removed: [] }])),
+      impact: {
+        attachment_changed_components: [],
+        component_delta_digest: digestA,
+        components: [
+          { controllable_component_id: 'arm', disposition: 'retain', replacement_reasons: [] },
+          { controllable_component_id: 'gripper', disposition: 'remove', replacement_reasons: [] },
+        ],
+        destructive: true,
+        detached_components: ['gripper-2'],
+        program: {
+          executable: false,
+          non_executable: {
+            affected_execution_groups: ['grasp'],
+            affected_nodes: ['close_gripper'],
+            api_version: 'manyforge.program-binding-outcome.v1',
+            graph_revision: digestA,
+            program_id: 'fixture-program',
+            program_revision: digestB,
+            retained_bundle_id: digestA,
+            role_assignment_digest: digestB,
+            unresolved_roles: [{
+              command_target_id: null,
+              component_role_id: 'gripper',
+              controllable_component_id: 'gripper',
+              detail: 'component role selects a missing or ambiguous retained component',
+              reason: 'component_missing',
+              target_role_id: null,
+            }],
+          },
+          program_id: 'fixture-program',
+          program_revision: digestB,
+        },
+        shared_scene_projection_changed: false,
+      },
       ok: true,
     };
 
-    expect(
-      parseManagerDeploymentCandidatePreviewResponse(preview)
-        .candidateReceipt.prepared_activation_id,
-    ).toBe(digestB);
+    const parsed = parseManagerDeploymentCandidatePreviewResponse(preview);
+    expect(parsed.candidateReceipt.prepared_activation_id).toBe(digestB);
+    expect(parsed.candidateReceipt.destructive_impact).toBe(true);
+    // The Manager's impact is carried verbatim, never re-derived locally.
+    expect(parsed.impact.components.map((row) => row.disposition))
+      .toEqual(['retain', 'remove']);
+    expect(parsed.impact.program.executable).toBe(false);
+    expect(parsed.impact.program.unresolvedReferences[0].reason)
+      .toBe('component_missing');
+    expect(parsed.impact.program.affectedExecutionGroups).toEqual(['grasp']);
+    expect(parsed.impact.detachedComponents).toEqual(['gripper-2']);
+    const executableWithReasons = structuredClone(preview);
+    (executableWithReasons.impact.program as Record<string, unknown>)
+      .executable = true;
+    expect(() => parseManagerDeploymentCandidatePreviewResponse(executableWithReasons))
+      .toThrow(/non-executable/);
     const stale = structuredClone(preview);
     delete (stale.candidate_receipt as Record<string, unknown>)
       .prepared_activation_id;
@@ -1207,7 +1314,7 @@ describe('Deployment workspace parser', () => {
     const digestB = `sha256:${'b'.repeat(64)}`;
     const digestC = `sha256:${'c'.repeat(64)}`;
     const preparedActivation = {
-      schema_version: 'manyforge.prepared_activation_input.v2',
+      schema_version: 'manyforge.prepared_activation_input.v3',
       prepared_activation_id: digestC,
       source_document_digest: digestA,
       captured_input_digest: digestB,
@@ -1217,7 +1324,7 @@ describe('Deployment workspace parser', () => {
       graph_revision: digestC,
       program_id: 'fixture-program',
       program_revision: digestB,
-      program_binding_id: digestA,
+      program_outcome: { kind: 'bound', program_binding_id: digestA },
       node_environment_digest: digestC,
       assistant_mode: 'forbidden',
       typed_parameter_overrides: {},
@@ -1996,6 +2103,11 @@ describe('headless projection parsers', () => {
       state: 'pending',
     };
     expect(parseManagerApplyStatus(base).phase).toBe('runtime_converged');
+    // A non-executable Program is reported by a null binding, not a failure.
+    expect(parseManagerApplyStatus({
+      ...base,
+      prepared_activation: { ...base.prepared_activation, program_binding_id: null },
+    }).preparedActivation.programBindingId).toBeNull();
 
     const failed = parseManagerApplyStatus({
       ...base,
@@ -2645,38 +2757,16 @@ describe('addressed Robot Control parsers', () => {
         observed_targets: [],
       },
     };
-    const status = parseExecutionOwnerStatus(response);
-
-    expect(status.directControl.baseFrameRoleId).toBe('base');
-    expect(status.observedMotion.sourceJointNames).toEqual(['joint1']);
-    expect(status.observedMotion.positionsRad).toEqual([0.2]);
-    expect(status.observedMotion.currentTcpPose.position_m.z_m).toBe(0.4);
-    expect(status.observedGripper?.position).toBe(0.02);
-    expect(status.cellStopAction.expectedStopGeneration).toBe(4);
-    expect(status.directControl.targetDescriptor.operationalJointLimits[0])
-      .toMatchObject({
-        deploymentMaxVelocityRadS: 1.5,
-        effectiveMaxVelocityRadS: 1.5,
-        effectiveMaxAccelerationRadS2: 2.5,
-        effectiveMaxJerkRadS3: 10,
-      });
-
+    // execution_identity.v2: runtime identity only (H1a-IF.2).
     const identity = {
       active_publication_generation: 1,
       cell_id: 'cell-1',
       control_management_mode: 'component_lifecycle',
       graph_revision: 'sha256:graph',
-      gripper_command_schema_id: 'gripper.command_position',
-      gripper_command_schema_revision: exactRevision,
-      gripper_target_role_id: 'command_target',
-      motion_target_role_id: 'command_target',
       owner_epoch: 'owner-1',
-      program_binding_id: 'sha256:binding',
-      program_id: 'manyforge.direct_control.motion',
-      program_revision: 'sha256:program',
       retained_bundle_id: 'sha256:bundle',
       scene_revision: sceneRevision,
-      schema_version: 'manyforge.execution_identity.v1',
+      schema_version: 'manyforge.execution_identity.v2',
     };
     const parsedIdentity = parseExecutionIdentity({
       command: 'identity', identity, ok: true,
@@ -2684,6 +2774,20 @@ describe('addressed Robot Control parsers', () => {
     });
     expect(parsedIdentity.ownerEpoch).toBe('owner-1');
     expect(parsedIdentity.controlManagementMode).toBe('component_lifecycle');
+    // v1's primary-target and Program fields are gone, not nulled.
+    expect(() => parseExecutionIdentity({
+      command: 'identity',
+      identity: { ...identity, motion_target_role_id: 'command_target' },
+      ok: true,
+      api_version: 'manyforge.execution_command_response.v1',
+    })).toThrow(/exactly/);
+    expect(() => parseExecutionIdentity({
+      command: 'identity',
+      identity: { ...identity, schema_version: 'manyforge.execution_identity.v1' },
+      ok: true,
+      api_version: 'manyforge.execution_command_response.v1',
+    })).toThrow(/execution_identity.v2/);
+
     const {
       observed_state: observedMotion,
       ...motionTarget
@@ -2692,91 +2796,314 @@ describe('addressed Robot Control parsers', () => {
       observed_state: observedGripper,
       ...gripperTarget
     } = structuredClone(response.status.direct_control_gripper);
-    const targetsResponse = {
-        api_version: 'manyforge.execution_command_response.v1',
-        command: 'targets',
-        identity,
-        ok: true,
-        targets: {
-          direct_control: motionTarget,
-          direct_control_gripper: gripperTarget,
-          schema_version: 'manyforge.execution_targets.v1',
-        },
-    };
-    const controlResponse = {
-        api_version: 'manyforge.execution_command_response.v1',
-        command: 'control_state',
-        control_state: {
-          cell_stop_action: response.status.cell_stop_action,
-          observed_gripper: observedGripper,
-          observed_motion: observedMotion,
-          manual_operations: [] as unknown[],
-          runtime_scale_control: {
-            active_control_configuration_generation: 1,
-            active_control_configuration_id: 'active-1',
-            active_operation_id: null,
-            active_operation_revision: null,
-            active_operation_scale_generation: null,
-            application_state: null,
-            control_binding_id: 'binding-1',
-            control_binding_revision: exactRevision,
-            control_domain_id: 'domain-1',
-            control_domain_revision: exactRevision,
-            control_generation: 0,
-            effective_scale: null,
-            frozen: false,
-            reason: null,
-            requested_scale: 1,
-            scaling_domain_id: 'scale-1',
-            selector: {
-              component_role_id: 'controlled_component',
-              program_binding_id: 'sha256:binding',
-              target_role_id: 'command_target',
-            },
-            supported: true,
+    // One wire target row: key fields out, binding fields in manual_control.
+    const wireTarget = (target: Record<string, unknown>, presentation: string) => {
+      const fields = { ...target };
+      delete fields.controllable_component_id;
+      const {
+        command_target_id: commandTargetId,
+        operation_capability_id: operationCapabilityId,
+        program_binding_id: programBindingId,
+        program_id: programId,
+        program_revision: programRevision,
+        program_run_id: programRunId,
+        ...command
+      } = fields;
+      return {
+        command: {
+          ...command,
+          manual_control: {
+            program_binding_id: programBindingId,
+            program_id: programId,
+            program_revision: programRevision,
+            program_run_id: programRunId,
           },
-          schema_version: 'manyforge.execution_control_state.v4',
         },
-        identity,
-        ok: true,
+        command_target_id: commandTargetId,
+        operation_capability_id: operationCapabilityId,
+        presentation,
+      };
     };
-    const scoped = parseExecutionControlStatus(targetsResponse, controlResponse);
-    const addressedTargets = structuredClone(targetsResponse);
-    addressedTargets.targets.schema_version = 'manyforge.execution_targets.v2';
-    Object.assign(addressedTargets.targets, {
-      direct_control_targets: [motionTarget],
-      direct_control_gripper_targets: [gripperTarget],
+    const byTargetKey = (rows: Array<Record<string, unknown>>) => [...rows].sort((left, right) => (
+      JSON.stringify([left.command_target_id, left.operation_capability_id])
+        < JSON.stringify([right.command_target_id, right.operation_capability_id]) ? -1 : 1));
+    const eligible = { command_eligible: true, reason: null };
+    const targetsV3 = (components: unknown[]) => ({
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'targets',
+      identity,
+      ok: true,
+      targets: { components, schema_version: 'manyforge.execution_targets.v3' },
     });
-    const addressedControl: { control_state: Record<string, unknown> } = structuredClone(controlResponse);
-    addressedControl.control_state.schema_version = 'manyforge.execution_control_state.v5';
-    addressedControl.control_state.observed_target_states = [{
-      command_target_id: motionTarget.command_target_id,
+    const observedRow = (
+      target: Record<string, unknown>,
+      kind: string,
+      observed: unknown,
+    ) => ({
+      command_target_id: target.command_target_id,
+      controllable_component_id: target.controllable_component_id,
+      observed: observed === null ? null : { kind, ...(observed as Record<string, unknown>) },
+      operation_capability_id: target.operation_capability_id,
+    });
+    const runtimeScale = {
+      active_control_configuration_generation: 1,
+      active_control_configuration_id: 'active-1',
+      active_operation_id: null,
+      active_operation_revision: null,
+      active_operation_scale_generation: null,
+      application_state: null,
+      control_binding_id: 'binding-1',
+      control_binding_revision: exactRevision,
+      control_domain_id: 'domain-1',
+      control_domain_revision: exactRevision,
+      control_generation: 0,
+      effective_scale: null,
+      frozen: false,
+      reason: null,
+      requested_scale: 1,
+      scaling_domain_id: 'scale-1',
+      selector: {
+        component_role_id: 'controlled_component',
+        program_binding_id: 'sha256:binding',
+        target_role_id: 'command_target',
+      },
+      supported: true,
+    };
+    const controlV6 = (
+      observedTargets: unknown[],
+      runtimeScaleControl: unknown = runtimeScale,
+    ): { control_state: Record<string, unknown> } & Record<string, unknown> => ({
+      api_version: 'manyforge.execution_command_response.v1',
+      command: 'control_state',
+      control_state: {
+        cell_stop_action: response.status.cell_stop_action,
+        manual_operations: [] as unknown[],
+        observed_targets: observedTargets,
+        runtime_scale_control: runtimeScaleControl,
+        schema_version: 'manyforge.execution_control_state.v6',
+      },
+      identity,
+      ok: true,
+    });
+    type WireRow = Record<string, unknown>;
+    // The execution_status.v2 wire composition (identity.v2, targets.v3,
+    // control_state.v6 of one owner snapshot) of a fixture that lists its
+    // addressed targets in the internal layout.
+    const composed = (fixture: { status: WireRow }) => {
+      const source = fixture.status;
+      const rowsAt = (list: unknown, single: unknown) => (
+        list === undefined ? (single === null ? [] : [single]) : list) as WireRow[];
+      const motions = rowsAt(source.direct_control_targets, source.direct_control);
+      const grippers = rowsAt(
+        source.direct_control_gripper_targets,
+        source.direct_control_gripper,
+      );
+      const withoutObservation = (source: WireRow) => {
+        const row = { ...source };
+        delete row.observed_state;
+        return row;
+      };
+      const componentIds = [...new Set([...motions, ...grippers]
+        .map((row) => row.controllable_component_id as string))].sort();
+      return {
+        api_version: 'manyforge.execution_command_response.v1',
+        command: 'status',
+        ok: true,
+        status: {
+          control_state: {
+            cell_stop_action: source.cell_stop_action,
+            manual_operations: [] as unknown[],
+            observed_targets: [
+              ...motions.map((row) => observedRow(row, 'joint_positions', row.observed_state)),
+              ...grippers.map((row) => observedRow(row, 'coordinate', row.observed_state)),
+            ],
+            runtime_scale_control: motions.length === 0 ? null : runtimeScale,
+            schema_version: 'manyforge.execution_control_state.v6',
+          },
+          identity,
+          schema_version: 'manyforge.execution_status.v2',
+          targets: {
+            components: componentIds.map((componentId) => ({
+              availability: eligible,
+              controllable_component_id: componentId,
+              targets: byTargetKey([
+                ...motions
+                  .filter((row) => row.controllable_component_id === componentId)
+                  .map((row) => wireTarget(withoutObservation(row), 'motion')),
+                ...grippers
+                  .filter((row) => row.controllable_component_id === componentId)
+                  .map((row) => wireTarget(withoutObservation(row), 'gripper')),
+              ]),
+            })),
+            schema_version: 'manyforge.execution_targets.v3',
+          },
+        },
+      };
+    };
+    const status = parseExecutionOwnerStatus(composed(response));
+    expect(status.directControl!.baseFrameRoleId).toBe('base');
+    expect(status.observedMotion!.sourceJointNames).toEqual(['joint1']);
+    expect(status.observedMotion!.positionsRad).toEqual([0.2]);
+    expect(status.observedMotion!.currentTcpPose.position_m.z_m).toBe(0.4);
+    expect(status.observedGripper?.position).toBe(0.02);
+    expect(status.cellStopAction.expectedStopGeneration).toBe(4);
+    expect(status.directControl!.targetDescriptor.operationalJointLimits[0])
+      .toMatchObject({
+        deploymentMaxVelocityRadS: 1.5,
+        effectiveMaxVelocityRadS: 1.5,
+        effectiveMaxAccelerationRadS2: 2.5,
+        effectiveMaxJerkRadS3: 10,
+      });
+    // Status is the composition only: no primary aliases, no old version.
+    const aliased = composed(response) as { status: WireRow };
+    aliased.status.direct_control = response.status.direct_control;
+    expect(() => parseExecutionOwnerStatus(aliased)).toThrow(/exactly/);
+    const oldStatus = composed(response) as { status: WireRow };
+    oldStatus.status.schema_version = 'manyforge.execution_status.v1';
+    expect(() => parseExecutionOwnerStatus(oldStatus)).toThrow(/execution_status.v2/);
+    const tornStatus = composed(response) as { status: WireRow };
+    tornStatus.status.targets = { components: [], schema_version: 'manyforge.execution_targets.v2' };
+    expect(() => parseExecutionOwnerStatus(tornStatus)).toThrow(/execution_targets.v3/);
+
+    const armRow = wireTarget(motionTarget, 'motion');
+    const gripperRow = wireTarget(gripperTarget, 'gripper');
+    const armObserved = observedRow(motionTarget, 'joint_positions', observedMotion);
+    const gripperObserved = observedRow(gripperTarget, 'coordinate', observedGripper);
+
+    // Arm and gripper owned by one component (the fixture's layout).
+    const targetsResponse = targetsV3([{
+      availability: eligible,
       controllable_component_id: motionTarget.controllable_component_id,
-      gripper: null,
-      gripper_target_role_id: gripperTarget.target_role_id,
-      motion: observedMotion,
-      motion_target_role_id: motionTarget.target_role_id,
-    }, {
-      command_target_id: gripperTarget.command_target_id,
-      controllable_component_id: gripperTarget.controllable_component_id,
-      gripper: observedGripper,
-      gripper_target_role_id: gripperTarget.target_role_id,
-      motion: null,
-      motion_target_role_id: motionTarget.target_role_id,
-    }];
-    const addressed = parseExecutionControlStatus(addressedTargets, addressedControl);
-    expect(addressed.directControlTargets).toHaveLength(1);
-    expect(addressed.observedMotions?.[0]).toMatchObject({
+      targets: byTargetKey([armRow, gripperRow]),
+    }]);
+    const controlResponse = controlV6([armObserved, gripperObserved]);
+    const scoped = parseExecutionControlStatus(targetsResponse, controlResponse);
+    expect(scoped.directControlTargets).toHaveLength(1);
+    expect(scoped.directControlGripperTargets).toHaveLength(1);
+    expect(scoped.components).toEqual([{
       controllableComponentId: motionTarget.controllable_component_id,
-      commandTargetId: motionTarget.command_target_id,
-    });
-    expect(addressed.observedGrippers?.[0]).toMatchObject({
-      controllableComponentId: gripperTarget.controllable_component_id,
-      commandTargetId: gripperTarget.command_target_id,
-    });
+      commandEligible: true,
+      unavailableReason: null,
+      unsupportedTargets: [],
+    }]);
+    // The direct-control binding is per target, never a runtime identity.
+    expect(scoped.directControl!.programBindingId).toBe(motionTarget.program_binding_id);
+
+    // Arm-only: one motion row, no gripper row and no null gripper fields.
+    const armOnly = parseExecutionControlStatus(
+      targetsV3([{
+        availability: eligible,
+        controllable_component_id: motionTarget.controllable_component_id,
+        targets: [armRow],
+      }]),
+      controlV6([armObserved]),
+    );
+    expect(armOnly.directControlGripper).toBeNull();
+    expect(armOnly.directControlGripperTargets).toEqual([]);
+    expect(armOnly.directControlTargets).toHaveLength(1);
+
+    // Independent arm and gripper components; the Disabled gripper stays
+    // listed with its manual-control details (the backend refuses commands).
+    const independentGripper = {
+      ...gripperTarget,
+      controllable_component_id: 'gripper-1',
+      target_descriptor: {
+        ...(gripperTarget.target_descriptor as Record<string, unknown>),
+        controllable_component_id: 'gripper-1',
+      },
+    };
+    const independent = parseExecutionControlStatus(
+      targetsV3([
+        {
+          availability: { command_eligible: false, reason: 'component_disabled' },
+          controllable_component_id: 'gripper-1',
+          targets: [wireTarget(independentGripper, 'gripper')],
+        },
+        {
+          availability: eligible,
+          controllable_component_id: motionTarget.controllable_component_id,
+          targets: [armRow],
+        },
+      ].sort((left, right) => (
+        left.controllable_component_id < right.controllable_component_id ? -1 : 1))),
+      controlV6([armObserved, observedRow(independentGripper, 'coordinate', observedGripper)]),
+    );
+    expect(independent.directControlGripperTargets[0].controllableComponentId).toBe('gripper-1');
+    expect(independent.components.find((row) => row.controllableComponentId === 'gripper-1'))
+      .toMatchObject({ commandEligible: false, unavailableReason: 'component_disabled' });
+
+    // Gripper-only: no motion identity anywhere and no runtime scaling.
+    const gripperOnly = parseExecutionControlStatus(
+      targetsV3([{
+        availability: eligible,
+        controllable_component_id: 'gripper-1',
+        targets: [wireTarget(independentGripper, 'gripper')],
+      }]),
+      controlV6([observedRow(independentGripper, 'coordinate', observedGripper)], null),
+    );
+    expect(gripperOnly.directControl).toBeNull();
+    expect(gripperOnly.observedMotion).toBeNull();
+    expect(gripperOnly.directControlTargets).toEqual([]);
+    expect(gripperOnly.directControlGripper!.controllableComponentId).toBe('gripper-1');
+    expect(gripperOnly.runtimeScaleControl).toBeNull();
+
+    // An unsupported capability is listed, never commandable or observed.
+    const withUnsupported = parseExecutionControlStatus(
+      targetsV3([{
+        availability: eligible,
+        controllable_component_id: 'gripper-1',
+        targets: byTargetKey([
+          wireTarget(independentGripper, 'gripper'),
+          {
+            command: null,
+            command_target_id: 'vacuum',
+            operation_capability_id: 'tool.vacuum.command',
+            presentation: 'unsupported',
+          },
+        ]),
+      }]),
+      controlV6([observedRow(independentGripper, 'coordinate', observedGripper)], null),
+    );
+    expect(withUnsupported.components[0].unsupportedTargets).toEqual([
+      { commandTargetId: 'vacuum', operationCapabilityId: 'tool.vacuum.command' },
+    ]);
+    expect(() => parseExecutionControlStatus(
+      targetsV3([{
+        availability: eligible,
+        controllable_component_id: 'gripper-1',
+        targets: [{
+          command: null,
+          command_target_id: 'vacuum',
+          operation_capability_id: 'tool.vacuum.command',
+          presentation: 'unsupported',
+        }],
+      }]),
+      controlV6([{
+        command_target_id: 'vacuum', controllable_component_id: 'gripper-1',
+        observed: null, operation_capability_id: 'tool.vacuum.command',
+      }], null),
+    )).toThrow(/observations only for commandable addressed targets/);
+
+    // An observation without its target, or a missing observation, is refused.
+    expect(() => parseExecutionControlStatus(targetsResponse, controlV6([armObserved])))
+      .toThrow(/one observation row for the exact addressed target/);
+    // Ineligibility needs an existing refusal reason, and vice versa.
+    expect(() => parseExecutionControlStatus(
+      targetsV3([{
+        availability: { command_eligible: false, reason: null },
+        controllable_component_id: motionTarget.controllable_component_id,
+        targets: [armRow],
+      }]),
+      controlV6([armObserved]),
+    )).toThrow(/refusal reason exactly when ineligible/);
+    // Old wire versions are not accepted (one clean cutover).
+    const legacyTargets = structuredClone(targetsResponse) as { targets: Record<string, unknown> };
+    legacyTargets.targets.schema_version = 'manyforge.execution_targets.v2';
+    expect(() => parseExecutionControlStatus(legacyTargets, controlResponse))
+      .toThrow(/execution_targets.v3/);
     const groupedControlResponse: { control_state: Record<string, unknown> } = structuredClone(controlResponse);
     groupedControlResponse.control_state.runtime_scale_control = {
-      ...controlResponse.control_state.runtime_scale_control,
+      ...runtimeScale,
       active_control_configuration_generation: null,
       active_control_configuration_id: null,
       control_binding_id: null,
@@ -2833,10 +3160,10 @@ describe('addressed Robot Control parsers', () => {
       controlResponse.control_state.manual_operations = rows;
       expect(() => parseExecutionControlStatus(targetsResponse, controlResponse)).toThrow();
     }
-    expect(scoped.directControl.targetDescriptor).toEqual(
-      status.directControl.targetDescriptor,
+    expect(scoped.directControl!.targetDescriptor).toEqual(
+      status.directControl!.targetDescriptor,
     );
-    expect(scoped.observedMotion.positionsRad).toEqual([0.2]);
+    expect(scoped.observedMotion!.positionsRad).toEqual([0.2]);
 
     const stopped = structuredClone(response);
     Object.assign(stopped.status.cell_stop_action, {
@@ -2871,7 +3198,7 @@ describe('addressed Robot Control parsers', () => {
         trigger: 'partial',
       },
     });
-    const stoppedStatus = parseExecutionOwnerStatus(stopped);
+    const stoppedStatus = parseExecutionOwnerStatus(composed(stopped));
     expect(stoppedStatus.cellStopAction.latestTerminal?.certificate.stopId)
       .toBe('stop.4');
     expect(stoppedStatus.cellStopAction.latestTerminal?.executedStages[0])
@@ -2892,27 +3219,74 @@ describe('addressed Robot Control parsers', () => {
     Object.assign(componentLocal.status.direct_control_gripper, {
       observed_state: null,
     });
-    const localStatus = parseExecutionOwnerStatus(componentLocal);
-    expect(localStatus.directControlGripper.sourceKind).toBe('component_local');
-    expect(localStatus.directControlGripper.minPosition).toBeNull();
+    const localStatus = parseExecutionOwnerStatus(composed(componentLocal));
+    expect(localStatus.directControlGripper?.sourceKind).toBe('component_local');
+    expect(localStatus.directControlGripper?.minPosition).toBeNull();
     expect(localStatus.observedGripper).toBeNull();
+
+    // An arm-only native component publishes no gripper at all (H1a-B).
+    const armOnlyStatus = structuredClone(response) as { status: Record<string, unknown> };
+    armOnlyStatus.status.direct_control_gripper = null;
+    const armOnlyComposed = parseExecutionOwnerStatus(composed(armOnlyStatus));
+    expect(armOnlyComposed.directControlGripper).toBeNull();
+    expect(armOnlyComposed.observedGripper).toBeNull();
+    const armOnlyInventory = structuredClone(armOnlyStatus);
+    Object.assign(armOnlyInventory.status, {
+      direct_control_targets: [response.status.direct_control],
+      direct_control_gripper_targets: [],
+    });
+    const armOnlyParsed = parseExecutionOwnerStatus(composed(armOnlyInventory));
+    expect(armOnlyParsed.directControlTargets).toHaveLength(1);
+    expect(armOnlyParsed.directControlGripperTargets).toEqual([]);
+    expect(armOnlyParsed.observedGrippers).toEqual([]);
+    // A present gripper still pairs exactly with its component.
+    const paired = structuredClone(response) as { status: Record<string, unknown> };
+    Object.assign(paired.status, {
+      direct_control_targets: [response.status.direct_control],
+      direct_control_gripper_targets: [response.status.direct_control_gripper],
+    });
+    expect(parseExecutionOwnerStatus(composed(paired)).directControlGripperTargets).toHaveLength(1);
+    // H1a-IF.2: a gripper need not share a motion component; targets nest
+    // in their component on the wire, and keys are unique.
+    const independentStatus = structuredClone(paired);
+    const independentGripperTarget = {
+      ...response.status.direct_control_gripper,
+      controllable_component_id: 'gripper-without-motion',
+      target_descriptor: {
+        ...response.status.direct_control_gripper.target_descriptor,
+        controllable_component_id: 'gripper-without-motion',
+      },
+    };
+    independentStatus.status.direct_control_gripper_targets = [{
+      ...independentGripperTarget,
+    }];
+    independentStatus.status.direct_control_gripper = null;
+    expect(parseExecutionOwnerStatus(composed(independentStatus))
+      .directControlGripperTargets[0].controllableComponentId).toBe('gripper-without-motion');
+    const ambiguous = structuredClone(paired);
+    ambiguous.status.direct_control_gripper_targets = [
+      response.status.direct_control_gripper,
+      response.status.direct_control_gripper,
+    ];
+    expect(() => parseExecutionOwnerStatus(composed(ambiguous)))
+      .toThrow(/one observation row/);
 
     const leaked = structuredClone(response);
     Object.assign(leaked.status.direct_control, {
       compiled_joint_names: ['robot-a__joint1'],
     });
-    expect(() => parseExecutionOwnerStatus(leaked)).toThrow(/exactly/);
+    expect(() => parseExecutionOwnerStatus(composed(leaked))).toThrow(/exactly/);
 
     const crossedDescriptor = structuredClone(response);
     crossedDescriptor.status.direct_control.target_descriptor.frames.reverse();
-    expect(() => parseExecutionOwnerStatus(crossedDescriptor)).toThrow(
+    expect(() => parseExecutionOwnerStatus(composed(crossedDescriptor))).toThrow(
       /exact addressed targets/,
     );
 
     const dishonestLimit = structuredClone(response);
     dishonestLimit.status.direct_control.target_descriptor
       .operational_joint_limits[0].effective_max_velocity_rad_s = 2;
-    expect(() => parseExecutionOwnerStatus(dishonestLimit)).toThrow(
+    expect(() => parseExecutionOwnerStatus(composed(dishonestLimit))).toThrow(
       /exact conservative Deployment\/model minimum/,
     );
 
@@ -2929,13 +3303,13 @@ describe('addressed Robot Control parsers', () => {
     Object.assign(ordinary.status.direct_control.target_descriptor.operational_joint_limits[0], {
       deployment_max_jerk_rad_s3: null, effective_max_jerk_rad_s3: 6,
     });
-    expect(parseExecutionOwnerStatus(ordinary).directControl.targetDescriptor.ordinaryJerk)
+    expect(parseExecutionOwnerStatus(composed(ordinary)).directControl!.targetDescriptor.ordinaryJerk)
       .toMatchObject({ enabled: true, jointLimits: [{ maximumRadS3: 6, source: 'imported' }] });
     jerkRow.maximum_rad_s3 = 7;
-    expect(() => parseExecutionOwnerStatus(ordinary)).toThrow(/effective jerk limits/);
+    expect(() => parseExecutionOwnerStatus(composed(ordinary))).toThrow(/effective jerk limits/);
     jerkRow.maximum_rad_s3 = 6;
     jerkRow.source_joint_name = 'foreign-joint';
-    expect(() => parseExecutionOwnerStatus(ordinary)).toThrow(/exact ordered model joints/);
+    expect(() => parseExecutionOwnerStatus(composed(ordinary))).toThrow(/exact ordered model joints/);
   });
 
   it('accepts only a no-motion receipt with equal source arrays', () => {

@@ -392,10 +392,6 @@ class HeadlessService:
         """Return the explicit, cold-path aggregate owner projection."""
         return self._execution().diagnostics()
 
-    def execution_status(self) -> dict[str, Any]:
-        """Compatibility alias; product consumers use focused projections."""
-        return self.execution_diagnostics()
-
     def execution_identity(self) -> dict[str, Any]:
         return self._execution().identity()
 
@@ -876,7 +872,12 @@ class HeadlessService:
         except HeadlessApiError as error:
             # Catalog authoring is independent of an Applied Program. Never
             # join a Runner offer when the local Applied identity is absent.
-            if error.code == "program_applied_selection_not_found":
+            # A non-executable Applied Program (H1a) is not a Runner source
+            # either; authoring stays available and joins no Runner offer.
+            if error.code in {
+                "program_applied_selection_not_found",
+                "program_applied_non_executable",
+            }:
                 return projection
             raise
         try:
@@ -1137,6 +1138,57 @@ class HeadlessService:
             error_code="program_applied_selection_invalid",
             message="native core returned an unsupported Applied Program selection",
         )
+        return projection
+
+    def program_applied_status(self) -> dict[str, Any]:
+        """Derived executable/non-executable status of the Applied Program.
+
+        Read on demand from the durable active Apply; for a non-executable
+        Program it carries the preserved authored Program and the named
+        unresolved references, and never a binding.
+        """
+
+        projection = self.core.applied_program_status()
+        if not isinstance(projection, dict):
+            raise HeadlessApiError(
+                "program_applied_selection_invalid",
+                "native core returned an unsupported Applied Program status",
+            )
+        executable = projection.get("executable")
+        expected_fields = {
+            "deployment_artifact_id",
+            "deployment_revision",
+            "executable",
+            "graph_revision",
+            "message",
+            "non_executable",
+            "program",
+            "program_binding_id",
+            "program_id",
+            "program_revision",
+            "record_digest",
+            "retained_bundle_id",
+            "scenario_id",
+            "schema_version",
+            "source_document_digest",
+        }
+        if (
+            set(projection) != expected_fields
+            or projection.get("schema_version") != "manyforge.applied_program_status.v1"
+            or type(executable) is not bool
+            or (projection.get("program_binding_id") is None) is executable
+            or (projection.get("non_executable") is None) is not executable
+            or (projection.get("program") is None) is not executable
+            or not _bounded_text(
+                projection.get("deployment_artifact_id"), maximum_bytes=256
+            )
+            or not isinstance(projection.get("deployment_revision"), str)
+            or not _sha256_identity(projection["deployment_revision"])
+        ):
+            raise HeadlessApiError(
+                "program_applied_selection_invalid",
+                "native core returned an unsupported Applied Program status",
+            )
         return projection
 
     def program_model_attempt(

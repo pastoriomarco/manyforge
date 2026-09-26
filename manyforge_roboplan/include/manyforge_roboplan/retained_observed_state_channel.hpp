@@ -90,6 +90,11 @@ class IRetainedObservedStateChannel {
 public:
   virtual ~IRetainedObservedStateChannel() = default;
 
+  /// A component owner was retired under the cell publication fence. Wake
+  /// readers so they reselect the current product instead of waiting on an
+  /// observation source that can no longer publish.
+  virtual void notify_composition_replaced() noexcept {}
+
   [[nodiscard]] virtual RetainedStateProjectionResult
   publish_state(std::span<const double> positions_si,
                 std::span<const double> velocities_si,
@@ -264,7 +269,9 @@ public:
   }
   // Called under the host's composition replacement fence. A waiting viewer
   // must recapture the new product (or its absence), even while we are idle.
-  void notify_composition_replaced() noexcept { render_wake_->notify(); }
+  void notify_composition_replaced() noexcept override {
+    render_wake_->notify();
+  }
   [[nodiscard]] std::uint64_t render_incarnation() const noexcept {
     return render_wake_->incarnation();
   }

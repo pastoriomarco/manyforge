@@ -74,6 +74,8 @@ native_geometry_name(const std::string_view body_id,
 resolve_retained_mesh_path(const RoboPlanWorkerModelDTO &model,
                            const std::optional<std::filesystem::path>
                                &scene_asset_root,
+                           const std::optional<int>
+                               &retained_package_root_fd,
                            const std::string_view uri) {
   constexpr std::string_view kAssetPrefix = "asset://";
   const bool model_asset = uri.starts_with(kAssetPrefix);
@@ -92,14 +94,15 @@ resolve_retained_mesh_path(const RoboPlanWorkerModelDTO &model,
       })) {
     throw std::invalid_argument("retained worker mesh asset path is invalid");
   }
-  if (!model_asset && scene_asset_root.has_value() &&
-      scene_asset_root->generic_string() == "/proc/self/fd/6") {
+  if (!model_asset && retained_package_root_fd.has_value()) {
+    const int retained_root_fd = *retained_package_root_fd;
     struct stat root_status {};
-    if (::fstat(6, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
+    if (::fstat(retained_root_fd, &root_status) != 0 ||
+        !S_ISDIR(root_status.st_mode)) {
       throw std::invalid_argument(
           "retained worker descriptor root is unavailable");
     }
-    int current = ::fcntl(6, F_DUPFD_CLOEXEC, 7);
+    int current = ::fcntl(retained_root_fd, F_DUPFD_CLOEXEC, 9);
     if (current < 0) {
       throw std::invalid_argument(
           "retained worker descriptor root could not be duplicated");
@@ -131,7 +134,9 @@ resolve_retained_mesh_path(const RoboPlanWorkerModelDTO &model,
         !S_ISREG(selected_status.st_mode)) {
       throw std::invalid_argument("retained worker mesh is not a regular file");
     }
-    return *scene_asset_root / relative;
+    // The source descriptor can be any inherited directory FD in the managed
+    // host. start_worker maps it to FD 6 in the worker process.
+    return std::filesystem::path("/proc/self/fd/6") / relative;
   }
   std::error_code filesystem_error;
   const auto root = std::filesystem::canonical(
@@ -196,6 +201,7 @@ projected_shape(const core::CollisionGeometryDescriptor &geometry) {
 project_worker_model(const RoboPlanWorkerModelDTO &base,
                      const std::optional<std::filesystem::path>
                          &scene_asset_root,
+                     const std::optional<int> &retained_package_root_fd,
                      const RoboPlanCandidateProjectionDTO &projection) {
   if (!projection.projection_binding.valid() || !projection.world ||
       !projection.policy) {
@@ -221,6 +227,7 @@ project_worker_model(const RoboPlanWorkerModelDTO &base,
       std::optional<std::filesystem::path> mesh_path;
       if (const auto *mesh = std::get_if<core::MeshShapeDTO>(&shape)) {
         mesh_path = resolve_retained_mesh_path(model, scene_asset_root,
+                                               retained_package_root_fd,
                                                mesh->resource_uri);
       }
       const auto name = native_geometry_name(body.body_id, index);
@@ -692,15 +699,20 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
           "RoboPlan process-contained client configuration is invalid");
     }
     if (config.retained_package_root_fd.has_value()) {
-      if (*config.retained_package_root_fd != 6 ||
+      const int retained_root_fd = *config.retained_package_root_fd;
+      const std::string expected_root =
+          "/proc/self/fd/" + std::to_string(retained_root_fd);
+      if (retained_root_fd < 6 || retained_root_fd == 7 ||
           !config.scene_asset_root.has_value() ||
-          config.scene_asset_root->generic_string() != "/proc/self/fd/6") {
+          config.scene_asset_root->generic_string() != expected_root) {
         throw std::invalid_argument(
-            "RoboPlan retained package descriptor must be reserved FD 6");
+            "RoboPlan retained package descriptor must name its exact "
+            "inherited root");
       }
       struct stat status {};
-      const int flags = ::fcntl(6, F_GETFD);
-      if (::fstat(6, &status) != 0 || !S_ISDIR(status.st_mode) ||
+      const int flags = ::fcntl(retained_root_fd, F_GETFD);
+      if (::fstat(retained_root_fd, &status) != 0 ||
+          !S_ISDIR(status.st_mode) ||
           flags < 0 || (flags & FD_CLOEXEC) != 0) {
         throw std::invalid_argument(
             "RoboPlan retained package descriptor is not inherited");
@@ -737,6 +749,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     RoboPlanWorkerModelDTO projected;
     try {
       projected = project_worker_model(base_model, config.scene_asset_root,
+                                       config.retained_package_root_fd,
                                        projection);
     } catch (const std::exception &exception) {
       return core::Result<void>::Err(
@@ -845,13 +858,18 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
              0)) {
       throw std::runtime_error("could not configure planner spawn actions");
     }
-    if (config.retained_package_root_fd.has_value() &&
-        (::posix_spawn_file_actions_adddup2(
-             &actions, *config.retained_package_root_fd, 6) != 0 ||
-         ::posix_spawn_file_actions_addclose(&actions, 4) != 0 ||
-         ::posix_spawn_file_actions_addclose(&actions, 5) != 0)) {
-      throw std::runtime_error(
-          "could not preserve the retained package descriptor for worker");
+    if (config.retained_package_root_fd.has_value()) {
+      const int source_root_fd = *config.retained_package_root_fd;
+      if (::posix_spawn_file_actions_adddup2(&actions, source_root_fd, 6) !=
+              0 ||
+          (source_root_fd != 6 &&
+           ::posix_spawn_file_actions_addclose(&actions, source_root_fd) !=
+               0) ||
+          ::posix_spawn_file_actions_addclose(&actions, 4) != 0 ||
+          ::posix_spawn_file_actions_addclose(&actions, 5) != 0) {
+        throw std::runtime_error(
+            "could not preserve the retained package descriptor for worker");
+      }
     }
 
     const std::string executable = config.worker_executable.string();

@@ -8,6 +8,8 @@
 #include <manyforge_core/gripper_participant_engine.hpp>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
+#include <manyforge_roboplan/retained_native_cell_runtime.hpp>
+#include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -16,6 +18,104 @@
 #include <utility>
 
 namespace manyforge::roboplan_backend {
+
+RetainedPlanningSceneSynchronizer::RetainedPlanningSceneSynchronizer(
+    std::shared_ptr<core::IPlanningSceneSynchronizer> target)
+    : target_(std::move(target)) {
+  if (target_ == nullptr) {
+    throw std::invalid_argument(
+        "retained planning-scene synchronizer target is required");
+  }
+}
+
+void RetainedPlanningSceneSynchronizer::ReplaceTarget(
+    std::shared_ptr<core::IPlanningSceneSynchronizer> target) {
+  if (target == nullptr) {
+    throw std::invalid_argument(
+        "retained planning-scene synchronizer target is required");
+  }
+  std::lock_guard lock(mutex_);
+  target_ = std::move(target);
+}
+
+RetainedReferencePoseResolverProxy::RetainedReferencePoseResolverProxy(
+    std::shared_ptr<core::IReferencePoseResolver> target)
+    : target_(std::move(target)) {
+  if (target_ == nullptr) {
+    throw std::invalid_argument(
+        "retained reference-pose resolver target is required");
+  }
+}
+
+void RetainedReferencePoseResolverProxy::ReplaceTarget(
+    std::shared_ptr<core::IReferencePoseResolver> target) {
+  if (target == nullptr) {
+    throw std::invalid_argument(
+        "retained reference-pose resolver target is required");
+  }
+  std::lock_guard lock(mutex_);
+  target_ = std::move(target);
+}
+
+std::shared_ptr<core::IReferencePoseResolver>
+RetainedReferencePoseResolverProxy::CurrentTarget() const {
+  std::lock_guard lock(mutex_);
+  return target_;
+}
+
+core::Result<core::ProgramFrameResolutionContextDTO>
+RetainedReferencePoseResolverProxy::capture_program_frame_resolution_context(
+    core::ProgramFrameResolutionCaptureDTO capture) const {
+  const auto target = CurrentTarget();
+  if (target == nullptr) {
+    return core::Result<core::ProgramFrameResolutionContextDTO>::Err(
+        core::ErrorDTO{"reference_resolver_target_missing",
+                       "retained reference-pose resolver has no active target",
+                       {}});
+  }
+  return target->capture_program_frame_resolution_context(std::move(capture));
+}
+
+core::Result<core::Pose3DTO>
+RetainedReferencePoseResolverProxy::resolve_reference_pose(
+    const core::ReferenceDTO &reference,
+    const core::ProgramFrameResolutionContextDTO &context) const {
+  const auto target = CurrentTarget();
+  if (target == nullptr) {
+    return core::Result<core::Pose3DTO>::Err(core::ErrorDTO{
+        "reference_resolver_target_missing",
+        "retained reference-pose resolver has no active target", {}});
+  }
+  return target->resolve_reference_pose(reference, context);
+}
+
+core::Result<core::ResolvedSceneFramePoseDTO>
+RetainedReferencePoseResolverProxy::resolve_scene_frame(
+    const core::SceneFrameRefDTO &reference,
+    const core::SceneFrameResolutionContextDTO &context) const {
+  const auto target = CurrentTarget();
+  if (target == nullptr) {
+    return core::Result<core::ResolvedSceneFramePoseDTO>::Err(core::ErrorDTO{
+        "reference_resolver_target_missing",
+        "retained reference-pose resolver has no active target", {}});
+  }
+  return target->resolve_scene_frame(reference, context);
+}
+
+core::Result<core::ProjectionRevisionDTO>
+RetainedPlanningSceneSynchronizer::SynchronizeBeforePlanning() {
+  std::shared_ptr<core::IPlanningSceneSynchronizer> target;
+  {
+    std::lock_guard lock(mutex_);
+    target = target_;
+  }
+  if (target == nullptr) {
+    return core::Result<core::ProjectionRevisionDTO>::Err(core::ErrorDTO{
+        "planning_scene_synchronizer_target_missing",
+        "retained planning-scene synchronizer has no active target", {}});
+  }
+  return target->SynchronizeBeforePlanning();
+}
 
 RetainedNativeRuntime::~RetainedNativeRuntime() {
   // The cell Kernel holds non-owning event subscriptions to every participant
@@ -51,6 +151,11 @@ RetainedNativeRuntime::~RetainedNativeRuntime() {
   if (stale_local_root) {
     cell_addressed_kernel = nullptr;
   }
+  cell_operation_journal = nullptr;
+  // Both roots and former peers can retire in different orders across an
+  // Apply. Never leave a self- or predecessor-root pointer dangling after
+  // this owner is destroyed.
+  cell_runtime_root = nullptr;
   // participant_peers intentionally retires with ordinary member destruction,
   // after this body: its engines stayed alive for the Kernel unsubscribe above
   // and for surveillance, and a peer kept alive elsewhere still resolves its
@@ -440,6 +545,16 @@ runtime_registration(
       deployment_maximum_tcp_linear_speed_mps};
 }
 
+[[nodiscard]] core::RuntimeParticipantExecutionRegistration
+gripper_runtime_registration(
+    core::RuntimeParticipantBinding binding,
+    const std::optional<core::RuntimeParticipantStopReadiness> &readiness,
+    core::IResolvedParticipantExecutionEngine *engine,
+    core::IControlDomainExecutionPort *stop_execution_port) {
+  return runtime_registration(std::move(binding), readiness, engine,
+                              stop_execution_port, std::nullopt);
+}
+
 [[nodiscard]] std::optional<core::RuntimeParticipantPolicySelection>
 representative_runtime_policy(
     const bool primary, const bool motion_owner,
@@ -448,6 +563,15 @@ representative_runtime_policy(
     return policy;
   }
   return std::nullopt;
+}
+
+[[nodiscard]] std::optional<core::StopDeadlineBudgetDTO>
+cell_stop_envelope(std::optional<core::StopDeadlineBudgetDTO> budget) {
+  // Phase rows belong to each participant's sealed Stop plan. The cell cache
+  // retains only the shared outer envelope and Kernel completion reserve.
+  if (budget.has_value())
+    budget->phases.clear();
+  return budget;
 }
 
 [[nodiscard]] std::vector<core::ResourceId>
@@ -475,11 +599,36 @@ motion_goal_observer(core::IResolvedParticipantExecutionEngine *engine,
 gripper_goal_observer(core::IResolvedParticipantExecutionEngine *engine,
                       core::RuntimeParticipantBinding binding);
 
+void append_stop_observation_sources(
+    RetainedStopSurveillanceSourceInput &source,
+    const core::RuntimeParticipantBinding &binding,
+    const core::RuntimeParticipantStopReadiness &readiness) {
+  for (const auto &stage :
+       readiness.value().resolved_stop_base_plan.escalation_stages) {
+    const auto resources = stop_observation_resources(binding, stage);
+    for (const auto &requirement : stage.evidence_requirements) {
+      if (requirement.requirement.evidence_kind !=
+              core::StopEvidenceRequirementKind::kMotionRest ||
+          requirement.resolved_source.source_kind !=
+              core::StopEvidenceSourceKind::kBindingStateAuthority) {
+        continue;
+      }
+      const RetainedStopSurveillanceObservationSource observation{
+          requirement.requirement, requirement.resolved_source, resources};
+      if (std::find(source.observation_sources.begin(),
+                    source.observation_sources.end(), observation) ==
+          source.observation_sources.end()) {
+        source.observation_sources.push_back(observation);
+      }
+    }
+  }
+}
+
 [[nodiscard]] std::optional<RetainedStopSurveillanceSourceInput>
 stop_surveillance_source(
     const core::RuntimeParticipantBinding &binding,
     const std::optional<core::RuntimeParticipantStopReadiness> &readiness,
-    const std::shared_ptr<RetainedObservedStateChannel> &channel,
+    const std::shared_ptr<IRetainedObservedStateChannel> &channel,
     RetainedNoActiveGoalEvidenceSource no_active_goal_evidence_source) {
   if (channel == nullptr || !no_active_goal_evidence_source) {
     return std::nullopt;
@@ -487,22 +636,7 @@ stop_surveillance_source(
   RetainedStopSurveillanceSourceInput result{
       binding, channel, {}, std::move(no_active_goal_evidence_source)};
   if (readiness.has_value()) {
-    const auto &plan = readiness->value().resolved_stop_base_plan;
-    for (const auto &stage : plan.escalation_stages) {
-      const auto resources = stop_observation_resources(binding, stage);
-      for (const auto &requirement : stage.evidence_requirements) {
-        if (requirement.requirement.evidence_kind !=
-                core::StopEvidenceRequirementKind::kMotionRest ||
-            requirement.resolved_source.source_kind !=
-                core::StopEvidenceSourceKind::kBindingStateAuthority) {
-          continue;
-        }
-        result.observation_sources.push_back(
-            RetainedStopSurveillanceObservationSource{
-                requirement.requirement, requirement.resolved_source,
-                resources});
-      }
-    }
+    append_stop_observation_sources(result, binding, *readiness);
   }
   return result;
 }
@@ -518,7 +652,9 @@ stop_surveillance_sources(
         &gripper_readiness,
     const std::shared_ptr<RetainedObservedStateChannel> &gripper_channel,
     core::IResolvedParticipantExecutionEngine *engine,
-    core::IResolvedParticipantExecutionEngine *gripper_engine) {
+    core::IResolvedParticipantExecutionEngine *gripper_engine,
+    const std::vector<core::RuntimeParticipantExecutionRegistration>
+        &registrations) {
   std::vector<RetainedStopSurveillanceSourceInput> result;
   if (auto motion = stop_surveillance_source(
           motion_binding, motion_readiness, motion_channel,
@@ -532,6 +668,32 @@ stop_surveillance_sources(
             gripper_goal_observer(gripper_engine, *gripper_binding));
         gripper.has_value()) {
       result.push_back(std::move(*gripper));
+    }
+  }
+  // Capability representatives share one physical observation channel, but
+  // their admitted Stop plans may name distinct exact evidence predicates.
+  // Preserve those predicates on that owner's single source row.
+  for (auto &source : result) {
+    const auto physical = std::find_if(
+        registrations.begin(), registrations.end(), [&](const auto &row) {
+          return row.binding.value() == source.binding.value();
+        });
+    if (physical == registrations.end() ||
+        !physical->stop_readiness.has_value()) {
+      continue;
+    }
+    for (const auto &registration : registrations) {
+      if (!registration.stop_readiness.has_value() ||
+          registration.engine != physical->engine ||
+          registration.stop_execution_port != physical->stop_execution_port ||
+          !(retained_bindings_share_backend_owner(source.binding,
+                                                 registration.binding) ||
+            core::runtime_participant_binding_physically_contains(
+                source.binding, registration.binding))) {
+        continue;
+      }
+      append_stop_observation_sources(source, registration.binding,
+                                      *registration.stop_readiness);
     }
   }
   return result;
@@ -732,6 +894,7 @@ rebase_runtime_binding_to_predecessor(
     const core::ActiveControlConfigurationDTO &configuration) {
   const auto &value = binding.value();
   if (!configuration.locally_valid() ||
+      !configuration.locally_valid() ||
       configuration.state !=
           core::ActiveControlConfigurationStateDTO::kReconciled ||
       !value.control_path.has_value()) {
@@ -835,7 +998,105 @@ make_kernel_participant_resolver(
   };
 }
 
+[[nodiscard]] bool same_binding_after_product_reseal(
+    const core::RuntimeParticipantBinding &predecessor,
+    const core::RuntimeParticipantBinding &candidate) {
+  const auto &before = predecessor.value();
+  auto after = candidate.value();
+  // These fields describe the authored Program/product seal, not the physical
+  // controller. The resolved model, frame, resource, route, provider and
+  // runtime-unit facts remain byte-for-byte equal below. Contact/grasp
+  // templates are consumed by admitted Program operations and do not alter
+  // the retained controller itself.
+  after.program_id = before.program_id;
+  after.program_revision = before.program_revision;
+  after.program_binding_id = before.program_binding_id;
+  after.retained_bundle_id = before.retained_bundle_id;
+  after.graph_revision = before.graph_revision;
+  after.component_role_id = before.component_role_id;
+  after.target_role_id = before.target_role_id;
+  after.contact_grasp_bindings = before.contact_grasp_bindings;
+  return after == before;
+}
+
+[[nodiscard]] bool same_readiness_after_product_reseal(
+    const std::optional<core::RuntimeParticipantStopReadiness> &predecessor,
+    const std::optional<core::RuntimeParticipantStopReadiness> &candidate) {
+  if (predecessor.has_value() != candidate.has_value()) return false;
+  if (!predecessor.has_value()) return true;
+  const auto &before = predecessor->value();
+  const auto &after = candidate->value();
+  if (before.controllable_component_id != after.controllable_component_id ||
+      before.component_lifecycle_generation !=
+          after.component_lifecycle_generation ||
+      before.expected_controller_domain != after.expected_controller_domain ||
+      before.maximum_controlled_stop_duration_ns !=
+          after.maximum_controlled_stop_duration_ns) {
+    return false;
+  }
+  auto prior_plan = before.resolved_stop_base_plan;
+  const auto &next_plan = after.resolved_stop_base_plan;
+  prior_plan.resolved_stop_base_plan_id =
+      next_plan.resolved_stop_base_plan_id;
+  prior_plan.retained_bundle_id = next_plan.retained_bundle_id;
+  prior_plan.graph_revision = next_plan.graph_revision;
+  return prior_plan == next_plan;
+}
+
+[[nodiscard]] bool same_registration_after_product_reseal(
+    const core::RuntimeParticipantExecutionRegistration &predecessor,
+    const core::RuntimeParticipantExecutionRegistration &candidate) {
+  const bool policy_equal =
+      predecessor.runtime_policy.has_value() ==
+          candidate.runtime_policy.has_value() &&
+      (!predecessor.runtime_policy.has_value() ||
+       predecessor.runtime_policy->value() ==
+           candidate.runtime_policy->value());
+  return same_binding_after_product_reseal(predecessor.binding,
+                                           candidate.binding) &&
+         same_readiness_after_product_reseal(predecessor.stop_readiness,
+                                              candidate.stop_readiness) &&
+         predecessor.retained_default_stop_limits ==
+             candidate.retained_default_stop_limits &&
+         predecessor.stop_node_category == candidate.stop_node_category &&
+         predecessor.engine == candidate.engine &&
+         predecessor.stop_execution_port == candidate.stop_execution_port &&
+         policy_equal &&
+         predecessor.prepared_motion_engine ==
+             candidate.prepared_motion_engine &&
+         predecessor.default_operator_stop_profile ==
+             candidate.default_operator_stop_profile &&
+         predecessor.default_fault_stop_profile ==
+             candidate.default_fault_stop_profile &&
+         predecessor.deployment_maximum_tcp_linear_speed_mps ==
+             candidate.deployment_maximum_tcp_linear_speed_mps &&
+         predecessor.intrinsic_direct_control ==
+             candidate.intrinsic_direct_control &&
+         predecessor.direct_control_joint_limits ==
+             candidate.direct_control_joint_limits;
+}
+
 } // namespace
+
+core::RuntimeParticipantAdmissionResolver
+make_retained_cell_kernel_participant_resolver(
+    RetainedRuntimeParticipantResolver binding_resolver,
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        physical_registrations) {
+  return make_kernel_participant_resolver(std::move(binding_resolver),
+                                         std::move(physical_registrations));
+}
+
+std::optional<RetainedStopSurveillanceSourceInput>
+build_retained_gripper_stop_surveillance_source(
+    const core::RuntimeParticipantBinding &binding,
+    const std::optional<core::RuntimeParticipantStopReadiness> &readiness,
+    const std::shared_ptr<IRetainedObservedStateChannel> &state_channel,
+    core::IResolvedParticipantExecutionEngine *participant_engine) {
+  return stop_surveillance_source(
+      binding, readiness, state_channel,
+      gripper_goal_observer(participant_engine, binding));
+}
 
 namespace detail {
 
@@ -883,6 +1144,8 @@ create_retained_native_runtime_participants(
         input.motion_stop_readiness->value()
             .resolved_stop_base_plan.deadline_budget;
   }
+  config.cell_stop_deadline_budget =
+      cell_stop_envelope(std::move(config.cell_stop_deadline_budget));
   const auto controlled_stop_profiles = retained_controlled_stop_profiles(
       input.motion_binding, input.motion_stop_readiness);
   std::optional<core::MotionInterruptStopProfileDTO>
@@ -1274,6 +1537,9 @@ create_retained_native_runtime_participants(
     throw std::invalid_argument(
         "native runtime reference resolver factory returned no resolver");
   }
+  runtime->reference_resolver_proxy =
+      std::make_shared<RetainedReferencePoseResolverProxy>(
+          runtime->reference_resolver);
 
   const auto &shared_model = input.collision_shared_model;
   if (!shared_model) {
@@ -1309,16 +1575,19 @@ create_retained_native_runtime_participants(
         collision_engine(shared_model, lookahead_cache));
   }
 
+  if (input.planning_scene_synchronizer != nullptr) {
+    runtime->planning_scene_synchronizer =
+        std::make_shared<RetainedPlanningSceneSynchronizer>(
+            std::move(input.planning_scene_synchronizer));
+  }
   core::ExecutionKernelPorts ports{*runtime->angular_observed_state,
                                    *runtime->kinematics,
-                                   *runtime->reference_resolver,
+                                   *runtime->reference_resolver_proxy,
                                    *runtime->trajectory_validator,
                                    *runtime->collision_trajectory_projector,
                                    nullptr,
                                    nullptr,
-                                   input.planning_scene_synchronizer.get()};
-  runtime->planning_scene_synchronizer =
-      std::move(input.planning_scene_synchronizer);
+                                   runtime->planning_scene_synchronizer.get()};
   runtime->participant_engine = std::make_shared<core::ExecutionKernel>(
       *runtime->planner, ports, *runtime->execution, *runtime->clock,
       *runtime->scheduler, *runtime->cache, std::move(config.kernel));
@@ -1344,23 +1613,23 @@ create_retained_native_runtime_participants(
     const bool primary = representative.value() ==
                          (motion_owner ? runtime->motion_binding.value()
                                        : runtime->gripper_binding->value());
-    registrations.push_back(runtime_registration(
-        representative,
-        primary ? (motion_owner ? input.motion_stop_readiness
-                                : input.gripper_stop_readiness)
-                : std::nullopt,
-        runtime->participant_engine_for(motion_owner),
-        motion_owner ? static_cast<core::IControlDomainExecutionPort *>(
-                           runtime->execution.get())
-                     : runtime->gripper_stop_execution_port,
-        representative_runtime_policy(primary, motion_owner,
-                                      motion_runtime_policy),
-        motion_owner ? motion_operator_stop_profile
-                     : std::optional<core::MotionInterruptStopProfileDTO>{},
-          motion_owner ? motion_fault_stop_profile
-                     : std::optional<core::MotionInterruptStopProfileDTO>{},
-        motion_owner ? input.deployment_maximum_tcp_linear_speed_mps
-                     : std::optional<double>{}));
+    if (motion_owner) {
+      registrations.push_back(runtime_registration(
+          representative,
+          primary ? input.motion_stop_readiness : std::nullopt,
+          runtime->participant_engine_for(true),
+          static_cast<core::IControlDomainExecutionPort *>(
+              runtime->execution.get()),
+          representative_runtime_policy(primary, true, motion_runtime_policy),
+          motion_operator_stop_profile, motion_fault_stop_profile,
+          input.deployment_maximum_tcp_linear_speed_mps));
+    } else {
+      registrations.push_back(gripper_runtime_registration(
+          representative,
+          primary ? input.gripper_stop_readiness : std::nullopt,
+          runtime->participant_engine_for(false),
+          runtime->gripper_stop_execution_port));
+    }
   }
   for (const auto &alias : runtime->motion_binding_aliases) {
     registrations.push_back(runtime_registration(
@@ -1370,10 +1639,10 @@ create_retained_native_runtime_participants(
         input.deployment_maximum_tcp_linear_speed_mps));
   }
   for (const auto &alias : runtime->gripper_binding_aliases) {
-    registrations.push_back(runtime_registration(
+    registrations.push_back(gripper_runtime_registration(
         alias, input.gripper_stop_readiness,
         runtime->gripper_participant_engine.get(),
-        runtime->gripper_stop_execution_port, std::nullopt));
+        runtime->gripper_stop_execution_port));
   }
   std::vector<core::RuntimeParticipantExecutionRegistration>
       physical_registrations;
@@ -1386,10 +1655,10 @@ create_retained_native_runtime_participants(
   physical_registrations.back().direct_control_joint_limits =
       runtime->direct_control_joint_limits;
   if (runtime->gripper_binding.has_value()) {
-    physical_registrations.push_back(runtime_registration(
+    physical_registrations.push_back(gripper_runtime_registration(
         *runtime->gripper_binding, input.gripper_stop_readiness,
         runtime->gripper_participant_engine.get(),
-        runtime->gripper_stop_execution_port, std::nullopt));
+        runtime->gripper_stop_execution_port));
   }
   auto binding_resolver = std::move(input.participant_resolver);
   if (runtime->participant_resolver_factory) {
@@ -1408,7 +1677,7 @@ create_retained_native_runtime_participants(
   runtime->participant_registrations = std::move(registrations);
   runtime->participant_resolver = std::move(participant_resolver);
   runtime->stop_surveillance_owner =
-      std::make_unique<RetainedStopSurveillanceOwner>(
+      std::make_shared<RetainedStopSurveillanceOwner>(
           stop_surveillance_sources(
               runtime->motion_binding,
               readiness_for(runtime->participant_registrations,
@@ -1419,10 +1688,69 @@ create_retained_native_runtime_participants(
                                   *runtime->gripper_binding)
                   : std::nullopt,
               runtime->gripper_state_channel, runtime->participant_engine.get(),
-              runtime->gripper_participant_engine.get()),
+              runtime->gripper_participant_engine.get(),
+              runtime->participant_registrations),
           runtime->clock.get());
   return runtime;
 }
+
+namespace {
+
+struct CollectedNativeRuntimeParticipants final {
+  std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
+  std::vector<core::RuntimeParticipantExecutionRegistration> physical;
+  std::vector<core::RuntimeParticipantBinding> physical_bindings;
+  std::vector<RetainedStopSurveillanceSourceInput> surveillance;
+};
+
+[[nodiscard]] CollectedNativeRuntimeParticipants
+collect_native_runtime_participants(
+    const std::vector<std::shared_ptr<RetainedNativeRuntime>> &runtimes) {
+  CollectedNativeRuntimeParticipants collected;
+  for (const auto &runtime : runtimes) {
+    collected.registrations.insert(collected.registrations.end(),
+                                   runtime->participant_registrations.begin(),
+                                   runtime->participant_registrations.end());
+    const auto append_physical =
+        [&](const core::RuntimeParticipantBinding &binding) {
+          collected.physical_bindings.push_back(binding);
+          const auto found = std::find_if(
+              runtime->participant_registrations.begin(),
+              runtime->participant_registrations.end(),
+              [&](const auto &registration) {
+                return registration.binding.value() == binding.value();
+              });
+          if (found == runtime->participant_registrations.end()) {
+            throw std::invalid_argument(
+                "native participant join has no physical registration");
+          }
+          collected.physical.push_back(*found);
+        };
+    append_physical(runtime->motion_binding);
+    if (runtime->gripper_binding.has_value()) {
+      append_physical(*runtime->gripper_binding);
+    }
+    auto sources = stop_surveillance_sources(
+        runtime->motion_binding,
+        readiness_for(runtime->participant_registrations,
+                      runtime->motion_binding),
+        runtime->motion_state_channel, runtime->gripper_binding,
+        runtime->gripper_binding.has_value()
+            ? readiness_for(runtime->participant_registrations,
+                            *runtime->gripper_binding)
+            : std::nullopt,
+        runtime->gripper_state_channel, runtime->participant_engine.get(),
+        runtime->gripper_participant_engine.get(),
+        runtime->participant_registrations);
+    collected.surveillance.insert(
+        collected.surveillance.end(),
+        std::make_move_iterator(sources.begin()),
+        std::make_move_iterator(sources.end()));
+  }
+  return collected;
+}
+
+} // namespace
 
 void join_retained_native_runtime_participants(
     const std::shared_ptr<RetainedNativeRuntime> &primary,
@@ -1456,58 +1784,629 @@ void join_retained_native_runtime_participants(
     runtimes.push_back(peer);
   }
 
-  std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
-  std::vector<core::RuntimeParticipantExecutionRegistration> physical;
-  std::vector<core::RuntimeParticipantBinding> physical_bindings;
-  std::vector<RetainedStopSurveillanceSourceInput> surveillance;
-  for (const auto &runtime : runtimes) {
-    registrations.insert(registrations.end(), runtime->participant_registrations.begin(),
-                         runtime->participant_registrations.end());
-    const auto append_physical = [&](const core::RuntimeParticipantBinding &binding) {
-      physical_bindings.push_back(binding);
-      const auto found = std::find_if(
-          runtime->participant_registrations.begin(),
-          runtime->participant_registrations.end(), [&](const auto &registration) {
-            return registration.binding.value() == binding.value();
-          });
-      if (found == runtime->participant_registrations.end()) {
-        throw std::invalid_argument("native participant join has no physical registration");
-      }
-      physical.push_back(*found);
-    };
-    append_physical(runtime->motion_binding);
-    if (runtime->gripper_binding.has_value()) append_physical(*runtime->gripper_binding);
-    auto sources = stop_surveillance_sources(
-        runtime->motion_binding,
-        readiness_for(runtime->participant_registrations, runtime->motion_binding),
-        runtime->motion_state_channel, runtime->gripper_binding,
-        runtime->gripper_binding.has_value()
-            ? readiness_for(runtime->participant_registrations, *runtime->gripper_binding)
-            : std::nullopt,
-        runtime->gripper_state_channel, runtime->participant_engine.get(),
-        runtime->gripper_participant_engine.get());
-    surveillance.insert(surveillance.end(),
-                        std::make_move_iterator(sources.begin()),
-                        std::make_move_iterator(sources.end()));
-  }
-  if (registrations.size() > core::kMaxProgramExecutionMemberships ||
-      physical.size() > kNativeMaximumLiveStopParticipants) {
+  auto collected = collect_native_runtime_participants(runtimes);
+  if (collected.registrations.size() >
+          core::kMaxProgramExecutionMemberships ||
+      collected.physical.size() > kNativeMaximumLiveStopParticipants) {
     throw std::invalid_argument("native participant join exceeds the cell bound");
   }
-  auto binding_resolver = participant_resolver_factory(physical_bindings);
+  auto binding_resolver =
+      participant_resolver_factory(collected.physical_bindings);
   if (!binding_resolver) {
     throw std::invalid_argument("native participant join has no resolver");
   }
-  primary->participant_registrations = std::move(registrations);
+  primary->participant_registrations = std::move(collected.registrations);
   primary->participant_resolver = make_kernel_participant_resolver(
-      std::move(binding_resolver), std::move(physical));
+      std::move(binding_resolver), std::move(collected.physical));
   primary->participant_resolver_factory = std::move(participant_resolver_factory);
   primary->stop_surveillance_owner =
-      std::make_unique<RetainedStopSurveillanceOwner>(std::move(surveillance),
-                                                       primary->clock.get());
+      std::make_shared<RetainedStopSurveillanceOwner>(
+          std::move(collected.surveillance), primary->clock.get());
   primary->cell_runtime_root = primary.get();
   for (const auto &peer : peers) peer->cell_runtime_root = primary.get();
   primary->participant_peers = std::move(peers);
+}
+
+core::Result<void> rejoin_retained_native_runtime_participants(
+    const std::shared_ptr<RetainedNativeRuntime> &primary,
+    std::vector<std::shared_ptr<RetainedNativeRuntime>> peers,
+    RetainedRuntimeParticipantResolverFactory participant_resolver_factory,
+    std::shared_ptr<RetainedStopSurveillanceOwner> stable_stop_observer,
+    std::vector<RetainedStopSurveillanceSourceInput>
+        &candidate_surveillance_sources,
+    core::IResourceOperationAdmissionGate &admission_gate,
+    const core::ConfigurationFenceId &fence_id,
+    const core::ConfigurationFenceScopeDTO &scope) {
+  const auto fail = [](std::string reason, std::string message) {
+    return route_publication_error<void>(std::move(reason),
+                                         std::move(message));
+  };
+  if (primary == nullptr || !participant_resolver_factory ||
+      stable_stop_observer == nullptr || fence_id.empty() || !scope.valid() ||
+      !admission_gate.exact_fence_is_held(fence_id, scope)) {
+    return fail("native_participant_rejoin_fence_or_owner_invalid",
+                "native participant rejoin requires a complete candidate and exact held Apply fence");
+  }
+
+  std::vector<std::shared_ptr<RetainedNativeRuntime>> runtimes{primary};
+  runtimes.insert(runtimes.end(), peers.begin(), peers.end());
+  std::set<RetainedNativeRuntime *> unique_runtimes;
+  std::vector<RetainedNativeRuntime *> lock_order;
+  std::set<core::ControllableComponentId> component_ids;
+  std::map<core::ControlDomainId, core::ControllableComponentId> domain_owners;
+  std::map<core::ResourceId, core::ControllableComponentId> resource_owners;
+  std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
+  std::vector<core::RuntimeParticipantExecutionRegistration> physical;
+  std::vector<core::RuntimeParticipantBinding> physical_bindings;
+  std::vector<RetainedStopSurveillanceSourceInput> surveillance_sources;
+  std::size_t addressed_kernel_owners = 0U;
+  std::size_t journal_owners = 0U;
+  std::optional<core::StopDeadlineBudgetDTO> stop_budget;
+  std::optional<core::StopSurveillancePolicyDTO> surveillance_policy;
+  std::set<RetainedNativeRuntime *> predecessor_roots;
+
+  for (const auto &runtime : runtimes) {
+    if (runtime == nullptr || !unique_runtimes.insert(runtime.get()).second ||
+        runtime->clock == nullptr || runtime->scheduler == nullptr ||
+        runtime->motion_binding.value().controllable_component_id.empty() ||
+        runtime->participant_engine == nullptr ||
+        runtime->motion_state_channel == nullptr ||
+        runtime->stop_surveillance_owner == nullptr) {
+      return fail("native_participant_rejoin_owner_invalid",
+                  "candidate cell has a null, duplicated, or incomplete component owner");
+    }
+    lock_order.push_back(runtime.get());
+    if (!component_ids
+             .insert(runtime->motion_binding.value().controllable_component_id)
+             .second) {
+      return fail("native_participant_rejoin_component_duplicated",
+                  "candidate cell repeats a controllable component owner");
+    }
+    if (runtime->addressed_kernel != nullptr) ++addressed_kernel_owners;
+    if (runtime->operation_journal != nullptr) ++journal_owners;
+    if (runtime->addressed_kernel != nullptr &&
+        runtime->operation_journal == nullptr) {
+      return fail("native_participant_rejoin_owner_pair_incomplete",
+                  "candidate stable Kernel has no matching durable journal");
+    }
+    if (runtime->cell_runtime_root != nullptr) {
+      predecessor_roots.insert(runtime->cell_runtime_root);
+      if ((runtime->cell_runtime_root->addressed_kernel != nullptr ||
+           runtime->cell_runtime_root->cell_addressed_kernel != nullptr) &&
+          runtime->cell_runtime_root->stop_surveillance_owner !=
+              stable_stop_observer) {
+        return fail("native_participant_rejoin_stable_observer_mismatch",
+                    "candidate does not preserve the observer referenced by its stable Kernel");
+      }
+    }
+    if (runtime->clock != primary->clock ||
+        runtime->scheduler != primary->scheduler) {
+      return fail("native_participant_rejoin_time_owner_mismatch",
+                  "candidate component engines do not share the cell clock and scheduler");
+    }
+    if (runtime->cell_stop_deadline_budget.has_value() !=
+            primary->cell_stop_deadline_budget.has_value() ||
+        (runtime->cell_stop_deadline_budget.has_value() &&
+         runtime->cell_stop_deadline_budget !=
+             primary->cell_stop_deadline_budget) ||
+        runtime->stop_surveillance_policy.has_value() !=
+            primary->stop_surveillance_policy.has_value() ||
+        (runtime->stop_surveillance_policy.has_value() &&
+         runtime->stop_surveillance_policy !=
+             primary->stop_surveillance_policy)) {
+      return fail("native_participant_rejoin_stop_policy_mismatch",
+                  "candidate component owners disagree on the cell Stop policy");
+    }
+    if (!stop_budget.has_value())
+      stop_budget = runtime->cell_stop_deadline_budget;
+    if (!surveillance_policy.has_value())
+      surveillance_policy = runtime->stop_surveillance_policy;
+    for (const auto &binding : runtime->control_binding_representatives) {
+      if (!binding.value().control_path.has_value()) {
+        return fail("native_participant_rejoin_binding_route_missing",
+                    "candidate component representative has no control route");
+      }
+      const auto &component = binding.value().controllable_component_id;
+      const auto &domain = binding.value().control_path->control_domain_id;
+      const auto [domain_at, domain_inserted] =
+          domain_owners.emplace(domain, component);
+      if (!domain_inserted && domain_at->second != component) {
+        return fail("native_participant_rejoin_shared_domain_unsupported",
+                    "native control domain is shared by distinct component owners");
+      }
+    }
+    const auto add_resources = [&](const core::RuntimeParticipantBinding &binding) {
+      for (const auto &resource : binding.value().resources) {
+        const auto [at, inserted] = resource_owners.emplace(
+            resource.resource_id,
+            binding.value().controllable_component_id);
+        if (!inserted) return false;
+      }
+      return true;
+    };
+    if (!add_resources(runtime->motion_binding) ||
+        (runtime->gripper_binding.has_value() &&
+         !add_resources(*runtime->gripper_binding))) {
+      return fail("native_participant_rejoin_resource_overlap",
+                  "candidate component owners share a native physical resource");
+    }
+  }
+  if (addressed_kernel_owners > 1U || journal_owners > 1U ||
+      addressed_kernel_owners != journal_owners) {
+    return fail("native_participant_rejoin_multiple_stable_owners",
+                "candidate cell does not have exactly one consistent addressed Kernel owner");
+  }
+  if (predecessor_roots.size() > 1U) {
+    return fail("native_participant_rejoin_predecessor_root_ambiguous",
+                "candidate components came from multiple native cell roots");
+  }
+
+  std::sort(lock_order.begin(), lock_order.end());
+  std::vector<std::unique_lock<std::mutex>> locks;
+  locks.reserve(lock_order.size());
+  for (auto *runtime : lock_order)
+    locks.emplace_back(runtime->route_publication_mutex_);
+  if (!admission_gate.exact_fence_is_held(fence_id, scope)) {
+    return fail("native_participant_rejoin_fence_changed",
+                "candidate cell lost its exact Apply fence during validation");
+  }
+
+  for (const auto &runtime : runtimes) {
+    std::vector<core::RuntimeParticipantExecutionRegistration> local;
+    for (const auto &registration : runtime->participant_registrations) {
+      if (registration.binding.value().controllable_component_id ==
+          runtime->motion_binding.value().controllable_component_id) {
+        local.push_back(registration);
+      }
+    }
+    if (local.empty()) {
+      return fail("native_participant_rejoin_registration_missing",
+                  "candidate component has no local execution registrations");
+    }
+    const auto collect_physical = [&](
+        const core::RuntimeParticipantBinding &binding) -> bool {
+      const auto selected = std::find_if(
+          local.begin(), local.end(), [&](const auto &registration) {
+            return registration.binding.value() == binding.value();
+          });
+      if (selected == local.end()) return false;
+      physical_bindings.push_back(binding);
+      physical.push_back(*selected);
+      return true;
+    };
+    if (!collect_physical(runtime->motion_binding) ||
+        (runtime->gripper_binding.has_value() &&
+         !collect_physical(*runtime->gripper_binding))) {
+      return fail("native_participant_rejoin_physical_registration_missing",
+                  "candidate component lacks exact physical registrations and Stop readiness");
+    }
+    const auto expected_count =
+        runtime->control_binding_representatives.size() +
+        runtime->motion_binding_aliases.size() +
+        runtime->gripper_binding_aliases.size();
+    std::vector<core::RuntimeParticipantBinding> expected_bindings;
+    expected_bindings.reserve(expected_count);
+    expected_bindings.insert(expected_bindings.end(),
+                             runtime->control_binding_representatives.begin(),
+                             runtime->control_binding_representatives.end());
+    expected_bindings.insert(expected_bindings.end(),
+                             runtime->motion_binding_aliases.begin(),
+                             runtime->motion_binding_aliases.end());
+    expected_bindings.insert(expected_bindings.end(),
+                             runtime->gripper_binding_aliases.begin(),
+                             runtime->gripper_binding_aliases.end());
+    std::set<core::ControlBindingId> local_ids;
+    if (local.size() != expected_count ||
+        std::any_of(local.begin(), local.end(), [&](const auto &row) {
+          return !row.binding.value().control_path.has_value() ||
+                 !local_ids.insert(row.binding.value()
+                                       .control_path->control_binding_id)
+                      .second ||
+                 std::none_of(expected_bindings.begin(),
+                              expected_bindings.end(), [&](const auto &expected) {
+                                return expected.value() ==
+                                       row.binding.value();
+                              });
+        }) ||
+        local_ids.size() != expected_bindings.size()) {
+      return fail("native_participant_rejoin_registration_count_mismatch",
+                  "candidate component registrations do not exactly match its selected bindings");
+    }
+    registrations.insert(registrations.end(), local.begin(), local.end());
+    auto local_sources = stop_surveillance_sources(
+        runtime->motion_binding,
+        readiness_for(local, runtime->motion_binding),
+        runtime->motion_state_channel, runtime->gripper_binding,
+        runtime->gripper_binding.has_value()
+            ? readiness_for(local, *runtime->gripper_binding)
+            : std::nullopt,
+        runtime->gripper_state_channel, runtime->participant_engine.get(),
+        runtime->gripper_participant_engine.get(), local);
+    surveillance_sources.insert(
+        surveillance_sources.end(),
+        std::make_move_iterator(local_sources.begin()),
+        std::make_move_iterator(local_sources.end()));
+  }
+  if (registrations.size() > core::kMaxProgramExecutionMemberships ||
+      physical.size() > kNativeMaximumLiveStopParticipants ||
+      surveillance_sources.empty()) {
+    return fail("native_participant_rejoin_cell_bound_exceeded",
+                "candidate cell exceeds a qualified limit or has no Stop sources");
+  }
+
+  auto sources_valid =
+      RetainedStopSurveillanceOwner::ValidateSources(surveillance_sources);
+  if (!sources_valid.ok()) {
+    return fail("native_participant_rejoin_surveillance_invalid",
+                sources_valid.error().message);
+  }
+  RetainedRuntimeParticipantResolver binding_resolver;
+  try {
+    binding_resolver = participant_resolver_factory(physical_bindings);
+  } catch (const std::exception &exception) {
+    return fail("native_participant_rejoin_resolver_factory_failed",
+                exception.what());
+  } catch (...) {
+    return fail("native_participant_rejoin_resolver_factory_failed",
+                "candidate native resolver factory threw an unknown exception");
+  }
+  if (!binding_resolver) {
+    return fail("native_participant_rejoin_resolver_missing",
+                "candidate native resolver factory returned no resolver");
+  }
+  auto aggregate_resolver = make_kernel_participant_resolver(
+      std::move(binding_resolver), physical);
+  if (!aggregate_resolver) {
+    return fail("native_participant_rejoin_resolver_aggregate_failed",
+                "candidate native resolver could not be aggregated");
+  }
+  if (!admission_gate.exact_fence_is_held(fence_id, scope)) {
+    return fail("native_participant_rejoin_fence_changed",
+                "candidate cell lost its exact Apply fence before publication");
+  }
+
+  // Return the fully validated source table for the host's atomic Kernel
+  // participant commit. Replacing sources here would expose the new observer
+  // view before that Kernel commit succeeds.
+  candidate_surveillance_sources = std::move(surveillance_sources);
+
+  // All candidate validation is complete. Move the prepared aggregate into
+  // the new root while preserving the exact observer object already
+  // referenced non-owningly by the stable Kernel; the observer's source table
+  // remains unchanged until the host's commit hook publishes it.
+  primary->participant_registrations = std::move(registrations);
+  primary->participant_resolver = std::move(aggregate_resolver);
+  primary->participant_resolver_factory =
+      std::move(participant_resolver_factory);
+  primary->cell_stop_deadline_budget = stop_budget;
+  primary->stop_surveillance_policy = surveillance_policy;
+  primary->stop_surveillance_owner = std::move(stable_stop_observer);
+  for (const auto &runtime : runtimes) {
+    if (runtime.get() != primary.get()) {
+      runtime->participant_peers.clear();
+      runtime->cell_runtime_root = primary.get();
+    }
+  }
+  primary->cell_runtime_root = primary.get();
+  primary->participant_peers = std::move(peers);
+  return core::Result<void>::Ok();
+}
+
+core::Result<void> reseal_retained_native_runtime_for_apply(
+    RetainedNativeRuntime &runtime, RetainedNativeRuntimeResealInput input) {
+  const auto fail = [](std::string reason, std::string message) {
+    return route_publication_error<void>(std::move(reason),
+                                         std::move(message));
+  };
+  if (input.apply_fence_id.empty() || !input.apply_scope.valid() ||
+      !input.admission_gate.exact_fence_is_held(input.apply_fence_id,
+                                                input.apply_scope)) {
+    return fail("native_product_reseal_fence_not_held",
+                "retained native owner re-seal requires the exact held Apply fence");
+  }
+
+  std::lock_guard lock(runtime.route_publication_mutex_);
+  if (!input.admission_gate.exact_fence_is_held(input.apply_fence_id,
+                                                input.apply_scope)) {
+    return fail("native_product_reseal_fence_changed",
+                "retained native owner lost its exact Apply fence");
+  }
+  if (runtime.clock == nullptr || runtime.motion_state_channel == nullptr ||
+      runtime.execution == nullptr || !runtime.rebind_motion_route ||
+      runtime.participant_engine == nullptr ||
+      runtime.reference_resolver_proxy == nullptr ||
+      input.reference_resolver == nullptr ||
+      input.motion_binding.value().control_path == std::nullopt ||
+      input.motion_binding.value().controllable_component_id !=
+          runtime.motion_binding.value().controllable_component_id ||
+      (input.gripper_binding.has_value() &&
+       (input.gripper_binding->value().retained_bundle_id !=
+            input.motion_binding.value().retained_bundle_id ||
+        input.gripper_binding->value().graph_revision !=
+            input.motion_binding.value().graph_revision)) ||
+      !same_binding_after_product_reseal(runtime.motion_binding,
+                                         input.motion_binding) ||
+      input.gripper_binding.has_value() !=
+          runtime.gripper_binding.has_value() ||
+      (input.gripper_binding.has_value() &&
+       (runtime.gripper_state_channel == nullptr || runtime.gripper == nullptr ||
+        !runtime.rebind_gripper_route ||
+        !same_binding_after_product_reseal(*runtime.gripper_binding,
+                                           *input.gripper_binding)))) {
+    return fail("native_product_reseal_physical_identity_changed",
+                "candidate product changes the retained component's physical controller identity");
+  }
+
+  const auto motion_status = runtime.participant_engine->get_status();
+  if (motion_status.state == core::ExecutionState::kPlanning ||
+      motion_status.state == core::ExecutionState::kValidating ||
+      motion_status.state == core::ExecutionState::kExecuting ||
+      motion_status.state == core::ExecutionState::kInterrupted ||
+      motion_status.state == core::ExecutionState::kPaused ||
+      motion_status.state == core::ExecutionState::kStopping ||
+      motion_status.state == core::ExecutionState::kInterventionRequired) {
+    return fail("native_product_reseal_motion_not_idle",
+                "retained native controller has active or unresolved motion work");
+  }
+  if (input.gripper_binding.has_value()) {
+    const auto gripper_status = runtime.gripper->get_gripper_status(
+        input.gripper_binding->value().command_target_id.value());
+    if (gripper_status.gripper_id !=
+            input.gripper_binding->value().command_target_id.value() ||
+        gripper_status.state == core::GripperCommandState::kExecuting) {
+      return fail("native_product_reseal_gripper_not_idle",
+                  "retained native gripper has active or unresolved command work");
+    }
+  }
+
+  std::vector<core::RuntimeParticipantBinding> expected_bindings;
+  expected_bindings.reserve(input.control_binding_representatives.size() +
+                            input.motion_binding_aliases.size() +
+                            input.gripper_binding_aliases.size());
+  expected_bindings.insert(expected_bindings.end(),
+                           input.control_binding_representatives.begin(),
+                           input.control_binding_representatives.end());
+  expected_bindings.insert(expected_bindings.end(),
+                           input.motion_binding_aliases.begin(),
+                           input.motion_binding_aliases.end());
+  expected_bindings.insert(expected_bindings.end(),
+                           input.gripper_binding_aliases.begin(),
+                           input.gripper_binding_aliases.end());
+  if (expected_bindings.empty() ||
+      input.participant_registrations.size() != expected_bindings.size()) {
+    return fail("native_product_reseal_registration_set_incomplete",
+                "candidate registrations do not exactly cover its control bindings");
+  }
+  std::set<core::ControlBindingId> expected_ids;
+  for (const auto &binding : expected_bindings) {
+    if (!binding.value().control_path.has_value() ||
+        !expected_ids
+             .insert(binding.value().control_path->control_binding_id)
+             .second) {
+      return fail("native_product_reseal_binding_set_ambiguous",
+                  "candidate component repeats or omits a control binding identity");
+    }
+  }
+  std::set<core::ControlBindingId> registration_ids;
+  for (const auto &candidate : input.participant_registrations) {
+    const auto &binding = candidate.binding;
+    if (!binding.value().control_path.has_value() ||
+        !registration_ids
+             .insert(binding.value().control_path->control_binding_id)
+             .second ||
+        std::none_of(expected_bindings.begin(), expected_bindings.end(),
+                     [&](const auto &expected) {
+                       return expected.value() == binding.value();
+                     })) {
+      return fail("native_product_reseal_registration_set_mismatch",
+                  "candidate registration does not exactly match one unique component binding");
+    }
+    const auto predecessor = std::find_if(
+        runtime.participant_registrations.begin(),
+        runtime.participant_registrations.end(), [&](const auto &prior) {
+          return prior.binding.value().control_path.has_value() &&
+                 prior.binding.value().control_path->control_binding_id ==
+                     binding.value().control_path->control_binding_id &&
+                 prior.binding.value().controllable_component_id ==
+                     binding.value().controllable_component_id;
+        });
+    if (predecessor == runtime.participant_registrations.end() ||
+        std::count_if(runtime.participant_registrations.begin(),
+                      runtime.participant_registrations.end(),
+                      [&](const auto &prior) {
+                        return prior.binding.value().control_path.has_value() &&
+                               prior.binding.value().control_path->control_binding_id ==
+                                   binding.value().control_path->control_binding_id &&
+                               prior.binding.value().controllable_component_id ==
+                                   binding.value().controllable_component_id;
+                      }) != 1 ||
+        !same_registration_after_product_reseal(*predecessor, candidate)) {
+      return fail("native_product_reseal_registration_identity_changed",
+                  "candidate registration changes a retained engine, route, policy, or Stop fact");
+    }
+    const bool motion_owner =
+        retained_bindings_share_backend_owner(input.motion_binding, binding);
+    const bool gripper_owner = input.gripper_binding.has_value() &&
+        retained_bindings_share_backend_owner(*input.gripper_binding, binding);
+    if (motion_owner == gripper_owner ||
+        candidate.engine != (motion_owner
+                                 ? runtime.participant_engine_for(true)
+                                 : runtime.participant_engine_for(false))) {
+      return fail("native_product_reseal_registration_owner_mismatch",
+                  "candidate binding does not resolve to exactly one retained engine");
+    }
+  }
+  if (registration_ids != expected_ids) {
+    return fail("native_product_reseal_registration_set_mismatch",
+                "candidate component registrations omit a control binding");
+  }
+  if (std::any_of(input.motion_binding_aliases.begin(),
+                  input.motion_binding_aliases.end(), [&](const auto &alias) {
+                    return !same_physical_binding(input.motion_binding, alias,
+                                                  true);
+                  }) ||
+      std::any_of(input.gripper_binding_aliases.begin(),
+                  input.gripper_binding_aliases.end(), [&](const auto &alias) {
+                    return !input.gripper_binding.has_value() ||
+                           !same_physical_binding(*input.gripper_binding, alias,
+                                                  true);
+                  })) {
+    return fail("native_product_reseal_alias_identity_changed",
+                "candidate Program alias widens or changes the retained physical owner");
+  }
+
+  const auto old_motion = runtime.motion_binding;
+  const auto old_gripper = runtime.gripper_binding;
+  const auto old_motion_aliases = runtime.motion_binding_aliases;
+  const auto transition_time_ns = runtime.clock->now();
+  bool motion_channel_attempted = false;
+  bool motion_backend_attempted = false;
+  bool gripper_channel_attempted = false;
+  bool gripper_backend_attempted = false;
+  const auto rollback = [&]() noexcept {
+    bool complete = true;
+    try {
+      if (gripper_backend_attempted && old_gripper.has_value() &&
+          runtime.rebind_gripper_route) {
+        if (gripper_channel_attempted &&
+            runtime.gripper_state_channel != nullptr) {
+          const bool channel_restored =
+              runtime.gripper_state_channel
+                  ->RebindRoute(*old_gripper, runtime.clock->now())
+                  .ok();
+          complete = channel_restored && complete;
+          if (channel_restored) {
+            complete = runtime.rebind_gripper_route(
+                           *old_gripper, runtime.gripper_state_channel)
+                           .ok() &&
+                       complete;
+          }
+        } else {
+          complete = false;
+        }
+      } else if (gripper_channel_attempted && old_gripper.has_value() &&
+                 runtime.gripper_state_channel != nullptr) {
+        complete = runtime.gripper_state_channel
+                       ->RebindRoute(*old_gripper, runtime.clock->now())
+                       .ok() &&
+                   complete;
+      }
+      if (motion_channel_attempted && runtime.motion_state_channel != nullptr) {
+        const bool channel_restored =
+            runtime.motion_state_channel
+                ->RebindRoute(old_motion, runtime.clock->now())
+                .ok();
+        complete = channel_restored && complete;
+        if (motion_backend_attempted && runtime.rebind_motion_route &&
+            channel_restored) {
+          complete = runtime.rebind_motion_route(old_motion,
+                                                 old_motion_aliases)
+                         .ok() &&
+                     complete;
+        } else if (motion_backend_attempted) {
+          complete = false;
+        }
+      } else if (motion_backend_attempted) {
+        complete = false;
+      }
+    } catch (...) {
+      complete = false;
+    }
+    return complete;
+  };
+
+  motion_channel_attempted = true;
+  auto rebound = runtime.motion_state_channel->RebindRoute(
+      input.motion_binding, transition_time_ns);
+  if (!rebound.ok()) {
+    if (!rollback()) {
+      return fail("native_product_reseal_rollback_failed",
+                  "motion state rebind failed and its predecessor could not be restored");
+    }
+    return core::Result<void>::Err(rebound.error());
+  }
+  if (input.gripper_binding.has_value()) {
+    gripper_channel_attempted = true;
+    rebound = runtime.gripper_state_channel->RebindRoute(
+        *input.gripper_binding, transition_time_ns);
+    if (!rebound.ok()) {
+      if (!rollback()) {
+        return fail("native_product_reseal_rollback_failed",
+                    "gripper state rebind failed and its predecessor could not be restored");
+      }
+      return core::Result<void>::Err(rebound.error());
+    }
+  }
+  auto validated_surveillance = RetainedStopSurveillanceOwner::ValidateSources(
+      stop_surveillance_sources(
+          input.motion_binding,
+          readiness_for(input.participant_registrations,
+                        input.motion_binding),
+          runtime.motion_state_channel, input.gripper_binding,
+          input.gripper_binding.has_value()
+              ? readiness_for(input.participant_registrations,
+                              *input.gripper_binding)
+              : std::nullopt,
+          runtime.gripper_state_channel, runtime.participant_engine.get(),
+          runtime.gripper_participant_engine.get(),
+          input.participant_registrations));
+  if (!validated_surveillance.ok()) {
+    if (!rollback()) {
+      return fail("native_product_reseal_rollback_failed",
+                  "candidate Stop sources were invalid and predecessor routes could not be restored");
+    }
+    return fail("native_product_reseal_surveillance_invalid",
+                validated_surveillance.error().message);
+  }
+  motion_backend_attempted = true;
+  rebound = runtime.rebind_motion_route(input.motion_binding,
+                                       input.motion_binding_aliases);
+  if (!rebound.ok()) {
+    if (!rollback()) {
+      return fail("native_product_reseal_rollback_failed",
+                  "motion backend rebind failed and its predecessor could not be restored");
+    }
+    return core::Result<void>::Err(rebound.error());
+  }
+  if (input.gripper_binding.has_value()) {
+    gripper_backend_attempted = true;
+    rebound = runtime.rebind_gripper_route(
+        *input.gripper_binding, runtime.gripper_state_channel);
+    if (!rebound.ok()) {
+      if (!rollback()) {
+        return fail("native_product_reseal_rollback_failed",
+                    "gripper backend rebind failed and its predecessor could not be restored");
+      }
+      return core::Result<void>::Err(rebound.error());
+    }
+  }
+
+  runtime.motion_binding = std::move(input.motion_binding);
+  runtime.gripper_binding = std::move(input.gripper_binding);
+  runtime.motion_binding_aliases = std::move(input.motion_binding_aliases);
+  runtime.gripper_binding_aliases = std::move(input.gripper_binding_aliases);
+  runtime.control_binding_representatives =
+      std::move(input.control_binding_representatives);
+  runtime.participant_registrations = std::move(input.participant_registrations);
+  runtime.reference_resolver = std::move(input.reference_resolver);
+  runtime.reference_resolver_proxy->ReplaceTarget(runtime.reference_resolver);
+  if (const auto primary = readiness_for(runtime.participant_registrations,
+                                         runtime.motion_binding);
+      primary.has_value()) {
+    const auto registration = std::find_if(
+        runtime.participant_registrations.begin(),
+        runtime.participant_registrations.end(), [&](const auto &row) {
+          return row.binding.value() == runtime.motion_binding.value();
+        });
+    if (registration != runtime.participant_registrations.end()) {
+      runtime.motion_runtime_policy = registration->runtime_policy;
+      runtime.deployment_maximum_tcp_linear_speed_mps =
+          registration->deployment_maximum_tcp_linear_speed_mps;
+      runtime.direct_control_joint_limits =
+          registration->direct_control_joint_limits;
+    }
+  }
+  return core::Result<void>::Ok();
 }
 
 namespace {
@@ -1561,6 +2460,15 @@ struct CellParticipantSet final {
     if (runtime.gripper_binding)
       result.physical_bindings.push_back(*runtime.gripper_binding);
   });
+  auto *const root = changed.cell_runtime_root != nullptr
+                         ? changed.cell_runtime_root
+                         : &changed;
+  for (const auto &gripper : root->independent_gripper_peers) {
+    if (gripper == nullptr)
+      throw std::logic_error("cell route has a missing independent gripper");
+    result.registrations.push_back(gripper->registration());
+    result.physical_bindings.push_back(gripper->binding());
+  }
   return result;
 }
 
@@ -1570,7 +2478,9 @@ compose_cell_surveillance_sources(
     const core::RuntimeParticipantBinding &changed_motion,
     const std::optional<core::RuntimeParticipantStopReadiness> &changed_motion_readiness,
     const std::optional<core::RuntimeParticipantBinding> &changed_gripper,
-    const std::optional<core::RuntimeParticipantStopReadiness> &changed_gripper_readiness) {
+    const std::optional<core::RuntimeParticipantStopReadiness> &changed_gripper_readiness,
+    const std::vector<core::RuntimeParticipantExecutionRegistration>
+        &changed_registrations) {
   std::vector<RetainedStopSurveillanceSourceInput> result;
   for_each_cell_runtime(changed, [&](RetainedNativeRuntime &runtime) {
     const bool selected = &runtime == &changed;
@@ -1586,10 +2496,22 @@ compose_cell_surveillance_sources(
     auto rows = stop_surveillance_sources(
         motion, motion_readiness, runtime.motion_state_channel, gripper,
         gripper_readiness, runtime.gripper_state_channel,
-        runtime.participant_engine.get(), runtime.gripper_participant_engine.get());
+        runtime.participant_engine.get(), runtime.gripper_participant_engine.get(),
+        selected ? changed_registrations : runtime.participant_registrations);
     result.insert(result.end(), std::make_move_iterator(rows.begin()),
                   std::make_move_iterator(rows.end()));
   });
+  auto *const root = changed.cell_runtime_root != nullptr
+                         ? changed.cell_runtime_root
+                         : &changed;
+  for (const auto &gripper : root->independent_gripper_peers) {
+    if (gripper == nullptr)
+      throw std::logic_error("cell Stop has a missing independent gripper");
+    auto source = build_retained_gripper_stop_surveillance_source(
+        gripper->binding(), gripper->stop_readiness(),
+        gripper->state_channel(), gripper->participant_engine());
+    if (source.has_value()) result.push_back(std::move(*source));
+  }
   return result;
 }
 
@@ -1692,6 +2614,22 @@ RetainedNativeRuntime::ReadCurrentPublishedRouteConfiguration(
   }
   return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(
       readback.value()->active_configuration);
+}
+
+core::RuntimeParticipantBinding
+RetainedNativeRuntime::ReadCurrentMotionBinding() const {
+  const auto *const cell_root =
+      cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  return motion_binding;
+}
+
+std::optional<core::RuntimeParticipantBinding>
+RetainedNativeRuntime::ReadCurrentGripperBinding() const {
+  const auto *const cell_root =
+      cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  return gripper_binding;
 }
 
 bool RetainedNativeRuntime::GripperSourceIsCurrent(
@@ -2145,7 +3083,8 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
       }
     }
     auto next_surveillance_sources = compose_cell_surveillance_sources(
-        *this, next_motion, motion_readiness, next_gripper, gripper_readiness);
+        *this, next_motion, motion_readiness, next_gripper, gripper_readiness,
+        local_registrations);
     if (cell_root->stop_surveillance_owner != nullptr) {
       auto valid = RetainedStopSurveillanceOwner::ValidateSources(
           next_surveillance_sources);
@@ -2156,6 +3095,15 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
             "route_publication_surveillance_source_invalid",
             valid.error().message);
       }
+    }
+    // Stage the stable cell-owner snapshot before changing Kernel state.
+    // Its later adoption is a no-throw swap under the same route fence.
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        stable_cell_registrations;
+    core::RuntimeParticipantAdmissionResolver stable_cell_resolver;
+    if (cell_root->cell_runtime_owner != nullptr) {
+      stable_cell_registrations = registrations;
+      stable_cell_resolver = kernel_resolver;
     }
     auto published = kernel->publish_runtime_route_configuration(
         configuration, registrations, kernel_resolver);
@@ -2199,12 +3147,17 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
     if (cell_root != this) {
       cell_root->participant_resolver = participant_resolver;
     }
+    if (cell_root->cell_runtime_owner != nullptr) {
+      cell_root->cell_runtime_owner->AdoptVerifiedComponentReadinessSnapshot(
+          std::move(stable_cell_registrations),
+          std::move(stable_cell_resolver));
+    }
     if (motion_readiness.has_value()) {
-      cell_stop_deadline_budget =
-          motion_readiness->value().resolved_stop_base_plan.deadline_budget;
+      cell_stop_deadline_budget = cell_stop_envelope(
+          motion_readiness->value().resolved_stop_base_plan.deadline_budget);
     } else if (gripper_readiness.has_value()) {
-      cell_stop_deadline_budget =
-          gripper_readiness->value().resolved_stop_base_plan.deadline_budget;
+      cell_stop_deadline_budget = cell_stop_envelope(
+          gripper_readiness->value().resolved_stop_base_plan.deadline_budget);
     }
 
     return readback;
@@ -2760,6 +3713,13 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
       }
     }
 
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        stable_cell_registrations;
+    core::RuntimeParticipantAdmissionResolver stable_cell_resolver;
+    if (cell_root->cell_runtime_owner != nullptr) {
+      stable_cell_registrations = registrations;
+      stable_cell_resolver = kernel_resolver;
+    }
     auto published =
         kernel->adopt_runtime_route_configuration_predecessor(
             configuration, registrations, kernel_resolver);
@@ -2783,7 +3743,8 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
 
     if (cell_root->stop_surveillance_owner != nullptr) {
       auto next_sources = compose_cell_surveillance_sources(
-          *this, next_motion, motion_readiness, next_gripper, gripper_readiness);
+          *this, next_motion, motion_readiness, next_gripper, gripper_readiness,
+          local_registrations);
       auto valid = RetainedStopSurveillanceOwner::ValidateSources(next_sources);
       if (!valid.ok()) {
         throw std::logic_error(
@@ -2812,6 +3773,11 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
     if (cell_root != this) {
       cell_root->participant_resolver = participant_resolver;
     }
+    if (cell_root->cell_runtime_owner != nullptr) {
+      cell_root->cell_runtime_owner->AdoptVerifiedComponentReadinessSnapshot(
+          std::move(stable_cell_registrations),
+          std::move(stable_cell_resolver));
+    }
 
     return readback;
   } catch (const std::exception &exception) {
@@ -2824,128 +3790,215 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
   }
 }
 
+namespace {
+
+[[nodiscard]] bool retained_stop_source_matches_current_route(
+    const RetainedStopSurveillanceSourceInput &source,
+    const core::ActiveControlConfigurationDTO &configuration,
+    const core::StopFaultRecoveryConfigurationExpectationDTO &expectation) {
+  if (source.state_channel == nullptr ||
+      !source.binding.value().control_path.has_value()) {
+    return false;
+  }
+  const auto &path = *source.binding.value().control_path;
+  const auto context = source.state_channel->query_context();
+  const auto derived_context = core::make_observed_state_query_context(
+      source.binding, context.freshness_budget_ns);
+  if (!derived_context.ok() || derived_context.value() != context ||
+      configuration.state !=
+          core::ActiveControlConfigurationStateDTO::kReconciled ||
+      configuration.control_domain_id != expectation.control_domain_id ||
+      configuration.active_control_configuration_id !=
+          expectation.active_control_configuration_id ||
+      configuration.active_control_configuration_generation !=
+          expectation.active_control_configuration_generation ||
+      configuration.control_domain_id != path.control_domain_id ||
+      configuration.control_domain_revision != path.control_domain_revision ||
+      configuration.activation_set_id != path.activation_set_id ||
+      configuration.controller_topology_id != path.controller_topology_id ||
+      configuration.topology_revision != path.topology_revision ||
+      configuration.source_runtime_unit_id != path.provider_runtime_unit_id ||
+      configuration.source_runtime_epoch != path.provider_runtime_epoch ||
+      context.active_control_configuration_id !=
+          expectation.active_control_configuration_id ||
+      context.active_control_configuration_generation !=
+          expectation.active_control_configuration_generation ||
+      context.runtime_epoch != configuration.source_runtime_epoch) {
+    return false;
+  }
+  return std::any_of(
+      configuration.binding_routes.begin(), configuration.binding_routes.end(),
+      [&](const auto &route) {
+        return route.control_binding_id == path.control_binding_id &&
+               route.control_binding_revision == path.control_binding_revision &&
+               route.control_route_id == path.control_route_id;
+      });
+}
+
+[[nodiscard]] core::ErrorDTO native_stop_recovery_error(
+    const core::ErrorCode code, std::string message, std::string reason) {
+  return core::ErrorDTO{std::string(core::to_string(code)), std::move(message),
+                        {{"reason", std::move(reason)}}};
+}
+
+}  // namespace
+
+core::Result<core::StopFaultRecoveryFactsDTO>
+build_retained_cell_stop_recovery_facts(
+    RetainedStopSurveillanceOwner &stop_surveillance_owner,
+    core::ResourceAddressedExecutionKernel &addressed_kernel,
+    core::IClock &clock, const core::RequestOwnerEpoch &request_owner_epoch,
+    const core::CellId &cell_id,
+    core::IResourceOperationAdmissionGate *operation_admission_gate,
+    const core::StopStatusDTO &status, const std::int64_t assessed_at_ns,
+    std::function<core::Result<core::ContentDigest>(
+        const core::StopFaultRecoveryConfigurationExpectationDTO &)>
+        configuration_source_override) {
+  if (!status.fault_latch.has_value() || request_owner_epoch.empty() ||
+      cell_id.empty()) {
+    return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+        native_stop_recovery_error(core::ErrorCode::kMissingReference,
+                                   "native Stop recovery owner is unavailable",
+                                   "native_stop_recovery_owner_unavailable"));
+  }
+  try {
+    auto facts = stop_surveillance_owner.BuildRecoveryFacts(status, assessed_at_ns);
+    if (!facts.ok()) {
+      return facts;
+    }
+    const auto &latch = *status.fault_latch;
+    const auto sources = stop_surveillance_owner.SnapshotSources();
+    for (auto &fact : facts.value().configuration_facts) {
+      if (configuration_source_override) {
+        auto proof = configuration_source_override(fact.configuration);
+        fact.reconciled = proof.ok();
+        fact.evidence_digest =
+            proof.ok() ? std::optional(proof.value()) : std::nullopt;
+        continue;
+      }
+
+      const auto current = addressed_kernel.current_runtime_route_configuration(
+          fact.configuration.control_domain_id);
+      bool source_reconciled = false;
+      if (current.ok() && current.value().has_value()) {
+        source_reconciled = std::any_of(
+            sources.begin(), sources.end(), [&](const auto &source) {
+              return source.binding.value().control_path.has_value() &&
+                     source.binding.value().control_path->control_domain_id ==
+                         fact.configuration.control_domain_id &&
+                     retained_stop_source_matches_current_route(
+                         source, current.value()->active_configuration,
+                         fact.configuration);
+            });
+      }
+      if (!source_reconciled) {
+        fact.reconciled = false;
+        fact.evidence_digest.reset();
+      }
+    }
+
+    if (std::all_of(facts.value().configuration_facts.begin(),
+                    facts.value().configuration_facts.end(),
+                    [](const auto &fact) { return fact.reconciled; })) {
+      const auto slots = addressed_kernel.resource_table_snapshot();
+      std::vector<core::ResourceId> orphans;
+      for (const auto &slot : slots.slots) {
+        if (slot.state ==
+                core::ResourceSlotState::kUnreconciledExternalOrOrphanGoal &&
+            std::binary_search(latch.captured_resources.begin(),
+                               latch.captured_resources.end(),
+                               slot.resource_id)) {
+          orphans.push_back(slot.resource_id);
+        }
+      }
+      if (!orphans.empty()) {
+        auto orphan_facts =
+            stop_surveillance_owner.BuildOrphanResourceReconciliationFacts(
+                request_owner_epoch, cell_id,
+                slots.operation_resource_generation, orphans, clock.now());
+        if (!orphan_facts.ok()) {
+          return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+              orphan_facts.error());
+        }
+        auto reconciled =
+            addressed_kernel.reconcile_orphaned_resources(orphan_facts.value());
+        if (!reconciled.ok()) {
+          return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+              reconciled.error());
+        }
+      }
+    }
+
+    for (const auto &slot : addressed_kernel.resource_snapshot()) {
+      if (!std::binary_search(latch.captured_resources.begin(),
+                              latch.captured_resources.end(),
+                              slot.resource_id)) {
+        continue;
+      }
+      const bool unresolved =
+          slot.state ==
+              core::ResourceSlotState::kUnreconciledExternalOrOrphanGoal ||
+          slot.state == core::ResourceSlotState::kReserved ||
+          slot.state == core::ResourceSlotState::kDispatched ||
+          slot.state == core::ResourceSlotState::kStopping ||
+          (slot.state == core::ResourceSlotState::kTerminal &&
+           slot.stop_generation > latch.stop_generation);
+      if (unresolved) {
+        facts.value().fenced_or_orphan_resources.push_back(slot.resource_id);
+      }
+    }
+    if (operation_admission_gate != nullptr) {
+      auto fenced = operation_admission_gate->current_fenced_resources(
+          latch.captured_resources);
+      facts.value().fenced_or_orphan_resources.insert(
+          facts.value().fenced_or_orphan_resources.end(), fenced.begin(),
+          fenced.end());
+    }
+    auto &blocked = facts.value().fenced_or_orphan_resources;
+    std::sort(blocked.begin(), blocked.end());
+    blocked.erase(std::unique(blocked.begin(), blocked.end()), blocked.end());
+    if (core::stop_fault_recovery_facts_field_error(facts.value()).has_value()) {
+      return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+          native_stop_recovery_error(
+              core::ErrorCode::kInvariantViolation,
+              "native Stop recovery facts failed Kernel blocker join",
+              "native_stop_recovery_blocker_join_invalid"));
+    }
+    return facts;
+  } catch (const std::exception &exception) {
+    return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+        native_stop_recovery_error(
+            core::ErrorCode::kInvariantViolation,
+            "native Stop recovery facts could not be joined: " +
+                std::string(exception.what()),
+            "native_stop_recovery_fact_join_failed"));
+  } catch (...) {
+    return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+        native_stop_recovery_error(
+            core::ErrorCode::kInvariantViolation,
+            "native Stop recovery facts could not be joined",
+            "native_stop_recovery_fact_join_failed"));
+  }
+}
+
 core::Result<core::StopFaultRecoveryFactsDTO>
 build_retained_native_stop_recovery_facts(
     RetainedNativeRuntime &runtime,
     core::ResourceAddressedExecutionKernel &addressed_kernel,
     core::IResourceOperationAdmissionGate *operation_admission_gate,
     const core::StopStatusDTO &status, const std::int64_t assessed_at_ns) {
-  if (runtime.stop_surveillance_owner == nullptr ||
-      !status.fault_latch.has_value()) {
-    return core::Result<core::StopFaultRecoveryFactsDTO>::Err(core::ErrorDTO{
-        std::string(core::to_string(core::ErrorCode::kMissingReference)),
-        "native Stop recovery owner is unavailable",
-        {{"reason", "native_stop_recovery_owner_unavailable"}}});
+  if (runtime.stop_surveillance_owner == nullptr || runtime.clock == nullptr ||
+      !runtime.addressed_request_owner_epoch || !runtime.addressed_cell_id) {
+    return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
+        native_stop_recovery_error(core::ErrorCode::kMissingReference,
+                                   "native Stop recovery owner is unavailable",
+                                   "native_stop_recovery_owner_unavailable"));
   }
-  auto facts = runtime.stop_surveillance_owner->BuildRecoveryFacts(
-      status, assessed_at_ns);
-  if (!facts.ok())
-    return facts;
-  const auto &latch = *status.fault_latch;
-  // Binding identity is not proof that a replacement host has reconciled its
-  // controllers. Keep configuration evidence separate from physical rest.
-  //
-  // A cell may contain several independently-built native runtimes.  The
-  // addressed Kernel is shared, but each runtime owns the observation channel
-  // for its own control domain.  Looking only at the primary runtime's
-  // channels makes a Stop captured on a peer (for example ur5e in a
-  // dual-robot cell) appear to wait forever even though its route is already
-  // reconciled.  Resolve the source by domain before checking the exact route.
-  std::vector<RetainedNativeRuntime *> cell_runtimes;
-  for_each_cell_runtime(runtime, [&](RetainedNativeRuntime &candidate) {
-    cell_runtimes.push_back(&candidate);
-  });
-  for (auto &fact : facts.value().configuration_facts) {
-    if (runtime.stop_recovery_configuration_source) {
-      auto proof =
-          runtime.stop_recovery_configuration_source(fact.configuration);
-      fact.reconciled = proof.ok();
-      fact.evidence_digest =
-          proof.ok() ? std::optional(proof.value()) : std::nullopt;
-      continue;
-    }
-    bool source_reconciled = false;
-    for (const auto *candidate : cell_runtimes) {
-      const auto current = candidate->ReadCurrentPublishedRouteConfiguration(
-          fact.configuration.control_domain_id);
-      if (!current.ok() || !current.value()) continue;
-      const auto matches_source = [&](const auto &channel) {
-        if (!channel) return false;
-        const auto context = channel->query_context();
-        const auto &configuration = *current.value();
-        return context.control_domain_id == fact.configuration.control_domain_id &&
-               configuration.state ==
-                   core::ActiveControlConfigurationStateDTO::kReconciled &&
-               configuration.control_domain_id == context.control_domain_id &&
-               configuration.active_control_configuration_id ==
-                   context.active_control_configuration_id &&
-               configuration.active_control_configuration_generation ==
-                   context.active_control_configuration_generation &&
-               configuration.source_runtime_epoch == context.runtime_epoch;
-      };
-      source_reconciled = matches_source(candidate->motion_state_channel) ||
-                          matches_source(candidate->gripper_state_channel);
-      if (source_reconciled) break;
-    }
-    if (!source_reconciled) {
-      fact.reconciled = false;
-      fact.evidence_digest.reset();
-    }
-  }
-  if (std::all_of(facts.value().configuration_facts.begin(),
-                  facts.value().configuration_facts.end(),
-                  [](const auto &fact) { return fact.reconciled; })) {
-    const auto slots = addressed_kernel.resource_table_snapshot();
-    std::vector<core::ResourceId> orphans;
-    for (const auto &slot : slots.slots) {
-      if (slot.state ==
-              core::ResourceSlotState::kUnreconciledExternalOrOrphanGoal &&
-          std::binary_search(latch.captured_resources.begin(),
-                             latch.captured_resources.end(),
-                             slot.resource_id)) {
-        orphans.push_back(slot.resource_id);
-      }
-    }
-    auto reconciled = reconcile_observed_orphans(
-        runtime, slots.operation_resource_generation, orphans);
-    if (!reconciled.ok())
-      return core::Result<core::StopFaultRecoveryFactsDTO>::Err(
-          reconciled.error());
-  }
-  for (const auto &slot : addressed_kernel.resource_snapshot()) {
-    if (!std::binary_search(latch.captured_resources.begin(),
-                            latch.captured_resources.end(), slot.resource_id)) {
-      continue;
-    }
-    const bool unresolved =
-        slot.state ==
-            core::ResourceSlotState::kUnreconciledExternalOrOrphanGoal ||
-        slot.state == core::ResourceSlotState::kReserved ||
-        slot.state == core::ResourceSlotState::kDispatched ||
-        slot.state == core::ResourceSlotState::kStopping ||
-        (slot.state == core::ResourceSlotState::kTerminal &&
-         slot.stop_generation > latch.stop_generation);
-    if (unresolved) {
-      facts.value().fenced_or_orphan_resources.push_back(slot.resource_id);
-    }
-  }
-  if (operation_admission_gate != nullptr) {
-    auto fenced = operation_admission_gate->current_fenced_resources(
-        latch.captured_resources);
-    facts.value().fenced_or_orphan_resources.insert(
-        facts.value().fenced_or_orphan_resources.end(), fenced.begin(),
-        fenced.end());
-  }
-  auto &blocked = facts.value().fenced_or_orphan_resources;
-  std::sort(blocked.begin(), blocked.end());
-  blocked.erase(std::unique(blocked.begin(), blocked.end()), blocked.end());
-  if (core::stop_fault_recovery_facts_field_error(facts.value()).has_value()) {
-    return core::Result<core::StopFaultRecoveryFactsDTO>::Err(core::ErrorDTO{
-        std::string(core::to_string(core::ErrorCode::kInvariantViolation)),
-        "native Stop recovery facts failed Kernel blocker join",
-        {{"reason", "native_stop_recovery_blocker_join_invalid"}}});
-  }
-  return facts;
+  return build_retained_cell_stop_recovery_facts(
+      *runtime.stop_surveillance_owner, addressed_kernel, *runtime.clock,
+      *runtime.addressed_request_owner_epoch, *runtime.addressed_cell_id,
+      operation_admission_gate, status, assessed_at_ns,
+      runtime.stop_recovery_configuration_source);
 }
 
 void attach_retained_native_addressed_owner(

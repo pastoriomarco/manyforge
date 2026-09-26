@@ -169,9 +169,16 @@ def _meaningful_execution_control_key(control_response: Any) -> str:
     state = control.get("control_state")
     if isinstance(state, dict):
         state = dict(state)
-        state.pop("observed_motion", None)
-        state.pop("observed_gripper", None)
-        state.pop("observed_target_states", None)
+        # execution_control_state.v6: samples live only in observed_targets;
+        # keep the row identities, drop the Viewer-only observation values.
+        rows = state.get("observed_targets")
+        if isinstance(rows, list):
+            state["observed_targets"] = [
+                {key: value for key, value in row.items() if key != "observed"}
+                if isinstance(row, dict)
+                else row
+                for row in rows
+            ]
         control["control_state"] = state
     return json.dumps(control, sort_keys=True, separators=(",", ":"))
 

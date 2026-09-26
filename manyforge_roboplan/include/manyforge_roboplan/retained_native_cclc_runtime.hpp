@@ -37,7 +37,10 @@ DeriveRetainedNativeStateSourceProjections(
 /// native controller/Stop-readiness path as post-publication CCLC; it never
 /// opens the parent fence or starts motion.
 [[nodiscard]] core::Result<void> InitializeRetainedNativeCandidateControlRoutes(
-    const deployment::RetainedBundle &bundle, RetainedNativeRuntime &runtime,
+    const deployment::RetainedBundle &bundle,
+    core::ResourceAddressedExecutionKernel &kernel,
+    deployment::IRouteConfigurationKernelPublicationOwner &route_owner,
+    core::ICCLCComponentCommandReadinessPort &readiness_owner,
     core::ActiveBundlePublicationGeneration candidate_publication_generation,
     const core::NativeApplyPlanDTO &plan,
     const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
@@ -102,5 +105,33 @@ CreateRetainedNativeCCLCRuntime(
     core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
     RetainedExternallyManagedDomainSnapshotSource
         externally_managed_controller_snapshot_source = {});
+
+/// Restart variant for a stable native cell with any mix of component owner
+/// kinds. It adopts durable predecessor routes under route-recovery exclusion,
+/// reconciles command-free orphans, reconstructs component eligibility from
+/// committed CCLC facts, and starts CCLC. The returned callback advances any
+/// old-runtime-epoch route recovery; the host retains it until composition
+/// detachment and never clears recovery admission before it succeeds.
+[[nodiscard]] core::Result<std::unique_ptr<deployment::CCLCRuntimeComposition>>
+CreateRecoveredRetainedNativeCellCCLCRuntime(
+    RetainedNativeCCLCRuntimeConfig config,
+    std::shared_ptr<const deployment::RetainedBundle> retained_bundle,
+    const core::IActiveBundlePublicationReader &active_publication_reader,
+    core::ActiveBundlePublicationReceiptDTO expected_active_publication,
+    const deployment::IVerifiedRetainedProductArtifactSource &artifact_source,
+    const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
+    std::vector<core::BrandLifecyclePortRegistrationDTO> brand_ports,
+    std::vector<core::RuntimeParticipantBinding> physical_bindings,
+    core::ICCLCKernelDisableHandoffPort &kernel_disable_handoff_port,
+    core::IKernelCellAdmissionPort &kernel_cell_admission_port,
+    core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port,
+    deployment::IRouteConfigurationKernelPublicationOwner &route_owner,
+    core::ICCLCComponentCommandReadinessPort &readiness_owner,
+    core::ResourceAddressedExecutionKernel &kernel,
+    core::IClock &clock, core::IScheduler &scheduler,
+    std::function<core::Result<core::RuntimeRouteConfigurationReadbackDTO>(
+        const core::ActiveControlConfigurationDTO &)> adopt_predecessor,
+    std::function<core::Result<void>()> reconcile_command_free_orphans,
+    std::function<core::Result<void>()> &reconcile_after_start);
 
 } // namespace manyforge::roboplan_backend

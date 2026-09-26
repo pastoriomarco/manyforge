@@ -19,6 +19,20 @@ constexpr std::string_view kDigestOne =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 constexpr std::string_view kDigestTwo =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+constexpr std::string_view kDigestThree =
+    "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+
+[[nodiscard]] manyforge::deployment::ApplyComponentDeltaDTO RetainOnlyDelta() {
+  const manyforge::deployment::ApplyComponentChangeDTO arm{
+      ControllableComponentId("arm.1"),
+      manyforge::deployment::ApplyComponentDisposition::kRetain,
+      ContentDigest(std::string(kDigestThree)),
+      ContentDigest(std::string(kDigestThree)),
+      {ControlDomainId("arm.domain")},
+      {ControlDomainId("arm.domain")},
+      {}};
+  return {{arm}, false, {}};
+}
 
 [[nodiscard]] ManagerSelectedRuntimeCompositionRequestDTO Request() {
   return {
@@ -41,7 +55,24 @@ constexpr std::string_view kDigestTwo =
       ConfigurationFenceId("fence-1"),
       ConfigurationFenceGeneration(6U),
       {},
+      ManagerSelectedRuntimeCompositionPhase::kFinalize,
+      RetainOnlyDelta(),
+      ProjectionRevisionDTO{
+          RetainedBundleId("bundle-0"),
+          GraphRevision("graph-0"),
+          SceneRevision{SceneId(std::string(kDigestOne)), 3U,
+                        ContentDigest(std::string(kDigestOne))},
+      },
   };
+}
+
+[[nodiscard]] ManagerRuntimeComponentReceiptDTO RetainedReceipt() {
+  return {ControllableComponentId("arm.1"),
+          manyforge::deployment::ApplyComponentDisposition::kRetain,
+          ContentDigest(std::string(kDigestThree)),
+          {{RuntimeUnitId("runtime.kernel"), RuntimeEpoch("runtime-epoch-1")}},
+          true,
+          true};
 }
 
 TEST(SelectedRuntimeCompositionRpcInternal,
@@ -59,7 +90,7 @@ TEST(SelectedRuntimeCompositionRpcInternal,
     for (const auto state :
          {ManagerSelectedRuntimeCompositionState::kPreparing,
           ManagerSelectedRuntimeCompositionState::kInstalled}) {
-      const ManagerSelectedRuntimeCompositionResultDTO result{request, state};
+      const ManagerSelectedRuntimeCompositionResultDTO result{request, state, {}};
       const auto decoded = DecodeSelectedRuntimeCompositionRpcResponse(
           EncodeSelectedRuntimeCompositionRpcResponse(result));
       const auto *round_trip =
@@ -68,6 +99,72 @@ TEST(SelectedRuntimeCompositionRpcInternal,
       EXPECT_EQ(*round_trip, result);
     }
   }
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal,
+     RoundTripsTheDurableDeltaAndPerComponentReceipts) {
+  const auto request = Request();
+  ASSERT_TRUE(request.valid());
+  const ManagerSelectedRuntimeCompositionResultDTO installed{
+      request, ManagerSelectedRuntimeCompositionState::kInstalled, {RetainedReceipt()}};
+  ASSERT_TRUE(installed.valid());
+  const auto decoded = DecodeSelectedRuntimeCompositionRpcResponse(
+      EncodeSelectedRuntimeCompositionRpcResponse(installed));
+  const auto *round_trip =
+      std::get_if<ManagerSelectedRuntimeCompositionResultDTO>(&decoded);
+  ASSERT_NE(round_trip, nullptr);
+  EXPECT_EQ(*round_trip, installed);
+  EXPECT_EQ(round_trip->request.component_delta, RetainOnlyDelta());
+
+  // A preparing result carries no installation receipts.
+  const ManagerSelectedRuntimeCompositionResultDTO preparing{
+      request, ManagerSelectedRuntimeCompositionState::kPreparing, {RetainedReceipt()}};
+  EXPECT_FALSE(preparing.valid());
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal, ReceiptsMustMatchTheDeltaExactly) {
+  const auto request = Request();
+  EXPECT_TRUE(ComponentReceiptsMatchRequest(request, {RetainedReceipt()}));
+  // Missing receipt for a retained component.
+  EXPECT_FALSE(ComponentReceiptsMatchRequest(request, {}));
+  // A retained controller whose product changed must report the re-seal.
+  auto not_resealed = RetainedReceipt();
+  not_resealed.product_binding_resealed = false;
+  EXPECT_FALSE(ComponentReceiptsMatchRequest(request, {not_resealed}));
+  auto same_product = request;
+  same_product.predecessor_projection_revision.retained_bundle_id =
+      request.candidate_projection_revision.retained_bundle_id;
+  same_product.predecessor_projection_revision.graph_revision =
+      request.candidate_projection_revision.graph_revision;
+  EXPECT_TRUE(ComponentReceiptsMatchRequest(same_product, {not_resealed}));
+  EXPECT_FALSE(ComponentReceiptsMatchRequest(same_product, {RetainedReceipt()}));
+  // Another installed identity, or a controller that was not retained.
+  auto foreign = RetainedReceipt();
+  foreign.installed_runtime_identity = ContentDigest(std::string(kDigestTwo));
+  EXPECT_FALSE(ComponentReceiptsMatchRequest(request, {foreign}));
+  auto rebuilt = RetainedReceipt();
+  rebuilt.predecessor_runtime_retained = false;
+  EXPECT_FALSE(ComponentReceiptsMatchRequest(request, {rebuilt}));
+  // Evidence from a stale or foreign runtime owner, or an extra owner.
+  auto stale_epoch = RetainedReceipt();
+  stale_epoch.runtime_unit_epochs.front().runtime_epoch =
+      RuntimeEpoch("runtime-epoch-0");
+  EXPECT_FALSE(ComponentReceiptsMatchRequest(request, {stale_epoch}));
+  auto foreign_unit = RetainedReceipt();
+  foreign_unit.runtime_unit_epochs.front().runtime_unit_id =
+      RuntimeUnitId("runtime.other");
+  EXPECT_FALSE(ComponentReceiptsMatchRequest(request, {foreign_unit}));
+  auto two_owners = RetainedReceipt();
+  two_owners.runtime_unit_epochs.push_back(
+      {RuntimeUnitId("runtime.later"), RuntimeEpoch("later-epoch-1")});
+  EXPECT_FALSE(ComponentReceiptsMatchRequest(request, {two_owners}));
+  auto no_owner = RetainedReceipt();
+  no_owner.runtime_unit_epochs.clear();
+  EXPECT_FALSE(ComponentReceiptsMatchRequest(request, {no_owner}));
+  // An extra receipt for a component outside the delta.
+  auto extra = RetainedReceipt();
+  extra.controllable_component_id = ControllableComponentId("gripper.1");
+  EXPECT_FALSE(ComponentReceiptsMatchRequest(request, {RetainedReceipt(), extra}));
 }
 
 TEST(SelectedRuntimeCompositionRpcInternal, RejectsUnknownPhase) {

@@ -18,6 +18,7 @@
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/program_binding_outcome.hpp>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -673,7 +674,7 @@ HeadlessApiCore::AssistantModeContext(const std::string_view mode_id) {
   });
 }
 
-CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
+const CanonicalValue &HeadlessApiCore::ActiveAppliedRecordLocked(
     const HeadlessRuntimeSnapshot &runtime) {
   const auto &manager_section = RequiredSection(runtime.root, "manager");
   Require(SectionFresh(manager_section), "program_applied_selection_unavailable",
@@ -712,14 +713,94 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
           "program_applied_selection_not_active",
           "the active Apply has no successful terminal evidence");
   const auto &prepared = RequiredMember(*record, "prepared_activation");
-  const auto active_bundle_id = RequiredString(active, "retained_bundle_id");
-  const auto active_graph_revision = RequiredString(active, "graph_revision");
-  Require(RequiredString(prepared, "retained_bundle_id") == active_bundle_id &&
+  Require(RequiredString(prepared, "retained_bundle_id") ==
+                  RequiredString(active, "retained_bundle_id") &&
               RequiredString(prepared, "graph_revision") ==
-                  active_graph_revision,
+                  RequiredString(active, "graph_revision"),
           "program_applied_selection_invalid",
           "active Manager publication and prepared activation disagree");
+  return *record;
+}
 
+namespace {
+
+/// The typed Program outcome of the active prepared activation (H1a): the
+/// binding id when bound, or the decoded non-executable result.
+struct AppliedProgramOutcome final {
+  std::optional<core::ProgramBindingId> program_binding_id;
+  std::optional<deployment::ProgramNonExecutableOutcomeDTO> non_executable;
+};
+
+AppliedProgramOutcome ReadAppliedProgramOutcome(const CanonicalValue &prepared) {
+  const auto &outcome = RequiredMember(prepared, "program_outcome");
+  const auto kind = RequiredString(outcome, "kind");
+  if (kind == "bound") {
+    return {core::ProgramBindingId(
+                RequiredString(outcome, "program_binding_id")),
+            std::nullopt};
+  }
+  Require(kind == "non_executable", "program_applied_selection_invalid",
+          "active Program outcome kind is unsupported");
+  try {
+    auto decoded = deployment::DecodeProgramNonExecutableOutcome(
+        content_identity::canonical_json(RequiredMember(outcome, "outcome")));
+    Require(decoded.program_id.value() == RequiredString(prepared, "program_id") &&
+                decoded.program_revision.value() ==
+                    RequiredString(prepared, "program_revision") &&
+                decoded.retained_bundle_id.value() ==
+                    RequiredString(prepared, "retained_bundle_id") &&
+                decoded.graph_revision.value() ==
+                    RequiredString(prepared, "graph_revision"),
+            "program_applied_selection_invalid",
+            "active Program outcome differs from its preparation");
+    return {std::nullopt, std::move(decoded)};
+  } catch (const deployment::ProgramBindingOutcomeError &error) {
+    CoreFail("program_applied_selection_invalid",
+             std::string("active Program outcome is invalid: ") + error.what());
+  }
+}
+
+/// One operator-readable sentence naming every unresolved reference.
+std::string NonExecutableMessage(
+    const deployment::ProgramNonExecutableOutcomeDTO &outcome) {
+  std::string message =
+      "Applied Program is not executable in the active Deployment:";
+  for (const auto &row : outcome.unresolved_roles) {
+    message += row.target_role_id.has_value()
+                   ? " target role '" + row.target_role_id->value() +
+                         "' (component '" +
+                         row.controllable_component_id.value() + "', target '" +
+                         row.command_target_id->value() + "')"
+                   : " component role '" + row.component_role_id.value() +
+                         "' (component '" +
+                         row.controllable_component_id.value() + "')";
+    message += " is " + std::string(deployment::to_string(row.reason)) + ";";
+  }
+  message.pop_back();
+  return message;
+}
+
+} // namespace
+
+CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
+    const HeadlessRuntimeSnapshot &runtime) {
+  // Freshness, convergence and the successful Apply are verified first.
+  const auto &record = ActiveAppliedRecordLocked(runtime);
+  const auto &manager_section = RequiredSection(runtime.root, "manager");
+  const auto &manager_payload = RequiredMember(manager_section, "payload");
+  const auto &active = RequiredMember(manager_payload, "active");
+  const auto apply_generation = RequiredCounter(record, "apply_generation", 1U);
+  const auto &prepared = RequiredMember(record, "prepared_activation");
+  // A Program that no longer binds in the active Deployment is preserved as
+  // authored and refused by name for every consumer (Execute, runner, API);
+  // it is never replaced by another binding (H1a).
+  const auto outcome = ReadAppliedProgramOutcome(prepared);
+  if (outcome.non_executable.has_value()) {
+    CoreFail("program_applied_non_executable",
+             NonExecutableMessage(*outcome.non_executable));
+  }
+  const auto active_bundle_id = RequiredString(active, "retained_bundle_id");
+  const auto active_graph_revision = RequiredString(active, "graph_revision");
   const auto bundle = retained_bundle_source_.get_verified(
       core::RetainedBundleId(active_bundle_id));
   Require(bundle != nullptr, "program_applied_selection_invalid",
@@ -728,8 +809,7 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
   const auto program_id = core::ProgramId(RequiredString(prepared, "program_id"));
   const auto program_revision =
       core::ProgramRevision(RequiredString(prepared, "program_revision"));
-  const auto binding_id = core::ProgramBindingId(
-      RequiredString(prepared, "program_binding_id"));
+  const auto binding_id = *outcome.program_binding_id;
   const auto program =
       program_repository_.get_verified(program_id, program_revision, *bundle);
   const auto binding =
@@ -817,7 +897,7 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
        CanonicalValue(std::string(kAppliedProgramSelectionSchemaVersion))},
       {"source",
        CanonicalValue(CanonicalValue::Object{
-           {"record_digest", RequiredMember(*record, "intent_digest")},
+           {"record_digest", RequiredMember(record, "intent_digest")},
            {"semantic_content_digest",
             RequiredMember(prepared, "prepared_activation_id")},
            {"source_generation",
@@ -836,6 +916,59 @@ CanonicalValue HeadlessApiCore::AppliedProgramSelection() {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   return ActiveProgramSelectionLocked(RefreshLocked());
+}
+
+CanonicalValue HeadlessApiCore::AppliedProgramStatus() {
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  const auto runtime = RefreshLocked();
+  const auto &record = ActiveAppliedRecordLocked(runtime);
+  const auto &prepared = RequiredMember(record, "prepared_activation");
+  const auto outcome = ReadAppliedProgramOutcome(prepared);
+  // Derived from the durable active Apply on every read; nothing here is a
+  // stored warning that could outlive the facts it describes.
+  CanonicalValue program(nullptr);
+  CanonicalValue non_executable(nullptr);
+  if (outcome.non_executable.has_value()) {
+    const auto bundle = retained_bundle_source_.get_verified(
+        core::RetainedBundleId(RequiredString(prepared, "retained_bundle_id")));
+    Require(bundle != nullptr, "program_applied_selection_invalid",
+            "active retained bundle is unavailable");
+    const auto authored = program_repository_.get_verified(
+        core::ProgramId(RequiredString(prepared, "program_id")),
+        core::ProgramRevision(RequiredString(prepared, "program_revision")),
+        *bundle);
+    Require(authored != nullptr, "program_applied_selection_invalid",
+            "active Program is unavailable");
+    program = authored->normalized_program_root();
+    non_executable = content_identity::parse_canonical_json(
+        deployment::EncodeProgramNonExecutableOutcome(*outcome.non_executable));
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"deployment_artifact_id",
+       RequiredMember(prepared, "deployment_artifact_id")},
+      {"deployment_revision", RequiredMember(prepared, "deployment_revision")},
+      {"executable", CanonicalValue(outcome.program_binding_id.has_value())},
+      {"graph_revision", RequiredMember(prepared, "graph_revision")},
+      {"message", outcome.non_executable.has_value()
+                      ? CanonicalValue(NonExecutableMessage(*outcome.non_executable))
+                      : CanonicalValue(nullptr)},
+      {"non_executable", std::move(non_executable)},
+      {"program", std::move(program)},
+      {"program_binding_id",
+       outcome.program_binding_id.has_value()
+           ? CanonicalValue(outcome.program_binding_id->value())
+           : CanonicalValue(nullptr)},
+      {"program_id", RequiredMember(prepared, "program_id")},
+      {"program_revision", RequiredMember(prepared, "program_revision")},
+      {"record_digest", RequiredMember(record, "intent_digest")},
+      {"retained_bundle_id", RequiredMember(prepared, "retained_bundle_id")},
+      {"scenario_id", RequiredMember(prepared, "scenario_id")},
+      {"schema_version",
+       CanonicalValue(std::string(kAppliedProgramStatusSchemaVersion))},
+      {"source_document_digest",
+       RequiredMember(prepared, "source_document_digest")},
+  });
 }
 
 ViewerModelAsset HeadlessApiCore::ViewerModelUrdf() {

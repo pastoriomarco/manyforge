@@ -319,6 +319,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/scenario-documents/save")
     def save_document(body: SaveScenarioDocumentRequest) -> dict[str, Any]:
+        saved_path: str | None = None
         try:
             _require_fence(state, body)
             # One immutable composite capture: the project written and the saved
@@ -352,43 +353,59 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             )
             target = normalize_scenario_save_path(body.path)
             current_target = project["document_path"]
+            source_project_root = (
+                state.deployment_draft_session.source_project_root
+                or current_target
+            )
             overwrite = body.confirm_overwrite or (
                 current_target is not None
                 and str(Path(target).expanduser().resolve()) == current_target
             )
-            if _published_content_digest(state, target) == _document_content_digest(
-                document
-            ):
-                # This exact content is already published at the target, so a
-                # lost response is resolved without repeating the write.
-                saved_path = str(Path(target).expanduser().resolve())
-            else:
-                saved_path = save_scenario_artifact(
-                    document,
-                    target,
-                    allowed_roots=state.allowed_fs_roots,
-                    overwrite=overwrite,
-                    source_project_path=current_target,
+
+            def prepare_saved_project() -> dict[str, Any]:
+                nonlocal saved_path
+                if _published_content_digest(state, target) == _document_content_digest(
+                    document
+                ):
+                    # Resolve a prior completed write without repeating its
+                    # filesystem effect. This check runs after admission is
+                    # acquired, so stale requests cannot create a Save As file.
+                    saved_path = str(Path(target).expanduser().resolve())
+                else:
+                    saved_path = save_scenario_artifact(
+                        document,
+                        target,
+                        allowed_roots=state.allowed_fs_roots,
+                        overwrite=overwrite,
+                        source_project_path=source_project_root,
+                    )
+                captured, _, source_digest = capture_scenario_artifact(
+                    saved_path, allowed_roots=state.allowed_fs_roots
                 )
-            captured, _, source_digest = capture_scenario_artifact(
-                saved_path, allowed_roots=state.allowed_fs_roots
-            )
-            # One composite commit adopts the written project path, Saved
-            # baseline and Scenario facts together, fenced by the identity the
-            # bytes were captured at. A concurrent edit keeps the correctly
-            # written file and refuses only the baseline.
+                return scenario_project_facts(
+                    captured,
+                    document_path=saved_path,
+                    source_document_digest=source_digest,
+                )
+
+            # Acquire the local authoring claim before publishing the file. A
+            # stale admission generation must not leave a new Scenario behind
+            # while reporting that Save was refused. The owner installs the
+            # resulting project facts in the same composite commit.
             commit = commit_local_authoring(
                 state,
                 body,
                 operation_kind="save_scenario_document",
                 captured_identity=snapshot.identity,
                 session="project",
-                project=scenario_project_facts(
-                    captured,
-                    document_path=saved_path,
-                    source_document_digest=source_digest,
-                ),
+                prepare_project_under_claim=prepare_saved_project,
             )
+            if saved_path is None:
+                raise ScenarioArtifactError(
+                    "scenario_saved_path_unavailable",
+                    "Scenario Save committed without a published path",
+                    status_code=503,
+                )
             workspace = program_workspace(state)
             return {
                 "status": "saved",
@@ -556,7 +573,8 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             )
             deployment_replacement = (
                 state.deployment_draft_session.prepare_load_replacement(
-                    post_state["deployment"]
+                    post_state["deployment"],
+                    source_project_root=source_path,
                 )
             )
 
@@ -793,7 +811,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             exported_path = export_scenario_artifact(
                 document,
                 body.destination_path,
-                source_project_path=source_path,
+                source_project_path=(
+                    state.deployment_draft_session.source_project_root or source_path
+                ),
                 allowed_roots=state.allowed_fs_roots,
             )
             return {"status": "exported", "path": exported_path}

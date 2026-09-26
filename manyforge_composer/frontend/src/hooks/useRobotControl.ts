@@ -192,6 +192,7 @@ export function manualAvailabilityScopeFence(
   if (selected === null) return null;
   const cycle = snapshot.programCycle;
   const target = mode === 'gripper' ? selected.directControlGripper : selected.directControl;
+  if (target === null) return null;
   return JSON.stringify([
     status.ownerEpoch, status.retainedBundleId, status.graphRevision,
     target.programBindingId, target.programRunId,
@@ -371,9 +372,12 @@ export function useRobotControl(
         if (state.mode === 'gripper' && status.observedGripper === null) {
           throw new Error('Gripper observation is unavailable.');
         }
+        if (state.mode !== 'gripper' && status.observedMotion === null) {
+          throw new Error('Motion observation is unavailable.');
+        }
         const intent = state.mode === 'gripper'
           ? buildGripperCommandIntent(status, status.observedGripper!.position, requestId())
-          : buildJointMotionIntent(status, status.observedMotion.positionsRad, requestId());
+          : buildJointMotionIntent(status, status.observedMotion!.positionsRad, requestId());
         const result = await api.execution.manualAvailability(intent, controller.signal);
         if (current) setAvailability({ scope: availabilityScope, result, error: null });
       } catch (error: unknown) {

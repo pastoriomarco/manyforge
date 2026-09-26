@@ -614,6 +614,72 @@ class MockCollisionWorldPublisher final : public ICollisionWorldSnapshotPublishe
   }
 };
 
+class FakeCollisionApplyFenceAdmissionGate final : public IResourceOperationAdmissionGate {
+ public:
+  FakeCollisionApplyFenceAdmissionGate()
+      : admission_mutex_(std::make_shared<std::recursive_mutex>()) {}
+
+  [[nodiscard]] std::shared_ptr<std::recursive_mutex> shared_admission_mutex() const override {
+    return admission_mutex_;
+  }
+
+  [[nodiscard]] Result<void> reserve(ResourceSlotTable&, const ResourceSlotOwnerDTO&,
+                                     const std::vector<ResourceId>&) override {
+    return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                      "test gate does not admit operations", {}});
+  }
+
+  [[nodiscard]] Result<void> reserve_batch(
+      ResourceSlotTable&,
+      const std::vector<ResourceSlotReservationOwnerDTO>&) override {
+    return Result<void>::Err(ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
+                                      "test gate does not admit operations", {}});
+  }
+
+  [[nodiscard]] std::vector<ResourceId> current_fenced_resources(
+      const std::vector<ResourceId>& resources) const override {
+    return held ? resources : std::vector<ResourceId>{};
+  }
+
+  [[nodiscard]] bool exact_fence_covers(
+      const ConfigurationFenceId& fence_id,
+      const std::vector<ResourceId>& resources) const override {
+    return held && held_fence_id.has_value() && *held_fence_id == fence_id &&
+           std::all_of(resources.begin(), resources.end(), [&](const auto& resource) {
+             return std::find(held_scope.resources.begin(), held_scope.resources.end(), resource) !=
+                    held_scope.resources.end();
+           });
+  }
+
+  [[nodiscard]] bool exact_fence_is_held(
+      const ConfigurationFenceId& fence_id,
+      const ConfigurationFenceScopeDTO& scope) const override {
+    return held && held_fence_id.has_value() && *held_fence_id == fence_id &&
+           held_scope == scope;
+  }
+
+  bool held{true};
+  std::optional<ConfigurationFenceId> held_fence_id;
+  ConfigurationFenceScopeDTO held_scope;
+
+ private:
+  std::shared_ptr<std::recursive_mutex> admission_mutex_;
+};
+
+ConfigurationFenceScopeDTO make_collision_apply_fence_scope(
+    std::string resource_id = "resource:collision-apply") {
+  ConfigurationFenceScopeDTO scope;
+  scope.controllable_component_ids = {ControllableComponentId{"component:collision-apply"}};
+  scope.domains = {ConfigurationFenceDomainScopeDTO{
+      ControlDomainId{"domain:collision-apply"}, std::nullopt,
+      ControlDomainRevision{"revision:candidate"}}};
+  scope.bindings = {ConfigurationFenceBindingScopeDTO{
+      ControlBindingId{"binding:collision-apply"}, std::nullopt,
+      ControlBindingRevision{"revision:candidate"}}};
+  scope.resources = {ResourceId{std::move(resource_id)}};
+  return scope;
+}
+
 class MockCollisionEngine final : public ICollisionQueryEngine {
  public:
   CollisionResult default_result;
@@ -2362,6 +2428,15 @@ KernelRecoveryActionResultDTO apply_recovery_action_after_projection(
   std::terminate();
 }
 
+CollisionPipelineResourceOwners make_owned_collision_pipeline_resources() {
+  auto publisher = std::make_shared<MockCollisionWorldPublisher>();
+  publisher->current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(make_test_collision_world_snapshot());
+  publisher->current_policy = make_test_collision_policy_snapshot();
+  return CollisionPipelineResourceOwners{publisher, std::make_shared<MockCollisionEngine>(),
+                                         {std::make_shared<MockCollisionEngine>()}, {}};
+}
+
 // --- Test fixture ---
 
 class ExecutionKernelTest : public ::testing::Test {
@@ -2521,6 +2596,69 @@ class ExecutionKernelTest : public ::testing::Test {
 };
 
 // --- Happy path ---
+
+TEST_F(ExecutionKernelTest, CollisionResourcesReplaceOnlyUnderExactApplyFenceAndReadBackOwners) {
+  const ConfigurationFenceId apply_fence_id{"apply:collision-resource-replacement"};
+  const auto apply_scope = make_collision_apply_fence_scope();
+  ASSERT_TRUE(apply_scope.valid());
+  FakeCollisionApplyFenceAdmissionGate admission_gate;
+  admission_gate.held_fence_id = apply_fence_id;
+  admission_gate.held_scope = apply_scope;
+
+  const auto candidate = make_owned_collision_pipeline_resources();
+  const auto installed = kernel.replace_collision_resources_under_apply_fence(
+      apply_fence_id, apply_scope, admission_gate, candidate);
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
+  EXPECT_EQ(installed.value().generation, 2U)
+      << "the fixture installed one bootstrap resource set before this Apply";
+  EXPECT_EQ(installed.value().resources, candidate);
+  ASSERT_TRUE(installed.value().coordinator_policy_snapshot);
+  const auto candidate_policy = candidate.snapshot_publisher->collision_policy_snapshot();
+  ASSERT_TRUE(candidate_policy.has_value());
+  EXPECT_EQ(*installed.value().coordinator_policy_snapshot, *candidate_policy);
+  ASSERT_TRUE(installed.value().coordinator_policy_index);
+
+  const auto readback = kernel.collision_resource_set_readback();
+  ASSERT_TRUE(readback.ok()) << readback.error().message;
+  EXPECT_EQ(readback.value(), installed.value());
+  EXPECT_EQ(readback.value().coordinator_policy_snapshot,
+            installed.value().coordinator_policy_snapshot);
+  EXPECT_EQ(readback.value().coordinator_policy_index,
+            installed.value().coordinator_policy_index);
+
+  auto replacement = make_owned_collision_pipeline_resources();
+  admission_gate.held_scope = make_collision_apply_fence_scope("resource:other");
+  const auto wrong_scope = kernel.replace_collision_resources_under_apply_fence(
+      apply_fence_id, apply_scope, admission_gate, replacement);
+  ASSERT_FALSE(wrong_scope.ok());
+  EXPECT_EQ(wrong_scope.error().details.at("reason"), "configuration_fence_not_held");
+  EXPECT_EQ(kernel.collision_resource_set_readback().value(), installed.value());
+
+  admission_gate.held_scope = apply_scope;
+  replacement.validation_engines.push_back(nullptr);
+  const auto sparse_candidate = kernel.replace_collision_resources_under_apply_fence(
+      apply_fence_id, apply_scope, admission_gate, replacement);
+  ASSERT_FALSE(sparse_candidate.ok());
+  EXPECT_EQ(sparse_candidate.error().details.at("reason"),
+            "collision_resource_candidate_engine_missing");
+  EXPECT_EQ(kernel.collision_resource_set_readback().value(), installed.value());
+
+  replacement.validation_engines.pop_back();
+  replacement.runtime_monitor_engine = replacement.validation_engines.front();
+  const auto invalid_candidate = kernel.replace_collision_resources_under_apply_fence(
+      apply_fence_id, apply_scope, admission_gate, replacement);
+  ASSERT_FALSE(invalid_candidate.ok());
+  EXPECT_EQ(invalid_candidate.error().details.at("reason"),
+            "collision_resource_candidate_invalid");
+  EXPECT_EQ(kernel.collision_resource_set_readback().value(), installed.value());
+}
+
+TEST_F(ExecutionKernelTest, CollisionResourcesReadbackRequiresKernelOwnedPublisher) {
+  const auto readback = kernel.collision_resource_set_readback();
+  ASSERT_FALSE(readback.ok());
+  EXPECT_EQ(readback.error().details.at("reason"),
+            "collision_resource_publisher_owner_missing");
+}
 
 TEST_F(ExecutionKernelTest, IndependentGripperParticipantHasNoMotionLifecycleOrWorkers) {
   GripperParticipantEngine gripper(context, clock);
@@ -10384,7 +10522,8 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest, Execute_ResolvedContactGraspInstallsExactEphemeralPolicy) {
-  configure_authoritative_collision_validation(kernel, collision_world_publisher, collision_engine);
+  // SetUp installs the authoritative collision resources for the fixture's
+  // Kernel. A second install is prohibited without an Apply fence.
   install_mock_contact_grasp_world(collision_world_publisher, "graspable",
                                    {"right_finger", "left_finger"});
   install_mock_detached_logical_object(collision_world_publisher, "graspable");
@@ -13228,7 +13367,7 @@ TEST_F(ExecutionKernelTest, Execute_ScopedTrip_CommandAuthoritativeStopIgnoresFe
 }
 
 TEST_F(ExecutionKernelTest,
-       Execute_ScopedTrip_StopMonitorUnavailableIsAuditedWithoutCancellingStop) {
+       Execute_ScopedTrip_CollisionResourceReplacementIsRefusedDuringStop) {
   using namespace motion_45c;
   ControlledExecution controlled_execution;
   controlled_execution.block_controlled_stop = true;
@@ -13247,18 +13386,24 @@ TEST_F(ExecutionKernelTest,
       planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
   configure_runtime_collision_monitoring(local_kernel, local_collision_world,
                                          local_collision_engine, local_runtime_engine);
+
+  const ConfigurationFenceId apply_fence_id{"apply:collision-resource-stop-test"};
+  const auto apply_scope = make_collision_apply_fence_scope();
+  FakeCollisionApplyFenceAdmissionGate admission_gate;
+  admission_gate.held_fence_id = apply_fence_id;
+  admission_gate.held_scope = apply_scope;
+  const auto baseline_resources = make_owned_collision_pipeline_resources();
+  const auto baseline_install = local_kernel.replace_collision_resources_under_apply_fence(
+      apply_fence_id, apply_scope, admission_gate, baseline_resources);
+  ASSERT_TRUE(baseline_install.ok()) << baseline_install.error().message;
+  const auto baseline_readback = local_kernel.collision_resource_set_readback();
+  ASSERT_TRUE(baseline_readback.ok()) << baseline_readback.error().message;
+
   ASSERT_TRUE(local_kernel.register_interrupt_source(make_fast_probe_source("probe")).ok());
   ASSERT_TRUE(
       local_kernel.register_interrupt_policy(make_move_trip_policy("probe_trip", "probe")).ok());
 
-  std::mutex events_mutex;
-  std::vector<KernelEvent> events;
-  local_kernel.subscribe_events([&](const KernelEvent& e) {
-    std::lock_guard<std::mutex> lock(events_mutex);
-    events.push_back(e);
-  });
-
-  auto req = make_test_request("trip_stop_monitor_unavailable");
+  auto req = make_test_request("trip_stop_collision_resource_replacement");
   req.motion_interrupt_scopes = {
       make_scope("scope_a", "probe_trip", MotionInterruptActivationMode::kTripIfAlreadyActive)};
   auto result = local_kernel.execute(req);
@@ -13269,37 +13414,39 @@ TEST_F(ExecutionKernelTest,
   auto trip = make_probe_sample("probe", 2, local_clock.now(), true);
   ASSERT_TRUE(local_kernel.publish_fast_interrupt_signal(trip).latched);
   ASSERT_TRUE(controlled_execution.wait_until_controlled_stop_count(1));
+  ASSERT_TRUE(wait_for_state(local_kernel, ExecutionState::kStopping));
 
-  // Break only the monitor query-engine availability while the stop is active.
-  // This must be visible, but must not be reported as a collision or cancel the
-  // in-flight stop.
-  local_kernel.set_collision_resources(local_collision_world, nullptr,
-                                       std::vector<std::shared_ptr<ICollisionQueryEngine>>{});
-  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
-      << "stop-window collision monitor did not schedule its next tick";
-  bool saw_monitor_unavailable = false;
-  for (int attempt = 0; attempt < 200 && !saw_monitor_unavailable; ++attempt) {
-    local_clock.advance(10'000'000);
-    local_scheduler.advance_to(local_clock.now());
-    {
-      std::lock_guard<std::mutex> lock(events_mutex);
-      saw_monitor_unavailable = std::any_of(events.begin(), events.end(), [](const KernelEvent& e) {
-        return e.type == KernelEventType::kErrorRaised &&
-               e.details.contains("reason_during_stop") &&
-               e.details.at("reason_during_stop") == "stop_monitor_unavailable";
-      });
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  EXPECT_TRUE(saw_monitor_unavailable);
+  // The exact Apply fence is present, but Kernel Stop is still active. The
+  // candidate must be rejected before any publisher or engine is inspected,
+  // and the installed owner set must remain byte-for-byte identifiable.
+  auto replacement_resources = make_owned_collision_pipeline_resources();
+  const auto replacement = local_kernel.replace_collision_resources_under_apply_fence(
+      apply_fence_id, apply_scope, admission_gate, replacement_resources);
+  ASSERT_FALSE(replacement.ok());
+  EXPECT_EQ(replacement.error().details.at("reason"), "collision_resource_kernel_not_idle");
+  const auto replacement_publisher =
+      std::dynamic_pointer_cast<MockCollisionWorldPublisher>(
+          replacement_resources.snapshot_publisher);
+  const auto replacement_engine =
+      std::dynamic_pointer_cast<MockCollisionEngine>(
+          replacement_resources.runtime_monitor_engine);
+  ASSERT_NE(replacement_publisher, nullptr);
+  ASSERT_NE(replacement_engine, nullptr);
+  EXPECT_EQ(replacement_publisher->published_runtime_bundle_call_count.load(), 0);
+  EXPECT_EQ(replacement_engine->runtime_query_prepare_count.load(), 0);
+  const auto refused_readback = local_kernel.collision_resource_set_readback();
+  ASSERT_TRUE(refused_readback.ok()) << refused_readback.error().message;
+  EXPECT_EQ(refused_readback.value(), baseline_readback.value());
   EXPECT_EQ(controlled_execution.controlled_stop_cancel_count_value(), 0);
 
-  // Repeated unavailable ticks are counted exactly but do not emit one ERROR
-  // per monitor period.
+  // The installed monitor remains available throughout the refused swap.
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "stop-window collision monitor did not schedule its next tick";
   for (int tick = 0; tick < 3; ++tick) {
     local_clock.advance(10'000'000);
     local_scheduler.advance_to(local_clock.now());
   }
+  EXPECT_EQ(controlled_execution.controlled_stop_cancel_count_value(), 0);
 
   controlled_execution.release_controlled_stop();
   ASSERT_TRUE(local_kernel.wait_for_completion(2'000'000'000));
@@ -13307,23 +13454,9 @@ TEST_F(ExecutionKernelTest,
   const auto coverage = local_kernel.get_metrics();
   EXPECT_EQ(coverage.runtime_collision_stop_windows_started, 1u);
   EXPECT_EQ(coverage.runtime_collision_stop_windows_completed, 1u);
-  EXPECT_GT(coverage.runtime_collision_last_stop_ticks_attempted, 0u);
-  EXPECT_EQ(coverage.runtime_collision_last_stop_queries_executed, 0u);
-  EXPECT_EQ(coverage.runtime_collision_last_stop_unavailable_ticks,
-            coverage.runtime_collision_last_stop_ticks_attempted);
-  EXPECT_GT(coverage.runtime_collision_last_stop_longest_unavailable_ns, 0u);
-  EXPECT_EQ(coverage.runtime_collision_stop_zero_check_windows, 1u);
-  EXPECT_GT(coverage.runtime_collision_unavailable_events_suppressed, 0u);
-  {
-    std::lock_guard<std::mutex> lock(events_mutex);
-    const auto summary = std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
-      return event.type == KernelEventType::kRuntimeCollisionCoverage;
-    });
-    ASSERT_NE(summary, events.end());
-    ASSERT_TRUE(summary->details.contains("unavailable_reason_collision_resources"));
-    EXPECT_EQ(std::stoull(summary->details.at("unavailable_reason_collision_resources")),
-              coverage.runtime_collision_last_stop_unavailable_ticks);
-  }
+  const auto final_readback = local_kernel.collision_resource_set_readback();
+  ASSERT_TRUE(final_readback.ok()) << final_readback.error().message;
+  EXPECT_EQ(final_readback.value(), baseline_readback.value());
 }
 
 TEST_F(ExecutionKernelTest, Execute_ScopedTrip_StopPathCollisionEscalatesToHardStop) {

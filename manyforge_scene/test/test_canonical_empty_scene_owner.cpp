@@ -2036,7 +2036,9 @@ public:
     rebuild_calls_ = 0U;
     frame_resolution_calls_ = 0U;
     policy_projection_calls_ = 0U;
+    rebuild_requests_.clear();
     throw_after_next_rebuild_effect_ = false;
+    reject_next_rebuild_without_effect_ = false;
     rebuild_entered_ = nullptr;
     rebuild_release_ = nullptr;
     accepted_rebuild_binding_.reset();
@@ -2055,6 +2057,10 @@ public:
   [[nodiscard]] std::size_t calls() const noexcept { return calls_; }
   [[nodiscard]] std::size_t rebuild_calls() const noexcept {
     return rebuild_calls_;
+  }
+  [[nodiscard]] const std::vector<core::NativeProjectionRebuildDTO> &
+  rebuild_requests() const noexcept {
+    return rebuild_requests_;
   }
   [[nodiscard]] const ProjectionNativeRuntimeBindingDTO &binding() const
       noexcept {
@@ -2102,6 +2108,10 @@ public:
 
   void ThrowAfterNextRebuildEffect() noexcept {
     throw_after_next_rebuild_effect_ = true;
+  }
+
+  void RejectNextRebuildWithoutEffect() noexcept {
+    reject_next_rebuild_without_effect_ = true;
   }
 
   void AcceptNextRebuildAs(
@@ -2319,6 +2329,20 @@ public:
           "test native projection rebuild request is foreign");
     }
     ++rebuild_calls_;
+    rebuild_requests_.push_back(request);
+    if (std::exchange(reject_next_rebuild_without_effect_, false)) {
+      return {
+          std::nullopt,
+          request.target_projection_revision,
+          core::ProjectionCommitResultStateDTO::kRejectedRollbackProven,
+          health_.active_projection_revision,
+          health_.native_projection_generation,
+          true,
+          health_,
+          ErrorDTO{"projection_rejected_rollback_proven",
+                   "injected rebuild refusal without effects", {}},
+      };
+    }
     if (rebuild_entered_ != nullptr && rebuild_release_ != nullptr) {
       auto *entered = std::exchange(rebuild_entered_, nullptr);
       auto *release = std::exchange(rebuild_release_, nullptr);
@@ -2388,12 +2412,14 @@ private:
   Mode mode_{Mode::kCommit};
   core::ProjectionHealthDTO health_;
   bool throw_after_next_rebuild_effect_{};
+  bool reject_next_rebuild_without_effect_{};
   std::barrier<> *rebuild_entered_{nullptr};
   std::barrier<> *rebuild_release_{nullptr};
   std::optional<ProjectionNativeRuntimeBindingDTO>
       accepted_rebuild_binding_;
   std::size_t calls_{};
   std::size_t rebuild_calls_{};
+  std::vector<core::NativeProjectionRebuildDTO> rebuild_requests_;
   std::vector<core::SceneTransactionDTO> transactions_;
   core::Pose3DTO frame_pose_in_cell_{};
   std::vector<core::ComponentAttachmentRevision> attachment_revisions_;
@@ -2759,16 +2785,21 @@ TEST(CanonicalEmptySceneOwner,
             final.target_projection_revision.scene_revision);
 
   // Changing only the selected Program may keep the same Deployment bundle.
-  // Its empty initial Scene must still replace the prior Program's objects.
-  const auto next_bindings = NativeRuntimeBindings(
-      candidate.bundle->value(), "runtime-empty-program");
-  auto next_projections = MakeFakeProjections(next_bindings);
-  resolver.ReplaceWith(ProjectionClients(next_projections));
+  // Its empty initial Scene must still replace the prior Program's objects,
+  // while refreshing the projection through the same retained native owner.
+  std::vector<FakePlannerSceneProjection *> retained_projection_owners;
+  retained_projection_owners.reserve(projections.size());
+  for (const auto &projection : projections) {
+    retained_projection_owners.push_back(projection.get());
+  }
+  const auto next_bindings = bindings;
   const core::ProjectionMaintenanceInitializationRequestDTO empty_program{
       ApplyId("apply-program-only-empty-scene"), ApplyGeneration(1U),
       completed.target_projection_revision, candidate.bundle->value(),
       next_bindings, {}};
-  ASSERT_EQ(owner.BeginMaintenanceInitialization(empty_program).state,
+  const auto empty_provisional =
+      owner.BeginMaintenanceInitialization(empty_program);
+  ASSERT_EQ(empty_provisional.state,
             core::ProjectionMaintenanceInitializationState::kInitialized);
   const auto empty_installed = owner.InstallInitialScene(empty_program);
   ASSERT_TRUE(empty_installed.ready_for_publication());
@@ -2788,6 +2819,25 @@ TEST(CanonicalEmptySceneOwner,
                 empty_installed.authoritative_snapshot_identity, empty_receipt})
                 .state,
             core::ProjectionMaintenanceInitializationState::kCompleted);
+  ASSERT_EQ(projections.size(), retained_projection_owners.size());
+  for (std::size_t index = 0U; index < projections.size(); ++index) {
+    EXPECT_EQ(projections[index].get(), retained_projection_owners[index]);
+    EXPECT_EQ(projections[index]->rebuild_calls(), 4U);
+    EXPECT_EQ(projections[index]->ProjectionHealth().active_projection_revision,
+              empty_installed.target_projection_revision);
+    const auto &rebuilds = projections[index]->rebuild_requests();
+    ASSERT_EQ(rebuilds.size(), 4U);
+    EXPECT_EQ(rebuilds[2].maintenance_successor,
+              std::make_pair(empty_program.apply_id,
+                             empty_program.apply_generation));
+    EXPECT_EQ(rebuilds[2].maintenance_predecessor,
+              completed.target_projection_revision);
+    EXPECT_EQ(rebuilds[3].maintenance_successor,
+              std::make_pair(empty_program.apply_id,
+                             empty_program.apply_generation));
+    EXPECT_EQ(rebuilds[3].maintenance_predecessor,
+              empty_provisional.target_projection_revision);
+  }
   const auto empty_snapshot = owner.ReadActiveSnapshot();
   ASSERT_TRUE(empty_snapshot.has_value());
   EXPECT_TRUE(empty_snapshot->shared()->objects.empty());
@@ -2961,6 +3011,51 @@ TEST(CanonicalEmptySceneOwner,
 }
 
 TEST(CanonicalEmptySceneOwner,
+     MaintenanceReplayRetainsPreviouslyCommittedProjectionEffects) {
+  TemporaryDirectory directory("scene-maintenance-partial-replay");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-epoch-partial-replay");
+  auto projections = MakeFakeProjections(bindings);
+  ASSERT_GE(projections.size(), 2U);
+  auto clients = ProjectionClients(projections);
+  FakePlannerSceneProjectionResolver resolver(clients);
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
+  TestCellAdmissionPort cell_admission;
+  CanonicalEmptySceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                                 admission, publication_reader, bundle_source,
+                                 resolver, cell_admission);
+  const auto predecessor = FinalizeNativeCandidate(
+      owner, publication_reader, admission, *candidate.bundle, bindings);
+  const core::ProjectionMaintenanceInitializationRequestDTO request{
+      ApplyId("maintenance-partial-replay"), ApplyGeneration(1U),
+      predecessor, candidate.bundle->value(), bindings};
+  // One participant commits; the other reports accepted, then refuses on
+  // the next observation. Classification must retain the earlier effect.
+  projections.back()->AcceptNextRebuildAs(bindings.back());
+  const auto pending = owner.BeginMaintenanceInitialization(request);
+  ASSERT_EQ(pending.state,
+            core::ProjectionMaintenanceInitializationState::kInitializing);
+  const auto first_rebuilds = projections.front()->rebuild_calls();
+  projections.back()->RejectNextRebuildWithoutEffect();
+  const auto result = owner.BeginMaintenanceInitialization(request);
+  EXPECT_EQ(result.state,
+            core::ProjectionMaintenanceInitializationState::kInterrupted);
+  EXPECT_TRUE(result.effects_unknown);
+  EXPECT_EQ(projections.front()->rebuild_calls(), first_rebuilds);
+  EXPECT_EQ(owner.ReadMaintenanceInitialization(
+                {request.apply_id, request.apply_generation}),
+            std::optional{result});
+  EXPECT_EQ(owner.BeginMaintenanceInitialization(request), result);
+}
+
+TEST(CanonicalEmptySceneOwner,
      MaintenanceStatusRemainsReadableWhileNativeInitializationIsBlocked) {
   TemporaryDirectory directory("scene-maintenance-responsive-status");
   const auto package_root = directory.path() / "packages";
@@ -3075,8 +3170,11 @@ TEST(CanonicalEmptySceneOwner,
       reopened.BeginMaintenanceInitialization(restoration_request);
   EXPECT_EQ(restored.state,
             core::ProjectionMaintenanceInitializationState::kInitialized);
+  // The interrupted initializer already left each projection healthy at this
+  // exact candidate target. An explicit retry may adopt that verified state
+  // without issuing a duplicate rebuild.
   for (std::size_t index = 0U; index < projections.size(); ++index) {
-    EXPECT_EQ(projections[index]->rebuild_calls(), rebuild_calls[index] + 1U);
+    EXPECT_EQ(projections[index]->rebuild_calls(), rebuild_calls[index]);
   }
 }
 

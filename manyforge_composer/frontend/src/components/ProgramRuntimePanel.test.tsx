@@ -254,6 +254,7 @@ function controller(
         message: '',
       },
       controls: null,
+      nonExecutable: null,
       runnerAvailable: true,
       loading: false,
       observationError: null,
@@ -615,7 +616,7 @@ describe('Program runtime projection', () => {
     program.state.controls = ordinaryMotionStopControls();
     const robot = robotController();
     robot.currentStatus!.manualOperations = [{
-      programRunId: robot.currentStatus!.directControlGripper.programRunId,
+      programRunId: robot.currentStatus!.directControlGripper!.programRunId,
       operationId: 'manual-gripper', operationRevision: 1, resident: true,
       state: 'executing', progress: 0.5, activeStopId: null,
       activeStopGeneration: null, terminalError: null,
@@ -774,7 +775,7 @@ describe('Program runtime projection', () => {
     robot.state.status = statusFixture();
     robot.currentStatus = robot.state.status;
     const operation = {
-      programRunId: robot.state.status.directControlGripper.programRunId,
+      programRunId: robot.state.status.directControlGripper!.programRunId,
       operationId: 'faulted-gripper', operationRevision: 2, resident: true,
       state: 'intervention_required' as const, progress: 0.78,
       terminalError: 'Execution timeout exceeded', activeStopId: null, activeStopGeneration: null,

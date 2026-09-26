@@ -2,7 +2,7 @@ import { buildJointMotionIntent, initialRobotControlState, robotControlReducer }
 import type { CapabilityCommandPreviewReceipt, ExecutionOwnerStatus, MotionPreviewReceipt } from '../types/robotControl';
 
 export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
-  return {
+  const status: ExecutionOwnerStatus = {
     ownerEpoch,
     cellId: 'cell.1',
     activePublicationGeneration: 1,
@@ -170,7 +170,31 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
       latestTerminal: null,
       fault: null,
     },
+    components: [],
+    directControlTargets: [],
+    directControlGripperTargets: [],
+    observedMotions: [],
+    observedGrippers: [],
   };
+  // One component owning the arm and gripper targets (H1a-IF.2 inventory).
+  const motion = status.directControl!;
+  const gripper = status.directControlGripper!;
+  status.components = [{
+    controllableComponentId: motion.controllableComponentId,
+    commandEligible: true,
+    unavailableReason: null,
+    unsupportedTargets: [],
+  }];
+  status.directControlTargets = [motion];
+  status.directControlGripperTargets = [gripper];
+  status.observedMotions = [status.observedMotion!];
+  status.observedGrippers = [{
+    ...status.observedGripper!,
+    targetRoleId: gripper.targetRoleId,
+    controllableComponentId: gripper.controllableComponentId,
+    commandTargetId: gripper.commandTargetId,
+  }];
+  return status;
 }
 
 export function receiptFixture(
@@ -184,20 +208,20 @@ export function receiptFixture(
     intentDigest: 'sha256:intent',
     requestId,
     requestOwnerEpoch: status.ownerEpoch,
-    programId: status.directControl.programId,
-    programRevision: status.directControl.programRevision,
-    programBindingId: status.directControl.programBindingId,
-    programRunId: status.directControl.programRunId,
+    programId: status.directControl!.programId,
+    programRevision: status.directControl!.programRevision,
+    programBindingId: status.directControl!.programBindingId,
+    programRunId: status.directControl!.programRunId,
     graphRevision: status.graphRevision,
     retainedBundleId: status.retainedBundleId,
     sceneRevision: { ...status.sceneRevision },
-    componentRoleId: status.directControl.componentRoleId,
-    targetRoleId: status.directControl.targetRoleId,
-    requiredCapabilityId: status.directControl.operationCapabilityId,
-    sourceJointNames: status.directControl.joints.map(
+    componentRoleId: status.directControl!.componentRoleId,
+    targetRoleId: status.directControl!.targetRoleId,
+    requiredCapabilityId: status.directControl!.operationCapabilityId,
+    sourceJointNames: status.directControl!.joints.map(
       (joint) => joint.sourceJointName,
     ),
-    startPositionsRad: [...status.observedMotion.positionsRad],
+    startPositionsRad: [...status.observedMotion!.positionsRad],
     finalPositionsRad: [...positionsRad],
     finalTcpPose: {
       position_m: { x_m: 0.1, y_m: 0.2, z_m: 0.3 },
@@ -240,7 +264,7 @@ export function executingState() {
   );
   const status = structuredClone(approving.status!);
   status.manualOperations = [{
-    programRunId: status.directControl.programRunId,
+    programRunId: status.directControl!.programRunId,
     operationId: 'operation-1',
     operationRevision: 1,
     resident: true,
@@ -261,30 +285,32 @@ export function gripperReceiptFixture(
   requestId: string,
   position: number,
 ): CapabilityCommandPreviewReceipt {
+  const gripper = status.directControlGripper;
+  if (gripper === null) throw new Error('gripper receipt fixture needs a gripper');
   return {
     schemaVersion: 'manyforge.direct_control_capability_command_preview.v1',
     receiptDigest: 'sha256:gripper-receipt',
     intentDigest: 'sha256:gripper-intent',
     requestId,
     requestOwnerEpoch: status.ownerEpoch,
-    programId: status.directControlGripper.programId,
-    programRevision: status.directControlGripper.programRevision,
-    programBindingId: status.directControlGripper.programBindingId,
-    programRunId: status.directControlGripper.programRunId,
+    programId: gripper.programId,
+    programRevision: gripper.programRevision,
+    programBindingId: gripper.programBindingId,
+    programRunId: gripper.programRunId,
     graphRevision: status.graphRevision,
     retainedBundleId: status.retainedBundleId,
     sceneRevision: { ...status.sceneRevision },
-    componentRoleId: status.directControlGripper.componentRoleId,
-    targetRoleId: status.directControlGripper.targetRoleId,
-    requiredCapabilityId: status.directControlGripper.operationCapabilityId,
-    commandSchemaId: status.directControlGripper.commandSchemaId,
-    commandSchemaRevision: status.directControlGripper.commandSchemaRevision,
-    sourceCoordinateName: status.directControlGripper.sourceCoordinateName,
-    sourceKind: status.directControlGripper.sourceKind,
-    coordinateKind: status.directControlGripper.coordinateKind,
+    componentRoleId: gripper.componentRoleId,
+    targetRoleId: gripper.targetRoleId,
+    requiredCapabilityId: gripper.operationCapabilityId,
+    commandSchemaId: gripper.commandSchemaId,
+    commandSchemaRevision: gripper.commandSchemaRevision,
+    sourceCoordinateName: gripper.sourceCoordinateName,
+    sourceKind: gripper.sourceKind,
+    coordinateKind: gripper.coordinateKind,
     targetPosition: position,
-    minPosition: status.directControlGripper.minPosition,
-    maxPosition: status.directControlGripper.maxPosition,
+    minPosition: gripper.minPosition,
+    maxPosition: gripper.maxPosition,
     commitEligible: true,
   };
 }

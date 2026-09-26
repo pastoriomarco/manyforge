@@ -77,7 +77,7 @@ def _preparer(tmp_path: Path) -> ActivationPreparer:
 
 def _result() -> dict[str, object]:
     identity: dict[str, object] = {
-        "schema_version": "manyforge.prepared_activation_input.v2",
+        "schema_version": "manyforge.prepared_activation_input.v3",
         "source_document_digest": _DIGEST,
         "scenario_id": "scenario_a",
         "captured_input_digest": _DIGEST,
@@ -87,7 +87,7 @@ def _result() -> dict[str, object]:
         "graph_revision": _DIGEST,
         "program_id": "program_a",
         "program_revision": _DIGEST,
-        "program_binding_id": _DIGEST,
+        "program_outcome": {"kind": "bound", "program_binding_id": _DIGEST},
         "node_environment_digest": _DIGEST,
         "assistant_mode": "forbidden",
         "typed_parameter_overrides": {},

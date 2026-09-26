@@ -31,6 +31,8 @@ inline constexpr std::string_view kViewerModelAssetSchemaVersion =
     "manyforge.viewer_model_asset.v1";
 inline constexpr std::string_view kAppliedProgramSelectionSchemaVersion =
     "manyforge.applied_program_selection.v2";
+inline constexpr std::string_view kAppliedProgramStatusSchemaVersion =
+    "manyforge.applied_program_status.v1";
 inline constexpr std::string_view kSourceModelContextSchemaVersion =
     "manyforge.source_model_context.v1";
 inline constexpr std::string_view kAssistantModeContextSchemaVersion =
@@ -180,6 +182,11 @@ public:
   AssistantModeContext(std::string_view mode_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   AppliedProgramSelection();
+  /// Derived executable/non-executable status of the active Applied Program.
+  /// For a non-executable Program it carries the preserved authored Program
+  /// and the named unresolved references; it never carries a binding.
+  [[nodiscard]] manyforge::content_identity::CanonicalValue
+  AppliedProgramStatus();
   [[nodiscard]] ViewerModelAsset ViewerModelUrdf();
   [[nodiscard]] ViewerModelAsset
   ViewerModelResource(std::string_view expected_retained_bundle_id,
@@ -288,6 +295,8 @@ private:
                                 std::string_view mode_id);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ActiveProgramSelectionLocked(const HeadlessRuntimeSnapshot &runtime);
+  [[nodiscard]] const manyforge::content_identity::CanonicalValue &
+  ActiveAppliedRecordLocked(const HeadlessRuntimeSnapshot &runtime);
   void
   RefreshRuntimeHealthAdapterLocked(const HeadlessRuntimeSnapshot &runtime);
   void RefreshSceneAdapterLocked(const HeadlessRuntimeSnapshot &runtime);

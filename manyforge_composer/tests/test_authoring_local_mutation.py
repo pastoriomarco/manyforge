@@ -24,6 +24,7 @@ from manyforge_composer.backend.authoring_workspace import (
     AuthoringWorkspace,
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
+    scenario_project_facts,
 )
 
 
@@ -287,6 +288,72 @@ def test_validated_no_op_does_not_advance_or_wake(tmp_path) -> None:
     assert commit.snapshot.workspace_revision == 1
     assert commit.admission_generation == 8
     assert workspace.revision == 1
+
+
+def test_under_claim_project_preparation_runs_between_acquire_and_commit(tmp_path) -> None:
+    workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+    workspace.set_observer(lambda: headless.events.append("wake"))
+
+    def prepare_project() -> dict[str, Any]:
+        assert headless.events == ["acquire"]
+        headless.events.append("prepare_project")
+        return scenario_project_facts(
+            {
+                "scenario_id": "saved-scenario",
+                "name": "Saved Scenario",
+                "description": "",
+                "program_draft": None,
+                "deployment_draft": None,
+                "program_role_assignment": None,
+                "typed_parameter_overrides": {},
+            },
+            document_path="scenario.test",
+            source_document_digest="sha256:" + "a" * 64,
+        )
+
+    commit = coordinator.execute_local_mutation(
+        _envelope(),
+        operation_kind="save_scenario_document",
+        draft_id=program.draft_id,
+        draft_revision=program.revision,
+        payload={"path": "scenario.test"},
+        workspace=workspace,
+        session="project",
+        prepare_project_under_claim=prepare_project,
+    )
+
+    assert headless.events == [
+        "acquire",
+        "prepare_project",
+        "settle:owner_commit",
+        "wake",
+    ]
+    assert commit.snapshot.project["document_id"] == "saved-scenario"
+
+
+def test_stale_generation_refuses_before_under_claim_project_effect(tmp_path) -> None:
+    workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+    headless.generation = 8
+    effects: list[str] = []
+    initial_revision = workspace.revision
+
+    with pytest.raises(HTTPException) as raised:
+        coordinator.execute_local_mutation(
+            _envelope(),
+            operation_kind="save_scenario_document",
+            draft_id=program.draft_id,
+            draft_revision=program.revision,
+            payload={"path": "scenario.test"},
+            workspace=workspace,
+            session="project",
+            prepare_project_under_claim=lambda: effects.append("write")
+            or scenario_project_facts(None),
+        )
+
+    assert raised.value.detail["code"] == "stale_generation"
+    assert effects == []
+    assert headless.claims == []
+    assert workspace.revision == initial_revision
     assert coordinator.local_claim_pending is False
 
 

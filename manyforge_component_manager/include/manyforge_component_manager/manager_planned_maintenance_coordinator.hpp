@@ -7,7 +7,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace manyforge::component_manager {
 
@@ -35,7 +34,7 @@ enum class ManagementIdleState {
 /// The two effects a planned transition needs from its admission owner.
 ///
 /// Implementations must read truth and must not start, stop, quiesce or resume
-/// any process: steady observation never mutates lifecycle.
+/// any runtime: steady observation never mutates lifecycle.
 class IPlannedMaintenanceGate {
 public:
   virtual ~IPlannedMaintenanceGate() = default;
@@ -51,14 +50,13 @@ public:
 
 /// How one planned transition attempt ended.
 enum class ManagerPlannedMaintenanceOutcome {
-  /// Admission is closed and every affected Manager-owned runtime content was
-  /// stopped with its exact absence proven. Replacement construction is the
-  /// caller's next step.
+  /// Admission is closed and proven. Runtime convergence is the caller's next
+  /// step; this operation deliberately does not stop the shared runtime host.
   kEnteredIdleMaintenance,
-  /// Refused before any process effect. Every effect of this attempt is
+  /// Refused before any runtime effect. Every effect of this attempt is
   /// therefore known: nothing happened.
   kFailedBeforeEffect,
-  /// A process effect began and at least one effect could not be established.
+  /// An admission/runtime effect may have begun and could not be established.
   kUnknownEffect,
 };
 
@@ -75,10 +73,6 @@ struct ManagerPlannedMaintenanceResult final {
   /// Meaningful exactly for a failed or unknown-effect attempt.
   ManagerApplyEffectDisposition effect_disposition{
       ManagerApplyEffectDisposition::kKnown};
-  /// Exact absence evidence for every affected content, in reverse dependency
-  /// order. Populated only on a successful entry.
-  std::vector<ProcessPresenceObservation> final_process_observations;
-
   [[nodiscard]] bool entered_idle_maintenance() const noexcept {
     return outcome == ManagerPlannedMaintenanceOutcome::kEnteredIdleMaintenance;
   }
@@ -106,23 +100,21 @@ struct ManagerPlannedMaintenanceResult final {
 ///      distinct typed refusal for active, paused, stopping and resetting;
 ///   3. the active plan is rechecked against the exact expected predecessor, so
 ///      a stale revision or identity is never destroyed;
-///   4. admission is closed and proven closed;
-///   5. affected Manager-owned runtime contents are stopped through the
-///      existing reverse-dependency, prove-absence owner.
+///   4. admission is closed and proven closed.
 ///
-/// Replacement construction deliberately happens after this method returns, and
-/// only through `ManagerActiveRuntimeCoordinator::Initialize()`. Unexpected
-/// runtime loss remains the separate catastrophic-fault path: this class never
-/// requests containment, reconciliation, retry, rollback or replacement.
+/// This owner never tears down the shared runtime host. The Apply runtime
+/// convergence owner consumes the exact component delta while unchanged
+/// component controllers remain alive. Unexpected runtime loss remains the
+/// separate catastrophic-fault path: this class never requests containment,
+/// reconciliation, retry, rollback or replacement.
 class ManagerPlannedMaintenanceCoordinator final {
 public:
   ManagerPlannedMaintenanceCoordinator(
       const IManagerActiveRuntimePlanSource &plan_source,
-      ManagerActiveRuntimeCoordinator &active_runtime,
       IPlannedMaintenanceGate &gate);
 
   /// Observation-only refusal check used before the Apply acquires its
-  /// configuration fence or changes a process. A parent authoring claim may
+  /// configuration fence or changes runtime state. A parent authoring claim may
   /// already be held to serialize submission, but a successful result still
   /// authorizes no effect; EnterIdleMaintenance repeats these checks after
   /// admission closes.
@@ -141,7 +133,6 @@ public:
 
 private:
   const IManagerActiveRuntimePlanSource &plan_source_;
-  ManagerActiveRuntimeCoordinator &active_runtime_;
   IPlannedMaintenanceGate &gate_;
 };
 

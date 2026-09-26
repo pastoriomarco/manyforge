@@ -23,8 +23,8 @@ it('manual availability follows owner and hold changes, not observed poses or no
     },
   } as unknown as ComposerHeadlessState;
   const initial = manualAvailabilityScopeFence(snapshot, 'joint');
-  snapshot.executionControlStatus!.observedMotion.positionsRad = [0.5, 0.6];
-  snapshot.executionControlStatus!.observedMotion.sequence += 1;
+  snapshot.executionControlStatus!.observedMotion!.positionsRad = [0.5, 0.6];
+  snapshot.executionControlStatus!.observedMotion!.sequence += 1;
   snapshot.programCycle.nodeStatusRevision = 2;
   expect(manualAvailabilityScopeFence(snapshot, 'joint')).toBe(initial);
   expect(manualAvailabilityScopeFence(snapshot, 'pose_goal')).toBe(initial);

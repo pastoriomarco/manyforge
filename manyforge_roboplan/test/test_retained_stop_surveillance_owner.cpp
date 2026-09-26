@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <limits>
 #include <manyforge_roboplan/retained_stop_surveillance_owner.hpp>
+#include <stdexcept>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -123,6 +124,80 @@ TEST(RetainedStopSurveillanceOwnerTest,
   EXPECT_EQ(nonfinite.availability,
             core::StopSurveillanceSourceAvailabilityDTO::kInvalid);
   EXPECT_FALSE(nonfinite.evaluated_evidence.has_value());
+}
+
+TEST(RetainedStopSurveillanceOwnerTest,
+     SnapshotSourcesReturnsAnIndependentCopyOfThePublishedTable) {
+  const auto binding = make_binding();
+  auto channel = std::make_shared<StateChannel>(binding);
+  const auto source = ObservationSource(binding);
+  RetainedStopSurveillanceOwner owner(
+      {RetainedStopSurveillanceSourceInput{binding, channel, {source}, {}}});
+
+  auto snapshot = owner.SnapshotSources();
+  ASSERT_EQ(snapshot.size(), 1U);
+  EXPECT_EQ(snapshot.front().binding.value(), binding.value());
+  EXPECT_EQ(snapshot.front().state_channel, channel);
+  ASSERT_EQ(snapshot.front().observation_sources.size(), 1U);
+  EXPECT_EQ(snapshot.front().observation_sources.front(), source);
+
+  snapshot.clear();
+  EXPECT_EQ(owner.SnapshotSources().size(), 1U);
+}
+
+TEST(RetainedStopSurveillanceOwnerTest,
+     OrdinaryOwnerRefusesAnEmptySourceTable) {
+  EXPECT_THROW(RetainedStopSurveillanceOwner({}), std::invalid_argument);
+
+  const auto binding = make_binding();
+  auto channel = std::make_shared<StateChannel>(binding);
+  const auto source = ObservationSource(binding);
+  RetainedStopSurveillanceOwner owner(
+      {RetainedStopSurveillanceSourceInput{binding, channel, {source}, {}}});
+  const auto replaced = owner.ReplaceSources({});
+  ASSERT_FALSE(replaced.ok());
+  EXPECT_EQ(replaced.error().code,
+            "native_stop_surveillance_sources_empty_or_oversized");
+  EXPECT_EQ(owner.SnapshotSources().size(), 1U);
+}
+
+TEST(RetainedStopSurveillanceOwnerTest,
+     ManagedCellBootstrapOwnerCanBecomeEmptyAndFailsClosed) {
+  const auto binding = make_binding();
+  auto channel = std::make_shared<StateChannel>(binding);
+  const auto source = ObservationSource(binding);
+  RetainedStopSurveillanceOwner owner(
+      {}, nullptr,
+      RetainedStopSurveillanceEmptySourceMode::kManagedCellBootstrapEmpty);
+  EXPECT_TRUE(owner.SnapshotSources().empty());
+
+  const auto unavailable_before_bootstrap = owner.Observe(Query(source, 105));
+  EXPECT_EQ(unavailable_before_bootstrap.availability,
+            core::StopSurveillanceSourceAvailabilityDTO::kInvalid);
+  ASSERT_TRUE(unavailable_before_bootstrap.error.has_value());
+  EXPECT_EQ(unavailable_before_bootstrap.error->code,
+            "stop_surveillance_source_unqualified");
+
+  ASSERT_TRUE(channel
+                  ->publish_state({std::array<double, 2U>{0.0, 0.0}},
+                                  {std::array<double, 2U>{0.0, 0.0}}, 100, 100)
+                  .applied());
+  ASSERT_TRUE(owner
+                  .ReplaceSources({RetainedStopSurveillanceSourceInput{
+                      binding, channel, {source}, {}}})
+                  .ok());
+  const auto available = owner.Observe(Query(source, 105));
+  EXPECT_EQ(available.availability,
+            core::StopSurveillanceSourceAvailabilityDTO::kAvailable);
+
+  ASSERT_TRUE(owner.ReplaceSources({}).ok());
+  EXPECT_TRUE(owner.SnapshotSources().empty());
+  const auto unavailable_after_transition = owner.Observe(Query(source, 105));
+  EXPECT_EQ(unavailable_after_transition.availability,
+            core::StopSurveillanceSourceAvailabilityDTO::kInvalid);
+  ASSERT_TRUE(unavailable_after_transition.error.has_value());
+  EXPECT_EQ(unavailable_after_transition.error->code,
+            "stop_surveillance_source_unqualified");
 }
 
 TEST(RetainedStopSurveillanceOwnerTest,

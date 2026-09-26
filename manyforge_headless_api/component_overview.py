@@ -589,20 +589,30 @@ def build_component_overview(
     targets_error = _fact_error(errors, "execution_targets") or _mapping(
         targets_response_error
     )
-    direct_control = _mapping(targets.get("direct_control"))
-    direct_control_rows = [
-        _mapping(row)
-        for row in _sequence(targets.get("direct_control_targets"))
-        if isinstance(row, Mapping)
+    # execution_targets.v3 (H1a-IF.2): component-owned targets, no primary.
+    commandable_rows = [
+        (_mapping(component), _mapping(target))
+        for component in _sequence(targets.get("components"))
+        if isinstance(component, Mapping)
+        for target in _sequence(_mapping(component).get("targets"))
+        if isinstance(target, Mapping) and _mapping(target).get("command") is not None
     ]
-    if not direct_control_rows and direct_control:
-        direct_control_rows = [direct_control]
     planning_capabilities = {
         value
-        for row in direct_control_rows
-        for value in _sequence(row.get("planning_capability_ids"))
+        for _component_row, target in commandable_rows
+        if target.get("presentation") == "motion"
+        for value in _sequence(
+            _mapping(target.get("command")).get("planning_capability_ids")
+        )
         if isinstance(value, str)
     }
+    direct_control_rows = [
+        {
+            "controllable_component_id": component.get("controllable_component_id"),
+            "command_target_id": target.get("command_target_id"),
+        }
+        for component, target in commandable_rows
+    ]
     target_status = _HEALTHY if direct_control_rows else _OFFLINE
     target_reason: str | None = None
     if targets_error:
@@ -619,13 +629,13 @@ def build_component_overview(
             target_status,
             (
                 (
-                    f"{len(direct_control_rows)} addressed motion targets available"
+                    f"{len(direct_control_rows)} addressed targets available"
                     if len(direct_control_rows) > 1
                     else f"{direct_control_rows[0].get('controllable_component_id')} / "
                     f"{direct_control_rows[0].get('command_target_id')}"
                 )
                 if target_status == _HEALTHY
-                else "no addressed motion target is currently offered"
+                else "no addressed target is currently offered"
             ),
             required=True,
             required_for=("Plan / Preview", "Execute / Control"),

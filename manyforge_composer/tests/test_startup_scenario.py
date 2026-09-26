@@ -4,6 +4,7 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import pytest
@@ -14,6 +15,7 @@ from manyforge_composer.backend.draft_session import (
     ComposerDraftSession,
     DraftSessionError,
 )
+from manyforge_composer.backend.authoring_workspace import AuthoringWorkspace
 from manyforge_composer.backend.deployment_draft import (
     CompiledDeploymentDocument,
     DeploymentDraftSession,
@@ -81,10 +83,86 @@ def _applied(selection: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _non_executable_outcome(
+    selection: dict[str, Any], *, command_target_id: str = "jaw"
+) -> dict[str, Any]:
+    return {
+        "affected_execution_groups": ["grasp"],
+        "affected_nodes": ["close_gripper"],
+        "api_version": "manyforge.program-binding-outcome.v1",
+        "graph_revision": selection["graph_revision"],
+        "program_id": selection["program_id"],
+        "program_revision": selection["program_revision"],
+        "retained_bundle_id": selection["retained_bundle_id"],
+        "role_assignment_digest": "sha256:" + "a" * 64,
+        "unresolved_roles": [
+            {
+                "command_target_id": command_target_id,
+                "component_role_id": "gripper",
+                "controllable_component_id": "gripper-1",
+                "detail": "The assigned target is not present in this Deployment.",
+                "reason": "target_missing",
+                "target_role_id": "jaw",
+            }
+        ],
+    }
+
+
+def _non_executable_status(
+    selection: dict[str, Any], *, command_target_id: str = "jaw"
+) -> dict[str, Any]:
+    return {
+        "deployment_artifact_id": selection["deployment_artifact_id"],
+        "deployment_revision": selection["deployment_revision"],
+        "executable": False,
+        "graph_revision": selection["graph_revision"],
+        "message": "Program references a gripper target removed from this Deployment.",
+        "non_executable": _non_executable_outcome(
+            selection, command_target_id=command_target_id
+        ),
+        "program": deepcopy(selection["program"]),
+        "program_binding_id": None,
+        "program_id": selection["program_id"],
+        "program_revision": selection["program_revision"],
+        "record_digest": "sha256:" + "b" * 64,
+        "retained_bundle_id": selection["retained_bundle_id"],
+        "scenario_id": selection["scenario_id"],
+        "schema_version": "manyforge.applied_program_status.v1",
+        "source_document_digest": selection["source_document_digest"],
+    }
+
+
+def _captured_activation(
+    state: ComposerState,
+    selection: dict[str, Any],
+    program_outcome: dict[str, Any],
+) -> tuple[Any, dict[str, Any]]:
+    intent = {
+        "deployment": deepcopy(selection["deployment"]),
+        "model_source_closure": {},
+        "program_role_assignment": {},
+        "typed_parameter_overrides": {},
+        "source_document_digest": selection["source_document_digest"],
+        "scenario_id": selection["scenario_id"],
+    }
+    prepared = {
+        "deployment_revision": selection["deployment_revision"],
+        "graph_revision": selection["graph_revision"],
+        "program_id": selection["program_id"],
+        "program_revision": selection["program_revision"],
+        "program_outcome": deepcopy(program_outcome),
+        "retained_bundle_id": selection["retained_bundle_id"],
+        "scenario_id": selection["scenario_id"],
+        "source_document_digest": selection["source_document_digest"],
+    }
+    return state._captured_deployment_context(intent, prepared)
+
+
 class _Headless:
     def __init__(self, selection: dict[str, Any]) -> None:
         self.selection = selection
         self.applied: dict[str, Any] | None = None
+        self.applied_status: dict[str, Any] | None = None
         self.manager_target = False
         self.manager_apply_bodies: list[dict[str, Any]] = []
 
@@ -96,6 +174,35 @@ class _Headless:
                 status_code=404,
             )
         return deepcopy(self.applied)
+
+    def program_applied_status(self) -> dict[str, Any]:
+        if self.applied_status is not None:
+            return deepcopy(self.applied_status)
+        if self.applied is None:
+            raise HeadlessClientError(
+                "program_applied_selection_not_found",
+                "no Program is Applied",
+                status_code=404,
+            )
+        applied = self.applied
+        executable = applied.get("program_binding_id") is not None
+        return {
+            "deployment_artifact_id": applied["deployment_artifact_id"],
+            "deployment_revision": applied["deployment_revision"],
+            "executable": executable,
+            "graph_revision": applied["graph_revision"],
+            "message": None,
+            "non_executable": None,
+            "program": None,
+            "program_binding_id": applied.get("program_binding_id"),
+            "program_id": applied["program_id"],
+            "program_revision": applied["program_revision"],
+            "record_digest": applied["source"]["record_digest"],
+            "retained_bundle_id": applied["retained_bundle_id"],
+            "scenario_id": applied["scenario_id"],
+            "schema_version": "manyforge.applied_program_status.v1",
+            "source_document_digest": applied["source_document_digest"],
+        }
 
     def authoring_admission(self) -> dict[str, Any]:
         return {"authoring_allowed": True, "admission_generation": 7}
@@ -159,7 +266,7 @@ class _Headless:
         return {
             "ok": True,
             "candidate_receipt": {
-                "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+                "schema_version": "manyforge.manager_deployment_candidate_receipt.v2",
                 "deployment_artifact_id": body["deployment_artifact_id"],
                 "deployment_revision": body["deployment_revision"],
                 "source_document_digest": self.selection[
@@ -174,6 +281,8 @@ class _Headless:
                     "expected_admission_generation"
                 ],
                 "manager_owner_epoch": body["request_owner_epoch"],
+                "impact_digest": "sha256:" + "c" * 64,
+                "destructive_impact": False,
                 "receipt_digest": "sha256:" + "8" * 64,
             },
         }
@@ -227,7 +336,20 @@ def _state(
     state.deployment_draft_session = DeploymentDraftSession(
         compiler=_fixture_deployment_compiler
     )
+    state.authoring_workspace = AuthoringWorkspace(
+        program_session=state.draft_session,
+        deployment_session=state.deployment_draft_session,
+    )
+    state.authoring_workspace.remember_project(
+        document=None,
+        document_path=str(_DEPLOYMENT_PATH),
+    )
     state._active_authoring_catalog = lambda: state.node_catalog  # type: ignore[method-assign]
+    state._applied_deployment_lock = Lock()
+    state.applied_deployment_document = None
+    state._applied_activation_context = None
+    state._applied_deployment_identity = None
+    state._pending_applied_deployment = None
     return state
 
 
@@ -330,4 +452,91 @@ def test_published_scenario_does_not_wait_for_runtime_convergence() -> None:
     assert state.current_scenario()["ready"] is False
     assert state.current_scenario()["unavailable_reasons"] == [
         "deployment_not_active_and_converged"
+    ]
+
+
+def test_non_executable_publication_promotes_exact_capture_but_is_not_runnable() -> None:
+    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
+    selection = _selection(program.to_dict())
+    headless = _Headless(selection)
+    headless.applied_status = _non_executable_status(selection)
+    headless.manager_target = True
+    state = _state(headless, _Coordinator(), program=program)
+    outcome = {
+        "kind": "non_executable",
+        "outcome": _non_executable_outcome(selection),
+    }
+    captured = _captured_activation(state, selection, outcome)
+    state._retain_submitted_deployment(captured)
+
+    published = state.published_scenario()
+    assert published["ready"] is True
+    projection = published["published_scenario"]
+    assert projection["program_outcome"] == outcome
+    assert state.applied_activation_for_publication(projection) is not None
+
+    current = state.current_scenario()
+    assert current["ready"] is False
+    assert current["current_scenario"] is None
+    assert current["unavailable_reasons"] == ["program_not_executable"]
+
+
+@pytest.mark.parametrize(
+    ("capture_outcome_kind", "published_outcome_kind", "published_target"),
+    [
+        ("bound", "non_executable", "jaw"),
+        ("non_executable", "bound", "jaw"),
+        ("non_executable", "non_executable", "different-jaw"),
+    ],
+)
+def test_activation_capture_promotes_only_for_the_same_program_outcome(
+    capture_outcome_kind: str,
+    published_outcome_kind: str,
+    published_target: str,
+) -> None:
+    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
+    selection = _selection(program.to_dict())
+    headless = _Headless(selection)
+    headless.manager_target = True
+    if published_outcome_kind == "bound":
+        headless.applied = _applied(selection)
+    else:
+        headless.applied_status = _non_executable_status(
+            selection, command_target_id=published_target
+        )
+    state = _state(headless, _Coordinator(), program=program)
+    if capture_outcome_kind == "bound":
+        outcome = {
+            "kind": "bound",
+            "program_binding_id": selection["program_binding_id"],
+        }
+    else:
+        outcome = {
+            "kind": "non_executable",
+            "outcome": _non_executable_outcome(selection),
+        }
+    state._retain_submitted_deployment(
+        _captured_activation(state, selection, outcome)
+    )
+
+    publication = state.published_scenario()["published_scenario"]
+    assert publication is not None
+    assert state.applied_activation_for_publication(publication) is None
+    assert state.applied_deployment_document is None
+
+
+def test_contradictory_applied_program_status_is_not_a_publication() -> None:
+    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
+    selection = _selection(program.to_dict())
+    headless = _Headless(selection)
+    headless.manager_target = True
+    headless.applied_status = _non_executable_status(selection)
+    headless.applied_status["executable"] = True
+    state = _state(headless, _Coordinator(), program=program)
+
+    published = state.published_scenario()
+    assert published["ready"] is False
+    assert published["published_scenario"] is None
+    assert published["unavailable_reasons"] == [
+        "program_applied_status_invalid"
     ]

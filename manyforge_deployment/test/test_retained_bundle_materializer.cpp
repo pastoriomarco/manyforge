@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
@@ -1341,6 +1342,7 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(bundle->value().catalogs.records.size(), 13U);
   EXPECT_EQ(catalog_store.size(), 13U);
   ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 1U);
+  const auto &unit = bundle->value().cell_graph.runtime_units.front();
   ASSERT_EQ(bundle->value().capability_provider_bindings.size(), 3U);
   const std::vector<std::string> capability_ids = [&] {
     std::vector<std::string> result;
@@ -1426,7 +1428,7 @@ TEST(RetainedBundleMaterializer,
       retained_liveness.runtime_policy_revision.value());
   EXPECT_EQ(
       canonical_json(member(parsed_manifest, "configuration")),
-      R"({"collision_monitor_period_ms":50,"direct_control_joint_limits":[{"command_target_id":"arm","controllable_component_id":"lite6_arm","max_acceleration_rad_s2":2.5,"max_velocity_rad_s":1.5,"source_joint_name":"joint1"}],"execution_tick_hz":100,"initial_joint_positions_rad":[0,0,1.57,0,0,0],"mode":"simulated","motion_target_limits":[{"command_target_id":"arm","controllable_component_id":"lite6_arm","maximum_tcp_linear_speed_mps":0.15,"ordinary_motion_jerk":{"enabled":false,"joint_limits":[],"preset_reference_time_s":1}}],"planner_rng_seed":12345})");
+      "{}");
   EXPECT_NO_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
           manifest, launch_descriptor, bundle->value(), group.runtime_unit_id));
@@ -1458,11 +1460,17 @@ TEST(RetainedBundleMaterializer,
                    0.15);
   EXPECT_FALSE(runtime_configuration.motion_target_limits.front().ordinary_motion_jerk.enabled);
   EXPECT_TRUE(runtime_configuration.motion_target_limits.front().ordinary_motion_jerk.joint_limits.empty());
-  const std::string changed_configuration = replace_once(
-      manifest, "\"execution_tick_hz\":100", "\"execution_tick_hz\":99");
-  EXPECT_NO_THROW(static_cast<void>(
-      detail::parse_and_verify_native_execution_runtime_manifest(
-          changed_configuration)));
+  const auto injected_controller_configuration = replace_object_member(
+      parsed_manifest, "configuration",
+      CanonicalValue(CanonicalValue::Object{
+          {"execution_tick_hz", CanonicalValue(100.0)},
+      }));
+  const std::string changed_configuration =
+      canonical_json(injected_controller_configuration);
+  EXPECT_THROW(static_cast<void>(
+                   detail::parse_and_verify_native_execution_runtime_manifest(
+                       changed_configuration)),
+               RetainedBundleError);
   EXPECT_THROW(
       detail::require_native_execution_runtime_product_matches_retained_bundle(
           changed_configuration, launch_descriptor, bundle->value(),
@@ -1476,6 +1484,36 @@ TEST(RetainedBundleMaterializer,
                        changed_liveness)),
                RetainedBundleError);
 
+  // Composition may change controller inputs while retaining the same host.
+  // The native manifest is consequently byte-identical for this runtime unit.
+  const auto aggregate_fixture =
+      test::make_lite6_controllable_retention_fixture(
+          false, false, 1U, true, true);
+  const test::Lite6ControllableCompilerInputArtifactSource aggregate_inputs(
+      aggregate_fixture);
+  test::InMemoryCatalogArtifactStoreFixture aggregate_catalog_store;
+  test::InMemoryRawArtifactStoreFixture aggregate_raw_store;
+  const auto aggregate_bundle = detail::RetainedBundleMaterializer::materialize(
+      aggregate_fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(),
+      aggregate_inputs,
+      aggregate_fixture.structural_preparations(), aggregate_catalog_store,
+      aggregate_raw_store);
+  ASSERT_NE(aggregate_bundle, nullptr);
+  ASSERT_EQ(aggregate_bundle->value().cell_graph.runtime_units.size(), 1U);
+  const auto &aggregate_unit =
+      aggregate_bundle->value().cell_graph.runtime_units.front();
+  EXPECT_EQ(aggregate_unit.runtime_unit_id, group.runtime_unit_id);
+  EXPECT_NE(aggregate_unit.configuration, unit.configuration);
+  const auto &aggregate_group = aggregate_bundle->value()
+                                    .compiled_products.runtime_unit_products
+                                    .front();
+  const std::string aggregate_manifest = require_product_artifact_bytes(
+      aggregate_group.products.front(),
+      detail::kNativeExecutionRuntimeManifestArtifactRole,
+      aggregate_raw_store);
+  EXPECT_EQ(aggregate_manifest, manifest);
+
   test::InMemoryCatalogArtifactStoreFixture second_catalog_store;
   test::InMemoryRawArtifactStoreFixture second_raw_store;
   const auto regenerated = detail::RetainedBundleMaterializer::materialize(
@@ -1486,6 +1524,196 @@ TEST(RetainedBundleMaterializer,
   ASSERT_NE(regenerated, nullptr);
   EXPECT_EQ(regenerated->retained_bundle_id(), bundle->retained_bundle_id());
   EXPECT_EQ(regenerated->canonical_bytes(), bundle->canonical_bytes());
+}
+
+TEST(RetainedBundleMaterializer,
+     NativeConfigurationCarriesMotionFieldsExactlyWhenTheUnitHostsMotion) {
+  const auto fixture = test::make_lite6_native_motion_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+  ASSERT_NE(bundle, nullptr);
+  const auto &graph = bundle->value().cell_graph;
+  ASSERT_EQ(graph.runtime_units.size(), 1U);
+  const auto &unit = graph.runtime_units.front();
+  const auto &runtime_unit_id = unit.runtime_unit_id;
+  const auto decode = [&](const core::JsonObjectDTO &configuration,
+                          const core::CellGraphDTO &cell_graph) {
+    return detail::decode_native_execution_runtime_configuration(
+        configuration, cell_graph, runtime_unit_id);
+  };
+  const auto empty_array = core::JsonValueDTO{core::JsonValueDTO::Array{}};
+
+  // The retained arm unit hosts motion and decodes as require_configuration.
+  const auto arm = decode(unit.configuration, graph);
+  EXPECT_EQ(arm.initial_joint_positions_rad,
+            native_execution_runtime_contract::require_configuration(
+                *bundle, runtime_unit_id)
+                .initial_joint_positions_rad);
+  ASSERT_EQ(arm.motion_target_limits.size(), 1U);
+
+  // A motion unit never omits its motion fields.
+  auto without_motion_fields = unit.configuration;
+  without_motion_fields["initial_joint_positions_rad"] = empty_array;
+  without_motion_fields["motion_target_limits"] = empty_array;
+  without_motion_fields["direct_control_joint_limits"] = empty_array;
+  EXPECT_THROW(static_cast<void>(decode(without_motion_fields, graph)),
+               RetainedBundleError);
+
+  // A motion limit must name a motion target this unit hosts.
+  auto foreign_limit = unit.configuration;
+  auto &limits = std::get<core::JsonValueDTO::Array>(
+      foreign_limit.at("motion_target_limits").value);
+  std::get<core::JsonObjectDTO>(limits.front().value)["controllable_component_id"] =
+      core::JsonValueDTO{std::string("foreign_arm")};
+  EXPECT_THROW(static_cast<void>(decode(foreign_limit, graph)),
+               RetainedBundleError);
+
+  // Direct-control joint limits must resolve to this unit's exact motion
+  // target, just like the TCP-speed limits above.
+  auto foreign_direct_control_limit = unit.configuration;
+  auto &direct_control_limits = std::get<core::JsonValueDTO::Array>(
+      foreign_direct_control_limit.at("direct_control_joint_limits").value);
+  auto &foreign_direct_control_row =
+      std::get<core::JsonObjectDTO>(direct_control_limits.front().value);
+  foreign_direct_control_row["command_target_id"] =
+      core::JsonValueDTO{std::string("gripper")};
+  EXPECT_THROW(static_cast<void>(decode(foreign_direct_control_limit, graph)),
+               RetainedBundleError);
+
+  // The same unit hosting only a gripper: its motion binding becomes the
+  // gripper's command binding on the unit's own gripper target.
+  auto gripper_graph = graph;
+  const auto is_hosted_motion = [&](const core::ControlBindingDTO &binding) {
+    return binding.provider_runtime_unit_id == runtime_unit_id &&
+           binding.capability_id.value() == "execution.trajectory.execute";
+  };
+  ASSERT_EQ(std::count_if(gripper_graph.control_bindings.begin(),
+                          gripper_graph.control_bindings.end(),
+                          is_hosted_motion),
+            1);
+  const auto motion_binding =
+      std::find_if(gripper_graph.control_bindings.begin(),
+                   gripper_graph.control_bindings.end(), is_hosted_motion);
+  motion_binding->capability_id = core::CapabilityId("tool.gripper.command");
+  motion_binding->controllable_component_id =
+      core::ControllableComponentId("lite6_gripper");
+  motion_binding->command_target_id = core::CommandTargetId("gripper");
+
+  // Placeholder motion values on a unit without motion are refused.
+  EXPECT_THROW(static_cast<void>(decode(unit.configuration, gripper_graph)),
+               RetainedBundleError);
+  auto dummy_limits_only = without_motion_fields;
+  dummy_limits_only["direct_control_joint_limits"] =
+      unit.configuration.at("direct_control_joint_limits");
+  EXPECT_THROW(static_cast<void>(decode(dummy_limits_only, gripper_graph)),
+               RetainedBundleError);
+
+  // Gripper-only: empty motion fields and one hosted gripper configuration.
+  const auto text = [](std::string value) {
+    return core::JsonValueDTO{std::move(value)};
+  };
+  const auto list = [&](std::initializer_list<std::string> values) {
+    core::JsonValueDTO::Array items;
+    for (const auto &value : values) {
+      items.push_back(text(value));
+    }
+    return core::JsonValueDTO{std::move(items)};
+  };
+  const core::JsonObjectDTO gripper_configuration{
+      {"controllable_component_id", text("lite6_gripper")},
+      {"command_target_id", text("gripper")},
+      {"description", text("Lite6 gripper")},
+      {"actuation_kind", text("pneumatic")},
+      {"open_state_ref", text("open")},
+      {"closed_state_ref", text("closed")},
+      {"command_duration_s", core::JsonValueDTO{0.5}},
+      {"touch_links", list({"gripper_link"})},
+      {"mount_frame", text("tool0")},
+      {"attach_frame", text("tool0")},
+      {"tcp_frame", text("gripper_tcp")},
+      {"auxiliary_frames", list({})},
+  };
+  auto gripper_only = without_motion_fields;
+  gripper_only["gripper_target_configurations"] = core::JsonValueDTO{
+      core::JsonValueDTO::Array{core::JsonValueDTO{gripper_configuration}}};
+  const auto gripper = decode(gripper_only, gripper_graph);
+  EXPECT_TRUE(gripper.initial_joint_positions_rad.empty());
+  EXPECT_TRUE(gripper.motion_target_limits.empty());
+  EXPECT_TRUE(gripper.direct_control_joint_limits.empty());
+  ASSERT_EQ(gripper.gripper_target_configurations.size(), 1U);
+  EXPECT_EQ(gripper.gripper_target_configurations.front().command_target_id,
+            core::CommandTargetId("gripper"));
+
+  // A gripper configuration never borrows a target the unit does not host.
+  auto borrowed = gripper_only;
+  auto &gripper_rows = std::get<core::JsonValueDTO::Array>(
+      borrowed.at("gripper_target_configurations").value);
+  std::get<core::JsonObjectDTO>(gripper_rows.front().value)["controllable_component_id"] =
+      text("lite6_arm");
+  EXPECT_THROW(static_cast<void>(decode(borrowed, gripper_graph)),
+               RetainedBundleError);
+}
+
+TEST(RetainedBundleMaterializer,
+     GripperOnlyNativeCellRetainsAUnitWithoutAnyMotionConfiguration) {
+  const auto plans = core::MakeNativeControlLifecyclePlans();
+  const auto anchor = [&](std::string_view provider_id) {
+    const auto digest = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+        core::ProviderManifestId(std::string(provider_id)), plans);
+    if (!digest.ok()) {
+      throw std::logic_error("generic native lifecycle anchor is unavailable");
+    }
+    return digest.value().value();
+  };
+  const auto fixture =
+      test::make_lite6_native_gripper_only_cclc_product_retention_fixture(
+          anchor("lite6_arm_provider"), anchor("lite6_gripper_provider"));
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+  ASSERT_NE(bundle, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
+
+  const auto &graph = bundle->value().cell_graph;
+  ASSERT_EQ(graph.runtime_units.size(), 1U);
+  const auto &runtime_unit_id = graph.runtime_units.front().runtime_unit_id;
+  // The arm target stays declared by the component type but is unbound:
+  // the one native unit hosts the gripper and nothing that moves an arm.
+  EXPECT_TRUE(std::none_of(
+      graph.control_bindings.begin(), graph.control_bindings.end(),
+      [](const auto &binding) {
+        return binding.capability_id.value() == "execution.trajectory.execute" ||
+               binding.command_target_id.value() == test::kLite6ArmTargetId;
+      }));
+  EXPECT_TRUE(std::any_of(
+      graph.control_bindings.begin(), graph.control_bindings.end(),
+      [&](const auto &binding) {
+        return binding.capability_id.value() == "tool.gripper.command" &&
+               binding.provider_runtime_unit_id == runtime_unit_id;
+      }));
+  EXPECT_TRUE(bundle->value().capability_provider_bindings.empty());
+  ASSERT_EQ(bundle->value().desired_control_configurations.size(), 1U);
+
+  const auto configuration =
+      native_execution_runtime_contract::require_configuration(*bundle,
+                                                               runtime_unit_id);
+  EXPECT_TRUE(configuration.initial_joint_positions_rad.empty());
+  EXPECT_TRUE(configuration.motion_target_limits.empty());
+  EXPECT_TRUE(configuration.direct_control_joint_limits.empty());
+  ASSERT_EQ(configuration.gripper_target_configurations.size(), 1U);
+  EXPECT_EQ(configuration.gripper_target_configurations.front().command_target_id,
+            core::CommandTargetId(std::string(test::kLite6GripperTargetId)));
 }
 
 TEST(RetainedBundleMaterializer,
@@ -2110,8 +2338,8 @@ TEST(RetainedBundleMaterializer,
     std::string to;
   };
   const std::array<Mutation, 10U> mutations{{
-      {"API version", "manyforge.native_execution_runtime_manifest.v1",
-       "manyforge.native_execution_runtime_manifest.v2"},
+      {"API version", "manyforge.native_execution_runtime_manifest.v2",
+       "manyforge.native_execution_runtime_manifest.v1"},
       {"lifecycle", "manager_managed", "externally_managed"},
       {"process adapter", "manyforge.installed_native_target",
        "manyforge.arbitrary_command"},

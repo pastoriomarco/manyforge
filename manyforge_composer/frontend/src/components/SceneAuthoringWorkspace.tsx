@@ -1768,7 +1768,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       placement: { ...object.placement, pose_in_cell: livePose },
     };
   }), [livePose, liveShape, selectedSceneResourceId, selection?.kind, visibleObjects]);
-  const motionDescriptor = robotControl.selectedStatus?.directControl.targetDescriptor ?? null;
+  const motionDescriptor = robotControl.selectedStatus?.directControl?.targetDescriptor ?? null;
   const sceneRuntimePresentation = useMemo(() => runtimeScenePresentation(
     presentationFacts?.sceneRuntime ?? null,
     presentationFacts?.logicalScene ?? null,
@@ -1877,22 +1877,24 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   const dragReference = useRef<string | null>(null);
   const readCandidateReference = () => {
     const status = robotControl.selectedStatus;
-    if (status === null || sourceValue === null) return null;
+    // A candidate TCP needs a selected motion target (none for gripper-only).
+    const motion = status?.directControl ?? null;
+    if (status === null || motion === null || sourceValue === null) return null;
     const observationEpoch = candidateObservationEpoch(source.getLatestExecutionObservation(), status);
     if (observationEpoch === null) return null;
-    const frames = status.directControl.targetDescriptor.frames;
-    const base = frames.find((frame) => frame.frameRoleId === status.directControl.baseFrameRoleId);
-    const tcp = frames.find((frame) => frame.frameRoleId === status.directControl.tcpFrameRoleId);
+    const frames = motion.targetDescriptor.frames;
+    const base = frames.find((frame) => frame.frameRoleId === motion.baseFrameRoleId);
+    const tcp = frames.find((frame) => frame.frameRoleId === motion.tcpFrameRoleId);
     const transforms = executionObservationPresentation.readMeasuredRobotPresentation()?.linkTransforms;
     const basePose = base === undefined ? undefined : transforms?.[base.compiledFrameName];
     const tcpPose = tcp === undefined ? undefined : transforms?.[tcp.compiledFrameName];
     if (base === undefined || basePose === undefined || tcpPose === undefined) return null;
     return {
       key: JSON.stringify([observationEpoch, status.retainedBundleId, status.graphRevision,
-        status.directControl.programBindingId, base, tcp, basePose, tcpPose]),
+        motion.programBindingId, base, tcp, basePose, tcpPose]),
       base: { modelInstanceId: base.modelInstanceId, viewerLinkName: base.compiledFrameName,
         poseInCell: poseValueFromTuple({ position: basePose.position_m, quaternion: basePose.orientation_xyzw }) },
-      status,
+      motion,
     };
   };
   const beginCandidateDrag = () => {
@@ -1917,7 +1919,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       robotControl.revert();
       return;
     }
-    const control = reference.status.directControl;
+    const control = reference.motion;
     const local = pose === null ? null : candidateTcpPoseFromCell(sourceValue,
       control.controllableComponentId, control.commandTargetId, control.baseFrameRoleId, pose, reference.base);
     robotControl.finishPoseDrag(local?.available ? local.pose : null);
@@ -2155,7 +2157,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       onBeginCandidateTcpDrag={beginCandidateDrag}
       candidateContextKey={JSON.stringify([robotControl.selectedStatus?.ownerEpoch,
         robotControl.selectedStatus?.retainedBundleId, robotControl.selectedStatus?.graphRevision,
-        robotControl.selectedStatus?.directControl.programBindingId, robotControl.selectedStatus?.sceneRevision,
+        robotControl.selectedStatus?.directControl?.programBindingId, robotControl.selectedStatus?.sceneRevision,
         robotControl.state.mode, robotControl.state.moveToDraft?.source,
         candidatePresentationAllowed, runtimeEnabled])}
       gizmo={gizmo}
@@ -2270,7 +2272,7 @@ export function SceneAuthoringWorkspace({
       facts?.logicalScene ?? null,
       sourceValue,
       manifest.status === 'ready' ? manifest.data : null,
-      robotControl.selectedStatus?.directControl.targetDescriptor ?? null,
+      robotControl.selectedStatus?.directControl?.targetDescriptor ?? null,
     ).status,
     [facts, manifest, robotControl.selectedStatus, sourceValue],
   );
@@ -2450,7 +2452,7 @@ export function SceneAuthoringWorkspace({
   const candidateTcp = tcpDraftMode
       ? robotControlHasLocalDraft(robotControl.state)
         ? robotControl.state.draftPose
-        : robotControl.selectedStatus?.observedMotion.currentTcpPose ?? null
+        : robotControl.selectedStatus?.observedMotion?.currentTcpPose ?? null
       : previewGhost?.finalTcpPose ?? null;
   const cellGhost = useMemo(() => candidateTcp === null
     ? null

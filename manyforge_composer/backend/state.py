@@ -38,6 +38,10 @@ from .authoring_admission import (
 )
 from .authoring_forest import from_program
 from .authoring_identity import canonical_digest
+from .deployment_intent import (
+    DeploymentIntentError,
+    rebase_deployment_intent_sources,
+)
 from .authoring_workspace import AuthoringWorkspace
 from .node_environment_client import read_active_node_environment
 from .program_artifacts import (
@@ -76,8 +80,61 @@ _CURRENT_SCENARIO_FIELDS = (
     "graph_revision",
     "program_id",
     "program_revision",
-    "program_binding_id",
+    "program_outcome",
 )
+_PROGRAM_NON_EXECUTABLE_OUTCOME_FIELDS = frozenset(
+    {
+        "affected_execution_groups",
+        "affected_nodes",
+        "api_version",
+        "graph_revision",
+        "program_id",
+        "program_revision",
+        "retained_bundle_id",
+        "role_assignment_digest",
+        "unresolved_roles",
+    }
+)
+_PROGRAM_UNRESOLVED_ROLE_FIELDS = frozenset(
+    {
+        "command_target_id",
+        "component_role_id",
+        "controllable_component_id",
+        "detail",
+        "reason",
+        "target_role_id",
+    }
+)
+_APPLIED_PROGRAM_STATUS_FIELDS = frozenset(
+    {
+        "deployment_artifact_id",
+        "deployment_revision",
+        "executable",
+        "graph_revision",
+        "message",
+        "non_executable",
+        "program",
+        "program_binding_id",
+        "program_id",
+        "program_revision",
+        "record_digest",
+        "retained_bundle_id",
+        "scenario_id",
+        "schema_version",
+        "source_document_digest",
+    }
+)
+_ProgramOutcomeIdentity = tuple[str, str]
+_DeploymentPublicationIdentity = tuple[str, str, str, str, _ProgramOutcomeIdentity]
+
+
+def _is_sha256_identity(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
 _PREPARED_ACTIVATION_FIELDS = (
     "schema_version",
     "prepared_activation_id",
@@ -90,7 +147,9 @@ _PREPARED_ACTIVATION_FIELDS = (
     "graph_revision",
     "program_id",
     "program_revision",
-    "program_binding_id",
+    # Bound binding id or named non-executable result (H1a); part of the
+    # confirmation digest, so a changed Program impact is a stale confirmation.
+    "program_outcome",
     "node_environment_digest",
     "assistant_mode",
     "typed_parameter_overrides",
@@ -447,22 +506,168 @@ class ComposerState:
         self._applied_deployment_lock = Lock()
         self.applied_deployment_document: dict[str, Any] | None = None
         self._applied_activation_context: dict[str, Any] | None = None
-        self._applied_deployment_identity: tuple[str, str, str, str, str] | None = None
+        self._applied_deployment_identity: _DeploymentPublicationIdentity | None = None
         self._pending_applied_deployment: tuple[
-            tuple[str, str, str, str, str], dict[str, Any]
+            _DeploymentPublicationIdentity, dict[str, Any]
         ] | None = None
 
     @staticmethod
-    def _deployment_publication_identity(
+    def _program_outcome_identity(
         publication: dict[str, Any],
-    ) -> tuple[str, str, str, str, str]:
-        return (
-            publication["retained_bundle_id"],
-            publication["graph_revision"],
-            publication["deployment_revision"],
-            publication["program_revision"],
-            publication["program_binding_id"],
+    ) -> _ProgramOutcomeIdentity:
+        outcome = publication.get("program_outcome")
+        if not isinstance(outcome, dict):
+            raise ValueError("publication has no typed Program outcome")
+        kind = outcome.get("kind")
+        if kind == "bound":
+            if set(outcome) != {"kind", "program_binding_id"}:
+                raise ValueError("bound Program outcome has unexpected fields")
+            binding_id = outcome.get("program_binding_id")
+            if not _is_sha256_identity(binding_id):
+                raise ValueError("bound Program outcome lacks its binding identity")
+            return ("bound", binding_id)
+        if kind != "non_executable" or set(outcome) != {"kind", "outcome"}:
+            raise ValueError("Program outcome must be bound or non_executable")
+
+        detail = outcome.get("outcome")
+        if (
+            not isinstance(detail, dict)
+            or set(detail) != _PROGRAM_NON_EXECUTABLE_OUTCOME_FIELDS
+            or detail.get("api_version") != "manyforge.program-binding-outcome.v1"
+            or detail.get("program_id") != publication.get("program_id")
+            or detail.get("program_revision") != publication.get("program_revision")
+            or detail.get("retained_bundle_id")
+            != publication.get("retained_bundle_id")
+            or detail.get("graph_revision") != publication.get("graph_revision")
+        ):
+            raise ValueError("non-executable Program outcome does not match its publication")
+        for name in (
+            "graph_revision",
+            "program_revision",
+            "retained_bundle_id",
+            "role_assignment_digest",
+        ):
+            value = detail.get(name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"non-executable Program outcome has invalid {name}")
+        for name in (
+            "graph_revision",
+            "program_revision",
+            "retained_bundle_id",
+            "role_assignment_digest",
+        ):
+            if not _is_sha256_identity(detail[name]):
+                raise ValueError(f"non-executable Program outcome has invalid {name}")
+        unresolved = detail.get("unresolved_roles")
+        if not isinstance(unresolved, list) or not unresolved:
+            raise ValueError("non-executable Program outcome has no unresolved roles")
+        for row in unresolved:
+            if (
+                not isinstance(row, dict)
+                or set(row) != _PROGRAM_UNRESOLVED_ROLE_FIELDS
+                or any(
+                    not isinstance(row.get(name), str) or not row[name]
+                    for name in (
+                        "component_role_id",
+                        "controllable_component_id",
+                        "detail",
+                        "reason",
+                    )
+                )
+                or any(
+                    row.get(name) is not None and not isinstance(row.get(name), str)
+                    for name in ("command_target_id", "target_role_id")
+                )
+            ):
+                raise ValueError("non-executable Program outcome has an invalid role row")
+        for name in ("affected_nodes", "affected_execution_groups"):
+            values = detail.get(name)
+            if not isinstance(values, list) or any(
+                not isinstance(item, str) or not item for item in values
+            ):
+                raise ValueError(f"non-executable Program outcome has invalid {name}")
+        canonical_outcome = canonical_json_bytes(detail).decode("utf-8")
+        return ("non_executable", canonical_outcome)
+
+    @classmethod
+    def _deployment_publication_identity(
+        cls, publication: dict[str, Any]
+    ) -> _DeploymentPublicationIdentity:
+        outcome_identity = cls._program_outcome_identity(publication)
+        identity_fields = (
+            "retained_bundle_id",
+            "graph_revision",
+            "deployment_revision",
+            "program_revision",
         )
+        identity_values = tuple(publication.get(name) for name in identity_fields)
+        if any(not isinstance(value, str) or not value for value in identity_values):
+            raise ValueError("publication lacks a complete activation identity")
+        if any(not _is_sha256_identity(value) for value in identity_values):
+            raise ValueError("publication has an invalid activation digest")
+        return (*identity_values, outcome_identity)
+
+    @classmethod
+    def _published_program_projection(
+        cls, status: dict[str, Any]
+    ) -> dict[str, Any]:
+        if (
+            set(status) != _APPLIED_PROGRAM_STATUS_FIELDS
+            or status.get("schema_version") != "manyforge.applied_program_status.v1"
+            or type(status.get("executable")) is not bool
+        ):
+            raise ValueError("Applied Program status has an unsupported shape")
+        executable = status["executable"]
+        binding_id = status.get("program_binding_id")
+        non_executable = status.get("non_executable")
+        if executable:
+            if (
+                not _is_sha256_identity(binding_id)
+                or non_executable is not None
+                or status.get("program") is not None
+                or status.get("message") is not None
+            ):
+                raise ValueError("executable Applied Program status is contradictory")
+            outcome: dict[str, Any] = {
+                "kind": "bound",
+                "program_binding_id": binding_id,
+            }
+        else:
+            if (
+                binding_id is not None
+                or not isinstance(non_executable, dict)
+                or not isinstance(status.get("program"), dict)
+                or not isinstance(status.get("message"), str)
+            ):
+                raise ValueError("non-executable Applied Program status is contradictory")
+            outcome = {"kind": "non_executable", "outcome": non_executable}
+
+        projection = {
+            name: status.get(name)
+            for name in (
+                "scenario_id",
+                "source_document_digest",
+                "deployment_artifact_id",
+                "deployment_revision",
+                "retained_bundle_id",
+                "graph_revision",
+                "program_id",
+                "program_revision",
+            )
+        }
+        if (
+            any(not isinstance(value, str) or not value for value in projection.values())
+            or not _is_sha256_identity(projection["source_document_digest"])
+            or not _is_sha256_identity(projection["deployment_revision"])
+            or not _is_sha256_identity(projection["retained_bundle_id"])
+            or not _is_sha256_identity(projection["graph_revision"])
+            or not _is_sha256_identity(projection["program_revision"])
+            or not _is_sha256_identity(status.get("record_digest"))
+        ):
+            raise ValueError("Applied Program status lacks activation identity fields")
+        projection["program_outcome"] = outcome
+        cls._deployment_publication_identity(projection)
+        return projection
 
     def applied_deployment_for_publication(
         self, publication: dict[str, Any]
@@ -491,7 +696,7 @@ class ComposerState:
 
     def _captured_deployment_context(
         self, intent: dict[str, Any], prepared_activation: dict[str, Any]
-    ) -> tuple[tuple[str, str, str, str, str], dict[str, Any]]:
+    ) -> tuple[_DeploymentPublicationIdentity, dict[str, Any]]:
         deployment = intent.get("deployment")
         if not isinstance(deployment, dict):
             raise AuthoringOperationError(
@@ -515,12 +720,12 @@ class ComposerState:
             "typed_parameter_overrides": deepcopy(intent["typed_parameter_overrides"]),
             "source_document_digest": intent["source_document_digest"],
             "scenario_id": intent["scenario_id"],
-            "project_path": self.scenario_document_path,
+            "project_path": self.deployment_source_project_path,
         }
         return identity, context
 
     def _retain_submitted_deployment(
-        self, captured: tuple[tuple[str, str, str, str, str], dict[str, Any]]
+        self, captured: tuple[_DeploymentPublicationIdentity, dict[str, Any]]
     ) -> None:
         with self._applied_deployment_lock:
             self._pending_applied_deployment = captured
@@ -569,6 +774,15 @@ class ComposerState:
     @property
     def scenario_document_path(self) -> str | None:
         return self._authoring_project_fact("document_path")
+
+    @property
+    def deployment_source_project_path(self) -> str | None:
+        """Base directory for relative assets in the current Deployment Draft."""
+
+        return (
+            self.deployment_draft_session.source_project_root
+            or self.scenario_document_path
+        )
 
     @property
     def scenario_document_id(self) -> str | None:
@@ -629,18 +843,31 @@ class ComposerState:
             or facts["source_deployment_digest"] is None
         ):
             return False
+        deployment = self.deployment_draft_session.retained_state().get("document")
+        source_root = self.deployment_source_project_path
+        document_path = facts["document_path"]
+        if (
+            isinstance(deployment, dict)
+            and isinstance(source_root, str)
+            and isinstance(document_path, str)
+            and Path(source_root).resolve() != Path(document_path).resolve()
+        ):
+            try:
+                deployment = rebase_deployment_intent_sources(
+                    deployment,
+                    source_project_root=Path(source_root),
+                    destination_project_root=Path(document_path),
+                )
+            except DeploymentIntentError:
+                # An unresolvable source cannot prove that the current Draft
+                # is the saved Scenario. Keep the explicit discard guard.
+                return False
         return (
             canonical_digest(
                 {"value": self.draft_session.retained_state().get("authoring")}
             )
             == facts["source_program_digest"]
-            and canonical_digest(
-                {
-                    "value": self.deployment_draft_session.retained_state().get(
-                        "document"
-                    )
-                }
-            )
+            and canonical_digest({"value": deployment})
             == facts["source_deployment_digest"]
         )
 
@@ -770,6 +997,10 @@ class ComposerState:
         except HeadlessClientError as error:
             if error.code == "program_applied_selection_not_found":
                 return None
+            if error.code == "program_applied_non_executable":
+                # H1a: the Applied Program is preserved but has no executable
+                # selection; its named status is read separately.
+                return None
             if allow_inactive and error.code == "program_applied_selection_not_active":
                 # An admitted Deployment handover retains the old record digest
                 # for Program Apply's compare-and-set, but that old binding is
@@ -795,6 +1026,11 @@ class ComposerState:
             else reason
             for reason in published.get("unavailable_reasons", [])
         ]
+        if (
+            current is not None
+            and current["program_outcome"].get("kind") != "bound"
+        ):
+            reasons.append("program_not_executable")
         if current is not None and not self._manager_matches_scenario(
             self.headless_client.manager_status(),
             self.headless_client.manager_diff(),
@@ -802,6 +1038,16 @@ class ComposerState:
         ):
             reasons.append("deployment_not_active_and_converged")
         execution_current = current if current is not None and not reasons else None
+        if execution_current is not None:
+            bound_outcome = execution_current["program_outcome"]
+            execution_current = {
+                name: value
+                for name, value in execution_current.items()
+                if name != "program_outcome"
+            }
+            execution_current["program_binding_id"] = bound_outcome[
+                "program_binding_id"
+            ]
         return {
             "schema_version": "manyforge.current_scenario.v1",
             "ready": execution_current is not None,
@@ -828,9 +1074,26 @@ class ComposerState:
                 "unavailable_reasons": ["headless_unavailable"],
             }
         reasons: list[str] = []
-        applied = self._optional_applied()
-        if applied is None:
-            reasons.append("program_not_applied")
+        status_reader = getattr(self.headless_client, "program_applied_status", None)
+        if not callable(status_reader):
+            reasons.append("program_applied_status_unavailable")
+            applied = None
+        else:
+            try:
+                applied = self._published_program_projection(status_reader())
+            except HeadlessClientError as error:
+                if error.code in {
+                    "program_applied_selection_not_found",
+                    "program_applied_selection_not_active",
+                }:
+                    reasons.append("program_not_applied")
+                    applied = None
+                else:
+                    reasons.append(error.code)
+                    applied = None
+            except (TypeError, ValueError):
+                reasons.append("program_applied_status_invalid")
+                applied = None
         if applied is not None:
             status = self.headless_client.manager_status()
             if not self._manager_published_matches_scenario(status, applied):
@@ -941,6 +1204,9 @@ class ComposerState:
                     "candidate_graph_revision"
                 ],
                 "diff": preview.get("diff"),
+                # The Manager's authoritative impact (H1a): a changed impact
+                # makes an earlier confirmation stale.
+                "impact": preview.get("impact"),
             }
         )
 
@@ -1052,11 +1318,18 @@ class ComposerState:
                 "the captured activation changed since it was confirmed",
             )
 
+        impact = preview.get("impact") if preview is not None else None
+        destructive_impact = isinstance(impact, dict) and impact.get(
+            "destructive"
+        ) is True
         confirmation_required = bool(
             apply
             and intent.get("confirmation_token") is None
             and preview is not None
-            and self._deployment_candidate_is_disruptive(preview.get("diff"))
+            and (
+                destructive_impact
+                or self._deployment_candidate_is_disruptive(preview.get("diff"))
+            )
         )
         confirmation_token = (
             fresh_confirmation_token if confirmation_required else None
@@ -1082,6 +1355,14 @@ class ComposerState:
                     "expected_admission_generation"
                 ],
                 "candidate_receipt": receipt,
+                # Only a confirmed destructive impact is accepted; the
+                # Manager revalidates it and refuses a stale acceptance.
+                "accepted_impact_digest": (
+                    receipt.get("impact_digest")
+                    if destructive_impact
+                    and supplied_confirmation == fresh_confirmation_token
+                    else None
+                ),
             }
         return {
             "prepared_activation": deepcopy(prepared_activation),

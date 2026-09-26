@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-09-24 09:16:56 UTC
+  Last regenerated: 2026-09-26 16:32:47 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -175,7 +175,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/execution/pick-place/plans/place` |  | Execution Plan Place |
 | `GET` | `/api/execution/runtime-scale-control` |  | Execution Get Runtime Scale Control |
 | `POST` | `/api/execution/runtime-scale-control` |  | Execution Set Runtime Scale Control |
-| `GET` | `/api/execution/status` |  | Execution Status |
 | `GET` | `/api/execution/stop-fault` |  | Execution Stop Fault |
 | `POST` | `/api/execution/stop-fault/recover` |  | Execution Recover Stop Fault |
 | `POST` | `/api/execution/stops` |  | Execution Stop |
@@ -189,6 +188,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/manager/status` |  | Manager Status |
 | `GET` | `/api/node-environment` |  | Node Environment |
 | `GET` | `/api/program/applied` |  | Program Applied |
+| `GET` | `/api/program/applied/status` |  | Program Applied Status |
 | `POST` | `/api/program/authoring-transactions` |  | Acquire Authoring Transaction |
 | `POST` | `/api/program/authoring-transactions/reconcile-owner` |  | Reconcile Authoring Owner |
 | `POST` | `/api/program/authoring-transactions/recovery-receipt` |  | Recover Authoring Transaction |

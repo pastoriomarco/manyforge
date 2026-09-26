@@ -203,6 +203,7 @@ class ManagerCommandClient:
             {
                 "api_version": MANAGER_COMMAND_VERSION,
                 "command": "apply",
+                "accepted_impact_digest": request.accepted_impact_digest,
                 "candidate_receipt": request.candidate_receipt.model_dump(),
                 "correlation_id": request.correlation_id,
                 "deployment_artifact_id": request.deployment_artifact_id,

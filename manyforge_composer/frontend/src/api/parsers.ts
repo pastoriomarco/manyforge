@@ -35,7 +35,11 @@ import type {
   ManagerApplyResponse,
   ManagerApplyStatus,
   ManagerDeploymentCandidatePreviewResponse,
+  ManagerDeploymentImpact,
+  ManagerDeploymentImpactComponent,
   ManagerDeploymentRecordDiff,
+  ProgramUnresolvedReference,
+  AppliedProgramStatus,
   ManagerDiffProjection,
   ManagerGraphProjection,
   ManagerRuntimeProjection,
@@ -293,6 +297,9 @@ import type {
   ManualControlContracts,
   ManualControlGripperDescriptor,
   ManualControlMotionDescriptor,
+  DirectControlGripperStatus,
+  DirectControlMotionStatus,
+  ExecutionComponentStatus,
   ExecutionIdentity,
   ExecutionOwnerStatus,
   MotionPreviewReceipt,
@@ -2168,7 +2175,7 @@ export function parseManagerDeploymentCandidatePreviewResponse(
   const record = objectAt(value, 'managerDeploymentCandidatePreview');
   exactKeysAt(
     record,
-    ['api_version', 'candidate_receipt', 'converged', 'diff', 'ok'],
+    ['api_version', 'candidate_receipt', 'converged', 'diff', 'impact', 'ok'],
     'managerDeploymentCandidatePreview',
   );
   if (record.ok !== true) {
@@ -2196,7 +2203,9 @@ export function parseManagerDeploymentCandidatePreviewResponse(
       'deployment_artifact_id',
       'deployment_revision',
       'expected_admission_generation',
+      'destructive_impact',
       'expected_current',
+      'impact_digest',
       'manager_owner_epoch',
       'prepared_activation_id',
       'receipt_digest',
@@ -2208,10 +2217,10 @@ export function parseManagerDeploymentCandidatePreviewResponse(
     receipt.schema_version,
     'managerDeploymentCandidatePreview.candidate_receipt.schema_version',
   );
-  if (schemaVersion !== 'manyforge.manager_deployment_candidate_receipt.v1') {
+  if (schemaVersion !== 'manyforge.manager_deployment_candidate_receipt.v2') {
     return fail(
       'managerDeploymentCandidatePreview.candidate_receipt.schema_version',
-      'manyforge.manager_deployment_candidate_receipt.v1',
+      'manyforge.manager_deployment_candidate_receipt.v2',
     );
   }
   const expected = objectAt(
@@ -2270,10 +2279,189 @@ export function parseManagerDeploymentCandidatePreviewResponse(
       },
       expected_admission_generation: positiveIntegerAt(receipt.expected_admission_generation, 'candidateReceipt.expected_admission_generation'),
       manager_owner_epoch: stringAt(receipt.manager_owner_epoch, 'candidateReceipt.manager_owner_epoch'),
+      impact_digest: digestAt(receipt.impact_digest, 'candidateReceipt.impact_digest'),
+      destructive_impact: booleanAt(receipt.destructive_impact, 'candidateReceipt.destructive_impact'),
       receipt_digest: digestAt(receipt.receipt_digest, 'candidateReceipt.receipt_digest'),
     },
     converged: booleanAt(record.converged, 'managerDeploymentCandidatePreview.converged'),
     diff: parsedDiff,
+    impact: parseManagerDeploymentImpact(record.impact, 'managerDeploymentCandidatePreview.impact'),
+  };
+}
+
+/** The non-executable outcome's named references (shared by impact/status). */
+function programUnresolvedReferencesAt(
+  outcome: JsonObject,
+  outcomePath: string,
+): {
+  unresolvedReferences: ProgramUnresolvedReference[];
+  affectedNodes: string[];
+  affectedExecutionGroups: string[];
+} {
+  const strings = (item: unknown, itemPath: string) => boundedArrayAt(item, itemPath, 4096)
+    .map((entry, index) => stringAt(entry, `${itemPath}[${index}]`));
+  const unresolvedReferences = boundedArrayAt(
+    outcome.unresolved_roles,
+    `${outcomePath}.unresolved_roles`,
+    256,
+  ).map((entry, index) => {
+    const rowPath = `${outcomePath}.unresolved_roles[${index}]`;
+    const row = objectAt(entry, rowPath);
+    exactKeysAt(
+      row,
+      [
+        'command_target_id', 'component_role_id', 'controllable_component_id',
+        'detail', 'reason', 'target_role_id',
+      ],
+      rowPath,
+    );
+    return {
+      component_role_id: stringAt(row.component_role_id, `${rowPath}.component_role_id`),
+      target_role_id: nullableStringAt(row.target_role_id, `${rowPath}.target_role_id`),
+      controllable_component_id: stringAt(
+        row.controllable_component_id,
+        `${rowPath}.controllable_component_id`,
+      ),
+      command_target_id: nullableStringAt(row.command_target_id, `${rowPath}.command_target_id`),
+      reason: stringAt(row.reason, `${rowPath}.reason`),
+      detail: stringAt(row.detail, `${rowPath}.detail`),
+    };
+  });
+  if (unresolvedReferences.length === 0) {
+    return fail(`${outcomePath}.unresolved_roles`, 'at least one named reference');
+  }
+  return {
+    unresolvedReferences,
+    affectedNodes: strings(outcome.affected_nodes, `${outcomePath}.affected_nodes`),
+    affectedExecutionGroups: strings(
+      outcome.affected_execution_groups,
+      `${outcomePath}.affected_execution_groups`,
+    ),
+  };
+}
+
+export function parseAppliedProgramStatus(value: unknown): AppliedProgramStatus {
+  const path = 'appliedProgramStatus';
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'deployment_artifact_id', 'deployment_revision', 'executable',
+    'graph_revision', 'message', 'non_executable', 'program',
+    'program_binding_id', 'program_id', 'program_revision', 'record_digest',
+    'retained_bundle_id', 'scenario_id', 'schema_version',
+    'source_document_digest',
+  ], path);
+  if (stringAt(record.schema_version, `${path}.schema_version`)
+    !== 'manyforge.applied_program_status.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.applied_program_status.v1');
+  }
+  const executable = booleanAt(record.executable, `${path}.executable`);
+  if (executable !== (record.non_executable === null)
+    || executable !== (record.program_binding_id !== null)) {
+    return fail(path, 'a binding exactly when executable, named references otherwise');
+  }
+  const references = record.non_executable === null
+    ? { unresolvedReferences: [], affectedNodes: [], affectedExecutionGroups: [] }
+    : programUnresolvedReferencesAt(
+      objectAt(record.non_executable, `${path}.non_executable`),
+      `${path}.non_executable`,
+    );
+  return {
+    deploymentArtifactId: stringAt(
+      record.deployment_artifact_id,
+      `${path}.deployment_artifact_id`,
+    ),
+    deploymentRevision: digestAt(
+      record.deployment_revision,
+      `${path}.deployment_revision`,
+    ),
+    executable,
+    programId: stringAt(record.program_id, `${path}.program_id`),
+    programRevision: digestAt(record.program_revision, `${path}.program_revision`),
+    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
+    message: nullableStringAt(record.message, `${path}.message`),
+    ...references,
+  };
+}
+
+const IMPACT_DISPOSITIONS = ['retain', 'add', 'remove', 'replace'] as const;
+
+function parseManagerDeploymentImpact(
+  value: unknown,
+  path: string,
+): ManagerDeploymentImpact {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    [
+      'attachment_changed_components', 'component_delta_digest', 'components',
+      'destructive', 'detached_components', 'program',
+      'shared_scene_projection_changed',
+    ],
+    path,
+  );
+  const strings = (item: unknown, itemPath: string) => boundedArrayAt(item, itemPath, 4096)
+    .map((entry, index) => stringAt(entry, `${itemPath}[${index}]`));
+  const components = boundedArrayAt(record.components, `${path}.components`, 128)
+    .map((entry, index) => {
+      const rowPath = `${path}.components[${index}]`;
+      const row = objectAt(entry, rowPath);
+      exactKeysAt(
+        row,
+        ['controllable_component_id', 'disposition', 'replacement_reasons'],
+        rowPath,
+      );
+      const disposition = stringAt(row.disposition, `${rowPath}.disposition`);
+      if (!(IMPACT_DISPOSITIONS as readonly string[]).includes(disposition)) {
+        return fail(`${rowPath}.disposition`, 'retain, add, remove, or replace');
+      }
+      return {
+        controllable_component_id: stringAt(
+          row.controllable_component_id,
+          `${rowPath}.controllable_component_id`,
+        ),
+        disposition: disposition as ManagerDeploymentImpactComponent['disposition'],
+        replacement_reasons: strings(row.replacement_reasons, `${rowPath}.replacement_reasons`),
+      };
+    });
+  const program = objectAt(record.program, `${path}.program`);
+  exactKeysAt(
+    program,
+    ['executable', 'non_executable', 'program_id', 'program_revision'],
+    `${path}.program`,
+  );
+  const executable = booleanAt(program.executable, `${path}.program.executable`);
+  let unresolvedReferences: ProgramUnresolvedReference[] = [];
+  let affectedNodes: string[] = [];
+  let affectedExecutionGroups: string[] = [];
+  if (executable !== (program.non_executable === null)) {
+    return fail(`${path}.program.non_executable`, 'present exactly for a non-executable Program');
+  }
+  if (program.non_executable !== null) {
+    const outcomePath = `${path}.program.non_executable`;
+    ({ unresolvedReferences, affectedNodes, affectedExecutionGroups } =
+      programUnresolvedReferencesAt(objectAt(program.non_executable, outcomePath), outcomePath));
+  }
+  return {
+    destructive: booleanAt(record.destructive, `${path}.destructive`),
+    components,
+    attachmentChangedComponents: strings(
+      record.attachment_changed_components,
+      `${path}.attachment_changed_components`,
+    ),
+    detachedComponents: strings(record.detached_components, `${path}.detached_components`),
+    sharedSceneProjectionChanged: booleanAt(
+      record.shared_scene_projection_changed,
+      `${path}.shared_scene_projection_changed`,
+    ),
+    componentDeltaDigest: digestAt(record.component_delta_digest, `${path}.component_delta_digest`),
+    program: {
+      executable,
+      programId: stringAt(program.program_id, `${path}.program.program_id`),
+      programRevision: digestAt(program.program_revision, `${path}.program.program_revision`),
+      unresolvedReferences,
+      affectedNodes,
+      affectedExecutionGroups,
+    },
   };
 }
 
@@ -2590,10 +2778,12 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
         activation.deployment_revision,
         'managerApplyStatus.prepared_activation.deployment_revision',
       ),
-      programBindingId: digestAt(
-        activation.program_binding_id,
-        'managerApplyStatus.prepared_activation.program_binding_id',
-      ),
+      programBindingId: activation.program_binding_id === null
+        ? null
+        : digestAt(
+          activation.program_binding_id,
+          'managerApplyStatus.prepared_activation.program_binding_id',
+        ),
       preparedActivationId: digestAt(
         activation.prepared_activation_id,
         'managerApplyStatus.prepared_activation.prepared_activation_id',
@@ -3540,18 +3730,34 @@ function parsePreparedActivationInput(
     'schema_version', 'prepared_activation_id', 'source_document_digest',
     'captured_input_digest', 'deployment_artifact_id',
     'deployment_revision', 'retained_bundle_id', 'graph_revision',
-    'program_id', 'program_revision', 'program_binding_id',
+    'program_id', 'program_revision', 'program_outcome',
     'node_environment_digest', 'assistant_mode', 'typed_parameter_overrides',
   ], path);
   if (stringAt(record.schema_version, `${path}.schema_version`)
-    !== 'manyforge.prepared_activation_input.v2') {
+    !== 'manyforge.prepared_activation_input.v3') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.prepared_activation_input.v2',
+      'manyforge.prepared_activation_input.v3',
     );
   }
+  const outcome = objectAt(record.program_outcome, `${path}.program_outcome`);
+  const outcomeKind = stringAt(outcome.kind, `${path}.program_outcome.kind`);
+  let programBindingId: string | null;
+  if (outcomeKind === 'bound') {
+    exactKeysAt(outcome, ['kind', 'program_binding_id'], `${path}.program_outcome`);
+    programBindingId = digestAt(
+      outcome.program_binding_id,
+      `${path}.program_outcome.program_binding_id`,
+    );
+  } else if (outcomeKind === 'non_executable') {
+    exactKeysAt(outcome, ['kind', 'outcome'], `${path}.program_outcome`);
+    objectAt(outcome.outcome, `${path}.program_outcome.outcome`);
+    programBindingId = null;
+  } else {
+    return fail(`${path}.program_outcome.kind`, 'bound or non_executable');
+  }
   return {
-    schemaVersion: 'manyforge.prepared_activation_input.v2',
+    schemaVersion: 'manyforge.prepared_activation_input.v3',
     preparedActivationId: digestAt(record.prepared_activation_id,
       `${path}.prepared_activation_id`),
     sourceDocumentDigest: digestAt(record.source_document_digest,
@@ -3576,10 +3782,7 @@ function parsePreparedActivationInput(
       record.program_revision,
       `${path}.program_revision`,
     ),
-    programBindingId: digestAt(
-      record.program_binding_id,
-      `${path}.program_binding_id`,
-    ),
+    programBindingId,
     nodeEnvironmentDigest: digestAt(record.node_environment_digest,
       `${path}.node_environment_digest`),
     assistantMode: (() => {
@@ -8372,27 +8575,23 @@ function manualControlGripperDescriptorAt(
 }
 
 function executionIdentityAt(value: unknown, path: string): ExecutionIdentity {
+  // execution_identity.v2 (H1a-IF.2): runtime identity only. No primary
+  // target roles and no Program fields: a manual target's direct-control
+  // binding lives in that target, the authored Program outcome elsewhere.
   const identity = objectAt(value, path);
   exactKeysAt(identity, [
     'active_publication_generation',
     'cell_id',
     'control_management_mode',
     'graph_revision',
-    'gripper_command_schema_id',
-    'gripper_command_schema_revision',
-    'gripper_target_role_id',
-    'motion_target_role_id',
     'owner_epoch',
-    'program_binding_id',
-    'program_id',
-    'program_revision',
     'retained_bundle_id',
     'scene_revision',
     'schema_version',
   ], path);
   if (stringAt(identity.schema_version, `${path}.schema_version`)
-      !== 'manyforge.execution_identity.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.execution_identity.v1');
+      !== 'manyforge.execution_identity.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.execution_identity.v2');
   }
   const controlManagementMode = stringAt(
     identity.control_management_mode,
@@ -8420,31 +8619,6 @@ function executionIdentityAt(value: unknown, path: string): ExecutionIdentity {
     sceneRevision: sceneRevisionAt(
       identity.scene_revision,
       `${path}.scene_revision`,
-    ),
-    programId: stringAt(identity.program_id, `${path}.program_id`),
-    programRevision: stringAt(
-      identity.program_revision,
-      `${path}.program_revision`,
-    ),
-    programBindingId: stringAt(
-      identity.program_binding_id,
-      `${path}.program_binding_id`,
-    ),
-    motionTargetRoleId: stringAt(
-      identity.motion_target_role_id,
-      `${path}.motion_target_role_id`,
-    ),
-    gripperTargetRoleId: stringAt(
-      identity.gripper_target_role_id,
-      `${path}.gripper_target_role_id`,
-    ),
-    gripperCommandSchemaId: stringAt(
-      identity.gripper_command_schema_id,
-      `${path}.gripper_command_schema_id`,
-    ),
-    gripperCommandSchemaRevision: stringAt(
-      identity.gripper_command_schema_revision,
-      `${path}.gripper_command_schema_revision`,
     ),
   };
 }
@@ -8511,176 +8685,180 @@ export function parseExecutionControlStatus(
   if (JSON.stringify(targetIdentity) !== JSON.stringify(controlIdentity)) {
     return fail('executionControlStatus', 'matching owner/product identities');
   }
+  // execution_targets.v3 + execution_control_state.v6 (H1a-IF.2): every
+  // managed cell uses one component-based shape; no primary target exists.
   const targets = objectAt(targetsEnvelope.targets, 'executionTargets.targets');
-  allowedKeysAt(
-    targets,
-    ['direct_control', 'direct_control_gripper', 'schema_version'],
-    ['direct_control_targets', 'direct_control_gripper_targets'],
-    'executionTargets.targets',
-  );
-  const targetsSchemaVersion = stringAt(
-    targets.schema_version,
-    'executionTargets.targets.schema_version',
-  );
-  if (!['manyforge.execution_targets.v1', 'manyforge.execution_targets.v2']
-    .includes(targetsSchemaVersion)) {
-    return fail(
-      'executionTargets.targets.schema_version',
-      'manyforge.execution_targets.v1 or manyforge.execution_targets.v2',
-    );
+  exactKeysAt(targets, ['components', 'schema_version'], 'executionTargets.targets');
+  if (stringAt(targets.schema_version, 'executionTargets.targets.schema_version')
+    !== 'manyforge.execution_targets.v3') {
+    return fail('executionTargets.targets.schema_version', 'manyforge.execution_targets.v3');
   }
   const control = objectAt(
     controlEnvelope.control_state,
     'executionControlState.control_state',
   );
-  allowedKeysAt(
-    control,
-    [
-      'cell_stop_action',
-      'observed_gripper',
-      'observed_motion',
-      'manual_operations',
-      'runtime_scale_control',
-      'schema_version',
-    ],
-    ['observed_target_states'],
-    'executionControlState.control_state',
-  );
-  const controlSchemaVersion = stringAt(
+  exactKeysAt(control, [
+    'cell_stop_action',
+    'manual_operations',
+    'observed_targets',
+    'runtime_scale_control',
+    'schema_version',
+  ], 'executionControlState.control_state');
+  if (stringAt(
     control.schema_version,
     'executionControlState.control_state.schema_version',
-  );
-  if (![
-    'manyforge.execution_control_state.v4',
-    'manyforge.execution_control_state.v5',
-  ].includes(controlSchemaVersion)) {
+  ) !== 'manyforge.execution_control_state.v6') {
     return fail(
       'executionControlState.control_state.schema_version',
-      'manyforge.execution_control_state.v4 or manyforge.execution_control_state.v5',
+      'manyforge.execution_control_state.v6',
     );
   }
-  const motionTarget = objectAt(
-    targets.direct_control,
-    'executionTargets.targets.direct_control',
+  const rowKey = (componentId: unknown, targetId: unknown, capabilityId: unknown) => (
+    JSON.stringify([componentId, targetId, capabilityId])
   );
-  const gripperTarget = objectAt(
-    targets.direct_control_gripper,
-    'executionTargets.targets.direct_control_gripper',
-  );
-  const motionTargetRows = targets.direct_control_targets === undefined
-    ? [motionTarget]
-    : arrayAt(
-      targets.direct_control_targets,
-      'executionTargets.targets.direct_control_targets',
-    ).map((value, index) => objectAt(
-      value,
-      `executionTargets.targets.direct_control_targets[${index}]`,
-    ));
-  const gripperTargetRows = targets.direct_control_gripper_targets === undefined
-    ? [gripperTarget]
-    : arrayAt(
-      targets.direct_control_gripper_targets,
-      'executionTargets.targets.direct_control_gripper_targets',
-    ).map((value, index) => objectAt(
-      value,
-      `executionTargets.targets.direct_control_gripper_targets[${index}]`,
-    ));
-  if (motionTargetRows.length === 0 || gripperTargetRows.length === 0) {
-    return fail(
-      'executionTargets.targets.direct_control_targets',
-      'at least one addressed motion and gripper target',
+  const observedByKey = new Map<string, unknown>();
+  boundedArrayAt(
+    control.observed_targets,
+    'executionControlState.control_state.observed_targets',
+    512,
+  ).forEach((entry, index) => {
+    const path = `executionControlState.control_state.observed_targets[${index}]`;
+    const row = objectAt(entry, path);
+    exactKeysAt(row, [
+      'command_target_id', 'controllable_component_id', 'observed', 'operation_capability_id',
+    ], path);
+    const key = rowKey(
+      stringAt(row.controllable_component_id, `${path}.controllable_component_id`),
+      stringAt(row.command_target_id, `${path}.command_target_id`),
+      stringAt(row.operation_capability_id, `${path}.operation_capability_id`),
     );
-  }
-  const observedTargetStates = control.observed_target_states === undefined
-    ? []
-    : arrayAt(
-      control.observed_target_states,
-      'executionControlState.control_state.observed_target_states',
-    ).map((value, index) => {
-      const row = objectAt(
-        value,
-        `executionControlState.control_state.observed_target_states[${index}]`,
-      );
-      exactKeysAt(row, [
-        'command_target_id',
-        'controllable_component_id',
-        'gripper',
-        'gripper_target_role_id',
-        'motion',
-        'motion_target_role_id',
-      ], `executionControlState.control_state.observed_target_states[${index}]`);
-      return row;
-    });
-  const addressedIdentity = (target: JsonObject, path: string) => ({
-    componentId: stringAt(
-      target.controllable_component_id,
-      `${path}.controllable_component_id`,
-    ),
-    commandTargetId: stringAt(
-      target.command_target_id,
-      `${path}.command_target_id`,
-    ),
-  });
-  const observedFor = (
-    target: JsonObject,
-    targetPath: string,
-    key: 'motion' | 'gripper',
-    fallback: unknown,
-  ): unknown => {
-    const identity = addressedIdentity(target, targetPath);
-    const matches = observedTargetStates.filter((row) => (
-      row.controllable_component_id === identity.componentId
-      && row.command_target_id === identity.commandTargetId
-    ));
-    if (matches.length > 1) {
-      return fail(
-        'executionControlState.control_state.observed_target_states',
-        'one observation row per addressed component/target',
-      );
+    if (observedByKey.has(key)) {
+      return fail(path, 'one observation row per commandable target');
     }
-    if (matches.length === 1) return matches[0][key];
-    const primary = addressedIdentity(
-      key === 'motion' ? motionTarget : gripperTarget,
-      key === 'motion'
-        ? 'executionTargets.targets.direct_control'
-        : 'executionTargets.targets.direct_control_gripper',
-    );
-    if (identity.componentId === primary.componentId
-      && identity.commandTargetId === primary.commandTargetId) return fallback;
-    return fail(
-      `${targetPath}.${key}`,
-      'an observation row for the exact addressed target',
-    );
+    observedByKey.set(key, row.observed);
+  });
+  // The v6 observation for one commandable target, in the internal shape
+  // (without its kind discriminator), or null when not yet authoritative.
+  const observationFor = (
+    componentId: string,
+    target: JsonObject,
+    kind: 'joint_positions' | 'coordinate',
+    path: string,
+  ): unknown => {
+    const key = rowKey(componentId, target.command_target_id, target.operation_capability_id);
+    if (!observedByKey.has(key)) {
+      return fail(path, 'one observation row for the exact addressed target');
+    }
+    const observed = observedByKey.get(key);
+    observedByKey.delete(key);
+    if (observed === null) return null;
+    const record = objectAt(observed, `${path}.observed`);
+    if (record.kind !== kind) return fail(`${path}.observed.kind`, kind);
+    const rest = { ...record };
+    delete rest.kind;
+    return rest;
   };
-  const motionProjectionRows = motionTargetRows.map((target, index) => ({
-    ...target,
-    observed_state: observedFor(
-      target,
-      `executionTargets.targets.direct_control_targets[${index}]`,
-      'motion',
-      target === motionTarget ? control.observed_motion : null,
-    ),
-  }));
-  const gripperProjectionRows = gripperTargetRows.map((target, index) => ({
-    ...target,
-    observed_state: observedFor(
-      target,
-      `executionTargets.targets.direct_control_gripper_targets[${index}]`,
-      'gripper',
-      target === gripperTarget ? control.observed_gripper : null,
-    ),
-  }));
+  const normalizedComponents: JsonObject[] = [];
+  const motionRows: JsonObject[] = [];
+  const gripperRows: JsonObject[] = [];
+  boundedArrayAt(
+    targets.components,
+    'executionTargets.targets.components',
+    128,
+  ).forEach((entry, componentIndex) => {
+    const componentPath = `executionTargets.targets.components[${componentIndex}]`;
+    const component = objectAt(entry, componentPath);
+    exactKeysAt(component, [
+      'availability', 'controllable_component_id', 'targets',
+    ], componentPath);
+    const componentId = stringAt(
+      component.controllable_component_id,
+      `${componentPath}.controllable_component_id`,
+    );
+    const availability = objectAt(component.availability, `${componentPath}.availability`);
+    exactKeysAt(availability, ['command_eligible', 'reason'], `${componentPath}.availability`);
+    const unsupported: JsonObject[] = [];
+    const targetKeys: string[] = [];
+    boundedArrayAt(component.targets, `${componentPath}.targets`, 128)
+      .forEach((targetEntry, targetIndex) => {
+        const targetPath = `${componentPath}.targets[${targetIndex}]`;
+        const target = objectAt(targetEntry, targetPath);
+        exactKeysAt(target, [
+          'command', 'command_target_id', 'operation_capability_id', 'presentation',
+        ], targetPath);
+        const commandTargetId = stringAt(target.command_target_id, `${targetPath}.command_target_id`);
+        const operationCapabilityId = stringAt(
+          target.operation_capability_id,
+          `${targetPath}.operation_capability_id`,
+        );
+        targetKeys.push(JSON.stringify([commandTargetId, operationCapabilityId]));
+        const presentation = stringAt(target.presentation, `${targetPath}.presentation`);
+        if (presentation === 'unsupported') {
+          if (target.command !== null) return fail(`${targetPath}.command`, 'null');
+          unsupported.push({
+            command_target_id: commandTargetId,
+            operation_capability_id: operationCapabilityId,
+          });
+          return;
+        }
+        const command = objectAt(target.command, `${targetPath}.command`);
+        const manual = objectAt(command.manual_control, `${targetPath}.command.manual_control`);
+        exactKeysAt(manual, [
+          'program_binding_id', 'program_id', 'program_revision', 'program_run_id',
+        ], `${targetPath}.command.manual_control`);
+        const commandFields = { ...command };
+        delete commandFields.manual_control;
+        const addressed = {
+          ...commandFields,
+          ...manual,
+          controllable_component_id: componentId,
+          command_target_id: commandTargetId,
+          operation_capability_id: operationCapabilityId,
+        };
+        if (presentation === 'motion') {
+          exactKeysAt(command, [
+            'base_frame_role_id', 'component_role_id', 'frame_role_ids', 'joints',
+            'manual_control', 'planning_capability_ids', 'target_descriptor',
+            'target_role_id', 'tcp_frame_role_id',
+          ], `${targetPath}.command`);
+          motionRows.push({
+            ...addressed,
+            observed_state: observationFor(componentId, target, 'joint_positions', targetPath),
+          });
+        } else if (presentation === 'gripper') {
+          exactKeysAt(command, [
+            'command_schema_id', 'command_schema_revision', 'component_role_id',
+            'manual_control', 'resource', 'target_descriptor', 'target_role_id',
+          ], `${targetPath}.command`);
+          gripperRows.push({
+            ...addressed,
+            observed_state: observationFor(componentId, target, 'coordinate', targetPath),
+          });
+        } else {
+          return fail(`${targetPath}.presentation`, 'motion, gripper, or unsupported');
+        }
+      });
+    if (targetKeys.some((key, index) => index > 0 && targetKeys[index - 1] >= key)) {
+      return fail(`${componentPath}.targets`, 'unique targets sorted by target and capability');
+    }
+    normalizedComponents.push({
+      controllable_component_id: componentId,
+      command_eligible: availability.command_eligible,
+      reason: availability.reason,
+      unsupported_targets: unsupported,
+    });
+  });
+  if (observedByKey.size !== 0) {
+    return fail(
+      'executionControlState.control_state.observed_targets',
+      'observations only for commandable addressed targets',
+    );
+  }
   const identity = targetIdentity;
-  const allowedProgramRuns = new Set([
-    ...motionTargetRows.map((target, index) => stringAt(
-      target.program_run_id,
-      `executionTargets.targets.direct_control_targets[${index}].program_run_id`,
-    )),
-    ...gripperTargetRows.map((target, index) => stringAt(
-      target.program_run_id,
-      `executionTargets.targets.direct_control_gripper_targets[${index}].program_run_id`,
-    )),
-  ]);
+  const allowedProgramRuns = new Set([...motionRows, ...gripperRows].map((row, index) => stringAt(
+    row.program_run_id,
+    `executionTargets.targets.program_run_id[${index}]`,
+  )));
   const manualRows = arrayAt(
     control.manual_operations,
     'executionControlState.control_state.manual_operations',
@@ -8730,7 +8908,7 @@ export function parseExecutionControlStatus(
       'unique operation and manual-target identities',
     );
   }
-  const status = parseExecutionOwnerStatus({
+  const status = normalizedOwnerStatusAt({
     api_version: 'manyforge.execution_command_response.v1',
     command: 'status',
     ok: true,
@@ -8738,29 +8916,37 @@ export function parseExecutionControlStatus(
       active_publication_generation: identity.activePublicationGeneration,
       cell_id: identity.cellId,
       cell_stop_action: control.cell_stop_action,
-      direct_control: motionProjectionRows[0],
-      direct_control_gripper: gripperProjectionRows[0],
-      direct_control_targets: motionProjectionRows,
-      direct_control_gripper_targets: gripperProjectionRows,
+      components: normalizedComponents,
+      // The first addressed targets are only the initial UI selection.
+      direct_control: motionRows[0] ?? null,
+      direct_control_gripper: gripperRows[0] ?? null,
+      direct_control_targets: motionRows,
+      direct_control_gripper_targets: gripperRows,
       graph_revision: identity.graphRevision,
       owner_epoch: identity.ownerEpoch,
       retained_bundle_id: identity.retainedBundleId,
       scene_revision: identity.sceneRevision,
     },
   });
-  const runtimeScaleControl = runtimeScaleControlStatusAt(
-    control.runtime_scale_control,
-    'executionControlState.control_state.runtime_scale_control',
-  );
-  if (runtimeScaleControl.selector.kind === 'singular' && (
-    runtimeScaleControl.selector.programBindingId !== status.directControl.programBindingId
-    || runtimeScaleControl.selector.componentRoleId !== status.directControl.componentRoleId
-    || runtimeScaleControl.selector.targetRoleId !== status.directControl.targetRoleId
-  )) {
-    return fail(
-      'executionControlState.control_state.runtime_scale_control.selector',
-      'the exact direct-control motion target',
+  // Null when no motion target supports scaling (for example gripper-only).
+  const runtimeScaleControl = control.runtime_scale_control === null
+    ? null
+    : runtimeScaleControlStatusAt(
+      control.runtime_scale_control,
+      'executionControlState.control_state.runtime_scale_control',
     );
+  if (runtimeScaleControl !== null && runtimeScaleControl.selector.kind === 'singular') {
+    const selector = runtimeScaleControl.selector;
+    if (!status.directControlTargets.some((target) => (
+      selector.programBindingId === target.programBindingId
+      && selector.componentRoleId === target.componentRoleId
+      && selector.targetRoleId === target.targetRoleId
+    ))) {
+      return fail(
+        'executionControlState.control_state.runtime_scale_control.selector',
+        'an addressed direct-control motion target',
+      );
+    }
   }
   return {
     ...status,
@@ -8769,15 +8955,15 @@ export function parseExecutionControlStatus(
   };
 }
 
-export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus {
-  const envelope = objectAt(value, 'executionStatus');
-  if (
-    booleanAt(envelope.ok, 'executionStatus.ok') !== true
-    || stringAt(envelope.command, 'executionStatus.command') !== 'status'
-  ) {
-    return fail('executionStatus', 'a successful status response');
-  }
-  const status = objectAt(envelope.status, 'executionStatus.status');
+/**
+ * One addressed direct-control motion target and its observation (internal
+ * normalized shape; the wire contract is execution_targets.v3/control v6).
+ */
+function directControlMotionAt(value: unknown): {
+  directControl: DirectControlMotionStatus;
+  observedMotion: ObservedMotionTarget | null;
+} {
+  const status: JsonObject = { direct_control: value };
   const direct = objectAt(
     status.direct_control,
     'executionStatus.status.direct_control',
@@ -8842,65 +9028,166 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
     direct.command_target_id,
     'executionStatus.status.direct_control.command_target_id',
   );
-  const observed = objectAt(
-    direct.observed_state,
-    'executionStatus.status.direct_control.observed_state',
-  );
-  exactKeysAt(observed, [
-    'complete',
-    'current_tcp_pose',
-    'positions_rad',
-    'sequence',
-    'source_epoch',
-    'source_joint_names',
-  ], 'executionStatus.status.direct_control.observed_state');
-  const observedNames = stringArrayAt(
-    observed.source_joint_names,
-    'executionStatus.observedMotion.joint_names',
-  );
-  const positions = arrayAt(
-    observed.positions_rad,
-    'executionStatus.observedMotion.positions_rad',
-  ).map((item, index) => numberAt(
-    item,
-    `executionStatus.observedMotion.positions_rad[${index}]`,
-  ));
-  if (
-    observedNames.length !== sourceNames.length
-    || observedNames.some((name, index) => name !== sourceNames[index])
-    || positions.length !== sourceNames.length
-  ) {
-    return fail(
-      'executionStatus.observedMotion',
-      'the exact source-local direct-control joint order',
+  // Null until the owner has an authoritative observation (IF.2).
+  let observedMotion: ObservedMotionTarget | null = null;
+  if (direct.observed_state !== null) {
+    const observed = objectAt(
+      direct.observed_state,
+      'executionStatus.status.direct_control.observed_state',
     );
+    exactKeysAt(observed, [
+      'complete',
+      'current_tcp_pose',
+      'positions_rad',
+      'sequence',
+      'source_epoch',
+      'source_joint_names',
+    ], 'executionStatus.status.direct_control.observed_state');
+    const observedNames = stringArrayAt(
+      observed.source_joint_names,
+      'executionStatus.observedMotion.joint_names',
+    );
+    const positions = arrayAt(
+      observed.positions_rad,
+      'executionStatus.observedMotion.positions_rad',
+    ).map((item, index) => numberAt(
+      item,
+      `executionStatus.observedMotion.positions_rad[${index}]`,
+    ));
+    if (
+      observedNames.length !== sourceNames.length
+      || observedNames.some((name, index) => name !== sourceNames[index])
+      || positions.length !== sourceNames.length
+    ) {
+      return fail(
+        'executionStatus.observedMotion',
+        'the exact source-local direct-control joint order',
+      );
+    }
+    observedMotion = {
+      targetRoleId: stringAt(
+        direct.target_role_id,
+        'executionStatus.status.direct_control.target_role_id',
+      ),
+      controllableComponentId: componentId,
+      commandTargetId: targetId,
+      sequence: integerAt(
+        observed.sequence,
+        'executionStatus.observedMotion.sequence',
+      ),
+      sourceEpoch: stringAt(
+        observed.source_epoch,
+        'executionStatus.observedMotion.source_epoch',
+      ),
+      sourceJointNames: observedNames,
+      positionsRad: positions,
+      complete: booleanAt(
+        observed.complete,
+        'executionStatus.observedMotion.complete',
+      ),
+      currentTcpPose: poseAt(
+        observed.current_tcp_pose,
+        'executionStatus.observedMotion.current_tcp_pose',
+      ),
+    };
   }
-  const observedMotion: ObservedMotionTarget = {
-    targetRoleId: stringAt(
-      direct.target_role_id,
-      'executionStatus.status.direct_control.target_role_id',
-    ),
-    controllableComponentId: componentId,
-    commandTargetId: targetId,
-    sequence: integerAt(
-      observed.sequence,
-      'executionStatus.observedMotion.sequence',
-    ),
-    sourceEpoch: stringAt(
-      observed.source_epoch,
-      'executionStatus.observedMotion.source_epoch',
-    ),
-    sourceJointNames: observedNames,
-    positionsRad: positions,
-    complete: booleanAt(
-      observed.complete,
-      'executionStatus.observedMotion.complete',
-    ),
-    currentTcpPose: poseAt(
-      observed.current_tcp_pose,
-      'executionStatus.observedMotion.current_tcp_pose',
-    ),
+  const frameRoleIds = stringArrayAt(
+    direct.frame_role_ids,
+    'executionStatus.status.direct_control.frame_role_ids',
+  );
+  const planningCapabilityIds = stringArrayAt(
+    direct.planning_capability_ids,
+    'executionStatus.status.direct_control.planning_capability_ids',
+  );
+  const descriptorFrameRoleIds = motionDescriptor.frames.map(
+    (frame) => frame.frameRoleId,
+  );
+  const descriptorSupportingCapabilityIds = motionDescriptor.contracts
+    .supportingProviders.map((provider) => provider.capabilityId);
+  if (
+    motionDescriptor.controllableComponentId !== componentId
+    || motionDescriptor.commandTargetId !== targetId
+    || motionDescriptor.componentRoleId !== direct.component_role_id
+    || motionDescriptor.targetRoleId !== direct.target_role_id
+    || motionDescriptor.contracts.operationCapabilityId !== direct.operation_capability_id
+    || frameRoleIds.length !== descriptorFrameRoleIds.length
+    || frameRoleIds.some((role, index) => role !== descriptorFrameRoleIds[index])
+    || planningCapabilityIds.length !== descriptorSupportingCapabilityIds.length
+    || planningCapabilityIds.some(
+      (capability, index) => capability !== descriptorSupportingCapabilityIds[index],
+    )
+    || motionDescriptor.joints.length !== joints.length
+    || motionDescriptor.joints.some((joint, index) => {
+      const statusJoint = joints[index];
+      return statusJoint === undefined
+        || joint.sourceJointName !== statusJoint.sourceJointName
+        || joint.minPositionRad !== statusJoint.minPositionRad
+        || joint.maxPositionRad !== statusJoint.maxPositionRad
+        || joint.maxVelocityRadS !== statusJoint.maxVelocityRadS
+        || joint.maxAccelerationRadS2 !== statusJoint.maxAccelerationRadS2;
+    })
+  ) {
+    return fail('executionStatus.status.direct_control', 'descriptors joined to the exact addressed targets');
+  }
+  return {
+    directControl: {
+      controllableComponentId: componentId,
+      commandTargetId: targetId,
+      componentRoleId: stringAt(
+        direct.component_role_id,
+        'executionStatus.status.direct_control.component_role_id',
+      ),
+      targetRoleId: stringAt(
+        direct.target_role_id,
+        'executionStatus.status.direct_control.target_role_id',
+      ),
+      baseFrameRoleId: stringAt(
+        direct.base_frame_role_id,
+        'executionStatus.status.direct_control.base_frame_role_id',
+      ),
+      tcpFrameRoleId: stringAt(
+        direct.tcp_frame_role_id,
+        'executionStatus.status.direct_control.tcp_frame_role_id',
+      ),
+      operationCapabilityId: stringAt(
+        direct.operation_capability_id,
+        'executionStatus.status.direct_control.operation_capability_id',
+      ),
+      planningCapabilityIds,
+      frameRoleIds,
+      programId: stringAt(
+        direct.program_id,
+        'executionStatus.status.direct_control.program_id',
+      ),
+      programRevision: stringAt(
+        direct.program_revision,
+        'executionStatus.status.direct_control.program_revision',
+      ),
+      programBindingId: stringAt(
+        direct.program_binding_id,
+        'executionStatus.status.direct_control.program_binding_id',
+      ),
+      programRunId: stringAt(
+        direct.program_run_id,
+        'executionStatus.status.direct_control.program_run_id',
+      ),
+      joints,
+      targetDescriptor: motionDescriptor,
+        },
+    observedMotion,
   };
+}
+
+/**
+ * The addressed direct-control gripper, or null for an arm-only component
+ * that has no gripper target at all (never a placeholder).
+ */
+function directControlGripperAt(value: unknown): {
+  directControlGripper: DirectControlGripperStatus | null;
+  observedGripper: ObservedGripperTarget | null;
+} {
+  if (value === null) return { directControlGripper: null, observedGripper: null };
+  const status: JsonObject = { direct_control_gripper: value };
   const directGripper = objectAt(
     status.direct_control_gripper,
     'executionStatus.status.direct_control_gripper',
@@ -9053,6 +9340,139 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
       ),
     };
   }
+  if (
+    gripperDescriptor.controllableComponentId !== directGripper.controllable_component_id
+    || gripperDescriptor.commandTargetId !== directGripper.command_target_id
+    || gripperDescriptor.componentRoleId !== directGripper.component_role_id
+    || gripperDescriptor.targetRoleId !== directGripper.target_role_id
+    || gripperDescriptor.sourceCoordinateName !== gripperSourceName
+    || gripperDescriptor.sourceKind !== sourceKind
+    || gripperDescriptor.coordinateKind !== coordinateKind
+    || gripperDescriptor.minPosition !== gripperMin
+    || gripperDescriptor.maxPosition !== gripperMax
+    || gripperDescriptor.contracts.operationCapabilityId !== directGripper.operation_capability_id
+    || gripperDescriptor.contracts.commandSchema?.commandSchemaId !== directGripper.command_schema_id
+    || gripperDescriptor.contracts.commandSchema?.commandSchemaRevision !== directGripper.command_schema_revision
+  ) {
+    return fail(
+      'executionStatus.status.direct_control_gripper',
+      'descriptors joined to the exact addressed gripper target',
+    );
+  }
+  return {
+    directControlGripper: {
+      controllableComponentId: stringAt(
+        directGripper.controllable_component_id,
+        'executionStatus.status.direct_control_gripper.controllable_component_id',
+      ),
+      commandTargetId: stringAt(
+        directGripper.command_target_id,
+        'executionStatus.status.direct_control_gripper.command_target_id',
+      ),
+      componentRoleId: stringAt(
+        directGripper.component_role_id,
+        'executionStatus.status.direct_control_gripper.component_role_id',
+      ),
+      targetRoleId: stringAt(
+        directGripper.target_role_id,
+        'executionStatus.status.direct_control_gripper.target_role_id',
+      ),
+      operationCapabilityId: stringAt(
+        directGripper.operation_capability_id,
+        'executionStatus.status.direct_control_gripper.operation_capability_id',
+      ),
+      programId: stringAt(
+        directGripper.program_id,
+        'executionStatus.status.direct_control_gripper.program_id',
+      ),
+      programRevision: stringAt(
+        directGripper.program_revision,
+        'executionStatus.status.direct_control_gripper.program_revision',
+      ),
+      programBindingId: stringAt(
+        directGripper.program_binding_id,
+        'executionStatus.status.direct_control_gripper.program_binding_id',
+      ),
+      programRunId: stringAt(
+        directGripper.program_run_id,
+        'executionStatus.status.direct_control_gripper.program_run_id',
+      ),
+      commandSchemaId: stringAt(
+        directGripper.command_schema_id,
+        'executionStatus.status.direct_control_gripper.command_schema_id',
+      ),
+      commandSchemaRevision: stringAt(
+        directGripper.command_schema_revision,
+        'executionStatus.status.direct_control_gripper.command_schema_revision',
+      ),
+      sourceCoordinateName: gripperSourceName,
+      sourceKind: sourceKind as ResourceSourceKind,
+      coordinateKind: coordinateKind as CoordinateKind,
+      minPosition: gripperMin,
+      maxPosition: gripperMax,
+      targetDescriptor: gripperDescriptor,
+        },
+    observedGripper,
+  };
+}
+
+/**
+ * Aggregate status/diagnostics (`manyforge.execution_status.v2`, H1a-IF.2):
+ * a pure composition of one owner snapshot's identity.v2, targets.v3 and
+ * control_state.v6 payloads, normalized exactly like the separate commands.
+ */
+export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus {
+  const envelope = objectAt(value, 'executionStatus');
+  exactKeysAt(envelope, ['api_version', 'command', 'ok', 'status'], 'executionStatus');
+  if (
+    stringAt(envelope.api_version, 'executionStatus.api_version')
+      !== 'manyforge.execution_command_response.v1'
+    || booleanAt(envelope.ok, 'executionStatus.ok') !== true
+    || stringAt(envelope.command, 'executionStatus.command') !== 'status'
+  ) {
+    return fail('executionStatus', 'a successful status response');
+  }
+  const status = objectAt(envelope.status, 'executionStatus.status');
+  exactKeysAt(status, [
+    'control_state', 'identity', 'schema_version', 'targets',
+  ], 'executionStatus.status');
+  if (stringAt(status.schema_version, 'executionStatus.status.schema_version')
+    !== 'manyforge.execution_status.v2') {
+    return fail('executionStatus.status.schema_version', 'manyforge.execution_status.v2');
+  }
+  return parseExecutionControlStatus({
+    api_version: 'manyforge.execution_command_response.v1',
+    command: 'targets',
+    identity: status.identity,
+    ok: true,
+    targets: status.targets,
+  }, {
+    api_version: 'manyforge.execution_command_response.v1',
+    command: 'control_state',
+    control_state: status.control_state,
+    identity: status.identity,
+    ok: true,
+  });
+}
+
+/** Internal normalized owner status; not a wire contract. */
+function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
+  const envelope = objectAt(value, 'executionStatus');
+  if (
+    booleanAt(envelope.ok, 'executionStatus.ok') !== true
+    || stringAt(envelope.command, 'executionStatus.command') !== 'status'
+  ) {
+    return fail('executionStatus', 'a successful status response');
+  }
+  const status = objectAt(envelope.status, 'executionStatus.status');
+  // Null exactly for a component without motion capability (H1a-IF.2).
+  const motion = status.direct_control === null
+    ? null
+    : directControlMotionAt(status.direct_control);
+  // Null exactly for an arm-only component (no gripper target).
+  const { directControlGripper, observedGripper } = directControlGripperAt(
+    status.direct_control_gripper,
+  );
   const certificateRefAt = (input: unknown, path: string) => {
     const record = objectAt(input, path);
     exactKeysAt(record, [
@@ -9223,57 +9643,66 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
         : certificateRefAt(fault.certificate, `${path}.certificate`),
     };
   }
-  const frameRoleIds = stringArrayAt(
-    direct.frame_role_ids,
-    'executionStatus.status.direct_control.frame_role_ids',
-  );
-  const planningCapabilityIds = stringArrayAt(
-    direct.planning_capability_ids,
-    'executionStatus.status.direct_control.planning_capability_ids',
-  );
-  const descriptorFrameRoleIds = motionDescriptor.frames.map(
-    (frame) => frame.frameRoleId,
-  );
-  const descriptorSupportingCapabilityIds = motionDescriptor.contracts
-    .supportingProviders.map((provider) => provider.capabilityId);
-  if (
-    motionDescriptor.controllableComponentId !== componentId
-    || motionDescriptor.commandTargetId !== targetId
-    || motionDescriptor.componentRoleId !== direct.component_role_id
-    || motionDescriptor.targetRoleId !== direct.target_role_id
-    || gripperDescriptor.controllableComponentId !== directGripper.controllable_component_id
-    || gripperDescriptor.commandTargetId !== directGripper.command_target_id
-    || gripperDescriptor.componentRoleId !== directGripper.component_role_id
-    || gripperDescriptor.targetRoleId !== directGripper.target_role_id
-    || gripperDescriptor.sourceCoordinateName !== gripperSourceName
-    || gripperDescriptor.sourceKind !== sourceKind
-    || gripperDescriptor.coordinateKind !== coordinateKind
-    || gripperDescriptor.minPosition !== gripperMin
-    || gripperDescriptor.maxPosition !== gripperMax
-    || motionDescriptor.contracts.operationCapabilityId !== direct.operation_capability_id
-    || gripperDescriptor.contracts.operationCapabilityId !== directGripper.operation_capability_id
-    || gripperDescriptor.contracts.commandSchema?.commandSchemaId !== directGripper.command_schema_id
-    || gripperDescriptor.contracts.commandSchema?.commandSchemaRevision !== directGripper.command_schema_revision
-    || frameRoleIds.length !== descriptorFrameRoleIds.length
-    || frameRoleIds.some((role, index) => role !== descriptorFrameRoleIds[index])
-    || planningCapabilityIds.length !== descriptorSupportingCapabilityIds.length
-    || planningCapabilityIds.some(
-      (capability, index) => capability !== descriptorSupportingCapabilityIds[index],
-    )
-    || motionDescriptor.joints.length !== joints.length
-    || motionDescriptor.joints.some((joint, index) => {
-      const statusJoint = joints[index];
-      return statusJoint === undefined
-        || joint.sourceJointName !== statusJoint.sourceJointName
-        || joint.minPositionRad !== statusJoint.minPositionRad
-        || joint.maxPositionRad !== statusJoint.maxPositionRad
-        || joint.maxVelocityRadS !== statusJoint.maxVelocityRadS
-        || joint.maxAccelerationRadS2 !== statusJoint.maxAccelerationRadS2;
-    })
-  ) {
-    return fail('executionStatus.status.direct_control', 'descriptors joined to the exact addressed targets');
+  // Every addressed target is parsed on its own: a gripper never needs a
+  // motion target on the same component, and neither needs the other.
+  const motionEntries = arrayAt(
+    status.direct_control_targets,
+    'executionStatus.status.direct_control_targets',
+  ).map((entry) => directControlMotionAt(entry));
+  const gripperEntries = arrayAt(
+    status.direct_control_gripper_targets,
+    'executionStatus.status.direct_control_gripper_targets',
+  ).map((entry) => directControlGripperAt(entry));
+  const directControlTargets = motionEntries.map((entry) => entry.directControl);
+  const directControlGripperTargets = gripperEntries
+    .map((entry) => entry.directControlGripper)
+    .filter((entry): entry is DirectControlGripperStatus => entry !== null);
+  const targetKey = (target: {
+    controllableComponentId: string;
+    commandTargetId: string;
+    operationCapabilityId: string;
+  }) => `${target.controllableComponentId}\u0000${target.commandTargetId}\u0000${target.operationCapabilityId}`;
+  const targetKeys = [
+    ...directControlTargets.map(targetKey),
+    ...directControlGripperTargets.map(targetKey),
+  ];
+  if (new Set(targetKeys).size !== targetKeys.length) {
+    return fail(
+      'executionStatus.status.direct_control_targets',
+      'unique component/target/capability identities',
+    );
   }
-  const parsedStatus: ExecutionOwnerStatus = {
+  // A selected alias must be one of the addressed targets, never extra.
+  if ((motion !== null && !targetKeys.includes(targetKey(motion.directControl)))
+    || (directControlGripper !== null
+      && !targetKeys.includes(targetKey(directControlGripper)))) {
+    return fail(
+      'executionStatus.status.direct_control',
+      'a selected target that is one of the addressed targets',
+    );
+  }
+  const components = executionComponentsAt(
+    status.components,
+    'executionStatus.status.components',
+  );
+  const componentIds = new Set(components.map((component) => component.controllableComponentId));
+  if ([...directControlTargets, ...directControlGripperTargets]
+    .some((target) => !componentIds.has(target.controllableComponentId))) {
+    return fail(
+      'executionStatus.status.components',
+      'every addressed target owned by a listed component',
+    );
+  }
+  const observedGrippers = gripperEntries
+    .map((entry) => (
+      entry.observedGripper === null || entry.directControlGripper === null ? null : {
+        ...entry.observedGripper,
+        targetRoleId: entry.directControlGripper.targetRoleId,
+        controllableComponentId: entry.directControlGripper.controllableComponentId,
+        commandTargetId: entry.directControlGripper.commandTargetId,
+      }))
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+  return {
     ownerEpoch: stringAt(status.owner_epoch, 'executionStatus.status.owner_epoch'),
     cellId: stringAt(status.cell_id, 'executionStatus.status.cell_id'),
     activePublicationGeneration: positiveIntegerAt(
@@ -9292,104 +9721,17 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
       status.scene_revision,
       'executionStatus.status.scene_revision',
     ),
-    directControl: {
-      controllableComponentId: componentId,
-      commandTargetId: targetId,
-      componentRoleId: stringAt(
-        direct.component_role_id,
-        'executionStatus.status.direct_control.component_role_id',
-      ),
-      targetRoleId: stringAt(
-        direct.target_role_id,
-        'executionStatus.status.direct_control.target_role_id',
-      ),
-      baseFrameRoleId: stringAt(
-        direct.base_frame_role_id,
-        'executionStatus.status.direct_control.base_frame_role_id',
-      ),
-      tcpFrameRoleId: stringAt(
-        direct.tcp_frame_role_id,
-        'executionStatus.status.direct_control.tcp_frame_role_id',
-      ),
-      operationCapabilityId: stringAt(
-        direct.operation_capability_id,
-        'executionStatus.status.direct_control.operation_capability_id',
-      ),
-      planningCapabilityIds,
-      frameRoleIds,
-      programId: stringAt(
-        direct.program_id,
-        'executionStatus.status.direct_control.program_id',
-      ),
-      programRevision: stringAt(
-        direct.program_revision,
-        'executionStatus.status.direct_control.program_revision',
-      ),
-      programBindingId: stringAt(
-        direct.program_binding_id,
-        'executionStatus.status.direct_control.program_binding_id',
-      ),
-      programRunId: stringAt(
-        direct.program_run_id,
-        'executionStatus.status.direct_control.program_run_id',
-      ),
-      joints,
-      targetDescriptor: motionDescriptor,
-    },
-    directControlGripper: {
-      controllableComponentId: stringAt(
-        directGripper.controllable_component_id,
-        'executionStatus.status.direct_control_gripper.controllable_component_id',
-      ),
-      commandTargetId: stringAt(
-        directGripper.command_target_id,
-        'executionStatus.status.direct_control_gripper.command_target_id',
-      ),
-      componentRoleId: stringAt(
-        directGripper.component_role_id,
-        'executionStatus.status.direct_control_gripper.component_role_id',
-      ),
-      targetRoleId: stringAt(
-        directGripper.target_role_id,
-        'executionStatus.status.direct_control_gripper.target_role_id',
-      ),
-      operationCapabilityId: stringAt(
-        directGripper.operation_capability_id,
-        'executionStatus.status.direct_control_gripper.operation_capability_id',
-      ),
-      programId: stringAt(
-        directGripper.program_id,
-        'executionStatus.status.direct_control_gripper.program_id',
-      ),
-      programRevision: stringAt(
-        directGripper.program_revision,
-        'executionStatus.status.direct_control_gripper.program_revision',
-      ),
-      programBindingId: stringAt(
-        directGripper.program_binding_id,
-        'executionStatus.status.direct_control_gripper.program_binding_id',
-      ),
-      programRunId: stringAt(
-        directGripper.program_run_id,
-        'executionStatus.status.direct_control_gripper.program_run_id',
-      ),
-      commandSchemaId: stringAt(
-        directGripper.command_schema_id,
-        'executionStatus.status.direct_control_gripper.command_schema_id',
-      ),
-      commandSchemaRevision: stringAt(
-        directGripper.command_schema_revision,
-        'executionStatus.status.direct_control_gripper.command_schema_revision',
-      ),
-      sourceCoordinateName: gripperSourceName,
-      sourceKind: sourceKind as ResourceSourceKind,
-      coordinateKind: coordinateKind as CoordinateKind,
-      minPosition: gripperMin,
-      maxPosition: gripperMax,
-      targetDescriptor: gripperDescriptor,
-    },
-    observedMotion,
+    components,
+    directControl: motion?.directControl ?? null,
+    directControlGripper,
+    directControlTargets,
+    directControlGripperTargets,
+    observedMotion: motion?.observedMotion ?? null,
     observedGripper,
+    observedMotions: motionEntries
+      .map((entry) => entry.observedMotion)
+      .filter((entry): entry is ObservedMotionTarget => entry !== null),
+    observedGrippers,
     manualOperations: [],
     runtimeScaleControl: null,
     cellStopAction: {
@@ -9403,89 +9745,52 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
       fault: cellStopFault,
     },
   };
-  const hasMotionInventory = status.direct_control_targets !== undefined;
-  const hasGripperInventory = status.direct_control_gripper_targets !== undefined;
-  if (hasMotionInventory !== hasGripperInventory) {
-    return fail(
-      'executionStatus.status.direct_control_targets',
-      'motion and gripper inventories published together',
-    );
-  }
-  if (!hasMotionInventory) return parsedStatus;
+}
 
-  const motionTargetEntries = arrayAt(
-    status.direct_control_targets,
-    'executionStatus.status.direct_control_targets',
-  ).map((value, index) => objectAt(
-    value,
-    `executionStatus.status.direct_control_targets[${index}]`,
-  ));
-  const gripperTargetEntries = arrayAt(
-    status.direct_control_gripper_targets,
-    'executionStatus.status.direct_control_gripper_targets',
-  ).map((value, index) => objectAt(
-    value,
-    `executionStatus.status.direct_control_gripper_targets[${index}]`,
-  ));
-  if (motionTargetEntries.length === 0 || gripperTargetEntries.length === 0) {
-    return fail(
-      'executionStatus.status.direct_control_targets',
-      'at least one addressed motion and gripper target',
-    );
-  }
-  const gripperForMotion = (motionTarget: JsonObject, index: number): JsonObject => {
-    const addressedComponentId = stringAt(
-      motionTarget.controllable_component_id,
-      `executionStatus.status.direct_control_targets[${index}].controllable_component_id`,
-    );
-    const matches = gripperTargetEntries.filter((candidate) => (
-      candidate.controllable_component_id === addressedComponentId
-    ));
-    if (matches.length !== 1) {
-      return fail(
-        `executionStatus.status.direct_control_targets[${index}]`,
-        'exactly one attached gripper target for its component',
-      );
+/** Components listed by the owner, including present but ineligible ones. */
+function executionComponentsAt(value: unknown, path: string): ExecutionComponentStatus[] {
+  const components = boundedArrayAt(value, path, 128).map((entry, index) => {
+    const rowPath = `${path}[${index}]`;
+    const row = objectAt(entry, rowPath);
+    exactKeysAt(row, [
+      'command_eligible', 'controllable_component_id', 'reason', 'unsupported_targets',
+    ], rowPath);
+    const commandEligible = booleanAt(row.command_eligible, `${rowPath}.command_eligible`);
+    const unavailableReason = nullableStringAt(row.reason, `${rowPath}.reason`);
+    if (commandEligible !== (unavailableReason === null)) {
+      return fail(`${rowPath}.reason`, 'a refusal reason exactly when ineligible');
     }
-    return matches[0];
-  };
-  const parsedInventory = motionTargetEntries.map((motionTarget, index) => {
-    const nestedStatus = { ...status };
-    delete nestedStatus.direct_control_targets;
-    delete nestedStatus.direct_control_gripper_targets;
-    nestedStatus.direct_control = motionTarget;
-    nestedStatus.direct_control_gripper = gripperForMotion(motionTarget, index);
-    return parseExecutionOwnerStatus({ ...envelope, status: nestedStatus });
+    return {
+      controllableComponentId: stringAt(
+        row.controllable_component_id,
+        `${rowPath}.controllable_component_id`,
+      ),
+      commandEligible,
+      unavailableReason,
+      unsupportedTargets: boundedArrayAt(
+        row.unsupported_targets,
+        `${rowPath}.unsupported_targets`,
+        128,
+      ).map((target, targetIndex) => {
+        const targetPath = `${rowPath}.unsupported_targets[${targetIndex}]`;
+        const record = objectAt(target, targetPath);
+        exactKeysAt(record, ['command_target_id', 'operation_capability_id'], targetPath);
+        return {
+          commandTargetId: stringAt(record.command_target_id, `${targetPath}.command_target_id`),
+          operationCapabilityId: stringAt(
+            record.operation_capability_id,
+            `${targetPath}.operation_capability_id`,
+          ),
+        };
+      }),
+    };
   });
-  const targetKeys = parsedInventory.map((entry) => (
-    `${entry.directControl.controllableComponentId}\u0000${entry.directControl.commandTargetId}`
-  ));
-  if (new Set(targetKeys).size !== targetKeys.length) {
-    return fail(
-      'executionStatus.status.direct_control_targets',
-      'unique addressed component/target identities',
-    );
+  const ids = components.map((component) => component.controllableComponentId);
+  if (new Set(ids).size !== ids.length
+    || ids.some((id, index) => index > 0 && ids[index - 1] >= id)) {
+    return fail(path, 'unique components sorted by id');
   }
-  const directControlTargets = parsedInventory.map((entry) => entry.directControl);
-  const directControlGripperTargets = parsedInventory.map(
-    (entry) => entry.directControlGripper,
-  );
-  const observedMotions = parsedInventory.map((entry) => entry.observedMotion);
-  const observedGrippers = parsedInventory
-    .map((entry) => entry.observedGripper === null ? null : {
-      ...entry.observedGripper,
-      targetRoleId: entry.directControlGripper.targetRoleId,
-      controllableComponentId: entry.directControlGripper.controllableComponentId,
-      commandTargetId: entry.directControlGripper.commandTargetId,
-    })
-    .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-  return {
-    ...parsedStatus,
-    directControlTargets,
-    directControlGripperTargets,
-    observedMotions,
-    observedGrippers,
-  };
+  return components;
 }
 
 function poseAt(value: unknown, path: string): MotionPreviewReceipt['finalTcpPose'] {

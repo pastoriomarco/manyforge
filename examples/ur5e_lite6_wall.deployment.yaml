@@ -1385,11 +1385,11 @@
         "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/7016c53470a155760287cdd2186a783a2185d63bb3ac2e455e49f1d80130a00b",
-        "content_digest": "sha256:252fe4b63a9acff6a82807ea5a996ee185a632c99260a791fe4864caf512156f",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
+        "content_digest": "sha256:39b4dfb0332d1ce0f100057b916a0aa2825fb4c446b0b1c092bdd519e1e8cd2e",
         "record_id": "manyforge.native_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:7016c53470a155760287cdd2186a783a2185d63bb3ac2e455e49f1d80130a00b",
+        "record_revision": "sha256:a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1428,7 +1428,7 @@
     ]
   },
   "deployment_artifact_id": "ur5e_lite6_wall",
-  "deployment_revision": "sha256:5bdec35cadb9cf844f03efa46e2400d83988d1106cf15bbf2a7c8ce2dc6547e3",
+  "deployment_revision": "sha256:72667ace062c39078b0dc3d2d85a91106525d78487c6c2cb02bc572c146e8e42",
   "description": "Minimal native UR5e and Lite6 qualification cell derived from the simple ManyMove dual-robot wall layout. The robots plan independently; both are owned by one cell execution Kernel and remain independently planned.",
   "desired_control_configurations": [
     {
@@ -3387,7 +3387,7 @@
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.native_execution_runtime",
-        "runtime_profile_revision": "sha256:7016c53470a155760287cdd2186a783a2185d63bb3ac2e455e49f1d80130a00b",
+        "runtime_profile_revision": "sha256:a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
         "runtime_unit_id": "robot_cell.native_execution"
       }
     ]

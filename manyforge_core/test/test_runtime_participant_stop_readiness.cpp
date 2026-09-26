@@ -174,6 +174,46 @@ TEST(RuntimeParticipantStopReadinessTest, SealsExactReconciledBasePlanJoin) {
             ComponentLifecycleGeneration(9U));
 }
 
+TEST(RuntimeParticipantStopReadinessTest,
+     ProductRebindKeepsStopAndLifecycleFactsButChangesContentIdentity) {
+  const auto base = BasePlan();
+  const auto predecessor = Binding(base);
+  const auto expected_domain = ExpectedDomain(base, predecessor);
+  const auto readiness = VerifyReadiness(
+      base, ComponentLifecycleGeneration(9U), predecessor, predecessor);
+  ASSERT_TRUE(readiness.ok());
+  auto successor_value = predecessor.value();
+  successor_value.retained_bundle_id = RetainedBundleId(
+      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab");
+  successor_value.graph_revision = GraphRevision(
+      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc");
+  const auto successor = verify_runtime_participant_binding(
+      std::move(successor_value));
+  ASSERT_TRUE(successor.ok()) << successor.error().message;
+
+  const auto rebound = rebind_runtime_participant_stop_readiness_product(
+      readiness.value(), predecessor, successor.value(), expected_domain);
+  ASSERT_TRUE(rebound.ok()) << rebound.error().message;
+  EXPECT_EQ(rebound.value().value().component_lifecycle_generation,
+            ComponentLifecycleGeneration(9U));
+  EXPECT_EQ(rebound.value().value().resolved_stop_base_plan.retained_bundle_id,
+            successor.value().value().retained_bundle_id);
+  EXPECT_EQ(rebound.value().value().resolved_stop_base_plan.graph_revision,
+            successor.value().value().graph_revision);
+  EXPECT_NE(rebound.value().value().resolved_stop_base_plan.resolved_stop_base_plan_id,
+            base.resolved_stop_base_plan_id);
+
+  auto changed_route = successor.value().value();
+  changed_route.control_path->control_route_id = ControlRouteId("route.changed");
+  const auto changed = verify_runtime_participant_binding(std::move(changed_route));
+  ASSERT_TRUE(changed.ok()) << changed.error().message;
+  const auto refused = rebind_runtime_participant_stop_readiness_product(
+      readiness.value(), predecessor, changed.value(), expected_domain);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"),
+            "runtime_participant_stop_product_rebind_changes_controller");
+}
+
 TEST(RuntimeParticipantStopReadinessTest, RejectsSelfAttestedControllerDomainSubstitution) {
   const auto base = BasePlan();
   const auto binding = Binding(base);

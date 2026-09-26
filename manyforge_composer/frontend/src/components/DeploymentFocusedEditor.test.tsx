@@ -174,7 +174,7 @@ describe('DeploymentFocusedEditor', () => {
     };
     value.workspace!.draft.deploymentRevision = null;
     value.workspace!.draft.graphRevision = null;
-    const descriptor = statusFixture().directControl.targetDescriptor;
+    const descriptor = statusFixture().directControl!.targetDescriptor;
     descriptor.controllableComponentId = 'robot';
     descriptor.commandTargetId = 'arm';
     descriptor.operationalLimit = { maximumTcpLinearSpeedMps: 0.15 };
@@ -211,7 +211,7 @@ describe('DeploymentFocusedEditor', () => {
         ...(imported === null ? {} : { imported: { enabled: true, maximum_rad_s3: imported } }),
       }],
     };
-    const descriptor = statusFixture().directControl.targetDescriptor;
+    const descriptor = statusFixture().directControl!.targetDescriptor;
     descriptor.controllableComponentId = 'robot';
     descriptor.operationalLimit = {
       maximumTcpLinearSpeedMps: 0.15,
@@ -236,7 +236,7 @@ describe('DeploymentFocusedEditor', () => {
       command_target_id: 'arm', source_joint_name: 'joint1', max_jerk_rad_s3: 8 }];
     const targets = configuration.motion_target_limits as Array<Record<string, unknown>>;
     targets[0].ordinary_motion_jerk = { enabled: true, preset_reference_time_s: 1, joint_limits: [] };
-    const descriptor = statusFixture().directControl.targetDescriptor;
+    const descriptor = statusFixture().directControl!.targetDescriptor;
     descriptor.controllableComponentId = 'robot';
     descriptor.ordinaryJerk = { enabled: true, presetReferenceTimeS: 1, jointLimits: [{
       sourceJointName: 'joint1', source: 'preset', maximumRadS3: 12, presetRadS3: 12, imported: null,
@@ -264,7 +264,7 @@ describe('DeploymentFocusedEditor', () => {
       controllable_component_id: 'robot-b', command_target_id: 'arm',
       maximum_tcp_linear_speed_mps: 0.25,
     });
-    const descriptor = statusFixture().directControl.targetDescriptor;
+    const descriptor = statusFixture().directControl!.targetDescriptor;
     descriptor.controllableComponentId = 'robot-b';
     const unrelatedDescriptor = { ...descriptor, controllableComponentId: 'robot-c' };
     const sourceModel = {
@@ -296,7 +296,7 @@ describe('DeploymentFocusedEditor', () => {
   it('does not show another component model or joint caps for an undescribed target', () => {
     const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={controller()}
       sourceModel={{ status: 'loading' }}
-      motionDescriptors={[statusFixture().directControl.targetDescriptor]} gripperDescriptors={[]} />);
+      motionDescriptors={[statusFixture().directControl!.targetDescriptor]} gripperDescriptors={[]} />);
     expect(markup).toContain('No current motion descriptor for this target.');
     expect(markup).not.toContain('aria-label="Source model joint limits"');
     expect(markup).not.toContain('Robot Control joint caps');

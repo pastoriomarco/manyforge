@@ -12,6 +12,7 @@
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <manyforge_deployment/apply_component_delta.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -22,8 +23,8 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.ua4.v15";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 15;
+    "manyforge.internal.component-manager.apply-journal.h1a.v16";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 16;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -97,7 +98,10 @@ struct ManagerApplyPreparedActivationDTO final {
   manyforge::core::ContentDigest captured_input_digest;
   manyforge::core::DeploymentArtifactId deployment_artifact_id;
   manyforge::core::DeploymentRevision deployment_revision;
-  manyforge::core::ProgramBindingId program_binding_id;
+  /// The candidate Program binding, or absent exactly when the prepared
+  /// activation's typed Program outcome is non-executable (H1a). The receipt
+  /// below carries that outcome; the Program itself is never rewritten.
+  std::optional<manyforge::core::ProgramBindingId> program_binding_id;
   manyforge::core::ContentDigest prepared_activation_id;
   /// Canonical JSON for the complete bounded preparation receipt.  This is
   /// operation input, not a second catalog: it lets observers recover the
@@ -154,16 +158,21 @@ struct ManagerApplyIntentWriteResult final {
   bool inserted;
 };
 
-/// Immutable whole-Apply admission scope derived from sealed bundles.
+/// Immutable whole-Apply admission scope and per-component decision, both
+/// derived from sealed bundles and persisted together before any effect.
 struct ManagerApplyAffectedScopeDTO final {
   manyforge::core::ApplyId apply_id;
   manyforge::core::ApplyGeneration apply_generation;
   manyforge::core::ConfigurationFenceScopeDTO scope;
   manyforge::core::ApplyFenceBusyDispositionDTO busy_disposition;
+  manyforge::deployment::ApplyComponentDeltaDTO component_delta;
 
   [[nodiscard]] bool valid() const noexcept {
     return !apply_id.empty() && apply_generation.nonzero() && scope.valid() &&
-           manyforge::core::IsKnownApplyFenceBusyDisposition(busy_disposition);
+           manyforge::core::IsKnownApplyFenceBusyDisposition(busy_disposition) &&
+           component_delta.valid() &&
+           manyforge::deployment::apply_component_delta_is_fenced(component_delta,
+                                                                 scope);
   }
 
   friend bool operator==(const ManagerApplyAffectedScopeDTO &,

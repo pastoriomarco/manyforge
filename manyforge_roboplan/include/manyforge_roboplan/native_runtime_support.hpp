@@ -2,6 +2,7 @@
 
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
+#include <manyforge_core/stop_terminal_state.hpp>
 
 #include <array>
 #include <atomic>
@@ -19,6 +20,12 @@
 #include <vector>
 
 namespace manyforge::roboplan_backend {
+
+// Cell-wide bounds and observation cadence belong to the native cell owner,
+// not to any particular motion or gripper runtime.
+inline constexpr std::size_t kNativeMaximumLiveStopParticipants = 64U;
+inline constexpr core::StopSurveillancePolicyDTO
+    kMaintainedNativeStopSurveillancePolicy{10'000'000, 100'000'000, 64U};
 
 /// Linux scheduling request for one native scheduler role.
 ///

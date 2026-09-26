@@ -52,11 +52,11 @@ _LOGGER = logging.getLogger(__name__)
 def _capture_model_sources(
     state: ComposerState, deployment: dict[str, Any]
 ) -> dict[str, Any]:
-    project = state.scenario_document_path
+    project = state.deployment_source_project_path
     if not isinstance(project, str):
         raise DeploymentDraftError(
             "activation_source_project_unavailable",
-            "Activation preparation requires an open Scenario project",
+            "Activation preparation requires a source project directory",
             status_code=409,
         )
     try:

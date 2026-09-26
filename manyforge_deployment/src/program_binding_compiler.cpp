@@ -5,6 +5,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -32,6 +33,35 @@ constexpr std::string_view kZeroDigest =
 
 [[noreturn]] void fail(std::string message) {
   throw ProgramBindingCompilerError(std::move(message));
+}
+
+/// A role does not resolve only because of a candidate-dependent fact. The
+/// ordinary compiler reports it as ProgramBindingCompilerError with the same
+/// message; the outcome compiler records it as a named unresolved role.
+class TargetUnavailable final : public std::runtime_error {
+ public:
+  TargetUnavailable(const ProgramBindingUnresolvedReason reason,
+                    const std::string& message)
+      : std::runtime_error(message), reason_(reason) {}
+
+  [[nodiscard]] ProgramBindingUnresolvedReason reason() const noexcept {
+    return reason_;
+  }
+
+ private:
+  ProgramBindingUnresolvedReason reason_;
+};
+
+[[noreturn]] void unavailable(const ProgramBindingUnresolvedReason reason,
+                              const std::string& message) {
+  throw TargetUnavailable(reason, message);
+}
+
+template <typename Value, typename Predicate>
+[[nodiscard]] std::size_t count_matching(std::span<const Value> values,
+                                         Predicate predicate) {
+  return static_cast<std::size_t>(
+      std::count_if(values.begin(), values.end(), predicate));
 }
 
 template <typename Value, typename Predicate>
@@ -316,10 +346,18 @@ void normalize_role_assignment(
 [[nodiscard]] const core::ControllableComponentDTO& require_component(
     const core::CellGraphDTO& graph,
     const core::ControllableComponentId& id) {
+  const auto matches = [&](const auto& value) {
+    return value.controllable_component_id == id;
+  };
   const auto* component = find_exactly_one<core::ControllableComponentDTO>(
-      graph.controllable_components,
-      [&](const auto& value) { return value.controllable_component_id == id; });
+      graph.controllable_components, matches);
   if (component == nullptr) {
+    if (count_matching<core::ControllableComponentDTO>(
+            graph.controllable_components, matches) == 0U) {
+      unavailable(ProgramBindingUnresolvedReason::kComponentMissing,
+                  "component role selects a missing or ambiguous retained "
+                  "component");
+    }
     fail("component role selects a missing or ambiguous retained component");
   }
   return *component;
@@ -397,19 +435,24 @@ template <typename Value, typename Id>
   const auto& type = component_type.value();
   for (const auto& tag : requirement.required_component_type_tags) {
     if (!contains(type.tags, tag)) {
-      fail("component role requirement is not satisfied by component tags");
+      unavailable(ProgramBindingUnresolvedReason::kComponentIncompatible,
+                  "component role requirement is not satisfied by component "
+                  "tags");
     }
   }
   for (const auto& role : requirement.required_model_roles) {
     if (!contains_id<core::ComponentTypeModelRoleDTO>(type.model_roles, role)) {
-      fail("component role requires an unavailable model role");
+      unavailable(ProgramBindingUnresolvedReason::kComponentIncompatible,
+                  "component role requires an unavailable model role");
     }
   }
   for (const auto& interface_id :
        requirement.required_attachment_interfaces) {
     if (!contains_id<core::ComponentTypeAttachmentInterfaceDTO>(
             type.attachment_interfaces, interface_id)) {
-      fail("component role requires an unavailable attachment interface");
+      unavailable(ProgramBindingUnresolvedReason::kComponentIncompatible,
+                  "component role requires an unavailable attachment "
+                  "interface");
     }
   }
 
@@ -428,7 +471,9 @@ template <typename Value, typename Id>
     if (std::none_of(models.begin(), models.end(), [&](const auto& value) {
           return value.model_role_id == required;
         })) {
-      fail("component role has no retained instance for a required model role");
+      unavailable(ProgramBindingUnresolvedReason::kComponentIncompatible,
+                  "component role has no retained instance for a required "
+                  "model role");
     }
   }
   return core::ProgramComponentRoleBindingDTO{
@@ -440,12 +485,18 @@ template <typename Value, typename Id>
 [[nodiscard]] const core::ComponentTypeCommandTargetDTO& require_target_type(
     const QualifiedComponentType& component_type,
     const core::CommandTargetId& target_id) {
-  const auto* target =
-      find_exactly_one<core::ComponentTypeCommandTargetDTO>(
-          component_type.value().command_targets, [&](const auto& value) {
-            return value.command_target_id == target_id;
-          });
+  const auto matches = [&](const auto& value) {
+    return value.command_target_id == target_id;
+  };
+  const auto* target = find_exactly_one<core::ComponentTypeCommandTargetDTO>(
+      component_type.value().command_targets, matches);
   if (target == nullptr) {
+    if (count_matching<core::ComponentTypeCommandTargetDTO>(
+            component_type.value().command_targets, matches) == 0U) {
+      unavailable(ProgramBindingUnresolvedReason::kTargetMissing,
+                  "target role selects a missing or ambiguous component "
+                  "target");
+    }
     fail("target role selects a missing or ambiguous component target");
   }
   return *target;
@@ -704,6 +755,21 @@ resolve_capability(
       catalog.capabilities, requirement.capability_id.value(),
       requirement.capability_definition_revision.value());
   if (qualified == nullptr) {
+    if (count_matching<QualifiedCapabilityDefinition>(
+            catalog.capabilities, [&](const auto& capability) {
+              return capability.value().capability_id ==
+                     requirement.capability_id;
+            }) == 0U) {
+      // The candidate retains no definition at all, e.g. after its last
+      // provider component was removed.
+      if (requirement.disposition ==
+          core::ProgramCapabilityDisposition::kOptional) {
+        return std::nullopt;
+      }
+      unavailable(ProgramBindingUnresolvedReason::kCapabilityUnavailable,
+                  "Program capability is absent or ambiguous in the retained "
+                  "catalog");
+    }
     fail("Program capability is absent or ambiguous in the retained catalog");
   }
   const auto& definition = qualified->value();
@@ -720,7 +786,9 @@ resolve_capability(
           core::ProgramCapabilityDisposition::kOptional) {
         return std::nullopt;
       }
-      fail("required target capability is absent from the component type");
+      unavailable(ProgramBindingUnresolvedReason::kCapabilityUnavailable,
+                  "required target capability is absent from the component "
+                  "type");
     }
   }
 
@@ -773,7 +841,8 @@ resolve_capability(
         core::ProgramCapabilityDisposition::kOptional) {
       return std::nullopt;
     }
-    fail("required Program capability has no exact retained provider");
+    unavailable(ProgramBindingUnresolvedReason::kCapabilityUnavailable,
+                "required Program capability has no exact retained provider");
   }
 
   const QualifiedCommandSchema* selected_schema = nullptr;
@@ -1021,13 +1090,20 @@ resolve_contact_grasp_bindings(
 
 namespace {
 
+struct UnresolvedRoleCollector final {
+  std::vector<ProgramBindingUnresolvedRoleDTO> rows;
+  std::optional<core::ContentDigest> role_assignment_digest;
+  ProgramResolvedRolesDTO resolved;
+};
+
 [[nodiscard]] std::shared_ptr<const ProgramBinding>
 compile_program_binding_contract(
     const core::ProgramBindingContractDTO& program_contract,
     core::ProgramRoleAssignmentDTO role_assignment,
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
-    const ICatalogArtifactSource& catalog_artifact_store) {
+    const ICatalogArtifactSource& catalog_artifact_store,
+    UnresolvedRoleCollector* collector = nullptr) {
   try {
     if (!verify_retained_bundle_identity(retained_bundle) ||
         retained_model_map.query().retained_bundle_id !=
@@ -1039,6 +1115,28 @@ compile_program_binding_contract(
       fail("Program contract selects another retained node environment");
     }
     normalize_role_assignment(program_contract, role_assignment);
+    if (collector != nullptr) {
+      collector->role_assignment_digest =
+          role_assignment_digest(role_assignment);
+    }
+    std::set<core::ComponentRoleId> unresolved_component_roles;
+    // Candidate-dependent failures of one role are recorded and the next role
+    // is compiled; without a collector they fail exactly as before.
+    const auto record = [&](const TargetUnavailable& error,
+                            const core::ComponentRoleId& component_role,
+                            std::optional<core::TargetRoleId> target_role,
+                            const core::ControllableComponentId& component,
+                            std::optional<core::CommandTargetId> target) {
+      if (collector == nullptr) {
+        fail(error.what());
+      }
+      std::string detail(error.what());
+      detail.resize(std::min(detail.size(),
+                             kMaximumProgramBindingUnresolvedDetailBytes));
+      collector->rows.push_back(ProgramBindingUnresolvedRoleDTO{
+          component_role, std::move(target_role), component,
+          std::move(target), error.reason(), std::move(detail)});
+    };
 
     const QualifiedCatalogClosure catalog = load_qualified_catalog_closure(
         bundle, catalog_artifact_store);
@@ -1056,20 +1154,27 @@ compile_program_binding_contract(
       const auto& assignment =
           require_component_assignment(role_assignment,
                                        requirement.component_role_id);
-      const auto& component = require_component(
-          bundle.cell_graph, assignment.controllable_component_id);
-      const auto key = std::make_pair(component.component_type_id.value(),
-                                      component.component_type_revision.value());
-      auto type = component_types.find(key);
-      if (type == component_types.end()) {
-        type = component_types
-                   .emplace(key, load_component_type(
-                                     bundle, component, catalog.capabilities,
-                                     catalog_artifact_store))
-                   .first;
+      try {
+        const auto& component = require_component(
+            bundle.cell_graph, assignment.controllable_component_id);
+        const auto key =
+            std::make_pair(component.component_type_id.value(),
+                           component.component_type_revision.value());
+        auto type = component_types.find(key);
+        if (type == component_types.end()) {
+          type = component_types
+                     .emplace(key, load_component_type(
+                                       bundle, component, catalog.capabilities,
+                                       catalog_artifact_store))
+                     .first;
+        }
+        component_bindings.push_back(resolve_component_role(
+            requirement, assignment, bundle.cell_graph, type->second));
+      } catch (const TargetUnavailable& error) {
+        record(error, requirement.component_role_id, std::nullopt,
+               assignment.controllable_component_id, std::nullopt);
+        unresolved_component_roles.insert(requirement.component_role_id);
       }
-      component_bindings.push_back(resolve_component_role(
-          requirement, assignment, bundle.cell_graph, type->second));
     }
 
     std::vector<core::ProgramTargetRoleBindingDTO> target_bindings;
@@ -1079,111 +1184,148 @@ compile_program_binding_contract(
           role_assignment, requirement.component_role_id);
       const auto& target_assignment =
           require_target_assignment(role_assignment, requirement.target_role_id);
-      const auto& component = require_component(
-          bundle.cell_graph, component_assignment.controllable_component_id);
-      const auto type = component_types.find(std::make_pair(
-          component.component_type_id.value(),
-          component.component_type_revision.value()));
-      if (type == component_types.end()) {
-        fail("target role has no qualified component-role type");
+      if (unresolved_component_roles.contains(requirement.component_role_id)) {
+        record(TargetUnavailable(
+                   ProgramBindingUnresolvedReason::kComponentRoleUnresolved,
+                   "target role depends on an unresolved component role"),
+               requirement.component_role_id, requirement.target_role_id,
+               component_assignment.controllable_component_id,
+               target_assignment.command_target_id);
+        continue;
       }
-      const auto& target_type =
-          require_target_type(type->second, target_assignment.command_target_id);
-      const auto* target = retained_model_map.find_target(
-          component.controllable_component_id,
-          target_assignment.command_target_id);
-      if (target == nullptr) {
-        fail("target role has no exact retained model-map target");
-      }
+      try {
+        const auto& component = require_component(
+            bundle.cell_graph, component_assignment.controllable_component_id);
+        const auto type = component_types.find(std::make_pair(
+            component.component_type_id.value(),
+            component.component_type_revision.value()));
+        if (type == component_types.end()) {
+          fail("target role has no qualified component-role type");
+        }
+        const auto& target_type =
+            require_target_type(type->second, target_assignment.command_target_id);
+        const auto* target = retained_model_map.find_target(
+            component.controllable_component_id,
+            target_assignment.command_target_id);
+        if (target == nullptr) {
+          fail("target role has no exact retained model-map target");
+        }
 
-      const auto component_binding = std::find_if(
-          component_bindings.begin(), component_bindings.end(),
-          [&](const auto& value) {
-            return value.component_role_id == requirement.component_role_id;
-          });
-      if (component_binding == component_bindings.end()) {
-        fail("target role has no resolved component role");
-      }
-      for (const auto& role : requirement.required_model_roles) {
-        if (std::none_of(component_binding->model_role_bindings.begin(),
-                         component_binding->model_role_bindings.end(),
-                         [&](const auto& value) {
-                           return value.model_role_id == role;
-                         })) {
-          fail("target role requires an unavailable component model role");
+        const auto component_binding = std::find_if(
+            component_bindings.begin(), component_bindings.end(),
+            [&](const auto& value) {
+              return value.component_role_id == requirement.component_role_id;
+            });
+        if (component_binding == component_bindings.end()) {
+          fail("target role has no resolved component role");
         }
-      }
+        for (const auto& role : requirement.required_model_roles) {
+          if (std::none_of(component_binding->model_role_bindings.begin(),
+                           component_binding->model_role_bindings.end(),
+                           [&](const auto& value) {
+                             return value.model_role_id == role;
+                           })) {
+            unavailable(ProgramBindingUnresolvedReason::kTargetIncompatible,
+                        "target role requires an unavailable component model "
+                        "role");
+          }
+        }
 
-      std::vector<core::ProgramFrameRoleBindingDTO> frames;
-      for (const auto& role : requirement.required_frame_roles) {
-        if (std::none_of(target_type.frame_roles.begin(),
-                         target_type.frame_roles.end(), [&](const auto& value) {
-                           return value.frame_role_id == role;
-                         })) {
-          fail("target role requires a frame absent from its component type");
+        std::vector<core::ProgramFrameRoleBindingDTO> frames;
+        for (const auto& role : requirement.required_frame_roles) {
+          if (std::none_of(target_type.frame_roles.begin(),
+                           target_type.frame_roles.end(), [&](const auto& value) {
+                             return value.frame_role_id == role;
+                           })) {
+            unavailable(ProgramBindingUnresolvedReason::kTargetIncompatible,
+                        "target role requires a frame absent from its component "
+                        "type");
+          }
+          const auto& frame = require_frame(*target, role);
+          const auto* resolved =
+              std::get_if<CompositionComponentModelFrame>(&frame.frame);
+          if (resolved == nullptr ||
+              resolved->controllable_component_id !=
+                  component.controllable_component_id) {
+            fail("target frame does not resolve to the selected component");
+          }
+          frames.push_back(core::ProgramFrameRoleBindingDTO{
+              role, resolved->model_instance_id, resolved->model_revision,
+              resolved->compiled_frame_name});
         }
-        const auto& frame = require_frame(*target, role);
-        const auto* resolved =
-            std::get_if<CompositionComponentModelFrame>(&frame.frame);
-        if (resolved == nullptr ||
-            resolved->controllable_component_id !=
-                component.controllable_component_id) {
-          fail("target frame does not resolve to the selected component");
-        }
-        frames.push_back(core::ProgramFrameRoleBindingDTO{
-            role, resolved->model_instance_id, resolved->model_revision,
-            resolved->compiled_frame_name});
-      }
 
-      std::vector<core::ProgramResourceRoleBindingDTO> resources;
-      for (const auto& role : requirement.required_resource_roles) {
-        if (std::none_of(target_type.resource_roles.begin(),
-                         target_type.resource_roles.end(), [&](const auto& value) {
-                           return core::resource_role_id(value) == role;
-                         })) {
-          fail("target role requires a resource absent from its component type");
+        // Scene frame resolution is independent of command capability
+        // availability. Preserve only these verified placement facts in the
+        // explicitly non-executable projection before resolving commands.
+        if (collector != nullptr) {
+          collector->resolved.target_roles.push_back(
+              core::ProgramTargetRoleBindingDTO{
+                  requirement.target_role_id, requirement.component_role_id,
+                  component.controllable_component_id,
+                  target_assignment.command_target_id, frames, {}, {}, {}});
         }
-        resources.push_back(resolve_resource_role(
-                                retained_model_map, target_type,
-                                component.controllable_component_id,
-                                target_assignment.command_target_id, role)
-                                .binding);
-      }
 
-      std::vector<core::ProgramCollisionBodyRoleBindingDTO> collision_bodies;
-      for (const auto& role : requirement.required_collision_body_roles) {
-        if (std::none_of(target_type.collision_body_roles.begin(),
-                         target_type.collision_body_roles.end(),
-                         [&](const auto& value) {
-                           return value.collision_body_role_id == role;
-                         })) {
-          fail("target role requires a collision body absent from its "
-               "component type");
+        std::vector<core::ProgramResourceRoleBindingDTO> resources;
+        for (const auto& role : requirement.required_resource_roles) {
+          if (std::none_of(target_type.resource_roles.begin(),
+                           target_type.resource_roles.end(), [&](const auto& value) {
+                             return core::resource_role_id(value) == role;
+                           })) {
+            unavailable(ProgramBindingUnresolvedReason::kTargetIncompatible,
+                        "target role requires a resource absent from its "
+                        "component type");
+          }
+          resources.push_back(resolve_resource_role(
+                                  retained_model_map, target_type,
+                                  component.controllable_component_id,
+                                  target_assignment.command_target_id, role)
+                                  .binding);
         }
-        const auto& collision = require_collision(*target, role);
-        const auto& model =
-            require_model(bundle.cell_graph, collision.model_instance_id);
-        collision_bodies.push_back(
-            core::ProgramCollisionBodyRoleBindingDTO{
-                role, collision.model_instance_id, model.model_revision,
-                collision.compiled_link_names});
-      }
 
-      std::vector<core::ProgramCapabilityBindingDTO> capabilities;
-      for (const auto& capability : requirement.required_capabilities) {
-        auto resolved = resolve_capability(
-            capability, target_type, component, bundle.cell_graph, bundle,
-            catalog, retained_model_map);
-        if (resolved.has_value()) {
-          capabilities.push_back(std::move(*resolved));
+        std::vector<core::ProgramCollisionBodyRoleBindingDTO> collision_bodies;
+        for (const auto& role : requirement.required_collision_body_roles) {
+          if (std::none_of(target_type.collision_body_roles.begin(),
+                           target_type.collision_body_roles.end(),
+                           [&](const auto& value) {
+                             return value.collision_body_role_id == role;
+                           })) {
+            unavailable(ProgramBindingUnresolvedReason::kTargetIncompatible,
+                        "target role requires a collision body absent from its "
+                        "component type");
+          }
+          const auto& collision = require_collision(*target, role);
+          const auto& model =
+              require_model(bundle.cell_graph, collision.model_instance_id);
+          collision_bodies.push_back(
+              core::ProgramCollisionBodyRoleBindingDTO{
+                  role, collision.model_instance_id, model.model_revision,
+                  collision.compiled_link_names});
         }
+
+        std::vector<core::ProgramCapabilityBindingDTO> capabilities;
+        for (const auto& capability : requirement.required_capabilities) {
+          auto resolved = resolve_capability(
+              capability, target_type, component, bundle.cell_graph, bundle,
+              catalog, retained_model_map);
+          if (resolved.has_value()) {
+            capabilities.push_back(std::move(*resolved));
+          }
+        }
+        target_bindings.push_back(core::ProgramTargetRoleBindingDTO{
+            requirement.target_role_id, requirement.component_role_id,
+            component.controllable_component_id,
+            target_assignment.command_target_id, std::move(frames),
+            std::move(resources), std::move(collision_bodies),
+            std::move(capabilities)});
+      } catch (const TargetUnavailable& error) {
+        record(error, requirement.component_role_id, requirement.target_role_id,
+               component_assignment.controllable_component_id,
+               target_assignment.command_target_id);
       }
-      target_bindings.push_back(core::ProgramTargetRoleBindingDTO{
-          requirement.target_role_id, requirement.component_role_id,
-          component.controllable_component_id,
-          target_assignment.command_target_id, std::move(frames),
-          std::move(resources), std::move(collision_bodies),
-          std::move(capabilities)});
+    }
+    if (collector != nullptr && !collector->rows.empty()) {
+      collector->resolved.component_roles = std::move(component_bindings);
+      return nullptr;
     }
 
     std::vector<core::RetainedSourceRecordDTO> resolved_records;
@@ -1221,6 +1363,9 @@ compile_program_binding_contract(
                                            retained_model_map);
   } catch (const ProgramBindingCompilerError&) {
     throw;
+  } catch (const TargetUnavailable& error) {
+    // Raised outside a per-role scope: never a non-executable Program.
+    fail(error.what());
   } catch (const std::exception& error) {
     fail(std::string("Program Binding compilation failed: ") + error.what());
   }
@@ -1543,6 +1688,170 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
   return compile_program_binding_contract(
       program_contract.value(), std::move(role_assignment), retained_bundle,
       retained_model_map, catalog_artifact_store);
+}
+
+ProgramBindingOutcome compile_program_binding_outcome(
+    const ProgramBindingContract& program_contract,
+    core::ProgramRoleAssignmentDTO role_assignment,
+    const RetainedBundle& retained_bundle,
+    const VerifiedRetainedModelMap& retained_model_map,
+    const ICatalogArtifactSource& catalog_artifact_store) {
+  UnresolvedRoleCollector collector;
+  auto binding = compile_program_binding_contract(
+      program_contract.value(), std::move(role_assignment), retained_bundle,
+      retained_model_map, catalog_artifact_store, &collector);
+  if (binding != nullptr) {
+    if (!collector.rows.empty()) {
+      fail("Program Binding outcome is both bound and unresolved");
+    }
+    return {std::move(binding), std::nullopt, std::nullopt};
+  }
+  if (collector.rows.empty() || !collector.role_assignment_digest.has_value()) {
+    fail("Program Binding outcome has neither a binding nor a reason");
+  }
+  std::sort(collector.rows.begin(), collector.rows.end(),
+            [](const auto& lhs, const auto& rhs) {
+              const auto key = [](const ProgramBindingUnresolvedRoleDTO& row) {
+                return std::make_tuple(row.component_role_id.value(),
+                                       row.target_role_id.has_value(),
+                                       row.target_role_id.has_value()
+                                           ? row.target_role_id->value()
+                                           : std::string{});
+              };
+              return key(lhs) < key(rhs);
+            });
+  std::vector<core::TargetRoleId> target_roles;
+  for (const auto& row : collector.rows) {
+    if (row.target_role_id.has_value()) {
+      target_roles.push_back(*row.target_role_id);
+    }
+  }
+  auto affected = program_binding_affected_scope(
+      program_contract.execution_table(), target_roles);
+  const auto& bundle = retained_bundle.value();
+  ProgramNonExecutableOutcomeDTO outcome{
+      program_contract.value().program_id,
+      program_contract.value().program_revision,
+      retained_bundle.retained_bundle_id(),
+      bundle.cell_graph.graph_revision,
+      *collector.role_assignment_digest,
+      std::move(collector.rows),
+      std::move(affected.nodes),
+      std::move(affected.execution_groups),
+  };
+  if (!outcome.valid()) {
+    fail("Program Binding produced an invalid non-executable outcome");
+  }
+  return {nullptr, std::move(outcome), std::move(collector.resolved)};
+}
+
+ProgramBindingOutcome compile_program_binding_outcome(
+    const ProgramBindingContract& program_contract,
+    core::ProgramRoleAssignmentDTO role_assignment,
+    const RetainedBundle& retained_bundle,
+    const std::optional<VerifiedRetainedModelMap>& retained_model_map,
+    const ICatalogArtifactSource& catalog_artifact_store) {
+  if (retained_model_map.has_value()) {
+    return compile_program_binding_outcome(
+        program_contract, std::move(role_assignment), retained_bundle,
+        *retained_model_map, catalog_artifact_store);
+  }
+
+  const auto& bundle = retained_bundle.value();
+  if (!verify_retained_bundle_identity(retained_bundle) ||
+      !bundle.compiled_products.symbol_role_maps.empty() ||
+      !bundle.cell_graph.controllable_components.empty() ||
+      !bundle.cell_graph.model_instances.empty()) {
+    fail("an absent model map is valid only for an empty candidate cell");
+  }
+  if (program_contract.value().node_environment !=
+      bundle.catalogs.node_environment) {
+    fail("Program contract selects another retained node environment");
+  }
+  normalize_role_assignment(program_contract.value(), role_assignment);
+  // Keep the same strict retained-catalog qualification as the ordinary
+  // compiler. Missing references may become a named outcome; corrupt or
+  // ambiguous candidate facts still abort preparation.
+  static_cast<void>(load_qualified_catalog_closure(
+      bundle, catalog_artifact_store));
+  static_cast<void>(detail::BuildQualifiedRetentionAuthority::qualify());
+
+  UnresolvedRoleCollector collector;
+  collector.role_assignment_digest = role_assignment_digest(role_assignment);
+  std::set<core::ComponentRoleId> unresolved_component_roles;
+  for (const auto& requirement : program_contract.value().component_roles) {
+    const auto& assignment = require_component_assignment(
+        role_assignment, requirement.component_role_id);
+    try {
+      static_cast<void>(require_component(
+          bundle.cell_graph, assignment.controllable_component_id));
+      // A component without its required retained model map is not an
+      // intentional candidate-dependent absence.
+      fail("candidate component has no exact retained model map");
+    } catch (const TargetUnavailable& error) {
+      std::string detail(error.what());
+      detail.resize(std::min(detail.size(),
+                             kMaximumProgramBindingUnresolvedDetailBytes));
+      collector.rows.push_back(ProgramBindingUnresolvedRoleDTO{
+          requirement.component_role_id, std::nullopt,
+          assignment.controllable_component_id, std::nullopt, error.reason(),
+          std::move(detail)});
+      unresolved_component_roles.insert(requirement.component_role_id);
+    }
+  }
+  for (const auto& requirement : program_contract.value().target_roles) {
+    const auto& component_assignment = require_component_assignment(
+        role_assignment, requirement.component_role_id);
+    const auto& target_assignment =
+        require_target_assignment(role_assignment, requirement.target_role_id);
+    if (!unresolved_component_roles.contains(requirement.component_role_id)) {
+      fail("candidate target has no exact retained model map");
+    }
+    constexpr std::string_view detail =
+        "target role depends on an unresolved component role";
+    collector.rows.push_back(ProgramBindingUnresolvedRoleDTO{
+        requirement.component_role_id, requirement.target_role_id,
+        component_assignment.controllable_component_id,
+        target_assignment.command_target_id,
+        ProgramBindingUnresolvedReason::kComponentRoleUnresolved,
+        std::string(detail)});
+  }
+  if (collector.rows.empty()) {
+    fail("an empty candidate cannot bind a Program without model data");
+  }
+  std::sort(collector.rows.begin(), collector.rows.end(),
+            [](const auto& lhs, const auto& rhs) {
+              const auto key = [](const auto& row) {
+                return std::make_tuple(row.component_role_id.value(),
+                                       row.target_role_id.has_value(),
+                                       row.target_role_id.has_value()
+                                           ? row.target_role_id->value()
+                                           : std::string{});
+              };
+              return key(lhs) < key(rhs);
+            });
+  std::vector<core::TargetRoleId> target_roles;
+  for (const auto& row : collector.rows) {
+    if (row.target_role_id.has_value()) {
+      target_roles.push_back(*row.target_role_id);
+    }
+  }
+  const auto affected = program_binding_affected_scope(
+      program_contract.execution_table(), target_roles);
+  ProgramNonExecutableOutcomeDTO outcome{
+      program_contract.value().program_id,
+      program_contract.value().program_revision,
+      retained_bundle.retained_bundle_id(),
+      bundle.cell_graph.graph_revision,
+      *collector.role_assignment_digest,
+      std::move(collector.rows),
+      affected.nodes,
+      affected.execution_groups,
+  };
+  if (!outcome.valid()) {
+    fail("Program Binding produced an invalid non-executable outcome");
+  }
+  return {nullptr, std::move(outcome), ProgramResolvedRolesDTO{}};
 }
 
 std::shared_ptr<const ProgramBinding>

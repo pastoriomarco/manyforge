@@ -30,13 +30,13 @@ import {
 } from './runtimeScenePresentation';
 
 function executionStatus(): ExecutionOwnerStatus {
-  return {
+  const status = {
     ownerEpoch: 'owner-1',
     cellId: 'cell-1',
     graphRevision: 'graph-1',
     retainedBundleId: 'bundle-1',
     directControl: {
-      controllableComponentId: 'robot-1', commandTargetId: 'arm',
+      controllableComponentId: 'robot-1', commandTargetId: 'arm', operationCapabilityId: 'execution.trajectory.execute',
       targetDescriptor: {
         controllableComponentId: 'robot-1',
         commandTargetId: 'arm',
@@ -53,6 +53,18 @@ function executionStatus(): ExecutionOwnerStatus {
       complete: true,
     },
   } as unknown as ExecutionOwnerStatus;
+  // The IF.2 inventory: one component owning the arm target.
+  status.components = [{
+    controllableComponentId: 'robot-1',
+    commandEligible: true,
+    unavailableReason: null,
+    unsupportedTargets: [],
+  }];
+  status.directControlTargets = [status.directControl!];
+  status.directControlGripperTargets = [];
+  status.observedMotions = [status.observedMotion!];
+  status.observedGrippers = [];
+  return status;
 }
 
 function joint(
@@ -365,23 +377,23 @@ describe('runtime scene presentation', () => {
   it('projects every observed robot instead of fabricating unselected robots at neutral', () => {
     const status = executionStatus();
     const secondDescriptor = {
-      ...status.directControl.targetDescriptor,
+      ...status.directControl!.targetDescriptor,
       controllableComponentId: 'robot-2',
       commandTargetId: 'arm-2',
       joints: [{
-        ...status.directControl.targetDescriptor.joints[0],
+        ...status.directControl!.targetDescriptor.joints[0],
         sourceJointName: 'source-joint-2',
         compiledJointName: 'joint-2',
       }],
     };
-    status.directControlTargets = [status.directControl, {
-      ...status.directControl,
+    status.directControlTargets = [status.directControl!, {
+      ...status.directControl!,
       controllableComponentId: 'robot-2',
       commandTargetId: 'arm-2',
       targetDescriptor: secondDescriptor,
     }];
-    status.observedMotions = [status.observedMotion, {
-      ...status.observedMotion,
+    status.observedMotions = [status.observedMotion!, {
+      ...status.observedMotion!,
       controllableComponentId: 'robot-2',
       commandTargetId: 'arm-2',
       sourceJointNames: ['source-joint-2'],
@@ -420,7 +432,7 @@ describe('runtime scene presentation', () => {
 
   it('projects and caches compact owner observations once per frame', () => {
     let frame: ExecutionObservationFrame | null = {
-      schemaVersion: 'manyforge.execution_observation_frame.v2',
+      schemaVersion: 'manyforge.execution_observation_frame.v3',
       ownerEpoch: 'owner-1',
       cellId: 'cell-1',
       retainedBundleId: 'bundle-1',
@@ -429,7 +441,7 @@ describe('runtime scene presentation', () => {
       sourceSequence: 5,
       receivedAtMonotonicUs: 123,
       targets: [{
-        controllableComponentId: 'robot-1', commandTargetId: 'arm',
+        controllableComponentId: 'robot-1', commandTargetId: 'arm', operationCapabilityId: 'execution.trajectory.execute',
         sourceEpoch: 'native-1', sourceSequence: 5,
         sourceJointNames: ['source-joint'], compiledJointNames: ['joint-1'],
         coordinateKinds: ['angular'], positionsSi: [Math.PI / 2],
@@ -511,20 +523,20 @@ describe('runtime scene presentation', () => {
     model.targets[1].model_groups = [{ ...model.targets[0].model_groups[0],
       model_instance_id: 'gripper-model', commandable_source_joint_names: ['finger'] }];
     const frame: ExecutionObservationFrame = {
-      schemaVersion: 'manyforge.execution_observation_frame.v2', ownerEpoch: 'owner-1',
+      schemaVersion: 'manyforge.execution_observation_frame.v3', ownerEpoch: 'owner-1',
       cellId: 'cell-1', retainedBundleId: 'bundle-1', graphRevision: 'graph-1',
       sourceEpoch: 'render-1', sourceSequence: 10, receivedAtMonotonicUs: 123,
       targets: [
-        { controllableComponentId: 'robot-1', commandTargetId: 'arm', sourceEpoch: 'arm-1', sourceSequence: 5,
+        { controllableComponentId: 'robot-1', commandTargetId: 'arm', operationCapabilityId: 'execution.trajectory.execute', sourceEpoch: 'arm-1', sourceSequence: 5,
           sourceJointNames: ['source-joint'], compiledJointNames: ['joint-1'], coordinateKinds: ['angular'], positionsSi: [0] },
-        { controllableComponentId: 'robot-1', commandTargetId: 'gripper', sourceEpoch: 'gripper-1', sourceSequence: 8,
+        { controllableComponentId: 'robot-1', commandTargetId: 'gripper', operationCapabilityId: 'tool.gripper.command', sourceEpoch: 'gripper-1', sourceSequence: 8,
           sourceJointNames: ['finger'], compiledJointNames: ['finger-master'], coordinateKinds: ['linear'], positionsSi: [0.025] },
       ],
     };
     const open = executionObservationRobotPresentation(frame, model, geometry, motionDescriptor(), null);
     const authoringStatus = executionStatus();
     authoringStatus.directControlGripper = {
-      controllableComponentId: 'robot-1', commandTargetId: 'gripper', sourceKind: 'model_role', sourceCoordinateName: 'finger',
+      controllableComponentId: 'robot-1', commandTargetId: 'gripper', operationCapabilityId: 'tool.gripper.command', sourceKind: 'model_role', sourceCoordinateName: 'finger',
     } as ExecutionOwnerStatus['directControlGripper'];
     expect(candidateObservationEpoch(frame, authoringStatus)).not.toBeNull();
     expect(candidateObservationEpoch({ ...frame, targets: [frame.targets[0]] }, authoringStatus)).toBeNull();
@@ -672,7 +684,7 @@ describe('runtime scene presentation', () => {
 
     const cellPose = (positionRad: number) => {
       const frame: ExecutionObservationFrame = {
-        schemaVersion: 'manyforge.execution_observation_frame.v2',
+        schemaVersion: 'manyforge.execution_observation_frame.v3',
         ownerEpoch: 'owner-1',
         cellId: 'cell-1',
         retainedBundleId: 'bundle-1',
@@ -681,7 +693,7 @@ describe('runtime scene presentation', () => {
         sourceSequence: positionRad === 0 ? 1 : 2,
         receivedAtMonotonicUs: 123,
         targets: [{
-          controllableComponentId: 'robot-1', commandTargetId: 'arm',
+          controllableComponentId: 'robot-1', commandTargetId: 'arm', operationCapabilityId: 'execution.trajectory.execute',
           sourceEpoch: 'native-1', sourceSequence: positionRad === 0 ? 1 : 2,
           sourceJointNames: ['source-joint'], compiledJointNames: ['joint-1'],
           coordinateKinds: ['angular'], positionsSi: [positionRad],
@@ -855,7 +867,7 @@ describe('runtime scene presentation', () => {
       finalPositionsRad: [Math.PI / 2],
     } as MotionPreviewReceipt;
     const descriptor = {
-      ...executionStatus().directControl.targetDescriptor,
+      ...executionStatus().directControl!.targetDescriptor,
       componentRoleId: 'controlled_component', targetRoleId: 'command_target',
     };
     const measured = measuredLinkTransforms(manifest(), new Map())!;
@@ -927,13 +939,15 @@ describe('runtime scene presentation', () => {
     }];
     const status = executionStatus();
     status.directControlGripper = {
-      controllableComponentId: 'robot-1', commandTargetId: 'gripper',
+      controllableComponentId: 'robot-1', commandTargetId: 'gripper', operationCapabilityId: 'tool.gripper.command',
       componentRoleId: 'controlled_component', targetRoleId: 'command_target',
-      operationCapabilityId: 'tool.gripper.command',
       commandSchemaId: 'gripper.command_position', commandSchemaRevision: 'schema-1',
       sourceCoordinateName: 'source-finger', sourceKind: 'model_role',
       coordinateKind: 'linear_m', minPosition: 0, maxPosition: 0.04,
-    } as ExecutionOwnerStatus['directControlGripper'];
+      programId: 'direct-control-gripper', programRevision: 'schema-1',
+      programBindingId: 'gripper-binding', programRunId: 'gripper-run',
+      targetDescriptor: {} as NonNullable<ExecutionOwnerStatus['directControlGripper']>['targetDescriptor'],
+    } as NonNullable<ExecutionOwnerStatus['directControlGripper']>;
     const receipt = {
       schemaVersion: 'manyforge.direct_control_capability_command_preview.v1',
       receiptDigest: 'gripper-receipt-1', retainedBundleId: 'bundle-1',
@@ -961,11 +975,11 @@ describe('runtime scene presentation', () => {
     source.occurrences[0].links = [{ source_link_name: 'source-tip', viewer_link_name: 'tip' }];
     source.targets[1].model_groups[0].model_instance_id = 'model-instance-1';
     const status = executionStatus();
-    status.directControl.tcpFrameRoleId = 'tcp';
-    status.directControl.targetDescriptor = motionDescriptor();
+    status.directControl!.tcpFrameRoleId = 'tcp';
+    status.directControl!.targetDescriptor = motionDescriptor();
     status.directControlGripper = { targetDescriptor: {
-      controllableComponentId: 'robot-1', commandTargetId: 'gripper', touchLinks: ['source-tip'],
-    } } as ExecutionOwnerStatus['directControlGripper'];
+      controllableComponentId: 'robot-1', commandTargetId: 'gripper', operationCapabilityId: 'tool.gripper.command', touchLinks: ['source-tip'],
+    } } as unknown as NonNullable<ExecutionOwnerStatus['directControlGripper']>;
     const pose = { position_m: { x_m: 7, y_m: 8, z_m: 9 }, orientation: { x: 0, y: 0, z: 0, w: 1 } };
     const measured = measuredLinkTransforms(manifest(), new Map())!;
     const marker = candidateToolPresentation(pose, status, source, manifest(), measured)!;

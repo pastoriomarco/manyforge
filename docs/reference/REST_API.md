@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-24 09:16:49 UTC
+  Last regenerated: 2026-09-26 16:32:46 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -78,7 +78,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/execution/pick-place/plans/place` | headless-runtime-client | Execution Plan Place |
 | `GET` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Get Runtime Scale Control |
 | `POST` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Set Runtime Scale Control |
-| `GET` | `/api/execution/status` | headless-runtime-client | Execution Status |
 | `GET` | `/api/execution/stop-fault` | headless-runtime-client | Execution Stop Fault |
 | `POST` | `/api/execution/stop-fault/recover` | headless-runtime-client | Execution Recover Stop Fault |
 | `POST` | `/api/execution/stops` | headless-runtime-client | Execution Stop |
@@ -92,6 +91,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/node-environment` | headless-runtime-client | Node Environment |
 | `GET` | `/api/nodes/environment` | node-environment | Get Node Environment |
 | `GET` | `/api/program/applied` | headless-runtime-client | Program Applied |
+| `GET` | `/api/program/applied/status` | headless-runtime-client | Program Applied Status |
 | `POST` | `/api/program/apply` | composer-draft | Apply Draft |
 | `POST` | `/api/program/cycle/reset` | headless-runtime-client | Program Cycle Reset |
 | `GET` | `/api/program/diagnostics/health` | headless-runtime-client | Program Diagnostic Health |

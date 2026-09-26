@@ -18,6 +18,7 @@
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/runtime_participant_registry.hpp>
+#include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
@@ -2642,6 +2643,157 @@ TEST(
 }
 
 TEST(RetainedProductCrossConsumer,
+     CellSceneFrameResolverUsesEveryComponentStateSource) {
+  ScopedTemporaryRoot temporary;
+  const auto package_root = temporary.path() / "retained-package";
+  const auto staging_parent = temporary.path() / "private-stages";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+  ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
+
+  constexpr std::string_view cell_id = "i6_cell_frame_resolver_cell";
+  const auto materialized = deployment::test::
+      materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
+          package_root, cell_id);
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto &bundle = *materialized.bundle;
+  const auto &products = bundle.value().compiled_products;
+  ASSERT_EQ(products.symbol_role_maps.size(), 1U);
+  const auto retained = load_lite6_planning_model(
+      package_root,
+      {bundle.retained_bundle_id(),
+       products.planning_collision_model.product_id});
+  const auto model_map = load_lite6_model_map(
+      package_root,
+      {bundle.retained_bundle_id(),
+       products.symbol_role_maps.front().product_id});
+
+  const core::ControllableComponentId root_component_id(
+      std::string(deployment::test::kLite6ControllableComponentId));
+  const core::ControllableComponentId peer_component_id(
+      deployment::test::lite6_controllable_fixture_detail::indexed_id(
+          deployment::test::kLite6ControllableComponentId, 1U));
+  const core::CommandTargetId arm_target_id(
+      std::string(deployment::test::kLite6ArmTargetId));
+  const core::RuntimeEpoch root_epoch("cell-frame-root-owner-epoch");
+  const auto root_binding = make_fixture_runtime_participant(
+      bundle, model_map, root_component_id, arm_target_id, std::nullopt,
+      std::nullopt, root_epoch);
+  const auto peer_binding = make_fixture_runtime_participant(
+      bundle, model_map, peer_component_id, arm_target_id);
+
+  const auto &root_component = require_fixture_one(
+      bundle.value().cell_graph.controllable_components,
+      [&](const auto &candidate) {
+        return candidate.controllable_component_id == root_component_id;
+      },
+      "root scene-frame component");
+  const auto &root_graph_binding = require_fixture_one(
+      bundle.value().cell_graph.control_bindings,
+      [&](const auto &candidate) {
+        return candidate.controllable_component_id == root_component_id &&
+               candidate.command_target_id == arm_target_id;
+      },
+      "root scene-frame control binding");
+  const auto &root_domain = require_fixture_one(
+      bundle.value().cell_graph.control_domains,
+      [&](const auto &candidate) {
+        return candidate.control_domain_id ==
+               root_graph_binding.control_domain_id;
+      },
+      "root scene-frame control domain");
+  std::set<core::RuntimeUnitId> root_runtime_units(
+      root_component.runtime_unit_ids.begin(),
+      root_component.runtime_unit_ids.end());
+  root_runtime_units.insert(root_domain.runtime_unit_ids.begin(),
+                            root_domain.runtime_unit_ids.end());
+  ASSERT_EQ(root_runtime_units.size(), 1U);
+  const auto root_runtime_unit_id = *root_runtime_units.begin();
+
+  auto stage =
+      RetainedPlanningModelStage::create_verified(retained, staging_parent);
+  auto scene = make_roboplan_scene(RoboPlanSceneInput{
+      "retained_two_lite6_cell_frame_state",
+      std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
+      stage.package_paths(), retained_joint_limit_rows(retained)});
+  auto scene_mutex = std::make_shared<std::mutex>();
+  auto projector = std::make_shared<RetainedKinematicStateProjector>(
+      RetainedKinematicStateProjector::create_verified(
+          scene, scene_mutex, bundle, model_map, retained,
+          std::vector<core::RuntimeParticipantBinding>{root_binding,
+                                                       peer_binding},
+          0));
+  auto make_arm_channel = [&](const core::RuntimeParticipantBinding &binding,
+                              std::string_view channel_name) {
+    return std::make_shared<RetainedObservedStateChannel>(
+        binding, projector,
+        RetainedObservedStateChannelConfig{
+            core::ObservedStateSourceKind::kPredictedState,
+            "test/cell-frame/" + std::string(channel_name), 0, 1U});
+  };
+  auto root_channel = make_arm_channel(root_binding, "root-arm");
+  auto peer_channel = make_arm_channel(peer_binding, "peer-arm");
+  ASSERT_TRUE(root_channel->initialize_from_projection(10).applied());
+  ASSERT_TRUE(peer_channel->initialize_from_projection(10).applied());
+
+  const auto *root_target = model_map.find_target(root_component_id,
+                                                  arm_target_id);
+  ASSERT_NE(root_target, nullptr);
+  ASSERT_FALSE(root_target->model_groups.empty());
+  auto collision_model = ManyForgeCollisionEngine::load_shared_model(
+      "retained_two_lite6_cell_frame_state", stage.loader_urdf_path(),
+      stage.srdf_path(), stage.package_paths(),
+      root_target->model_groups.front().compiled_group_name);
+  const auto source_for = [](const auto &channel) {
+    return RetainedSceneFrameStateSourceInput{
+        channel->query_context(),
+        core::ObservedStateSourceKind::kPredictedState,
+        std::shared_ptr<const core::IObservedStateProvider>(
+            channel, channel->addressed_publication())};
+  };
+  const auto root_source = source_for(root_channel);
+  const auto peer_source = source_for(peer_channel);
+  const auto root_only_resolver = RetainedSceneFrameResolver::create_verified(
+      collision_model, bundle, model_map, retained, root_runtime_unit_id,
+      root_epoch, {root_source}, root_component_id);
+  const auto cell_resolver = RetainedSceneFrameResolver::create_verified(
+      collision_model, bundle, model_map, retained, root_runtime_unit_id,
+      root_epoch, {root_source, peer_source});
+
+  const auto logical_scene = make_projection_runtime_shadow_snapshot(
+      bundle.value().cell_graph.cell_id);
+  const core::ProjectionLeaseBindingDTO projection_binding{
+      {bundle.retained_bundle_id(), bundle.value().cell_graph.graph_revision,
+       logical_scene.shared()->revision},
+      core::ProjectionLeaseId("cell-frame-resolver-lease")};
+  const auto query_for = [&](const core::ControllableComponentId
+                                 &component_id) {
+    return core::SceneFrameResolutionQueryDTO{
+        core::TargetCarrierSceneFrameRefDTO{
+            component_id, arm_target_id, core::FrameRoleId("tcp")},
+        projection_binding};
+  };
+  for (const auto &component_id : {root_component_id, peer_component_id}) {
+    const auto resolved = cell_resolver->Resolve(
+        query_for(component_id), logical_scene.shared(), 10);
+    ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+    const auto *model_frame =
+        std::get_if<core::ResolvedComponentModelFrameDTO>(
+            &resolved.value().resolved_frame);
+    ASSERT_NE(model_frame, nullptr);
+    EXPECT_EQ(model_frame->controllable_component_id, component_id);
+  }
+
+  const auto root_frame = root_only_resolver->Resolve(
+      query_for(root_component_id), logical_scene.shared(), 10);
+  ASSERT_TRUE(root_frame.ok()) << root_frame.error().message;
+  const auto peer_without_source = root_only_resolver->Resolve(
+      query_for(peer_component_id), logical_scene.shared(), 10);
+  ASSERT_FALSE(peer_without_source.ok());
+  EXPECT_EQ(peer_without_source.error().details.at("reason"),
+            "kinematic_state_source_unavailable");
+}
+
+TEST(RetainedProductCrossConsumer,
      BootstrapStopEnvelopeFollowsDeclaredCapabilityAndExactArtifacts) {
   ScopedTemporaryRoot temporary;
   const auto passive_root = temporary.path() / "not-stoppable";
@@ -2738,8 +2890,7 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(native_default.authority_generation, 1U);
 }
 
-TEST(RetainedProductCrossConsumer,
-     PredictedLite6AggregateComposesButUnqualifiedParticipantsStayClosed) {
+void check_predicted_lite6_aggregate(const bool reseal_capability_inventory) {
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
       temporary.path() / "retained-package";
@@ -2919,6 +3070,30 @@ TEST(RetainedProductCrossConsumer,
   for (const auto &[joint, limit] : jerk_profile.limits)
     runtime_input.ordinary_motion_jerk->joint_limits.push_back(
         {joint, std::get<core::AngularJerkDTO>(limit).value_rad_s3, {}});
+  if (reseal_capability_inventory) {
+    // This synthetic DTO fixture adds a real control-facing feedback capability
+    // to the same controller. It tests owner classification, not graph/compiler
+    // qualification; the mixed-Apply process test covers that product boundary.
+    auto observed = arm_binding.value();
+    const auto *feedback = core::find_builtin_capability_definition(
+        "execution.feedback.state_snapshots");
+    ASSERT_NE(feedback, nullptr);
+    observed.capability_id =
+        core::CapabilityId("execution.feedback.state_snapshots");
+    observed.capability_definition_revision =
+        core::CapabilityDefinitionRevision(
+            std::string(feedback->capability_definition_revision));
+    observed.control_path->control_binding_id =
+        core::ControlBindingId("arm.feedback.control-binding");
+    observed.control_path->runtime_scale_qualification.reset();
+    auto representative =
+        core::verify_runtime_participant_binding(std::move(observed));
+    ASSERT_TRUE(representative.ok()) << representative.error().message;
+    ASSERT_TRUE(retained_bindings_share_backend_owner(
+        arm_binding, representative.value()));
+    runtime_input.control_binding_representatives =
+        {arm_binding, gripper_binding, representative.value()};
+  }
   auto runtime = create_retained_native_runtime(std::move(runtime_input),
                                                 std::move(runtime_config));
 
@@ -2926,6 +3101,68 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_NE(runtime->addressed_kernel, nullptr);
   ASSERT_NE(runtime->participant_engine, nullptr);
   ASSERT_TRUE(runtime->gripper_binding.has_value());
+  if (reseal_capability_inventory) {
+    ASSERT_EQ(runtime->control_binding_representatives.size(), 3U);
+    ASSERT_EQ(runtime->participant_registrations.size(), 3U);
+    const auto motion_engine = runtime->participant_engine;
+    const auto gripper_engine = runtime->gripper_participant_engine;
+    const auto motion_channel = runtime->motion_state_channel;
+    const auto gripper_channel = runtime->gripper_state_channel;
+    const auto registrations = runtime->participant_registrations;
+    const auto secondary = std::find_if(
+        registrations.begin(), registrations.end(), [](const auto &row) {
+          return row.binding.value().capability_id ==
+                 core::CapabilityId("execution.feedback.state_snapshots");
+        });
+    ASSERT_NE(secondary, registrations.end());
+    ASSERT_EQ(secondary->engine, motion_engine.get());
+    const auto secondary_index = static_cast<std::size_t>(
+        std::distance(registrations.begin(), secondary));
+    const core::ConfigurationFenceId fence_id("same-controller.reseal.apply");
+    const core::ConfigurationFenceScopeDTO scope{};
+    admission_gate.RestoreFence(fence_id, scope);
+    const auto reseal = [&](auto candidate_registrations) {
+      return reseal_retained_native_runtime_for_apply(
+          *runtime,
+          RetainedNativeRuntimeResealInput{
+              arm_binding, gripper_binding, {}, {},
+              runtime->control_binding_representatives,
+              std::move(candidate_registrations), {}, nullptr,
+              runtime->reference_resolver, fence_id, scope, admission_gate});
+    };
+
+    auto changed_engine = registrations;
+    changed_engine[secondary_index].engine = runtime->participant_engine_for(false);
+    const auto bad_candidate = reseal(std::move(changed_engine));
+    ASSERT_FALSE(bad_candidate.ok());
+    EXPECT_EQ(bad_candidate.error().details.at("reason"),
+              "native_product_reseal_registration_identity_changed");
+    runtime->participant_registrations.erase(
+        runtime->participant_registrations.begin() + secondary_index);
+    const auto missing_predecessor = reseal(registrations);
+    runtime->participant_registrations = registrations;
+    ASSERT_FALSE(missing_predecessor.ok());
+    EXPECT_EQ(missing_predecessor.error().details.at("reason"),
+              "native_product_reseal_registration_identity_changed");
+
+    const auto accepted = reseal(registrations);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    EXPECT_EQ(runtime->participant_engine, motion_engine);
+    EXPECT_EQ(runtime->gripper_participant_engine, gripper_engine);
+    EXPECT_EQ(runtime->motion_state_channel, motion_channel);
+    EXPECT_EQ(runtime->gripper_state_channel, gripper_channel);
+    EXPECT_EQ(runtime->motion_binding.value(), arm_binding.value());
+    EXPECT_EQ(runtime->gripper_binding->value(), gripper_binding.value());
+    ASSERT_EQ(runtime->participant_registrations.size(), registrations.size());
+    for (std::size_t index = 0U; index < registrations.size(); ++index) {
+      const auto &current = runtime->participant_registrations[index];
+      EXPECT_EQ(current.binding.value(), registrations[index].binding.value());
+      EXPECT_EQ(current.engine, registrations[index].engine);
+      EXPECT_EQ(current.stop_execution_port,
+                registrations[index].stop_execution_port);
+    }
+    return;
+  }
   const auto motion_registration = std::find_if(
       runtime->participant_registrations.begin(),
       runtime->participant_registrations.end(), [](const auto &registration) {
@@ -3153,6 +3390,16 @@ TEST(RetainedProductCrossConsumer,
 }
 
 TEST(RetainedProductCrossConsumer,
+     PredictedLite6AggregateComposesButUnqualifiedParticipantsStayClosed) {
+  check_predicted_lite6_aggregate(false);
+}
+
+TEST(RetainedProductCrossConsumer,
+     SameControllerCapabilityInventoryResealPreservesOwnersAndRejectsChangedRegistration) {
+  check_predicted_lite6_aggregate(true);
+}
+
+TEST(RetainedProductCrossConsumer,
      RootOwnedJoinedTwoLite6TeardownRetiresKernelBeforePeerEngines) {
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
@@ -3312,6 +3559,12 @@ TEST(RetainedProductCrossConsumer,
         {},
         {},
         {}};
+    if (index == 0U) {
+      // A retained participant may supply its full phase-bearing Stop budget;
+      // a newly restored owner supplies the same cell envelope without phases.
+      runtime_config.cell_stop_deadline_budget->phases.push_back(
+          {core::StopBudgetPhaseId("phase.component.nominal"), 500'000'000});
+    }
     runtime_config.kernel.runtime_collision_stop_owned_by_addressed_kernel =
         true;
     const auto local_runtime_unit_id = control.provider_runtime_unit_id;
@@ -3370,6 +3623,12 @@ TEST(RetainedProductCrossConsumer,
           runtimes.front()->clock, runtimes.front()->scheduler);
     }
     ASSERT_NE(runtime, nullptr);
+    ASSERT_TRUE(runtime->cell_stop_deadline_budget.has_value());
+    EXPECT_TRUE(runtime->cell_stop_deadline_budget->phases.empty());
+    EXPECT_EQ(runtime->cell_stop_deadline_budget->outer_duration_ns,
+              1'000'000'000);
+    EXPECT_EQ(runtime->cell_stop_deadline_budget->kernel_completion_reserve_ns,
+              100'000'000);
     EXPECT_FALSE(runtime->motion_runtime_policy.has_value());
     ASSERT_NE(runtime->participant_engine, nullptr);
     ASSERT_NE(runtime->motion_state_channel, nullptr);
@@ -3388,6 +3647,40 @@ TEST(RetainedProductCrossConsumer,
   runtimes.clear();
   ASSERT_EQ(primary->clock, peer->clock);
   ASSERT_EQ(primary->scheduler, peer->scheduler);
+
+  // Product reseal must not be used to disguise a physical model change as a
+  // retained controller. Reject that mismatch before touching either state
+  // channel or the backend route.
+  auto changed_model_dto = primary->motion_binding.value();
+  changed_model_dto.component_type_revision =
+      core::ComponentTypeRevision("foreign-retained-controller-revision");
+  auto changed_model_binding = core::verify_runtime_participant_binding(
+      std::move(changed_model_dto));
+  ASSERT_TRUE(changed_model_binding.ok())
+      << changed_model_binding.error().message;
+  auto changed_model_registrations = primary->participant_registrations;
+  ASSERT_EQ(changed_model_registrations.size(), 1U);
+  changed_model_registrations.front().binding = changed_model_binding.value();
+  ManagedKernelAdmissionGate reseal_gate;
+  const core::ConfigurationFenceId reseal_fence_id(
+      "i6.joined.invalid-retained-reseal.apply");
+  const core::ConfigurationFenceScopeDTO empty_reseal_scope{};
+  reseal_gate.RestoreFence(reseal_fence_id, empty_reseal_scope);
+  const auto unchanged_state_binding = primary->motion_state_channel->binding();
+  const auto invalid_reseal = reseal_retained_native_runtime_for_apply(
+      *primary,
+      RetainedNativeRuntimeResealInput{
+          changed_model_binding.value(), std::nullopt, {}, {},
+          {changed_model_binding.value()},
+          std::move(changed_model_registrations), {}, nullptr,
+          primary->reference_resolver,
+          reseal_fence_id, empty_reseal_scope, reseal_gate});
+  ASSERT_FALSE(invalid_reseal.ok());
+  EXPECT_EQ(invalid_reseal.error().details.at("reason"),
+            "native_product_reseal_physical_identity_changed");
+  EXPECT_EQ(primary->motion_binding.value(), physical_bindings.front().value());
+  EXPECT_EQ(primary->motion_state_channel->binding().value(),
+            unchanged_state_binding.value());
 
   auto subscription_ledger =
       std::make_shared<SubscriptionObservationLedger>();
@@ -3452,7 +3745,7 @@ TEST(RetainedProductCrossConsumer,
         };
       };
   join_retained_native_runtime_participants(
-      primary, {peer}, std::move(joined_resolver_factory));
+      primary, {peer}, joined_resolver_factory);
   attach_retained_native_addressed_owner(
       primary,
       RetainedNativeAddressedOwnerConfig{
@@ -3480,24 +3773,128 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_EQ(peer->cell_addressed_kernel, primary->addressed_kernel.get());
   ASSERT_EQ(peer->cell_runtime_root, primary.get());
 
+  auto stable_stop_observer = primary->stop_surveillance_owner;
+  ASSERT_NE(stable_stop_observer, nullptr);
+  std::weak_ptr<RetainedStopSurveillanceOwner> stable_observer_lifetime =
+      stable_stop_observer;
+  ManagedKernelAdmissionGate rejoin_gate;
+  const auto rejoin_scope = make_runtime_fence_scope(
+      {&primary->motion_binding, &peer->motion_binding});
+  const core::ConfigurationFenceId rejoin_fence_id(
+      "i6.joined.root-replacement.apply");
+  rejoin_gate.RestoreFence(rejoin_fence_id, rejoin_scope);
+  ASSERT_EQ(primary->cell_stop_deadline_budget, peer->cell_stop_deadline_budget);
+  ASSERT_TRUE(primary->stop_surveillance_policy.has_value());
+  const auto original_budget = primary->cell_stop_deadline_budget;
+  const auto original_surveillance_policy = primary->stop_surveillance_policy;
+  for (const auto changed_fact : {0, 1, 2}) {
+    if (changed_fact == 0)
+      ++primary->cell_stop_deadline_budget->outer_duration_ns;
+    else if (changed_fact == 1)
+      ++primary->cell_stop_deadline_budget->kernel_completion_reserve_ns;
+    else
+      ++primary->stop_surveillance_policy->sample_cadence_ns;
+    std::vector<RetainedStopSurveillanceSourceInput> rejected_sources;
+    const auto rejected = rejoin_retained_native_runtime_participants(
+        peer, {primary}, joined_resolver_factory, stable_stop_observer,
+        rejected_sources, rejoin_gate, rejoin_fence_id, rejoin_scope);
+    primary->cell_stop_deadline_budget = original_budget;
+    primary->stop_surveillance_policy = original_surveillance_policy;
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.error().details.at("reason"),
+              "native_participant_rejoin_stop_policy_mismatch");
+    EXPECT_TRUE(rejected_sources.empty());
+  }
+  std::vector<RetainedStopSurveillanceSourceInput> root_swapped_sources;
+  const auto root_swapped = rejoin_retained_native_runtime_participants(
+      peer, {primary}, joined_resolver_factory, stable_stop_observer,
+      root_swapped_sources, rejoin_gate, rejoin_fence_id, rejoin_scope);
+  ASSERT_TRUE(root_swapped.ok()) << root_swapped.error().message;
+  ASSERT_EQ(root_swapped_sources.size(), 2U);
+  EXPECT_EQ(peer->participant_peers.size(), 1U);
+  EXPECT_EQ(peer->participant_peers.front(), primary);
+  EXPECT_EQ(peer->stop_surveillance_owner, stable_stop_observer);
+  EXPECT_EQ(primary->stop_surveillance_owner, stable_stop_observer);
+  EXPECT_EQ(primary->cell_runtime_root, peer.get());
+  EXPECT_EQ(peer->cell_runtime_root, peer.get());
+  EXPECT_EQ(peer->cell_addressed_kernel, primary->addressed_kernel.get());
+
+  // Rejoin can succeed before the host's scoped Core participant install.
+  // If that later step fails, the host retains the private prepared
+  // composition while admission stays closed. Model that ownership boundary:
+  // the candidate root must keep both the old Kernel owner and its exact Stop
+  // observer alive, even after the caller drops its predecessor references.
+  std::weak_ptr<RetainedNativeRuntime> failed_candidate_lifetime = peer;
+  std::weak_ptr<RetainedNativeRuntime> failed_predecessor_lifetime = primary;
+  auto failed_prepared_composition = peer;
+  peer.reset();
+  primary.reset();
+  stable_stop_observer.reset();
+  ASSERT_FALSE(failed_candidate_lifetime.expired());
+  ASSERT_FALSE(failed_predecessor_lifetime.expired());
+  ASSERT_FALSE(stable_observer_lifetime.expired());
+  ASSERT_EQ(failed_prepared_composition->participant_peers.size(), 1U);
+  auto *const failed_predecessor =
+      failed_prepared_composition->participant_peers.front().get();
+  ASSERT_NE(failed_predecessor, nullptr);
+  EXPECT_EQ(failed_predecessor->cell_runtime_root,
+            failed_prepared_composition.get());
+  ASSERT_NE(failed_prepared_composition->cell_addressed_kernel, nullptr);
+  EXPECT_EQ(failed_prepared_composition->cell_addressed_kernel,
+            failed_predecessor->addressed_kernel.get());
+  EXPECT_EQ(failed_prepared_composition->stop_surveillance_owner,
+            failed_predecessor->stop_surveillance_owner);
+
+  // The failed candidate is still available for diagnosis/authorized
+  // restoration. Reacquire the exact retained owners before modeling the next
+  // successful Apply that removes one cell peer.
+  peer = failed_prepared_composition;
+  primary = peer->participant_peers.front();
+  stable_stop_observer = peer->stop_surveillance_owner;
+  failed_prepared_composition.reset();
+
+  // A later Apply can remove the former root entirely. Rejoin accepts zero
+  // peers and returns a one-component Stop table, but must leave the stable
+  // observer on its predecessor table until the host's Kernel commit hook.
+  std::vector<RetainedStopSurveillanceSourceInput> single_component_sources;
+  const auto single_component = rejoin_retained_native_runtime_participants(
+      peer, {}, joined_resolver_factory, stable_stop_observer,
+      single_component_sources, rejoin_gate, rejoin_fence_id, rejoin_scope);
+  ASSERT_TRUE(single_component.ok()) << single_component.error().message;
+  ASSERT_EQ(single_component_sources.size(), 1U);
+  EXPECT_EQ(single_component_sources.front().binding.value(),
+            peer->motion_binding.value());
+  EXPECT_TRUE(peer->participant_peers.empty());
+  EXPECT_EQ(peer->stop_surveillance_owner, stable_stop_observer);
+  peer->addressed_kernel = std::move(primary->addressed_kernel);
+  peer->operation_journal = std::move(primary->operation_journal);
+  primary->stop_surveillance_owner.reset();
+  primary->cell_addressed_kernel = nullptr;
+  primary->cell_runtime_root = nullptr;
+  EXPECT_FALSE(stable_observer_lifetime.expired());
+
   std::weak_ptr<RetainedNativeRuntime> primary_runtime_lifetime = primary;
   std::weak_ptr<RetainedNativeRuntime> peer_runtime_lifetime = peer;
   primary_subscription.reset();
   peer_subscription.reset();
   retained_primary_engine.reset();
   retained_peer_engine.reset();
-  peer.reset();
   ASSERT_EQ(primary.use_count(), 1U);
   ASSERT_FALSE(peer_runtime_lifetime.expired());
   ASSERT_FALSE(primary_subscription_lifetime.expired());
   ASSERT_FALSE(peer_subscription_lifetime.expired());
   ASSERT_FALSE(primary_engine_lifetime.expired());
   ASSERT_FALSE(peer_engine_lifetime.expired());
+  stable_stop_observer.reset();
 
+  peer.reset();
+
+  EXPECT_TRUE(peer_runtime_lifetime.expired());
+  EXPECT_TRUE(stable_observer_lifetime.expired());
+  EXPECT_FALSE(primary_runtime_lifetime.expired());
   primary.reset();
 
   EXPECT_TRUE(primary_runtime_lifetime.expired());
-  EXPECT_TRUE(peer_runtime_lifetime.expired());
   EXPECT_TRUE(primary_subscription_lifetime.expired());
   EXPECT_TRUE(peer_subscription_lifetime.expired());
   EXPECT_TRUE(primary_engine_lifetime.expired());

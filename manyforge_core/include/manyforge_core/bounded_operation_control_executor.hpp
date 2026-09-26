@@ -92,6 +92,14 @@ enum class OperationControlEffectReleaseStatus : std::uint8_t {
   kStaleHandle,
 };
 
+enum class OperationControlLaneUpdateStatus : std::uint8_t {
+  kApplied = 0,
+  kBusy,
+  kClosed,
+  kInvalid,
+  kCapacityUnavailable,
+};
+
 class BoundedOperationControlExecutor;
 
 class IOperationControlEffectCompletionReceiver {
@@ -124,6 +132,11 @@ class BoundedOperationControlExecutor final {
   [[nodiscard]] bool prequalified_ready() const noexcept;
   /// Includes completion callbacks after their result slot was released.
   [[nodiscard]] bool has_active_calls() const noexcept;
+  /// Under the Kernel's configuration fence, retain workers for unchanged
+  /// engines and retire/add only changed lanes. No effect or unreleased handle
+  /// may be present; a refusal leaves the old set intact.
+  [[nodiscard]] OperationControlLaneUpdateStatus ReconfigureEngines(
+      std::vector<IResolvedParticipantExecutionEngine*> engines) noexcept;
   [[nodiscard]] OperationControlEffectStartResult TryStart(
       OperationControlEffectRequest request) noexcept;
   [[nodiscard]] OperationControlEffectTakeResult TryTake(

@@ -26,7 +26,7 @@ def test_manager_transport_accepts_bounded_cold_apply_timeout(tmp_path: Path) ->
 
 def _prepared_activation() -> dict[str, object]:
     return {
-        "schema_version": "manyforge.prepared_activation_input.v2",
+        "schema_version": "manyforge.prepared_activation_input.v3",
         "scenario_id": "scenario.1",
         "source_document_digest": "sha256:" + "1" * 64,
         "captured_input_digest": "sha256:" + "d" * 64,
@@ -36,7 +36,7 @@ def _prepared_activation() -> dict[str, object]:
         "graph_revision": "sha256:" + "3" * 64,
         "program_id": "program.1",
         "program_revision": "sha256:" + "4" * 64,
-        "program_binding_id": "sha256:" + "9" * 64,
+        "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
         "node_environment_digest": "sha256:" + "5" * 64,
         "assistant_mode": "optional",
         "typed_parameter_overrides": {},
@@ -61,7 +61,7 @@ def _request() -> ManagerApplyRequest:
             "prepared_activation": _prepared_activation(),
             "expected_admission_generation": 7,
             "candidate_receipt": {
-                "schema_version": "manyforge.manager_deployment_candidate_receipt.v1",
+                "schema_version": "manyforge.manager_deployment_candidate_receipt.v2",
                 "deployment_artifact_id": "deployment.1",
                 "deployment_revision": "sha256:" + "a" * 64,
                 "prepared_activation_id": "sha256:" + "e" * 64,
@@ -73,6 +73,8 @@ def _request() -> ManagerApplyRequest:
                 },
                 "expected_admission_generation": 7,
                 "manager_owner_epoch": "client.epoch.1",
+                "impact_digest": "sha256:" + "c" * 64,
+                "destructive_impact": False,
                 "receipt_digest": "sha256:" + "c" * 64,
             },
         }
@@ -167,6 +169,7 @@ def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> 
     ).encode()
     assert decoded["command"] == "apply"
     assert set(decoded) == {
+        "accepted_impact_digest",
         "api_version",
         "command",
         "candidate_receipt",
@@ -289,14 +292,18 @@ def _status_response() -> dict[str, object]:
         "ok": True,
         "phase": "accepted",
         "prepared_activation": {
-            field: _prepared_activation()[field]
-            for field in (
-                "captured_input_digest",
-                "deployment_artifact_id",
-                "deployment_revision",
-                "program_binding_id",
-                "prepared_activation_id",
-            )
+            **{
+                field: _prepared_activation()[field]
+                for field in (
+                    "captured_input_digest",
+                    "deployment_artifact_id",
+                    "deployment_revision",
+                    "prepared_activation_id",
+                )
+            },
+            "program_binding_id": _prepared_activation()["program_outcome"][
+                "program_binding_id"
+            ],
         },
         "request_id": "request.3",
         "request_owner_epoch": "client.epoch.3",

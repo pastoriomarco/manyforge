@@ -805,6 +805,17 @@ bool ManagedKernelAdmissionGate::exact_fence_covers(
          });
 }
 
+bool ManagedKernelAdmissionGate::exact_fence_is_held(
+    const core::ConfigurationFenceId &fence_id,
+    const core::ConfigurationFenceScopeDTO &scope) const {
+  std::lock_guard lock(*admission_mutex_);
+  return !fence_id.empty() &&
+         std::any_of(held_fences_.begin(), held_fences_.end(),
+                     [&](const auto &held) {
+                       return held.fence_id == fence_id && held.scope == scope;
+                     });
+}
+
 ManagedKernelAdmissionObservation ManagedKernelAdmissionGate::Observe(
     const core::ConfigurationFenceScopeDTO &scope) const {
   Require(scope.valid(), "admission observation scope is invalid");

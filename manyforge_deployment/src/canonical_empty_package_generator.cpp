@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "build_manifest_internal.hpp"
 #include "manyforge_deployment/build_manifest.hpp"
@@ -80,6 +81,52 @@ require_array(const CanonicalValue &value, const std::string_view label) {
     fail(std::string(label) + " must be an array");
   }
   return *array;
+}
+
+[[nodiscard]] const CanonicalValue::Object &
+require_object(const CanonicalValue &value, const std::string_view label) {
+  const auto *object = std::get_if<CanonicalValue::Object>(&value.storage());
+  if (object == nullptr) {
+    fail(std::string(label) + " must be an object");
+  }
+  return *object;
+}
+
+[[nodiscard]] CanonicalValue make_native_canonical_empty_runtime_unit(
+    const CanonicalValue &authored_runtime_unit) {
+  const auto &authored_configuration = require_member(
+      authored_runtime_unit, "configuration", "deployment.graph.runtime_unit");
+  CanonicalValue::Object empty_configuration = require_object(
+      authored_configuration, "deployment.graph.runtime_unit.configuration");
+  constexpr std::string_view kEmptyArrayMembers[]{
+      "initial_joint_positions_rad", "motion_target_limits",
+      "direct_control_joint_limits", "gripper_target_configurations"};
+  for (const std::string_view name : kEmptyArrayMembers) {
+    const auto member = std::find_if(
+        empty_configuration.begin(), empty_configuration.end(),
+        [name](const auto &row) { return row.first == name; });
+    if (member == empty_configuration.end()) {
+      if (name != "gripper_target_configurations") {
+        fail("native canonical-empty source configuration is missing " +
+             std::string(name));
+      }
+      empty_configuration.emplace_back(
+          std::string(name), CanonicalValue(CanonicalValue::Array{}));
+      continue;
+    }
+    member->second = CanonicalValue(CanonicalValue::Array{});
+  }
+
+  CanonicalValue::Object empty_runtime_unit = authored_runtime_unit.as_object();
+  const auto configuration = std::find_if(
+      empty_runtime_unit.begin(), empty_runtime_unit.end(), [](const auto &row) {
+        return row.first == "configuration";
+      });
+  if (configuration == empty_runtime_unit.end()) {
+    fail("native canonical-empty source runtime is missing configuration");
+  }
+  configuration->second = CanonicalValue(std::move(empty_configuration));
+  return CanonicalValue(std::move(empty_runtime_unit));
 }
 
 [[nodiscard]] std::filesystem::path
@@ -189,6 +236,12 @@ derive_cell_scoped_canonical_empty_deployment_impl(
     fail("cell-scoped canonical-empty derivation found a divergent runtime "
          "projection");
   }
+  const CanonicalValue empty_runtime_unit =
+      runtime.runtime_profile_id.value() ==
+              native_execution_runtime_contract::kRuntimeProfileId
+          ? make_native_canonical_empty_runtime_unit(
+                authored_runtime_units.front())
+          : authored_runtime_units.front();
 
   const std::string deployment_id =
       first_deployment.deployment_artifact_id().value() + ".canonical_empty";
@@ -205,7 +258,7 @@ derive_cell_scoped_canonical_empty_deployment_impl(
       {"graph",
        CanonicalValue(CanonicalValue::Object{
            {"runtime_units", CanonicalValue(CanonicalValue::Array{
-                                 authored_runtime_units.front(),
+                                 empty_runtime_unit,
                              })},
            {"model_instances", CanonicalValue(CanonicalValue::Array{})},
            {"controllable_components", CanonicalValue(CanonicalValue::Array{})},

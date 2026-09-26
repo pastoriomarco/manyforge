@@ -1,6 +1,5 @@
 #include "manyforge_component_manager/manager_planned_maintenance_coordinator.hpp"
 
-#include <algorithm>
 #include <utility>
 
 namespace manyforge::component_manager {
@@ -12,20 +11,8 @@ namespace {
   result.outcome = ManagerPlannedMaintenanceOutcome::kFailedBeforeEffect;
   result.failure_code = std::move(code);
   result.failure_message = std::move(message);
-  // Nothing was destroyed, so every effect of this attempt is exactly known.
+  // No runtime lifecycle effect was issued, so this attempt is known.
   result.effect_disposition = ManagerApplyEffectDisposition::kKnown;
-  return result;
-}
-
-[[nodiscard]] ManagerPlannedMaintenanceResult UncertainEffect(
-    std::string code, std::string message) {
-  ManagerPlannedMaintenanceResult result;
-  result.outcome = ManagerPlannedMaintenanceOutcome::kUnknownEffect;
-  result.failure_code = std::move(code);
-  result.failure_message = std::move(message);
-  // A stop that may have taken effect without a usable result is never
-  // reported as clean absence.
-  result.effect_disposition = ManagerApplyEffectDisposition::kUnknown;
   return result;
 }
 
@@ -60,16 +47,9 @@ const char *ToString(const ManagementIdleState state) noexcept {
 bool ManagerPlannedMaintenanceResult::valid() const noexcept {
   if (entered_idle_maintenance()) {
     return failure_code.empty() && failure_message.empty() &&
-           effect_disposition == ManagerApplyEffectDisposition::kKnown &&
-           std::all_of(final_process_observations.begin(),
-                       final_process_observations.end(),
-                       [](const auto &observation) {
-                         return observation.state() ==
-                                ProcessPresenceState::kAbsent;
-                       });
+           effect_disposition == ManagerApplyEffectDisposition::kKnown;
   }
   return !failure_code.empty() && !failure_message.empty() &&
-         final_process_observations.empty() &&
          effect_disposition ==
              (outcome == ManagerPlannedMaintenanceOutcome::kFailedBeforeEffect
                   ? ManagerApplyEffectDisposition::kKnown
@@ -78,10 +58,8 @@ bool ManagerPlannedMaintenanceResult::valid() const noexcept {
 
 ManagerPlannedMaintenanceCoordinator::ManagerPlannedMaintenanceCoordinator(
     const IManagerActiveRuntimePlanSource &plan_source,
-    ManagerActiveRuntimeCoordinator &active_runtime,
     IPlannedMaintenanceGate &gate)
-    : plan_source_(plan_source), active_runtime_(active_runtime),
-      gate_(gate) {}
+    : plan_source_(plan_source), gate_(gate) {}
 
 std::optional<ManagerPlannedMaintenanceResult>
 ManagerPlannedMaintenanceCoordinator::Preflight(
@@ -98,9 +76,9 @@ ManagerPlannedMaintenanceCoordinator::Preflight(
         "planned reconfiguration predecessor is not the accepted intent");
   }
 
-  // Step 2: refuse before any effect unless the affected surface is exactly
-  // idle. Planned teardown must never be started on top of motion, a paused
-  // run, an in-progress stop or a reset.
+  // Step 2: refuse before any Apply effect unless the affected surface is
+  // exactly idle. A planned configuration transition must not overlap motion,
+  // a paused run, an in-progress stop or a reset.
   switch (gate_.ReadIdleState()) {
   case ManagementIdleState::kIdle:
     break;
@@ -143,8 +121,7 @@ ManagerPlannedMaintenanceCoordinator::Preflight(
   }
 
   // Step 3: recheck that the original inputs and revisions are still current.
-  // The predecessor identity is the last fact that selects what will be
-  // destroyed, so a stale revision is refused rather than destroyed.
+  // A stale predecessor must not be used to select the transition.
   try {
     const auto plan = plan_source_.ReadCurrentPlan();
     if (!plan.valid() ||
@@ -177,34 +154,20 @@ ManagerPlannedMaintenanceCoordinator::EnterIdleMaintenance(
     return *refusal;
   }
 
-  // Step 4: close admission and prove it is closed before destroying anything.
+  // Step 4: close admission and prove it is closed before runtime convergence.
   if (!gate_.CloseAdmissionAndProveClosed()) {
     return RefusedBeforeEffect(
         "planned_maintenance_admission_not_closed",
         "planned reconfiguration could not prove admission closed");
   }
 
-  // Step 5: stop the affected Manager-owned runtime contents in reverse
-  // dependency order and prove their exact absence. A stop that may already
-  // have taken effect without a usable result leaves the effects unknown: the
-  // Manager never retries, rolls back or replaces on its own.
-  try {
-    auto stopped = active_runtime_.Shutdown();
-    ManagerPlannedMaintenanceResult result;
-    result.outcome =
-        ManagerPlannedMaintenanceOutcome::kEnteredIdleMaintenance;
-    result.final_process_observations =
-        std::move(stopped.final_process_observations);
-    return result;
-  } catch (const ManagerActiveRuntimeProcessEffectUncertainError &error) {
-    return UncertainEffect("planned_maintenance_stop_uncertain", error.what());
-  } catch (const std::exception &error) {
-    return UncertainEffect("planned_maintenance_teardown_failed",
-                           error.what());
-  } catch (...) {
-    return UncertainEffect("planned_maintenance_teardown_failed",
-                           "planned teardown failed");
-  }
+  // Keep the Manager-owned host process and all unaffected component owners
+  // alive. The accepted component delta is applied by the runtime convergence
+  // owner under this still-held Manager Apply admission.
+  ManagerPlannedMaintenanceResult result;
+  result.outcome =
+      ManagerPlannedMaintenanceOutcome::kEnteredIdleMaintenance;
+  return result;
 }
 
 } // namespace manyforge::component_manager

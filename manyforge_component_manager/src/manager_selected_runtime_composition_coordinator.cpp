@@ -64,14 +64,17 @@ ManagerSelectedRuntimeCompositionCoordinator::Advance(
   const auto apply = apply_journal_.ReadIntent(apply_id, apply_generation);
   const auto attempt =
       apply_journal_.ReadFenceAttempt(apply_id, apply_generation);
+  const auto affected =
+      apply_journal_.ReadAffectedScope(apply_id, apply_generation);
   const auto acceptance =
       apply_journal_.ReadFenceAcceptance(apply_id, apply_generation);
   const auto runtime =
       apply_journal_.ReadLatestRuntimeStagedReady(apply_id, apply_generation);
   const auto initialized = scene_owner_.ReadMaintenanceInitialization(
       {apply_id, apply_generation});
-  Require(apply.has_value() && attempt.has_value() && acceptance.has_value() &&
-              runtime.has_value() && initialized.has_value(),
+  Require(apply.has_value() && attempt.has_value() && affected.has_value() &&
+              acceptance.has_value() && runtime.has_value() &&
+              initialized.has_value(),
           "selected runtime composition requires complete durable Apply, "
           "fence, runtime, and Scene initialization evidence");
   Require(runtime->staged_ready.runtime_units.size() == 1U,
@@ -147,7 +150,15 @@ ManagerSelectedRuntimeCompositionCoordinator::Advance(
       accepted_fence.configuration_fence_generation,
       accepted_fence.captured_scope,
       phase,
+      // The exact durable decision, never re-derived here.
+      affected->affected_scope.component_delta,
+      apply->intent.expected_active_projection_revision,
   };
+  Require(affected->affected_scope.scope == fence_intent.scope &&
+              attempt->affected_scope_digest ==
+                  affected->affected_scope_digest,
+          "selected runtime composition fence differs from its durable "
+          "affected scope");
   Require(request.valid(), "selected runtime-composition request is invalid");
   const auto result = runtime_composition_.InstallOrObserve(request);
   Require(result.valid() && result.request == request,
@@ -161,6 +172,11 @@ ManagerSelectedRuntimeCompositionCoordinator::Advance(
     return {ManagerSelectedRuntimeCompositionResultState::kInstalled, result,
             std::nullopt};
   }
+  // Installation is claimed only with live-owner evidence for every
+  // retained, added and replaced component, matching the durable delta.
+  Require(ComponentReceiptsMatchRequest(request, result.component_receipts),
+          "managed execution host installed a component set that differs "
+          "from the durable Apply delta");
   auto durable = apply_journal_.EnsurePrivateMaterialization(materialization);
   return {ManagerSelectedRuntimeCompositionResultState::kInstalled, result,
           std::move(durable)};

@@ -1,4 +1,5 @@
 #include "apply_affected_scope_internal.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 
 #include <gtest/gtest.h>
 
@@ -8,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace manyforge::deployment::detail {
@@ -169,6 +171,411 @@ Products(std::string planning_id = "planning",
       {},
       {},
   };
+}
+
+[[nodiscard]] core::RuntimeUnitId NativeHostId() {
+  return core::RuntimeUnitId(
+      std::string(native_execution_runtime_contract::kCellHostRuntimeUnitId));
+}
+
+[[nodiscard]] core::JsonValueDTO MotionLimit(const std::string &component,
+                                             const std::string &target,
+                                             const double maximum = 0.5) {
+  return {core::JsonObjectDTO{
+      {"controllable_component_id", core::JsonValueDTO{component}},
+      {"command_target_id", core::JsonValueDTO{target}},
+      {"maximum_tcp_linear_speed_mps", core::JsonValueDTO{maximum}},
+      {"ordinary_motion_jerk",
+       core::JsonValueDTO{core::JsonObjectDTO{
+           {"enabled", core::JsonValueDTO{false}},
+           {"preset_reference_time_s", core::JsonValueDTO{1.0}},
+           {"joint_limits", core::JsonValueDTO{core::JsonValueDTO::Array{}}},
+       }}},
+  }};
+}
+
+[[nodiscard]] core::CellGraphDTO NativeGraph(const bool include_b = true) {
+  auto runtime = RuntimeUnit(NativeHostId().value());
+  runtime.runtime_profile_id =
+      core::RuntimeProfileId(std::string(kNativeExecutionRuntimeProfileId));
+  runtime.runtime_profile_revision =
+      core::RuntimeProfileRevision(native_execution_runtime_profile_revision());
+  auto positions = core::JsonValueDTO::Array{core::JsonValueDTO{0.1},
+                                             core::JsonValueDTO{0.2}};
+  auto limits =
+      core::JsonValueDTO::Array{MotionLimit("component-a", "target-a")};
+  if (include_b) {
+    positions.push_back(core::JsonValueDTO{0.3});
+    limits.push_back(MotionLimit("component-b", "target-b"));
+  }
+  runtime.configuration = {
+      {"mode", core::JsonValueDTO{std::string("simulated")}},
+      {"planner_rng_seed", core::JsonValueDTO{1.0}},
+      {"execution_tick_hz", core::JsonValueDTO{100.0}},
+      {"collision_monitor_period_ms", core::JsonValueDTO{10.0}},
+      {"initial_joint_positions_rad", core::JsonValueDTO{std::move(positions)}},
+      {"motion_target_limits", core::JsonValueDTO{std::move(limits)}},
+      {"direct_control_joint_limits",
+       core::JsonValueDTO{core::JsonValueDTO::Array{}}},
+      {"gripper_target_configurations",
+       core::JsonValueDTO{core::JsonValueDTO::Array{}}},
+  };
+  const auto motion_binding = [](const std::string &suffix,
+                                 std::vector<std::string> resources) {
+    auto binding = Binding("binding-" + suffix, "binding-" + suffix + "-r1",
+                           "component-" + suffix, "domain-" + suffix,
+                           std::move(resources));
+    binding.command_target_id = core::CommandTargetId("target-" + suffix);
+    binding.capability_id = core::CapabilityId("execution.trajectory.execute");
+    binding.provider_runtime_unit_id = NativeHostId();
+    binding.provider_manifest_id =
+        core::ProviderManifestId(std::string(kNativeControlProviderManifestId));
+    return binding;
+  };
+  auto components = std::vector{Component("component-a", {NativeHostId()})};
+  auto domains = std::vector{Domain("domain-a", {NativeHostId()})};
+  auto bindings =
+      std::vector{motion_binding("a", {"resource-a-1", "resource-a-2"})};
+  if (include_b) {
+    components.push_back(Component("component-b", {NativeHostId()}));
+    domains.push_back(Domain("domain-b", {NativeHostId()}));
+    bindings.push_back(motion_binding("b", {"resource-b"}));
+  }
+  return Graph({std::move(runtime)}, std::move(components), std::move(domains),
+               std::move(bindings));
+}
+
+[[nodiscard]] core::CellGraphDTO NativeGraphWithDependentGenericRuntime() {
+  auto graph = NativeGraph(false);
+  const auto dependent_runtime = core::RuntimeUnitId("runtime");
+  // Exercise the verified-values algorithm contract: the reference generic
+  // runtime profile does not currently admit this dependency in production.
+  graph.runtime_units.push_back(
+      RuntimeUnit(dependent_runtime.value(), {NativeHostId()}));
+  graph.controllable_components.push_back(
+      Component("component-b", {dependent_runtime}));
+  graph.control_domains.push_back(Domain("domain-b"));
+  graph.control_bindings.push_back(
+      Binding("binding-b", "binding-b-r1", "component-b", "domain-b",
+              {"resource-b"}));
+  return graph;
+}
+
+[[nodiscard]] core::RetainedCompiledProductsDTO NativeProducts() {
+  auto products = Products();
+  auto runtime_product =
+      Product(native_execution_runtime_product_id(NativeHostId()),
+              core::RetainedProductKind::kRuntimeUnitConfiguration);
+  runtime_product.product_contract_id = core::ProductContractId(
+      std::string(kNativeExecutionRuntimeProductContractId));
+  products.runtime_unit_products = {
+      {NativeHostId(), {std::move(runtime_product)}}};
+  return products;
+}
+
+[[nodiscard]] core::RetainedRuntimeContractRequirementDTO
+RuntimeRequirement(const core::RuntimeUnitId &runtime_unit_id) {
+  return {
+      runtime_unit_id,
+      {core::RuntimeContractRequirementDigest("sha256:" +
+                                              std::string(64U, 'a')),
+       core::RuntimeImplementationFamilyId(
+           std::string(native_execution_runtime_contract::kImplementationId)),
+       {core::ApiContractId(std::string(
+           native_execution_runtime_contract::kRuntimeRoleApiContractId))},
+       {{core::CapabilityId("execution.trajectory.execute"),
+         core::CapabilityDefinitionRevision("capability-r1")}}},
+  };
+}
+
+void ExpectOnlyComponentB(const core::ConfigurationFenceScopeDTO &scope) {
+  ASSERT_TRUE(scope.valid());
+  EXPECT_EQ(scope.controllable_component_ids,
+            (std::vector{core::ControllableComponentId("component-b")}));
+  EXPECT_EQ(scope.resources, (std::vector{core::ResourceId("resource-b")}));
+  ASSERT_EQ(scope.bindings.size(), 1U);
+  EXPECT_EQ(scope.bindings.front().control_binding_id,
+            core::ControlBindingId("binding-b"));
+  ASSERT_EQ(scope.domains.size(), 1U);
+  EXPECT_EQ(scope.domains.front().control_domain_id,
+            core::ControlDomainId("domain-b"));
+}
+
+void ExpectBothComponents(const core::ConfigurationFenceScopeDTO &scope) {
+  ASSERT_TRUE(scope.valid());
+  EXPECT_EQ(scope.controllable_component_ids,
+            (std::vector{core::ControllableComponentId("component-a"),
+                         core::ControllableComponentId("component-b")}));
+  EXPECT_EQ(scope.resources, (std::vector{core::ResourceId("resource-a-1"),
+                                          core::ResourceId("resource-a-2"),
+                                          core::ResourceId("resource-b")}));
+  EXPECT_EQ(scope.bindings.size(), 2U);
+  EXPECT_EQ(scope.domains.size(), 2U);
+}
+
+TEST(ApplyAffectedScope, NativeInitialPositionChangeFencesOnlyItsComponent) {
+  const auto predecessor = NativeGraph();
+  auto candidate = predecessor;
+  std::get<core::JsonValueDTO::Array>(
+      candidate.runtime_units.front()
+          .configuration.at("initial_joint_positions_rad")
+          .value)
+      .back() = core::JsonValueDTO{0.4};
+
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      Bundle(predecessor, NativeProducts()),
+      Bundle(candidate, NativeProducts()));
+
+  ExpectOnlyComponentB(scope);
+}
+
+TEST(ApplyAffectedScope, NativeMotionLimitChangeFencesOnlyItsComponent) {
+  const auto predecessor = NativeGraph();
+  auto candidate = predecessor;
+  std::get<core::JsonValueDTO::Array>(
+      candidate.runtime_units.front()
+          .configuration.at("motion_target_limits")
+          .value)
+      .back() = MotionLimit("component-b", "target-b", 0.75);
+
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      Bundle(predecessor, NativeProducts()),
+      Bundle(candidate, NativeProducts()));
+
+  ExpectOnlyComponentB(scope);
+}
+
+TEST(ApplyAffectedScope,
+     NativeRemovalKeepsOnlyRemovedComponentPredecessorScope) {
+  // The collision product/model tables deliberately stay equal: this isolates
+  // removal's aggregate controller settings from genuine shared dependencies.
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      Bundle(NativeGraph(), NativeProducts()),
+      Bundle(NativeGraph(false), NativeProducts()));
+
+  ExpectOnlyComponentB(scope);
+  ASSERT_EQ(scope.bindings.size(), 1U);
+  EXPECT_EQ(scope.bindings.front().predecessor_control_binding_revision,
+            core::ControlBindingRevision("binding-b-r1"));
+  EXPECT_FALSE(scope.bindings.front().candidate_control_binding_revision);
+  ASSERT_EQ(scope.domains.size(), 1U);
+  EXPECT_EQ(scope.domains.front().predecessor_control_domain_revision,
+            core::ControlDomainRevision("domain-r1"));
+  EXPECT_FALSE(scope.domains.front().candidate_control_domain_revision);
+}
+
+TEST(ApplyAffectedScope, SharedNativeScalarsFenceEveryHostedComponent) {
+  const auto predecessor = NativeGraph();
+  for (const auto *field : {"planner_rng_seed", "execution_tick_hz",
+                            "collision_monitor_period_ms"}) {
+    SCOPED_TRACE(field);
+    auto candidate = predecessor;
+    auto &value = candidate.runtime_units.front().configuration.at(field).value;
+    value = std::get<double>(value) + 1.0;
+
+    const auto scope = derive_apply_configuration_fence_scope_verified_values(
+        Bundle(predecessor, NativeProducts()),
+        Bundle(candidate, NativeProducts()));
+
+    ExpectBothComponents(scope);
+  }
+}
+
+TEST(ApplyAffectedScope, SharedNativeScalarsFenceDependentGenericRuntime) {
+  const auto predecessor = NativeGraphWithDependentGenericRuntime();
+  for (const auto *field : {"planner_rng_seed", "execution_tick_hz",
+                            "collision_monitor_period_ms"}) {
+    SCOPED_TRACE(field);
+    auto candidate = predecessor;
+    auto &value = candidate.runtime_units.front().configuration.at(field).value;
+    value = std::get<double>(value) + 1.0;
+
+    const auto scope = derive_apply_configuration_fence_scope_verified_values(
+        Bundle(predecessor, NativeProducts()),
+        Bundle(candidate, NativeProducts()));
+
+    ExpectBothComponents(scope);
+  }
+}
+
+TEST(ApplyAffectedScope,
+     NativeLocalConfigurationDoesNotFenceDependentGenericRuntime) {
+  const auto predecessor = NativeGraphWithDependentGenericRuntime();
+  for (const auto *field : {"initial_joint_positions_rad",
+                            "motion_target_limits"}) {
+    SCOPED_TRACE(field);
+    auto candidate = predecessor;
+    auto &values = std::get<core::JsonValueDTO::Array>(
+        candidate.runtime_units.front().configuration.at(field).value);
+    values.front() = std::string(field) == "initial_joint_positions_rad"
+                         ? core::JsonValueDTO{0.4}
+                         : MotionLimit("component-a", "target-a", 0.75);
+
+    const auto scope = derive_apply_configuration_fence_scope_verified_values(
+        Bundle(predecessor, NativeProducts()),
+        Bundle(candidate, NativeProducts()));
+
+    ASSERT_TRUE(scope.valid());
+    EXPECT_EQ(scope.controllable_component_ids,
+              (std::vector{core::ControllableComponentId("component-a")}));
+    EXPECT_EQ(scope.resources,
+              (std::vector{core::ResourceId("resource-a-1"),
+                           core::ResourceId("resource-a-2")}));
+    ASSERT_EQ(scope.bindings.size(), 1U);
+    EXPECT_EQ(scope.bindings.front().control_binding_id,
+              core::ControlBindingId("binding-a"));
+    ASSERT_EQ(scope.domains.size(), 1U);
+    EXPECT_EQ(scope.domains.front().control_domain_id,
+              core::ControlDomainId("domain-a"));
+  }
+}
+
+TEST(ApplyAffectedScope, NativeCollisionProductChangeFencesEveryComponent) {
+  const auto graph = NativeGraph();
+  auto candidate_products = NativeProducts();
+  candidate_products.planning_collision_model.product_id =
+      core::ProductId("changed-planning");
+
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      Bundle(graph, NativeProducts()), Bundle(graph, candidate_products));
+
+  ExpectBothComponents(scope);
+}
+
+TEST(ApplyAffectedScope, NativeHostProfileChangeFencesEveryHostedComponent) {
+  const auto predecessor = NativeGraph();
+  auto candidate = predecessor;
+  candidate.runtime_units.front().runtime_profile_revision =
+      core::RuntimeProfileRevision("changed-profile-revision");
+
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      Bundle(predecessor, NativeProducts()),
+      Bundle(candidate, NativeProducts()));
+
+  ExpectBothComponents(scope);
+}
+
+TEST(ApplyAffectedScope, NativeHostProductChangeFencesEveryHostedComponent) {
+  const auto graph = NativeGraph();
+  auto candidate_products = NativeProducts();
+  candidate_products.runtime_unit_products.front().products.front().product_id =
+      core::ProductId("changed-native-host-product");
+
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      Bundle(graph, NativeProducts()), Bundle(graph, candidate_products));
+
+  ExpectBothComponents(scope);
+}
+
+TEST(ApplyAffectedScope,
+     NativeAggregateRequirementChangeDoesNotFenceUnchangedComponent) {
+  auto predecessor = Bundle(NativeGraph(), NativeProducts());
+  predecessor.runtime_contract_requirements = {
+      RuntimeRequirement(NativeHostId())};
+  auto candidate = predecessor;
+  candidate.cell_graph.control_bindings.back().control_binding_revision =
+      core::ControlBindingRevision("binding-b-r2");
+  std::get<core::JsonValueDTO::Array>(
+      candidate.cell_graph.runtime_units.front()
+          .configuration.at("initial_joint_positions_rad")
+          .value)
+      .back() = core::JsonValueDTO{0.4};
+  candidate.runtime_contract_requirements.front()
+      .requirement.requirement_digest =
+      core::RuntimeContractRequirementDigest("sha256:" + std::string(64U, 'b'));
+
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      predecessor, candidate);
+
+  ExpectOnlyComponentB(scope);
+  ASSERT_EQ(scope.bindings.size(), 1U);
+  EXPECT_EQ(scope.bindings.front().candidate_control_binding_revision,
+            core::ControlBindingRevision("binding-b-r2"));
+}
+
+TEST(ApplyAffectedScope, GenericRequirementChangeStillFencesWholeRuntime) {
+  const auto runtime_id = core::RuntimeUnitId("runtime");
+  auto predecessor =
+      Bundle(Graph({RuntimeUnit(runtime_id.value())},
+                   {Component("component-a", {runtime_id}),
+                    Component("component-b", {runtime_id})},
+                   {Domain("domain-a"), Domain("domain-b")},
+                   {Binding("binding-a", "binding-a-r1", "component-a",
+                            "domain-a", {"resource-a-1", "resource-a-2"}),
+                    Binding("binding-b", "binding-b-r1", "component-b",
+                            "domain-b", {"resource-b"})}),
+             Products());
+  predecessor.runtime_contract_requirements = {RuntimeRequirement(runtime_id)};
+  auto candidate = predecessor;
+  candidate.runtime_contract_requirements.front()
+      .requirement.requirement_digest =
+      core::RuntimeContractRequirementDigest("sha256:" + std::string(64U, 'b'));
+
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      predecessor, candidate);
+
+  ExpectBothComponents(scope);
+}
+
+TEST(ApplyAffectedScope, GenericConfigurationChangeStillFencesWholeRuntime) {
+  const auto runtime_id = core::RuntimeUnitId("runtime");
+  const auto predecessor =
+      Bundle(Graph({RuntimeUnit(runtime_id.value())},
+                   {Component("component-a", {runtime_id}),
+                    Component("component-b", {runtime_id})},
+                   {Domain("domain-a"), Domain("domain-b")},
+                   {Binding("binding-a", "binding-a-r1", "component-a",
+                            "domain-a", {"resource-a-1", "resource-a-2"}),
+                    Binding("binding-b", "binding-b-r1", "component-b",
+                            "domain-b", {"resource-b"})}),
+             Products());
+  auto candidate = predecessor;
+  candidate.cell_graph.runtime_units.front().configuration.emplace(
+      "changed", core::JsonValueDTO{true});
+
+  const auto scope = derive_apply_configuration_fence_scope_verified_values(
+      predecessor, candidate);
+
+  ExpectBothComponents(scope);
+}
+
+TEST(ApplyAffectedScope,
+     MultipleNativeMotionTargetsRejectBeforeScopeProduction) {
+  const auto predecessor = NativeGraph();
+  auto candidate = predecessor;
+  auto second_motion = candidate.control_bindings.back();
+  second_motion.control_binding_id =
+      core::ControlBindingId("binding-b-secondary");
+  second_motion.command_target_id = core::CommandTargetId("target-b-secondary");
+  second_motion.resource_bindings.front().resource_id =
+      core::ResourceId("resource-b-secondary");
+  candidate.control_bindings.push_back(std::move(second_motion));
+  auto &configuration = candidate.runtime_units.front().configuration;
+  std::get<core::JsonValueDTO::Array>(
+      configuration.at("initial_joint_positions_rad").value)
+      .push_back(core::JsonValueDTO{0.5});
+  std::get<core::JsonValueDTO::Array>(
+      configuration.at("motion_target_limits").value)
+      .push_back(MotionLimit("component-b", "target-b-secondary"));
+  const auto decoded = decode_native_execution_runtime_configuration(
+      configuration, candidate, NativeHostId());
+  try {
+    static_cast<void>(select_native_component_configuration(
+        decoded, candidate, NativeHostId(),
+        core::ControllableComponentId("component-b")));
+    FAIL() << "ambiguous native motion ownership returned a configuration";
+  } catch (const RetainedBundleError &error) {
+    EXPECT_EQ(
+        std::string(error.what()),
+        "native runtime supports at most one motion target per component: "
+        "component-b");
+  }
+
+  EXPECT_THROW(
+      static_cast<void>(derive_apply_configuration_fence_scope_verified_values(
+          Bundle(predecessor, NativeProducts()),
+          Bundle(candidate, NativeProducts()))),
+      RetainedBundleError);
 }
 
 TEST(ApplyAffectedScope, RuntimeOnlyAndViewerOnlyChangesStayEmpty) {

@@ -188,24 +188,29 @@ export const initialRobotControlState: RobotControlState = {
 
 /**
  * Manual control targets are an owner projection, not a second browser-side
- * model.  The singular fields are retained as the compatibility fallback for
- * older owners; a multi-target owner publishes the complete arrays.
+ * model (H1a-IF.2): every addressed target is owned by one listed component.
  */
 export function motionTargetsForStatus(
   status: ExecutionOwnerStatus,
 ): DirectControlMotionStatus[] {
-  return status.directControlTargets !== undefined
-    && status.directControlTargets.length > 0
-    ? status.directControlTargets
-    : [status.directControl];
+  return status.directControlTargets;
 }
 
 export function gripperTargetsForStatus(
   status: ExecutionOwnerStatus,
 ): DirectControlGripperStatus[] {
-  return status.directControlGripperTargets !== undefined
-    ? status.directControlGripperTargets
-    : [status.directControlGripper];
+  return status.directControlGripperTargets;
+}
+
+/** The selected motion target and its observation, for motion-only paths. */
+function requireSelectedMotion(status: ExecutionOwnerStatus): {
+  motion: DirectControlMotionStatus;
+  observed: ObservedMotionTarget;
+} {
+  if (status.directControl === null || status.observedMotion === null) {
+    throw new Error('The selected component has no observed motion target.');
+  }
+  return { motion: status.directControl, observed: status.observedMotion };
 }
 
 export interface RobotTargetSelection {
@@ -229,31 +234,31 @@ export function reconcileRobotTargetSelection(
   status: ExecutionOwnerStatus,
   selection: RobotTargetSelection,
 ): RobotTargetSelection {
+  // Component first: a component may own motion, gripper, both, or neither
+  // commandable target; targets are never borrowed across components.
   const motions = motionTargetsForStatus(status);
-  const selectedComponentMotions = selection.componentId === null
-    ? []
-    : motions.filter((target) => (
-      target.controllableComponentId === selection.componentId
-    ));
-  const selectedMotion = motions.find((target) => (
-    target.controllableComponentId === selection.componentId
-    && target.commandTargetId === selection.motionTargetId
-  )) ?? selectedComponentMotions[0] ?? motions.find((target) => (
-    target.controllableComponentId === status.directControl.controllableComponentId
-    && target.commandTargetId === status.directControl.commandTargetId
-  )) ?? motions[0];
-  if (selectedMotion === undefined) {
+  const grippers = gripperTargetsForStatus(status);
+  const commandable = new Set([
+    ...motions.map((target) => target.controllableComponentId),
+    ...grippers.map((target) => target.controllableComponentId),
+  ]);
+  const componentId = selection.componentId !== null && commandable.has(selection.componentId)
+    ? selection.componentId
+    : motions[0]?.controllableComponentId ?? grippers[0]?.controllableComponentId ?? null;
+  if (componentId === null) {
     return { componentId: null, motionTargetId: null, gripperTargetId: null };
   }
-  const tools = gripperTargetsForStatus(status).filter((target) => (
-    target.controllableComponentId === selectedMotion.controllableComponentId
-  ));
-  const selectedTool = tools.find((target) => (
+  const ownMotions = motions.filter((target) => target.controllableComponentId === componentId);
+  const ownTools = grippers.filter((target) => target.controllableComponentId === componentId);
+  const selectedMotion = ownMotions.find((target) => (
+    target.commandTargetId === selection.motionTargetId
+  )) ?? ownMotions[0];
+  const selectedTool = ownTools.find((target) => (
     target.commandTargetId === selection.gripperTargetId
-  )) ?? tools[0];
+  )) ?? ownTools[0];
   return {
-    componentId: selectedMotion.controllableComponentId,
-    motionTargetId: selectedMotion.commandTargetId,
+    componentId,
+    motionTargetId: selectedMotion?.commandTargetId ?? null,
     gripperTargetId: selectedTool?.commandTargetId ?? null,
   };
 }
@@ -261,21 +266,21 @@ export function reconcileRobotTargetSelection(
 function observedMotionForSelection(
   status: ExecutionOwnerStatus,
   motion: DirectControlMotionStatus,
-): ObservedMotionTarget {
-  return status.observedMotions?.find((observed) => (
+): ObservedMotionTarget | null {
+  return status.observedMotions.find((observed) => (
     observed.controllableComponentId === motion.controllableComponentId
     && observed.commandTargetId === motion.commandTargetId
-  )) ?? status.observedMotion;
+  )) ?? null;
 }
 
 function observedGripperForSelection(
   status: ExecutionOwnerStatus,
   gripper: DirectControlGripperStatus,
 ): ObservedGripperTarget | null {
-  return status.observedGrippers?.find((observed) => (
+  return status.observedGrippers.find((observed) => (
     observed.controllableComponentId === gripper.controllableComponentId
     && observed.commandTargetId === gripper.commandTargetId
-  )) ?? status.observedGripper;
+  )) ?? null;
 }
 
 /** Return the current owner snapshot projected onto one selected robot/tool. */
@@ -291,17 +296,19 @@ export function selectedStatusForState(
   const motion = motionTargetsForStatus(state.status).find((target) => (
     target.controllableComponentId === selection.componentId
     && target.commandTargetId === selection.motionTargetId
-  )) ?? state.status.directControl;
+  )) ?? null;
   const gripper = gripperTargetsForStatus(state.status).find((target) => (
     target.controllableComponentId === selection.componentId
     && target.commandTargetId === selection.gripperTargetId
-  )) ?? state.status.directControlGripper;
+  )) ?? null;
   return {
     ...state.status,
     directControl: motion,
     directControlGripper: gripper,
-    observedMotion: observedMotionForSelection(state.status, motion),
-    observedGripper: observedGripperForSelection(state.status, gripper),
+    observedMotion: motion === null ? null : observedMotionForSelection(state.status, motion),
+    observedGripper: gripper === null
+      ? null
+      : observedGripperForSelection(state.status, gripper),
   };
 }
 
@@ -365,6 +372,7 @@ function positionsAreValid(
   status: ExecutionOwnerStatus,
   positions: number[],
 ): boolean {
+  if (status.directControl === null) return false;
   const joints = status.directControl.targetDescriptor.joints;
   return positions.length === joints.length
     && positions.every((position, index) => {
@@ -378,7 +386,12 @@ function positionsAreValid(
 
 function motionSettingsAreValid(status: ExecutionOwnerStatus, settings: ManualMotionSettings): boolean {
   const { jointLimits, cartesianMaxBlendDeviationRad, ...positiveValues } = settings;
-  const descriptor = status.directControl.targetDescriptor;
+  // Motion-only limits apply only when a motion target is selected.
+  const descriptor = status.directControl?.targetDescriptor;
+  if (descriptor === undefined) {
+    return Object.values(positiveValues).every((value) => Number.isFinite(value) && value > 0)
+      && Number.isFinite(cartesianMaxBlendDeviationRad) && cartesianMaxBlendDeviationRad >= 0;
+  }
   return Object.values(positiveValues).every((value) => Number.isFinite(value) && value > 0)
     && Number.isFinite(cartesianMaxBlendDeviationRad) && cartesianMaxBlendDeviationRad >= 0
     && settings.velocityScale <= 1 && settings.accelerationScale <= 1
@@ -406,7 +419,7 @@ function initialMotionSettings(
     cartesianMaxBlendDeviationRad: cartesianDefaults?.maxBlendDeviationRad
       ?? DEFAULT_MANUAL_MOTION_SETTINGS.cartesianMaxBlendDeviationRad,
     tcpLinearSpeedMps: Math.min(DEFAULT_MANUAL_MOTION_SETTINGS.tcpLinearSpeedMps,
-      status.directControl.targetDescriptor.operationalLimit?.maximumTcpLinearSpeedMps ?? Infinity),
+      status.directControl?.targetDescriptor.operationalLimit?.maximumTcpLinearSpeedMps ?? Infinity),
   };
 }
 
@@ -433,7 +446,7 @@ function gripperPositionIsValid(
   status: ExecutionOwnerStatus,
   position: number,
 ): boolean {
-  if (!Number.isFinite(position)) return false;
+  if (!Number.isFinite(position) || status.directControlGripper === null) return false;
   const { minPosition, maxPosition } = status.directControlGripper.targetDescriptor;
   return minPosition === null && maxPosition === null
     ? true
@@ -479,7 +492,7 @@ function receiptMatchesCurrentDraft(
   const payload = intent.participants[0].payload;
   if (!commonReceiptMatches(status, intent, receipt)) return false;
   if (receipt.schemaVersion === 'manyforge.direct_control_motion_preview.v1') {
-    if (payload.kind !== 'motion') return false;
+    if (payload.kind !== 'motion' || status.directControl === null) return false;
     const expectedNames = status.directControl.targetDescriptor.joints.map(
       (joint) => joint.sourceJointName,
     );
@@ -487,6 +500,7 @@ function receiptMatchesCurrentDraft(
       && receipt.finalPositionsRad.length === expectedNames.length;
   }
   if (payload.kind !== 'capability_command') return false;
+  if (status.directControlGripper === null) return false;
   const position = payload.command_value.position;
   const target = position.kind === 'angular_rad'
     ? position.value_rad
@@ -513,8 +527,10 @@ function draftFromStatus(status: ExecutionOwnerStatus) {
   return {
     moveToDraft: null,
     poseDragging: false,
-    draftPositionsRad: [...status.observedMotion.positionsRad],
-    draftPose: copyPose(status.observedMotion.currentTcpPose),
+    draftPositionsRad: status.observedMotion === null
+      ? [] : [...status.observedMotion.positionsRad],
+    draftPose: status.observedMotion === null
+      ? IDENTITY_POSE : copyPose(status.observedMotion.currentTcpPose),
     draftGripperPosition: status.observedGripper?.position ?? null,
   };
 }
@@ -536,30 +552,33 @@ function operationMatchesSelectedTarget(
     // A partial address cannot safely identify a target in a multi-target
     // owner. Require both owner-issued identity fields before projecting it.
     if (!hasComponentId || !hasCommandTargetId) return false;
-    const matchesMotion = operation.controllableComponentId
-      === selectedStatus.directControl.controllableComponentId
-      && operation.commandTargetId === selectedStatus.directControl.commandTargetId;
-    const matchesGripper = operation.controllableComponentId
-      === selectedStatus.directControlGripper.controllableComponentId
-      && operation.commandTargetId === selectedStatus.directControlGripper.commandTargetId;
+    const motion = selectedStatus.directControl;
+    const matchesMotion = motion !== null
+      && operation.controllableComponentId === motion.controllableComponentId
+      && operation.commandTargetId === motion.commandTargetId;
+    const gripper = selectedStatus.directControlGripper;
+    const matchesGripper = gripper !== null
+      && operation.controllableComponentId === gripper.controllableComponentId
+      && operation.commandTargetId === gripper.commandTargetId;
     if (!matchesMotion && !matchesGripper) return false;
     return operation.targetRoleId === undefined
-      || operation.targetRoleId === selectedStatus.directControl.targetRoleId
-      || operation.targetRoleId === selectedStatus.directControlGripper.targetRoleId;
+      || operation.targetRoleId === motion?.targetRoleId
+      || operation.targetRoleId === gripper?.targetRoleId;
   }
   if (operation.targetRoleId === undefined) {
     // Old singleton owners did not publish participant identity. Preserve that
     // compatibility only when there is no second target to guess between.
-    return motionTargetsForStatus(status).length === 1
-      && gripperTargetsForStatus(status).length === 1;
+    // An arm-only singleton has no tool to confuse with its arm.
+    return motionTargetsForStatus(status).length <= 1
+      && gripperTargetsForStatus(status).length <= 1;
   }
   // The exact Program-run identity was matched by the caller. Legacy
   // singleton owners may use the same target-role name for arm and gripper,
   // so that role is corroborating evidence rather than a discriminator.
-  return motionTargetsForStatus(status).length === 1
-    && gripperTargetsForStatus(status).length === 1
-    && (operation.targetRoleId === selectedStatus.directControl.targetRoleId
-      || operation.targetRoleId === selectedStatus.directControlGripper.targetRoleId);
+  return motionTargetsForStatus(status).length <= 1
+    && gripperTargetsForStatus(status).length <= 1
+    && (operation.targetRoleId === selectedStatus.directControl?.targetRoleId
+      || operation.targetRoleId === selectedStatus.directControlGripper?.targetRoleId);
 }
 
 function resolveStatus(
@@ -583,9 +602,17 @@ function resolveStatus(
   const previousSelectedStatus = state.status === null
     ? null
     : selectedStatusForState(state);
+  if (state.mode === 'gripper' && selectedStatus.directControlGripper === null) {
+    // The selected component has no tool (arm-only).
+    state = { ...state, mode: 'joint' };
+  } else if (state.mode !== 'gripper' && selectedStatus.directControl === null
+    && selectedStatus.directControlGripper !== null) {
+    // The selected component has no motion target (gripper-only).
+    state = { ...state, mode: 'gripper' };
+  }
   const selectedRun = state.mode === 'gripper'
-    ? selectedStatus.directControlGripper.programRunId
-    : selectedStatus.directControl.programRunId;
+    ? selectedStatus.directControlGripper?.programRunId ?? null
+    : selectedStatus.directControl?.programRunId ?? null;
   const projected = status.manualOperations.filter((operation) => {
     if (operation.programRunId !== selectedRun) return false;
     return operationMatchesSelectedTarget(status, selectedStatus, operation);
@@ -611,18 +638,18 @@ function resolveStatus(
     || state.selectedMotionTargetId !== selection.motionTargetId
     || state.selectedGripperTargetId !== selection.gripperTargetId;
   const selectedBindingChanged = previousSelectedStatus !== null && (
-    previousSelectedStatus.directControl.programBindingId
-      !== selectedStatus.directControl.programBindingId
-    || previousSelectedStatus.directControlGripper.programBindingId
-      !== selectedStatus.directControlGripper.programBindingId
-    || previousSelectedStatus.directControl.controllableComponentId
-      !== selectedStatus.directControl.controllableComponentId
-    || previousSelectedStatus.directControl.commandTargetId
-      !== selectedStatus.directControl.commandTargetId
-    || previousSelectedStatus.directControlGripper.controllableComponentId
-      !== selectedStatus.directControlGripper.controllableComponentId
-    || previousSelectedStatus.directControlGripper.commandTargetId
-      !== selectedStatus.directControlGripper.commandTargetId
+    previousSelectedStatus.directControl?.programBindingId
+      !== selectedStatus.directControl?.programBindingId
+    || previousSelectedStatus.directControlGripper?.programBindingId
+      !== selectedStatus.directControlGripper?.programBindingId
+    || previousSelectedStatus.directControl?.controllableComponentId
+      !== selectedStatus.directControl?.controllableComponentId
+    || previousSelectedStatus.directControl?.commandTargetId
+      !== selectedStatus.directControl?.commandTargetId
+    || previousSelectedStatus.directControlGripper?.controllableComponentId
+      !== selectedStatus.directControlGripper?.controllableComponentId
+    || previousSelectedStatus.directControlGripper?.commandTargetId
+      !== selectedStatus.directControlGripper?.commandTargetId
   );
   if (state.status !== null && (
     state.status.ownerEpoch !== status.ownerEpoch
@@ -898,6 +925,10 @@ export function robotControlReducer(
         state.status === null
         || robotControlHasActiveOperation(state)
         || state.mode === action.mode
+        || (action.mode === 'gripper'
+          && selectedStatusForState(state)?.directControlGripper == null)
+        || (action.mode !== 'gripper'
+          && selectedStatusForState(state)?.directControl == null)
       ) return state;
       // A new editor must not relabel the last settled operation as its own
       // preview. resolveStatus still retains any resident operation/fault.
@@ -923,7 +954,7 @@ export function robotControlReducer(
         return state;
       }
       const selectedStatus = selectedStatusForState(state);
-      if (selectedStatus === null) return state;
+      if (selectedStatus === null || selectedStatus.observedMotion === null) return state;
       const baseline = robotControlHasLocalDraft(state)
         ? state.draftPositionsRad : selectedStatus.observedMotion.positionsRad;
       const positionsRad = action.type === 'edit' ? action.positionsRad : [...baseline];
@@ -974,7 +1005,7 @@ export function robotControlReducer(
     case 'select_move_source': {
       if (state.status === null || robotControlHasActiveOperation(state)) return state;
       const selectedStatus = selectedStatusForState(state);
-      if (selectedStatus === null) return state;
+      if (selectedStatus === null || selectedStatus.observedMotion === null) return state;
       const moveToDraft: MoveToDraft = {
         source: structuredClone(action.source),
         currentTcpPose: poseTupleFromValue(selectedStatus.observedMotion.currentTcpPose),
@@ -998,12 +1029,13 @@ export function robotControlReducer(
     }
     case 'begin_pose_drag':
       if (state.status === null || state.poseDragging || robotControlHasActiveOperation(state)
+        || selectedStatusForState(state)?.observedMotion == null
         || !['pose_goal', 'cartesian_path', 'move_to'].includes(state.mode)
         || (state.mode === 'move_to' && state.moveToDraft?.source.kind !== 'pose')) return state;
       return {
         ...state,
         draftPose: robotControlHasLocalDraft(state) ? state.draftPose
-          : copyPose(selectedStatusForState(state)!.observedMotion.currentTcpPose),
+          : copyPose(selectedStatusForState(state)!.observedMotion!.currentTcpPose),
         poseDragging: true,
         generation: state.generation + 1,
       };
@@ -1047,7 +1079,7 @@ export function robotControlReducer(
         return state;
       }
       const selectedStatus = selectedStatusForState(state);
-      if (selectedStatus === null) return state;
+      if (selectedStatus === null || selectedStatus.observedMotion === null) return state;
       if (!poseIsValid(action.pose)) {
         return {
           ...state,
@@ -1078,7 +1110,9 @@ export function robotControlReducer(
         return state;
       }
       const selectedStatus = selectedStatusForState(state);
-      if (selectedStatus === null) return state;
+      if (selectedStatus === null || selectedStatus.directControlGripper === null) {
+        return state;
+      }
       if (!gripperPositionIsValid(selectedStatus, action.position)) {
         return {
           ...state,
@@ -1231,13 +1265,13 @@ function requireMotionStatus(
   status: ExecutionOwnerStatus,
   capability: string,
 ): void {
-  if (!status.observedMotion.complete) {
+  if (!requireSelectedMotion(status).observed.complete) {
     throw new Error('Authoritative joint state is incomplete.');
   }
-  const descriptor = status.directControl.targetDescriptor;
+  const descriptor = requireSelectedMotion(status).motion.targetDescriptor;
   const frameRoles = descriptor.frames.map((frame) => frame.frameRoleId);
-  if (!frameRoles.includes(status.directControl.baseFrameRoleId)
-    || !frameRoles.includes(status.directControl.tcpFrameRoleId)) {
+  if (!frameRoles.includes(requireSelectedMotion(status).motion.baseFrameRoleId)
+    || !frameRoles.includes(requireSelectedMotion(status).motion.tcpFrameRoleId)) {
     throw new Error('The direct-control base/TCP frame contract is incomplete.');
   }
   if (!descriptor.contracts.supportingProviders.some(
@@ -1268,8 +1302,8 @@ function buildMotionIntent(
   const payload: MotionParticipantPayload = {
     kind: 'motion',
     move_id: `robot-control-${requestId}`,
-    base_frame_role_id: status.directControl.baseFrameRoleId,
-    tcp_frame_role_id: status.directControl.tcpFrameRoleId,
+    base_frame_role_id: requireSelectedMotion(status).motion.baseFrameRoleId,
+    tcp_frame_role_id: requireSelectedMotion(status).motion.tcpFrameRoleId,
     tolerances: {
       joint_position_tol_rad: 0.05,
       translation_tol_m: settings.cartesianTranslationToleranceM,
@@ -1302,17 +1336,17 @@ function buildMotionIntent(
       source_label: 'composer_ui',
       correlation_id: null,
     },
-    program_id: status.directControl.programId,
-    program_revision: status.directControl.programRevision,
-    program_binding_id: status.directControl.programBindingId,
-    program_run_id: status.directControl.programRunId,
+    program_id: requireSelectedMotion(status).motion.programId,
+    program_revision: requireSelectedMotion(status).motion.programRevision,
+    program_binding_id: requireSelectedMotion(status).motion.programBindingId,
+    program_run_id: requireSelectedMotion(status).motion.programRunId,
     expected_graph_revision: status.graphRevision,
     expected_retained_bundle_id: status.retainedBundleId,
     expected_scene_revision: { ...status.sceneRevision },
     participants: [{
-      component_role_id: status.directControl.targetDescriptor.componentRoleId,
-      target_role_id: status.directControl.targetDescriptor.targetRoleId,
-      required_capability_id: status.directControl.targetDescriptor.contracts.operationCapabilityId,
+      component_role_id: requireSelectedMotion(status).motion.targetDescriptor.componentRoleId,
+      target_role_id: requireSelectedMotion(status).motion.targetDescriptor.targetRoleId,
+      required_capability_id: requireSelectedMotion(status).motion.targetDescriptor.contracts.operationCapabilityId,
       action_span: null,
       payload,
     }],
@@ -1331,7 +1365,7 @@ export function buildJointMotionIntent(
   }
   return buildMotionIntent(status, {
     kind: 'joint_goal',
-    joint_names: status.directControl.targetDescriptor.joints.map(
+    joint_names: requireSelectedMotion(status).motion.targetDescriptor.joints.map(
       (joint) => joint.sourceJointName,
     ),
     positions_rad: [...positionsRad],
@@ -1378,7 +1412,7 @@ export function buildCartesianMotionIntent(
   return buildMotionIntent(status, {
     kind: 'cartesian_path',
     waypoints: [
-      copyPose(status.observedMotion.currentTcpPose),
+      copyPose(requireSelectedMotion(status).observed.currentTcpPose),
       normalizedPose(pose),
     ],
     max_translation_step_m: 0.005,
@@ -1398,6 +1432,9 @@ export function buildGripperCommandIntent(
   requestId: string,
 ): DirectControlOperationIntent {
   const gripper = status.directControlGripper;
+  if (gripper === null) {
+    throw new Error('The selected component has no gripper target.');
+  }
   const descriptor = gripper.targetDescriptor;
   if (
     status.observedGripper === null

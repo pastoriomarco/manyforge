@@ -7,6 +7,7 @@
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/cache/trajectory_cache.hpp>
 #include <manyforge_core/execution_kernel.hpp>
+#include <manyforge_core/ports/iplanning_scene_synchronizer.hpp>
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
@@ -32,9 +33,8 @@ class GripperParticipantEngine;
 
 namespace manyforge::roboplan_backend {
 
-// One execution cell may contain multiple independently controlled robots.
-// This is a hard construction bound, not a configured group size.
-inline constexpr std::size_t kNativeMaximumLiveStopParticipants = 64U;
+class RetainedNativeCellRuntime;
+class RetainedNativeGripperRuntime;
 
 struct RetainedNativeRuntimeConfig final {
   core::RequestOwnerEpoch request_owner_epoch;
@@ -64,9 +64,6 @@ struct RetainedNativeRuntimeConfig final {
   std::optional<core::ManagerLivenessRequiredSetDTO>
       manager_liveness_required_set;
 };
-
-inline constexpr core::StopSurveillancePolicyDTO
-    kMaintainedNativeStopSurveillancePolicy{10'000'000, 100'000'000, 64U};
 
 struct RetainedNativeAddressedOwnerConfig final {
   core::RequestOwnerEpoch request_owner_epoch;
@@ -126,6 +123,93 @@ using RetainedRuntimeParticipantResolver =
 using RetainedRuntimeParticipantResolverFactory =
     std::function<RetainedRuntimeParticipantResolver(
         std::vector<core::RuntimeParticipantBinding>)>;
+
+/// Adapt a cell-wide Program-binding resolver to exact physical Kernel
+/// registrations. This shares the native runtime's ambiguity and physical-owner
+/// validation without requiring the motion runtime to own the cell resolver.
+[[nodiscard]] core::RuntimeParticipantAdmissionResolver
+make_retained_cell_kernel_participant_resolver(
+    RetainedRuntimeParticipantResolver binding_resolver,
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        physical_registrations);
+
+/// Build the exact cell Stop-surveillance source for one independently owned
+/// gripper. The binding, readiness and state channel must come from the same
+/// retained gripper owner; its participant engine supplies command-free
+/// no-active-goal evidence.
+[[nodiscard]] std::optional<RetainedStopSurveillanceSourceInput>
+build_retained_gripper_stop_surveillance_source(
+    const core::RuntimeParticipantBinding &binding,
+    const std::optional<core::RuntimeParticipantStopReadiness> &readiness,
+    const std::shared_ptr<IRetainedObservedStateChannel> &state_channel,
+    core::IResolvedParticipantExecutionEngine *participant_engine);
+
+/// Stable Kernel-facing owner for the current planning-scene synchronization
+/// authority. A retained runtime keeps this object for its lifetime while the
+/// owner may replace the publication-specific target under its Apply fence.
+class RetainedPlanningSceneSynchronizer final
+    : public core::IPlanningSceneSynchronizer {
+public:
+  explicit RetainedPlanningSceneSynchronizer(
+      std::shared_ptr<core::IPlanningSceneSynchronizer> target);
+
+  RetainedPlanningSceneSynchronizer(
+      const RetainedPlanningSceneSynchronizer &) = delete;
+  RetainedPlanningSceneSynchronizer &operator=(
+      const RetainedPlanningSceneSynchronizer &) = delete;
+
+  /// Atomically replace the authority used by subsequent calls. An in-flight
+  /// call safely finishes against the authority it already captured.
+  void ReplaceTarget(
+      std::shared_ptr<core::IPlanningSceneSynchronizer> target);
+
+  [[nodiscard]] core::Result<core::ProjectionRevisionDTO>
+  SynchronizeBeforePlanning() override;
+
+private:
+  std::mutex mutex_;
+  std::shared_ptr<core::IPlanningSceneSynchronizer> target_;
+};
+
+/// Stable Kernel-facing owner for the current retained-scene frame authority.
+/// The underlying resolver is publication-specific; a retained runtime keeps
+/// this proxy for its lifetime while the host replaces the target under the
+/// Apply fence.
+class RetainedReferencePoseResolverProxy final
+    : public core::IReferencePoseResolver {
+public:
+  explicit RetainedReferencePoseResolverProxy(
+      std::shared_ptr<core::IReferencePoseResolver> target);
+
+  RetainedReferencePoseResolverProxy(
+      const RetainedReferencePoseResolverProxy &) = delete;
+  RetainedReferencePoseResolverProxy &operator=(
+      const RetainedReferencePoseResolverProxy &) = delete;
+
+  /// Replace the publication-specific authority used by subsequent calls.
+  /// An in-flight call safely finishes against the target it already captured.
+  void ReplaceTarget(std::shared_ptr<core::IReferencePoseResolver> target);
+
+  [[nodiscard]] core::Result<core::ProgramFrameResolutionContextDTO>
+  capture_program_frame_resolution_context(
+      core::ProgramFrameResolutionCaptureDTO capture) const override;
+
+  [[nodiscard]] core::Result<core::Pose3DTO> resolve_reference_pose(
+      const core::ReferenceDTO &reference,
+      const core::ProgramFrameResolutionContextDTO &context) const override;
+
+  [[nodiscard]] core::Result<core::ResolvedSceneFramePoseDTO>
+  resolve_scene_frame(
+      const core::SceneFrameRefDTO &reference,
+      const core::SceneFrameResolutionContextDTO &context) const override;
+
+private:
+  [[nodiscard]] std::shared_ptr<core::IReferencePoseResolver>
+  CurrentTarget() const;
+
+  mutable std::mutex mutex_;
+  std::shared_ptr<core::IReferencePoseResolver> target_;
+};
 
 /// Already-verified inputs to one native runtime composition.
 ///
@@ -204,6 +288,39 @@ struct RetainedNativeRuntimeInput final {
   std::shared_ptr<RetainedObservationWake> observation_wake{};
 };
 
+struct RetainedNativeRuntime;
+
+/// Candidate product facts for a retained component. The host has already
+/// compiled and verified the candidate bindings/readiness; this API performs
+/// only the physical owner re-seal while the exact Apply fence is held.
+/// Candidate collision resources are deliberately not accepted here: the
+/// Core collision-resource replacement seam is not yet transactional, so the
+/// host must update them through its separately verified cell-level path.
+struct RetainedNativeRuntimeResealInput final {
+  core::RuntimeParticipantBinding motion_binding;
+  std::optional<core::RuntimeParticipantBinding> gripper_binding;
+  std::vector<core::RuntimeParticipantBinding> motion_binding_aliases;
+  std::vector<core::RuntimeParticipantBinding> gripper_binding_aliases;
+  std::vector<core::RuntimeParticipantBinding> control_binding_representatives;
+  std::vector<core::RuntimeParticipantExecutionRegistration>
+      participant_registrations;
+  /// Independently owned grippers in the same managed cell. They are peers,
+  /// not subordinate controllers of this motion component. Route publication
+  /// must preserve their registrations and Stop sources in the shared Kernel.
+  std::vector<std::shared_ptr<RetainedNativeGripperRuntime>>
+      independent_gripper_peers;
+  /// Non-owning stable cell authority; the Composition pins it through every
+  /// publication and clears/rebinds this pointer before retiring an owner.
+  RetainedNativeCellRuntime *cell_runtime_owner{};
+  std::shared_ptr<core::IReferencePoseResolver> reference_resolver;
+  core::ConfigurationFenceId apply_fence_id;
+  core::ConfigurationFenceScopeDTO apply_scope;
+  core::IResourceOperationAdmissionGate &admission_gate;
+};
+
+[[nodiscard]] core::Result<void> reseal_retained_native_runtime_for_apply(
+    RetainedNativeRuntime &runtime, RetainedNativeRuntimeResealInput input);
+
 /// Owning native composition root. Destruction order is deliberate: the public
 /// addressed owner unsubscribes first, then the subordinate Kernel quiesces,
 /// then backends/scheduler/state/model resources retire.
@@ -250,7 +367,13 @@ struct RetainedNativeRuntime final
   std::shared_ptr<SimpleScheduler> scheduler;
   std::unique_ptr<core::TrajectoryCache> cache;
   std::unique_ptr<RoboPlanPlannerBackend> planner;
+  /// Publication-specific resolver retained for owner-side inspection and
+  /// dynamic dispatch (for example, route/configuration rebinding).
   std::shared_ptr<core::IReferencePoseResolver> reference_resolver;
+  /// Stable object installed into ExecutionKernelPorts. Replacing its target
+  /// does not invalidate the Kernel's resolver reference.
+  std::shared_ptr<RetainedReferencePoseResolverProxy>
+      reference_resolver_proxy;
   std::unique_ptr<core::AddressedAngularObservedRobotStateAdapter>
       angular_observed_state;
   std::unique_ptr<RetainedRoboPlanKinematicsAdapter> kinematics;
@@ -259,7 +382,8 @@ struct RetainedNativeRuntime final
       collision_trajectory_projector;
   std::shared_ptr<core::IExecutionBackend> execution;
   std::shared_ptr<core::IGripperCommandBackend> gripper;
-  std::shared_ptr<core::IPlanningSceneSynchronizer> planning_scene_synchronizer;
+  std::shared_ptr<RetainedPlanningSceneSynchronizer>
+      planning_scene_synchronizer;
   core::IControlDomainExecutionPort *gripper_stop_execution_port{};
   RetainedMotionBackendRouteRebinder rebind_motion_route;
   RetainedGripperBackendRouteRebinder rebind_gripper_route;
@@ -285,15 +409,37 @@ struct RetainedNativeRuntime final
       participant_registrations;
   core::RuntimeParticipantAdmissionResolver participant_resolver;
   RetainedRuntimeParticipantResolverFactory participant_resolver_factory;
-  std::unique_ptr<RetainedStopSurveillanceOwner> stop_surveillance_owner;
+  /// The stable Kernel stores a non-owning pointer to this source. A retained
+  /// root may change during Apply, so the stable owner is shared with the
+  /// candidate root until the Kernel itself retires.
+  std::shared_ptr<RetainedStopSurveillanceOwner> stop_surveillance_owner;
   std::unique_ptr<core::SqliteOperationJournal> operation_journal;
+  core::SqliteOperationJournal *cell_operation_journal{};
+  [[nodiscard]] core::SqliteOperationJournal *
+  active_operation_journal() const noexcept {
+    return operation_journal != nullptr ? operation_journal.get()
+                                        : cell_operation_journal;
+  }
   std::unique_ptr<core::ResourceAddressedExecutionKernel> addressed_kernel;
   core::ResourceAddressedExecutionKernel *cell_addressed_kernel{};
+  /// The standalone runtime owns its Kernel. Managed components borrow the
+  /// process-stable cell Kernel, whose owner outlives all registered engines.
+  [[nodiscard]] core::ResourceAddressedExecutionKernel *
+  active_addressed_kernel() const noexcept {
+    return addressed_kernel != nullptr ? addressed_kernel.get()
+                                       : cell_addressed_kernel;
+  }
   /// Non-owning root used only to assemble complete cell-level route updates.
   RetainedNativeRuntime *cell_runtime_root{};
   /// Additional independently built robot engines owned by this cell-level
   /// runtime. Only the primary owns the addressed Kernel and durable journal.
   std::vector<std::shared_ptr<RetainedNativeRuntime>> participant_peers;
+  /// Independently managed grippers share the stable cell Kernel but are not
+  /// subordinate to any motion component.
+  std::vector<std::shared_ptr<RetainedNativeGripperRuntime>>
+      independent_gripper_peers;
+  /// Non-owning stable cell authority for managed component compositions.
+  RetainedNativeCellRuntime *cell_runtime_owner{};
 
   [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
   ReadCurrentPhysicalParticipants(
@@ -340,6 +486,15 @@ struct RetainedNativeRuntime final
   ReadCurrentPublishedRouteConfiguration(
       const core::ControlDomainId &control_domain_id) const;
 
+  /// Take a route-publication-consistent copy of the physical target bindings.
+  /// CCLC may re-seal their active configuration identity without replacing
+  /// the runtime owner; status and observation readers must use these current
+  /// bindings rather than the Composition's build-time candidate copies.
+  [[nodiscard]] core::RuntimeParticipantBinding
+  ReadCurrentMotionBinding() const;
+  [[nodiscard]] std::optional<core::RuntimeParticipantBinding>
+  ReadCurrentGripperBinding() const;
+
   /// Final source check and evidence write share route-publication ordering.
   /// The host supplies the verified confirmation representative and its
   /// explicit policy; this is not an unqualified public mutation endpoint.
@@ -353,6 +508,20 @@ struct RetainedNativeRuntime final
   ReadGripperStatus(const core::RuntimeParticipantBinding &source) const;
 
 private:
+  friend core::Result<void> reseal_retained_native_runtime_for_apply(
+      RetainedNativeRuntime &runtime,
+      RetainedNativeRuntimeResealInput input);
+  friend core::Result<void> rejoin_retained_native_runtime_participants(
+      const std::shared_ptr<RetainedNativeRuntime> &primary,
+      std::vector<std::shared_ptr<RetainedNativeRuntime>> peers,
+      RetainedRuntimeParticipantResolverFactory participant_resolver_factory,
+      std::shared_ptr<RetainedStopSurveillanceOwner> stable_stop_observer,
+      std::vector<RetainedStopSurveillanceSourceInput>
+          &candidate_surveillance_sources,
+      core::IResourceOperationAdmissionGate &admission_gate,
+      const core::ConfigurationFenceId &fence_id,
+      const core::ConfigurationFenceScopeDTO &scope);
+
   // Caller holds route_publication_mutex_. No owner read or write escapes it.
   [[nodiscard]] bool
   GripperSourceIsCurrent(const core::RuntimeParticipantBinding &source) const;
@@ -378,6 +547,24 @@ void join_retained_native_runtime_participants(
     std::vector<std::shared_ptr<RetainedNativeRuntime>> peers,
     RetainedRuntimeParticipantResolverFactory participant_resolver_factory);
 
+/// Rebuild cell-local registration/resolver aggregates after candidate
+/// per-component re-seals and return a validated candidate Stop-source table
+/// for the host's atomic Kernel commit hook. This never mutates the stable
+/// observer or Kernel and creates no engines; it only publishes new runtime
+/// membership after the complete candidate set validates under the exact
+/// Apply fence.
+[[nodiscard]] core::Result<void>
+rejoin_retained_native_runtime_participants(
+    const std::shared_ptr<RetainedNativeRuntime> &primary,
+    std::vector<std::shared_ptr<RetainedNativeRuntime>> peers,
+    RetainedRuntimeParticipantResolverFactory participant_resolver_factory,
+    std::shared_ptr<RetainedStopSurveillanceOwner> stable_stop_observer,
+    std::vector<RetainedStopSurveillanceSourceInput>
+        &candidate_surveillance_sources,
+    core::IResourceOperationAdmissionGate &admission_gate,
+    const core::ConfigurationFenceId &fence_id,
+    const core::ConfigurationFenceScopeDTO &scope);
+
 /// Resolve current Stop-recovery facts for either a directly attached owner
 /// or the process-stable managed owner. This is one product-facts adapter;
 /// ownership of the Stop latch and its clear remains in Core.
@@ -387,6 +574,25 @@ build_retained_native_stop_recovery_facts(
     core::ResourceAddressedExecutionKernel &addressed_kernel,
     core::IResourceOperationAdmissionGate *operation_admission_gate,
     const core::StopStatusDTO &status, std::int64_t assessed_at_ns);
+
+/// Shared Stop-fault recovery join for the process-stable cell owner and
+/// motion-owned compatibility path. The observer supplies exact current
+/// source channels and orphan evidence; this function verifies those sources
+/// against the addressed Kernel, reconciles command-free captured orphans,
+/// then joins Kernel and admission-fence blockers. A motion owner may provide
+/// its stronger owner-local configuration verifier; when absent, the exact
+/// observer source table is used for both motion and gripper-only cells.
+[[nodiscard]] core::Result<core::StopFaultRecoveryFactsDTO>
+build_retained_cell_stop_recovery_facts(
+    RetainedStopSurveillanceOwner &stop_surveillance_owner,
+    core::ResourceAddressedExecutionKernel &addressed_kernel,
+    core::IClock &clock, const core::RequestOwnerEpoch &request_owner_epoch,
+    const core::CellId &cell_id,
+    core::IResourceOperationAdmissionGate *operation_admission_gate,
+    const core::StopStatusDTO &status, std::int64_t assessed_at_ns,
+    std::function<core::Result<core::ContentDigest>(
+        const core::StopFaultRecoveryConfigurationExpectationDTO &)>
+        configuration_source_override = {});
 
 /// Attach the sole stable addressed owner to one prepared participant set.
 /// The owner config is process-selected, not supplied by a Program or caller.

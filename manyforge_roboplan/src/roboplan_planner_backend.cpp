@@ -2,6 +2,7 @@
 #include <cmath>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -331,8 +332,30 @@ RoboPlanPlannerBackend::RoboPlanPlannerBackend(
   }
 }
 
+core::Result<void> RoboPlanPlannerBackend::RebindProjection(
+    const core::ProjectionLeaseBindingDTO& expected_predecessor,
+    core::ProjectionLeaseBindingDTO candidate) {
+  if (!expected_predecessor.valid() || !candidate.valid()) {
+    return core::Result<void>::Err(error(
+        ErrorCode::kInvalidRequest, "planner product rebind has an invalid lease",
+        "native_planner_product_rebind_invalid"));
+  }
+  std::unique_lock lock(projection_mutex_);
+  if (projection_binding_ != expected_predecessor) {
+    return core::Result<void>::Err(error(
+        ErrorCode::kInvalidStateTransition,
+        "planner product rebind crossed its exact predecessor",
+        "native_planner_product_rebind_stale_predecessor"));
+  }
+  // The candidate client selects the exact retained Scene lease per request.
+  // Re-anchor the unchanged worker without replacing its engine or model.
+  projection_binding_ = std::move(candidate);
+  return core::Result<void>::Ok();
+}
+
 core::PlanResultDTO
 RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
+  std::shared_lock projection_lock(projection_mutex_);
   if (auto invalid = validate_plan_binding(request, projection_binding_,
                                            candidate_binding_);
       invalid.has_value()) {
@@ -401,6 +424,7 @@ void RoboPlanPlannerBackend::request_cancel() {
 
 core::IkResultDTO
 RoboPlanPlannerBackend::solve_ik(const core::IkRequestDTO &request) {
+  std::shared_lock projection_lock(projection_mutex_);
   if (auto invalid =
           validate_ik_binding(request, projection_binding_, candidate_binding_);
       invalid.has_value()) {

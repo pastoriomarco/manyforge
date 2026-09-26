@@ -11,6 +11,9 @@
 #include <manyforge_component_manager/manager_liveness_transport.hpp>
 #include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
 #include <manyforge_deployment/initial_scene_projection.hpp>
+#include <manyforge_deployment/apply_component_delta.hpp>
+#include <manyforge_deployment/prepared_activation_repository.hpp>
+#include <manyforge_deployment/program_binding_outcome.hpp>
 #include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
@@ -453,6 +456,11 @@ struct DeploymentCandidateReceipt final {
   core::GraphRevision expected_current_graph_revision;
   core::AdmissionGeneration expected_admission_generation;
   std::string manager_owner_epoch;
+  /// Digest of the authoritative impact shown with this preview (H1a). Apply
+  /// is refused if the recomputed impact differs, and a destructive impact
+  /// must be explicitly accepted by echoing this digest.
+  core::ContentDigest impact_digest;
+  bool destructive_impact{};
   core::ContentDigest receipt_digest;
 
   friend bool operator==(const DeploymentCandidateReceipt &,
@@ -509,6 +517,7 @@ struct ManagerCommand final {
   std::optional<core::RetainedBundleId> candidate_retained_bundle_id{};
   std::optional<core::GraphRevision> candidate_graph_revision{};
   std::optional<core::ContentDigest> prepared_activation_id{};
+  std::optional<core::ContentDigest> accepted_impact_digest{};
   std::optional<core::ApplyId> apply_id{};
   std::optional<core::ApplyGeneration> apply_generation{};
 };
@@ -565,11 +574,13 @@ DeploymentCandidateReceiptPayload(const DeploymentCandidateReceipt &receipt) {
             CanonicalValue(
                 receipt.expected_current_retained_bundle_id.value())},
        })},
+      {"destructive_impact", CanonicalValue(receipt.destructive_impact)},
+      {"impact_digest", CanonicalValue(receipt.impact_digest.value())},
       {"manager_owner_epoch", CanonicalValue(receipt.manager_owner_epoch)},
       {"prepared_activation_id",
        CanonicalValue(receipt.prepared_activation_id.value())},
       {"schema_version",
-       CanonicalValue("manyforge.manager_deployment_candidate_receipt.v1")},
+       CanonicalValue("manyforge.manager_deployment_candidate_receipt.v2")},
   });
 }
 
@@ -591,9 +602,9 @@ DeploymentCandidateReceiptValue(const DeploymentCandidateReceipt &receipt) {
 
 DeploymentCandidateReceipt
 RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
-  RequireExactObjectSize(value, 10U, "deployment candidate receipt");
+  RequireExactObjectSize(value, 12U, "deployment candidate receipt");
   Require(RequiredString(value, "schema_version") ==
-              "manyforge.manager_deployment_candidate_receipt.v1",
+              "manyforge.manager_deployment_candidate_receipt.v2",
           "deployment candidate receipt schema is unsupported");
   const auto &expected = RequiredMember(value, "expected_current");
   RequireExactObjectSize(expected, 2U, "deployment candidate expected current");
@@ -611,9 +622,12 @@ RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
           RequiredMember(value, "expected_admission_generation"),
           "deployment candidate admission generation")),
       RequiredString(value, "manager_owner_epoch"),
+      core::ContentDigest(RequiredString(value, "impact_digest")),
+      RequiredBool(value, "destructive_impact"),
       core::ContentDigest(RequiredString(value, "receipt_digest")),
   };
   Require(
+      core::IsExactLowercaseSha256Digest(receipt.impact_digest.value()) &&
       core::IsExactLowercaseSha256Digest(receipt.deployment_revision.value()) &&
           core::IsExactLowercaseSha256Digest(
               receipt.prepared_activation_id.value()) &&
@@ -634,7 +648,7 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
     const CanonicalValue &value) {
   RequireExactObjectSize(value, 15U, "Apply prepared activation");
   Require(RequiredString(value, "schema_version") ==
-              "manyforge.prepared_activation_input.v2",
+              "manyforge.prepared_activation_input.v3",
           "Apply prepared activation schema is unsupported");
   const auto captured_input_digest =
       RequiredString(value, "captured_input_digest");
@@ -648,9 +662,40 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
           "SHA-256");
   Require(core::IsExactLowercaseSha256Digest(prepared_activation_id),
           "Apply prepared_activation_id must be canonical SHA-256");
-  const auto program_binding_id = RequiredString(value, "program_binding_id");
-  Require(core::IsExactLowercaseSha256Digest(program_binding_id),
-          "Apply program_binding_id must be canonical SHA-256");
+  // Exactly one typed Program outcome (H1a): the candidate binding, or the
+  // named non-executable result for the preserved authored Program.
+  const auto &program_outcome = RequiredMember(value, "program_outcome");
+  std::optional<core::ProgramBindingId> program_binding_id;
+  const auto outcome_kind = RequiredString(program_outcome, "kind");
+  if (outcome_kind == "bound") {
+    RequireExactObjectSize(program_outcome, 2U, "Apply Program outcome");
+    const auto binding_id = RequiredString(program_outcome, "program_binding_id");
+    Require(core::IsExactLowercaseSha256Digest(binding_id),
+            "Apply program_binding_id must be canonical SHA-256");
+    program_binding_id = core::ProgramBindingId(binding_id);
+  } else {
+    Require(outcome_kind == "non_executable",
+            "Apply Program outcome kind is unsupported");
+    RequireExactObjectSize(program_outcome, 2U, "Apply Program outcome");
+    const auto outcome = [&]() {
+      try {
+        return deployment::DecodeProgramNonExecutableOutcome(
+            content_identity::canonical_json(
+                RequiredMember(program_outcome, "outcome")));
+      } catch (const deployment::ProgramBindingOutcomeError &error) {
+        Fail(std::string("Apply Program outcome is invalid: ") +
+             error.what());
+      }
+    }();
+    Require(outcome.program_id.value() == RequiredString(value, "program_id") &&
+                outcome.program_revision.value() ==
+                    RequiredString(value, "program_revision") &&
+                outcome.retained_bundle_id.value() ==
+                    RequiredString(value, "retained_bundle_id") &&
+                outcome.graph_revision.value() ==
+                    RequiredString(value, "graph_revision"),
+            "Apply Program outcome differs from its prepared activation");
+  }
   for (const auto field : {"source_document_digest", "retained_bundle_id",
                            "graph_revision", "program_revision",
                            "node_environment_digest"}) {
@@ -671,10 +716,37 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
       core::DeploymentArtifactId(
           RequiredString(value, "deployment_artifact_id")),
       core::DeploymentRevision(deployment_revision),
-      core::ProgramBindingId(program_binding_id),
+      std::move(program_binding_id),
       core::ContentDigest(prepared_activation_id),
       content_identity::canonical_json(value),
   };
+}
+
+/// A new Apply is accepted only for a prepared value the preparer published
+/// in the trusted activation store: its identity and content reverify, its
+/// Program outcome recompiles to exactly the recorded binding or named
+/// non-executable result (H1a), and the request summary equals it exactly.
+/// A caller therefore cannot submit an outcome the preparer did not produce.
+bool PreparedActivationIsStoredExactly(
+    const std::filesystem::path &activation_root,
+    const component_manager::ManagerApplyPreparedActivationDTO &activation) {
+  if (activation_root.empty()) {
+    return false;
+  }
+  const auto stored =
+      deployment::FilesystemPreparedActivationRepository(activation_root)
+          .get_verified(activation.prepared_activation_id);
+  if (stored == nullptr) {
+    return false;
+  }
+  CanonicalValue::Object summary;
+  for (const auto &[name, value] : stored->normalized_root().as_object()) {
+    if (name != "activation_payload") {
+      summary.emplace_back(name, value);
+    }
+  }
+  return content_identity::canonical_json(CanonicalValue(std::move(summary))) ==
+         activation.canonical_receipt_json;
 }
 
 std::optional<std::string> OptionalString(const CanonicalValue &root,
@@ -1351,7 +1423,7 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     return result;
   }
   Require(command == "apply", "command kind is unsupported");
-  RequireExactObjectSize(root, 13U, "Apply command");
+  RequireExactObjectSize(root, 14U, "Apply command");
   const auto request_id = RequiredString(root, "request_id");
   const auto request_owner_epoch = RequiredString(root, "request_owner_epoch");
   const auto source_label = RequiredString(root, "source_label");
@@ -1378,6 +1450,13 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
   result.deployment_artifact_id =
       core::DeploymentArtifactId(deployment_artifact_id);
   result.deployment_revision = core::DeploymentRevision(deployment_revision);
+  // Explicit acceptance of a destructive preview impact (H1a); null when
+  // the caller accepts none.
+  if (const auto accepted = OptionalString(root, "accepted_impact_digest")) {
+    Require(core::IsExactLowercaseSha256Digest(*accepted),
+            "Apply accepted_impact_digest must be canonical SHA-256");
+    result.accepted_impact_digest = core::ContentDigest(*accepted);
+  }
   result.deployment_candidate_receipt = RequiredDeploymentCandidateReceipt(
       RequiredMember(root, "candidate_receipt"));
   result.prepared_activation =
@@ -1873,16 +1952,99 @@ CanonicalValue DeploymentGraphDiff(const core::CellGraphDTO &current,
   });
 }
 
+/// The one authoritative impact of applying `candidate` over `current` (H1a):
+/// the per-component runtime decision, shared Scene/attachment consequences
+/// and the prepared Program outcome, all derived from verified facts. Clients
+/// present it and bind their confirmation to it; they never re-derive it.
+CanonicalValue DeploymentApplyImpact(
+    const deployment::RetainedBundle &current,
+    const deployment::RetainedBundle &candidate,
+    const std::filesystem::path &activation_root,
+    const core::ContentDigest &prepared_activation_id) {
+  const auto delta =
+      deployment::derive_apply_component_delta(current, candidate);
+  Require(!activation_root.empty(),
+          "Deployment impact requires the trusted activation store");
+  const auto prepared =
+      deployment::FilesystemPreparedActivationRepository(activation_root)
+          .get_verified(prepared_activation_id);
+  Require(prepared != nullptr &&
+              prepared->retained_bundle_id() == candidate.retained_bundle_id(),
+          "Deployment impact names no stored prepared activation for the "
+          "candidate");
+  CanonicalValue::Array components;
+  bool destructive = false;
+  for (const auto &change : delta.components) {
+    destructive = destructive ||
+                  change.disposition ==
+                      deployment::ApplyComponentDisposition::kRemove ||
+                  change.disposition ==
+                      deployment::ApplyComponentDisposition::kReplace;
+    CanonicalValue::Array reasons;
+    for (const auto &reason : change.replacement_reasons) {
+      reasons.emplace_back(reason);
+    }
+    components.emplace_back(CanonicalValue::Object{
+        {"controllable_component_id",
+         CanonicalValue(change.controllable_component_id.value())},
+        {"disposition",
+         CanonicalValue(std::string(deployment::to_string(change.disposition)))},
+        {"replacement_reasons", CanonicalValue(std::move(reasons))},
+    });
+  }
+  CanonicalValue::Array attachments;
+  for (const auto &component : delta.attachment_changed_components) {
+    attachments.emplace_back(component.value());
+  }
+  // Children that stay in the cell, detached at their authored root pose.
+  CanonicalValue::Array detached;
+  for (const auto &component : deployment::detached_attachment_children(
+           current.value().cell_graph, candidate.value().cell_graph)) {
+    detached.emplace_back(component.value());
+  }
+  const auto &outcome = prepared->program_outcome();
+  destructive = destructive || outcome.has_value();
+  return CanonicalValue(CanonicalValue::Object{
+      {"attachment_changed_components", CanonicalValue(std::move(attachments))},
+      {"component_delta_digest",
+       CanonicalValue(deployment::DigestApplyComponentDelta(delta).value())},
+      {"components", CanonicalValue(std::move(components))},
+      {"destructive", CanonicalValue(destructive)},
+      {"detached_components", CanonicalValue(std::move(detached))},
+      {"program",
+       CanonicalValue(CanonicalValue::Object{
+           {"executable", CanonicalValue(!outcome.has_value())},
+           {"non_executable",
+            outcome.has_value()
+                ? content_identity::parse_canonical_json(
+                      deployment::EncodeProgramNonExecutableOutcome(*outcome))
+                : CanonicalValue(nullptr)},
+           {"program_id", CanonicalValue(prepared->program_id().value())},
+           {"program_revision",
+            CanonicalValue(prepared->program_revision().value())},
+       })},
+      {"shared_scene_projection_changed",
+       CanonicalValue(delta.shared_scene_projection_changed)},
+  });
+}
+
+core::ContentDigest DeploymentApplyImpactDigest(const CanonicalValue &impact) {
+  return core::ContentDigest(content_identity::sha256_digest(
+      content_identity::canonical_json(impact)));
+}
+
 CanonicalValue
 DeploymentCandidatePreviewResponse(const DeploymentCandidateReceipt &receipt,
                                    const core::CellGraphDTO &current_graph,
-                                   const core::CellGraphDTO &candidate_graph) {
+                                   const core::CellGraphDTO &candidate_graph,
+                                   CanonicalValue impact) {
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
       {"candidate_receipt", DeploymentCandidateReceiptValue(receipt)},
       {"converged", CanonicalValue(current_graph == candidate_graph)},
       {"diff", DeploymentGraphDiff(current_graph, candidate_graph)},
+      {"impact", std::move(impact)},
       {"ok", CanonicalValue(true)},
   });
 }
@@ -1940,8 +2102,11 @@ CanonicalValue ApplyPreparedActivationValue(
        CanonicalValue(activation.deployment_artifact_id.value())},
       {"deployment_revision",
        CanonicalValue(activation.deployment_revision.value())},
+      // Null exactly for a prepared non-executable Program (H1a).
       {"program_binding_id",
-       CanonicalValue(activation.program_binding_id.value())},
+       activation.program_binding_id.has_value()
+           ? CanonicalValue(activation.program_binding_id->value())
+           : CanonicalValue(nullptr)},
       {"prepared_activation_id",
        CanonicalValue(activation.prepared_activation_id.value())},
   });
@@ -2142,10 +2307,18 @@ public:
       }
       return field->as_string();
     };
+    const auto *outcome = receipt.find_object_member("program_outcome");
+    const auto *bound_id =
+        outcome == nullptr ? nullptr
+                           : outcome->find_object_member("program_binding_id");
+    const bool outcome_matches =
+        activation.program_binding_id.has_value()
+            ? bound_id != nullptr && bound_id->is_string() &&
+                  bound_id->as_string() == activation.program_binding_id->value()
+            : outcome != nullptr && bound_id == nullptr;
     if (required("prepared_activation_id") !=
             activation.prepared_activation_id.value() ||
-        required("program_binding_id") !=
-            activation.program_binding_id.value() ||
+        !outcome_matches ||
         required("retained_bundle_id") != bundle.retained_bundle_id().value() ||
         required("graph_revision") !=
             bundle.value().cell_graph.graph_revision.value() ||
@@ -2157,17 +2330,23 @@ public:
           "Apply initial Scene prepared identity differs from candidate");
     }
     const auto &maps = bundle.value().compiled_products.symbol_role_maps;
-    if (maps.size() != 1U) {
+    const bool empty_non_executable_candidate =
+        !activation.program_binding_id.has_value() && maps.empty() &&
+        bundle.value().cell_graph.controllable_components.empty();
+    if (maps.size() != 1U && !empty_non_executable_candidate) {
       throw std::invalid_argument(
           "Apply initial Scene requires one exact retained model map");
     }
-    deployment::FilesystemVerifiedRetainedModelMapSource map_source(
-        package_root_, activation_root_);
-    const auto model_map = map_source.get_verified({
-        bundle.retained_bundle_id(), maps.front().product_id});
-    if (!model_map.has_value()) {
-      throw std::invalid_argument(
-          "Apply initial Scene retained model map is unavailable");
+    std::optional<deployment::VerifiedRetainedModelMap> model_map;
+    if (!maps.empty()) {
+      deployment::FilesystemVerifiedRetainedModelMapSource map_source(
+          package_root_, activation_root_);
+      model_map = map_source.get_verified(
+          {bundle.retained_bundle_id(), maps.front().product_id});
+      if (!model_map.has_value()) {
+        throw std::invalid_argument(
+            "Apply initial Scene retained model map is unavailable");
+      }
     }
     const auto read_program = [&](const std::filesystem::path &root) {
       return deployment::FilesystemVerifiedProgramSource(root).get_verified(
@@ -2175,14 +2354,45 @@ public:
           core::ProgramRevision(required("program_revision")), bundle);
     };
     const auto read_binding = [&](const std::filesystem::path &root) {
+      if (!model_map.has_value()) {
+        throw std::invalid_argument(
+            "Apply initial Scene binding has no retained model map");
+      }
       return deployment::FilesystemVerifiedProgramBindingSource(root)
-          .get_verified(activation.program_binding_id, bundle, *model_map);
+          .get_verified(*activation.program_binding_id, bundle, *model_map);
     };
     auto program = activation_root_.has_value()
                        ? read_program(*activation_root_)
                        : nullptr;
     if (program == nullptr)
       program = read_program(package_root_);
+    if (!activation.program_binding_id.has_value()) {
+      // A non-executable Program is placed through the roles that still
+      // resolve against this verified candidate: an object on a surviving
+      // frame keeps its place, one on an unresolved frame is refused by name,
+      // never dropped. Unverifiable evidence fails closed.
+      if (program == nullptr || !activation_root_.has_value()) {
+        throw std::invalid_argument(
+            "Apply initial Scene Program or prepared evidence is not retained");
+      }
+      const auto prepared =
+          deployment::FilesystemPreparedActivationRepository(*activation_root_)
+              .get_verified(activation.prepared_activation_id);
+      if (prepared == nullptr ||
+          prepared->retained_bundle_id() != bundle.retained_bundle_id() ||
+          prepared->program_revision() != program->value().program_revision) {
+        throw std::invalid_argument(
+            "Apply initial Scene prepared evidence differs from candidate");
+      }
+      const auto outcome =
+          deployment::recompile_prepared_program_outcome(*prepared);
+      if (!outcome.resolved_roles.has_value()) {
+        throw std::invalid_argument(
+            "Apply initial Scene outcome is not non-executable");
+      }
+      return deployment::project_resolved_initial_scene(
+          *program, *outcome.resolved_roles, bundle.value().cell_graph.cell_id);
+    }
     auto binding = activation_root_.has_value()
                        ? read_binding(*activation_root_)
                        : nullptr;
@@ -2381,8 +2591,7 @@ public:
         planned_maintenance_gate_(
             [this] { return ReadPlannedMaintenanceState(); },
             [this] { return ClosePlannedMaintenanceAdmission(); }),
-        planned_maintenance_(plan_source_, active_runtime_,
-                             planned_maintenance_gate_),
+        planned_maintenance_(plan_source_, planned_maintenance_gate_),
         manager_runtime_epoch_(RandomToken("manager-runtime-")),
         named_apply_(
             stores_.apply_journal(), plan_source_, verified_package_,
@@ -3957,6 +4166,19 @@ private:
                         "handover, which is not currently supported."));
             return false;
           }
+          const auto host_continuity =
+              component_manager::VerifyNativeExecutionHostContinuity(
+                  *current_bundle, *candidate_bundle, verified_package_);
+          if (!host_continuity.ok()) {
+            const auto &error = host_continuity.error();
+            TrySendResponse(client.get(), DetailedErrorResponse(
+                                               error.code, error.message,
+                                               error.details));
+            return false;
+          }
+          auto impact = DeploymentApplyImpact(
+              *current_bundle, *candidate_bundle, config_.activation_root,
+              *command.prepared_activation_id);
           DeploymentCandidateReceipt receipt{
               *command.deployment_artifact_id,
               *command.deployment_revision,
@@ -3967,6 +4189,8 @@ private:
               *command.expected_current_graph_revision,
               *command.expected_admission_generation,
               manager_owner_epoch_,
+              DeploymentApplyImpactDigest(impact),
+              RequiredBool(impact, "destructive"),
               core::ContentDigest(""),
           };
           receipt.receipt_digest = DeploymentCandidateReceiptDigest(receipt);
@@ -3981,10 +4205,11 @@ private:
             }
             deployment_candidate_receipts_.push_back(receipt);
           }
-          TrySendResponse(client.get(),
-                          DeploymentCandidatePreviewResponse(
-                              receipt, current_bundle->value().cell_graph,
-                              candidate_bundle->value().cell_graph));
+          TrySendResponse(
+              client.get(),
+              DeploymentCandidatePreviewResponse(
+                  receipt, current_bundle->value().cell_graph,
+                  candidate_bundle->value().cell_graph, std::move(impact)));
         } catch (const std::exception &error) {
           TrySendResponse(
               client.get(),
@@ -4060,6 +4285,17 @@ private:
             TrySendResponse(client.get(), ApplyUnavailableResponse(command));
             return false;
           }
+          if (!existing.has_value() &&
+              !PreparedActivationIsStoredExactly(config_.activation_root,
+                                                 *command.prepared_activation)) {
+            TrySendResponse(
+                client.get(),
+                ApplyErrorResponse(
+                    command, "prepared_activation_unverified",
+                    "Apply names no stored, reverified prepared activation "
+                    "equal to its summary"));
+            return false;
+          }
           if (!existing.has_value()) {
             if (std::find(deployment_candidate_receipts_.begin(),
                           deployment_candidate_receipts_.end(),
@@ -4087,6 +4323,49 @@ private:
                                   command, "deployment_candidate_receipt_stale",
                                   "Deployment candidate or current graph "
                                   "changed after preview"));
+              return false;
+            }
+            // The previewed impact is revalidated at acceptance for every
+            // caller, not only the GUI: a changed impact is a stale
+            // confirmation, and a destructive one must be explicitly
+            // accepted by its exact digest (H1a). Both refuse before effects.
+            const auto current_bundle =
+                verified_package_.get_verified(current_pointer.candidate_retained_bundle_id);
+            const auto candidate_bundle = verified_package_.get_verified(
+                candidate_receipt.candidate_retained_bundle_id);
+            Require(current_bundle != nullptr && candidate_bundle != nullptr,
+                    "Apply could not resolve its exact previewed graphs");
+            const auto host_continuity =
+                component_manager::VerifyNativeExecutionHostContinuity(
+                    *current_bundle, *candidate_bundle, verified_package_);
+            if (!host_continuity.ok()) {
+              TrySendResponse(
+                  client.get(),
+                  ApplyDetailedErrorResponse(command,
+                                             host_continuity.error()));
+              return false;
+            }
+            const auto impact = DeploymentApplyImpact(
+                *current_bundle, *candidate_bundle, config_.activation_root,
+                candidate_receipt.prepared_activation_id);
+            if (DeploymentApplyImpactDigest(impact) !=
+                candidate_receipt.impact_digest) {
+              TrySendResponse(
+                  client.get(),
+                  ApplyErrorResponse(command, "confirmation_stale",
+                                     "Deployment Apply impact changed after "
+                                     "preview; preview and confirm again"));
+              return false;
+            }
+            if (candidate_receipt.destructive_impact &&
+                command.accepted_impact_digest != candidate_receipt.impact_digest) {
+              TrySendResponse(
+                  client.get(),
+                  ApplyErrorResponse(command, "confirmation_required",
+                                     "Deployment Apply removes or replaces "
+                                     "components or leaves the Program "
+                                     "non-executable; accept its exact "
+                                     "impact digest"));
               return false;
             }
           }

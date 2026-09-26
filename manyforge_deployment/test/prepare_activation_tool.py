@@ -128,12 +128,156 @@ def _request(
     return request
 
 
+def _scenario_request(
+    workspace: Path, scenario: str
+) -> tuple[Path, dict[str, object], dict[str, object]]:
+    scenario_path = (workspace / scenario).resolve()
+    manifest = load_strict_json_yaml(scenario_path / "scenario.yaml")
+    document: dict[str, object] = {
+        "scenario_id": manifest["scenario_id"],
+        "deployment_draft": load_strict_json_yaml(
+            scenario_path / "deployment.yaml"
+        ),
+        "program_draft": load_strict_json_yaml(scenario_path / "program.yaml"),
+        "program_role_assignment": load_strict_json_yaml(
+            scenario_path / "assignment.yaml"
+        ),
+        "typed_parameter_overrides": load_strict_json_yaml(
+            scenario_path / "overrides.yaml"
+        ),
+    }
+    if manifest.get("api_version") != "manyforge.scenario.project.v1":
+        raise AssertionError("test input is not a Scenario project")
+    program_id = document["program_draft"]["program_id"]
+    return scenario_path, document, _request(
+        scenario_path, document, _program(workspace, program_id)
+    )
+
+
+def _native_host_identity(prepared: dict[str, object]) -> str:
+    bundle = prepared["activation_payload"]["retained_bundle"]
+    runtime_units = bundle["cell_graph"]["runtime_units"]
+    if len(runtime_units) != 1:
+        raise AssertionError("prepared Deployment does not have one native host")
+    runtime = runtime_units[0]
+    if runtime["runtime_profile_id"] != "manyforge.native_execution_runtime":
+        raise AssertionError("prepared Deployment selected a non-native runtime")
+    return runtime["runtime_unit_id"]
+
+
+def _native_host_products(prepared: dict[str, object]) -> object:
+    bundle = prepared["activation_payload"]["retained_bundle"]
+    products = bundle["compiled_products"]["runtime_unit_products"]
+    if len(products) != 1:
+        raise AssertionError("prepared Deployment has no exact native host product")
+    return products[0]
+
+
+def _require_native_canonical_empty_configuration(
+    activation_root: Path, candidate_bundle: dict[str, object]
+) -> None:
+    candidate_graph = candidate_bundle.get("cell_graph")
+    if not isinstance(candidate_graph, dict):
+        raise AssertionError("prepared candidate has no retained cell graph")
+    cell_id = candidate_graph.get("cell_id")
+    if not isinstance(cell_id, str) or not cell_id:
+        raise AssertionError("prepared candidate has no exact CellId")
+    admission_path = activation_root / f"canonical-empty-admission.{cell_id}.json"
+    if not admission_path.is_file():
+        raise AssertionError("preparer omitted its canonical-empty admission")
+    admission = json.loads(admission_path.read_text(encoding="utf-8"))
+    retained_bundle_id = admission.get("retained_bundle_id")
+    if (
+        not isinstance(retained_bundle_id, str)
+        or not retained_bundle_id.startswith("sha256:")
+    ):
+        raise AssertionError("canonical-empty admission has no bundle identity")
+    empty_bundle_path = (
+        activation_root
+        / "retained-bundles"
+        / "sha256"
+        / f"{retained_bundle_id.removeprefix('sha256:')}.json"
+    )
+    if not empty_bundle_path.is_file():
+        raise AssertionError("preparer omitted its canonical-empty retained bundle")
+    empty_bundle = json.loads(empty_bundle_path.read_text(encoding="utf-8"))
+    empty_graph = empty_bundle.get("cell_graph")
+    if not isinstance(empty_graph, dict):
+        raise AssertionError("canonical-empty bundle has no cell graph")
+    candidate_runtime_units = candidate_graph.get("runtime_units")
+    empty_runtime_units = empty_graph.get("runtime_units")
+    if (
+        not isinstance(candidate_runtime_units, list)
+        or len(candidate_runtime_units) != 1
+        or not isinstance(empty_runtime_units, list)
+        or len(empty_runtime_units) != 1
+    ):
+        raise AssertionError("native bootstrap does not retain exactly one host")
+    candidate_host = candidate_runtime_units[0]
+    empty_host = empty_runtime_units[0]
+    if (
+        not isinstance(candidate_host, dict)
+        or not isinstance(empty_host, dict)
+        or candidate_host.get("runtime_profile_id")
+        != "manyforge.native_execution_runtime"
+    ):
+        raise AssertionError("canonical-empty regression requires a native host")
+    for field in (
+        "runtime_unit_id",
+        "runtime_profile_id",
+        "runtime_profile_revision",
+        "dependency_runtime_unit_ids",
+    ):
+        if candidate_host.get(field) != empty_host.get(field):
+            raise AssertionError(
+                f"canonical-empty host changed infrastructure field {field}"
+            )
+    candidate_products = candidate_bundle.get("compiled_products")
+    empty_products = empty_bundle.get("compiled_products")
+    if (
+        not isinstance(candidate_products, dict)
+        or not isinstance(empty_products, dict)
+        or candidate_products.get("runtime_unit_products")
+        != empty_products.get("runtime_unit_products")
+    ):
+        raise AssertionError("canonical-empty host product differs from candidate")
+    candidate_configuration = candidate_host.get("configuration")
+    empty_configuration = empty_host.get("configuration")
+    if (
+        not isinstance(candidate_configuration, dict)
+        or not isinstance(empty_configuration, dict)
+    ):
+        raise AssertionError("native runtime configuration is not an object")
+    for field in (
+        "mode",
+        "planner_rng_seed",
+        "execution_tick_hz",
+        "collision_monitor_period_ms",
+    ):
+        if candidate_configuration.get(field) != empty_configuration.get(field):
+            raise AssertionError(
+                f"canonical-empty host did not retain scalar setting {field}"
+            )
+    for field in (
+        "initial_joint_positions_rad",
+        "motion_target_limits",
+        "direct_control_joint_limits",
+        "gripper_target_configurations",
+    ):
+        if empty_configuration.get(field) != []:
+            raise AssertionError(
+                f"canonical-empty host retained controller setting {field}"
+            )
+
+
 def _run(
     args: argparse.Namespace,
     request: dict[str, object],
     root: Path,
     *,
     expect_error: str | None = None,
+    expected_program_outcome_kind: str = "bound",
+    publish_canonical_empty: bool = False,
 ) -> dict[str, object] | None:
     root.mkdir()
     activation_root = root / "activation"
@@ -146,6 +290,8 @@ def _run(
         "--capability-root", str(args.workspace),
         "--activation-root", str(activation_root),
     ]
+    if publish_canonical_empty:
+        command.append("--publish-canonical-empty")
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     if expect_error is not None:
         if result.returncode == 0 or expect_error not in result.stderr:
@@ -163,13 +309,35 @@ def _run(
         raise AssertionError("preparer changed the source-document identity")
     if value["captured_input_digest"] != request["captured_input_digest"]:
         raise AssertionError("preparer changed the captured-input identity")
-    if value.get("schema_version") != "manyforge.prepared_activation_input.v2":
-        raise AssertionError("preparer did not return the direct v2 handoff")
+    if value.get("schema_version") != "manyforge.prepared_activation_input.v3":
+        raise AssertionError("preparer did not return the direct v3 handoff")
+    program_outcome = value.get("program_outcome")
+    if (
+        not isinstance(program_outcome, dict)
+        or program_outcome.get("kind") != expected_program_outcome_kind
+    ):
+        raise AssertionError(
+            "preparer returned an unexpected Program outcome: "
+            f"{program_outcome!r}"
+        )
+    if expected_program_outcome_kind == "non_executable":
+        outcome = program_outcome.get("outcome")
+        unresolved = outcome.get("unresolved_roles") if isinstance(outcome, dict) else None
+        if not isinstance(unresolved, list) or not any(
+            isinstance(row, dict)
+            and row.get("command_target_id") == "foreign_target"
+            and row.get("reason") == "target_missing"
+            for row in unresolved
+        ):
+            raise AssertionError(
+                "non-executable outcome did not name the missing target"
+            )
     payload = value.get("activation_payload")
     if not isinstance(payload, dict) or set(payload) != {
         "catalog_artifacts",
         "program",
         "program_binding",
+        "program_role_assignment",
         "raw_artifacts",
         "retained_bundle",
     }:
@@ -211,6 +379,8 @@ def _run(
         raise AssertionError("prepared runtime policy is not restrictive and exact")
     if not any(activation_root.iterdir()):
         raise AssertionError("preparer omitted the activation closure")
+    if publish_canonical_empty:
+        _require_native_canonical_empty_configuration(activation_root, bundle)
     return value
 
 
@@ -261,26 +431,7 @@ def _rehash_request(request: dict[str, object]) -> None:
 def main() -> int:
     args = _arguments()
     workspace = args.workspace.resolve()
-    scenario_path = (workspace / args.scenario).resolve()
-    manifest = load_strict_json_yaml(scenario_path / "scenario.yaml")
-    document = {
-        "scenario_id": manifest["scenario_id"],
-        "deployment_draft": load_strict_json_yaml(
-            scenario_path / "deployment.yaml"
-        ),
-        "program_draft": load_strict_json_yaml(scenario_path / "program.yaml"),
-        "program_role_assignment": load_strict_json_yaml(
-            scenario_path / "assignment.yaml"
-        ),
-        "typed_parameter_overrides": load_strict_json_yaml(
-            scenario_path / "overrides.yaml"
-        ),
-    }
-    if manifest.get("api_version") != "manyforge.scenario.project.v1":
-        raise AssertionError("test input is not a Scenario project")
-    program_id = document["program_draft"]["program_id"]
-    program = _program(workspace, program_id)
-    request = _request(scenario_path, document, program)
+    scenario_path, document, request = _scenario_request(workspace, args.scenario)
     with tempfile.TemporaryDirectory(prefix="manyforge-prepare-test-") as raw:
         temporary = Path(raw)
         if args.intent_rejections:
@@ -410,13 +561,55 @@ def main() -> int:
             )
             return 0
 
-        prepared = _run(args, request, temporary / "valid")
+        prepared = _run(
+            args,
+            request,
+            temporary / "valid",
+            publish_canonical_empty=True,
+        )
         assert prepared is not None
         if not args.negative_matrix:
+            if len(request["deployment"]["components"]) == 1:
+                dual_path = "examples/ur5e_lite6_wall_grouped.scenario"
+                _, _, dual_request = _scenario_request(workspace, dual_path)
+                if len(dual_request["deployment"]["components"]) != 2:
+                    raise AssertionError(
+                        "stable-host regression requires the maintained dual fixture"
+                    )
+                # Re-seal the dual authored candidate under the single fixture's
+                # CellId so both products describe the same native host scope.
+                dual_request["deployment"]["cell_id"] = request["deployment"][
+                    "cell_id"
+                ]
+                _rehash_request(dual_request)
+                dual_prepared = _run(
+                    args,
+                    dual_request,
+                    temporary / "stable-host-dual",
+                    publish_canonical_empty=True,
+                )
+                assert dual_prepared is not None
+                single_host_id = _native_host_identity(prepared)
+                dual_host_id = _native_host_identity(dual_prepared)
+                expected_host_id = "robot_cell.native_execution"
+                if (
+                    single_host_id != expected_host_id
+                    or dual_host_id != expected_host_id
+                ):
+                    raise AssertionError(
+                        "native host identity changed with component membership: "
+                        f"single={single_host_id!r}, dual={dual_host_id!r}"
+                    )
+                if _native_host_products(prepared) != _native_host_products(
+                    dual_prepared
+                ):
+                    raise AssertionError(
+                        "native host product changed with component membership"
+                    )
             changed = _request(
                 scenario_path,
                 document,
-                program,
+                _program(workspace, document["program_draft"]["program_id"]),
                 source_digest="sha256:" + "f" * 64,
             )
             changed_result = _run(args, changed, temporary / "changed")
@@ -447,6 +640,37 @@ def main() -> int:
             expect_error="duplicate component role assignment",
         )
 
+        mispartitioned_initial_state = copy.deepcopy(request)
+        components = mispartitioned_initial_state["deployment"]["components"]
+        if len(components) != 2:
+            raise AssertionError(
+                "initial-state ownership regression requires two components"
+            )
+        runtime_configurations = [
+            component["configuration"]["runtime_configuration"]
+            for component in components
+        ]
+        positions = [
+            runtime_configuration["initial_joint_positions_rad"]
+            for runtime_configuration in runtime_configurations
+        ]
+        if any(not isinstance(row, list) or len(row) != 6 for row in positions):
+            raise AssertionError(
+                "initial-state ownership regression requires two six-resource arms"
+            )
+        positions[0].append(0.25)
+        positions[1].pop()
+        _rehash_request(mispartitioned_initial_state)
+        _run(
+            args,
+            mispartitioned_initial_state,
+            temporary / "mispartitioned-initial-state",
+            expect_error=(
+                "lite6_robot initial_joint_positions_rad count does not match "
+                "its arm resource bindings"
+            ),
+        )
+
         foreign = copy.deepcopy(request)
         foreign["program_role_assignment"]["target_roles"][0][
             "command_target_id"
@@ -456,7 +680,7 @@ def main() -> int:
             args,
             foreign,
             temporary / "foreign",
-            expect_error="target role selects a missing or ambiguous component target",
+            expected_program_outcome_kind="non_executable",
         )
     return 0
 

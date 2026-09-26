@@ -229,7 +229,11 @@ require_capability_definition(const core::RetainedBundleDTO &bundle,
       ++conflicting_matches;
     }
   }
-  if (exact_matches != 1U || conflicting_matches != 0U) {
+  // The requirement's revision is the builtin definition. Whether the
+  // candidate cell retains that definition is a binding fact: an absent
+  // record makes the Program non-executable against this cell (H1a), while
+  // a duplicate or different revision remains a corrupt/incompatible catalog.
+  if (exact_matches > 1U || conflicting_matches != 0U) {
     fail("retained catalog does not contain exactly one selected capability "
          "definition revision");
   }

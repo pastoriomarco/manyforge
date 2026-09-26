@@ -1,9 +1,15 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
+#include <memory>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
 #include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/types/execution_status.hpp>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -15,9 +21,37 @@ namespace manyforge::core {
 
 struct CollisionPipelineResources {
   ICollisionWorldSnapshotPublisher* snapshot_publisher = nullptr;
+  /// Present for retained resource-set replacement. Initial bootstrap callers
+  /// may keep publisher ownership in their composition root.
+  std::shared_ptr<ICollisionWorldSnapshotPublisher> snapshot_publisher_owner;
   std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine;
   std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines;
   std::vector<std::shared_ptr<ICollisionQueryEngine>> runtime_lookahead_engines;
+};
+
+/// Owned candidate resources for a retained Kernel replacement. Every
+/// resource is shared so the Kernel and its readback keep the exact installed
+/// objects alive.
+struct CollisionPipelineResourceOwners final {
+  std::shared_ptr<ICollisionWorldSnapshotPublisher> snapshot_publisher;
+  std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine;
+  std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines;
+  std::vector<std::shared_ptr<ICollisionQueryEngine>> runtime_lookahead_engines;
+
+  friend bool operator==(const CollisionPipelineResourceOwners&,
+                         const CollisionPipelineResourceOwners&) = default;
+};
+
+struct CollisionPipelineResourceReadbackDTO final {
+  std::uint64_t generation{};
+  CollisionPipelineResourceOwners resources;
+  /// Exact immutable fallback policy installed with the resource set. It is
+  /// captured from the same published runtime bundle as its world and index.
+  std::shared_ptr<const CollisionPolicySnapshot> coordinator_policy_snapshot;
+  std::shared_ptr<const CollisionPolicyIndex> coordinator_policy_index;
+
+  friend bool operator==(const CollisionPipelineResourceReadbackDTO&,
+                         const CollisionPipelineResourceReadbackDTO&) = default;
 };
 
 enum class CollisionValidationAdmissionStatus {
@@ -123,8 +157,39 @@ class CollisionResourceManager {
         next.runtime_lookahead_engines.push_back(std::move(engine));
       }
     }
+    configure(std::move(next));
+  }
+
+  void configure(CollisionPipelineResourceOwners owned_resources) {
+    CollisionPipelineResources next;
+    next.snapshot_publisher = owned_resources.snapshot_publisher.get();
+    next.snapshot_publisher_owner =
+        std::move(owned_resources.snapshot_publisher);
+    next.runtime_monitor_engine = std::move(owned_resources.runtime_monitor_engine);
+    next.validation_engines = std::move(owned_resources.validation_engines);
+    next.validation_engines.erase(
+        std::remove(next.validation_engines.begin(), next.validation_engines.end(), nullptr),
+        next.validation_engines.end());
+    next.runtime_lookahead_engines =
+        std::move(owned_resources.runtime_lookahead_engines);
+    next.runtime_lookahead_engines.erase(
+        std::remove(next.runtime_lookahead_engines.begin(),
+                    next.runtime_lookahead_engines.end(), nullptr),
+        next.runtime_lookahead_engines.end());
+    configure(std::move(next));
+  }
+
+  void configure(CollisionPipelineResources resources) {
+    resources.validation_engines.erase(
+        std::remove(resources.validation_engines.begin(),
+                    resources.validation_engines.end(), nullptr),
+        resources.validation_engines.end());
+    resources.runtime_lookahead_engines.erase(
+        std::remove(resources.runtime_lookahead_engines.begin(),
+                    resources.runtime_lookahead_engines.end(), nullptr),
+        resources.runtime_lookahead_engines.end());
     std::lock_guard<std::mutex> lock(mutex_);
-    resources_ = std::move(next);
+    resources_ = std::move(resources);
   }
 
   [[nodiscard]] CollisionPipelineResources snapshot() const {

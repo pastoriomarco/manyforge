@@ -140,6 +140,37 @@ TEST(RoboPlanPlannerBackendTest,
   EXPECT_EQ(fixture.client->last_request->planning_attempt_index, 7U);
 }
 
+TEST(RoboPlanPlannerBackendTest,
+     ProductRebindKeepsTheWorkerAndRejectsAStalePredecessor) {
+  BackendFixture fixture;
+  const auto predecessor = fixture.backend->projection_binding();
+  auto candidate = predecessor;
+  candidate.projection_revision.graph_revision = GraphRevision("graph.next");
+  candidate.projection_lease_id = ProjectionLeaseId("lease.next");
+  ASSERT_TRUE(candidate.valid());
+
+  const auto stale = fixture.backend->RebindProjection(candidate, predecessor);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"),
+            "native_planner_product_rebind_stale_predecessor");
+  ASSERT_TRUE(fixture.backend->RebindProjection(predecessor, candidate).ok());
+  EXPECT_EQ(fixture.backend->projection_binding(), candidate);
+
+  auto request = testing::make_test_plan_request(
+      "move:next-product", ResolvedMotionSpecDTO{joint_goal(fixture.binding)});
+  request.projection_binding = predecessor;
+  const auto stale_request_result = fixture.backend->plan(request);
+  ASSERT_TRUE(stale_request_result.error.has_value());
+  EXPECT_EQ(stale_request_result.error->details.at("reason"),
+            "native_planner_projection_binding_mismatch");
+  EXPECT_EQ(fixture.client->compute_calls, 0);
+
+  request.projection_binding = candidate;
+  const auto result = fixture.backend->plan(request);
+  ASSERT_TRUE(result.trajectory.has_value());
+  EXPECT_EQ(fixture.client->compute_calls, 1);
+}
+
 TEST(RoboPlanPlannerBackendTest, AcceptsAnExactProviderGenerationWithoutInventingARuntimeUnit) {
   BackendFixture fixture;
   auto request = testing::make_test_plan_request(

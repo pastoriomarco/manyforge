@@ -71,6 +71,7 @@ class _AuthoringPassThrough:
         install=None,
         expected_identity=None,
         project=None,
+        prepare_project_under_claim=None,
         **_kwargs,
     ):
         """Commit through the real composite owner; only the Kernel is stubbed.
@@ -88,6 +89,8 @@ class _AuthoringPassThrough:
                 project=project,
             )
         elif session == "project":
+            if prepare_project_under_claim is not None:
+                project = prepare_project_under_claim()
             snapshot = workspace.commit_project(
                 expected_identity=expected_identity,
                 facts=project,
@@ -172,11 +175,17 @@ def _motion_targets_projection() -> dict:
         "ok": True,
         "identity": _motion_identity(),
         "targets": {
-            "direct_control": {
-                "target_role_id": "arm",
+            "schema_version": "manyforge.execution_targets.v3",
+            "components": [{
                 "controllable_component_id": "robot",
-                "command_target_id": "arm",
-            },
+                "availability": {"command_eligible": True, "reason": None},
+                "targets": [{
+                    "command_target_id": "arm",
+                    "operation_capability_id": "execution.trajectory.execute",
+                    "presentation": "motion",
+                    "command": {"target_role_id": "arm"},
+                }],
+            }],
         },
     }
 
@@ -194,17 +203,24 @@ def _motion_control_projection(*, sequence: int = 1) -> dict:
         "ok": True,
         "identity": _motion_identity(),
         "control_state": {
-            "observed_motion": {
-                "complete": True,
-                "current_tcp_pose": {
-                    "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
-                    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            "schema_version": "manyforge.execution_control_state.v6",
+            "observed_targets": [{
+                "controllable_component_id": "robot",
+                "command_target_id": "arm",
+                "operation_capability_id": "execution.trajectory.execute",
+                "observed": {
+                    "kind": "joint_positions",
+                    "complete": True,
+                    "current_tcp_pose": {
+                        "position_m": {"x_m": 0.1, "y_m": 0.2, "z_m": 0.3},
+                        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
                 },
                 "positions_rad": [0.1, -1.1, 0.9, -1.4, -1.2, 0.3],
                 "sequence": sequence,
                 "source_epoch": "native-source",
                 "source_joint_names": names,
-            }
+                },
+            }],
         },
     }
 

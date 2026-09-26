@@ -1,5 +1,7 @@
 #include <manyforge_deployment/cell_compiler.hpp>
 #include <manyforge_deployment/cell_composition.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
@@ -11,7 +13,9 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -37,7 +41,30 @@ struct Arguments final {
   std::filesystem::path metadata_path;
   bool assistant_native;
   bool operator_confirmation;
+  bool gripper_only;
 };
+
+[[nodiscard]] bool SameExecutionHostInfrastructure(
+    const deployment::RetainedBundle &predecessor,
+    const deployment::RetainedBundle &candidate) {
+  const auto &old_graph = predecessor.value().cell_graph;
+  const auto &new_graph = candidate.value().cell_graph;
+  if (old_graph.cell_id != new_graph.cell_id ||
+      old_graph.runtime_units.size() != 1U ||
+      new_graph.runtime_units.size() != 1U) {
+    return false;
+  }
+  const auto &old_host = old_graph.runtime_units.front();
+  const auto &new_host = new_graph.runtime_units.front();
+  // Empty and populated cells share infrastructure, not controller settings.
+  return old_host.runtime_unit_id == new_host.runtime_unit_id &&
+         old_host.runtime_profile_id == new_host.runtime_profile_id &&
+         old_host.runtime_profile_revision == new_host.runtime_profile_revision &&
+         old_host.dependency_runtime_unit_ids ==
+             new_host.dependency_runtime_unit_ids &&
+         predecessor.value().compiled_products.runtime_unit_products ==
+             candidate.value().compiled_products.runtime_unit_products;
+}
 
 void WriteDeploymentSource(
     const std::filesystem::path &package_root,
@@ -64,14 +91,16 @@ void WriteDeploymentSource(
       std::string_view(argv[4]).empty() ||
       (argc == 7 && (std::string_view(argv[5]) != "--profile" ||
                      (std::string_view(argv[6]) != "assistant-native" &&
-                      std::string_view(argv[6]) != "operator-confirmation")))) {
+                      std::string_view(argv[6]) != "operator-confirmation" &&
+                      std::string_view(argv[6]) != "gripper-only")))) {
     throw std::invalid_argument(
         "usage: generate_manager_apply_package --package-root <path> "
-        "--metadata <path> [--profile assistant-native|operator-confirmation]");
+        "--metadata <path> [--profile assistant-native|operator-confirmation|gripper-only]");
   }
   return {argv[2], argv[4],
           argc == 7 && std::string_view(argv[6]) == "assistant-native",
-          argc == 7 && std::string_view(argv[6]) == "operator-confirmation"};
+          argc == 7 && std::string_view(argv[6]) == "operator-confirmation",
+          argc == 7 && std::string_view(argv[6]) == "gripper-only"};
 }
 
 [[nodiscard]] deployment::RetentionQualifiedDeployment CompileEmpty(
@@ -122,6 +151,9 @@ NamedRuntimeOnlyCandidate(
 struct ProgramPublication final {
   core::ProgramBindingId binding_id;
   core::ProgramRevision program_revision;
+  /// The exact authored assignment the binding was compiled from.
+  deployment::CanonicalValue role_assignment;
+  std::shared_ptr<const deployment::ProgramBindingContract> program;
 };
 
 void WriteMetadata(
@@ -162,6 +194,7 @@ void WriteMetadata(
           {"program_id", deployment::CanonicalValue("program_apply_fixture")},
           {"program_revision",
            deployment::CanonicalValue(program.program_revision.value())},
+          {"program_role_assignment", program.role_assignment},
       }));
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);
   if (!stream) {
@@ -176,7 +209,8 @@ void WriteMetadata(
 
 [[nodiscard]] std::string ProgramBytes(const deployment::RetainedBundle &bundle,
                                        const bool operator_confirmation,
-                                       const bool initial_scene) {
+                                       const bool initial_scene,
+                                       const bool gripper_only) {
   const auto arm_binding =
       std::find_if(bundle.value().cell_graph.control_bindings.begin(),
                    bundle.value().cell_graph.control_bindings.end(),
@@ -184,9 +218,13 @@ void WriteMetadata(
                      return binding.command_target_id.value() ==
                             deployment::test::kLite6ArmTargetId;
                    });
-  if (arm_binding == bundle.value().cell_graph.control_bindings.end()) {
+  if (!gripper_only &&
+      arm_binding == bundle.value().cell_graph.control_bindings.end()) {
     throw std::logic_error("assistant-native bundle has no arm capability");
   }
+  const std::string arm_capability =
+      gripper_only ? "execution.trajectory.execute"
+                   : arm_binding->capability_id.value();
   deployment::CanonicalValue root(deployment::CanonicalValue::Object{
       {"api_version", deployment::CanonicalValue("manyforge.program.v2")},
       {"catalog",
@@ -228,7 +266,7 @@ void WriteMetadata(
                          deployment::CanonicalValue::Object{
                              {"capability_id",
                               deployment::CanonicalValue(
-                                  arm_binding->capability_id.value())},
+                                  arm_capability)},
                              {"disposition",
                               deployment::CanonicalValue("required")},
                              {"parameters",
@@ -272,25 +310,41 @@ void WriteMetadata(
             deployment::CanonicalValue(deployment::CanonicalValue::Object{})},
        })},
   });
-  if (operator_confirmation) {
+  if (operator_confirmation || gripper_only) {
     // One explicit qualified test source; the maintained default is unchanged.
     auto fields = root.as_object();
     for (auto &[field, value] : fields) {
       if (field == "target_roles") {
         auto targets = value.as_object();
+        if (gripper_only) {
+          targets.erase(std::remove_if(targets.begin(), targets.end(),
+                                       [](const auto &entry) {
+                                         return entry.first == "arm";
+                                       }),
+                        targets.end());
+        }
         targets.emplace_back("gripper",
                              deployment::parse_strict_json_model_yaml(R"({
           "component_role":"robot",
           "required_capabilities":[
-            {"capability_id":"tool.gripper.command","parameters":{},"disposition":"required"},
-            {"capability_id":"tool.gripper.confirmation.operator","parameters":{},"disposition":"required"},
-            {"capability_id":"tool.gripper.feedback","parameters":{},"disposition":"required"}],
+            {"capability_id":"tool.gripper.command","parameters":{},"disposition":"required"}],
           "required_frame_roles":["tcp"], "required_resource_roles":["fingers"],
           "required_collision_body_roles":["gripper_collision"], "required_model_roles":["arm_model"]
         })")
                                  .root());
+        if (operator_confirmation) {
+          auto gripper_role = targets.back().second.as_object();
+          for (auto &[name, item] : gripper_role) {
+            if (name != "required_capabilities") continue;
+            auto capabilities = item.as_array();
+            capabilities.emplace_back(deployment::parse_strict_json_model_yaml(R"({"capability_id":"tool.gripper.confirmation.operator","parameters":{},"disposition":"required"})").root());
+            capabilities.emplace_back(deployment::parse_strict_json_model_yaml(R"({"capability_id":"tool.gripper.feedback","parameters":{},"disposition":"required"})").root());
+            item = deployment::CanonicalValue(std::move(capabilities));
+          }
+          targets.back().second = deployment::CanonicalValue(std::move(gripper_role));
+        }
         value = deployment::CanonicalValue(std::move(targets));
-      } else if (field == "tree") {
+      } else if (field == "tree" && operator_confirmation) {
         value = deployment::parse_strict_json_model_yaml(R"({
           "node_id":"sequence","instance_id":"root","parameters":{},"children":[
             {"node_id":"gripper.command_position","instance_id":"close_gripper",
@@ -324,7 +378,8 @@ void WriteMetadata(
     const std::filesystem::path &package_root,
     const std::shared_ptr<const deployment::RetainedBundle> &bundle,
     const bool operator_confirmation = false,
-    const bool initial_scene = false) {
+    const bool initial_scene = false,
+    const bool gripper_only = false) {
   if (bundle == nullptr ||
       bundle->value().compiled_products.symbol_role_maps.size() != 1U) {
     throw std::logic_error("assistant-native bundle has no sole model map");
@@ -341,31 +396,89 @@ void WriteMetadata(
     throw std::logic_error("assistant-native model map did not reopen");
   }
   const auto program = deployment::verify_program_binding_contract(
-      ProgramBytes(*bundle, operator_confirmation, initial_scene), *bundle);
+      ProgramBytes(*bundle, operator_confirmation, initial_scene,
+                   gripper_only), *bundle);
   deployment::FilesystemCatalogArtifactStore catalogs(package_root);
-  std::vector<core::ProgramTargetRoleAssignmentDTO> targets{
-      {core::TargetRoleId("arm"), core::CommandTargetId(std::string(
-                                      deployment::test::kLite6ArmTargetId))}};
-  if (operator_confirmation) {
-    targets.push_back({core::TargetRoleId("gripper"),
-                       core::CommandTargetId(std::string(
-                           deployment::test::kLite6GripperTargetId))});
+  using Value = deployment::CanonicalValue;
+  Value::Array targets;
+  if (!gripper_only) {
+    targets.emplace_back(Value::Object{
+        {"command_target_id",
+         Value(std::string(deployment::test::kLite6ArmTargetId))},
+        {"target_role_id", Value("arm")},
+    });
   }
+  if (operator_confirmation || gripper_only) {
+    targets.emplace_back(Value::Object{
+        {"command_target_id",
+         Value(std::string(deployment::test::kLite6GripperTargetId))},
+        {"target_role_id", Value("gripper")},
+    });
+  }
+  // One authored assignment value is both compiled here and carried by the
+  // published prepared activations, so the two can never diverge.
+  Value role_assignment(Value::Object{
+      {"component_roles",
+       Value(Value::Array{Value(Value::Object{
+           {"component_role_id", Value("robot")},
+           {"controllable_component_id",
+            Value(std::string(
+                deployment::test::kLite6ControllableComponentId))},
+       })})},
+      {"target_roles", Value(std::move(targets))},
+  });
   const auto binding = deployment::compile_program_binding(
-      *program,
-      core::ProgramRoleAssignmentDTO{
-          {core::ProgramComponentRoleAssignmentDTO{
-              core::ComponentRoleId("robot"),
-              core::ControllableComponentId(std::string(
-                  deployment::test::kLite6ControllableComponentId))}},
-          std::move(targets),
-      },
+      *program, deployment::parse_program_role_assignment(role_assignment),
       *bundle, *model_map, catalogs);
   deployment::FilesystemProgramRepository programs(package_root);
   deployment::FilesystemProgramBindingRepository bindings(package_root);
   static_cast<void>(programs.put_if_absent(program, *bundle));
   static_cast<void>(bindings.put_if_absent(binding, *bundle, *model_map));
-  return {binding->program_binding_id(), program->value().program_revision};
+  return {binding->program_binding_id(), program->value().program_revision,
+          std::move(role_assignment), program};
+}
+
+/// Assemble and publish one real prepared activation per Scenario ID the
+/// process tests submit, and return their Apply summaries by Scenario ID.
+/// The Manager admits only stored, reverified prepared values.
+[[nodiscard]] deployment::CanonicalValue PublishPreparedActivations(
+    const std::filesystem::path &package_root,
+    const deployment::RetainedBundle &bundle, const ProgramPublication &program,
+    const deployment::IRawArtifactStore &raw_artifacts,
+    std::initializer_list<std::string_view> scenario_ids) {
+  const deployment::FilesystemVerifiedRetainedModelMapSource model_maps(
+      package_root);
+  const auto model_map =
+      model_maps.get_verified(deployment::RetainedModelMapQuery{
+          bundle.retained_bundle_id(),
+          bundle.value().compiled_products.symbol_role_maps.front().product_id});
+  if (!model_map.has_value()) {
+    throw std::logic_error("prepared-activation model map did not reopen");
+  }
+  deployment::FilesystemCatalogArtifactStore catalogs(package_root);
+  const deployment::FilesystemPreparedActivationRepository repository(
+      package_root);
+  deployment::CanonicalValue::Object summaries;
+  for (const auto scenario_id : scenario_ids) {
+    const auto prepared = deployment::assemble_prepared_activation(
+        deployment::PreparedActivationAssemblyInput{
+            core::ContentDigest("sha256:" + std::string(64U, '2')),
+            std::string(scenario_id),
+            core::ContentDigest("sha256:" + std::string(64U, 'e')),
+            "optional",
+            deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
+        },
+        bundle, *model_map, *program.program, program.role_assignment,
+        catalogs, raw_artifacts);
+    static_cast<void>(repository.put_if_absent(prepared));
+    deployment::CanonicalValue::Object summary;
+    for (const auto &[name, value] : prepared.normalized_root().as_object()) {
+      if (name != "activation_payload") summary.emplace_back(name, value);
+    }
+    summaries.emplace_back(std::string(scenario_id),
+                           deployment::CanonicalValue(std::move(summary)));
+  }
+  return deployment::CanonicalValue(std::move(summaries));
 }
 
 void WriteAssistantNativeMetadata(
@@ -373,12 +486,14 @@ void WriteAssistantNativeMetadata(
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const deployment::RetainedBundle &physical,
     const ProgramPublication &program,
-    const std::filesystem::path &admission_filename) {
+    const std::filesystem::path &admission_filename,
+    deployment::CanonicalValue prepared_activations) {
   const auto bytes = deployment::canonical_json(
       deployment::CanonicalValue(deployment::CanonicalValue::Object{
           {"admission_filename",
            deployment::CanonicalValue(admission_filename.string())},
           {"cell_id", deployment::CanonicalValue(admission.cell_id().value())},
+          {"prepared_activations", std::move(prepared_activations)},
           {"predecessor_graph_revision",
            deployment::CanonicalValue(admission.graph_revision().value())},
           {"predecessor_retained_bundle_id",
@@ -431,7 +546,12 @@ int main(int argc, char **argv) {
           "Manager Apply fixture lifecycle catalogs are unavailable");
     }
     auto source =
-        arguments.assistant_native
+        arguments.gripper_only
+            ? deployment::test::
+                  make_lite6_native_gripper_only_cclc_product_retention_fixture(
+                      arm_lifecycle_semantic.value().value(),
+                      gripper_lifecycle_semantic.value().value())
+        : arguments.assistant_native
             ? deployment::test::
                   make_lite6_native_cclc_assistant_product_retention_fixture(
                       arm_lifecycle_semantic.value().value(),
@@ -464,7 +584,7 @@ int main(int argc, char **argv) {
             CompileEmpty(predecessor_source, profiles), manifests, input_source,
             {}, catalogs, raw_artifacts, bundles);
     std::shared_ptr<const deployment::RetainedBundle> candidate;
-    if (!arguments.assistant_native) {
+    if (!arguments.assistant_native && !arguments.gripper_only) {
       const auto candidate_source =
           NamedRuntimeOnlyCandidate(predecessor_source, profiles);
       WriteDeploymentSource(arguments.package_root, candidate_source);
@@ -480,19 +600,21 @@ int main(int argc, char **argv) {
     WriteDeploymentSource(arguments.package_root,
                           source.qualified.deployment());
     if (predecessor == nullptr || physical_candidate == nullptr ||
-        (!arguments.assistant_native && candidate == nullptr) ||
+        (!arguments.assistant_native && !arguments.gripper_only &&
+         candidate == nullptr) ||
         (candidate != nullptr &&
-         (predecessor->value().cell_graph.runtime_units !=
-              candidate->value().cell_graph.runtime_units ||
-          predecessor->value().compiled_products.runtime_unit_products !=
-              candidate->value().compiled_products.runtime_unit_products)) ||
-        predecessor->value().cell_graph.runtime_units !=
-            physical_candidate->value().cell_graph.runtime_units ||
-        predecessor->value().compiled_products.runtime_unit_products !=
-            physical_candidate->value()
-                .compiled_products.runtime_unit_products) {
+         !SameExecutionHostInfrastructure(*predecessor, *candidate)) ||
+        !SameExecutionHostInfrastructure(*predecessor, *physical_candidate)) {
       throw std::logic_error(
           "Manager Apply fixture lost exact execution-host continuity");
+    }
+    const auto &host_id =
+        predecessor->value().cell_graph.runtime_units.front().runtime_unit_id;
+    static_cast<void>(deployment::native_execution_runtime_contract::
+                          require_configuration(*predecessor, host_id));
+    if (candidate != nullptr) {
+      static_cast<void>(deployment::native_execution_runtime_contract::
+                            require_configuration(*candidate, host_id));
     }
     const auto admission_filename =
         deployment::cell_scoped_canonical_empty_admission_filename(
@@ -501,18 +623,23 @@ int main(int argc, char **argv) {
         deployment::detail::publish_cell_scoped_canonical_empty_admission(
             arguments.package_root, admission_filename, *predecessor);
 
-    if (arguments.assistant_native || arguments.operator_confirmation) {
+    if (arguments.assistant_native || arguments.operator_confirmation ||
+        arguments.gripper_only) {
       const auto program = PublishAssistantNativeProgram(
           arguments.package_root, physical_candidate,
-          arguments.operator_confirmation);
-      WriteAssistantNativeMetadata(arguments.metadata_path, admission,
-                                   *physical_candidate, program,
-                                   admission_filename);
+          arguments.operator_confirmation, false, arguments.gripper_only);
+      WriteAssistantNativeMetadata(
+          arguments.metadata_path, admission, *physical_candidate, program,
+          admission_filename,
+          PublishPreparedActivations(
+              arguments.package_root, *physical_candidate, program,
+              raw_artifacts,
+              {"assistant_native_process_fixture", "program_apply_fixture"}));
       return 0;
     }
 
     const auto program = PublishAssistantNativeProgram(
-        arguments.package_root, physical_candidate, false, true);
+        arguments.package_root, physical_candidate, false, true, false);
     WriteMetadata(arguments.metadata_path, admission, *candidate,
                   *physical_candidate, program, admission_filename);
     return 0;

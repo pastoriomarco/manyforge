@@ -700,8 +700,8 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       registry.find_qualified_value_schema(
           core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
           core::SchemaRevision("sha256:"
-                               "49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5"
-                               "702c61a9828c62035")),
+                               "6b540dac39434e05a2cb5da209206e2105b824b9f56704a7"
+                               "4f0d88f327944689")),
       nullptr);
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
@@ -767,7 +767,7 @@ TEST(ClosedSchema,
       core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "49b3bbd377ad4cb93e7d27df06ff84b7e9ddbce3f3047e5702c61a9828c62035"));
+          "6b540dac39434e05a2cb5da209206e2105b824b9f56704a74f0d88f327944689"));
   ASSERT_NE(schema, nullptr);
 
   const CanonicalValue valid = value_object({

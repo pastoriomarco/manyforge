@@ -1,10 +1,11 @@
--- ManyForge UA4 typed named-Apply journal, version 15.
+-- ManyForge UA4 typed named-Apply journal, version 16.
 --
 -- This schema stores immutable named-Apply intents, including the exact UA2A
 -- prepared activation each operation accepted (captured source-closure digest,
 -- candidate Deployment identity, prepared Program-binding identity and the
 -- prepared-activation transfer handle), their exact generation-
--- bound whole-Apply affected scopes, configuration-fence attempts, and
+-- bound whole-Apply affected scopes with their per-component runtime delta,
+-- configuration-fence attempts, and
 -- successful fence acceptances, complete runtime convergence intents, and
 -- immutable candidate staged-ready sets, Scene-owned maintenance completion,
 -- private selected-bundle materialization, public publication,
@@ -15,12 +16,12 @@
 -- It is deliberately not a mutable phase/event journal.
 
 PRAGMA application_id = 1296450128;
-PRAGMA user_version = 15;
+PRAGMA user_version = 16;
 
 CREATE TABLE IF NOT EXISTS apply_journal_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 15),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 16),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_apply_intents INTEGER NOT NULL
@@ -117,7 +118,9 @@ CREATE TABLE IF NOT EXISTS manager_apply_intents (
     captured_input_digest TEXT NOT NULL,
     deployment_artifact_id TEXT NOT NULL,
     deployment_revision TEXT NOT NULL,
-    program_binding_id TEXT NOT NULL,
+    -- NULL exactly for a prepared non-executable Program outcome (H1a).
+    program_binding_id TEXT
+        CHECK (program_binding_id IS NULL OR length(program_binding_id) = 71),
     prepared_activation_id TEXT NOT NULL,
     prepared_activation_receipt_json TEXT NOT NULL
         CHECK (
@@ -154,6 +157,8 @@ CREATE TABLE IF NOT EXISTS manager_apply_affected_scopes (
     busy_disposition TEXT NOT NULL
         CHECK (busy_disposition = 'reject_if_affected_busy'),
     affected_scope_digest TEXT NOT NULL,
+    component_delta_encoding TEXT NOT NULL
+        CHECK (length(component_delta_encoding) BETWEEN 2 AND 262144),
     PRIMARY KEY (apply_id, apply_generation),
     UNIQUE (apply_id, apply_generation, affected_scope_digest),
     FOREIGN KEY (apply_id, apply_generation, intent_digest)

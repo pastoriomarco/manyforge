@@ -289,6 +289,27 @@ TEST(ComponentLifecycleAdmission, DisableRejectsChangedDomainSetBeforeReservatio
   EXPECT_EQ(prepared.error().code, "component_lifecycle_configuration_stale");
 }
 
+TEST(ComponentLifecycleAdmission,
+     OrdinaryDisableUsesTheCurrentSnapshotWithoutAStopHandoff) {
+  const auto expected = ExpectedDomain("a");
+  auto snapshot = Snapshot({expected}, ComponentLifecycleStateDTO::kActive);
+  const auto catalog = Catalog(
+      snapshot.provider_occurrences.front(),
+      {FixedPlan(ComponentLifecycleIntentKindDTO::kDisable,
+                 ComponentLifecycleStateDTO::kDisabled, 6'000)});
+
+  const auto prepared = PrepareComponentLifecycleAdmission(
+      Intent(ComponentLifecycleIntentKindDTO::kDisable, {expected}),
+      Candidate(snapshot, {catalog}));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  EXPECT_TRUE(prepared.value().lifecycle_mutation_eligible);
+  EXPECT_FALSE(prepared.value().disable_handoff_admission.has_value());
+  EXPECT_FALSE(prepared.value().initial_status.disable_handoff.has_value());
+  EXPECT_EQ(prepared.value().initial_status.requested_state.state,
+            ComponentLifecycleStateDTO::kDisabled);
+  EXPECT_EQ(prepared.value().acceptance.timeout_duration_ns, 6'000);
+}
+
 TEST(ComponentLifecycleAdmission, DisableRejectsUnqualifiedCatalogBeforeReservation) {
   const auto expected = ExpectedDomain("a");
   auto snapshot = Snapshot({expected}, ComponentLifecycleStateDTO::kActive);
@@ -360,7 +381,8 @@ TEST(ComponentLifecycleAdmission, NoSnapshotDisableDoesNotPromoteToContainment) 
   EXPECT_EQ(prepared.error().code, "component_lifecycle_scope_unresolved");
 }
 
-TEST(ComponentLifecycleAdmission, RejectsDisableAdmissionForAnotherSnapshot) {
+TEST(ComponentLifecycleAdmission,
+     OrdinaryDisableRejectsALegacyStopHandoffSnapshot) {
   const auto expected = ExpectedDomain("a");
   auto snapshot = Snapshot({expected}, ComponentLifecycleStateDTO::kActive);
   const auto catalog = Catalog(snapshot.provider_occurrences.front(),
@@ -376,7 +398,9 @@ TEST(ComponentLifecycleAdmission, RejectsDisableAdmissionForAnotherSnapshot) {
       Candidate(snapshot, {catalog}, admission));
 
   ASSERT_FALSE(prepared.ok());
-  EXPECT_EQ(prepared.error().code, "component_lifecycle_disable_admission_mismatch");
+  EXPECT_EQ(prepared.error().code, "component_lifecycle_admission_invalid");
+  EXPECT_EQ(prepared.error().details.at("reason"),
+            "unexpected_disable_handoff_admission");
 }
 
 }  // namespace

@@ -86,13 +86,6 @@ const execution = {
     revision_id: 1,
     content_hash: 'sha256:scene',
   },
-  programId: 'program.1',
-  programRevision: 'sha256:program',
-  programBindingId: 'sha256:binding',
-  motionTargetRoleId: 'arm',
-  gripperTargetRoleId: 'gripper',
-  gripperCommandSchemaId: 'gripper.command_position',
-  gripperCommandSchemaRevision: 'sha256:gripper',
 } satisfies ExecutionIdentity;
 
 afterEach(() => {

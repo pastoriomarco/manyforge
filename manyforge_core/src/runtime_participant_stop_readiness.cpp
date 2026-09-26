@@ -211,4 +211,51 @@ Result<RuntimeParticipantStopReadiness> rebind_runtime_participant_stop_readines
       RuntimeParticipantStopReadiness(std::move(value)));
 }
 
+Result<RuntimeParticipantStopReadiness> rebind_runtime_participant_stop_readiness_product(
+    const RuntimeParticipantStopReadiness& verified,
+    const RuntimeParticipantBinding& predecessor,
+    const RuntimeParticipantBinding& candidate,
+    const ControllerLifecycleExpectedDomain& expected_domain) {
+  const auto& old_binding = predecessor.value();
+  const auto& new_binding = candidate.value();
+  if (old_binding.controllable_component_id !=
+          new_binding.controllable_component_id ||
+      old_binding.component_type_id != new_binding.component_type_id ||
+      old_binding.component_type_revision !=
+          new_binding.component_type_revision ||
+      old_binding.command_target_id != new_binding.command_target_id ||
+      old_binding.capability_id != new_binding.capability_id ||
+      old_binding.capability_definition_revision !=
+          new_binding.capability_definition_revision ||
+      old_binding.model_bindings != new_binding.model_bindings ||
+      old_binding.model_groups != new_binding.model_groups ||
+      old_binding.frame_bindings != new_binding.frame_bindings ||
+      old_binding.resources != new_binding.resources ||
+      old_binding.control_path != new_binding.control_path ||
+      old_binding.capability_provider_path !=
+          new_binding.capability_provider_path ||
+      old_binding.supporting_capability_provider_paths !=
+          new_binding.supporting_capability_provider_paths ||
+      old_binding.runtime_unit_epochs != new_binding.runtime_unit_epochs) {
+    return invalid<RuntimeParticipantStopReadiness>(
+        "runtime_participant_stop_product_rebind_changes_controller");
+  }
+  const auto predecessor_check = verify_runtime_participant_stop_readiness(
+      verified.value(), predecessor, expected_domain);
+  if (!predecessor_check.ok()) {
+    return Result<RuntimeParticipantStopReadiness>::Err(predecessor_check.error());
+  }
+  auto value = verified.value();
+  auto plan = value.resolved_stop_base_plan;
+  plan.retained_bundle_id = candidate.value().retained_bundle_id;
+  plan.graph_revision = candidate.value().graph_revision;
+  const auto sealed_plan = MakeResolvedStopBasePlan(std::move(plan));
+  if (!sealed_plan.ok()) {
+    return Result<RuntimeParticipantStopReadiness>::Err(sealed_plan.error());
+  }
+  value.resolved_stop_base_plan = sealed_plan.value();
+  return verify_runtime_participant_stop_readiness(std::move(value), candidate,
+                                                   expected_domain);
+}
+
 }  // namespace manyforge::core

@@ -193,7 +193,9 @@ set_target_properties(manyforge_headless_owner_publication PROPERTIES
 add_executable(manyforge_manager_daemon src/manager_daemon.cpp)
 target_link_libraries(manyforge_manager_daemon PRIVATE
   manyforge_headless_owner_publication
-  manyforge::deployment_admission)
+  manyforge::deployment_admission
+  # Apply acceptance recompiles the stored prepared Program outcome (H1a).
+  manyforge::deployment)
 
 option(BUILD_TESTING "Build unit tests" ON)
 set(
@@ -523,6 +525,32 @@ if(BUILD_TESTING)
     add_custom_target(manyforge_headless_test_assistant_native_package
       DEPENDS "${MANYFORGE_HEADLESS_TEST_ASSISTANT_NATIVE_METADATA}")
 
+    set(MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/gripper-only-manager-test-fixture")
+    set(MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT
+      "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}/retained-package")
+    set(MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA
+      "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}/metadata.json")
+    add_custom_command(
+      OUTPUT "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}"
+      COMMAND "${CMAKE_COMMAND}" -E remove_directory
+        "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_FIXTURE_ROOT}"
+      COMMAND "$<TARGET_FILE:manyforge_generate_headless_manager_apply_test_package>"
+        --package-root "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT}"
+        --metadata "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}"
+        --profile gripper-only
+      DEPENDS
+        manyforge_generate_headless_manager_apply_test_package
+        "${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${MANYFORGE_HEADLESS_TEST_LITE6_FIXTURE_ROOT}/model.srdf"
+        ${MANYFORGE_HEADLESS_TEST_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(manyforge_headless_test_gripper_only_package
+      DEPENDS "${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}")
+
     set(MANYFORGE_HEADLESS_TEST_GRIPPER_CONFIRMATION_FIXTURE_ROOT
       "${CMAKE_CURRENT_BINARY_DIR}/gripper-confirmation-test-fixture")
     add_custom_command(
@@ -686,6 +714,7 @@ if(BUILD_TESTING)
     add_dependencies(test_manager_daemon_process
       manyforge_headless_test_manager_apply_package
       manyforge_headless_test_assistant_native_package
+      manyforge_headless_test_gripper_only_package
       manyforge_headless_test_gripper_confirmation_package)
     target_compile_definitions(test_manager_daemon_process PRIVATE
       MANYFORGE_HEADLESS_TEST_PYTHON="${Python3_EXECUTABLE}"
@@ -693,6 +722,8 @@ if(BUILD_TESTING)
       MANYFORGE_HEADLESS_TEST_PYTHON_MODULE_ROOT="${CMAKE_CURRENT_BINARY_DIR}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_METADATA}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT}"
+      MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA="${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA}"
+      MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA}"
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT}"
       MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_NATIVE_EXECUTION_HOST}"
@@ -703,6 +734,8 @@ if(BUILD_TESTING)
   endif()
   target_link_libraries(test_manager_daemon_process PRIVATE
     manyforge_headless_owner_publication
+    # Publishes real prepared activations for each Apply (H1a).
+    manyforge::deployment
     GTest::gtest_main)
   gtest_discover_tests(test_manager_daemon_process
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})

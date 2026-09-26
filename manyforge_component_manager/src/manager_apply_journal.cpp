@@ -100,7 +100,7 @@ using core::SceneRevision;
 constexpr std::string_view kDigestDomain =
     "manyforge.component-manager-apply-intent.v1";
 constexpr std::string_view kAffectedScopeDigestDomain =
-    "manyforge.component-manager-apply-affected-scope.v1";
+    "manyforge.component-manager-apply-affected-scope.v2";
 constexpr std::string_view kFenceAttemptDigestDomain =
     "manyforge.component-manager-apply-fence-attempt.v2";
 constexpr std::string_view kFenceAcceptanceDigestDomain =
@@ -568,8 +568,10 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
       "deployment_artifact_id");
   ValidateDigest(intent.prepared_activation.deployment_revision.value(),
                  "deployment_revision");
-  ValidateDigest(intent.prepared_activation.program_binding_id.value(),
-                 "program_binding_id");
+  if (intent.prepared_activation.program_binding_id.has_value()) {
+    ValidateDigest(intent.prepared_activation.program_binding_id->value(),
+                   "program_binding_id");
+  }
   ValidateDigest(intent.prepared_activation.prepared_activation_id.value(),
                  "prepared_activation_id");
   ValidateBoundedText(intent.prepared_activation.canonical_receipt_json,
@@ -630,8 +632,11 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
               intent.prepared_activation.deployment_artifact_id.value());
   AppendField(record, "deployment_revision",
               intent.prepared_activation.deployment_revision.value());
+  // Empty only for a non-executable Program; a bound id is a digest.
   AppendField(record, "program_binding_id",
-              intent.prepared_activation.program_binding_id.value());
+              intent.prepared_activation.program_binding_id.has_value()
+                  ? intent.prepared_activation.program_binding_id->value()
+                  : std::string{});
   AppendField(record, "prepared_activation_id",
               intent.prepared_activation.prepared_activation_id.value());
   AppendField(record, "prepared_activation_receipt_json",
@@ -1403,6 +1408,7 @@ struct EncodedAffectedScope final {
   std::string bindings;
   std::string resources;
   std::string busy_disposition;
+  std::string component_delta;
   std::string digest;
 };
 
@@ -1432,6 +1438,8 @@ EncodeAffectedScope(const ContentDigest &intent_digest,
       EncodeBindings(affected_scope.scope.bindings),
       EncodeResources(affected_scope.scope.resources),
       std::string(core::to_string(affected_scope.busy_disposition)),
+      manyforge::deployment::EncodeApplyComponentDelta(
+          affected_scope.component_delta),
       {},
   };
   std::string record;
@@ -1445,6 +1453,7 @@ EncodeAffectedScope(const ContentDigest &intent_digest,
   AppendField(record, "bindings_encoding", encoded.bindings);
   AppendField(record, "resources_encoding", encoded.resources);
   AppendField(record, "busy_disposition", encoded.busy_disposition);
+  AppendField(record, "component_delta_encoding", encoded.component_delta);
   encoded.digest = RawDigest(record);
   return encoded;
 }
@@ -2281,7 +2290,8 @@ bool ManagerApplyPreparedActivationDTO::valid() const noexcept {
   return core::IsExactLowercaseSha256Digest(captured_input_digest.value()) &&
          !deployment_artifact_id.empty() &&
          core::IsExactLowercaseSha256Digest(deployment_revision.value()) &&
-         core::IsExactLowercaseSha256Digest(program_binding_id.value()) &&
+         (!program_binding_id.has_value() ||
+          core::IsExactLowercaseSha256Digest(program_binding_id->value())) &&
          core::IsExactLowercaseSha256Digest(prepared_activation_id.value()) &&
          !canonical_receipt_json.empty() &&
          canonical_receipt_json.size() <=
@@ -2739,7 +2749,7 @@ public:
     const auto captured_input_digest = row.Text(13);
     const auto deployment_artifact_id = row.Text(14);
     const auto deployment_revision = row.Text(15);
-    const auto program_binding_id = row.Text(16);
+    const auto program_binding_id = row.OptionalText(16);
     const auto prepared_activation_id = row.Text(17);
     const auto prepared_activation_receipt_json = row.Text(18);
     std::optional<core::AdmissionGeneration> expected_admission_generation;
@@ -2788,7 +2798,9 @@ public:
             ContentDigest(captured_input_digest),
             core::DeploymentArtifactId(deployment_artifact_id),
             core::DeploymentRevision(deployment_revision),
-            core::ProgramBindingId(program_binding_id),
+            program_binding_id.has_value()
+                ? std::optional(core::ProgramBindingId(*program_binding_id))
+                : std::nullopt,
             ContentDigest(prepared_activation_id),
             prepared_activation_receipt_json,
         },
@@ -2852,7 +2864,8 @@ public:
     Statement row(database_,
                   "SELECT intent_digest,components_encoding,domains_encoding,"
                   "bindings_encoding,resources_encoding,busy_disposition,"
-                  "affected_scope_digest FROM manager_apply_affected_scopes "
+                  "affected_scope_digest,component_delta_encoding "
+                  "FROM manager_apply_affected_scopes "
                   "WHERE apply_id=? AND apply_generation=?");
     row.Bind(1, apply_id.value());
     row.Bind(2, apply_generation);
@@ -2866,6 +2879,7 @@ public:
     const auto resources = row.Text(4);
     const auto busy_disposition = row.Text(5);
     const auto stored_digest = row.Text(6);
+    const auto component_delta = row.Text(7);
     if (row.Step()) {
       throw ManagerApplyJournalIntegrityError(
           "stored Apply affected scope is not unique");
@@ -2876,6 +2890,7 @@ public:
           ApplyGeneration(static_cast<std::uint64_t>(apply_generation)),
           DecodeScope(components, domains, bindings, resources),
           DecodeBusyDisposition(busy_disposition),
+          manyforge::deployment::DecodeApplyComponentDelta(component_delta),
       };
       const ContentDigest parent_digest(intent_digest);
       const auto encoded = EncodeAffectedScope(parent_digest, affected_scope);
@@ -4276,7 +4291,11 @@ SqliteManagerApplyJournal::EnsureIntent(const ManagerApplyIntentDTO &intent) {
   insert.Bind(14, intent.prepared_activation.captured_input_digest.value());
   insert.Bind(15, intent.prepared_activation.deployment_artifact_id.value());
   insert.Bind(16, intent.prepared_activation.deployment_revision.value());
-  insert.Bind(17, intent.prepared_activation.program_binding_id.value());
+  if (intent.prepared_activation.program_binding_id.has_value()) {
+    insert.Bind(17, intent.prepared_activation.program_binding_id->value());
+  } else {
+    insert.BindNull(17);
+  }
   insert.Bind(18, intent.prepared_activation.prepared_activation_id.value());
   insert.Bind(19, intent.prepared_activation.canonical_receipt_json);
   if (encoded.expected_admission_generation.has_value()) {
@@ -4433,8 +4452,8 @@ SqliteManagerApplyJournal::EnsureAffectedScope(
       "INSERT INTO manager_apply_affected_scopes ("
       "apply_id,apply_generation,intent_digest,components_encoding,"
       "domains_encoding,bindings_encoding,resources_encoding,"
-      "busy_disposition,affected_scope_digest) "
-      "VALUES (?,?,?,?,?,?,?,?,?)");
+      "busy_disposition,affected_scope_digest,component_delta_encoding) "
+      "VALUES (?,?,?,?,?,?,?,?,?,?)");
   insert.Bind(1, affected_scope.apply_id.value());
   insert.Bind(2, encoded.apply_generation);
   insert.Bind(3, intent_digest.value());
@@ -4444,6 +4463,7 @@ SqliteManagerApplyJournal::EnsureAffectedScope(
   insert.Bind(7, encoded.resources);
   insert.Bind(8, encoded.busy_disposition);
   insert.Bind(9, encoded.digest);
+  insert.Bind(10, encoded.component_delta);
   static_cast<void>(insert.Step());
   const auto stored = impl_->AffectedScopeLocked(affected_scope.apply_id,
                                                  encoded.apply_generation);

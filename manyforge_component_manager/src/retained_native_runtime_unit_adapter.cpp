@@ -782,12 +782,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   class ProjectionClient;
 
   struct Child final {
-    struct ProjectionPreparation final {
-      manyforge::core::RetainedBundleId retained_bundle_id;
-      manyforge::core::GraphRevision graph_revision;
-      manyforge::core::RetainedProductDTO planning_collision_model;
-    };
-
     pid_t pid;
     RuntimeEpoch runtime_epoch;
     UniqueFd channel;
@@ -795,8 +789,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     std::string configuration_identity;
     std::string runtime_contract_offer_digest;
     std::set<ProjectionBindingKey> admitted_projection_bindings;
-    std::map<ProjectionBindingKey, ProjectionPreparation>
-        prepared_projection_products;
     Child(pid_t child_pid, RuntimeEpoch child_epoch, UniqueFd child_channel,
           std::string selected_product_identity,
           std::string selected_configuration_identity,
@@ -1525,8 +1517,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         NativeProjectionBindingsForRuntime(bundle, runtime_unit_id);
     for (const auto &[provider_binding_id, provider_binding_revision] :
          bindings) {
-      const ProjectionBindingKey key{provider_binding_id,
-                                     provider_binding_revision};
       detail::NativeProjectionPrepareRequest request{
           {provider_binding_id, provider_binding_revision, runtime_unit_id,
            child.runtime_epoch},
@@ -1537,15 +1527,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       if (!request.valid()) {
         Fail("native projection preparation request is invalid");
       }
-      const auto previous = child.prepared_projection_products.find(key);
-      if (previous != child.prepared_projection_products.end() &&
-          previous->second.retained_bundle_id ==
-              request.candidate_retained_bundle_id &&
-          previous->second.graph_revision == request.candidate_graph_revision &&
-          previous->second.planning_collision_model ==
-              request.planning_collision_model) {
-        continue;
-      }
+      // The child owns projection residency and bounded retirement. Historical
+      // preparation is not proof that a removed provider still exists; its
+      // exact Prepare replay already avoids rebuilding a resident product.
       auto response = ExchangeProjection(
           child, request,
           std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1566,11 +1550,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       }
       child.admitted_projection_bindings.emplace(provider_binding_id,
                                                  provider_binding_revision);
-      child.prepared_projection_products.insert_or_assign(
-          key,
-          Child::ProjectionPreparation{request.candidate_retained_bundle_id,
-                                       request.candidate_graph_revision,
-                                       request.planning_collision_model});
     }
   }
 

@@ -37,8 +37,8 @@ _RECEIPT_FIELDS = {
     "graph_revision",
     "node_environment_digest",
     "prepared_activation_id",
-    "program_binding_id",
     "program_id",
+    "program_outcome",
     "program_revision",
     "retained_bundle_id",
     "scenario_id",
@@ -369,7 +369,7 @@ class ActivationPreparer:
                 not isinstance(value, dict)
                 or set(value) != _EXPECTED_RESULT_FIELDS
                 or value.get("schema_version")
-                != "manyforge.prepared_activation_input.v2"
+                != "manyforge.prepared_activation_input.v3"
                 or value.get("source_document_digest") != source_document_digest
                 or value.get("captured_input_digest") != captured_input_digest
                 or value.get("typed_parameter_overrides")

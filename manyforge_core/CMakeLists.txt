@@ -38,6 +38,7 @@ add_library(manyforge_core
   src/addressed_observed_state_publication.cpp
   src/build_owned_lifecycle_plan_catalog_source.cpp
   src/component_lifecycle.cpp
+  src/component_lifecycle_plan_validity.cpp
   src/component_lifecycle_snapshot.cpp
   src/component_lifecycle_admission.cpp
   src/component_lifecycle_coordinator.cpp

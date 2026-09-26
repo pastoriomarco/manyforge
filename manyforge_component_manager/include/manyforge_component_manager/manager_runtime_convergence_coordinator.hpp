@@ -4,6 +4,7 @@
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_component_manager/runtime_convergence.hpp>
 #include <manyforge_core/ports/iactive_bundle_publication_store.hpp>
+#include <manyforge_core/types/error_code.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <mutex>
 #include <optional>
@@ -65,6 +66,15 @@ BuildVerifiedRuntimeConvergencePlan(
         &artifact_source,
     std::string_view operating_system,
     std::vector<std::string> launch_environment_contracts);
+
+/// Effect-free continuity admission for a retained native execution host.
+/// Generic runtime units are intentionally outside this stable-host rule.
+[[nodiscard]] manyforge::core::Result<void>
+VerifyNativeExecutionHostContinuity(
+    const manyforge::deployment::RetainedBundle &predecessor,
+    const manyforge::deployment::RetainedBundle &candidate,
+    const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+        &artifact_source);
 
 /// Bounded named-Apply runtime convergence coordinator.
 ///

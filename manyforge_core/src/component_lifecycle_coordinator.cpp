@@ -713,7 +713,7 @@ class ComponentLifecycleCoordinator::Impl final {
             }
           }
           auto runtime = std::make_shared<RuntimeState>(status, std::nullopt, false, std::nullopt,
-                                                        std::move(domains));
+                                                        std::move(domains), std::nullopt);
           const auto recovered_claim =
               std::find_if(recovered.value().cell_claims.begin(),
                            recovered.value().cell_claims.end(), [&](const auto& row) {
@@ -776,7 +776,7 @@ class ComponentLifecycleCoordinator::Impl final {
       restoration_committed = true;
       for (const auto& runtime : recovered_runtimes) {
         const bool kernel_lane =
-            runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable ||
+            runtime->status.disable_handoff.has_value() ||
             (runtime->unresolved_recovery_effect.has_value() &&
              runtime->unresolved_recovery_effect->effect_kind !=
                  CCLCEffectKindDTO::kBrandLifecyclePrimitive);
@@ -1316,12 +1316,14 @@ class ComponentLifecycleCoordinator::Impl final {
                  std::optional<std::vector<BrandLifecyclePlanCatalogDTO>> accepted_catalogs,
                  bool accepted_lifecycle_mutation_eligible,
                  std::optional<DisableHandoffAdmissionSnapshotDTO> accepted_disable_admission,
-                 std::vector<ControlDomainId> accepted_reserved_domains)
+                 std::vector<ControlDomainId> accepted_reserved_domains,
+                 std::optional<ComponentLifecycleCurrentSnapshotDTO> accepted_component_snapshot)
         : status(std::move(initial_status)),
           qualified_catalogs(std::move(accepted_catalogs)),
           lifecycle_mutation_eligible(accepted_lifecycle_mutation_eligible),
           disable_admission(std::move(accepted_disable_admission)),
           reserved_domains(std::move(accepted_reserved_domains)),
+          accepted_snapshot(std::move(accepted_component_snapshot)),
           effective_deadline_ns(deadline_at(status)),
           ports(status.domains.size()),
           observations(status.domains.size()),
@@ -1337,6 +1339,7 @@ class ComponentLifecycleCoordinator::Impl final {
     bool lifecycle_mutation_eligible;
     std::optional<DisableHandoffAdmissionSnapshotDTO> disable_admission;
     std::vector<ControlDomainId> reserved_domains;
+    std::optional<ComponentLifecycleCurrentSnapshotDTO> accepted_snapshot;
     std::int64_t effective_deadline_ns;
     std::vector<std::shared_ptr<IBrandLifecyclePort>> ports;
     std::vector<std::optional<BrandLifecycleObservationDTO>> observations;
@@ -3274,19 +3277,6 @@ class ComponentLifecycleCoordinator::Impl final {
           }
           result.catalogs.push_back(catalog.value());
         }
-        if (intent.intent == ComponentLifecycleIntentKindDTO::kDisable) {
-          const auto expectation = BuildDisableHandoffComponentScopeExpectation(snapshot.value());
-          if (!expectation.ok()) {
-            return Result<AdmissionFacts>::Err(expectation.error());
-          }
-          const auto admission = kernel_disable_handoff_port_.ObserveDisableHandoffAdmission(
-              {intent.controllable_component_id,
-               DisableHandoffScopeRequestKindDTO::kResolvedComponentScope, expectation.value()});
-          if (!admission.ok()) {
-            return Result<AdmissionFacts>::Err(admission.error());
-          }
-          result.disable_admission = admission.value();
-        }
         return Result<AdmissionFacts>::Ok(std::move(result));
       }
     } catch (...) {
@@ -3451,7 +3441,7 @@ class ComponentLifecycleCoordinator::Impl final {
       runtime = std::make_shared<RuntimeState>(
           prepared.value().initial_status, prepared.value().qualified_lifecycle_plan_catalogs,
           prepared.value().lifecycle_mutation_eligible, prepared.value().disable_handoff_admission,
-          prepared.value().reserved_control_domains);
+          prepared.value().reserved_control_domains, facts.current_snapshot);
     } catch (...) {
       release_on_failure();
       return Result<CCLCLifecycleRequestResultDTO>::Err(coordinator_error(
@@ -3586,9 +3576,10 @@ class ComponentLifecycleCoordinator::Impl final {
         std::lock_guard lock(state_mutex_);
         active_transactions_.push_back(runtime);
       }
-      auto& initial_pool = intent.intent == ComponentLifecycleIntentKindDTO::kDisable
-                               ? kernel_worker_pool_
-                               : worker_pool_;
+      // Ordinary Disable is an idle lifecycle mutation under the same exact
+      // cell claim as Prepare and Enable. The Kernel Stop worker remains for
+      // read-only recovery of durable pre-cutover handoff records.
+      auto& initial_pool = worker_pool_;
       if (!initial_pool.Submit(
               [this, runtime](std::stop_token cancellation) { Process(runtime, cancellation); })) {
         CloseAdmissionLocked();
@@ -3615,6 +3606,7 @@ class ComponentLifecycleCoordinator::Impl final {
         return;
       }
       if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
+          runtime->status.disable_handoff.has_value() &&
           !runtime->lifecycle_lane_active) {
         ProcessDisable(runtime, cancellation);
         return;
@@ -3624,7 +3616,8 @@ class ComponentLifecycleCoordinator::Impl final {
       }
       RunCurrentDomain(runtime, cancellation);
     } catch (const std::exception& exception) {
-      if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable) {
+      if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
+          runtime->status.disable_handoff.has_value()) {
         CloseAdmission();
         return;
       }
@@ -3632,7 +3625,8 @@ class ComponentLifecycleCoordinator::Impl final {
           runtime, coordinator_error("component_lifecycle_worker_exception",
                                      "the lifecycle worker caught an exception", exception.what()));
     } catch (...) {
-      if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable) {
+      if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
+          runtime->status.disable_handoff.has_value()) {
         CloseAdmission();
         return;
       }
@@ -3743,7 +3737,8 @@ class ComponentLifecycleCoordinator::Impl final {
       }
     }
 
-    if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable) {
+    if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
+        runtime->status.disable_handoff.has_value()) {
       if (!AdoptRecoveredStatus(runtime)) {
         return;
       }
@@ -5078,6 +5073,96 @@ class ComponentLifecycleCoordinator::Impl final {
   }
 
   [[nodiscard]] bool Initialize(const std::shared_ptr<RuntimeState>& runtime) {
+    // The whole-cell claim is held now. A preclaim snapshot reread alone
+    // cannot authorize a provider effect across the claim-acquisition gap.
+    if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
+        runtime->accepted_snapshot.has_value()) {
+      // Acceptance advances the durable component-generation watermark and
+      // retains the pre-effect lifecycle state at that new generation. The
+      // snapshot captured before acceptance is therefore expected to differ
+      // by exactly this generation step once read back from the journal.
+      auto expected = *runtime->accepted_snapshot;
+      const auto predecessor_generation =
+          expected.component_lifecycle_generation.value();
+      const auto accepted_generation =
+          runtime->status.acceptance.component_lifecycle_generation.value();
+      if (predecessor_generation == std::numeric_limits<std::uint64_t>::max() ||
+          accepted_generation != predecessor_generation + 1U) {
+        FailBeforeEffect(
+            runtime,
+            coordinator_error(
+                "component_lifecycle_snapshot_generation_invalid",
+                "Disable acceptance did not reserve the exact successor "
+                "component generation",
+                "accepted_generation_not_successor"));
+        return false;
+      }
+      expected.component_lifecycle_generation =
+          runtime->status.acceptance.component_lifecycle_generation;
+      const auto expected_digest =
+          ComputeComponentLifecycleCurrentSnapshotDigest(expected);
+      if (!expected_digest.ok()) {
+        FailBeforeEffect(
+            runtime,
+            coordinator_error(
+                "component_lifecycle_snapshot_generation_invalid",
+                "the accepted Disable snapshot cannot be canonically "
+                "recomputed",
+                "accepted_snapshot_digest_failed"));
+        return false;
+      }
+      expected.snapshot_digest = expected_digest.value();
+      Result<ComponentLifecycleCurrentSnapshotDTO> current =
+          Result<ComponentLifecycleCurrentSnapshotDTO>::Err(
+              coordinator_error("component_lifecycle_snapshot_reread_failed",
+                                "the claimed component snapshot reread raised an exception",
+                                "claimed_snapshot_reread_exception"));
+      try {
+        current = current_snapshot_source_.ReadCurrentComponentSnapshot(
+            runtime->status.accepted_intent.controllable_component_id);
+      } catch (...) {
+      }
+      if (!current.ok() || current.value() != expected) {
+        auto error = coordinator_error(
+            "component_lifecycle_snapshot_changed_under_claim",
+            "the component changed before its claimed lifecycle effect",
+            "claimed_snapshot_mismatch");
+        if (!current.ok()) {
+          error.details.emplace("readback_error_code", current.error().code);
+        } else {
+          const auto &observed = current.value();
+          std::string mismatches;
+          const auto note = [&](const std::string_view name,
+                                const bool equal) {
+            if (equal) return;
+            if (!mismatches.empty()) mismatches.push_back(',');
+            mismatches.append(name);
+          };
+          note("component_id", expected.controllable_component_id ==
+                                   observed.controllable_component_id);
+          note("component_generation", expected.component_lifecycle_generation ==
+                                          observed.component_lifecycle_generation);
+          note("component_state", expected.component_lifecycle_state ==
+                                      observed.component_lifecycle_state);
+          note("active_publication", expected.active_publication_receipt ==
+                                         observed.active_publication_receipt);
+          note("domains", expected.domains == observed.domains);
+          note("provider_occurrences", expected.provider_occurrences ==
+                                           observed.provider_occurrences);
+          note("snapshot_digest", expected.snapshot_digest ==
+                                      observed.snapshot_digest);
+          error.details.emplace("mismatched_fields", std::move(mismatches));
+          error.details.emplace(
+              "expected_component_generation",
+              std::to_string(expected.component_lifecycle_generation.value()));
+          error.details.emplace(
+              "observed_component_generation",
+              std::to_string(observed.component_lifecycle_generation.value()));
+        }
+        FailBeforeEffect(runtime, std::move(error));
+        return false;
+      }
+    }
     // Close command eligibility before any adapter work. The held claim
     // already excludes commands; closing first makes every later failure
     // settle command-closed unless a verified result reopens it.
@@ -5840,7 +5925,8 @@ class ComponentLifecycleCoordinator::Impl final {
   }
 
   void Succeed(const std::shared_ptr<RuntimeState>& runtime) {
-    if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable) {
+    if (runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kDisable &&
+        runtime->status.disable_handoff.has_value()) {
       ScheduleDisableRelease(runtime);
       return;
     }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <exception>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <map>
 #include <set>
@@ -462,6 +463,175 @@ BuildVerifiedRuntimeConvergencePlan(
   return result;
 }
 
+manyforge::core::Result<void> VerifyNativeExecutionHostContinuity(
+    const RetainedBundle &predecessor, const RetainedBundle &candidate,
+    const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+        &artifact_source) {
+  using manyforge::core::ErrorDTO;
+  using manyforge::core::RuntimeUnitDTO;
+  using manyforge::deployment::native_execution_runtime_contract::
+      kRuntimeProfileId;
+
+  const auto reject = [](const std::string &expected_runtime_unit_id,
+                         const std::string &candidate_runtime_unit_id,
+                         const std::string &reason,
+                         const std::string &verification_detail = {}) {
+    const auto bounded_detail = verification_detail.substr(0U, 256U);
+    return manyforge::core::Result<void>::Err(ErrorDTO{
+        "native_execution_host_incompatible",
+        "candidate native execution host is incompatible with the current "
+        "host [expected_runtime_unit_id=" + expected_runtime_unit_id +
+            ", candidate_runtime_unit_id=" + candidate_runtime_unit_id +
+            ", reason=" + reason +
+            (bounded_detail.empty() ? std::string{} :
+                                      ", verification_detail=" +
+                                          bounded_detail) +
+            "]",
+        {{"expected_runtime_unit_id", expected_runtime_unit_id},
+         {"candidate_runtime_unit_id", candidate_runtime_unit_id},
+         {"reason", reason},
+         {"verification_detail", bounded_detail}}});
+  };
+  const auto is_native_host = [](const RuntimeUnitDTO &unit) {
+    return unit.runtime_profile_id.value() == kRuntimeProfileId;
+  };
+  const auto &predecessor_units = predecessor.value().cell_graph.runtime_units;
+  const auto &candidate_units = candidate.value().cell_graph.runtime_units;
+  std::vector<const RuntimeUnitDTO *> predecessor_hosts;
+  std::vector<const RuntimeUnitDTO *> candidate_hosts;
+  for (const auto &unit : predecessor_units) {
+    if (is_native_host(unit)) {
+      predecessor_hosts.push_back(&unit);
+    }
+  }
+  // Generic-runtime Apply paths retain their existing semantics. The stable
+  // host contract begins only after the current predecessor has one native
+  // execution host.
+  if (predecessor_hosts.empty()) {
+    return manyforge::core::Result<void>::Ok();
+  }
+  for (const auto &unit : candidate_units) {
+    if (is_native_host(unit)) {
+      candidate_hosts.push_back(&unit);
+    }
+  }
+
+  const auto expected_id = predecessor_hosts.front()->runtime_unit_id.value();
+  const RuntimeUnitDTO *candidate_for_error = nullptr;
+  const auto same_id = std::find_if(
+      candidate_units.begin(), candidate_units.end(), [&](const auto &unit) {
+        return unit.runtime_unit_id == predecessor_hosts.front()->runtime_unit_id;
+      });
+  if (same_id != candidate_units.end()) {
+    candidate_for_error = &*same_id;
+  } else if (!candidate_hosts.empty()) {
+    candidate_for_error = candidate_hosts.front();
+  }
+  const auto candidate_id = [&]() {
+    return candidate_for_error == nullptr
+               ? std::string("<missing>")
+               : candidate_for_error->runtime_unit_id.value();
+  };
+  if (predecessor.value().cell_graph.cell_id !=
+      candidate.value().cell_graph.cell_id) {
+    return reject(expected_id, candidate_id(), "cell_id_changed");
+  }
+  if (predecessor_hosts.size() != 1U) {
+    return reject(expected_id, candidate_id(),
+                  "predecessor_native_host_ambiguous");
+  }
+  if (candidate_hosts.size() != 1U) {
+    return reject(expected_id, candidate_id(),
+                  candidate_hosts.empty() ? "candidate_native_host_missing"
+                                           : "candidate_native_host_ambiguous");
+  }
+  const auto &expected = *predecessor_hosts.front();
+  const auto &actual = *candidate_hosts.front();
+  const auto actual_id = actual.runtime_unit_id.value();
+  if (expected.runtime_unit_id != actual.runtime_unit_id) {
+    return reject(expected_id, actual_id, "runtime_unit_id_changed");
+  }
+  if (expected.runtime_profile_id != actual.runtime_profile_id ||
+      expected.runtime_profile_revision != actual.runtime_profile_revision) {
+    return reject(expected_id, actual_id, "runtime_profile_changed");
+  }
+  if (expected.dependency_runtime_unit_ids !=
+      actual.dependency_runtime_unit_ids) {
+    return reject(expected_id, actual_id,
+                  "runtime_dependencies_changed");
+  }
+
+  std::optional<manyforge::deployment::VerifiedRetainedRuntimeUnitProduct>
+      expected_product;
+  std::optional<manyforge::deployment::VerifiedRetainedRuntimeUnitProduct>
+      candidate_product;
+  try {
+    expected_product = manyforge::deployment::verify_runtime_unit_product(
+        predecessor, expected.runtime_unit_id, artifact_source);
+    candidate_product = manyforge::deployment::verify_runtime_unit_product(
+        candidate, actual.runtime_unit_id, artifact_source);
+  } catch (const std::exception &error) {
+    return reject(expected_id, actual_id,
+                  "native_runtime_product_verification_failed", error.what());
+  } catch (...) {
+    return reject(expected_id, actual_id,
+                  "native_runtime_product_verification_failed");
+  }
+  if (!expected_product.has_value() || !candidate_product.has_value()) {
+    return reject(expected_id, actual_id,
+                  "native_runtime_product_missing");
+  }
+
+  const auto *expected_contract =
+      manyforge::deployment::runtime_contract_declaration_registry().find(
+          expected.runtime_profile_id, expected.runtime_profile_revision,
+          expected_product->product_contract_id(),
+          expected_product->product_contract_revision());
+  const auto *candidate_contract =
+      manyforge::deployment::runtime_contract_declaration_registry().find(
+          actual.runtime_profile_id, actual.runtime_profile_revision,
+          candidate_product->product_contract_id(),
+          candidate_product->product_contract_revision());
+  if (expected_contract == nullptr || candidate_contract == nullptr) {
+    return reject(expected_id, actual_id,
+                  "native_runtime_contract_offer_missing");
+  }
+
+  if (expected_product->product_id() != candidate_product->product_id() ||
+      expected_product->product_contract_id() !=
+          candidate_product->product_contract_id() ||
+      expected_product->product_contract_revision() !=
+          candidate_product->product_contract_revision()) {
+    return reject(expected_id, actual_id, "native_product_contract_changed");
+  }
+  // These are the exact identities SameChildProduct uses for adapter reuse.
+  // In the v2 native manifest they encode infrastructure-only product and
+  // configuration facts; controller configuration remains in the sealed
+  // graph and is deliberately not compared here.
+  if (expected_product->product_identity() !=
+      candidate_product->product_identity()) {
+    return reject(expected_id, actual_id, "native_product_identity_changed");
+  }
+  if (expected_product->configuration_identity() !=
+      candidate_product->configuration_identity()) {
+    return reject(expected_id, actual_id,
+                  "native_infrastructure_configuration_changed");
+  }
+  if (expected_product->process_adapter_contract_id() !=
+          candidate_product->process_adapter_contract_id() ||
+      expected_product->process_adapter_contract_revision() !=
+          candidate_product->process_adapter_contract_revision()) {
+    return reject(expected_id, actual_id,
+                  "native_process_adapter_contract_changed");
+  }
+  if (expected_contract->offer().offer_digest !=
+      candidate_contract->offer().offer_digest) {
+    return reject(expected_id, actual_id,
+                  "native_runtime_contract_offer_changed");
+  }
+  return manyforge::core::Result<void>::Ok();
+}
+
 ManagerRuntimeProcessEffectUncertainError::
     ManagerRuntimeProcessEffectUncertainError(
         std::string detail, RuntimeUnitConvergenceQueryDTO recovery_query)
@@ -537,6 +707,11 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
   std::lock_guard operation_lock(operation_mutex_);
 
   VerifyApplyInputs(apply_intent, predecessor, candidate);
+  const auto host_continuity = VerifyNativeExecutionHostContinuity(
+      predecessor, candidate, artifact_source_);
+  if (!host_continuity.ok()) {
+    Fail(host_continuity.error().message);
+  }
   const auto initial_publication = VerifyCurrentPredecessor(
       publication_reader_, apply_intent, predecessor_publication_generation);
   const auto predecessor_plans =
@@ -548,8 +723,9 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
   const auto dependency_order = DependencyOrder(runtime_plans);
 
   // The named Apply owner acquired and durably recorded the fence before
-  // stopping the predecessor. Reacquiring here would contact that stopped
-  // child, so convergence consumes only the verified journal evidence.
+  // candidate convergence. Planned maintenance closes command admission but
+  // keeps the shared host and retained component owners alive, allowing this
+  // stage to refresh candidate projections without restarting them.
   const auto status = apply_journal_.ReadStatus(
       apply_intent.apply_id, apply_intent.apply_generation);
   if (!status.has_value() || status->intent.intent != apply_intent ||

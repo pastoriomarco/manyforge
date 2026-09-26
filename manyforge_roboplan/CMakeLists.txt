@@ -196,13 +196,16 @@ target_link_libraries(manyforge_roboplan_native_lifecycle_product PUBLIC
   manyforge_deployment)
 
 add_library(manyforge_roboplan_native_gripper
-  src/retained_gripper_command_backend.cpp)
+  src/retained_gripper_command_backend.cpp
+  src/retained_native_gripper_runtime.cpp
+  src/retained_native_gripper_route_publication_owner.cpp)
 target_include_directories(manyforge_roboplan_native_gripper PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(manyforge_roboplan_native_gripper PUBLIC
   manyforge_roboplan_native_state_projection
-  manyforge_roboplan_native_runtime_support)
+  manyforge_roboplan_native_runtime_support
+  manyforge_deployment)
 
 add_library(manyforge_roboplan_native_focused_adapters
   src/retained_focused_adapters.cpp)
@@ -273,6 +276,7 @@ target_link_libraries(manyforge_roboplan_planner_backend PUBLIC
 
 add_library(manyforge_roboplan_native_runtime
   src/retained_native_runtime.cpp
+  src/retained_native_cell_runtime.cpp
   src/retained_stop_surveillance_owner.cpp)
 target_include_directories(manyforge_roboplan_native_runtime PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -678,6 +682,7 @@ if(BUILD_TESTING)
     target_link_libraries(test_retained_native_backends PRIVATE
       manyforge_roboplan_native_execution
       manyforge_roboplan_native_gripper
+      manyforge_roboplan_native_runtime
       GTest::gtest_main)
 
     if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
@@ -694,6 +699,11 @@ if(BUILD_TESTING)
     target_include_directories(test_retained_stop_surveillance_owner PRIVATE
       "${CMAKE_CURRENT_SOURCE_DIR}/test")
     target_link_libraries(test_retained_stop_surveillance_owner PRIVATE
+      manyforge_roboplan_native_runtime GTest::gtest_main)
+
+    add_executable(test_retained_native_cell_runtime
+      test/test_retained_native_cell_runtime.cpp)
+    target_link_libraries(test_retained_native_cell_runtime PRIVATE
       manyforge_roboplan_native_runtime GTest::gtest_main)
 
     add_executable(test_retained_native_controller_lifecycle_port
@@ -1042,6 +1052,33 @@ if(BUILD_TESTING)
     add_custom_target(generate_lite6_native_cclc_product_fixture ALL
       DEPENDS "${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_MANIFEST}")
 
+    # Managed component with a gripper command and no motion/planner binding.
+    set(_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/lite6_native_gripper_only_fixture")
+    set(_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST
+      "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}/manifest.json")
+    add_custom_command(
+      OUTPUT "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E rm -rf
+        "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+      COMMAND
+        "${CMAKE_COMMAND}" -E make_directory
+        "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+      COMMAND
+        "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
+        --output-root "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+        --fixture-kind gripper-only
+      DEPENDS
+        generate_lite6_native_execution_fixture_tool
+        manyforge_native_execution_host
+        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.srdf"
+        ${_MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(generate_lite6_native_gripper_only_fixture ALL
+      DEPENDS "${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_MANIFEST}")
+
     # Focused single-domain fixture for the CCLC repository-readiness test.
     # It exercises the ordinary retained product path without pulling the
     # application fixture's independent gripper domain into that unit test.
@@ -1073,6 +1110,30 @@ if(BUILD_TESTING)
       generate_lite6_native_cclc_readiness_fixture)
     target_compile_definitions(test_retained_native_cclc_runtime PRIVATE
       MANYFORGE_CCLC_READINESS_FIXTURE_ROOT="${_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT}")
+
+    # Same provider/controller catalog and host infrastructure as the ordinary
+    # fixture, with a new graph/bundle for projection candidate staging.
+    set(_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/lite6_native_projection_successor_fixture")
+    set(_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_MANIFEST
+      "${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT}/manifest.json")
+    add_custom_command(
+      OUTPUT "${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_MANIFEST}"
+      COMMAND "${CMAKE_COMMAND}" -E rm -rf
+        "${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT}"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT}"
+      COMMAND "$<TARGET_FILE:generate_lite6_native_execution_fixture_tool>"
+        --output-root "${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT}"
+        --fixture-kind projection-successor
+      DEPENDS
+        generate_lite6_native_execution_fixture_tool
+        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.urdf"
+        "${_MANYFORGE_ROBOPLAN_LITE6_FIXTURE_ROOT}/model.srdf"
+        ${_MANYFORGE_ROBOPLAN_LITE6_RESOURCE_INPUTS}
+      VERBATIM)
+    add_custom_target(generate_lite6_native_projection_successor_fixture ALL
+      DEPENDS "${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_MANIFEST}")
 
     add_executable(test_retained_product_consumer
       src/product_backed_runtime_participant_resolver.cpp
@@ -1116,18 +1177,26 @@ if(BUILD_TESTING)
       test/test_retained_native_runtime_unit_adapter.cpp)
     add_dependencies(test_retained_native_runtime_unit_adapter
       generate_lite6_native_execution_fixture
+      generate_lite6_native_cclc_readiness_fixture
+      generate_lite6_native_projection_successor_fixture
+      generate_lite6_native_gripper_only_fixture
       manyforge_native_execution_host
       manyforge_native_execution_host_projection_fixture
       manyforge_roboplan_candidate_worker)
     target_compile_definitions(
       test_retained_native_runtime_unit_adapter PRIVATE
       MANYFORGE_I6_NATIVE_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT}"
+      MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT="${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
+      MANYFORGE_CCLC_READINESS_FIXTURE_ROOT="${_MANYFORGE_CCLC_READINESS_FIXTURE_ROOT}"
+      MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT="${_MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT}"
       MANYFORGE_NATIVE_PICK_PLACE_PLANNING_TARGET="$<TARGET_FILE:manyforge_native_execution_host_pick_place_planning_fixture>"
       MANYFORGE_NATIVE_PROJECTION_TEST_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_native_execution_host_projection_fixture>"
       MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT="$<TARGET_FILE_DIR:manyforge_native_execution_host>")
     target_link_libraries(test_retained_native_runtime_unit_adapter PRIVATE
       manyforge_component_manager
       manyforge_deployment_verification_core
+      manyforge_scene
+      manyforge_roboplan_native_runtime
       GTest::gtest_main)
 
     # Pinocchio/coal/roboplan .so files live in cmeel.prefix/lib.
@@ -1211,6 +1280,10 @@ if(BUILD_TESTING)
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_retained_native_cell_runtime
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_retained_native_controller_lifecycle_port
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
@@ -1272,7 +1345,7 @@ if(BUILD_TESTING)
       native_addressed_execution_process
       PROPERTIES
         ENVIRONMENT
-          "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host_admission_fixture>;MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host>;MANYFORGE_NATIVE_PICK_PLACE_PLANNING_FIXTURE_HOST=$<TARGET_FILE:manyforge_native_execution_host_pick_place_planning_fixture>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_ROBOPLAN_FAKE_WORKER=$<TARGET_FILE:fake_process_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT}"
+          "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT};LD_LIBRARY_PATH=${_LIB_PATHS};MANYFORGE_NATIVE_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host_admission_fixture>;MANYFORGE_NATIVE_PRODUCTION_EXECUTION_HOST=$<TARGET_FILE:manyforge_native_execution_host>;MANYFORGE_NATIVE_PICK_PLACE_PLANNING_FIXTURE_HOST=$<TARGET_FILE:manyforge_native_execution_host_pick_place_planning_fixture>;MANYFORGE_ROBOPLAN_CANDIDATE_WORKER=$<TARGET_FILE:manyforge_roboplan_candidate_worker>;MANYFORGE_ROBOPLAN_FAKE_WORKER=$<TARGET_FILE:fake_process_candidate_worker>;MANYFORGE_I6_NATIVE_FIXTURE_ROOT=${_MANYFORGE_L07_NATIVE_CCLC_FIXTURE_ROOT};MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT=${_MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT}"
         # This process test intentionally executes many sequential, model-
         # limited trajectories. Keep its harness deadline independent from
         # the much shorter per-operation execution deadlines it verifies.

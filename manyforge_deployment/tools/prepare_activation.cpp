@@ -13,7 +13,9 @@
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/initial_scene_projection.hpp>
 #include <manyforge_deployment/prepared_activation_input.hpp>
+#include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
@@ -147,11 +149,15 @@ void materialize_activation(
     static_cast<void>(
         store.put_if_absent(closure.program, *closure.retained_bundle));
   }
-  {
+  if (closure.program_binding != nullptr) {
+    if (!closure.retained_model_map.has_value()) {
+      throw std::logic_error(
+          "prepared Program binding has no retained model map");
+    }
     deployment::FilesystemProgramBindingRepository store(activation_root);
     static_cast<void>(store.put_if_absent(
         closure.program_binding, *closure.retained_bundle,
-        closure.retained_model_map));
+        *closure.retained_model_map));
   }
 }
 
@@ -203,16 +209,6 @@ object(const deployment::CanonicalValue &value, std::string_view label) {
   return *result;
 }
 
-[[nodiscard]] const deployment::CanonicalValue::Array &
-array(const deployment::CanonicalValue &value, std::string_view label) {
-  const auto *result =
-      std::get_if<deployment::CanonicalValue::Array>(&value.storage());
-  if (result == nullptr) {
-    throw std::invalid_argument(std::string(label) + " must be an array");
-  }
-  return *result;
-}
-
 void require_exact_fields(const deployment::CanonicalValue &value,
                           std::initializer_list<std::string_view> expected,
                           std::string_view label) {
@@ -237,49 +233,6 @@ void require_exact_fields(const deployment::CanonicalValue &value,
     }
     throw std::logic_error("preparation field comparison is inconsistent");
   }
-}
-
-[[nodiscard]] core::ProgramRoleAssignmentDTO
-parse_assignment(const deployment::CanonicalValue &value) {
-  require_exact_fields(value, {"component_roles", "target_roles"},
-                       "program_role_assignment");
-  core::ProgramRoleAssignmentDTO result;
-  std::set<std::string, std::less<>> component_roles;
-  for (const auto &row :
-       array(member(value, "component_roles", "program_role_assignment"),
-             "program_role_assignment.component_roles")) {
-    require_exact_fields(row,
-                         {"component_role_id", "controllable_component_id"},
-                         "component role assignment");
-    const auto &role = text(member(row, "component_role_id", "component role"),
-                            "component_role_id");
-    const auto &component =
-        text(member(row, "controllable_component_id", "component role"),
-             "controllable_component_id");
-    if (!component_roles.insert(role).second) {
-      throw std::invalid_argument("duplicate component role assignment");
-    }
-    result.component_roles.push_back(
-        {core::ComponentRoleId(role),
-         core::ControllableComponentId(component)});
-  }
-  std::set<std::string, std::less<>> target_roles;
-  for (const auto &row :
-       array(member(value, "target_roles", "program_role_assignment"),
-             "program_role_assignment.target_roles")) {
-    require_exact_fields(row, {"target_role_id", "command_target_id"},
-                         "target role assignment");
-    const auto &role =
-        text(member(row, "target_role_id", "target role"), "target_role_id");
-    const auto &target = text(member(row, "command_target_id", "target role"),
-                              "command_target_id");
-    if (!target_roles.insert(role).second) {
-      throw std::invalid_argument("duplicate target role assignment");
-    }
-    result.target_roles.push_back(
-        {core::TargetRoleId(role), core::CommandTargetId(target)});
-  }
-  return result;
 }
 
 [[nodiscard]] deployment::ScenarioAssistantMode
@@ -310,67 +263,22 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   throw std::logic_error("unknown assistant mode");
 }
 
-[[nodiscard]] std::string base64_encode(const std::string_view bytes) {
-  static constexpr std::string_view alphabet =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::string result;
-  result.reserve(((bytes.size() + 2U) / 3U) * 4U);
-  for (std::size_t offset = 0U; offset < bytes.size(); offset += 3U) {
-    const auto first = static_cast<unsigned char>(bytes[offset]);
-    const bool has_second = offset + 1U < bytes.size();
-    const bool has_third = offset + 2U < bytes.size();
-    const auto second = has_second
-                            ? static_cast<unsigned char>(bytes[offset + 1U])
-                            : 0U;
-    const auto third = has_third
-                           ? static_cast<unsigned char>(bytes[offset + 2U])
-                           : 0U;
-    result.push_back(alphabet[first >> 2U]);
-    result.push_back(alphabet[((first & 0x03U) << 4U) | (second >> 4U)]);
-    result.push_back(has_second
-                         ? alphabet[((second & 0x0fU) << 2U) | (third >> 6U)]
-                         : '=');
-    result.push_back(has_third ? alphabet[third & 0x3fU] : '=');
-  }
-  return result;
-}
-
 [[nodiscard]] deployment::CanonicalValue artifact_payload(
-    std::vector<deployment::detail::PreparedActivationArtifact> artifacts) {
-  std::ranges::sort(artifacts, {}, [](const auto &artifact) {
-    return artifact.content_addressed_store_key.value();
-  });
-  deployment::CanonicalValue::Array rows;
+    const std::vector<deployment::detail::PreparedActivationArtifact> &artifacts) {
+  std::vector<deployment::PreparedActivationArtifact> rows;
   rows.reserve(artifacts.size());
-  constexpr std::size_t chunk_bytes = 192U * 1024U;
   for (const auto &artifact : artifacts) {
-    if (artifact.bytes.empty()) {
-      throw std::logic_error("prepared activation contains an empty artifact");
-    }
-    deployment::CanonicalValue::Array chunks;
-    for (std::size_t offset = 0U; offset < artifact.bytes.size();
-         offset += chunk_bytes) {
-      chunks.emplace_back(base64_encode(std::string_view(artifact.bytes).substr(
-          offset, std::min(chunk_bytes, artifact.bytes.size() - offset))));
-    }
-    rows.emplace_back(deployment::CanonicalValue::Object{
-        {"byte_size",
-         deployment::CanonicalValue(static_cast<double>(artifact.bytes.size()))},
-        {"chunks", deployment::CanonicalValue(std::move(chunks))},
-        {"content_addressed_store_key",
-         deployment::CanonicalValue(
-             artifact.content_addressed_store_key.value())},
-        {"content_digest",
-         deployment::CanonicalValue(artifact.content_digest.value())},
-        {"encoding", deployment::CanonicalValue("base64")},
-    });
+    rows.push_back({artifact.content_addressed_store_key,
+                    artifact.content_digest, artifact.bytes});
   }
-  return deployment::CanonicalValue(std::move(rows));
+  return deployment::prepared_activation_artifact_rows(std::move(rows));
 }
 
 [[nodiscard]] deployment::CanonicalValue prepare(const Options &options) {
   const auto request =
-      deployment::parse_strict_json_model_yaml(read_file(options.input));
+      deployment::parse_strict_json_model_yaml(
+          read_file(options.input),
+          deployment::kMaxActivationPreparationRequestBytes);
   const auto &root = request.root();
   require_exact_fields(root,
                        {"schema_version", "source_document_digest",
@@ -458,21 +366,60 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       program->normalized_program_root(), materialized.bundle->value(),
       materialized.deployment_compatibility, mode, overrides);
   const PreparedCatalogSource catalog_store(materialized.catalog_artifacts);
-  const auto binding = deployment::compile_program_binding(
-      *program, parse_assignment(assignment_value), *materialized.bundle,
+  // Bind the preserved authored Program to this candidate. A Program whose
+  // roles no longer resolve is prepared as explicitly non-executable (H1a);
+  // malformed input or unexpected failures still abort here.
+  auto outcome = deployment::compile_program_binding_outcome(
+      *program, deployment::parse_program_role_assignment(assignment_value), *materialized.bundle,
       materialized.model_map, catalog_store);
+  const auto &binding = outcome.binding;
   const auto reverified_program = deployment::verify_program_binding_contract(
       program->canonical_program_bytes(), *materialized.bundle);
-  const auto reverified_binding = deployment::reload_verified_program_binding(
-      binding->canonical_bytes(), *materialized.bundle, materialized.model_map);
-  if (reverified_program == nullptr || reverified_binding == nullptr ||
+  if (reverified_program == nullptr ||
       reverified_program->value().program_id != program->value().program_id ||
       reverified_program->value().program_revision !=
-          program->value().program_revision ||
-      reverified_binding->program_binding_id() !=
-          binding->program_binding_id()) {
+          program->value().program_revision) {
     throw std::logic_error(
-        "prepared Program or binding failed independent in-memory reload");
+        "prepared Program failed independent in-memory reload");
+  }
+  deployment::CanonicalValue program_outcome(nullptr);
+  deployment::CanonicalValue program_binding_payload(nullptr);
+  if (binding != nullptr) {
+    if (!materialized.model_map.has_value()) {
+      throw std::logic_error(
+          "prepared Program binding has no retained model map");
+    }
+    const auto reverified_binding = deployment::reload_verified_program_binding(
+        binding->canonical_bytes(), *materialized.bundle,
+        *materialized.model_map);
+    if (reverified_binding == nullptr ||
+        reverified_binding->program_binding_id() !=
+            binding->program_binding_id()) {
+      throw std::logic_error(
+          "prepared Program binding failed independent in-memory reload");
+    }
+    program_binding_payload = binding->normalized_root();
+    program_outcome = deployment::CanonicalValue(deployment::CanonicalValue::Object{
+        {"kind", deployment::CanonicalValue("bound")},
+        {"program_binding_id",
+         deployment::CanonicalValue(binding->program_binding_id().value())},
+    });
+  } else {
+    if (!outcome.non_executable.has_value()) {
+      throw std::logic_error("prepared Program has no typed outcome");
+    }
+    // Refuse rather than drop an authored Scene object that needs a binding.
+    static_cast<void>(deployment::project_resolved_initial_scene(
+        *program, *outcome.resolved_roles,
+        materialized.bundle->value().cell_graph.cell_id));
+    program_outcome = deployment::CanonicalValue(deployment::CanonicalValue::Object{
+        {"kind", deployment::CanonicalValue("non_executable")},
+        {"outcome",
+         deployment::parse_strict_json_model_yaml(
+             deployment::EncodeProgramNonExecutableOutcome(
+                 *outcome.non_executable))
+             .root()},
+    });
   }
   deployment::CanonicalValue::Object identity{
       {"activation_payload",
@@ -480,7 +427,8 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
            {"catalog_artifacts",
             artifact_payload(materialized.catalog_artifacts)},
            {"program", program->normalized_program_root()},
-           {"program_binding", binding->normalized_root()},
+           {"program_binding", std::move(program_binding_payload)},
+           {"program_role_assignment", assignment_value},
            {"raw_artifacts", artifact_payload(materialized.raw_artifacts)},
            {"retained_bundle", materialized.bundle->normalized_root()},
        })},
@@ -498,10 +446,9 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
        deployment::CanonicalValue(
            materialized.bundle->value()
                .catalogs.node_environment.environment_digest.value())},
-      {"program_binding_id",
-       deployment::CanonicalValue(binding->program_binding_id().value())},
       {"program_id",
        deployment::CanonicalValue(program->value().program_id.value())},
+      {"program_outcome", std::move(program_outcome)},
       {"program_revision",
        deployment::CanonicalValue(program->value().program_revision.value())},
       {"retained_bundle_id",
@@ -509,7 +456,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
            materialized.bundle->retained_bundle_id().value())},
       {"scenario_id", deployment::CanonicalValue(scenario_id)},
       {"schema_version",
-       deployment::CanonicalValue("manyforge.prepared_activation_input.v2")},
+       deployment::CanonicalValue("manyforge.prepared_activation_input.v3")},
       {"source_document_digest", deployment::CanonicalValue(source_digest)},
       {"typed_parameter_overrides", overrides},
   };
@@ -519,7 +466,14 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
                         deployment::CanonicalValue(prepared_id));
   const deployment::CanonicalValue result(std::move(identity));
   auto prepared = deployment::parse_prepared_activation_input(result);
+  // The recorded Program outcome must be exactly what recompilation yields.
+  deployment::verify_prepared_program_outcome(prepared);
   materialize_activation(prepared, options.activation_root);
+  // Publish the whole prepared value last, after everything it references:
+  // the Manager accepts an Apply only for a stored, reverified value.
+  static_cast<void>(
+      deployment::FilesystemPreparedActivationRepository(options.activation_root)
+          .put_if_absent(prepared));
   if (options.publish_canonical_empty) {
     if (materialized.canonical_empty_bundle == nullptr) {
       throw std::logic_error(

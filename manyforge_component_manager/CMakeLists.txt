@@ -235,10 +235,11 @@ target_link_libraries(manyforge_component_manager PRIVATE
   OpenSSL::Crypto
   SQLite::SQLite3
   manyforge::deployment_admission
-  manyforge::deployment_verification_core
   manyforge::persistence
   manyforge::scene_value_codec
 )
+target_link_libraries(manyforge_component_manager PUBLIC
+  manyforge::deployment_verification_core)
 get_target_property(
   MANYFORGE_COMPONENT_MANAGER_DIRECT_LINKS
   manyforge_component_manager
@@ -401,6 +402,48 @@ if(BUILD_TESTING)
 
   add_executable(test_manager_runtime_convergence_coordinator
     test/test_manager_runtime_convergence_coordinator.cpp)
+  # The native-host continuity regression uses a real retained Lite6 product.
+  # Prepare its model through the same importer as Deployment/RoboPlan tests.
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  get_filename_component(_MANYFORGE_MANAGER_DEPLOYMENT_ROOT
+    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}" REALPATH)
+  get_filename_component(_MANYFORGE_MANAGER_WORKSPACE_ROOT
+    "${_MANYFORGE_MANAGER_DEPLOYMENT_ROOT}/.." REALPATH)
+  set(_MANYFORGE_MANAGER_LITE6_SOURCE
+    "${_MANYFORGE_MANAGER_WORKSPACE_ROOT}/manyforge_example_models/models/lite6_lite_gripper")
+  set(_MANYFORGE_MANAGER_LITE6_FIXTURE
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural")
+  set(_MANYFORGE_MANAGER_MODEL_PREPARER
+    "${_MANYFORGE_MANAGER_DEPLOYMENT_ROOT}/tools/prepare_structural_model.py")
+  file(GLOB_RECURSE _MANYFORGE_MANAGER_LITE6_RESOURCES
+    CONFIGURE_DEPENDS LIST_DIRECTORIES false
+    "${_MANYFORGE_MANAGER_LITE6_SOURCE}/meshes/*")
+  file(MAKE_DIRECTORY "${_MANYFORGE_MANAGER_LITE6_FIXTURE}")
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${_MANYFORGE_MANAGER_MODEL_PREPARER}"
+      --urdf "${_MANYFORGE_MANAGER_LITE6_SOURCE}/lite6_lite_gripper.urdf"
+      --srdf "${_MANYFORGE_MANAGER_LITE6_SOURCE}/lite6_lite_gripper.srdf"
+      --model-asset-id lite6_lite_gripper
+      --accepted-package-uri-prefix "package://manyforge_example_models/models/lite6_lite_gripper/"
+      --resource-root "${_MANYFORGE_MANAGER_LITE6_SOURCE}"
+      --output-directory "${_MANYFORGE_MANAGER_LITE6_FIXTURE}"
+    RESULT_VARIABLE _MANYFORGE_MANAGER_MODEL_PREPARATION_RESULT
+    OUTPUT_VARIABLE _MANYFORGE_MANAGER_MODEL_PREPARATION_OUTPUT
+    ERROR_VARIABLE _MANYFORGE_MANAGER_MODEL_PREPARATION_ERROR)
+  if(NOT _MANYFORGE_MANAGER_MODEL_PREPARATION_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "Manager native-host fixture preparation failed:\n"
+      "${_MANYFORGE_MANAGER_MODEL_PREPARATION_OUTPUT}${_MANYFORGE_MANAGER_MODEL_PREPARATION_ERROR}")
+  endif()
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_MANYFORGE_MANAGER_MODEL_PREPARER}"
+    "${_MANYFORGE_MANAGER_WORKSPACE_ROOT}/manyforge_behavior/manyforge_behavior/model_source_preparation.py"
+    "${_MANYFORGE_MANAGER_LITE6_SOURCE}/lite6_lite_gripper.urdf"
+    "${_MANYFORGE_MANAGER_LITE6_SOURCE}/lite6_lite_gripper.srdf"
+    ${_MANYFORGE_MANAGER_LITE6_RESOURCES})
+  target_compile_definitions(test_manager_runtime_convergence_coordinator PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_MANAGER_LITE6_FIXTURE}"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_MANAGER_LITE6_SOURCE}")
   target_include_directories(
     test_manager_runtime_convergence_coordinator PRIVATE
     "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"

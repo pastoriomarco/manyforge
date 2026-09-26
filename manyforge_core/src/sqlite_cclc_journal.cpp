@@ -538,6 +538,20 @@ CREATE TABLE cclc_native_apply_reservations (
 ) STRICT;
 )sql";
 
+// v12: a native Apply plan records which components/routes it retains
+// unchanged and which predecessor components/domains it removes.
+constexpr std::string_view kNativeApplyDeltaSchemaUpgrade = R"sql(
+ALTER TABLE cclc_native_apply_plan_components ADD COLUMN retained INTEGER NOT NULL DEFAULT 0
+  CHECK (retained IN (0, 1));
+ALTER TABLE cclc_native_apply_plan_routes ADD COLUMN retained INTEGER NOT NULL DEFAULT 0
+  CHECK (retained IN (0, 1));
+CREATE TABLE cclc_native_apply_plan_removals (
+  removal_kind TEXT NOT NULL CHECK (removal_kind IN ('component', 'route')),
+  identity TEXT NOT NULL,
+  PRIMARY KEY(removal_kind, identity)
+) STRICT;
+)sql";
+
 [[nodiscard]] bool ValidCCLCClaimIntent(const CellAdmissionClaimIntentDTO& intent) {
   return ValidateCellAdmissionClaimIntent(intent).ok() &&
          intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner &&
@@ -615,6 +629,7 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
       if (version >= 7) Exec(expected, kProgramNodeSchemaUpgrade);
       if (version >= 10) Exec(expected, kRouteRecoverySchemaUpgrade);
       if (version >= 11) Exec(expected, kNativeApplySchemaUpgrade);
+      if (version >= 12) Exec(expected, kNativeApplyDeltaSchemaUpgrade);
       auto result = SchemaDefinitions(expected);
       const auto close_result = sqlite3_close(expected);
       if (close_result != SQLITE_OK) {
@@ -634,9 +649,11 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
   static const auto legacy = build(6);
   static const auto previous = build(9);
   static const auto previous_current = build(10);
-  static const auto current = build(11);
+  static const auto native_apply = build(11);
+  static const auto current = build(12);
   return version == 6 ? legacy : version < 10 ? previous
-                      : version == 10 ? previous_current : current;
+                      : version == 10 ? previous_current
+                      : version == 11 ? native_apply : current;
 }
 
 [[nodiscard]] const std::set<std::string>& ExpectedSchemaObjects() {
@@ -660,6 +677,7 @@ FROM cclc_request_memberships WHERE retained_result=1 AND rejection_blob IS NOT 
       "table:cclc_route_effect_attempts",
       "table:cclc_native_apply_adoptions",
       "table:cclc_native_apply_plan_components",
+      "table:cclc_native_apply_plan_removals",
       "table:cclc_native_apply_plan_routes",
       "table:cclc_native_apply_plans",
       "table:cclc_native_apply_reservations",
@@ -1479,6 +1497,9 @@ class SqliteCCLCJournal::Impl final {
   /// Highest generation already used or reserved for one identity.
   std::uint64_t NativeApplyGenerationFloorLocked(std::string_view kind,
                                                  std::string_view identity);
+  void RequireNativeApplyCapacityLocked(
+      const std::vector<ControllableComponentId>& components,
+      const std::vector<ControlDomainId>& domains);
   std::optional<NamedApplyPublicationTransactionDTO> ReadUnsettledNativeApplyPlanLocked();
   std::uint64_t ActiveTransactionCount() {
     return Nonnegative(
@@ -1548,6 +1569,7 @@ class SqliteCCLCJournal::Impl final {
       Exec(database_, kProgramNodeSchemaUpgrade);
       Exec(database_, kRouteRecoverySchemaUpgrade);
       Exec(database_, kNativeApplySchemaUpgrade);
+      Exec(database_, kNativeApplyDeltaSchemaUpgrade);
       Exec(database_, "PRAGMA application_id=" + std::to_string(kCCLCJournalSqliteApplicationId));
       Exec(database_, "PRAGMA user_version=" + std::to_string(kCCLCJournalSchemaVersion));
       Statement metadata(database_,
@@ -1618,6 +1640,24 @@ class SqliteCCLCJournal::Impl final {
       Exec(database_, kNativeApplySchemaUpgrade);
       Exec(database_, "UPDATE cclc_journal_metadata SET schema_version=11 WHERE singleton=1");
       Exec(database_, "PRAGMA user_version=11");
+    }
+    if (ScalarInteger(database_, "PRAGMA application_id") == kCCLCJournalSqliteApplicationId &&
+        ScalarInteger(database_, "PRAGMA user_version") == 11) {
+      Require(SchemaDefinitions(database_) == ExpectedSchemaDefinitions(11),
+              "component_lifecycle_journal_storage_foreign",
+              "predecessor native-Apply-delta CCLC schema is not exact");
+      Statement predecessor(database_,
+                            "SELECT schema_id,schema_version,cell_id "
+                            "FROM cclc_journal_metadata WHERE singleton=1");
+      Require(predecessor.Step() && predecessor.Text(0) == kCCLCJournalSchemaId &&
+                  predecessor.Integer(1) == 11 &&
+                  predecessor.Text(2) == cell_id_.value() && !predecessor.Step(),
+              "component_lifecycle_journal_storage_foreign",
+              "predecessor native-Apply-delta CCLC journal identity is not exact");
+      // Existing plans retained nothing and removed nothing explicitly.
+      Exec(database_, kNativeApplyDeltaSchemaUpgrade);
+      Exec(database_, "UPDATE cclc_journal_metadata SET schema_version=12 WHERE singleton=1");
+      Exec(database_, "PRAGMA user_version=12");
     }
     Require(SchemaObjectNames(database_) == ExpectedSchemaObjects() &&
                 SchemaDefinitions(database_) == ExpectedSchemaDefinitions(),
@@ -5204,6 +5244,34 @@ SqliteCCLCJournal::Impl::LoadCurrentActiveControlConfiguration(
   return configuration;
 }
 
+void SqliteCCLCJournal::Impl::RequireNativeApplyCapacityLocked(
+    const std::vector<ControllableComponentId>& components,
+    const std::vector<ControlDomainId>& domains) {
+  // Removed and abandoned identities retain generation history. Bound the
+  // complete durable namespace before reserving or adopting a new identity,
+  // not merely the number of components present in this candidate.
+  const auto check = [&](const auto& candidate, const std::string_view query,
+                          const std::size_t capacity) {
+    std::set<std::string> identities;
+    Statement rows(database_, query);
+    while (rows.Step()) identities.insert(rows.Text(0));
+    for (const auto& id : candidate) identities.insert(id.value());
+    Require(identities.size() <= capacity,
+            "component_lifecycle_journal_capacity_exhausted",
+            "native Apply exceeds the durable lifecycle or route identity capacity");
+  };
+  check(components,
+        "SELECT controllable_component_id FROM lifecycle_component_watermarks "
+        "UNION SELECT identity FROM cclc_native_apply_reservations "
+        "WHERE reservation_kind='component'",
+        kMaximumCCLCComponentWatermarks);
+  check(domains,
+        "SELECT control_domain_id FROM control_domain_active_configuration_watermarks "
+        "UNION SELECT identity FROM cclc_native_apply_reservations "
+        "WHERE reservation_kind='route'",
+        kMaximumCCLCActiveConfigurationWatermarks);
+}
+
 std::uint64_t SqliteCCLCJournal::Impl::NativeApplyGenerationFloorLocked(
     std::string_view kind, std::string_view identity) {
   const bool component = kind == "component";
@@ -5285,31 +5353,48 @@ std::optional<NativeApplyPlanDTO> SqliteCCLCJournal::Impl::ReadNativeApplyPlanLo
     return std::nullopt;
   }
   NativeApplyPlanDTO plan{apply, RetainedBundleId(header.Text(2)),
-                          GraphRevision(header.Text(3)), {}, {}};
+                          GraphRevision(header.Text(3)), {}, {}, {}, {}, {}, {}};
   Require(!header.Step(), "component_lifecycle_journal_corrupt",
           "native Apply plan header is duplicated");
   Statement components(database_,
                        "SELECT controllable_component_id,component_lifecycle_state,"
-                       "component_lifecycle_generation FROM cclc_native_apply_plan_components "
+                       "component_lifecycle_generation,retained "
+                       "FROM cclc_native_apply_plan_components "
                        "ORDER BY controllable_component_id");
   while (components.Step()) {
     const auto state = static_cast<ComponentLifecycleStateDTO>(components.Integer(1));
-    Require(state == ComponentLifecycleStateDTO::kActive ||
-                state == ComponentLifecycleStateDTO::kDisabled,
+    const bool retained = components.Integer(3) == 1;
+    // A changed component starts Active or keeps an explicit Disable; a
+    // retained one keeps whatever exact state it already had.
+    Require(retained ? !to_string(state).empty()
+                     : (state == ComponentLifecycleStateDTO::kActive ||
+                        state == ComponentLifecycleStateDTO::kDisabled),
             "component_lifecycle_journal_corrupt", "native Apply plan state is invalid");
     plan.components.push_back(
         {ControllableComponentId(components.Text(0)), state,
          ComponentLifecycleGeneration(
              Positive(components.Integer(2), "native Apply planned component generation"))});
+    if (retained) plan.retained_components.push_back(plan.components.back().component_id);
   }
   Statement routes(database_,
-                   "SELECT control_domain_id,active_control_configuration_generation "
+                   "SELECT control_domain_id,active_control_configuration_generation,retained "
                    "FROM cclc_native_apply_plan_routes ORDER BY control_domain_id");
   while (routes.Step()) {
     plan.routes.push_back(
         {ControlDomainId(routes.Text(0)),
          ActiveControlConfigurationGeneration(
              Positive(routes.Integer(1), "native Apply planned route generation"))});
+    if (routes.Integer(2) == 1) plan.retained_domains.push_back(plan.routes.back().control_domain_id);
+  }
+  Statement removals(database_,
+                     "SELECT removal_kind,identity FROM cclc_native_apply_plan_removals "
+                     "ORDER BY removal_kind,identity");
+  while (removals.Step()) {
+    if (removals.Text(0) == "component") {
+      plan.removed_components.emplace_back(removals.Text(1));
+    } else {
+      plan.removed_domains.emplace_back(removals.Text(1));
+    }
   }
   return plan;
 }
@@ -5319,18 +5404,37 @@ NativeApplyPlanDTO SqliteCCLCJournal::Impl::PlanNativeApply(
   Require(request.apply.valid() && !request.candidate_retained_bundle_id.empty() &&
               !request.candidate_graph_revision.empty() &&
               request.components.size() <= kMaximumCCLCComponentWatermarks &&
-              request.compiled_routes.size() <= kMaximumCCLCActiveConfigurationWatermarks,
+              request.removed_components.size() <= kMaximumCCLCComponentWatermarks &&
+              request.compiled_routes.size() <= kMaximumCCLCActiveConfigurationWatermarks &&
+              request.removed_domains.size() <= kMaximumCCLCActiveConfigurationWatermarks,
           "component_lifecycle_native_apply_invalid",
           "native Apply plan has an invalid Apply, candidate or scope");
-  auto components = request.components;
-  std::sort(components.begin(), components.end());
-  Require(std::adjacent_find(components.begin(), components.end()) == components.end() &&
-              std::all_of(components.begin(), components.end(),
-                          [](const auto& id) {
-                            return !id.empty() && id.value().size() <= kMaxLifecycleIdentityBytes;
-                          }),
+  const auto valid_identity = [](const auto& id) {
+    return !id.empty() && id.value().size() <= kMaxLifecycleIdentityBytes;
+  };
+  const auto sorted_unique = [](auto values) {
+    std::sort(values.begin(), values.end());
+    Require(std::adjacent_find(values.begin(), values.end()) == values.end(),
+            "component_lifecycle_native_apply_invalid",
+            "native Apply plan identities are duplicated");
+    return values;
+  };
+  auto components = sorted_unique(request.components);
+  const auto retained_components = sorted_unique(request.retained_components);
+  const auto removed_components = sorted_unique(request.removed_components);
+  const auto removed_domains = sorted_unique(request.removed_domains);
+  Require(std::all_of(components.begin(), components.end(), valid_identity) &&
+              std::all_of(removed_components.begin(), removed_components.end(),
+                          valid_identity) &&
+              std::all_of(removed_domains.begin(), removed_domains.end(), valid_identity) &&
+              std::includes(components.begin(), components.end(),
+                            retained_components.begin(), retained_components.end()) &&
+              std::none_of(removed_components.begin(), removed_components.end(),
+                           [&](const auto& id) {
+                             return std::binary_search(components.begin(), components.end(), id);
+                           }),
           "component_lifecycle_native_apply_invalid",
-          "native Apply plan components are invalid or duplicated");
+          "native Apply plan components are invalid, or retained/removed sets do not fit");
   auto compiled = request.compiled_routes;
   std::sort(compiled.begin(), compiled.end(), [](const auto& a, const auto& b) {
     return a.control_domain_id < b.control_domain_id;
@@ -5341,10 +5445,26 @@ NativeApplyPlanDTO SqliteCCLCJournal::Impl::PlanNativeApply(
                 compiled[index].generation.nonzero() &&
                 FitsSqliteInteger(compiled[index].generation.value()) &&
                 (index == 0U ||
-                 compiled[index - 1U].control_domain_id != compiled[index].control_domain_id),
+                 compiled[index - 1U].control_domain_id != compiled[index].control_domain_id) &&
+                !std::binary_search(removed_domains.begin(), removed_domains.end(),
+                                    compiled[index].control_domain_id),
             "component_lifecycle_native_apply_invalid",
-            "native Apply plan routes are invalid or duplicated");
+            "native Apply plan routes are invalid, duplicated or also removed");
   }
+  std::map<ControlDomainId, ActiveControlConfigurationDTO> retained_routes;
+  for (const auto& route : request.retained_routes) {
+    Require(route.locally_valid() &&
+                route.state == ActiveControlConfigurationStateDTO::kReconciled &&
+                std::any_of(compiled.begin(), compiled.end(),
+                            [&](const auto& row) {
+                              return row.control_domain_id == route.control_domain_id;
+                            }) &&
+                retained_routes.emplace(route.control_domain_id, route).second,
+            "component_lifecycle_native_apply_invalid",
+            "native Apply retained route is invalid, duplicated or not planned");
+  }
+  std::vector<ControlDomainId> retained_domains;
+  for (const auto& [domain, route] : retained_routes) retained_domains.push_back(domain);
 
   std::lock_guard lock(mutex_);
   RequireOpen();
@@ -5366,66 +5486,112 @@ NativeApplyPlanDTO SqliteCCLCJournal::Impl::PlanNativeApply(
       replay = true;
     }
   }
-  {
-    if (!replay) {
-      Require(ActiveTransactionCount() == 0U &&
-                  ScalarInteger(database_,
-                                "SELECT count(*) FROM cclc_lifecycle_cell_claims "
-                                "WHERE release_receipt_recorded=0") == 0,
-              "component_lifecycle_native_apply_unsettled",
-              "native Apply cannot be planned over unsettled CCLC work");
-      Exec(database_, "DELETE FROM cclc_native_apply_plan_components");
-      Exec(database_, "DELETE FROM cclc_native_apply_plan_routes");
-      Exec(database_, "DELETE FROM cclc_native_apply_plans");
-      Statement insert(database_,
-                       "INSERT INTO cclc_native_apply_plans(singleton,apply_id,apply_generation,"
-                       "candidate_bundle_id,candidate_graph_revision) VALUES(1,?,?,?,?)");
-      insert.Bind(1, request.apply.apply_id.value());
-      insert.Bind(2, static_cast<std::int64_t>(request.apply.apply_generation.value()));
-      insert.Bind(3, request.candidate_retained_bundle_id.value());
-      insert.Bind(4, request.candidate_graph_revision.value());
-      Require(!insert.Step(), "component_lifecycle_journal_corrupt",
-              "native Apply plan write returned a row");
-      const auto reserve = [&](std::string_view kind, std::string_view identity,
-                               std::uint64_t generation) {
-        Statement row(database_,
-                      "INSERT INTO cclc_native_apply_reservations("
-                      "reservation_kind,identity,generation) VALUES(?,?,?) "
-                      "ON CONFLICT(reservation_kind,identity) DO UPDATE SET "
-                      "generation=excluded.generation");
-        row.Bind(1, kind);
-        row.Bind(2, identity);
-        row.Bind(3, static_cast<std::int64_t>(generation));
-        Require(!row.Step(), "component_lifecycle_journal_corrupt",
-                "native Apply reservation write returned a row");
-      };
-      for (const auto& component : components) {
-        // Only an explicit, completed Disable is preserved; every other
-        // native component is enabled by the Apply.
-        auto state = ComponentLifecycleStateDTO::kActive;
+  if (!replay) {
+    Require(ActiveTransactionCount() == 0U &&
+                ScalarInteger(database_,
+                              "SELECT count(*) FROM cclc_lifecycle_cell_claims "
+                              "WHERE release_receipt_recorded=0") == 0,
+            "component_lifecycle_native_apply_unsettled",
+            "native Apply cannot be planned over unsettled CCLC work");
+    std::vector<ControlDomainId> domains;
+    for (const auto& route : compiled) domains.push_back(route.control_domain_id);
+    RequireNativeApplyCapacityLocked(components, domains);
+    Exec(database_, "DELETE FROM cclc_native_apply_plan_components");
+    Exec(database_, "DELETE FROM cclc_native_apply_plan_routes");
+    Exec(database_, "DELETE FROM cclc_native_apply_plan_removals");
+    Exec(database_, "DELETE FROM cclc_native_apply_plans");
+    Statement insert(database_,
+                     "INSERT INTO cclc_native_apply_plans(singleton,apply_id,apply_generation,"
+                     "candidate_bundle_id,candidate_graph_revision) VALUES(1,?,?,?,?)");
+    insert.Bind(1, request.apply.apply_id.value());
+    insert.Bind(2, static_cast<std::int64_t>(request.apply.apply_generation.value()));
+    insert.Bind(3, request.candidate_retained_bundle_id.value());
+    insert.Bind(4, request.candidate_graph_revision.value());
+    Require(!insert.Step(), "component_lifecycle_journal_corrupt",
+            "native Apply plan write returned a row");
+    const auto reserve = [&](std::string_view kind, std::string_view identity,
+                             std::uint64_t generation) {
+      Statement row(database_,
+                    "INSERT INTO cclc_native_apply_reservations("
+                    "reservation_kind,identity,generation) VALUES(?,?,?) "
+                    "ON CONFLICT(reservation_kind,identity) DO UPDATE SET "
+                    "generation=excluded.generation");
+      row.Bind(1, kind);
+      row.Bind(2, identity);
+      row.Bind(3, static_cast<std::int64_t>(generation));
+      Require(!row.Step(), "component_lifecycle_journal_corrupt",
+              "native Apply reservation write returned a row");
+    };
+    for (const auto& component : components) {
+      std::optional<std::pair<ComponentLifecycleStateDTO, std::uint64_t>> current_fact;
+      {
         Statement current(database_,
-                          "SELECT component_lifecycle_state FROM lifecycle_component_current_facts "
+                          "SELECT component_lifecycle_state,component_lifecycle_generation "
+                          "FROM lifecycle_component_current_facts "
                           "WHERE controllable_component_id=?");
         current.Bind(1, component.value());
-        if (current.Step() && static_cast<ComponentLifecycleStateDTO>(current.Integer(0)) ==
-                                  ComponentLifecycleStateDTO::kDisabled) {
+        if (current.Step()) {
+          current_fact.emplace(static_cast<ComponentLifecycleStateDTO>(current.Integer(0)),
+                               Positive(current.Integer(1), "current component generation"));
+        }
+      }
+      const bool retained =
+          std::binary_search(retained_components.begin(), retained_components.end(), component);
+      auto state = ComponentLifecycleStateDTO::kActive;
+      std::uint64_t generation = 0U;
+      if (retained) {
+        // The retained runtime keeps its exact lifecycle fact. A component
+        // with no coherent current state (e.g. after a settled partial
+        // effect) cannot be retained: that needs restoration, not reuse.
+        Require(current_fact.has_value(), "component_lifecycle_native_apply_retained_fact_missing",
+                "native Apply retains " + component.value() +
+                    " but it has no coherent current lifecycle state");
+        state = current_fact->first;
+        generation = current_fact->second;
+      } else {
+        // Only an explicit, completed Disable is preserved; every other
+        // changed native component is enabled by the Apply.
+        if (current_fact.has_value() &&
+            current_fact->first == ComponentLifecycleStateDTO::kDisabled) {
           state = ComponentLifecycleStateDTO::kDisabled;
         }
         const auto floor = NativeApplyGenerationFloorLocked("component", component.value());
         Require(FitsSqliteInteger(floor + 1U),
                 "component_lifecycle_native_apply_generation_exhausted",
                 "native Apply component generation cannot advance");
-        reserve("component", component.value(), floor + 1U);
-        Statement row(database_,
-                      "INSERT INTO cclc_native_apply_plan_components(controllable_component_id,"
-                      "component_lifecycle_state,component_lifecycle_generation) VALUES(?,?,?)");
-        row.Bind(1, component.value());
-        row.Bind(2, static_cast<std::int64_t>(state));
-        row.Bind(3, static_cast<std::int64_t>(floor + 1U));
-        Require(!row.Step(), "component_lifecycle_journal_corrupt",
-                "native Apply plan component write returned a row");
+        generation = floor + 1U;
+        reserve("component", component.value(), generation);
       }
-      for (const auto& route : compiled) {
+      Statement row(database_,
+                    "INSERT INTO cclc_native_apply_plan_components(controllable_component_id,"
+                    "component_lifecycle_state,component_lifecycle_generation,retained) "
+                    "VALUES(?,?,?,?)");
+      row.Bind(1, component.value());
+      row.Bind(2, static_cast<std::int64_t>(state));
+      row.Bind(3, static_cast<std::int64_t>(generation));
+      row.Bind(4, static_cast<std::int64_t>(retained ? 1 : 0));
+      Require(!row.Step(), "component_lifecycle_journal_corrupt",
+              "native Apply plan component write returned a row");
+    }
+    for (const auto& route : compiled) {
+      std::uint64_t generation = 0U;
+      const auto retained = retained_routes.find(route.control_domain_id);
+      if (retained != retained_routes.end()) {
+        // The live route the host keeps must be exactly the journal's
+        // current fact; retaining it mints and reserves nothing.
+        Statement current(database_,
+                          "SELECT configuration_blob FROM control_domain_active_configurations "
+                          "WHERE control_domain_id=?");
+        current.Bind(1, route.control_domain_id.value());
+        Require(current.Step() &&
+                    detail::DecodeActiveControlConfiguration(current.Blob(0)) ==
+                        retained->second &&
+                    !current.Step(),
+                "component_lifecycle_native_apply_retained_route_mismatch",
+                "native Apply retained route " + route.control_domain_id.value() +
+                    " differs from the journal's current configuration");
+        generation = retained->second.active_control_configuration_generation.value();
+      } else {
         const auto floor = NativeApplyGenerationFloorLocked(
             "route", route.control_domain_id.value());
         Require(FitsSqliteInteger(floor + 1U),
@@ -5433,18 +5599,32 @@ NativeApplyPlanDTO SqliteCCLCJournal::Impl::PlanNativeApply(
                 "native Apply route generation cannot advance");
         // First publication keeps the compiled generation; afterwards the
         // route continues past every used or reserved generation.
-        const auto generation =
+        generation =
             floor == 0U ? route.generation.value() : std::max(route.generation.value(), floor + 1U);
         reserve("route", route.control_domain_id.value(), generation);
-        Statement row(database_,
-                      "INSERT INTO cclc_native_apply_plan_routes(control_domain_id,"
-                      "active_control_configuration_generation) VALUES(?,?)");
-        row.Bind(1, route.control_domain_id.value());
-        row.Bind(2, static_cast<std::int64_t>(generation));
-        Require(!row.Step(), "component_lifecycle_journal_corrupt",
-                "native Apply plan route write returned a row");
       }
+      Statement row(database_,
+                    "INSERT INTO cclc_native_apply_plan_routes(control_domain_id,"
+                    "active_control_configuration_generation,retained) VALUES(?,?,?)");
+      row.Bind(1, route.control_domain_id.value());
+      row.Bind(2, static_cast<std::int64_t>(generation));
+      row.Bind(3, static_cast<std::int64_t>(retained != retained_routes.end() ? 1 : 0));
+      Require(!row.Step(), "component_lifecycle_journal_corrupt",
+              "native Apply plan route write returned a row");
     }
+    const auto record_removal = [&](std::string_view kind, std::string_view identity) {
+      Statement row(database_,
+                    "INSERT INTO cclc_native_apply_plan_removals(removal_kind,identity) "
+                    "VALUES(?,?)");
+      row.Bind(1, kind);
+      row.Bind(2, identity);
+      Require(!row.Step(), "component_lifecycle_journal_corrupt",
+              "native Apply plan removal write returned a row");
+    };
+    for (const auto& component : removed_components) {
+      record_removal("component", component.value());
+    }
+    for (const auto& domain : removed_domains) record_removal("route", domain.value());
   }
   auto plan = ReadNativeApplyPlanLocked(request.apply);
   Require(plan.has_value(), "component_lifecycle_journal_corrupt",
@@ -5455,9 +5635,13 @@ NativeApplyPlanDTO SqliteCCLCJournal::Impl::PlanNativeApply(
   for (const auto& route : compiled) requested_domains.push_back(route.control_domain_id);
   std::vector<ControllableComponentId> planned_components;
   for (const auto& component : plan->components) planned_components.push_back(component.component_id);
-  Require(planned_domains == requested_domains && planned_components == components,
+  Require(planned_domains == requested_domains && planned_components == components &&
+              plan->retained_components == retained_components &&
+              plan->retained_domains == retained_domains &&
+              plan->removed_components == removed_components &&
+              plan->removed_domains == removed_domains,
           "component_lifecycle_native_apply_conflict",
-          "native Apply replay names another component or route scope");
+          "native Apply replay names another component, route, retained or removed scope");
   transaction.Commit();
   return *plan;
 }
@@ -5499,9 +5683,9 @@ void SqliteCCLCJournal::Impl::AdoptNativeApplyFacts(
   append(adoption.publication.request.candidate_graph_revision.value());
   for (std::size_t index = 0U; index < components.size(); ++index) {
     const auto& component = components[index];
-    Require(!component.component_id.empty() &&
-                (component.state == ComponentLifecycleStateDTO::kActive ||
-                 component.state == ComponentLifecycleStateDTO::kDisabled) &&
+    // The recorded plan fixes each state (a retained component may keep any
+    // known state); here only the shape is checked.
+    Require(!component.component_id.empty() && !to_string(component.state).empty() &&
                 component.generation.nonzero() &&
                 FitsSqliteInteger(component.generation.value()) &&
                 (index == 0U || components[index - 1U].component_id != component.component_id),
@@ -5581,13 +5765,23 @@ void SqliteCCLCJournal::Impl::AdoptNativeApplyFacts(
                   "WHERE release_receipt_recorded=0") == 0,
           "component_lifecycle_native_apply_unsettled",
           "native Apply cannot replace unsettled CCLC facts");
+  std::vector<ControllableComponentId> component_ids;
+  for (const auto& component : components) component_ids.push_back(component.component_id);
+  std::vector<ControlDomainId> domain_ids;
+  for (const auto& route : routes) domain_ids.push_back(route.control_domain_id);
+  RequireNativeApplyCapacityLocked(component_ids, domain_ids);
 
-  Exec(database_, "DELETE FROM lifecycle_component_current_facts");
-  Exec(database_, "DELETE FROM control_domain_active_configurations");
-  const auto advance = [&](std::string_view kind, std::string_view identity,
-                           std::uint64_t generation) {
-    // The planned generation is above every earlier one; the watermark and
-    // current fact move to it together, and its reservation is released.
+  // Retained facts stay exactly as they are; changed facts advance; every
+  // other current fact (removed or no longer native) is erased while its
+  // watermark stays, so a later re-add always mints a newer generation.
+  const auto retained_component = [&](const ControllableComponentId& id) {
+    return std::binary_search(plan->retained_components.begin(),
+                              plan->retained_components.end(), id);
+  };
+  const auto retained_domain = [&](const ControlDomainId& id) {
+    return std::binary_search(plan->retained_domains.begin(), plan->retained_domains.end(), id);
+  };
+  const auto watermark_of = [&](std::string_view kind, std::string_view identity) {
     Statement old(database_,
                   kind == "component"
                       ? "SELECT component_lifecycle_generation FROM "
@@ -5597,7 +5791,15 @@ void SqliteCCLCJournal::Impl::AdoptNativeApplyFacts(
                         "WHERE control_domain_id=?");
     old.Bind(1, identity);
     const auto previous = old.Step() ? Positive(old.Integer(0), "native Apply watermark") : 0U;
-    Require(!old.Step() && previous < generation,
+    Require(!old.Step(), "component_lifecycle_journal_corrupt",
+            "native Apply watermark is duplicated");
+    return previous;
+  };
+  const auto advance = [&](std::string_view kind, std::string_view identity,
+                           std::uint64_t generation) {
+    // The planned generation is above every earlier one; the watermark and
+    // current fact move to it together, and its reservation is released.
+    Require(watermark_of(kind, identity) < generation,
             "component_lifecycle_native_apply_generation_stale",
             "native Apply planned generation is no longer above the journal watermark");
     Statement watermark(database_,
@@ -5624,12 +5826,91 @@ void SqliteCCLCJournal::Impl::AdoptNativeApplyFacts(
     Require(!release.Step(), "component_lifecycle_journal_corrupt",
             "native Apply reservation release returned a row");
   };
+
+  // Verify every retained fact before any write: the plan retained exactly
+  // what was current then, and nothing may have changed it since.
   for (const auto& component : components) {
+    if (!retained_component(component.component_id)) continue;
+    Statement current(database_,
+                      "SELECT component_lifecycle_state,component_lifecycle_generation "
+                      "FROM lifecycle_component_current_facts WHERE controllable_component_id=?");
+    current.Bind(1, component.component_id.value());
+    Require(current.Step() &&
+                static_cast<ComponentLifecycleStateDTO>(current.Integer(0)) == component.state &&
+                Positive(current.Integer(1), "retained component generation") ==
+                    component.generation.value() &&
+                !current.Step() &&
+                watermark_of("component", component.component_id.value()) ==
+                    component.generation.value(),
+            "component_lifecycle_native_apply_retained_fact_changed",
+            "native Apply retained component " + component.component_id.value() +
+                " no longer has its planned fact");
+  }
+  for (const auto& route : routes) {
+    if (!retained_domain(route.control_domain_id)) continue;
+    Statement current(database_,
+                      "SELECT configuration_blob FROM control_domain_active_configurations "
+                      "WHERE control_domain_id=?");
+    current.Bind(1, route.control_domain_id.value());
+    Require(current.Step() && detail::DecodeActiveControlConfiguration(current.Blob(0)) == route &&
+                !current.Step(),
+            "component_lifecycle_native_apply_retained_fact_changed",
+            "native Apply retained route " + route.control_domain_id.value() +
+                " is not the journal's current configuration");
+  }
+
+  // Erase current facts outside the planned sets (removed components and
+  // domains, or ones no longer native) without touching their watermarks.
+  {
+    std::vector<std::string> stale;
+    Statement current(database_,
+                      "SELECT controllable_component_id FROM lifecycle_component_current_facts");
+    while (current.Step()) {
+      const ControllableComponentId id(current.Text(0));
+      if (std::none_of(components.begin(), components.end(),
+                       [&](const auto& row) { return row.component_id == id; })) {
+        stale.push_back(id.value());
+      }
+    }
+    for (const auto& id : stale) {
+      Statement erase(database_,
+                      "DELETE FROM lifecycle_component_current_facts "
+                      "WHERE controllable_component_id=?");
+      erase.Bind(1, id);
+      Require(!erase.Step(), "component_lifecycle_journal_corrupt",
+              "native Apply component fact removal returned a row");
+    }
+  }
+  {
+    std::vector<std::string> stale;
+    Statement current(database_,
+                      "SELECT control_domain_id FROM control_domain_active_configurations");
+    while (current.Step()) {
+      const ControlDomainId id(current.Text(0));
+      if (std::none_of(routes.begin(), routes.end(),
+                       [&](const auto& row) { return row.control_domain_id == id; })) {
+        stale.push_back(id.value());
+      }
+    }
+    for (const auto& id : stale) {
+      Statement erase(database_,
+                      "DELETE FROM control_domain_active_configurations WHERE control_domain_id=?");
+      erase.Bind(1, id);
+      Require(!erase.Step(), "component_lifecycle_journal_corrupt",
+              "native Apply route fact removal returned a row");
+    }
+  }
+
+  for (const auto& component : components) {
+    if (retained_component(component.component_id)) continue;
     advance("component", component.component_id.value(), component.generation.value());
     Statement current(database_,
         "INSERT INTO lifecycle_component_current_facts("
         "controllable_component_id,component_lifecycle_generation,"
-        "component_lifecycle_state) VALUES(?,?,?)");
+        "component_lifecycle_state) VALUES(?,?,?) "
+        "ON CONFLICT(controllable_component_id) DO UPDATE SET "
+        "component_lifecycle_generation=excluded.component_lifecycle_generation,"
+        "component_lifecycle_state=excluded.component_lifecycle_state");
     current.Bind(1, component.component_id.value());
     current.Bind(2, static_cast<std::int64_t>(component.generation.value()));
     current.Bind(3, static_cast<std::int64_t>(component.state));
@@ -5637,6 +5918,7 @@ void SqliteCCLCJournal::Impl::AdoptNativeApplyFacts(
             "native Apply component fact write returned a row");
   }
   for (const auto& route : routes) {
+    if (retained_domain(route.control_domain_id)) continue;
     advance("route", route.control_domain_id.value(),
             route.active_control_configuration_generation.value());
     Statement current(database_,
@@ -5644,7 +5926,13 @@ void SqliteCCLCJournal::Impl::AdoptNativeApplyFacts(
         "control_domain_id,active_control_configuration_generation,"
         "origin_route_selection_transaction_id,"
         "origin_route_selection_transaction_generation,configuration_blob) "
-        "VALUES(?,?,NULL,NULL,?)");
+        "VALUES(?,?,NULL,NULL,?) "
+        "ON CONFLICT(control_domain_id) DO UPDATE SET "
+        "active_control_configuration_generation="
+        "excluded.active_control_configuration_generation,"
+        "origin_route_selection_transaction_id=NULL,"
+        "origin_route_selection_transaction_generation=NULL,"
+        "configuration_blob=excluded.configuration_blob");
     current.Bind(1, route.control_domain_id.value());
     current.Bind(2, static_cast<std::int64_t>(
                         route.active_control_configuration_generation.value()));

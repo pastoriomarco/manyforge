@@ -21,6 +21,8 @@ struct ComponentLifecycleAdmissionCandidate final {
   /// first-admission seed. Caller expectations never populate this field.
   ComponentLifecycleGeneration durable_component_generation_predecessor;
   std::int64_t accepted_at_ns;
+  /// Legacy bounded value retained in the admission DTO/codec; ordinary
+  /// Disable uses the selected provider plan timeout, not a Stop handoff.
   std::int64_t containment_only_disable_timeout_duration_ns;
   std::optional<ComponentLifecycleCurrentSnapshotDTO> current_snapshot;
   std::vector<BrandLifecyclePlanCatalogDTO> lifecycle_plan_catalogs;
@@ -32,19 +34,18 @@ struct PreparedComponentLifecycleAdmission final {
   ComponentLifecycleAcceptedDTO acceptance;
   ComponentLifecycleStatusDTO initial_status;
   std::vector<ControlDomainId> reserved_control_domains;
-  /// Present only when the complete exact provider-catalog closure was
-  /// qualified for this accepted intent.  Containment-only Disable admission
-  /// deliberately carries no executable vendor plan.
+  /// Present when the complete exact provider-catalog closure was qualified
+  /// for this accepted ordinary lifecycle intent.
   std::optional<std::vector<BrandLifecyclePlanCatalogDTO>> qualified_lifecycle_plan_catalogs;
-  /// True only when the accepted request's original component scope and
-  /// caller expectations permit vendor lifecycle mutation after a ready
-  /// Kernel handoff.  The exact provider/catalog closure is independently
-  /// requalified under that fence; it may have been unavailable at admission.
+  /// True when the current component snapshot and exact provider/catalog
+  /// closure permit mutation under the ordinary idle lifecycle claim.
   bool lifecycle_mutation_eligible;
+  /// Retained only for decoding pre-cutover Stop-bearing Disable records;
+  /// fresh admissions never carry a Kernel Stop handoff.
   std::optional<DisableHandoffAdmissionSnapshotDTO> disable_handoff_admission;
 };
 
-/// Derive the exact component-shaped read-only Kernel admission expectation.
+/// Derive the historical Stop-handoff expectation for read-only recovery.
 [[nodiscard]] Result<DisableHandoffComponentScopeExpectationDTO>
 BuildDisableHandoffComponentScopeExpectation(const ComponentLifecycleCurrentSnapshotDTO& snapshot);
 

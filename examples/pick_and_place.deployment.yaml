@@ -5,12 +5,12 @@
       "capability_definition_revision": "sha256:59cfd352c4a08e315f95c2cb93ada8d2a16a6d2155f83b1c7603e9643088f73b",
       "capability_id": "collision.query.detailed",
       "capability_provider_binding_id": "ur5_pick_place_cell.collision-query-detailed.provider",
-      "capability_provider_binding_revision": "sha256:9603d3f5df1c1f82cf1cd46ef8b01a4fcfd5b730ac67b98885fc5dcb3bc8d0d9",
+      "capability_provider_binding_revision": "sha256:14780a6d51f88e03118191ad6c01764d7a415ac643f6d18a4c076c24c1a9e74f",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -26,12 +26,12 @@
       "capability_definition_revision": "sha256:c45cdcea2f79fbef5d1bc95db064078560c7d5d161b72667a5ce2c72a7432eca",
       "capability_id": "collision.query.pre_execution",
       "capability_provider_binding_id": "ur5_pick_place_cell.collision-query-pre_execution.provider",
-      "capability_provider_binding_revision": "sha256:602c6461df578a3877d7f73191829647ab8eb091a9f9c6fba659cc61b349f720",
+      "capability_provider_binding_revision": "sha256:a255dce7aaafcd85081b7620eb287718d7310150d88d4de5c33b84bc1941708c",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -47,12 +47,12 @@
       "capability_definition_revision": "sha256:aa079df5821ad6ad0fdfc15f15368ca6682cd17dd1c804998e4e954fe1979180",
       "capability_id": "observability.trace.scene",
       "capability_provider_binding_id": "ur5_pick_place_cell.observability-trace-scene.provider",
-      "capability_provider_binding_revision": "sha256:741c4ac9e0fc5d3935ad4fac70e56853f5e1cc327bafb89834d519cb5f74d9ff",
+      "capability_provider_binding_revision": "sha256:09a26671af961bac14ba96e4ea0450101179542a22762a3daa7ce1c31064e7a9",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -68,12 +68,12 @@
       "capability_definition_revision": "sha256:9f7fbd7203abe565edfb6468d9e52fa15c028f3636615eb62a8d5e8e0c84fea5",
       "capability_id": "scene.edit.add",
       "capability_provider_binding_id": "ur5_pick_place_cell.scene-edit-add.provider",
-      "capability_provider_binding_revision": "sha256:38309816e23c04ad0ab9ec0720332305f4bc8f2e6d3ec51b8fee3ed9392d0b97",
+      "capability_provider_binding_revision": "sha256:2cd5af88d0a209f1641ae8ba49f91004eda59619322c2446e7d7c385db92ed0b",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -89,12 +89,12 @@
       "capability_definition_revision": "sha256:444c80303025e78b49df614d71c7df35d0f40867cb0901a8bd0117e65d50eed2",
       "capability_id": "scene.edit.attach_detach",
       "capability_provider_binding_id": "ur5_pick_place_cell.scene-edit-attach_detach.provider",
-      "capability_provider_binding_revision": "sha256:741b5ca4ccc4c94a956735aab411ff32da80a7118add869191198ea70e9d5e69",
+      "capability_provider_binding_revision": "sha256:650087ae68299dddb1d755d24f12c831292ecec1d497b20b1f1dead57cd2ab8b",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -110,12 +110,12 @@
       "capability_definition_revision": "sha256:c19f72293c0b9f54b24e8f165b27112e3ad8496e1d319f0d20d74b7eee6951bc",
       "capability_id": "scene.edit.remove",
       "capability_provider_binding_id": "ur5_pick_place_cell.scene-edit-remove.provider",
-      "capability_provider_binding_revision": "sha256:154de67af56007e4689e4d14afedd0d3334175a9f8344c21f4776662d7094ebd",
+      "capability_provider_binding_revision": "sha256:fd0ec9d7ce4849156a636fe9c18510c14089ec51e244b2c96cd7486ed2e848ec",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -131,12 +131,12 @@
       "capability_definition_revision": "sha256:2289472ab0392c94e512d8bfe65406ef7a7ffafb73b40381bd36f627248de4f3",
       "capability_id": "scene.edit.update_pose",
       "capability_provider_binding_id": "ur5_pick_place_cell.scene-edit-update_pose.provider",
-      "capability_provider_binding_revision": "sha256:e73825a957adfd91c5c3894221014a4e6bec8b1e58c8caae4ca9003c59b7f4ec",
+      "capability_provider_binding_revision": "sha256:c84689d7b3097e882870cb8024fb5ffe54bf498ad9ab418f03e90c810e70a1b2",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -152,12 +152,12 @@
       "capability_definition_revision": "sha256:01668536a12a75af7024ce6dd1248ce5fd18f25f75d1fadfb953b4b7da0ed1f2",
       "capability_id": "scene.edit.upsert",
       "capability_provider_binding_id": "ur5_pick_place_cell.scene-edit-upsert.provider",
-      "capability_provider_binding_revision": "sha256:4ebb3e422ac5dc37bd18eea13dbe5f96cb68bbbe5d26c5802b71e584b5761b18",
+      "capability_provider_binding_revision": "sha256:abe18049fdcd95d2f68916d2cd5632ab54645edae9f3e3b8b43ab695d40737af",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -173,12 +173,12 @@
       "capability_definition_revision": "sha256:59bad10b1c6eea73c493dbba88cf15befe3345d32bbebd0b7c7fce4947531109",
       "capability_id": "scene.object.query",
       "capability_provider_binding_id": "ur5_pick_place_cell.scene-object-query.provider",
-      "capability_provider_binding_revision": "sha256:489424bd1e8b956b0ab038246f2b5075157adc798f98dc4d7e119bdc8826c9d3",
+      "capability_provider_binding_revision": "sha256:d627b42b4ff63e5bee68539d9173338109e5eb1231afeb00ba62f68fcf0dfb83",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -194,12 +194,12 @@
       "capability_definition_revision": "sha256:4f66fab4656567598a11844b3b2572112b5239d9eaca4a538f90e082db7154d9",
       "capability_id": "scene.reference.resolve",
       "capability_provider_binding_id": "ur5_pick_place_cell.scene-reference-resolve.provider",
-      "capability_provider_binding_revision": "sha256:7371de6421a61d9d44691491673674e939c0e7bfcb513050c06f5f4faa12c9c6",
+      "capability_provider_binding_revision": "sha256:3824ee7ce41788ea25ab85d508147a1d055ffc6deeba472a4a16b0e32ca21fa7",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -215,12 +215,12 @@
       "capability_definition_revision": "sha256:76e9a3ca351e30e271ec75e3b6de1ea42a718f81cca35cda6bab4ee642e1e12d",
       "capability_id": "scene.shape.box",
       "capability_provider_binding_id": "ur5_pick_place_cell.scene-shape-box.provider",
-      "capability_provider_binding_revision": "sha256:a6c08d2da62e31d4c4da6772754b3e2e2774ab8c99890452c9d7d3aaef8040b6",
+      "capability_provider_binding_revision": "sha256:0b79b8597780a4ccf3fe3e29b30e5ab9b1bafeeea00ad0fb009ae0b02ed7f9a5",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -236,12 +236,12 @@
       "capability_definition_revision": "sha256:4ffc860d1851db9b3a7fd82f5e9bd88eb1eca624dba372852fb2912fab9e34d5",
       "capability_id": "scene.shape.cylinder",
       "capability_provider_binding_id": "ur5_pick_place_cell.scene-shape-cylinder.provider",
-      "capability_provider_binding_revision": "sha256:97901ab74c1c5df2580cb32e4bcc1abdc07e0fc0ab811c3836d1bb255e81ef26",
+      "capability_provider_binding_revision": "sha256:c871b3d93924b7a7035f801304d710fa9b4057269d0a36f95c9b7bd8045a41b2",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -257,12 +257,12 @@
       "capability_definition_revision": "sha256:5ea0a60f5d788c2133419b84f110f0edc033405c7bfd7385086888f09bd2779e",
       "capability_id": "scene.shape.mesh",
       "capability_provider_binding_id": "ur5_pick_place_cell.scene-shape-mesh.provider",
-      "capability_provider_binding_revision": "sha256:19733bfa866e323e8adfe0f384ae049368730300f7f7c77ffb11a077936832e5",
+      "capability_provider_binding_revision": "sha256:dd2835e68a6cb3cdb2669e79a5f1f15e63e49f8f543cc1a74762f7cccefd9d27",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -278,12 +278,12 @@
       "capability_definition_revision": "sha256:d84d92a0e0d9592ead27340278315b3a691c18a902fec44bc99626f36d9bc8f2",
       "capability_id": "scene.shape.sphere",
       "capability_provider_binding_id": "ur5_pick_place_cell.scene-shape-sphere.provider",
-      "capability_provider_binding_revision": "sha256:cf431f77589bcba1a525eb9fe9e677be2b066f2d6ad2d68dabd45e7c8a447e74",
+      "capability_provider_binding_revision": "sha256:d02c2a6046b357812d2163e899de584686f5dc27966755a9260aaf2ae2da5f7a",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "logical_scene_services",
           "source_endpoint_role_id": "logical_scene_services",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -299,12 +299,12 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "ur5_robot.arm.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:e2db07104aeaeb84d6e4438078d87bf31a4bf165a4560b2932e51c3b4e6c8fae",
+      "capability_provider_binding_revision": "sha256:65530cbfc0ce7532b5f5304017139454ceaf21f98b2b345fcab65c7c48acb0b8",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -316,7 +316,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "controllable_component_id": "ur5_robot"
       }
     },
@@ -324,12 +324,12 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "ur5_robot.arm.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:0b00f6b0ecfa71d6976832864f8eb5f8d3a9cd0fe4f3c9521e3f8f0b95833c57",
+      "capability_provider_binding_revision": "sha256:31f2d8ba1c231252c36f30338a173ffd0760671111b0e0f75646de5f39630209",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -341,7 +341,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "controllable_component_id": "ur5_robot"
       }
     },
@@ -349,12 +349,12 @@
       "capability_definition_revision": "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00",
       "capability_id": "planning.motion.cartesian_path",
       "capability_provider_binding_id": "ur5_robot.arm.planning-motion-cartesian_path.provider",
-      "capability_provider_binding_revision": "sha256:7b70395e374b00d89205d97bfe2b2e4e0a6133f743bb5d047adc83be3ccbfd2f",
+      "capability_provider_binding_revision": "sha256:110a317d8bad606caa7483336eefd069195708b370a893fbeaa992f06e4fd133",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -366,7 +366,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "controllable_component_id": "ur5_robot"
       }
     },
@@ -374,12 +374,12 @@
       "capability_definition_revision": "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
       "capability_id": "planning.motion.joint_goal",
       "capability_provider_binding_id": "ur5_robot.arm.planning-motion-joint_goal.provider",
-      "capability_provider_binding_revision": "sha256:aa4c5727f5c1f4cbf1dee25dd3d4d0c342a529af731bbd2ac310b4a19b331ed9",
+      "capability_provider_binding_revision": "sha256:8f82e26883adf97ea7640618b5bb4f9f4ec73ea2655a6f0f3186f82077f6866e",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -391,7 +391,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "controllable_component_id": "ur5_robot"
       }
     },
@@ -399,12 +399,12 @@
       "capability_definition_revision": "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148",
       "capability_id": "planning.motion.pose_goal",
       "capability_provider_binding_id": "ur5_robot.arm.planning-motion-pose_goal.provider",
-      "capability_provider_binding_revision": "sha256:ff9e816ac6f16c42acad0ed2228e5dd29e85fb27055ac47c08cc798db89ff885",
+      "capability_provider_binding_revision": "sha256:e8be58fd704cf8ed0e822cf7bed63f8abcbc52316c37864f885123b475b328b6",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -416,7 +416,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "controllable_component_id": "ur5_robot"
       }
     },
@@ -424,12 +424,12 @@
       "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
       "capability_id": "planning.profile.balanced",
       "capability_provider_binding_id": "ur5_robot.arm.planning-profile-balanced.provider",
-      "capability_provider_binding_revision": "sha256:a451ff274bf11179240c1eea3160aab76bfe721b18b30e86f76d5c8c42f6b7a1",
+      "capability_provider_binding_revision": "sha256:bea352afe2de5ac7f8557451ac418c8d15c719642fe3516e1fef2b21a4c31763",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -441,7 +441,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "controllable_component_id": "ur5_robot"
       }
     },
@@ -449,12 +449,12 @@
       "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
       "capability_id": "planning.profile.first_feasible",
       "capability_provider_binding_id": "ur5_robot.arm.planning-profile-first_feasible.provider",
-      "capability_provider_binding_revision": "sha256:c25b588cd426ab6f3c3605195b3b6896a5f146d333ea6850b1d1a4bb47405b3b",
+      "capability_provider_binding_revision": "sha256:3d842ab4e4159b2106fc0f0541d8623661fe41577681d4fee977981edcdbfb9b",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -466,7 +466,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "controllable_component_id": "ur5_robot"
       }
     },
@@ -474,12 +474,12 @@
       "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
       "capability_id": "planning.profile.quality_bounded",
       "capability_provider_binding_id": "ur5_robot.arm.planning-profile-quality_bounded.provider",
-      "capability_provider_binding_revision": "sha256:dc16f669e64def50f970e3aa37c35519d246db821e5f883e1416b081eb6a3bf4",
+      "capability_provider_binding_revision": "sha256:1c03b91f19904d3846f0ab117c7b546323134dbb0a1e58c7dd541e306acf6fe4",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -491,7 +491,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "controllable_component_id": "ur5_robot"
       }
     },
@@ -499,12 +499,12 @@
       "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
       "capability_id": "planning.trajectory.time_parameterized",
       "capability_provider_binding_id": "ur5_robot.arm.planning-trajectory-time_parameterized.provider",
-      "capability_provider_binding_revision": "sha256:f71375c833f89e62d8b0cc8f8f5f65127415b79fac0b6ada2f4e0af4046cc74f",
+      "capability_provider_binding_revision": "sha256:64606bbc1a6a19d48b3fa64858ae23e1303e34d2b3d7cd6e960a374fa474435d",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -516,7 +516,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "controllable_component_id": "ur5_robot"
       }
     },
@@ -524,12 +524,12 @@
       "capability_definition_revision": "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653",
       "capability_id": "validation.trajectory.non_collision",
       "capability_provider_binding_id": "ur5_robot.arm.validation-trajectory-non_collision.provider",
-      "capability_provider_binding_revision": "sha256:6ad718e0b658783c674bddb07d6c95fc828553fac7cd8ad34148cc549f360d7e",
+      "capability_provider_binding_revision": "sha256:fb1bf23c96e91a143c5c3ef5a363173574348c3935f85bfcb66e07001ded3cd7",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -541,7 +541,7 @@
         "command_target_id": "arm",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "controllable_component_id": "ur5_robot"
       }
     },
@@ -549,12 +549,12 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "ur5_robot.gripper.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:4d1430a7324b58fc1c1de2cf401a403b38805818d9f85dd0b7316e5abe5ccede",
+      "capability_provider_binding_revision": "sha256:93423006aef49550b45892bd1c31455df09c7e729b8fd18972bab637e21f023a",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -566,7 +566,7 @@
         "command_target_id": "gripper",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:7a37ae94556765403565208dc35aa3ed21f50b8cebdbc98febc8a8a26f393c62",
+        "control_binding_revision": "sha256:0aedb9536b83a28656acb4020f54cce04f6eb0590bbf281bbe9721fa183d904f",
         "controllable_component_id": "ur5_robot"
       }
     },
@@ -574,12 +574,12 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "ur5_robot.gripper.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:1cb3a0aeb098345f2da7d4bdd96031b4b28c9b4d8401fb54c03649b393e68066",
+      "capability_provider_binding_revision": "sha256:2767cb9ea8872f70ed0def180e149198416d9a71169193aa9fc1575cfdcc84ff",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
           "source_endpoint_role_id": "planner_scene_projection",
-          "source_id": "ur5_robot.native_execution",
+          "source_id": "robot_cell.native_execution",
           "source_kind": "runtime_unit"
         }
       ],
@@ -591,7 +591,7 @@
         "command_target_id": "gripper",
         "component_type_revision": "sha256:437081bdb41251cb4788bb58585dc5265b4efb4ab342a1af88a123b564ca2550",
         "control_binding_id": "ur5_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:7a37ae94556765403565208dc35aa3ed21f50b8cebdbc98febc8a8a26f393c62",
+        "control_binding_revision": "sha256:0aedb9536b83a28656acb4020f54cce04f6eb0590bbf281bbe9721fa183d904f",
         "controllable_component_id": "ur5_robot"
       }
     }
@@ -1067,11 +1067,11 @@
         "schema_revision": "sha256:fa386ae2d58f4bf2e19897a114cfb5e5f80cbd08a23a23eeac38e3342ced7fb4"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/7016c53470a155760287cdd2186a783a2185d63bb3ac2e455e49f1d80130a00b",
-        "content_digest": "sha256:252fe4b63a9acff6a82807ea5a996ee185a632c99260a791fe4864caf512156f",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.native_execution_runtime/a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
+        "content_digest": "sha256:39b4dfb0332d1ce0f100057b916a0aa2825fb4c446b0b1c092bdd519e1e8cd2e",
         "record_id": "manyforge.native_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:7016c53470a155760287cdd2186a783a2185d63bb3ac2e455e49f1d80130a00b",
+        "record_revision": "sha256:a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1105,7 +1105,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_pick_place",
-  "deployment_revision": "sha256:ac7806d4bf3707f21122c646a18b7b0d657fe93190f127009400cb0481d3bcf2",
+  "deployment_revision": "sha256:92a31480eec3663aa00c066534aa7f90a2aa1c75392ea0ae8b14ce800698c126",
   "description": "Local deployment with native in-process RoboPlan planning and simulated execution for the backend-authoritative pick-and-place demo.",
   "desired_control_configurations": [
     {
@@ -1113,62 +1113,62 @@
       "binding_routes": [
         {
           "control_binding_id": "ur5_robot.arm.execution-contact-geometric",
-          "control_binding_revision": "sha256:71c746b6bd30ff25638140a48546814c580545a76d0c3f3da27bd0b351fbad75",
+          "control_binding_revision": "sha256:f5044eee7b4d3b8bfd63804277e9effa64ecbf2ec67f4e11a8d9849db76c88d1",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "ur5_robot.arm.execution-contact-geometric_signed_penetration",
-          "control_binding_revision": "sha256:e6cefa7f36b4a824c27e620dccda80a4dfd8e1d9c65475c67647ca05b042fbd7",
+          "control_binding_revision": "sha256:27a54e3e2e4b0be1e9ade61e6568655abbbe067dd88eae4c027344302e878c10",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "ur5_robot.arm.execution-feedback-phase_events",
-          "control_binding_revision": "sha256:0097bf9d80f8be4e21a6185f5378042dfd00294780de9e61db3dcc0ab3a339c2",
+          "control_binding_revision": "sha256:c609a3f62c022a965e64d441aeb234ca16a4825216b0730a3486ebfdbb171a74",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "ur5_robot.arm.execution-feedback-state_snapshots",
-          "control_binding_revision": "sha256:536e059be95305072dd7e848c5863261e3140f0787bf1d761ccf1262171d1900",
+          "control_binding_revision": "sha256:960c91c94df498cdf26129047acf196d6a20394df1ff08ca4f278936d8c8c745",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "ur5_robot.arm.execution-pause",
-          "control_binding_revision": "sha256:e1e13c989ff8827bc8e08319b7753c3a26dc383847a5afebb384bbd74c05e0cc",
+          "control_binding_revision": "sha256:709137e4fe383e5721efcb5fb03da89689614dd27a15677138c1d43897bd4f84",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "ur5_robot.arm.execution-reset",
-          "control_binding_revision": "sha256:ad51fa97b486072a1ba89a57321fe93924235c3c0bba3fbed84bcd9f8be74920",
+          "control_binding_revision": "sha256:10a0992986429e0a6c8ae80135d37f82e237da9bc7cad8dde0842e8e99b84181",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "ur5_robot.arm.execution-resume",
-          "control_binding_revision": "sha256:634576b964233e1d7fc77779a50b93ae19ef51f1c46ae606bdf2fa2cbb5a56c0",
+          "control_binding_revision": "sha256:e188575e766d613ec3e7e1b7c10e9460fadaa289f15cad1a380a3dc7469512dc",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "ur5_robot.arm.execution-runtime_scale-operation_scoped",
-          "control_binding_revision": "sha256:692669dc7499b59d36f459493bd396b0e35593f05fb2369759c8d51ee7964347",
+          "control_binding_revision": "sha256:5bc4c0e6dfb093b695e7e37664ee397976d2f8d9beaf63574ed3e99e9f2062f7",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "ur5_robot.arm.execution-stop-soft",
-          "control_binding_revision": "sha256:cb76905f5d0c8c8947ce8078556bac168806250cf79eec7485847fc48aeb1e3a",
+          "control_binding_revision": "sha256:5aa1242f746aa118105fd6f717a1b308fb42a97fd9db95aaf82380c387869a01",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-          "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+          "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
           "control_route_id": "arm_position"
         },
         {
           "control_binding_id": "ur5_robot.arm.state-observed-current",
-          "control_binding_revision": "sha256:90d173ccdd619b061663473cd9a0e213c94f1cad0d449f2a2d5bd86b77c4b4c4",
+          "control_binding_revision": "sha256:8cfc4a5b5be5dd42e6d772e0b8521f9f51569ed2f13778b2ebfd5abfea058df4",
           "control_route_id": "arm_position"
         }
       ],
       "control_domain_id": "ur5_robot.arm.control",
-      "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+      "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
       "controller_topology_id": "manyforge.native_arm_direct",
       "topology_revision": "sha256:3145691725146de20d4ffdb1a595e471519f3bcff188603ee844a75a6b9f2f4f"
     },
@@ -1177,17 +1177,17 @@
       "binding_routes": [
         {
           "control_binding_id": "ur5_robot.gripper.tool-gripper-command",
-          "control_binding_revision": "sha256:7a37ae94556765403565208dc35aa3ed21f50b8cebdbc98febc8a8a26f393c62",
+          "control_binding_revision": "sha256:0aedb9536b83a28656acb4020f54cce04f6eb0590bbf281bbe9721fa183d904f",
           "control_route_id": "gripper_position"
         },
         {
           "control_binding_id": "ur5_robot.gripper.tool-gripper-feedback",
-          "control_binding_revision": "sha256:b134fe4b4b6e491ffc0bf345a52ae3278083ed3ed257bdf2d049e555d7492812",
+          "control_binding_revision": "sha256:23a970a243d8b324bbd3962b54727a247f57a0e48bbe2812ef8ff91fa35178c2",
           "control_route_id": "gripper_position"
         }
       ],
       "control_domain_id": "ur5_robot.gripper.control",
-      "control_domain_revision": "sha256:d1f733c93624a8cd329702c3bd5c9915444c1ef3cb6c08d745aadc6acbb3a90b",
+      "control_domain_revision": "sha256:3b5eaec3cc62f5d345b954fd58f6d3189eccdc820b428906602d0b65b58d646e",
       "controller_topology_id": "manyforge.native_gripper_direct",
       "topology_revision": "sha256:1a7d97854724f63090cf8d1adb293e9633f4d7644094aae095f277a53fdfd0d0"
     }
@@ -1201,7 +1201,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric",
-        "control_binding_revision": "sha256:71c746b6bd30ff25638140a48546814c580545a76d0c3f3da27bd0b351fbad75",
+        "control_binding_revision": "sha256:f5044eee7b4d3b8bfd63804277e9effa64ecbf2ec67f4e11a8d9849db76c88d1",
         "control_domain_id": "ur5_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1213,7 +1213,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.arm.coordinate.000000",
@@ -1263,7 +1263,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric_signed_penetration",
-        "control_binding_revision": "sha256:e6cefa7f36b4a824c27e620dccda80a4dfd8e1d9c65475c67647ca05b042fbd7",
+        "control_binding_revision": "sha256:27a54e3e2e4b0be1e9ade61e6568655abbbe067dd88eae4c027344302e878c10",
         "control_domain_id": "ur5_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1275,7 +1275,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.arm.coordinate.000000",
@@ -1325,7 +1325,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.arm.execution-feedback-phase_events",
-        "control_binding_revision": "sha256:0097bf9d80f8be4e21a6185f5378042dfd00294780de9e61db3dcc0ab3a339c2",
+        "control_binding_revision": "sha256:c609a3f62c022a965e64d441aeb234ca16a4825216b0730a3486ebfdbb171a74",
         "control_domain_id": "ur5_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1337,7 +1337,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.arm.coordinate.000000",
@@ -1387,7 +1387,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.arm.execution-feedback-state_snapshots",
-        "control_binding_revision": "sha256:536e059be95305072dd7e848c5863261e3140f0787bf1d761ccf1262171d1900",
+        "control_binding_revision": "sha256:960c91c94df498cdf26129047acf196d6a20394df1ff08ca4f278936d8c8c745",
         "control_domain_id": "ur5_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1399,7 +1399,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.arm.coordinate.000000",
@@ -1449,7 +1449,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.arm.execution-pause",
-        "control_binding_revision": "sha256:e1e13c989ff8827bc8e08319b7753c3a26dc383847a5afebb384bbd74c05e0cc",
+        "control_binding_revision": "sha256:709137e4fe383e5721efcb5fb03da89689614dd27a15677138c1d43897bd4f84",
         "control_domain_id": "ur5_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1461,7 +1461,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.arm.coordinate.000000",
@@ -1511,7 +1511,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.arm.execution-reset",
-        "control_binding_revision": "sha256:ad51fa97b486072a1ba89a57321fe93924235c3c0bba3fbed84bcd9f8be74920",
+        "control_binding_revision": "sha256:10a0992986429e0a6c8ae80135d37f82e237da9bc7cad8dde0842e8e99b84181",
         "control_domain_id": "ur5_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1523,7 +1523,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.arm.coordinate.000000",
@@ -1573,7 +1573,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.arm.execution-resume",
-        "control_binding_revision": "sha256:634576b964233e1d7fc77779a50b93ae19ef51f1c46ae606bdf2fa2cbb5a56c0",
+        "control_binding_revision": "sha256:e188575e766d613ec3e7e1b7c10e9460fadaa289f15cad1a380a3dc7469512dc",
         "control_domain_id": "ur5_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1585,7 +1585,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.arm.coordinate.000000",
@@ -1635,7 +1635,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.arm.execution-runtime_scale-operation_scoped",
-        "control_binding_revision": "sha256:692669dc7499b59d36f459493bd396b0e35593f05fb2369759c8d51ee7964347",
+        "control_binding_revision": "sha256:5bc4c0e6dfb093b695e7e37664ee397976d2f8d9beaf63574ed3e99e9f2062f7",
         "control_domain_id": "ur5_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1647,7 +1647,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.arm.coordinate.000000",
@@ -1708,7 +1708,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.arm.execution-stop-soft",
-        "control_binding_revision": "sha256:cb76905f5d0c8c8947ce8078556bac168806250cf79eec7485847fc48aeb1e3a",
+        "control_binding_revision": "sha256:5aa1242f746aa118105fd6f717a1b308fb42a97fd9db95aaf82380c387869a01",
         "control_domain_id": "ur5_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1720,7 +1720,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.arm.coordinate.000000",
@@ -1770,7 +1770,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "control_domain_id": "ur5_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1782,7 +1782,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.arm.coordinate.000000",
@@ -1843,7 +1843,7 @@
         "command_target_id": "arm",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.arm.state-observed-current",
-        "control_binding_revision": "sha256:90d173ccdd619b061663473cd9a0e213c94f1cad0d449f2a2d5bd86b77c4b4c4",
+        "control_binding_revision": "sha256:8cfc4a5b5be5dd42e6d772e0b8521f9f51569ed2f13778b2ebfd5abfea058df4",
         "control_domain_id": "ur5_robot.arm.control",
         "control_interface_contract_id": "manyforge.native_arm_position",
         "control_interface_revision": "sha256:97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",
@@ -1855,7 +1855,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.arm.coordinate.000000",
@@ -1905,7 +1905,7 @@
         "command_target_id": "gripper",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:7a37ae94556765403565208dc35aa3ed21f50b8cebdbc98febc8a8a26f393c62",
+        "control_binding_revision": "sha256:0aedb9536b83a28656acb4020f54cce04f6eb0590bbf281bbe9721fa183d904f",
         "control_domain_id": "ur5_robot.gripper.control",
         "control_interface_contract_id": "manyforge.native_gripper_position",
         "control_interface_revision": "sha256:865d6a1fa8ecd0de6bf1a7a88ea683f63120616d9355faf33535c7a55ec4b2db",
@@ -1917,7 +1917,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.gripper.logical_position",
@@ -1947,7 +1947,7 @@
         "command_target_id": "gripper",
         "containment_granularity": "resource",
         "control_binding_id": "ur5_robot.gripper.tool-gripper-feedback",
-        "control_binding_revision": "sha256:b134fe4b4b6e491ffc0bf345a52ae3278083ed3ed257bdf2d049e555d7492812",
+        "control_binding_revision": "sha256:23a970a243d8b324bbd3962b54727a247f57a0e48bbe2812ef8ff91fa35178c2",
         "control_domain_id": "ur5_robot.gripper.control",
         "control_interface_contract_id": "manyforge.native_gripper_position",
         "control_interface_revision": "sha256:865d6a1fa8ecd0de6bf1a7a88ea683f63120616d9355faf33535c7a55ec4b2db",
@@ -1959,7 +1959,7 @@
         "provider_instance_id": "ur5_robot.native_control",
         "provider_manifest_id": "manyforge.provider.native_control",
         "provider_manifest_revision": "sha256:a2973974a4c244d3f99d71f80d4975b902ac9373c1feaa5dbb112e2592d728bb",
-        "provider_runtime_unit_id": "ur5_robot.native_execution",
+        "provider_runtime_unit_id": "robot_cell.native_execution",
         "resource_bindings": [
           {
             "resource_id": "ur5_robot.gripper.logical_position",
@@ -1989,10 +1989,10 @@
         "containment_granularity": "resource",
         "control_coordinator_endpoint_role": "native_execution_status",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "controller_topology_id": "manyforge.native_arm_direct",
         "runtime_unit_ids": [
-          "ur5_robot.native_execution"
+          "robot_cell.native_execution"
         ],
         "topology_revision": "sha256:3145691725146de20d4ffdb1a595e471519f3bcff188603ee844a75a6b9f2f4f"
       },
@@ -2000,10 +2000,10 @@
         "containment_granularity": "resource",
         "control_coordinator_endpoint_role": "native_execution_status",
         "control_domain_id": "ur5_robot.gripper.control",
-        "control_domain_revision": "sha256:d1f733c93624a8cd329702c3bd5c9915444c1ef3cb6c08d745aadc6acbb3a90b",
+        "control_domain_revision": "sha256:3b5eaec3cc62f5d345b954fd58f6d3189eccdc820b428906602d0b65b58d646e",
         "controller_topology_id": "manyforge.native_gripper_direct",
         "runtime_unit_ids": [
-          "ur5_robot.native_execution"
+          "robot_cell.native_execution"
         ],
         "topology_revision": "sha256:1a7d97854724f63090cf8d1adb293e9633f4d7644094aae095f277a53fdfd0d0"
       }
@@ -2033,7 +2033,7 @@
           ]
         },
         "runtime_unit_ids": [
-          "ur5_robot.native_execution"
+          "robot_cell.native_execution"
         ]
       }
     ],
@@ -2075,8 +2075,8 @@
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.native_execution_runtime",
-        "runtime_profile_revision": "sha256:7016c53470a155760287cdd2186a783a2185d63bb3ac2e455e49f1d80130a00b",
-        "runtime_unit_id": "ur5_robot.native_execution"
+        "runtime_profile_revision": "sha256:a0530683791b2ee5b657bec84dfddc55483f238fb7b3ed5bb27a2b433b755d99",
+        "runtime_unit_id": "robot_cell.native_execution"
       }
     ]
   },
@@ -2105,9 +2105,9 @@
     "stop_stage_parameters": [
       {
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric",
-        "control_binding_revision": "sha256:71c746b6bd30ff25638140a48546814c580545a76d0c3f3da27bd0b351fbad75",
+        "control_binding_revision": "sha256:f5044eee7b4d3b8bfd63804277e9effa64ecbf2ec67f4e11a8d9849db76c88d1",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {
@@ -2196,9 +2196,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric",
-        "control_binding_revision": "sha256:71c746b6bd30ff25638140a48546814c580545a76d0c3f3da27bd0b351fbad75",
+        "control_binding_revision": "sha256:f5044eee7b4d3b8bfd63804277e9effa64ecbf2ec67f4e11a8d9849db76c88d1",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {},
@@ -2214,9 +2214,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric_signed_penetration",
-        "control_binding_revision": "sha256:e6cefa7f36b4a824c27e620dccda80a4dfd8e1d9c65475c67647ca05b042fbd7",
+        "control_binding_revision": "sha256:27a54e3e2e4b0be1e9ade61e6568655abbbe067dd88eae4c027344302e878c10",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {
@@ -2305,9 +2305,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric_signed_penetration",
-        "control_binding_revision": "sha256:e6cefa7f36b4a824c27e620dccda80a4dfd8e1d9c65475c67647ca05b042fbd7",
+        "control_binding_revision": "sha256:27a54e3e2e4b0be1e9ade61e6568655abbbe067dd88eae4c027344302e878c10",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {},
@@ -2323,9 +2323,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-feedback-phase_events",
-        "control_binding_revision": "sha256:0097bf9d80f8be4e21a6185f5378042dfd00294780de9e61db3dcc0ab3a339c2",
+        "control_binding_revision": "sha256:c609a3f62c022a965e64d441aeb234ca16a4825216b0730a3486ebfdbb171a74",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {
@@ -2414,9 +2414,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-feedback-phase_events",
-        "control_binding_revision": "sha256:0097bf9d80f8be4e21a6185f5378042dfd00294780de9e61db3dcc0ab3a339c2",
+        "control_binding_revision": "sha256:c609a3f62c022a965e64d441aeb234ca16a4825216b0730a3486ebfdbb171a74",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {},
@@ -2432,9 +2432,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-feedback-state_snapshots",
-        "control_binding_revision": "sha256:536e059be95305072dd7e848c5863261e3140f0787bf1d761ccf1262171d1900",
+        "control_binding_revision": "sha256:960c91c94df498cdf26129047acf196d6a20394df1ff08ca4f278936d8c8c745",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {
@@ -2523,9 +2523,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-feedback-state_snapshots",
-        "control_binding_revision": "sha256:536e059be95305072dd7e848c5863261e3140f0787bf1d761ccf1262171d1900",
+        "control_binding_revision": "sha256:960c91c94df498cdf26129047acf196d6a20394df1ff08ca4f278936d8c8c745",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {},
@@ -2541,9 +2541,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-pause",
-        "control_binding_revision": "sha256:e1e13c989ff8827bc8e08319b7753c3a26dc383847a5afebb384bbd74c05e0cc",
+        "control_binding_revision": "sha256:709137e4fe383e5721efcb5fb03da89689614dd27a15677138c1d43897bd4f84",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {
@@ -2632,9 +2632,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-pause",
-        "control_binding_revision": "sha256:e1e13c989ff8827bc8e08319b7753c3a26dc383847a5afebb384bbd74c05e0cc",
+        "control_binding_revision": "sha256:709137e4fe383e5721efcb5fb03da89689614dd27a15677138c1d43897bd4f84",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {},
@@ -2650,9 +2650,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-reset",
-        "control_binding_revision": "sha256:ad51fa97b486072a1ba89a57321fe93924235c3c0bba3fbed84bcd9f8be74920",
+        "control_binding_revision": "sha256:10a0992986429e0a6c8ae80135d37f82e237da9bc7cad8dde0842e8e99b84181",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {
@@ -2741,9 +2741,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-reset",
-        "control_binding_revision": "sha256:ad51fa97b486072a1ba89a57321fe93924235c3c0bba3fbed84bcd9f8be74920",
+        "control_binding_revision": "sha256:10a0992986429e0a6c8ae80135d37f82e237da9bc7cad8dde0842e8e99b84181",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {},
@@ -2759,9 +2759,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-resume",
-        "control_binding_revision": "sha256:634576b964233e1d7fc77779a50b93ae19ef51f1c46ae606bdf2fa2cbb5a56c0",
+        "control_binding_revision": "sha256:e188575e766d613ec3e7e1b7c10e9460fadaa289f15cad1a380a3dc7469512dc",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {
@@ -2850,9 +2850,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-resume",
-        "control_binding_revision": "sha256:634576b964233e1d7fc77779a50b93ae19ef51f1c46ae606bdf2fa2cbb5a56c0",
+        "control_binding_revision": "sha256:e188575e766d613ec3e7e1b7c10e9460fadaa289f15cad1a380a3dc7469512dc",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {},
@@ -2868,9 +2868,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-runtime_scale-operation_scoped",
-        "control_binding_revision": "sha256:692669dc7499b59d36f459493bd396b0e35593f05fb2369759c8d51ee7964347",
+        "control_binding_revision": "sha256:5bc4c0e6dfb093b695e7e37664ee397976d2f8d9beaf63574ed3e99e9f2062f7",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {
@@ -2959,9 +2959,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-runtime_scale-operation_scoped",
-        "control_binding_revision": "sha256:692669dc7499b59d36f459493bd396b0e35593f05fb2369759c8d51ee7964347",
+        "control_binding_revision": "sha256:5bc4c0e6dfb093b695e7e37664ee397976d2f8d9beaf63574ed3e99e9f2062f7",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {},
@@ -2977,9 +2977,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-stop-soft",
-        "control_binding_revision": "sha256:cb76905f5d0c8c8947ce8078556bac168806250cf79eec7485847fc48aeb1e3a",
+        "control_binding_revision": "sha256:5aa1242f746aa118105fd6f717a1b308fb42a97fd9db95aaf82380c387869a01",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {
@@ -3068,9 +3068,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-stop-soft",
-        "control_binding_revision": "sha256:cb76905f5d0c8c8947ce8078556bac168806250cf79eec7485847fc48aeb1e3a",
+        "control_binding_revision": "sha256:5aa1242f746aa118105fd6f717a1b308fb42a97fd9db95aaf82380c387869a01",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {},
@@ -3086,9 +3086,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {
@@ -3177,9 +3177,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {},
@@ -3195,9 +3195,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.state-observed-current",
-        "control_binding_revision": "sha256:90d173ccdd619b061663473cd9a0e213c94f1cad0d449f2a2d5bd86b77c4b4c4",
+        "control_binding_revision": "sha256:8cfc4a5b5be5dd42e6d772e0b8521f9f51569ed2f13778b2ebfd5abfea058df4",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {
@@ -3286,9 +3286,9 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.state-observed-current",
-        "control_binding_revision": "sha256:90d173ccdd619b061663473cd9a0e213c94f1cad0d449f2a2d5bd86b77c4b4c4",
+        "control_binding_revision": "sha256:8cfc4a5b5be5dd42e6d772e0b8521f9f51569ed2f13778b2ebfd5abfea058df4",
         "control_domain_id": "ur5_robot.arm.control",
-        "control_domain_revision": "sha256:950a5261ff5e77f1ae7448cc1527bf7c782d77a9f54c2d35d1fde19ba5b493c8",
+        "control_domain_revision": "sha256:85fd6e5634b7ac01df77038bf7bd16e0a6c447c921e3522c035dac1595f9ef7c",
         "control_route_id": "arm_position",
         "controller_topology_id": "manyforge.native_arm_direct",
         "default_contract_parameters": {},
@@ -3304,9 +3304,9 @@
       },
       {
         "control_binding_id": "ur5_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:7a37ae94556765403565208dc35aa3ed21f50b8cebdbc98febc8a8a26f393c62",
+        "control_binding_revision": "sha256:0aedb9536b83a28656acb4020f54cce04f6eb0590bbf281bbe9721fa183d904f",
         "control_domain_id": "ur5_robot.gripper.control",
-        "control_domain_revision": "sha256:d1f733c93624a8cd329702c3bd5c9915444c1ef3cb6c08d745aadc6acbb3a90b",
+        "control_domain_revision": "sha256:3b5eaec3cc62f5d345b954fd58f6d3189eccdc820b428906602d0b65b58d646e",
         "control_route_id": "gripper_position",
         "controller_topology_id": "manyforge.native_gripper_direct",
         "default_contract_parameters": {},
@@ -3322,9 +3322,9 @@
       },
       {
         "control_binding_id": "ur5_robot.gripper.tool-gripper-feedback",
-        "control_binding_revision": "sha256:b134fe4b4b6e491ffc0bf345a52ae3278083ed3ed257bdf2d049e555d7492812",
+        "control_binding_revision": "sha256:23a970a243d8b324bbd3962b54727a247f57a0e48bbe2812ef8ff91fa35178c2",
         "control_domain_id": "ur5_robot.gripper.control",
-        "control_domain_revision": "sha256:d1f733c93624a8cd329702c3bd5c9915444c1ef3cb6c08d745aadc6acbb3a90b",
+        "control_domain_revision": "sha256:3b5eaec3cc62f5d345b954fd58f6d3189eccdc820b428906602d0b65b58d646e",
         "control_route_id": "gripper_position",
         "controller_topology_id": "manyforge.native_gripper_direct",
         "default_contract_parameters": {},
@@ -3342,7 +3342,7 @@
     "stop_timing_parameters": [
       {
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric",
-        "control_binding_revision": "sha256:71c746b6bd30ff25638140a48546814c580545a76d0c3f3da27bd0b351fbad75",
+        "control_binding_revision": "sha256:f5044eee7b4d3b8bfd63804277e9effa64ecbf2ec67f4e11a8d9849db76c88d1",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3351,7 +3351,7 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-contact-geometric_signed_penetration",
-        "control_binding_revision": "sha256:e6cefa7f36b4a824c27e620dccda80a4dfd8e1d9c65475c67647ca05b042fbd7",
+        "control_binding_revision": "sha256:27a54e3e2e4b0be1e9ade61e6568655abbbe067dd88eae4c027344302e878c10",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3360,7 +3360,7 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-feedback-phase_events",
-        "control_binding_revision": "sha256:0097bf9d80f8be4e21a6185f5378042dfd00294780de9e61db3dcc0ab3a339c2",
+        "control_binding_revision": "sha256:c609a3f62c022a965e64d441aeb234ca16a4825216b0730a3486ebfdbb171a74",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3369,7 +3369,7 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-feedback-state_snapshots",
-        "control_binding_revision": "sha256:536e059be95305072dd7e848c5863261e3140f0787bf1d761ccf1262171d1900",
+        "control_binding_revision": "sha256:960c91c94df498cdf26129047acf196d6a20394df1ff08ca4f278936d8c8c745",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3378,7 +3378,7 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-pause",
-        "control_binding_revision": "sha256:e1e13c989ff8827bc8e08319b7753c3a26dc383847a5afebb384bbd74c05e0cc",
+        "control_binding_revision": "sha256:709137e4fe383e5721efcb5fb03da89689614dd27a15677138c1d43897bd4f84",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3387,7 +3387,7 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-reset",
-        "control_binding_revision": "sha256:ad51fa97b486072a1ba89a57321fe93924235c3c0bba3fbed84bcd9f8be74920",
+        "control_binding_revision": "sha256:10a0992986429e0a6c8ae80135d37f82e237da9bc7cad8dde0842e8e99b84181",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3396,7 +3396,7 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-resume",
-        "control_binding_revision": "sha256:634576b964233e1d7fc77779a50b93ae19ef51f1c46ae606bdf2fa2cbb5a56c0",
+        "control_binding_revision": "sha256:e188575e766d613ec3e7e1b7c10e9460fadaa289f15cad1a380a3dc7469512dc",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3405,7 +3405,7 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-runtime_scale-operation_scoped",
-        "control_binding_revision": "sha256:692669dc7499b59d36f459493bd396b0e35593f05fb2369759c8d51ee7964347",
+        "control_binding_revision": "sha256:5bc4c0e6dfb093b695e7e37664ee397976d2f8d9beaf63574ed3e99e9f2062f7",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3414,7 +3414,7 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-stop-soft",
-        "control_binding_revision": "sha256:cb76905f5d0c8c8947ce8078556bac168806250cf79eec7485847fc48aeb1e3a",
+        "control_binding_revision": "sha256:5aa1242f746aa118105fd6f717a1b308fb42a97fd9db95aaf82380c387869a01",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3423,7 +3423,7 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.execution-trajectory-execute",
-        "control_binding_revision": "sha256:49193d7ce9c81888aec6c3a38c7d251a82d51fe281b191f383cb70c19c7eeb1e",
+        "control_binding_revision": "sha256:6d0a2c7f24b47228a19ff775f183fc9149842183af7c03f058da05bb0d2f0bf3",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3432,7 +3432,7 @@
       },
       {
         "control_binding_id": "ur5_robot.arm.state-observed-current",
-        "control_binding_revision": "sha256:90d173ccdd619b061663473cd9a0e213c94f1cad0d449f2a2d5bd86b77c4b4c4",
+        "control_binding_revision": "sha256:8cfc4a5b5be5dd42e6d772e0b8521f9f51569ed2f13778b2ebfd5abfea058df4",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3441,7 +3441,7 @@
       },
       {
         "control_binding_id": "ur5_robot.gripper.tool-gripper-command",
-        "control_binding_revision": "sha256:7a37ae94556765403565208dc35aa3ed21f50b8cebdbc98febc8a8a26f393c62",
+        "control_binding_revision": "sha256:0aedb9536b83a28656acb4020f54cce04f6eb0590bbf281bbe9721fa183d904f",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,
@@ -3450,7 +3450,7 @@
       },
       {
         "control_binding_id": "ur5_robot.gripper.tool-gripper-feedback",
-        "control_binding_revision": "sha256:b134fe4b4b6e491ffc0bf345a52ae3278083ed3ed257bdf2d049e555d7492812",
+        "control_binding_revision": "sha256:23a970a243d8b324bbd3962b54727a247f57a0e48bbe2812ef8ff91fa35178c2",
         "timing": {
           "command_latency_allowance_ns": 250000000,
           "operational_timeout_ns": 3000000000,

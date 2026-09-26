@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 import shutil
 import sys
 from tempfile import TemporaryDirectory
 import time
+import threading
+import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -74,7 +78,18 @@ def _dual_robot_stack() -> Iterator[ProcessStack]:
                 stack.close()
 
 
-def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any], str]:
+def _load_scenario(
+    stack: ProcessStack,
+    scenario_id: str,
+    *,
+    scenario_path: Path | None = None,
+    executable: bool = True,
+) -> tuple[dict[str, Any], str]:
+    # Each deliberate Load is a new Manager request, even when it loads the
+    # same Scenario again. Retries within this one Load keep their own distinct
+    # attempt identities because a stale admission snapshot changes the
+    # request's expected generation.
+    load_identity = uuid.uuid4().hex
     with (
         _composer_snapshot_stream(stack, client_id=f"ui6i-{scenario_id}") as snapshots,
         HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
@@ -83,6 +98,7 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
         rows = {row["scenario_id"]: row for row in scenarios["entries"]}
         ids = set(rows)
         assert {GROUPED_SCENARIO, ISOLATION_SCENARIO} <= ids
+        path = str(scenario_path) if scenario_path is not None else rows[scenario_id]["path"]
         draft = composer.request("GET", "/api/program/draft")
         for attempt in range(8):
             snapshot = _matching_composer_snapshot(snapshots, draft)
@@ -94,13 +110,15 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
                     body={
                         **_composer_fence(
                             snapshot,
-                            request_id=f"ui6i.{scenario_id}.load.{attempt}",
+                            request_id=(
+                                f"ui6i.{scenario_id}.load.{load_identity}.{attempt}"
+                            ),
                         ),
                         "deploymentDraftId": deployment["draft"]["id"],
                         "expectedDeploymentDraftRevision": deployment["draft"][
                             "revision"
                         ],
-                        "path": rows[scenario_id]["path"],
+                        "path": path,
                         "confirmDiscard": False,
                     },
                 )
@@ -111,10 +129,50 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
                     not in {"authoring_not_ready", "stale_generation"}
                     or attempt == 7
                 ):
-                    raise
+                    try:
+                        manager_status = composer.manager_status()["status"]
+                        active = manager_status.get("active")
+                        publication = (
+                            active.get("publication")
+                            if isinstance(active, dict)
+                            else None
+                        )
+                        records = manager_status.get("apply", {}).get(
+                            "records", []
+                        )
+                        manager_summary = {
+                            "manager_ready": manager_status.get(
+                                "manager_ready"
+                            ),
+                            "active_publication": publication,
+                            "recent_applies": [
+                                {
+                                    "apply_id": row.get("apply_id"),
+                                    "phase": row.get("phase"),
+                                    "terminal_state": row.get(
+                                        "terminal_state"
+                                    ),
+                                    "error": row.get("error"),
+                                    "failure": row.get("failure"),
+                                    "scenario_id": row.get(
+                                        "prepared_activation", {}
+                                    ).get("scenario_id"),
+                                    "request": row.get("request"),
+                                }
+                                for row in records[-4:]
+                                if isinstance(row, dict)
+                            ],
+                        }
+                    except Exception as status_error:  # noqa: BLE001
+                        manager_summary = {"read_error": str(status_error)}
+                    raise AssertionError(
+                        f"{scenario_id}: Load failed: code={error.code!r}, "
+                        f"response={error.response!r}, "
+                        f"Manager={manager_summary!r}"
+                    ) from error
                 draft = composer.request("GET", "/api/program/draft")
         assert loaded["status"] == "accepted"
-        assert loaded["path"] == rows[scenario_id]["path"]
+        assert loaded["path"] == path
         activation = loaded["activation"]
         deadline = time.monotonic() + 30.0
         with HeadlessHttpClient(
@@ -125,7 +183,9 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
                     activation["apply_id"], activation["apply_generation"]
                 )
                 if status["state"] != "pending":
-                    assert status["state"] == "succeeded", (scenario_id, status)
+                    assert status["state"] == "succeeded", (
+                        f"{scenario_id}: terminal Apply status {status!r}"
+                    )
                     break
                 if time.monotonic() >= deadline:
                     raise AssertionError(
@@ -137,7 +197,14 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
         assert deployment["draft"]["document"]["deployment_artifact_id"] == (
             "ur5e_lite6_wall"
         )
-        applied = composer.program_applied()
+        if executable:
+            applied = composer.program_applied()
+        else:
+            with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+                applied = headless.request("GET", "/api/program/applied/status")
+            assert applied["executable"] is False
+            assert applied["program_binding_id"] is None
+            assert applied["non_executable"]["unresolved_roles"]
         assert applied["scenario_id"] == scenario_id
         return (
             applied,
@@ -147,41 +214,66 @@ def _load_scenario(stack: ProcessStack, scenario_id: str) -> tuple[dict[str, Any
 
 def _save_and_reopen_current_scenario(
     stack: ProcessStack, scenario_id: str
-) -> None:
+) -> dict[str, Any]:
     directory = stack.root / "saved-scenarios"
     directory.mkdir()
     target = directory / f"{scenario_id}.scenario"
     with (
         _composer_snapshot_stream(stack, client_id=f"ui6i-save-{scenario_id}") as snapshots,
         HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
+        HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
     ):
-        draft = composer.request("GET", "/api/program/draft")
-        snapshot = _matching_composer_snapshot(snapshots, draft)
-        deployment = composer.request("GET", "/api/deployment/workspace")
-        fence = {
-            **_composer_fence(
-                snapshot,
-                request_id=f"ui6i.{scenario_id}.save",
-            ),
-            "deploymentDraftId": deployment["draft"]["id"],
-            "expectedDeploymentDraftRevision": deployment["draft"]["revision"],
-        }
         manager_before = composer.manager_status()["status"]["active"]
-        saved = composer.request(
-            "POST",
-            "/api/scenario-documents/save",
-            body={
-                **fence,
-                "path": str(target),
-                "scenarioId": f"{scenario_id}_saved",
-                "name": "UI6-I grouped Scenario copy",
-                "description": "Native Save/Load qualification copy",
-                "confirmOverwrite": False,
-            },
-        )
+        applied_before = composer.program_applied()
+        components_before = {
+            component_id: headless.cclc_component(component_id)
+            for component_id in ("lite6_robot", "ur5e_robot")
+        }
+        save_identity = uuid.uuid4().hex
+        saved: dict[str, Any] | None = None
+        for attempt in range(8):
+            draft = composer.request("GET", "/api/program/draft")
+            snapshot = _matching_composer_snapshot(snapshots, draft)
+            deployment = composer.request("GET", "/api/deployment/workspace")
+            try:
+                saved = composer.request(
+                    "POST",
+                    "/api/scenario-documents/save",
+                    body={
+                        **_composer_fence(
+                            snapshot,
+                            request_id=(
+                                f"ui6i.{scenario_id}.save.{save_identity}.{attempt}"
+                            ),
+                        ),
+                        "deploymentDraftId": deployment["draft"]["id"],
+                        "expectedDeploymentDraftRevision": deployment["draft"][
+                            "revision"
+                        ],
+                        "path": str(target),
+                        "scenarioId": f"{scenario_id}_saved",
+                        "name": "UI6-I grouped Scenario copy",
+                        "description": "Native Save/Load qualification copy",
+                        "confirmOverwrite": False,
+                    },
+                )
+                break
+            except HeadlessClientError as error:
+                # These exact admission refusals occur before the Save claim or
+                # filesystem write. Refresh the coherent snapshot and retry;
+                # never retry an ambiguous or effectful outcome.
+                if error.code not in {"authoring_not_ready", "stale_generation"} or attempt == 7:
+                    raise
+        assert saved is not None
         assert saved["status"] == "saved"
-        assert saved["last_known_status"] == "ready"
+        # Saving records content, not validation against a new activation.
+        # A complete newly saved document therefore starts with an unknown
+        # status until it is loaded and qualified again.
+        assert saved["last_known_status"] == "unknown"
         assert saved["path"] == str(target.resolve())
+        # Save only persists authored content. Load below deliberately activates
+        # the saved copy and may publish a new activation of the same runtime.
+        assert composer.manager_status()["status"]["active"] == manager_before
         index = composer.request(
             "GET",
             "/api/scenario-documents",
@@ -222,9 +314,43 @@ def _save_and_reopen_current_scenario(
                 ):
                     raise
                 draft = composer.request("GET", "/api/program/draft")
-        assert reopened["status"] == "loaded"
+        assert reopened["status"] in {"accepted", "applied"}
         assert reopened["path"] == str(target.resolve())
-        assert composer.manager_status()["status"]["active"] == manager_before
+        activation = reopened["activation"]
+        if reopened["status"] == "accepted":
+            deadline = time.monotonic() + 30.0
+            while True:
+                status = headless.manager_apply_status(
+                    activation["apply_id"], activation["apply_generation"]
+                )
+                if status["state"] != "pending":
+                    assert status["state"] == "succeeded", (
+                        f"reopened Scenario Apply did not succeed: {status!r}"
+                    )
+                    break
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        "reopened Scenario Apply did not settle: " f"{status!r}"
+                    )
+                time.sleep(0.02)
+        stack.wait_authoring_admission(expected_allowed=True)
+        manager_after = composer.manager_status()["status"]["active"]
+        for key in ("retained_bundle_id", "graph_revision", "cell_graph"):
+            assert manager_after[key] == manager_before[key]
+        for component_id, before in components_before.items():
+            after = headless.cclc_component(component_id)
+            for key in (
+                "component_lifecycle_generation",
+                "component_lifecycle_state",
+                "domains",
+                "provider_occurrences",
+            ):
+                assert after[key] == before[key], (component_id, key, before, after)
+        applied = composer.program_applied()
+        assert applied["scenario_id"] == f"{scenario_id}_saved"
+        for key in ("program_revision", "program_binding_id"):
+            assert applied[key] == applied_before[key]
+        return applied
 
 
 def _start_run(
@@ -402,7 +528,9 @@ def _set_scale(
     client: HeadlessHttpClient, selector: dict[str, Any], scale: float, request_id: str
 ) -> dict[str, Any]:
     current = client.runtime_scale_control(selector)["runtime_scale_control"]
-    owner_epoch = client.execution_diagnostics()["status"]["owner_epoch"]
+    owner_epoch = client.execution_diagnostics()["status"]["identity"][
+        "owner_epoch"
+    ]
     accepted = client.set_runtime_scale_control(
         {
             "request_context": {
@@ -497,18 +625,271 @@ def test_repeated_project_activation_replaces_one_coherent_publication() -> None
         assert observed[0] != observed[1]
 
 
+def test_mixed_apply_preserves_survivor_and_observations_during_publication() -> None:
+    # Keep Composer out of native-only test collection. These helpers are
+    # required only by this owner-connected scenario test.
+    from manyforge_composer.backend.scenario_artifacts import (
+        build_scenario_document,
+        load_scenario_artifact,
+        save_scenario_artifact,
+    )
+
+    with _dual_robot_stack() as stack:
+        _load_scenario(stack, GROUPED_SCENARIO)
+        examples = _required_path("MANYFORGE_EXAMPLE_SCENARIO_ROOT")
+        source = examples / f"{GROUPED_SCENARIO}.scenario"
+        document, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
+        variants = stack.root / "mixed-scenarios"
+        variants.mkdir()
+        paths: dict[str, Path] = {}
+        for kind in ("single", "replace"):
+            candidate = deepcopy(document)
+            candidate["scenario_id"] = f"mixed_{kind}"
+            candidate["name"] = f"Mixed Apply {kind}"
+            components = candidate["deployment_draft"]["components"]
+            if kind == "single":
+                candidate["deployment_draft"]["components"] = [
+                    row for row in components if row["component_id"] == "lite6_robot"
+                ]
+            else:
+                ur5e = next(row for row in components if row["component_id"] == "ur5e_robot")
+                # Change only B's controller input; A must survive unchanged.
+                ur5e["configuration"]["runtime_configuration"]["initial_joint_positions_rad"][0] = 0.1
+            target = variants / f"mixed_{kind}.scenario"
+            candidate = build_scenario_document(
+                scenario_id=candidate["scenario_id"],
+                name=candidate["name"],
+                description=candidate["description"],
+                program_draft=candidate["program_draft"],
+                deployment_draft=candidate["deployment_draft"],
+                program_role_assignment=candidate["program_role_assignment"],
+                typed_parameter_overrides=candidate["typed_parameter_overrides"],
+                manyforge_version=candidate["saved_status"]["manyforge_version"],
+                last_known_status="unknown",
+            )
+            save_scenario_artifact(
+                candidate, str(target),
+                allowed_roots=[str(examples), str(stack.root)],
+                overwrite=False, source_project_path=str(source),
+            )
+            paths[kind] = target
+
+        def target_keys(status: dict[str, Any]) -> set[tuple[str, str, str]]:
+            return {
+                (component["controllable_component_id"], target["command_target_id"],
+                 target["operation_capability_id"])
+                for component in status["targets"]["components"]
+                for target in component["targets"] if target["command"] is not None
+            }
+
+        def inventory_keys(targets: dict[str, Any]) -> set[tuple[str, str, str]]:
+            rows = [
+                (component["controllable_component_id"], target["command_target_id"],
+                 target["operation_capability_id"])
+                for component in targets["components"] for target in component["targets"]
+            ]
+            assert len(rows) == len(set(rows)), targets
+            return set(rows)
+
+        def keyed_observations(rows: list[dict[str, Any]]) -> dict[tuple[str, str, str], dict[str, Any]]:
+            result = {
+                (row["controllable_component_id"], row["command_target_id"],
+                 row["operation_capability_id"]): row for row in rows
+            }
+            assert len(result) == len(rows), rows
+            return result
+
+        def survivor_facts(snapshot: dict[str, Any]) -> dict[str, Any]:
+            # Product evidence may be re-sealed to the new bundle. Assert the
+            # controller, lifecycle and route facts that must remain stable.
+            return {
+                "generation": snapshot["component_lifecycle_generation"],
+                "state": snapshot["component_lifecycle_state"],
+                "domains": snapshot["domains"],
+                "owners": [
+                    {key: row[key] for key in (
+                        "control_domain_id",
+                        "provider_instance_id", "provider_runtime_unit_id",
+                        "provider_runtime_epoch",
+                    )}
+                    for row in snapshot["provider_occurrences"]
+                ],
+            }
+
+        stop_reader = threading.Event()
+        reader_started = threading.Event()
+
+        def read_publications() -> int:
+            native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+            count = 0
+            sequences = dict(initial_survivor_sequences)
+            while not stop_reader.is_set():
+                # Use the production render projection without competing for
+                # Composer/headless's dedicated single-client stream lane.
+                assert_observation(native.observation(), sequences)
+                count += 1
+                reader_started.set()
+            return count
+
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            survivor = survivor_facts(headless.cclc_component("lite6_robot"))
+            native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+            initial_diagnostics = native.diagnostics()
+            assert initial_diagnostics.get("ok") is True, initial_diagnostics
+            initial_status = initial_diagnostics["status"]
+            assert initial_status["schema_version"] == "manyforge.execution_status.v2"
+            host_epoch = initial_status["identity"]["owner_epoch"]
+            dual_inventory = inventory_keys(initial_status["targets"])
+            dual_supported = target_keys(initial_status)
+            single_inventory = {key for key in dual_inventory if key[0] == "lite6_robot"}
+            single_supported = {key for key in dual_supported if key[0] == "lite6_robot"}
+            assert {key[0] for key in dual_inventory} == {"lite6_robot", "ur5e_robot"}
+
+            initial_response = native.observation()
+            assert initial_response.get("ok") is True, initial_response
+            initial_observation = initial_response["observation"]
+            wake_epoch = initial_observation["source_epoch"]
+            assert wake_epoch
+            initial_rows = keyed_observations(initial_observation["targets"])
+            dual_render = set(initial_rows)
+            single_render = {key for key in dual_render if key[0] == "lite6_robot"}
+            assert dual_render <= dual_supported
+            assert {key[0] for key in dual_render} == {"lite6_robot", "ur5e_robot"}
+            assert single_render
+
+            # The initial verified frame defines the exact render inventory.
+            # Cross-check its coordinates against settled command payloads;
+            # the producer omits only component-local gripper resources.
+            coordinate_shapes: dict[tuple[str, str, str], tuple[list[str], list[str]]] = {}
+            for component in initial_status["targets"]["components"]:
+                for target in component["targets"]:
+                    command = target["command"]
+                    if command is None:
+                        continue
+                    key = (component["controllable_component_id"], target["command_target_id"],
+                           target["operation_capability_id"])
+                    if target["presentation"] == "motion":
+                        assert key in dual_render, target
+                        names = [joint["source_joint_name"] for joint in command["joints"]]
+                        coordinate_shapes[key] = (names, ["angular"] * len(names))
+                    else:
+                        assert target["presentation"] == "gripper", target
+                        resource = command["resource"]
+                        if key not in dual_render:
+                            assert resource["source_kind"] == "component_local", target
+                            continue
+                        assert resource["source_kind"] == "model_role", target
+                        kind = {"angular_rad": "angular", "linear_m": "linear"}[resource["coordinate_kind"]]
+                        coordinate_shapes[key] = ([resource["source_coordinate_name"]], [kind])
+            assert set(coordinate_shapes) == dual_render
+            survivor_epochs = {key: initial_rows[key]["source_epoch"] for key in single_render}
+            initial_survivor_sequences = {
+                key: initial_rows[key]["source_sequence"] for key in single_render
+            }
+
+            def assert_observation(
+                response: dict[str, Any], sequences: dict[tuple[str, str, str], int],
+            ) -> set[tuple[str, str, str]]:
+                assert response.get("ok") is True, response
+                observation = response["observation"]
+                assert observation["schema_version"] == "manyforge.execution_observation.v3"
+                assert observation["owner_epoch"] == host_epoch
+                assert observation["source_epoch"] == wake_epoch
+                rows = keyed_observations(observation["targets"])
+                keys = set(rows)
+                assert keys == dual_render or keys == single_render, observation
+                for key, row in rows.items():
+                    names, kinds = coordinate_shapes[key]
+                    assert names
+                    assert row["source_joint_names"] == names, row
+                    assert row["coordinate_kinds"] == kinds, row
+                    assert len(row["compiled_joint_names"]) == len(names), row
+                    assert len(set(row["compiled_joint_names"])) == len(names), row
+                    assert row["compiled_joint_names"] == initial_rows[key]["compiled_joint_names"], row
+                    assert len(row["positions_si"]) == len(names), row
+                    assert row["source_epoch"], row
+                    assert row["source_sequence"] >= 0, row
+                    if key in single_render:
+                        assert row["source_epoch"] == survivor_epochs[key], row
+                        assert row["source_sequence"] >= sequences[key], row
+                        sequences[key] = row["source_sequence"]
+                return keys
+
+            def assert_settled_control_state(
+                control_state: dict[str, Any], expected: set[tuple[str, str, str]],
+                *, check_sequences: bool = True,
+            ) -> None:
+                assert control_state["schema_version"] == "manyforge.execution_control_state.v6"
+                rows = keyed_observations(control_state["observed_targets"])
+                assert set(rows) == expected, control_state
+                for key in single_render:
+                    observed = rows[key]["observed"]
+                    assert observed["complete"] is True, rows[key]
+                    assert observed["source_epoch"] == survivor_epochs[key], rows[key]
+                    if check_sequences:
+                        assert observed["sequence"] >= initial_survivor_sequences[key], rows[key]
+
+            settled_sequences = dict(initial_survivor_sequences)
+            assert assert_observation(initial_response, settled_sequences) == dual_render
+            assert_settled_control_state(
+                initial_status["control_state"], dual_supported, check_sequences=False,
+            )
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                reader = executor.submit(read_publications)
+                try:
+                    if not reader_started.wait(timeout=10.0):
+                        if reader.done():
+                            reader.result()
+                        raise AssertionError("concurrent publication reader did not start")
+                    for kind in ("single", "restore", "replace", "restore"):
+                        _load_scenario(
+                            stack, GROUPED_SCENARIO if kind == "restore" else f"mixed_{kind}",
+                            scenario_path=None if kind == "restore" else paths[kind],
+                            executable=kind != "single",
+                        )
+                        current = survivor_facts(headless.cclc_component("lite6_robot"))
+                        assert current == survivor, (kind, survivor, current)
+                        expected_inventory = single_inventory if kind == "single" else dual_inventory
+                        expected_supported = single_supported if kind == "single" else dual_supported
+                        diagnostics = native.diagnostics()
+                        assert diagnostics.get("ok") is True, diagnostics
+                        status = diagnostics["status"]
+                        assert status["schema_version"] == "manyforge.execution_status.v2"
+                        assert status["identity"]["owner_epoch"] == host_epoch
+                        assert inventory_keys(status["targets"]) == expected_inventory
+                        assert target_keys(status) == expected_supported
+                        assert_settled_control_state(status["control_state"], expected_supported)
+                        identity = native.identity()
+                        assert identity.get("ok") is True, identity
+                        assert identity["identity"]["owner_epoch"] == host_epoch
+                        targets = native.targets()
+                        assert targets.get("ok") is True, targets
+                        assert targets["targets"]["schema_version"] == "manyforge.execution_targets.v3"
+                        assert inventory_keys(targets["targets"]) == expected_inventory
+                        control_state = native.control_state()
+                        assert control_state.get("ok") is True, control_state
+                        assert_settled_control_state(control_state["control_state"], expected_supported)
+                        assert assert_observation(native.observation(), settled_sequences) == (
+                            single_render if kind == "single" else dual_render
+                        )
+                        if reader.done():
+                            reader.result()
+                            raise AssertionError("concurrent publication reader exited early")
+                finally:
+                    stop_reader.set()
+                assert reader.result(timeout=10.0) > 0
+
+
 def test_grouped_dual_robot_run_scales_stops_and_resumes() -> None:
     with _dual_robot_stack() as stack:
-        applied, catalog_revision = _load_scenario(stack, GROUPED_SCENARIO)
-        _save_and_reopen_current_scenario(stack, GROUPED_SCENARIO)
-        with HeadlessHttpClient(stack.composer_url, timeout_seconds=10.0) as client:
-            applied = client.program_applied()
+        _load_scenario(stack, GROUPED_SCENARIO)
+        applied = _save_and_reopen_current_scenario(stack, GROUPED_SCENARIO)
         selector = _group_selector(applied["program_binding_id"])
         with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
             started = _start_run(
                 stack,
-                scenario_id=GROUPED_SCENARIO,
-                source_document_digest=catalog_revision,
+                scenario_id=applied["scenario_id"],
+                source_document_digest=applied["source_document_digest"],
                 applied=applied,
             )
             program_run_id = started["capture"]["program_run_id"]

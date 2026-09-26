@@ -13,7 +13,7 @@ from typing import Any, Callable, Final, Mapping
 from manyforge_headless_api.client import HeadlessHttpClient
 
 
-OBSERVATION_FRAME_SCHEMA: Final = "manyforge.execution_observation_frame.v2"
+OBSERVATION_FRAME_SCHEMA: Final = "manyforge.execution_observation_frame.v3"
 OBSERVATION_CREDIT_SCHEMA: Final = "manyforge.execution_observation_credit.v1"
 OBSERVATION_DEMAND_LEASE_SECONDS: Final = 45.0
 MAXIMUM_OBSERVATION_CLIENTS: Final = 16
@@ -99,15 +99,16 @@ def project_execution_observation(
             "source_sequence",
             "targets",
         }
-        or observed.get("schema_version") != "manyforge.execution_observation.v2"
+        or observed.get("schema_version") != "manyforge.execution_observation.v3"
     ):
         raise ExecutionObservationProjectionError(
             "execution observation schema is unsupported"
         )
     raw_targets = observed.get("targets")
-    if not isinstance(raw_targets, list) or not 0 < len(raw_targets) <= 64:
+    # H1a-IF.2: a cell may have no observable coordinate at all.
+    if not isinstance(raw_targets, list) or len(raw_targets) > 64:
         raise ExecutionObservationProjectionError(
-            "observation targets must contain 1..64 entries"
+            "observation targets must contain 0..64 entries"
         )
     targets = [_project_target(item) for item in raw_targets]
     addresses = [
@@ -152,6 +153,7 @@ def _project_target(raw: Any) -> dict[str, Any]:
     if set(target) != {
         "controllable_component_id",
         "command_target_id",
+        "operation_capability_id",
         "source_epoch",
         "source_sequence",
         "source_joint_names",
@@ -184,6 +186,9 @@ def _project_target(raw: Any) -> dict[str, Any]:
         ),
         "command_target_id": _text(
             target["command_target_id"], "target.command_target"
+        ),
+        "operation_capability_id": _text(
+            target["operation_capability_id"], "target.operation_capability"
         ),
         "source_epoch": _text(target["source_epoch"], "target.source_epoch"),
         "source_sequence": _safe_integer(
@@ -221,6 +226,7 @@ def _render_signature(frame: dict[str, Any]) -> tuple[Any, ...]:
             (
                 target["controllable_component_id"],
                 target["command_target_id"],
+                target["operation_capability_id"],
                 target["source_epoch"],
                 tuple(target["source_joint_names"]),
                 tuple(target["compiled_joint_names"]),

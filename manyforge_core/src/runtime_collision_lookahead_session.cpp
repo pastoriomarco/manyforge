@@ -499,6 +499,12 @@ void RuntimeCollisionLookaheadSession::disarm() noexcept {
   }
 }
 
+bool RuntimeCollisionLookaheadSession::quiescent_for_resource_replacement() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return !arm_.trajectory && !pending_job_.has_value() && !job_active_ &&
+         !callback_active_;
+}
+
 void RuntimeCollisionLookaheadSession::request(
     std::int64_t requested_at_ns, RuntimeCollisionQueryBundlePtr bundle,
     RuntimeContactReleaseStateSnapshot contact_state) noexcept {
@@ -707,6 +713,7 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
       }
       active_cancel_.store(nullptr, std::memory_order_release);
       job_active_ = false;
+      callback_active_ = !stale_arm;
       const auto completed_at_ns = clock_->now();
       const auto active_duration_ns =
           std::max<std::int64_t>(0, completed_at_ns - active_job_started_at_ns_);
@@ -746,6 +753,8 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
         // the existing kernel event-publisher policy.
         std::terminate();
       }
+      std::lock_guard<std::mutex> lock(mutex_);
+      callback_active_ = false;
     }
   }
 }

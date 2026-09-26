@@ -203,6 +203,11 @@ class RuntimeCollisionLookaheadSession final {
            std::optional<ProjectionRevisionDTO> admission_projection_revision = std::nullopt);
   void disarm() noexcept;
 
+  /// True only when this generation has no arm, queued/in-flight job, or
+  /// result callback. Retained collision-resource replacement uses this to
+  /// avoid destroying a publisher still borrowed by the worker.
+  [[nodiscard]] bool quiescent_for_resource_replacement() const;
+
   /// Called only after a clear immediate current-state tick. It never waits:
   /// a busy session coalesces one rerun and returns.
   void request(std::int64_t requested_at_ns, RuntimeCollisionQueryBundlePtr bundle,
@@ -276,6 +281,7 @@ class RuntimeCollisionLookaheadSession final {
   std::optional<Job> pending_job_;
   std::atomic<std::shared_ptr<CollisionCancellationToken>> active_cancel_{nullptr};
   bool job_active_ = false;
+  bool callback_active_ = false;
   std::atomic<bool> accepting_clear_permits_{false};
   std::atomic<std::uint64_t> permit_generation_{1};
   std::atomic<std::uint64_t> reruns_coalesced_total_{0};

@@ -4,6 +4,7 @@
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -111,13 +112,33 @@ materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_native_arm_only_cclc_product_retained_consumer_fixture(
+    const std::filesystem::path& package_root,
+    std::string_view arm_lifecycle_semantic_digest) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_native_arm_only_cclc_product_retention_fixture(
+                        arm_lifecycle_semantic_digest));
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_lite6_native_cclc_product_retained_consumer_fixture(
     const std::filesystem::path& package_root, std::string_view arm_lifecycle_semantic_digest,
-    std::string_view gripper_lifecycle_semantic_digest, bool operator_confirmation = false) {
+    std::string_view gripper_lifecycle_semantic_digest, bool operator_confirmation = false,
+    std::optional<double> initial_joint1_position_rad = std::nullopt) {
   return materialize_lite6_retained_consumer_fixture_from(
       package_root,
       make_lite6_native_cclc_product_retention_fixture(
-          arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest, operator_confirmation));
+          arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest,
+          operator_confirmation, initial_joint1_position_rad));
+}
+
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_native_gripper_only_cclc_product_retained_consumer_fixture(
+    const std::filesystem::path& package_root, std::string_view arm_lifecycle_semantic_digest,
+    std::string_view gripper_lifecycle_semantic_digest) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root, make_lite6_native_gripper_only_cclc_product_retention_fixture(
+                        arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest));
 }
 
 }  // namespace manyforge::deployment::test

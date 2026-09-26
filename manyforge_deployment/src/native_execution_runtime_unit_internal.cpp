@@ -19,6 +19,10 @@
 namespace manyforge::deployment::detail {
 namespace {
 
+constexpr std::string_view kMotionExecutionCapabilityId =
+    "execution.trajectory.execute";
+constexpr std::string_view kGripperCommandCapabilityId = "tool.gripper.command";
+
 constexpr std::string_view kRuntimeProfileConfigurationSchemaId =
     kNativeExecutionRuntimeConfigurationSchemaId;
 constexpr std::string_view kRuntimeProfileConfigurationSchemaRevision =
@@ -175,18 +179,28 @@ canonical_to_json_value(const CanonicalValue &value) {
 [[nodiscard]] const core::ManagerLivenessPolicyDTO&
 manager_liveness_policy_value();
 
-CanonicalValue
-native_execution_runtime_manifest_projection(const core::RuntimeUnitDTO &unit) {
-  const CanonicalValue configuration =
-      require_qualified_runtime_configuration(unit.configuration);
+namespace {
+
+[[nodiscard]] CanonicalValue
+native_execution_runtime_infrastructure_projection(
+    const core::RuntimeUnitId &runtime_unit_id) {
+  const core::RuntimeProfileId runtime_profile_id{
+      std::string(kNativeExecutionRuntimeProfileId)};
+  const core::RuntimeProfileRevision runtime_profile_revision(
+      native_execution_runtime_profile_revision());
+  const auto &contract = require_runtime_contract(
+      runtime_profile_id, runtime_profile_revision,
+      core::ProductContractId(
+          std::string(kNativeExecutionRuntimeProductContractId)),
+      native_execution_runtime_product_contract_revision());
   const auto& liveness = manager_liveness_policy_value();
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kNativeExecutionRuntimeManifestApiVersion))},
-      {"runtime_unit_id", CanonicalValue(unit.runtime_unit_id.value())},
+      {"runtime_unit_id", CanonicalValue(runtime_unit_id.value())},
       {"runtime_product_id", CanonicalValue(native_execution_runtime_product_id(
-                                 unit.runtime_unit_id))},
-      {"configuration", configuration},
+                                 runtime_unit_id))},
+      {"configuration", CanonicalValue(CanonicalValue::Object{})},
       {"manager_liveness_policy",
        CanonicalValue(CanonicalValue::Object{
            {"runtime_policy_id",
@@ -207,9 +221,9 @@ native_execution_runtime_manifest_projection(const core::RuntimeUnitDTO &unit) {
       {"runtime_profile",
        CanonicalValue(CanonicalValue::Object{
            {"runtime_profile_id",
-            CanonicalValue(unit.runtime_profile_id.value())},
+            CanonicalValue(runtime_profile_id.value())},
            {"runtime_profile_revision",
-            CanonicalValue(unit.runtime_profile_revision.value())},
+            CanonicalValue(runtime_profile_revision.value())},
            {"implementation_id", CanonicalValue(std::string(
                                      kNativeExecutionRuntimeImplementationId))},
            {"implementation_revision",
@@ -301,9 +315,24 @@ native_execution_runtime_manifest_projection(const core::RuntimeUnitDTO &unit) {
                 std::string(kNativeExecutionRuntimeLaunchEnvironmentContract))},
        })},
       {"runtime_contract_offer",
-       runtime_contract_offer_projection(
-           require_runtime_contract_for_unit(unit).offer())},
+       runtime_contract_offer_projection(contract.offer())},
   });
+}
+
+} // namespace
+
+CanonicalValue
+native_execution_runtime_manifest_projection(const core::RuntimeUnitDTO &unit) {
+  static_cast<void>(require_qualified_runtime_configuration(unit.configuration));
+  if (unit.runtime_profile_id.value() != kNativeExecutionRuntimeProfileId ||
+      unit.runtime_profile_revision.value() !=
+          native_execution_runtime_profile_revision() ||
+      !unit.dependency_runtime_unit_ids.empty()) {
+    fail_retained_bundle(
+        "runtime unit differs from the stable native execution profile");
+  }
+  return native_execution_runtime_infrastructure_projection(
+      unit.runtime_unit_id);
 }
 
 namespace {
@@ -454,7 +483,9 @@ std::string native_execution_runtime_implementation_revision() {
   return contract_revision(
       "runtime-implementation",
       "native-execution-host;deployment-bound-startup;operation-bound-program;"
-      "projection-handoff-v1;private-rpc-v1;retained-runtime-config-v2;"
+      "projection-handoff-v1;private-rpc-v1;runtime-manifest-v2;"
+      "stable-host-infrastructure;composition-owned-controller-configuration;"
+      "retained-runtime-config-v2;"
       "logical-scene-services-v1;manager-managed-product-composition;"
       "build-owned-candidate-worker;sha256-projection-content;"
       "atomic-resource-table-admission;"
@@ -554,31 +585,15 @@ CanonicalValue parse_and_verify_native_execution_runtime_manifest(
                                     "native_execution_runtime_manifest"),
                      "native_execution_runtime_manifest.runtime_unit_id");
   require_retained_portable_identity(runtime_unit_id, "runtime_unit_id");
-  const auto configuration = canonical_to_json_object(
-      require_member(object, "configuration",
-                     "native_execution_runtime_manifest"),
-      "native_execution_runtime_manifest.configuration");
-  if (!native_execution_runtime_configuration_is_qualified(configuration)) {
+  if (require_member(object, "configuration",
+                     "native_execution_runtime_manifest") !=
+      CanonicalValue(CanonicalValue::Object{})) {
     fail_retained_bundle(
-        "native execution runtime manifest has an unqualified configuration");
-  }
-  const core::RuntimeUnitDTO expected{
-      core::RuntimeUnitId(runtime_unit_id),
-      core::RuntimeProfileId(std::string(kNativeExecutionRuntimeProfileId)),
-      core::RuntimeProfileRevision(native_execution_runtime_profile_revision()),
-      {},
-      configuration,
-  };
-  const auto embedded_offer = decode_runtime_contract_offer_projection(
-      require_member(object, "runtime_contract_offer",
-                     "native_execution_runtime_manifest"),
-      "native_execution_runtime_manifest.runtime_contract_offer");
-  if (embedded_offer != require_runtime_contract_for_unit(expected).offer()) {
-    fail_retained_bundle(
-        "native runtime embedded offer differs from package offer");
+        "native execution runtime manifest configuration must be empty");
   }
   if (api != kNativeExecutionRuntimeManifestApiVersion ||
-      root != native_execution_runtime_manifest_projection(expected)) {
+      root != native_execution_runtime_infrastructure_projection(
+                  core::RuntimeUnitId(runtime_unit_id))) {
     fail_retained_bundle(
         "native execution runtime manifest differs from its closed contract");
   }
@@ -671,34 +686,15 @@ void require_native_execution_runtime_product_matches_retained_bundle(
   }
 }
 
-} // namespace manyforge::deployment::detail
-
-namespace manyforge::deployment::native_execution_runtime_contract {
-
-Configuration
-require_configuration(const RetainedBundle &retained_bundle,
-                      const core::RuntimeUnitId &runtime_unit_id) {
-  if (!verify_retained_bundle_identity(retained_bundle)) {
-    throw RetainedBundleError(
-        "native runtime configuration received an unverifiable bundle");
-  }
-  const auto &unit = detail::require_retained_runtime_unit(
-      retained_bundle.value(), runtime_unit_id);
-  if (unit.runtime_profile_id.value() !=
-          detail::kNativeExecutionRuntimeProfileId ||
-      unit.runtime_profile_revision.value() !=
-          detail::native_execution_runtime_profile_revision() ||
-      !unit.dependency_runtime_unit_ids.empty() ||
-      !detail::native_execution_runtime_configuration_is_qualified(
-          unit.configuration)) {
-    throw RetainedBundleError(
-        "native runtime unit differs from the build-qualified profile");
-  }
-
+native_execution_runtime_contract::Configuration
+decode_native_execution_runtime_configuration(
+    const core::JsonObjectDTO &configuration, const core::CellGraphDTO &graph,
+    const core::RuntimeUnitId &runtime_unit_id) {
+  using native_execution_runtime_contract::Configuration;
   const auto require_member =
       [&](const std::string_view name) -> const core::JsonValueDTO & {
-    const auto found = unit.configuration.find(name);
-    if (found == unit.configuration.end()) {
+    const auto found = configuration.find(name);
+    if (found == configuration.end()) {
       throw RetainedBundleError("native runtime configuration is missing " +
                                 std::string(name));
     }
@@ -732,18 +728,42 @@ require_configuration(const RetainedBundle &retained_bundle,
       std::get_if<core::JsonValueDTO::Array>(
           &require_member("direct_control_joint_limits").value);
   const auto gripper_configurations_member =
-      unit.configuration.find("gripper_target_configurations");
+      configuration.find("gripper_target_configurations");
   const auto *gripper_target_configurations =
-      gripper_configurations_member == unit.configuration.end()
+      gripper_configurations_member == configuration.end()
           ? nullptr
           : std::get_if<core::JsonValueDTO::Array>(
                 &gripper_configurations_member->second.value);
+  // Motion-only fields are required exactly when this unit hosts a motion
+  // capability (H1a-IF.2). A capability-only unit (for example gripper-only)
+  // carries them empty; placeholder joints or TCP limits are refused.
+  const auto hosts = [&](const core::ControllableComponentId &component,
+                         const core::CommandTargetId &target,
+                         const std::string_view capability) {
+    return std::any_of(
+        graph.control_bindings.begin(), graph.control_bindings.end(),
+        [&](const auto &binding) {
+          return binding.provider_runtime_unit_id == runtime_unit_id &&
+                 binding.capability_id.value() == capability &&
+                 (component.empty() ||
+                  (binding.controllable_component_id == component &&
+                   binding.command_target_id == target));
+        });
+  };
+  const bool motion_advertised = std::any_of(
+      graph.control_bindings.begin(), graph.control_bindings.end(),
+      [&](const auto &binding) {
+        return binding.provider_runtime_unit_id == runtime_unit_id &&
+               binding.capability_id.value() == kMotionExecutionCapabilityId;
+      });
   if (mode == nullptr || *mode != "simulated" || positions == nullptr ||
-      positions->empty() || motion_target_limits == nullptr ||
-      motion_target_limits->empty() || direct_control_joint_limits == nullptr) {
+      motion_target_limits == nullptr || direct_control_joint_limits == nullptr ||
+      positions->empty() != !motion_advertised ||
+      motion_target_limits->empty() != !motion_advertised ||
+      (!motion_advertised && !direct_control_joint_limits->empty())) {
     throw RetainedBundleError(
         "native runtime configuration has an unsupported mode or initial "
-        "state");
+        "state for its advertised capabilities");
   }
 
   Configuration result;
@@ -886,7 +906,25 @@ require_configuration(const RetainedBundle &retained_bundle,
     throw RetainedBundleError(
         "native runtime configuration repeats a direct-control joint limit");
   }
-  if (gripper_configurations_member != unit.configuration.end() &&
+  // Direct-control limits apply only to exact motion-execution targets hosted
+  // by this unit; they cannot qualify a gripper or foreign component target.
+  for (const auto &limit : result.direct_control_joint_limits) {
+    if (!hosts(limit.controllable_component_id, limit.command_target_id,
+               kMotionExecutionCapabilityId)) {
+      throw RetainedBundleError(
+          "native runtime direct-control limit names a target this unit does "
+          "not host for motion execution");
+    }
+  }
+  // Each motion limit names a motion target this unit actually hosts.
+  for (const auto &limit : result.motion_target_limits) {
+    if (!hosts(limit.controllable_component_id, limit.command_target_id,
+               kMotionExecutionCapabilityId)) {
+      throw RetainedBundleError(
+          "native runtime motion limit names a target this unit does not host");
+    }
+  }
+  if (gripper_configurations_member != configuration.end() &&
       gripper_target_configurations == nullptr) {
     throw RetainedBundleError(
         "native runtime configuration has invalid gripper target configurations");
@@ -999,12 +1037,50 @@ require_configuration(const RetainedBundle &retained_bundle,
           "native runtime configuration repeats a gripper target configuration");
     }
   }
+  // Each gripper configuration names a gripper target this unit hosts, on
+  // its own component; it never borrows an arm's identity.
+  for (const auto &gripper : result.gripper_target_configurations) {
+    if (!hosts(gripper.controllable_component_id, gripper.command_target_id,
+               kGripperCommandCapabilityId)) {
+      throw RetainedBundleError(
+          "native runtime gripper configuration names a target this unit does "
+          "not host");
+    }
+  }
   if (result.execution_tick_hz == 0U ||
       !(result.collision_monitor_period_ms > 0.0)) {
     throw RetainedBundleError(
         "native runtime configuration has an invalid cadence");
   }
   return result;
+}
+
+} // namespace manyforge::deployment::detail
+
+namespace manyforge::deployment::native_execution_runtime_contract {
+
+Configuration
+require_configuration(const RetainedBundle &retained_bundle,
+                      const core::RuntimeUnitId &runtime_unit_id) {
+  if (!verify_retained_bundle_identity(retained_bundle)) {
+    throw RetainedBundleError(
+        "native runtime configuration received an unverifiable bundle");
+  }
+  const auto &unit = detail::require_retained_runtime_unit(
+      retained_bundle.value(), runtime_unit_id);
+  if (unit.runtime_profile_id.value() !=
+          detail::kNativeExecutionRuntimeProfileId ||
+      unit.runtime_profile_revision.value() !=
+          detail::native_execution_runtime_profile_revision() ||
+      !unit.dependency_runtime_unit_ids.empty() ||
+      !detail::native_execution_runtime_configuration_is_qualified(
+          unit.configuration)) {
+    throw RetainedBundleError(
+        "native runtime unit differs from the build-qualified profile");
+  }
+
+  return detail::decode_native_execution_runtime_configuration(
+      unit.configuration, retained_bundle.value().cell_graph, runtime_unit_id);
 }
 
 std::string implementation_revision() {

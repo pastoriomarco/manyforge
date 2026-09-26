@@ -1,12 +1,14 @@
 #include <gtest/gtest.h>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -28,6 +30,8 @@
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <manyforge_roboplan/retained_native_runtime.hpp>
+#include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <memory>
 #include <optional>
 #include <set>
@@ -46,11 +50,66 @@ namespace content_identity = manyforge::content_identity;
 namespace contract = manyforge::deployment::native_execution_runtime_contract;
 namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
+namespace scene = manyforge::scene;
+using content_identity::CanonicalValue;
 
 constexpr std::string_view kIntentDigest =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+class FixedPlanningSceneSynchronizer final
+    : public core::IPlanningSceneSynchronizer {
+public:
+  explicit FixedPlanningSceneSynchronizer(const std::uint64_t revision_id)
+      : revision_{core::RetainedBundleId("bundle"),
+                  core::GraphRevision("graph"),
+                  core::SceneRevision{
+                      core::SceneId(std::string(kIntentDigest)), revision_id,
+                      core::ContentDigest(std::string(kIntentDigest))}} {}
+
+  [[nodiscard]] core::Result<core::ProjectionRevisionDTO>
+  SynchronizeBeforePlanning() override {
+    ++calls_;
+    return core::Result<core::ProjectionRevisionDTO>::Ok(revision_);
+  }
+
+  [[nodiscard]] std::size_t calls() const noexcept { return calls_; }
+
+private:
+  core::ProjectionRevisionDTO revision_;
+  std::size_t calls_{};
+};
+
+class TaggedReferencePoseResolver final : public core::IReferencePoseResolver {
+public:
+  explicit TaggedReferencePoseResolver(std::string tag)
+      : tag_(std::move(tag)) {}
+
+  core::Result<core::ProgramFrameResolutionContextDTO>
+  capture_program_frame_resolution_context(
+      core::ProgramFrameResolutionCaptureDTO) const override {
+    return core::Result<core::ProgramFrameResolutionContextDTO>::Err(
+        core::ErrorDTO{tag_ + ".capture", "tagged resolver capture", {}});
+  }
+
+  core::Result<core::Pose3DTO> resolve_reference_pose(
+      const core::ReferenceDTO &,
+      const core::ProgramFrameResolutionContextDTO &) const override {
+    return core::Result<core::Pose3DTO>::Err(
+        core::ErrorDTO{tag_ + ".reference", "tagged resolver reference", {}});
+  }
+
+  core::Result<core::ResolvedSceneFramePoseDTO> resolve_scene_frame(
+      const core::SceneFrameRefDTO &,
+      const core::SceneFrameResolutionContextDTO &) const override {
+    return core::Result<core::ResolvedSceneFramePoseDTO>::Err(
+        core::ErrorDTO{tag_ + ".scene", "tagged resolver scene", {}});
+  }
+
+private:
+  std::string tag_;
+};
 
 [[nodiscard]] core::LogicalSceneSnapshotRoot
 MakeEmptyScene(const core::CellId &cell_id, const std::uint64_t revision_id) {
@@ -356,6 +415,105 @@ ExecutionPacket(const std::filesystem::path &socket_path,
       std::string_view(bytes.data(), static_cast<std::size_t>(count)));
 }
 
+/// The host intentionally asks the Manager for the current Scene revision
+/// before publishing identity/status. This small test authority supplies that
+/// read-only Manager-owned projection for the adapter-only arm fixture; it
+/// does not replace Scene admission or command authority.
+class ManagerSceneReadServer final {
+public:
+  ManagerSceneReadServer(
+      const std::filesystem::path &manager_run_root,
+      const core::ProjectionRevisionDTO &projection,
+      const core::LogicalSceneSnapshotDTO &scene_snapshot) {
+    const auto socket_path = manager_run_root / "manager-command.sock";
+    const auto spelling = socket_path.string();
+    if (spelling.size() >= sizeof(sockaddr_un::sun_path))
+      throw std::runtime_error("Manager scene test socket path exceeds bound");
+    descriptor_ = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (descriptor_ < 0)
+      throw std::runtime_error("Manager scene test socket creation failed");
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::copy(spelling.begin(), spelling.end(), address.sun_path);
+    if (::bind(descriptor_, reinterpret_cast<const sockaddr *>(&address),
+               sizeof(address)) != 0 ||
+        ::listen(descriptor_, 8) != 0) {
+      ::close(descriptor_);
+      descriptor_ = -1;
+      throw std::runtime_error("Manager scene test socket setup failed");
+    }
+    response_ = content_identity::canonical_json(CanonicalValue(
+        CanonicalValue::Object{
+            {"api_version",
+             CanonicalValue("manyforge.manager_command_response.v1")},
+            {"logical_scene",
+             content_identity::parse_canonical_json(
+                 scene::EncodeLogicalSceneSnapshot(scene_snapshot))},
+            {"ok", CanonicalValue(true)},
+            {"projection_revision",
+             CanonicalValue(CanonicalValue::Object{
+                 {"graph_revision",
+                  CanonicalValue(projection.graph_revision.value())},
+                 {"retained_bundle_id",
+                  CanonicalValue(projection.retained_bundle_id.value())},
+                 {"scene_revision",
+                  CanonicalValue(CanonicalValue::Object{
+                      {"content_hash", CanonicalValue(
+                                           projection.scene_revision.content_hash
+                                               .value())},
+                      {"revision_id", CanonicalValue(static_cast<double>(
+                                               projection.scene_revision
+                                                   .revision_id))},
+                      {"scene_id", CanonicalValue(
+                                       projection.scene_revision.scene_id.value())},
+                  })},
+             })},
+            {"request_owner_epoch",
+             CanonicalValue("native-adapter-scene-owner")},
+        }));
+    thread_ = std::thread([this] { Serve(); });
+  }
+
+  ~ManagerSceneReadServer() {
+    stopping_.store(true, std::memory_order_release);
+    if (thread_.joinable()) thread_.join();
+    if (descriptor_ >= 0) ::close(descriptor_);
+  }
+
+  ManagerSceneReadServer(const ManagerSceneReadServer &) = delete;
+  ManagerSceneReadServer &operator=(const ManagerSceneReadServer &) = delete;
+
+private:
+  void Serve() noexcept {
+    while (!stopping_.load(std::memory_order_acquire)) {
+      pollfd ready{descriptor_, POLLIN, 0};
+      const auto polled = ::poll(&ready, 1, 50);
+      if (polled <= 0 || (ready.revents & POLLIN) == 0) continue;
+      const int client = ::accept4(descriptor_, nullptr, nullptr, SOCK_CLOEXEC);
+      if (client < 0) continue;
+      std::array<char, 4096> request{};
+      const auto received = ::recv(client, request.data(), request.size(), 0);
+      if (received > 0) {
+        const auto parsed = content_identity::parse_canonical_json(
+            std::string_view(request.data(),
+                             static_cast<std::size_t>(received)));
+        const auto *command = parsed.find_object_member("command");
+        if (command != nullptr && command->is_string() &&
+            command->as_string() == "scene_owner_read") {
+          static_cast<void>(::send(client, response_.data(), response_.size(),
+                                   MSG_NOSIGNAL));
+        }
+      }
+      ::close(client);
+    }
+  }
+
+  int descriptor_{-1};
+  std::atomic_bool stopping_{};
+  std::string response_;
+  std::thread thread_;
+};
+
 class CountingBundleSource final
     : public deployment::IVerifiedRetainedBundleSource {
 public:
@@ -560,6 +718,95 @@ WaitForAuthoringAdmission(
   return std::nullopt;
 }
 
+[[nodiscard]] bool BootstrapNativeProjectionSet(
+    NativeFixture &fixture,
+    component_manager::RetainedNativeRuntimeUnitAdapter &adapter,
+    const core::NativeProjectionBootstrapStatusQueryDTO &bootstrap_query,
+    const core::LogicalSceneSnapshotRoot &initial_scene,
+    core::IPlannerSceneProjection &primary_projection) {
+  for (const auto &required_binding : NativeProjectionBindings(
+           fixture, bootstrap_query.native_runtime_binding.runtime_epoch)) {
+    if (required_binding == bootstrap_query.native_runtime_binding) {
+      continue;
+    }
+    const auto required = adapter.ResolveProjection(required_binding);
+    if (!required.ok()) {
+      ADD_FAILURE() << required.error().message;
+      return false;
+    }
+    const core::NativeProjectionBootstrapRebuildDTO required_request{
+        bootstrap_query.bootstrap_id,
+        bootstrap_query.bootstrap_generation,
+        required_binding,
+        bootstrap_query.canonical_empty_target,
+        fixture.bundle->value().compiled_products.planning_collision_model,
+        initial_scene};
+    const auto required_result =
+        required.value()->RebuildBootstrapProjection(required_request);
+    if (!required_result.presence_valid()) {
+      ADD_FAILURE() << "required native projection bootstrap is invalid";
+      return false;
+    }
+    EXPECT_TRUE(required_result.resulting_health.healthy_for_target(
+        bootstrap_query.canonical_empty_target));
+  }
+
+  const core::NativeProjectionBootstrapRebuildDTO bootstrap_request{
+      bootstrap_query.bootstrap_id,
+      bootstrap_query.bootstrap_generation,
+      bootstrap_query.native_runtime_binding,
+      bootstrap_query.canonical_empty_target,
+      fixture.bundle->value().compiled_products.planning_collision_model,
+      initial_scene};
+  const auto bootstrapped =
+      primary_projection.RebuildBootstrapProjection(bootstrap_request);
+  if (!bootstrapped.presence_valid()) {
+    ADD_FAILURE() << "primary native projection bootstrap is invalid";
+    return false;
+  }
+  EXPECT_EQ(bootstrapped.state,
+            core::NativeProjectionBootstrapRebuildState::kRebuilt);
+  EXPECT_TRUE(bootstrapped.resulting_health.healthy_for_target(
+      bootstrap_query.canonical_empty_target));
+  return true;
+}
+
+TEST(RetainedPlanningSceneSynchronizer,
+     StableOwnerForwardsToItsCurrentTarget) {
+  auto first = std::make_shared<FixedPlanningSceneSynchronizer>(1U);
+  auto second = std::make_shared<FixedPlanningSceneSynchronizer>(2U);
+  RetainedPlanningSceneSynchronizer owner(first);
+  auto *const stable_owner =
+      static_cast<core::IPlanningSceneSynchronizer *>(&owner);
+
+  const auto first_result = owner.SynchronizeBeforePlanning();
+  ASSERT_TRUE(first_result.ok());
+  EXPECT_EQ(first_result.value().scene_revision.revision_id, 1U);
+
+  owner.ReplaceTarget(second);
+  const auto second_result = owner.SynchronizeBeforePlanning();
+  ASSERT_TRUE(second_result.ok());
+  EXPECT_EQ(second_result.value().scene_revision.revision_id, 2U);
+  EXPECT_EQ(stable_owner,
+            static_cast<core::IPlanningSceneSynchronizer *>(&owner));
+  EXPECT_EQ(first->calls(), 1U);
+  EXPECT_EQ(second->calls(), 1U);
+}
+
+TEST(RetainedReferencePoseResolverProxy,
+     StableKernelPortReplacesItsTargetWithoutChangingItsAddress) {
+  auto first = std::make_shared<TaggedReferencePoseResolver>("first");
+  auto second = std::make_shared<TaggedReferencePoseResolver>("second");
+  RetainedReferencePoseResolverProxy owner(first);
+  auto *const stable_owner =
+      static_cast<core::IReferencePoseResolver *>(&owner);
+
+  EXPECT_NO_THROW(owner.ReplaceTarget(second));
+  EXPECT_EQ(stable_owner,
+            static_cast<core::IReferencePoseResolver *>(&owner));
+  EXPECT_THROW(owner.ReplaceTarget(nullptr), std::invalid_argument);
+}
+
 TEST(NativeExecutionRuntimeUnitAdmission,
      SelectsOnlyTheBuildOwnedInstalledTargetAndFixedArguments) {
   NativeFixture fixture;
@@ -572,9 +819,9 @@ TEST(NativeExecutionRuntimeUnitAdmission,
   EXPECT_EQ(admission->installed_target_id(), contract::kInstalledTargetId);
   EXPECT_EQ(admission->implementation_revision(),
             contract::implementation_revision());
-  EXPECT_EQ(admission->implementation_revision(),
-            "sha256:"
-            "003f915c030a96347ca9f79ac4fe6fd8ead5baec3790e9b44377e1eaad6dc400");
+  // The installed offer is generated from this build's implementation. Its
+  // revision legitimately changes with the native host; admission must match
+  // that exact offer, not a historical implementation digest.
   EXPECT_EQ(fixture.query->plan.process_adapter_contract_revision,
             "sha256:"
             "c5ee4ce0842e61b38da1c34e3979244896ae40461b5d6bb0fe3e1e81aac10186");
@@ -1171,6 +1418,356 @@ TEST(RetainedNativeRuntimeUnitAdapter,
 }
 
 TEST(RetainedNativeRuntimeUnitAdapter,
+     ArmOnlyManagedCompositionProjectsExplicitAbsentGripper) {
+  NativeFixture fixture(MANYFORGE_CCLC_READINESS_FIXTURE_ROOT);
+  const auto publication = PublishActiveFixture(fixture);
+  auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT);
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch runtime_epoch(started.process_incarnation());
+  const auto binding = NativeProjectionBinding(fixture, runtime_epoch);
+  const auto resolved = adapter.ResolveProjection(binding);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+
+  const auto initial_scene =
+      MakeEmptyScene(fixture.bundle->value().cell_graph.cell_id, 1U);
+  const core::ProjectionRevisionDTO initial_revision{
+      fixture.bundle->retained_bundle_id(),
+      fixture.bundle->value().cell_graph.graph_revision,
+      initial_scene.shared()->revision};
+  ASSERT_EQ(initial_revision,
+            publication.request.candidate_projection_revision);
+  const core::NativeProjectionBootstrapStatusQueryDTO bootstrap_query{
+      core::BootstrapId("native-adapter-bootstrap"),
+      core::BootstrapGeneration(1U), binding, initial_revision};
+  ASSERT_TRUE(BootstrapNativeProjectionSet(
+      fixture, adapter, bootstrap_query, initial_scene, *resolved.value()));
+
+  ManagerSceneReadServer manager_scene_authority(
+      fixture.manager_run_root.path(), initial_revision,
+      *initial_scene.shared());
+
+  const auto command_socket =
+      fixture.execution_run_root.path() / "execution-command.sock";
+  const auto identity_packet =
+      R"({"api_version":"manyforge.execution_command.v1","command":"identity"})";
+  std::optional<content_identity::CanonicalValue> identity_response;
+  std::optional<content_identity::CanonicalValue> last_identity_response;
+  const auto identity_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (std::chrono::steady_clock::now() < identity_deadline &&
+         !identity_response.has_value()) {
+    try {
+      auto response = ExecutionPacket(command_socket, identity_packet);
+      last_identity_response = response;
+      const auto *ok = response.find_object_member("ok");
+      if (ok != nullptr && ok->is_bool() && ok->as_bool() &&
+          response.find_object_member("identity") != nullptr) {
+        identity_response = std::move(response);
+      }
+    } catch (const std::runtime_error &) {
+      // The child may not have opened its command socket yet.
+    }
+    if (!identity_response.has_value()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  if (!identity_response.has_value()) {
+    static_cast<void>(adapter.EnsureStopped(*fixture.query));
+    FAIL() << "arm-only execution identity did not become ready"
+           << (last_identity_response.has_value()
+                   ? ": " + content_identity::canonical_json(
+                               *last_identity_response)
+                   : "; no command response was received");
+    return;
+  }
+
+  const auto query = [&](const std::string_view command) {
+    return ExecutionPacket(
+        command_socket,
+        "{\"api_version\":\"manyforge.execution_command.v1\","
+        "\"command\":\"" +
+            std::string(command) + "\"}");
+  };
+  const auto status_response = query("status");
+  const auto targets_response = query("targets");
+  const auto control_state_response = query("control_state");
+  const auto observation_response = query("observation");
+  const auto *identity = identity_response->find_object_member("identity");
+  ASSERT_NE(identity, nullptr);
+  EXPECT_EQ(TextMember(*identity, "schema_version"),
+            "manyforge.execution_identity.v2");
+  EXPECT_EQ(identity->as_object().size(), 8U);
+  for (const auto field : {"gripper_command_schema_id",
+                           "gripper_command_schema_revision",
+                           "gripper_target_role_id", "motion_target_role_id",
+                           "program_binding_id", "program_id",
+                           "program_revision"}) {
+    EXPECT_EQ(identity->find_object_member(field), nullptr) << field;
+  }
+
+  const auto *status = status_response.find_object_member("status");
+  ASSERT_NE(status, nullptr);
+  EXPECT_EQ(TextMember(*status, "schema_version"),
+            "manyforge.execution_status.v2");
+  const auto *status_identity = status->find_object_member("identity");
+  ASSERT_NE(status_identity, nullptr);
+  EXPECT_EQ(*status_identity, *identity);
+  const auto *status_targets = status->find_object_member("targets");
+  ASSERT_NE(status_targets, nullptr);
+  EXPECT_EQ(TextMember(*status_targets, "schema_version"),
+            "manyforge.execution_targets.v3");
+  const auto *status_components =
+      status_targets->find_object_member("components");
+  ASSERT_NE(status_components, nullptr);
+  ASSERT_TRUE(status_components->is_array());
+  ASSERT_EQ(status_components->as_array().size(), 1U);
+  const auto &status_component = status_components->as_array().front();
+  EXPECT_EQ(TextMember(status_component, "controllable_component_id"),
+            "lite6_arm");
+  const auto *status_component_targets =
+      status_component.find_object_member("targets");
+  ASSERT_NE(status_component_targets, nullptr);
+  ASSERT_TRUE(status_component_targets->is_array());
+  ASSERT_EQ(status_component_targets->as_array().size(), 1U);
+  const auto &status_target = status_component_targets->as_array().front();
+  EXPECT_EQ(TextMember(status_target, "command_target_id"), "arm");
+  EXPECT_EQ(TextMember(status_target, "operation_capability_id"),
+            "execution.trajectory.execute");
+  EXPECT_EQ(TextMember(status_target, "presentation"), "motion");
+  ASSERT_NE(status_target.find_object_member("command"), nullptr);
+  const auto *status_control_state =
+      status->find_object_member("control_state");
+  ASSERT_NE(status_control_state, nullptr);
+  EXPECT_EQ(TextMember(*status_control_state, "schema_version"),
+            "manyforge.execution_control_state.v6");
+  const auto *status_observed_targets =
+      status_control_state->find_object_member("observed_targets");
+  ASSERT_NE(status_observed_targets, nullptr);
+  ASSERT_TRUE(status_observed_targets->is_array());
+  ASSERT_EQ(status_observed_targets->as_array().size(), 1U);
+
+  const auto *targets = targets_response.find_object_member("targets");
+  ASSERT_NE(targets, nullptr);
+  EXPECT_EQ(TextMember(*targets, "schema_version"),
+            "manyforge.execution_targets.v3");
+  ASSERT_EQ(targets->as_object().size(), 2U);
+  const auto *components = targets->find_object_member("components");
+  ASSERT_NE(components, nullptr);
+  ASSERT_TRUE(components->is_array());
+  ASSERT_EQ(components->as_array().size(), 1U);
+  const auto &component = components->as_array().front();
+  ASSERT_EQ(component.as_object().size(), 3U);
+  const auto *component_id =
+      component.find_object_member("controllable_component_id");
+  ASSERT_NE(component_id, nullptr);
+  const auto *availability = component.find_object_member("availability");
+  ASSERT_NE(availability, nullptr);
+  ASSERT_EQ(availability->as_object().size(), 2U);
+  const auto *command_eligible =
+      availability->find_object_member("command_eligible");
+  ASSERT_NE(command_eligible, nullptr);
+  ASSERT_TRUE(command_eligible->is_bool());
+  const auto *availability_reason = availability->find_object_member("reason");
+  ASSERT_NE(availability_reason, nullptr);
+  EXPECT_EQ(command_eligible->as_bool(), availability_reason->is_null());
+  if (!command_eligible->as_bool()) {
+    EXPECT_TRUE(availability_reason->is_string());
+    EXPECT_FALSE(TextMember(*availability, "reason").empty());
+  }
+  const auto *component_targets = component.find_object_member("targets");
+  ASSERT_NE(component_targets, nullptr);
+  ASSERT_TRUE(component_targets->is_array());
+  ASSERT_EQ(component_targets->as_array().size(), 1U);
+  const auto &target = component_targets->as_array().front();
+  ASSERT_EQ(target.as_object().size(), 4U);
+  EXPECT_EQ(TextMember(target, "command_target_id"), "arm");
+  EXPECT_EQ(TextMember(target, "operation_capability_id"),
+            "execution.trajectory.execute");
+  EXPECT_EQ(TextMember(target, "presentation"), "motion");
+  const auto *target_command = target.find_object_member("command");
+  ASSERT_NE(target_command, nullptr);
+  ASSERT_TRUE(target_command->is_object());
+  ASSERT_EQ(target_command->as_object().size(), 9U);
+  EXPECT_EQ(target_command->find_object_member("controllable_component_id"),
+            nullptr);
+  EXPECT_EQ(target_command->find_object_member("command_target_id"), nullptr);
+  EXPECT_EQ(target_command->find_object_member("operation_capability_id"),
+            nullptr);
+  EXPECT_EQ(target_command->find_object_member("observed_state"), nullptr);
+  const auto *manual_control =
+      target_command->find_object_member("manual_control");
+  ASSERT_NE(manual_control, nullptr);
+  ASSERT_EQ(manual_control->as_object().size(), 4U);
+  const auto *target_descriptor =
+      target_command->find_object_member("target_descriptor");
+  ASSERT_NE(target_descriptor, nullptr);
+  EXPECT_EQ(TextMember(*target_command, "target_role_id"),
+            TextMember(*target_descriptor, "target_role_id"));
+  EXPECT_EQ(TextMember(*target_descriptor, "controllable_component_id"),
+            TextMember(component, "controllable_component_id"));
+  EXPECT_EQ(TextMember(*target_descriptor, "command_target_id"),
+            TextMember(target, "command_target_id"));
+  const auto *targets_identity =
+      targets_response.find_object_member("identity");
+  ASSERT_NE(targets_identity, nullptr);
+  EXPECT_EQ(*targets_identity, *identity);
+
+  const auto *control_state =
+      control_state_response.find_object_member("control_state");
+  ASSERT_NE(control_state, nullptr);
+  EXPECT_EQ(TextMember(*control_state, "schema_version"),
+            "manyforge.execution_control_state.v6");
+  EXPECT_EQ(control_state->find_object_member("observed_motion"), nullptr);
+  EXPECT_EQ(control_state->find_object_member("observed_gripper"), nullptr);
+  const auto *observed_targets =
+      control_state->find_object_member("observed_targets");
+  ASSERT_NE(observed_targets, nullptr);
+  ASSERT_TRUE(observed_targets->is_array());
+  ASSERT_EQ(observed_targets->as_array().size(), 1U);
+  const auto &observed_target = observed_targets->as_array().front();
+  EXPECT_EQ(TextMember(observed_target, "controllable_component_id"),
+            "lite6_arm");
+  EXPECT_EQ(TextMember(observed_target, "command_target_id"), "arm");
+  EXPECT_EQ(TextMember(observed_target, "operation_capability_id"),
+            "execution.trajectory.execute");
+  const auto *observed = observed_target.find_object_member("observed");
+  ASSERT_NE(observed, nullptr);
+  EXPECT_FALSE(observed->is_null());
+  EXPECT_EQ(TextMember(*observed, "kind"), "joint_positions");
+  const auto *control_state_identity =
+      control_state_response.find_object_member("identity");
+  ASSERT_NE(control_state_identity, nullptr);
+  EXPECT_EQ(*control_state_identity, *identity);
+
+  const auto *observation =
+      observation_response.find_object_member("observation");
+  ASSERT_NE(observation, nullptr);
+  const auto *observation_ok =
+      observation_response.find_object_member("ok");
+  ASSERT_NE(observation_ok, nullptr);
+  ASSERT_TRUE(observation_ok->is_bool());
+  EXPECT_TRUE(observation_ok->as_bool());
+  EXPECT_EQ(TextMember(*observation, "schema_version"),
+            "manyforge.execution_observation.v3");
+  const auto *observation_targets =
+      observation->find_object_member("targets");
+  ASSERT_NE(observation_targets, nullptr);
+  ASSERT_TRUE(observation_targets->is_array());
+  ASSERT_EQ(observation_targets->as_array().size(), 1U);
+  const auto &observation_target = observation_targets->as_array().front();
+  EXPECT_EQ(TextMember(observation_target, "controllable_component_id"),
+            TextMember(observed_target, "controllable_component_id"));
+  EXPECT_EQ(TextMember(observation_target, "command_target_id"),
+            TextMember(observed_target, "command_target_id"));
+  EXPECT_EQ(TextMember(observation_target, "operation_capability_id"),
+            TextMember(observed_target, "operation_capability_id"));
+
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     GripperOnlyManagedCompositionNeedsNoMotionProjectionAcrossRestart) {
+  NativeFixture fixture(MANYFORGE_I6_NATIVE_GRIPPER_ONLY_FIXTURE_ROOT);
+  const auto manifest = deployment::parse_strict_json_model_yaml(
+      ReadFile(fixture.root / "manifest.json"));
+  const auto *gripper_only =
+      manifest.root().find_object_member("gripper_only");
+  ASSERT_NE(gripper_only, nullptr);
+  ASSERT_TRUE(gripper_only->is_bool());
+  ASSERT_TRUE(gripper_only->as_bool());
+  for (const auto field : {"target_role_id", "execution_capability_id",
+                           "planning_capability_ids", "source_joint_names"}) {
+    EXPECT_EQ(manifest.root().find_object_member(field), nullptr) << field;
+  }
+  static_cast<void>(PublishActiveFixture(fixture));
+  auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_EXECUTION_TARGET_ROOT);
+  const auto socket = fixture.execution_run_root.path() /
+                      "execution-command.sock";
+  const auto query = [&](const std::string_view command) {
+    return ExecutionPacket(
+        socket,
+        "{\"api_version\":\"manyforge.execution_command.v1\","
+        "\"command\":\"" + std::string(command) + "\"}");
+  };
+  const auto check_status = [&] {
+    std::optional<content_identity::CanonicalValue> result;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline && !result.has_value()) {
+      try {
+        auto response = query("status");
+        const auto *ok = response.find_object_member("ok");
+        if (ok != nullptr && ok->is_bool() && ok->as_bool())
+          result = std::move(response);
+      } catch (const std::runtime_error &) {
+        // The managed child can still be opening its command socket.
+      }
+      if (!result.has_value())
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return result;
+  };
+
+  for (int attempt = 0; attempt != 2; ++attempt) {
+    const auto started = adapter.EnsureRunning(*fixture.query);
+    ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+    const auto response = check_status();
+    ASSERT_TRUE(response.has_value())
+        << "gripper-only managed status did not become ready";
+    const auto *status = response->find_object_member("status");
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(TextMember(*status, "schema_version"),
+              "manyforge.execution_status.v2");
+    const auto *identity = status->find_object_member("identity");
+    ASSERT_NE(identity, nullptr);
+    EXPECT_EQ(TextMember(*identity, "schema_version"),
+              "manyforge.execution_identity.v2");
+    for (const auto field : {"motion_target_role_id", "program_binding_id",
+                             "gripper_target_role_id"})
+      EXPECT_EQ(identity->find_object_member(field), nullptr) << field;
+
+    const auto *targets = status->find_object_member("targets");
+    ASSERT_NE(targets, nullptr);
+    const auto *components = targets->find_object_member("components");
+    ASSERT_NE(components, nullptr);
+    ASSERT_TRUE(components->is_array());
+    ASSERT_EQ(components->as_array().size(), 1U);
+    const auto *target_rows =
+        components->as_array().front().find_object_member("targets");
+    ASSERT_NE(target_rows, nullptr);
+    ASSERT_TRUE(target_rows->is_array());
+    ASSERT_EQ(target_rows->as_array().size(), 1U);
+    const auto &target = target_rows->as_array().front();
+    EXPECT_EQ(TextMember(target, "presentation"), "gripper");
+    EXPECT_EQ(TextMember(target, "operation_capability_id"),
+              "tool.gripper.command");
+    const auto *command = target.find_object_member("command");
+    ASSERT_NE(command, nullptr);
+    ASSERT_TRUE(command->is_object());
+    const auto *manual = command->find_object_member("manual_control");
+    ASSERT_NE(manual, nullptr);
+    ASSERT_TRUE(manual->is_object());
+
+    const auto *control = status->find_object_member("control_state");
+    ASSERT_NE(control, nullptr);
+    const auto *scale = control->find_object_member("runtime_scale_control");
+    ASSERT_NE(scale, nullptr);
+    EXPECT_TRUE(scale->is_null());
+    const auto *observed = control->find_object_member("observed_targets");
+    ASSERT_NE(observed, nullptr);
+    ASSERT_TRUE(observed->is_array());
+    ASSERT_EQ(observed->as_array().size(), 1U);
+    EXPECT_EQ(TextMember(observed->as_array().front(),
+                         "operation_capability_id"),
+              "tool.gripper.command");
+    EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+              component_manager::ProcessPresenceState::kAbsent);
+  }
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
      ExactIdentityResolverReturnsPrivateChildProjectionClient) {
   NativeFixture fixture;
   const auto publication = PublishActiveFixture(fixture);
@@ -1206,40 +1803,8 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   // joint-goal projection makes the active composition buildable. This keeps
   // the asynchronous child from observing a partially initialized provider
   // set as a stale active composition.
-  for (const auto &required_binding :
-       NativeProjectionBindings(fixture, first_epoch)) {
-    if (required_binding == binding) {
-      continue;
-    }
-    const auto required = adapter.ResolveProjection(required_binding);
-    ASSERT_TRUE(required.ok()) << required.error().message;
-    const core::NativeProjectionBootstrapRebuildDTO required_request{
-        bootstrap_query.bootstrap_id,
-        bootstrap_query.bootstrap_generation,
-        required_binding,
-        initial_revision,
-        fixture.bundle->value().compiled_products.planning_collision_model,
-        initial_scene};
-    const auto required_result =
-        required.value()->RebuildBootstrapProjection(required_request);
-    ASSERT_TRUE(required_result.presence_valid());
-    EXPECT_TRUE(
-        required_result.resulting_health.healthy_for_target(initial_revision));
-  }
-  const core::NativeProjectionBootstrapRebuildDTO bootstrap_request{
-      bootstrap_query.bootstrap_id,
-      bootstrap_query.bootstrap_generation,
-      binding,
-      initial_revision,
-      fixture.bundle->value().compiled_products.planning_collision_model,
-      initial_scene};
-  const auto bootstrapped =
-      resolved.value()->RebuildBootstrapProjection(bootstrap_request);
-  ASSERT_TRUE(bootstrapped.presence_valid());
-  EXPECT_EQ(bootstrapped.state,
-            core::NativeProjectionBootstrapRebuildState::kRebuilt);
-  EXPECT_TRUE(
-      bootstrapped.resulting_health.healthy_for_target(initial_revision));
+  ASSERT_TRUE(BootstrapNativeProjectionSet(
+      fixture, adapter, bootstrap_query, initial_scene, *resolved.value()));
   const auto observed_authoring_admission =
       WaitForAuthoringAdmission(adapter, std::chrono::seconds(30));
   ASSERT_TRUE(observed_authoring_admission.has_value());
@@ -1581,6 +2146,242 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   }
   EXPECT_TRUE(rebuilt_health.healthy_for_target(candidate_revision));
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+TEST(RetainedNativeRuntimeUnitAdapter,
+     SameProviderCandidateRebuildKeepsPredecessorLeaseUntilRelease) {
+  // Merge immutable CAS entries in a disposable package, leaving both generated
+  // fixture roots untouched. The ordinary verifier admits each exact bundle.
+  ScopedTemporaryRoot merged;
+  const auto fixture_root = merged.path() / "fixture";
+  std::filesystem::copy(MANYFORGE_I6_NATIVE_FIXTURE_ROOT, fixture_root,
+                        std::filesystem::copy_options::recursive);
+  NativeFixture successor(MANYFORGE_NATIVE_PROJECTION_SUCCESSOR_FIXTURE_ROOT);
+  std::filesystem::copy(
+      successor.root / "retained-package", fixture_root / "retained-package",
+      std::filesystem::copy_options::recursive |
+          std::filesystem::copy_options::skip_existing);
+  NativeFixture fixture(fixture_root);
+  ASSERT_NE(fixture.bundle->retained_bundle_id(),
+            successor.bundle->retained_bundle_id());
+  ASSERT_NE(fixture.bundle->value().cell_graph.graph_revision,
+            successor.bundle->value().cell_graph.graph_revision);
+  ASSERT_EQ(fixture.bundle->value().cell_graph.cell_id,
+            successor.bundle->value().cell_graph.cell_id);
+  ASSERT_EQ(fixture.query->plan.product_identity,
+            successor.query->plan.product_identity);
+  ASSERT_EQ(fixture.query->plan.configuration_identity,
+            successor.query->plan.configuration_identity);
+  ASSERT_EQ(fixture.query->plan.runtime_contract_offer_digest,
+            successor.query->plan.runtime_contract_offer_digest);
+
+  const auto publication = PublishActiveFixture(fixture);
+  ScopedTemporaryRoot projection_control;
+  auto adapter = MakeAdapter(fixture, MANYFORGE_NATIVE_PROJECTION_TEST_TARGET_ROOT);
+  // Declared after adapter: assertion unwinding releases construction before
+  // the adapter drains its child, and restores the inherited environment.
+  class ProjectionRebuildHold final {
+  public:
+    explicit ProjectionRebuildHold(std::filesystem::path root)
+        : root_(std::move(root)),
+          previous_control_(Environment(
+              "MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR")),
+          previous_hold_(Environment("MANYFORGE_NATIVE_PROJECTION_TEST_HOLD")) {}
+
+    ~ProjectionRebuildHold() {
+      static_cast<void>(Release());
+      Restore("MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR", previous_control_);
+      Restore("MANYFORGE_NATIVE_PROJECTION_TEST_HOLD", previous_hold_);
+    }
+
+    bool Configure() const {
+      return ::setenv("MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR",
+                      root_.string().c_str(), 1) == 0 &&
+             ::setenv("MANYFORGE_NATIVE_PROJECTION_TEST_HOLD", "rebuild", 1) == 0;
+    }
+
+    bool Release() const noexcept {
+      try {
+        std::ofstream marker(root_ / "rebuild.release");
+        marker << "release\n";
+        return static_cast<bool>(marker);
+      } catch (...) {
+        return false;
+      }
+    }
+
+  private:
+    static std::optional<std::string> Environment(const char *name) {
+      const auto *value = std::getenv(name);
+      return value != nullptr ? std::optional<std::string>(value) : std::nullopt;
+    }
+
+    static void Restore(const char *name,
+                        const std::optional<std::string> &value) noexcept {
+      if (value.has_value())
+        static_cast<void>(::setenv(name, value->c_str(), 1));
+      else
+        static_cast<void>(::unsetenv(name));
+    }
+
+    std::filesystem::path root_;
+    std::optional<std::string> previous_control_;
+    std::optional<std::string> previous_hold_;
+  } projection_hold(projection_control.path());
+  ASSERT_TRUE(projection_hold.Configure());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  const auto binding = NativeProjectionBinding(fixture, epoch);
+  ASSERT_EQ(binding, NativeProjectionBinding(successor, epoch));
+  ASSERT_EQ(NativeProjectionBindings(fixture, epoch),
+            NativeProjectionBindings(successor, epoch));
+  const auto resolved = adapter.ResolveProjection(binding);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  auto &projection = *resolved.value();
+  const auto initial_scene =
+      MakeEmptyScene(fixture.bundle->value().cell_graph.cell_id, 1U);
+  const auto initial_revision = publication.request.candidate_projection_revision;
+  const core::NativeProjectionBootstrapStatusQueryDTO bootstrap{
+      core::BootstrapId("native-adapter-bootstrap"),
+      core::BootstrapGeneration(1U), binding, initial_revision};
+  ASSERT_TRUE(BootstrapNativeProjectionSet(
+      fixture, adapter, bootstrap, initial_scene, projection));
+
+  const core::ProjectionLeaseId old_lease("native-adapter.predecessor-lease");
+  const auto retained =
+      projection.RetainProjectionBinding(initial_revision, old_lease);
+  ASSERT_TRUE(retained.ok()) << retained.error().message;
+  const auto &control =
+      fixture.bundle->value().cell_graph.control_bindings.front();
+  const core::SceneFrameResolutionQueryDTO frame_query{
+      core::TargetCarrierSceneFrameRefDTO{
+          control.controllable_component_id, control.command_target_id,
+          core::FrameRoleId("tcp")},
+      retained.value()};
+  std::optional<core::SceneFrameResolutionReceiptDTO> initial_frame;
+  const auto frame_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < frame_deadline) {
+    const auto frame = projection.ResolveSceneFrame(frame_query);
+    if (frame.ok()) {
+      initial_frame = frame.value();
+      break;
+    }
+    ASSERT_EQ(frame.error().details.at("reason"),
+              "native_scene_frame_lease_unavailable")
+        << frame.error().message;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(initial_frame.has_value());
+  ASSERT_TRUE(initial_frame->valid());
+
+  // EnsureRunning prepares a successor under the existing provider key without
+  // replacing the host. It is private until its exact rebuild becomes healthy.
+  const auto prepared = adapter.EnsureRunning(*successor.query);
+  ASSERT_EQ(prepared.state(), component_manager::ProcessPresenceState::kPresent);
+  EXPECT_EQ(prepared.process_incarnation(), started.process_incarnation());
+  const auto frame_after_prepare = projection.ResolveSceneFrame(frame_query);
+  ASSERT_TRUE(frame_after_prepare.ok()) << frame_after_prepare.error().message;
+  EXPECT_EQ(frame_after_prepare.value().projection_binding, retained.value());
+  EXPECT_EQ(frame_after_prepare.value().resolved_frame,
+            initial_frame->resolved_frame);
+
+  const core::ProjectionRevisionDTO candidate_revision{
+      successor.bundle->retained_bundle_id(),
+      successor.bundle->value().cell_graph.graph_revision,
+      initial_scene.shared()->revision};
+  const core::NativeProjectionRebuildDTO rebuild{
+      binding, candidate_revision,
+      successor.bundle->value().compiled_products.planning_collision_model,
+      initial_scene.shared()};
+  const auto accepted = projection.RebuildProjection(rebuild);
+  ASSERT_TRUE(accepted.presence_valid());
+  ASSERT_TRUE(accepted.result == core::ProjectionCommitResultStateDTO::kAccepted ||
+              accepted.result == core::ProjectionCommitResultStateDTO::kCommitted);
+  const auto rebuild_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  const auto entered = projection_control.path() / "rebuild.entered";
+  while (!std::filesystem::exists(entered) &&
+         std::chrono::steady_clock::now() < rebuild_deadline) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(std::filesystem::exists(entered));
+
+  // Exact preparation replay must not conflict with its own progressing
+  // rebuild, while a different model remains refused.
+  const auto pending_preparation = adapter.EnsureRunning(*successor.query);
+  EXPECT_EQ(pending_preparation.state(),
+            component_manager::ProcessPresenceState::kPresent);
+  EXPECT_EQ(pending_preparation.process_incarnation(),
+            started.process_incarnation());
+  EXPECT_THROW(static_cast<void>(adapter.EnsureRunning(*fixture.query)),
+               component_manager::RetainedNativeRuntimeUnitAdapterError);
+  EXPECT_EQ(adapter.ObserveProcess(*successor.query).process_incarnation(),
+            started.process_incarnation());
+  ASSERT_TRUE(projection_hold.Release());
+
+  auto health = projection.ProjectionHealth();
+  while (!health.healthy_for_target(candidate_revision) &&
+         std::chrono::steady_clock::now() < rebuild_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    health = projection.ProjectionHealth();
+  }
+  ASSERT_TRUE(health.healthy_for_target(candidate_revision));
+  const auto old_frame = projection.ResolveSceneFrame(frame_query);
+  ASSERT_TRUE(old_frame.ok()) << old_frame.error().message;
+  EXPECT_EQ(old_frame.value().projection_binding, retained.value());
+  EXPECT_EQ(old_frame.value().resolved_frame, initial_frame->resolved_frame);
+  const auto retained_replay =
+      projection.RetainProjectionBinding(initial_revision, old_lease);
+  ASSERT_TRUE(retained_replay.ok()) << retained_replay.error().message;
+  EXPECT_EQ(retained_replay.value(), retained.value());
+
+  const auto preparation_replay = adapter.EnsureRunning(*successor.query);
+  EXPECT_EQ(preparation_replay.process_incarnation(),
+            started.process_incarnation());
+  const auto rebuilt_replay = projection.RebuildProjection(rebuild);
+  ASSERT_TRUE(rebuilt_replay.presence_valid());
+  EXPECT_EQ(rebuilt_replay.result, core::ProjectionCommitResultStateDTO::kCommitted);
+  EXPECT_EQ(rebuilt_replay.native_projection_generation,
+            health.native_projection_generation);
+
+  const core::ProjectionLeaseId candidate_lease("native-adapter.candidate-lease");
+  const auto candidate_retained =
+      projection.RetainProjectionBinding(candidate_revision, candidate_lease);
+  ASSERT_TRUE(candidate_retained.ok()) << candidate_retained.error().message;
+  EXPECT_EQ(candidate_retained.value(), (core::ProjectionLeaseBindingDTO{
+                                           candidate_revision, candidate_lease}));
+  const auto mismatched = projection.ResolveSceneFrame(
+      {frame_query.selector, {candidate_revision, old_lease}});
+  ASSERT_FALSE(mismatched.ok());
+  EXPECT_EQ(mismatched.error().details.at("reason"),
+            "native_scene_frame_lease_unavailable");
+
+  // A further preparation cannot allocate a third projection while the exact
+  // predecessor remains leased or owned by the active composition.
+  try {
+    static_cast<void>(adapter.EnsureRunning(*fixture.query));
+    ADD_FAILURE() << "third projection preparation was admitted";
+  } catch (const component_manager::RetainedNativeRuntimeUnitAdapterError &error) {
+    EXPECT_NE(std::string(error.what()).find("predecessor is still retained"),
+              std::string::npos) << error.what();
+  }
+  EXPECT_EQ(adapter.ObserveProcess(*successor.query).process_incarnation(),
+            started.process_incarnation());
+  projection.ReleaseProjection(old_lease);
+  const auto released = projection.ResolveSceneFrame(frame_query);
+  ASSERT_FALSE(released.ok());
+  EXPECT_EQ(released.error().details.at("reason"),
+            "native_scene_frame_lease_unavailable");
+  EXPECT_TRUE(projection.ProjectionHealth().healthy_for_target(candidate_revision));
+  const auto candidate_lease_replay =
+      projection.RetainProjectionBinding(candidate_revision, candidate_lease);
+  ASSERT_TRUE(candidate_lease_replay.ok()) << candidate_lease_replay.error().message;
+  EXPECT_EQ(candidate_lease_replay.value(), candidate_retained.value());
+  projection.ReleaseProjection(candidate_lease);
+  EXPECT_EQ(adapter.EnsureStopped(*successor.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
 }
 

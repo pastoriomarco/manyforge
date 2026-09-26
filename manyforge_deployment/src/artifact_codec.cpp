@@ -341,10 +341,15 @@ class CandidateBuilder final {
 }  // namespace
 
 ParsedArtifactCandidate parse_strict_json_model_yaml(std::string_view yaml_bytes) {
+  return parse_strict_json_model_yaml(yaml_bytes, kMaxArtifactEncodedBytes);
+}
+
+ParsedArtifactCandidate parse_strict_json_model_yaml(
+    std::string_view yaml_bytes, const std::size_t max_encoded_bytes) {
   if (yaml_bytes.empty()) {
     throw ArtifactCodecError("exactly one non-empty YAML document is required");
   }
-  if (yaml_bytes.size() > kMaxArtifactEncodedBytes) {
+  if (max_encoded_bytes == 0U || yaml_bytes.size() > max_encoded_bytes) {
     throw ArtifactCodecError("artifact exceeds the v1 encoded-byte limit");
   }
   if (yaml_bytes.find('\0') != std::string_view::npos) {

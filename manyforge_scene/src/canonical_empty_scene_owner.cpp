@@ -6562,36 +6562,72 @@ CanonicalEmptySceneOwner::BeginMaintenanceInitialization(
           initialization.authoritative_snapshot));
   std::optional<ErrorDTO> failure;
   bool effects_unknown = false;
+  bool projection_effect_pending_or_committed = false;
   for (const auto &binding : initialization.bindings) {
     try {
       auto projection = ResolveRequiredProjection(
           binding, impl_->projection_resolver_);
-      if (!inserted_intent &&
-          projection.preflight_health.healthy_for_target(
+      if (projection.preflight_health.healthy_for_target(
               initialization.target)) {
+        // A previous poll may already have installed this projection. Its
+        // effect still counts if another participant subsequently refuses.
+        projection_effect_pending_or_committed = true;
         continue;
       }
+      const bool same_retained_product =
+          initialization.predecessor.retained_bundle_id ==
+              initialization.target.retained_bundle_id &&
+          initialization.predecessor.graph_revision ==
+              initialization.target.graph_revision &&
+          initialization.predecessor.scene_revision.scene_id ==
+              initialization.target.scene_revision.scene_id &&
+          initialization.target.scene_revision.revision_id >
+              initialization.predecessor.scene_revision.revision_id;
+      const bool exact_apply_predecessor =
+          same_retained_product &&
+          projection.preflight_health.healthy_for_target(
+              initialization.predecessor);
       if (!inserted_intent) {
         if (projection.preflight_health.state ==
                 ProjectionHealthState::kRebuilding ||
             projection.preflight_health.state ==
                 ProjectionHealthState::kUninitialized) {
           progressing = true;
+          projection_effect_pending_or_committed =
+              projection_effect_pending_or_committed ||
+              projection.preflight_health.state ==
+                  ProjectionHealthState::kRebuilding;
           continue;
         }
-        failure = ErrorDTO{
-            "native_projection_initialization_failed",
-            "a required native projection did not reach the exact "
-            "authoritative snapshot",
-            {}};
-        effects_unknown = true;
-        break;
+        if (!exact_apply_predecessor) {
+          failure = ErrorDTO{
+              "native_projection_initialization_failed",
+              "a required native projection is neither at the Apply target "
+              "nor at its exact predecessor",
+              {}};
+          effects_unknown =
+              projection_effect_pending_or_committed ||
+              projection.preflight_health.state ==
+                  ProjectionHealthState::kDesynchronized ||
+              projection.preflight_health.state ==
+                  ProjectionHealthState::kUnavailable;
+          break;
+        }
       }
       const core::NativeProjectionRebuildDTO rebuild{
           binding,
           initialization.target,
           candidate->value().compiled_products.planning_collision_model,
           snapshot.shared(),
+          exact_apply_predecessor
+              ? std::optional<std::pair<ApplyId, ApplyGeneration>>{
+                    std::pair{initialization.apply_id,
+                              initialization.apply_generation}}
+              : std::nullopt,
+          exact_apply_predecessor
+              ? std::optional<ProjectionRevisionDTO>{
+                    initialization.predecessor}
+              : std::nullopt,
       };
       const auto rebuilt = projection.projection->RebuildProjection(rebuild);
       if (rebuilt.result == core::ProjectionCommitResultStateDTO::kAccepted &&
@@ -6599,6 +6635,7 @@ CanonicalEmptySceneOwner::BeginMaintenanceInitialization(
           rebuilt.proposed_projection_revision == initialization.target &&
           rebuilt.resulting_health.native_runtime_binding == binding) {
         progressing = true;
+        projection_effect_pending_or_committed = true;
         continue;
       }
       if (!rebuilt.presence_valid() ||
@@ -6606,14 +6643,22 @@ CanonicalEmptySceneOwner::BeginMaintenanceInitialization(
           rebuilt.acknowledged_projection_revision != initialization.target ||
           !rebuilt.resulting_health.healthy_for_target(
               initialization.target)) {
+        const std::string detail =
+            rebuilt.error.has_value()
+                ? ": " + rebuilt.error->code + ": " +
+                      rebuilt.error->message
+                : std::string{};
         failure = ErrorDTO{
             "native_projection_initialization_failed",
             "a required native projection did not acknowledge the exact "
-            "authoritative snapshot",
+            "authoritative snapshot" + detail,
             {}};
-        effects_unknown = true;
+        effects_unknown =
+            projection_effect_pending_or_committed ||
+            !rebuilt.rollback_proven;
         break;
       }
+      projection_effect_pending_or_committed = true;
     } catch (const std::exception &error) {
       failure = ErrorDTO{"native_projection_initialization_uncertain",
                          error.what(), {}};

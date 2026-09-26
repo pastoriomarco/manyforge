@@ -70,6 +70,7 @@ def commit_local_authoring(
     validate_under_claim: Callable[[], None] | None = None,
     session: str = "program",
     project: Mapping[str, Any] | None = None,
+    prepare_project_under_claim: Callable[[], Mapping[str, Any]] | None = None,
 ) -> LocalAuthoringCommit:
     """Commit one already-prepared value through the local admission path.
 
@@ -107,6 +108,7 @@ def commit_local_authoring(
         session=session,
         expected_identity=identity,
         project=project,
+        prepare_project_under_claim=prepare_project_under_claim,
     )
 
 

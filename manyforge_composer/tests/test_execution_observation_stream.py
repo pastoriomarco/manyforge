@@ -24,7 +24,7 @@ def _status(*, sequence: int = 7, position: float = 0.25) -> dict[str, Any]:
         "command": "observation",
         "ok": True,
         "observation": {
-            "schema_version": "manyforge.execution_observation.v2",
+            "schema_version": "manyforge.execution_observation.v3",
             "owner_epoch": "execution-owner.1",
             "cell_id": "cell-1",
             "retained_bundle_id": "bundle-1",
@@ -35,6 +35,7 @@ def _status(*, sequence: int = 7, position: float = 0.25) -> dict[str, Any]:
                 {
                     "controllable_component_id": "robot-1",
                     "command_target_id": "arm",
+                    "operation_capability_id": "execution.trajectory.execute",
                     "source_epoch": "arm-source.1",
                     "source_sequence": sequence,
                     "source_joint_names": ["joint1", "joint2"],
@@ -52,7 +53,7 @@ def test_project_execution_observation_is_exact_and_compact() -> None:
         _status(), received_at_monotonic_us=123_456
     )
     assert frame == {
-        "schema_version": "manyforge.execution_observation_frame.v2",
+        "schema_version": "manyforge.execution_observation_frame.v3",
         "owner_epoch": "execution-owner.1",
         "cell_id": "cell-1",
         "retained_bundle_id": "bundle-1",
@@ -64,6 +65,7 @@ def test_project_execution_observation_is_exact_and_compact() -> None:
             {
                 "controllable_component_id": "robot-1",
                 "command_target_id": "arm",
+                "operation_capability_id": "execution.trajectory.execute",
                 "source_epoch": "arm-source.1",
                 "source_sequence": 7,
                 "source_joint_names": ["joint1", "joint2"],
@@ -96,6 +98,7 @@ def test_gripper_only_changes_are_typed_and_not_deduplicated_as_idle_arm() -> No
     target = {
         "controllable_component_id": "robot-1",
         "command_target_id": "gripper",
+        "operation_capability_id": "tool.gripper.command",
         "source_epoch": "gripper-source.1",
         "source_sequence": 1,
         "source_joint_names": ["finger"],

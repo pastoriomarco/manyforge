@@ -975,8 +975,15 @@ recovery_motion_rest_requirements(const core::StopStatusDTO &status,
 
 RetainedStopSurveillanceOwner::RetainedStopSurveillanceOwner(
     std::vector<RetainedStopSurveillanceSourceInput> sources,
-    core::IClock *clock)
-    : clock_(clock) {
+    core::IClock *clock,
+    const RetainedStopSurveillanceEmptySourceMode empty_source_mode)
+    : clock_(clock), empty_source_mode_(empty_source_mode) {
+  if (empty_source_mode_ !=
+          RetainedStopSurveillanceEmptySourceMode::kRequireNonEmpty &&
+      empty_source_mode_ !=
+          RetainedStopSurveillanceEmptySourceMode::kManagedCellBootstrapEmpty) {
+    throw std::invalid_argument("native Stop empty-source mode is invalid");
+  }
   auto replaced = ReplaceSources(std::move(sources));
   if (!replaced.ok())
     throw std::invalid_argument(replaced.error().message);
@@ -1038,12 +1045,29 @@ core::Result<void> RetainedStopSurveillanceOwner::ValidateSources(
 
 core::Result<void> RetainedStopSurveillanceOwner::ReplaceSources(
     std::vector<RetainedStopSurveillanceSourceInput> sources) {
+  if (sources.empty()) {
+    if (empty_source_mode_ !=
+        RetainedStopSurveillanceEmptySourceMode::kManagedCellBootstrapEmpty) {
+      return invalid<void>(
+          "native_stop_surveillance_sources_empty_or_oversized",
+          "native Stop source table is empty or oversized");
+    }
+    std::lock_guard lock(mutex_);
+    sources_.clear();
+    return core::Result<void>::Ok();
+  }
   auto valid = ValidateSources(sources);
   if (!valid.ok())
     return valid;
   std::lock_guard lock(mutex_);
   sources_ = std::move(sources);
   return core::Result<void>::Ok();
+}
+
+std::vector<RetainedStopSurveillanceSourceInput>
+RetainedStopSurveillanceOwner::SnapshotSources() const {
+  std::lock_guard lock(mutex_);
+  return sources_;
 }
 
 core::StopSurveillanceObservationSampleDTO

@@ -649,6 +649,9 @@ class HeadlessHttpClient:
             ) from error
         return projection
 
+    def program_applied_status(self) -> dict[str, Any]:
+        return self.request("GET", "/api/program/applied/status")
+
     def program_scene_prepare(self, body: Mapping[str, Any]) -> dict[str, Any]:
         result = self.request("POST", "/api/program/scene-preparations", body=body)
         if (
@@ -925,10 +928,6 @@ class HeadlessHttpClient:
 
     def execution_diagnostics(self) -> dict[str, Any]:
         return self.request("GET", "/api/execution/diagnostics")
-
-    def execution_status(self) -> dict[str, Any]:
-        """Compatibility alias for the aggregate diagnostic projection."""
-        return self.request("GET", "/api/execution/status")
 
     def execution_identity(self) -> dict[str, Any]:
         return self.request("GET", "/api/execution/identity")

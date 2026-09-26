@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { ApiError, api } from '../api/client';
+import { ApiError, api, apiErrorCode } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
 import type {
   AppliedProgramSelection,
+  AppliedProgramStatus,
   CurrentScenarioResponse,
   JsonValue,
   CycleRecoveryActionId,
@@ -147,6 +148,9 @@ export interface ProgramSelectionPending {
 
 interface ProgramRuntimeState {
   applied: AppliedProgramSelection | null;
+  /** The Applied Program is preserved but not executable in the active
+   * Deployment (H1a); derived on every refresh, never stored as a flag. */
+  nonExecutable: AppliedProgramStatus | null;
   currentScenario: CurrentScenarioResponse | null;
   run: ProgramRunStatus | null;
   controls: ProgramRuntimeControlProjection | null;
@@ -161,6 +165,7 @@ interface ProgramRuntimeState {
 
 const INITIAL_STATE: ProgramRuntimeState = {
   applied: null,
+  nonExecutable: null,
   currentScenario: null,
   run: null,
   controls: null,
@@ -574,8 +579,17 @@ export function useProgramRuntime(
       }
 
       let applied: AppliedProgramSelection | null = null;
+      let nonExecutable: AppliedProgramStatus | null = null;
       if (appliedResult.status === 'fulfilled') {
         applied = appliedResult.value;
+      } else if (apiErrorCode(appliedResult.reason) === 'program_applied_non_executable') {
+        // Not an observation fault: read the named outcome for the operator.
+        try {
+          const status = await api.programs.appliedStatus();
+          nonExecutable = status.executable ? null : status;
+        } catch (reason: unknown) {
+          errors.push(errorMessage(reason, 'Applied Program status unavailable.'));
+        }
       } else if (!(appliedResult.reason instanceof ApiError
         && appliedResult.reason.status === 404)) {
         errors.push(errorMessage(
@@ -597,6 +611,7 @@ export function useProgramRuntime(
           ...current,
           currentScenario,
           applied,
+          nonExecutable,
           runnerAvailable: true,
           loading: false,
           observationError,
@@ -607,6 +622,7 @@ export function useProgramRuntime(
         return currentScenarioKey(current.currentScenario)
             === currentScenarioKey(next.currentScenario)
           && appliedKey(current.applied) === appliedKey(next.applied)
+          && JSON.stringify(current.nonExecutable) === JSON.stringify(next.nonExecutable)
           && programRunProjectionKey(current.run) === programRunProjectionKey(next.run)
           && controlsKey(current.controls) === controlsKey(next.controls)
           && current.runnerAvailable === next.runnerAvailable

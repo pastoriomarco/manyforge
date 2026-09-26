@@ -1,6 +1,7 @@
 export interface ExecutionObservationTarget {
   controllableComponentId: string;
   commandTargetId: string;
+  operationCapabilityId: string;
   sourceEpoch: string;
   sourceSequence: number;
   sourceJointNames: string[];
@@ -10,7 +11,7 @@ export interface ExecutionObservationTarget {
 }
 
 export interface ExecutionObservationFrame {
-  schemaVersion: 'manyforge.execution_observation_frame.v2';
+  schemaVersion: 'manyforge.execution_observation_frame.v3';
   ownerEpoch: string;
   cellId: string;
   retainedBundleId: string;

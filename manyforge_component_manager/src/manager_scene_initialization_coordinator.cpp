@@ -100,7 +100,15 @@ ManagerSceneInitializationCoordinator::Initialize(
   if (result.state !=
           core::ProjectionMaintenanceInitializationState::kInitialized &&
       !result.ready_for_publication()) {
-    Fail("Scene maintenance initialization did not complete successfully");
+    std::string message =
+        "Scene maintenance initialization did not complete successfully";
+    if (result.first_error.has_value()) {
+      message += ": " + result.first_error->code + ": " +
+                 result.first_error->message;
+    } else if (result.effects_unknown) {
+      message += ": effects are unknown";
+    }
+    Fail(message);
   }
   return result;
 }

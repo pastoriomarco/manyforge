@@ -349,7 +349,71 @@ derive_route_readiness_projection(
          left.stop_execution_port == right.stop_execution_port &&
          left.prepared_motion_engine == right.prepared_motion_engine &&
          left.default_operator_stop_profile == right.default_operator_stop_profile &&
-         left.default_fault_stop_profile == right.default_fault_stop_profile;
+         left.default_fault_stop_profile == right.default_fault_stop_profile &&
+         left.deployment_maximum_tcp_linear_speed_mps ==
+             right.deployment_maximum_tcp_linear_speed_mps &&
+         left.intrinsic_direct_control == right.intrinsic_direct_control &&
+         left.direct_control_joint_limits == right.direct_control_joint_limits;
+}
+
+[[nodiscard]] bool registration_controller_equal_after_product_reseal(
+    const RuntimeParticipantExecutionRegistration& left,
+    const RuntimeParticipantExecutionRegistration& right) {
+  const auto& a = left.binding.value();
+  const auto& b = right.binding.value();
+  auto candidate_controller_binding = b;
+  // A retained controller may receive a fresh product seal and fresh authored
+  // Program metadata during Apply. Everything that identifies its physical
+  // control/runtime context remains exact. The role IDs are Program aliases;
+  // their resolved target, model, frame, resource and provider facts below
+  // still have to match. Contact/grasp templates are likewise authored
+  // Program inputs consumed by later admitted operations, not controller state.
+  candidate_controller_binding.program_id = a.program_id;
+  candidate_controller_binding.program_revision = a.program_revision;
+  candidate_controller_binding.program_binding_id = a.program_binding_id;
+  candidate_controller_binding.retained_bundle_id = a.retained_bundle_id;
+  candidate_controller_binding.graph_revision = a.graph_revision;
+  candidate_controller_binding.component_role_id = a.component_role_id;
+  candidate_controller_binding.target_role_id = a.target_role_id;
+  candidate_controller_binding.contact_grasp_bindings = a.contact_grasp_bindings;
+  if (a != candidate_controller_binding ||
+      left.engine != right.engine ||
+      left.stop_execution_port != right.stop_execution_port ||
+      left.prepared_motion_engine != right.prepared_motion_engine ||
+      left.retained_default_stop_limits != right.retained_default_stop_limits ||
+      left.stop_node_category != right.stop_node_category ||
+      left.default_operator_stop_profile != right.default_operator_stop_profile ||
+      left.default_fault_stop_profile != right.default_fault_stop_profile ||
+      left.deployment_maximum_tcp_linear_speed_mps !=
+          right.deployment_maximum_tcp_linear_speed_mps ||
+      left.intrinsic_direct_control != right.intrinsic_direct_control ||
+      left.direct_control_joint_limits != right.direct_control_joint_limits ||
+      left.runtime_policy.has_value() != right.runtime_policy.has_value() ||
+      (left.runtime_policy.has_value() &&
+       left.runtime_policy->value() != right.runtime_policy->value()) ||
+      left.stop_readiness.has_value() != right.stop_readiness.has_value()) {
+    return false;
+  }
+  if (!left.stop_readiness.has_value()) return true;
+  const auto& old_readiness = left.stop_readiness->value();
+  const auto& next_readiness = right.stop_readiness->value();
+  if (old_readiness.controllable_component_id != next_readiness.controllable_component_id ||
+      old_readiness.component_lifecycle_generation !=
+          next_readiness.component_lifecycle_generation ||
+      old_readiness.expected_controller_domain != next_readiness.expected_controller_domain ||
+      old_readiness.maximum_controlled_stop_duration_ns !=
+          next_readiness.maximum_controlled_stop_duration_ns) {
+    return false;
+  }
+  auto old_plan = old_readiness.resolved_stop_base_plan;
+  const auto& next_plan = next_readiness.resolved_stop_base_plan;
+  // The content address and product lineage change when the same verified
+  // Stop mechanism is re-sealed to the candidate bundle. Every executable
+  // Stop fact and its route/source generation must remain identical.
+  old_plan.resolved_stop_base_plan_id = next_plan.resolved_stop_base_plan_id;
+  old_plan.retained_bundle_id = next_plan.retained_bundle_id;
+  old_plan.graph_revision = next_plan.graph_revision;
+  return old_plan == next_plan;
 }
 
 [[nodiscard]] std::set<ControlDomainId> changed_registration_domains(
@@ -498,9 +562,13 @@ select_disable_active_configurations(
 [[nodiscard]] StopStaticFacts derive_stop_static_facts(
     const std::vector<RuntimeParticipantExecutionRegistration>& registrations,
     const ResourceAddressedExecutionKernelConfig& config,
-    const std::optional<StopDeadlineBudgetDTO>* selected_deadline_budget = nullptr) {
+    const std::optional<StopDeadlineBudgetDTO>* selected_deadline_budget = nullptr,
+    const bool require_bootstrap_graph_revision = true) {
   std::optional<GraphRevision> graph_revision =
-      registrations.empty() ? config.empty_runtime_graph_revision : config.graph_revision;
+      registrations.empty() ? config.empty_runtime_graph_revision
+                            : (require_bootstrap_graph_revision
+                                   ? config.graph_revision
+                                   : std::optional<GraphRevision>{});
   std::optional<RetainedBundleId> retained_bundle_id;
   if (registrations.empty()) {
     if (config.empty_runtime_retained_bundle_id.has_value() !=
@@ -3986,9 +4054,37 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants(
 Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_product(
     std::vector<RuntimeParticipantExecutionRegistration> registrations,
     RuntimeParticipantAdmissionResolver participant_resolver,
-    std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget) {
+    std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget,
+    std::function<Result<void>()> commit_publication) {
   return reconfigure_runtime_participants_impl(
-      std::move(registrations), std::move(participant_resolver), false, &cell_stop_deadline_budget);
+      std::move(registrations), std::move(participant_resolver), false,
+      &cell_stop_deadline_budget, nullptr, nullptr, nullptr, nullptr, nullptr,
+      commit_publication ? &commit_publication : nullptr);
+}
+
+Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_component_set(
+    std::vector<RuntimeParticipantExecutionRegistration> registrations,
+    RuntimeParticipantAdmissionResolver participant_resolver,
+    std::optional<StopDeadlineBudgetDTO> cell_stop_deadline_budget,
+    RetainedBundleId candidate_retained_bundle_id,
+    GraphRevision candidate_graph_revision,
+    const ConfigurationFenceId& apply_fence_id,
+    const ConfigurationFenceScopeDTO& scope,
+    const std::vector<ControllableComponentId>& retained_components,
+    std::function<Result<void>()> commit_publication) {
+  if (candidate_retained_bundle_id.empty() || candidate_graph_revision.empty() ||
+      apply_fence_id.empty() || !scope.valid() ||
+      !std::is_sorted(retained_components.begin(), retained_components.end()) ||
+      std::adjacent_find(retained_components.begin(), retained_components.end()) !=
+          retained_components.end()) {
+    return reject<void>("component-set transition has no exact Apply fence scope",
+                        "runtime_component_set_scope_invalid", ErrorCode::kInvalidRequest);
+  }
+  return reconfigure_runtime_participants_impl(
+      std::move(registrations), std::move(participant_resolver), false,
+      &cell_stop_deadline_budget, &apply_fence_id, &scope,
+      &retained_components, &candidate_retained_bundle_id,
+      &candidate_graph_revision, commit_publication ? &commit_publication : nullptr);
 }
 
 Result<void>
@@ -4070,7 +4166,31 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
     std::vector<RuntimeParticipantExecutionRegistration> registrations,
     RuntimeParticipantAdmissionResolver participant_resolver,
     const bool retain_unready_configuration_facts,
-    const std::optional<StopDeadlineBudgetDTO>* replacement_stop_deadline_budget) {
+    const std::optional<StopDeadlineBudgetDTO>* replacement_stop_deadline_budget,
+    const ConfigurationFenceId* apply_fence_id,
+    const ConfigurationFenceScopeDTO* apply_scope,
+    const std::vector<ControllableComponentId>* retained_components,
+    const RetainedBundleId* candidate_retained_bundle_id,
+    const GraphRevision* candidate_graph_revision,
+    const std::function<Result<void>()>* commit_publication) {
+  if ((candidate_retained_bundle_id == nullptr) !=
+      (candidate_graph_revision == nullptr)) {
+    return reject<void>("component-set transition has incomplete product identity",
+                        "runtime_component_set_product_invalid",
+                        ErrorCode::kInvalidRequest);
+  }
+  if (candidate_retained_bundle_id != nullptr &&
+      std::any_of(registrations.begin(), registrations.end(),
+                  [&](const auto& registration) {
+                    const auto& binding = registration.binding.value();
+                    return binding.retained_bundle_id !=
+                               *candidate_retained_bundle_id ||
+                           binding.graph_revision != *candidate_graph_revision;
+                  })) {
+    return reject<void>("component-set participants differ from candidate product",
+                        "runtime_component_set_product_mismatch",
+                        ErrorCode::kInvalidRequest);
+  }
   if (qualified_execution_engine_count(registrations) > prequalified_max_live_stop_participants_) {
     return Result<void>::Err(
         error(std::string(to_string(ErrorCode::kInvalidRequest)),
@@ -4118,18 +4238,33 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
                 return lhs.control_domain_id < rhs.control_domain_id;
               });
     if (registrations.empty()) {
-      candidate_stop_facts.emplace(StopStaticFacts{*stop_retained_bundle_id_,
-                                                   *stop_graph_revision_,
-                                                   replacement_stop_deadline_budget == nullptr
-                                                       ? cell_stop_deadline_budget_
-                                                       : *replacement_stop_deadline_budget,
-                                                   {}});
+      candidate_stop_facts.emplace(StopStaticFacts{
+          candidate_retained_bundle_id != nullptr
+              ? *candidate_retained_bundle_id
+              : *stop_retained_bundle_id_,
+          candidate_graph_revision != nullptr ? *candidate_graph_revision
+                                              : *stop_graph_revision_,
+          replacement_stop_deadline_budget == nullptr
+              ? cell_stop_deadline_budget_
+              : *replacement_stop_deadline_budget,
+          {}});
     } else {
       if (replacement_stop_deadline_budget == nullptr) {
-        candidate_stop_facts.emplace(derive_stop_static_facts(registrations, config_));
+        candidate_stop_facts.emplace(derive_stop_static_facts(
+            registrations, config_, nullptr, apply_scope == nullptr));
       } else {
         candidate_stop_facts.emplace(
-            derive_stop_static_facts(registrations, config_, replacement_stop_deadline_budget));
+            derive_stop_static_facts(registrations, config_,
+                                     replacement_stop_deadline_budget,
+                                     apply_scope == nullptr));
+      }
+      if (candidate_retained_bundle_id != nullptr &&
+          (candidate_stop_facts->retained_bundle_id !=
+               *candidate_retained_bundle_id ||
+           candidate_stop_facts->graph_revision !=
+               *candidate_graph_revision)) {
+        throw std::invalid_argument(
+            "component-set Stop facts differ from candidate product");
       }
     }
   } catch (const std::exception& exception) {
@@ -4140,6 +4275,77 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
   }
 
   std::lock_guard submit_lock(submission_mutex_);
+  if (apply_scope != nullptr) {
+    if (apply_fence_id == nullptr || config_.operation_admission_gate == nullptr ||
+        !config_.operation_admission_gate->exact_fence_is_held(*apply_fence_id,
+                                                                *apply_scope) ||
+        (!apply_scope->resources.empty() &&
+         !config_.operation_admission_gate->exact_fence_covers(
+             *apply_fence_id, apply_scope->resources))) {
+      return reject<void>("component-set transition is outside its exact Apply fence",
+                          "runtime_component_set_fence_missing",
+                          ErrorCode::kExecutionRejected);
+    }
+    const auto check_changed = [&](const auto& source, const auto& other,
+                                   const bool predecessor_side) {
+      for (const auto& registration : source) {
+        if (std::any_of(other.begin(), other.end(), [&](const auto& row) {
+              return registration_truth_equal(registration, row);
+            })) {
+          continue;
+        }
+        const auto& binding = registration.binding.value();
+        if (retained_components != nullptr &&
+            std::binary_search(retained_components->begin(), retained_components->end(),
+                               binding.controllable_component_id) &&
+            std::any_of(other.begin(), other.end(), [&](const auto& row) {
+              return registration_controller_equal_after_product_reseal(registration, row);
+            })) {
+          continue;
+        }
+        if (!std::binary_search(apply_scope->controllable_component_ids.begin(),
+                                apply_scope->controllable_component_ids.end(),
+                                binding.controllable_component_id) ||
+            !binding.control_path.has_value() ||
+            std::any_of(binding.resources.begin(), binding.resources.end(),
+                        [&](const auto& row) {
+                          return !std::binary_search(apply_scope->resources.begin(),
+                                                     apply_scope->resources.end(),
+                                                     row.resource_id);
+                        })) {
+          return false;
+        }
+        const auto& control_path = *binding.control_path;
+        const auto domain_scope = std::find_if(
+            apply_scope->domains.begin(), apply_scope->domains.end(), [&](const auto& row) {
+              return row.control_domain_id == control_path.control_domain_id;
+            });
+        const auto binding_scope = std::find_if(
+            apply_scope->bindings.begin(), apply_scope->bindings.end(), [&](const auto& row) {
+              return row.control_binding_id == control_path.control_binding_id;
+            });
+        if (domain_scope == apply_scope->domains.end() ||
+            binding_scope == apply_scope->bindings.end() ||
+            (predecessor_side
+                 ? domain_scope->predecessor_control_domain_revision
+                 : domain_scope->candidate_control_domain_revision) !=
+                std::optional(control_path.control_domain_revision) ||
+            (predecessor_side
+                 ? binding_scope->predecessor_control_binding_revision
+                 : binding_scope->candidate_control_binding_revision) !=
+                std::optional(control_path.control_binding_revision)) {
+          return false;
+        }
+      }
+      return true;
+    };
+    if (!check_changed(registrations_, registrations, true) ||
+        !check_changed(registrations, registrations_, false)) {
+      return reject<void>("component-set transition changes an unfenced participant",
+                          "runtime_component_set_scope_incomplete",
+                          ErrorCode::kExecutionRejected);
+    }
+  }
   std::vector<EngineSubscription> added_subscriptions;
   try {
     for (const auto& registration : registrations) {
@@ -4191,12 +4397,24 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
 
   std::vector<IResolvedParticipantExecutionEngine*> control_engines;
   bool control_reconfiguration_busy = false;
+  bool retain_control_executor = false;
+  bool update_control_executor_in_place = false;
   {
     std::lock_guard state_lock(state_mutex_);
     if (operation_control_reconfiguration_busy_locked()) {
       control_reconfiguration_busy = true;
     } else {
       control_engines = operation_control_engines_locked(registrations);
+      const auto current_engines = operation_control_engines_locked(registrations_);
+      retain_control_executor =
+          (operation_control_executor_ != nullptr || control_engines.empty()) &&
+          std::set<IResolvedParticipantExecutionEngine*>(control_engines.begin(),
+                                                          control_engines.end()) ==
+              std::set<IResolvedParticipantExecutionEngine*>(current_engines.begin(),
+                                                              current_engines.end());
+      update_control_executor_in_place = !retain_control_executor &&
+                                         operation_control_executor_ != nullptr &&
+                                         !control_engines.empty();
       operation_control_reconfiguration_in_progress_ = true;
     }
   }
@@ -4211,7 +4429,8 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
 
   std::unique_ptr<BoundedOperationControlExecutor> candidate_control_executor;
   try {
-    if (!control_engines.empty()) {
+    if (!retain_control_executor && !update_control_executor_in_place &&
+        !control_engines.empty()) {
       candidate_control_executor = std::make_unique<BoundedOperationControlExecutor>(
           std::move(control_engines),
           static_cast<IOperationControlEffectCompletionReceiver&>(*this));
@@ -4234,6 +4453,8 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
   }
 
   std::optional<ErrorDTO> table_error;
+  std::optional<ErrorDTO> control_lane_error;
+  std::optional<ErrorDTO> publication_commit_error;
   std::unique_ptr<BoundedOperationControlExecutor> retired_control_executor;
   {
     std::lock_guard admission_lock(*admission_mutex_);
@@ -4256,11 +4477,25 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
           domain_id, readback.active_configuration.active_control_configuration_id,
           readback.active_configuration.active_control_configuration_generation});
     }
-    auto table_result = resource_slots_->reconfigure_runtime_inventory(
-        candidate_registry->resource_inventory(),
-        retain_unready_configuration_facts ? declared_candidate_configurations
-                                           : table_configurations,
-        table_route_publications);
+    // Preparation can create subscriptions and worker lanes outside admission.
+    // Verify the delegation again under the lock that also serializes release,
+    // before changing any inventory or invoking the publication callback.
+    const bool authority_current =
+        apply_scope == nullptr ||
+        (config_.operation_admission_gate->exact_fence_is_held(
+             *apply_fence_id, *apply_scope) &&
+         (apply_scope->resources.empty() ||
+          config_.operation_admission_gate->exact_fence_covers(
+              *apply_fence_id, apply_scope->resources)));
+    auto table_result = authority_current
+        ? resource_slots_->reconfigure_runtime_inventory(
+              candidate_registry->resource_inventory(),
+              retain_unready_configuration_facts ? declared_candidate_configurations
+                                                 : table_configurations,
+              table_route_publications)
+        : reject<void>("component-set transition lost its exact Apply fence",
+                       "runtime_component_set_fence_missing",
+                       ErrorCode::kExecutionRejected);
     if (!table_result.ok()) {
       table_error = table_result.error();
     } else {
@@ -4305,21 +4540,81 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
           runtime_route_configuration_publication_required_.insert(configuration.control_domain_id);
         }
       }
-      registry_ = std::move(*candidate_registry);
-      registrations_ = std::move(registrations);
-      stop_retained_bundle_id_ = std::move(candidate_stop_facts->retained_bundle_id);
-      stop_graph_revision_ = std::move(candidate_stop_facts->graph_revision);
-      cell_stop_deadline_budget_ = std::move(candidate_stop_facts->deadline_budget);
-      if (replacement_stop_deadline_budget != nullptr) {
-        config_.cell_stop_deadline_budget = *replacement_stop_deadline_budget;
+      if (commit_publication != nullptr && *commit_publication) {
+        try {
+          auto committed = (*commit_publication)();
+          if (!committed.ok()) {
+            const bool under_apply_fence = apply_scope != nullptr;
+            publication_commit_error = error(
+                std::string(to_string(ErrorCode::kInvariantViolation)),
+                std::string("candidate publication commit failed after Kernel inventory update; ") +
+                    (under_apply_fence
+                         ? "admission remains closed and the Apply fence must remain held: "
+                         : "Kernel admission remains closed: ") +
+                    committed.error().message,
+                under_apply_fence ? "runtime_component_set_publication_commit_failed"
+                                  : "runtime_product_publication_commit_failed");
+          }
+        } catch (const std::exception& exception) {
+          const bool under_apply_fence = apply_scope != nullptr;
+          publication_commit_error = error(
+              std::string(to_string(ErrorCode::kInvariantViolation)),
+              std::string("candidate publication commit threw after Kernel inventory update; ") +
+                  (under_apply_fence
+                       ? "admission remains closed and the Apply fence must remain held: "
+                       : "Kernel admission remains closed: ") +
+                  exception.what(),
+              under_apply_fence ? "runtime_component_set_publication_commit_failed"
+                                : "runtime_product_publication_commit_failed");
+        } catch (...) {
+          const bool under_apply_fence = apply_scope != nullptr;
+          publication_commit_error = error(
+              std::string(to_string(ErrorCode::kInvariantViolation)),
+              std::string("candidate publication commit threw after Kernel inventory update; ") +
+                  (under_apply_fence
+                       ? "admission remains closed and the Apply fence must remain held"
+                       : "Kernel admission remains closed"),
+              under_apply_fence ? "runtime_component_set_publication_commit_failed"
+                                : "runtime_product_publication_commit_failed");
+        }
       }
-      stop_component_scope_ = std::move(candidate_stop_facts->components);
-      config_.participant_resolver = std::move(participant_resolver);
-      engine_subscriptions_.insert(engine_subscriptions_.end(),
-                                   std::make_move_iterator(added_subscriptions.begin()),
-                                   std::make_move_iterator(added_subscriptions.end()));
-      retired_control_executor = std::move(operation_control_executor_);
-      operation_control_executor_ = std::move(candidate_control_executor);
+      if (publication_commit_error.has_value()) {
+        motion_admission_closed_ = true;
+      } else {
+        registry_ = std::move(*candidate_registry);
+        registrations_ = std::move(registrations);
+        stop_retained_bundle_id_ = std::move(candidate_stop_facts->retained_bundle_id);
+        stop_graph_revision_ = std::move(candidate_stop_facts->graph_revision);
+        config_.graph_revision = stop_graph_revision_;
+        if (candidate_retained_bundle_id != nullptr) {
+          config_.empty_runtime_retained_bundle_id = *candidate_retained_bundle_id;
+          config_.empty_runtime_graph_revision = *candidate_graph_revision;
+        }
+        cell_stop_deadline_budget_ = std::move(candidate_stop_facts->deadline_budget);
+        if (replacement_stop_deadline_budget != nullptr) {
+          config_.cell_stop_deadline_budget = *replacement_stop_deadline_budget;
+        }
+        stop_component_scope_ = std::move(candidate_stop_facts->components);
+        config_.participant_resolver = std::move(participant_resolver);
+        engine_subscriptions_.insert(engine_subscriptions_.end(),
+                                     std::make_move_iterator(added_subscriptions.begin()),
+                                     std::make_move_iterator(added_subscriptions.end()));
+        if (update_control_executor_in_place) {
+          const auto update = operation_control_executor_->ReconfigureEngines(control_engines);
+          if (update != OperationControlLaneUpdateStatus::kApplied) {
+            // Inventory may already have changed. Do not publish a partial lane
+            // update as a successful installation or release the Apply fence.
+            motion_admission_closed_ = true;
+            control_lane_error =
+                error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                      "incremental operation-control lane update could not be verified",
+                      "operation_control_incremental_update_failed");
+          }
+        } else if (!retain_control_executor) {
+          retired_control_executor = std::move(operation_control_executor_);
+          operation_control_executor_ = std::move(candidate_control_executor);
+        }
+      }
     }
     operation_control_reconfiguration_in_progress_ = false;
   }
@@ -4335,6 +4630,22 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
       subscription.engine->unsubscribe_events(subscription.handle);
     }
     return Result<void>::Err(std::move(*table_error));
+  }
+  if (publication_commit_error.has_value()) {
+    if (candidate_control_executor != nullptr) {
+      candidate_control_executor->CloseIngress();
+      if (!candidate_control_executor->DrainFor(std::chrono::seconds(5))) {
+        std::terminate();
+      }
+      candidate_control_executor.reset();
+    }
+    for (const auto& subscription : added_subscriptions) {
+      subscription.engine->unsubscribe_events(subscription.handle);
+    }
+    return Result<void>::Err(std::move(*publication_commit_error));
+  }
+  if (control_lane_error.has_value()) {
+    return Result<void>::Err(std::move(*control_lane_error));
   }
   if (retired_control_executor != nullptr) {
     retired_control_executor->CloseIngress();
@@ -4973,30 +5284,20 @@ Result<void> ResourceAddressedExecutionKernel::release_retired_engine(
                                    "operation_control_reconfiguration_busy"));
   }
 
-  std::unique_ptr<BoundedOperationControlExecutor> candidate_control_executor;
-  try {
-    if (!control_engines.empty()) {
-      candidate_control_executor = std::make_unique<BoundedOperationControlExecutor>(
-          std::move(control_engines),
-          static_cast<IOperationControlEffectCompletionReceiver&>(*this));
-      if (!candidate_control_executor->prequalified_ready()) {
-        throw std::runtime_error("retained operation-control lanes are not ready");
-      }
-    }
-  } catch (const std::exception& exception) {
-    std::lock_guard state_lock(state_mutex_);
-    operation_control_reconfiguration_in_progress_ = false;
-    return Result<void>::Err(error(
-        std::string(to_string(ErrorCode::kInternalError)),
-        std::string("retained operation-control lane construction failed: ") + exception.what(),
-        "operation_control_reconfiguration_failed"));
-  }
-
   std::unique_ptr<BoundedOperationControlExecutor> retired_control_executor;
   {
     std::lock_guard state_lock(state_mutex_);
-    retired_control_executor = std::move(operation_control_executor_);
-    operation_control_executor_ = std::move(candidate_control_executor);
+    if (control_engines.empty()) {
+      retired_control_executor = std::move(operation_control_executor_);
+    } else if (operation_control_executor_ == nullptr ||
+               operation_control_executor_->ReconfigureEngines(std::move(control_engines)) !=
+                   OperationControlLaneUpdateStatus::kApplied) {
+      operation_control_reconfiguration_in_progress_ = false;
+      return Result<void>::Err(error(
+          std::string(to_string(ErrorCode::kExecutionRejected)),
+          "retired engine cleanup could not retain the current operation-control lanes",
+          "operation_control_reconfiguration_failed"));
+    }
     operation_control_reconfiguration_in_progress_ = false;
   }
   if (retired_control_executor != nullptr) {

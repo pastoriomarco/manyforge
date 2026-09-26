@@ -642,6 +642,7 @@ endif()
 add_library(manyforge_deployment_verification_core
   src/assistant_settings_codec.cpp
   src/apply_affected_scope.cpp
+  src/apply_component_delta.cpp
   src/native_domain_topology.cpp
   src/artifact_codec.cpp
   src/composed_model_symbol_role_map_verifier.cpp
@@ -660,6 +661,7 @@ add_library(manyforge_deployment_verification_core
   src/model_asset_codec.cpp
   src/model_source.cpp
   src/native_execution_runtime_unit_internal.cpp
+  src/native_component_configuration.cpp
   src/ordinary_motion_jerk.cpp
   src/deployment_jerk_import.cpp
   src/initial_scene_projection.cpp
@@ -667,6 +669,7 @@ add_library(manyforge_deployment_verification_core
   src/planning_resource_map_internal.cpp
   src/posix_read_only_internal.cpp
   src/prepared_activation_input.cpp
+  src/program_binding_outcome.cpp
   src/program_contract.cpp
   src/program_binding.cpp
   src/provider_manifest_codec.cpp
@@ -868,6 +871,7 @@ add_library(manyforge_deployment
   src/ros2_control_execution_runtime_unit_emitter.cpp
   src/posix_durability_internal.cpp
   src/program_binding_compiler.cpp
+  src/prepared_activation_repository.cpp
   src/reference_runtime_unit_internal.cpp
   src/retained_bundle.cpp
   src/retained_bundle_materializer.cpp
@@ -1731,6 +1735,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_retained_bundle
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_program_binding_outcome
+    test/test_program_binding_outcome.cpp)
+  target_link_libraries(test_program_binding_outcome PRIVATE
+    manyforge_deployment_verification_core GTest::gtest_main)
+  gtest_discover_tests(test_program_binding_outcome
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_apply_affected_scope
     test/test_apply_affected_scope.cpp)
   target_include_directories(test_apply_affected_scope PRIVATE
@@ -1738,6 +1749,18 @@ if(BUILD_TESTING)
   target_link_libraries(test_apply_affected_scope PRIVATE
     manyforge_deployment_verification_core GTest::gtest_main)
   gtest_discover_tests(test_apply_affected_scope
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_apply_component_delta
+    test/test_apply_component_delta.cpp)
+  target_compile_definitions(test_apply_component_delta PRIVATE
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
+  target_include_directories(test_apply_component_delta PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_apply_component_delta PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_apply_component_delta
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_retained_bundle_store
@@ -1842,7 +1865,13 @@ if(BUILD_TESTING)
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_retained_bundle_materializer
-    test/test_retained_bundle_materializer.cpp)
+    test/test_retained_bundle_materializer.cpp
+    # The gripper-only fixture derives the same maintained lifecycle semantic
+    # digest as the production native catalog. Compile the shared pure
+    # lifecycle DTO validation and catalog codec rather than the full Core
+    # Kernel.
+    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_catalog_codec.cpp"
+    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_validity.cpp")
   target_compile_definitions(test_retained_bundle_materializer PRIVATE
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
     MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")

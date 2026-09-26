@@ -5,6 +5,7 @@
 #include <manyforge_core/types/manager_liveness.hpp>
 #include <manyforge_core/types/validation.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <manyforge_deployment/canonical_value.hpp>
 #include <optional>
 #include <span>
 #include <string>
@@ -29,6 +30,9 @@ inline constexpr std::string_view kProductContractId =
 inline constexpr std::string_view kRuntimeProfileId =
     "manyforge.native_execution_runtime";
 inline constexpr std::string_view kRuntimeRoleId = "native_execution";
+/// The CellId scopes this infrastructure role; controller membership does not.
+inline constexpr std::string_view kCellHostRuntimeUnitId =
+    "robot_cell.native_execution";
 inline constexpr std::string_view kStatusEndpointRoleId =
     "native_execution_status";
 inline constexpr std::string_view kProjectionEndpointRoleId =
@@ -170,6 +174,22 @@ struct Configuration final {
 [[nodiscard]] Configuration
 require_configuration(const RetainedBundle &retained_bundle,
                       const core::RuntimeUnitId &runtime_unit_id);
+
+/// Select one component's controller settings using the exact motion binding
+/// resource order. Rejects ambiguous ownership or incomplete aggregate state.
+/// The native adapter currently supports at most one motion-execution target
+/// per component. Multiple motion targets are refused, never partially selected.
+[[nodiscard]] Configuration require_component_configuration(
+    const RetainedBundle &retained_bundle,
+    const core::RuntimeUnitId &runtime_unit_id,
+    const core::ControllableComponentId &component_id);
+
+/// The same selection in canonical form for retained controller identity.
+/// Shared settings remain dependencies; unrelated target rows are excluded.
+[[nodiscard]] CanonicalValue component_configuration_projection(
+    const RetainedBundle &retained_bundle,
+    const core::RuntimeUnitId &runtime_unit_id,
+    const core::ControllableComponentId &component_id);
 
 /// Build-owned closed policy embedded in every native runtime manifest.
 ///

@@ -20,6 +20,7 @@
 #include "manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp"
 #include "manyforge_component_manager/reference_runtime_unit_admission.hpp"
 #include "manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp"
+#include "lite6_controllable_retention_fixture.hpp"
 #include "runtime_only_retention_fixture.hpp"
 
 namespace manyforge::component_manager {
@@ -144,6 +145,36 @@ MaterializeRuntimePackage(const std::filesystem::path &root,
   if (bundle == nullptr) {
     throw std::runtime_error(
         "runtime-convergence fixture produced no retained bundle");
+  }
+  return {
+      std::move(bundle),
+      std::make_unique<deployment::FilesystemVerifiedRetainedBundleSource>(
+          root),
+      std::make_unique<
+          deployment::FilesystemVerifiedRetainedProductArtifactSource>(root),
+  };
+}
+
+[[nodiscard]] RuntimePackage
+MaterializeNativeRuntimePackage(const std::filesystem::path &root) {
+  static_cast<void>(std::filesystem::create_directories(root));
+  auto fixture =
+      deployment::test::make_lite6_native_motion_retention_fixture_for_cell(
+          "runtime_only_cell");
+  const deployment::test::Lite6ControllableCompilerInputArtifactSource
+      input_source(fixture);
+  deployment::FilesystemBuildManifestRepository manifests(root);
+  deployment::FilesystemCatalogArtifactStore catalogs(root);
+  deployment::FilesystemRawArtifactStore raw_artifacts(root);
+  deployment::FilesystemRetainedBundleRepository bundles(root);
+  auto bundle = deployment::detail::RetainedBundleMaterializer::
+      materialize_store_and_reload_production(
+          fixture.qualified, manifests, input_source,
+          fixture.structural_preparations(), catalogs, raw_artifacts,
+          bundles);
+  if (bundle == nullptr) {
+    throw std::runtime_error(
+        "native runtime-convergence fixture produced no retained bundle");
   }
   return {
       std::move(bundle),
@@ -831,13 +862,48 @@ public:
       response_request.manager_runtime_epoch = RuntimeEpoch("foreign-manager");
     }
     const auto preparing = prepare_once && calls == 1;
+    if (preparing) {
+      return {std::move(response_request),
+              ManagerSelectedRuntimeCompositionState::kPreparing,
+              {}};
+    }
     return {std::move(response_request),
-            preparing ? ManagerSelectedRuntimeCompositionState::kPreparing
-                      : ManagerSelectedRuntimeCompositionState::kInstalled};
+            ManagerSelectedRuntimeCompositionState::kInstalled,
+            omit_receipts ? std::vector<ManagerRuntimeComponentReceiptDTO>{}
+                          : Receipts(request)};
+  }
+
+  // What a conforming host reports: one live-owner receipt per retained,
+  // added or replaced component, re-sealing retained controllers when the
+  // product changed.
+  [[nodiscard]] static std::vector<ManagerRuntimeComponentReceiptDTO>
+  Receipts(const ManagerSelectedRuntimeCompositionRequestDTO &request) {
+    const auto product_changed =
+        request.predecessor_projection_revision.retained_bundle_id !=
+            request.candidate_projection_revision.retained_bundle_id ||
+        request.predecessor_projection_revision.graph_revision !=
+            request.candidate_projection_revision.graph_revision;
+    std::vector<ManagerRuntimeComponentReceiptDTO> receipts;
+    for (const auto &change : request.component_delta.components) {
+      if (change.disposition ==
+          deployment::ApplyComponentDisposition::kRemove) {
+        continue;
+      }
+      const auto retained =
+          change.disposition == deployment::ApplyComponentDisposition::kRetain;
+      receipts.push_back({change.controllable_component_id,
+                          change.disposition,
+                          change.candidate_runtime_identity,
+                          {{request.runtime_unit_id, request.runtime_epoch}},
+                          retained,
+                          retained && product_changed});
+    }
+    return receipts;
   }
 
   bool prepare_once{false};
   bool foreign_response{false};
+  bool omit_receipts{false};
   int calls{0};
   std::vector<ManagerSelectedRuntimeCompositionPhase> phases;
   std::optional<ManagerSelectedRuntimeCompositionRequestDTO> last_request;
@@ -1419,6 +1485,70 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
+     NativeExecutionHostRemovalRejectsBeforeRuntimeEffect) {
+  ScopedPackageRoot native_root;
+  ScopedPackageRoot candidate_root;
+  ScopedPackageRoot state_root;
+  auto predecessor =
+      MaterializeNativeRuntimePackage(native_root.path());
+  auto candidate = MaterializeRuntimePackage(candidate_root.path());
+  ASSERT_EQ(predecessor.bundle->value().cell_graph.cell_id,
+            candidate.bundle->value().cell_graph.cell_id);
+  ASSERT_EQ(predecessor.bundle->value().cell_graph.runtime_units.size(), 1U);
+  ASSERT_EQ(predecessor.bundle->value().cell_graph.runtime_units.front()
+                .runtime_profile_id.value(),
+            deployment::native_execution_runtime_contract::
+                kRuntimeProfileId);
+
+  auto intent = ApplyIntent(*predecessor.bundle);
+  intent.candidate_retained_bundle_id = candidate.bundle->retained_bundle_id();
+  intent.candidate_graph_revision =
+      candidate.bundle->value().cell_graph.graph_revision;
+  const auto continuity = VerifyNativeExecutionHostContinuity(
+      *predecessor.bundle, *candidate.bundle, *predecessor.artifact_source);
+  ASSERT_FALSE(continuity.ok());
+  EXPECT_EQ(continuity.error().code,
+            "native_execution_host_incompatible");
+  EXPECT_EQ(continuity.error().details.at("expected_runtime_unit_id"),
+            predecessor.bundle->value().cell_graph.runtime_units.front()
+                .runtime_unit_id.value());
+  EXPECT_EQ(continuity.error().details.at("candidate_runtime_unit_id"),
+            "<missing>");
+  EXPECT_EQ(continuity.error().details.at("reason"),
+            "candidate_native_host_missing");
+  const auto database = state_root.path() / "native-host-removal.sqlite3";
+  SqliteManagerApplyJournal journal(
+      database, predecessor.bundle->value().cell_graph.cell_id);
+  SqliteManagerApplyJournal independent_reader(
+      database, predecessor.bundle->value().cell_graph.cell_id);
+  CurrentPublicationReader publication(PredecessorPublication(intent));
+  ScriptedRuntimePorts runtime_ports(independent_reader);
+  ManagerApplyRuntimeConvergenceCoordinator coordinator(
+      journal, publication, *predecessor.artifact_source, runtime_ports,
+      runtime_ports, "linux",
+      {std::string(deployment::native_execution_runtime_contract::
+                       kLaunchEnvironmentContract)},
+      [] { return 1'000U; });
+
+  EXPECT_THROW(static_cast<void>(coordinator.ConvergeOrRecover(
+                   intent, *predecessor.bundle, *candidate.bundle,
+                   ActiveBundlePublicationGeneration(3U))),
+               ManagerRuntimeConvergenceCoordinatorError);
+  EXPECT_EQ(publication.read_calls, 0);
+  EXPECT_EQ(runtime_ports.observe_calls, 0);
+  EXPECT_EQ(runtime_ports.ensure_calls, 0);
+  EXPECT_FALSE(journal.ReadFenceAttempt(intent.apply_id,
+                                        intent.apply_generation)
+                   .has_value());
+  EXPECT_FALSE(journal.ReadFenceAcceptance(intent.apply_id,
+                                           intent.apply_generation)
+                   .has_value());
+  EXPECT_FALSE(journal.ReadRuntimeConvergenceIntent(intent.apply_id,
+                                                   intent.apply_generation)
+                   .has_value());
+}
+
+TEST(ManagerApplyRuntimeConvergenceCoordinator,
      ConcreteRetainedProcessReachesDurableStagedReadyWithoutEpochReplacement) {
   ScopedPackageRoot root;
   auto package = MaterializeRuntimePackage(root.path());
@@ -1516,7 +1646,7 @@ TEST(ManagerNamedApplyCoordinator,
       active_plan_source, runtime_ports, runtime_ports, [] { return 1'000U; });
   AlwaysIdleMaintenanceGate maintenance_gate;
   ManagerPlannedMaintenanceCoordinator planned_maintenance(
-      active_plan_source, active_runtime, maintenance_gate);
+      active_plan_source, maintenance_gate);
   bool invalid_initial_scene = true;
   ManagerNamedApplyCoordinator coordinator(
       journal, active_plan_source, bundle_source,
@@ -1594,6 +1724,17 @@ TEST(ManagerNamedApplyCoordinator,
   ASSERT_TRUE(runtime_composition.last_request.has_value());
   EXPECT_EQ(runtime_composition.last_request->phase,
             ManagerSelectedRuntimeCompositionPhase::kFinalize);
+  // The host executes the exact durable decision, never a re-derived one.
+  const auto affected = journal.ReadAffectedScope(
+      completed->terminal_outcome->apply_id,
+      completed->terminal_outcome->apply_generation);
+  ASSERT_TRUE(affected.has_value());
+  EXPECT_EQ(runtime_composition.last_request->component_delta,
+            affected->affected_scope.component_delta);
+  EXPECT_TRUE(runtime_composition.last_request->component_delta.valid());
+  EXPECT_EQ(runtime_composition.last_request->predecessor_projection_revision
+                .retained_bundle_id,
+            predecessor.request.candidate_retained_bundle_id);
   EXPECT_EQ(publication_store.publish_calls, 1);
   EXPECT_EQ(kernel_fence.acquire_calls, 1);
   EXPECT_EQ(kernel_fence.release_calls, 1);
@@ -1612,6 +1753,141 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(kernel_fence.acquire_calls, 1);
   EXPECT_EQ(kernel_fence.release_calls, 1);
   EXPECT_FALSE(coordinator.RecoverIncompleteApply().has_value());
+}
+
+TEST(ManagerNamedApplyCoordinator,
+     EmptyDeltaInstallationDoesNotRequireComponentReceipts) {
+  ScopedPackageRoot package_root;
+  ScopedPackageRoot state_root;
+  auto package = MaterializeRuntimePackage(package_root.path());
+  const auto intent_template = ApplyIntent(*package.bundle);
+  const auto predecessor = PredecessorPublication(intent_template);
+  const auto database = state_root.path() / "receipt-apply.sqlite3";
+  SqliteManagerApplyJournal journal(database,
+                                    package.bundle->value().cell_graph.cell_id);
+  SqliteManagerApplyJournal independent_reader(
+      database, package.bundle->value().cell_graph.cell_id);
+  ScriptedPublicationStore publication_store(predecessor, &independent_reader);
+  FixedActiveRuntimePlanSource active_plan_source(
+      predecessor, BuildVerifiedRuntimeConvergencePlan(
+                       *package.bundle, *package.artifact_source, "linux",
+                       {"posix.1-2017"}));
+  ScriptedRuntimePorts runtime_ports(independent_reader);
+  MaintenanceSceneOwner scene_owner(
+      predecessor.request.candidate_projection_revision);
+  AggregateFencePort kernel_fence(independent_reader, predecessor);
+  ScriptedRuntimeCompositionPort runtime_composition;
+  runtime_composition.omit_receipts = true;
+  ScriptedCellAdmissionPort cell_admission;
+  ManagerActiveRuntimeCoordinator active_runtime(
+      active_plan_source, runtime_ports, runtime_ports, [] { return 1'000U; });
+  AlwaysIdleMaintenanceGate maintenance_gate;
+  ManagerPlannedMaintenanceCoordinator planned_maintenance(
+      active_plan_source, maintenance_gate);
+  ManagerNamedApplyCoordinator coordinator(
+      journal, active_plan_source, *package.bundle_source,
+      *package.artifact_source, publication_store, scene_owner, nullptr,
+      kernel_fence, cell_admission, runtime_composition, runtime_ports,
+      runtime_ports, planned_maintenance,
+      RuntimeEpoch("manager-runtime.receipts.1"), "linux", {"posix.1-2017"},
+      [] { return 1'000U; }, [] { return ApplyId("apply.receipts.1"); },
+      [](const auto &, const auto &) {
+        return std::vector<core::AddObjectRequestDTO>{};
+      });
+  const ManagerNamedApplyRequestDTO request{
+      intent_template.request_context,
+      package.bundle->value().deployment_artifact_id,
+      package.bundle->value().deployment_revision,
+      predecessor.request.candidate_retained_bundle_id,
+      predecessor.request.candidate_graph_revision,
+      package.bundle->retained_bundle_id(),
+      intent_template.prepared_activation,
+      core::AdmissionGeneration(7U),
+      std::nullopt,
+  };
+  EXPECT_EQ(coordinator.AcceptOrReplay(request).state,
+            ManagerNamedApplyResultState::kPending);
+  const auto outcome = coordinator.RecoverIncompleteApply();
+  ASSERT_TRUE(outcome.has_value());
+  // This runtime-only candidate has no controllable components, so an empty
+  // receipt list is the exact complete receipt set and installation may
+  // publish. Non-empty deltas' missing-receipt refusal is tested directly by
+  // ComponentReceiptsMatchRequest.
+  EXPECT_EQ(outcome->state, ManagerNamedApplyResultState::kSucceeded);
+  EXPECT_EQ(runtime_composition.phases,
+            (std::vector<ManagerSelectedRuntimeCompositionPhase>{
+                ManagerSelectedRuntimeCompositionPhase::kPrepare,
+                ManagerSelectedRuntimeCompositionPhase::kFinalize,
+                ManagerSelectedRuntimeCompositionPhase::kFinalize}));
+  ASSERT_TRUE(runtime_composition.last_request.has_value());
+  EXPECT_TRUE(runtime_composition.last_request->component_delta.components.empty());
+  EXPECT_EQ(publication_store.publish_calls, 1);
+}
+
+TEST(ManagerNamedApplyCoordinator,
+     StalePredecessorIsRefusedBeforeAnyDurableRecordOrEffect) {
+  ScopedPackageRoot package_root;
+  ScopedPackageRoot state_root;
+  auto package = MaterializeRuntimePackage(package_root.path());
+  const auto intent_template = ApplyIntent(*package.bundle);
+  const auto predecessor = PredecessorPublication(intent_template);
+  const auto database = state_root.path() / "stale-predecessor.sqlite3";
+  SqliteManagerApplyJournal journal(database,
+                                    package.bundle->value().cell_graph.cell_id);
+  SqliteManagerApplyJournal independent_reader(
+      database, package.bundle->value().cell_graph.cell_id);
+  ScriptedPublicationStore publication_store(predecessor, &independent_reader);
+  FixedActiveRuntimePlanSource active_plan_source(
+      predecessor, BuildVerifiedRuntimeConvergencePlan(
+                       *package.bundle, *package.artifact_source, "linux",
+                       {"posix.1-2017"}));
+  ScriptedRuntimePorts runtime_ports(independent_reader);
+  MaintenanceSceneOwner scene_owner(
+      predecessor.request.candidate_projection_revision);
+  AggregateFencePort kernel_fence(independent_reader, predecessor);
+  ScriptedRuntimeCompositionPort runtime_composition;
+  ScriptedCellAdmissionPort cell_admission;
+  ManagerActiveRuntimeCoordinator active_runtime(
+      active_plan_source, runtime_ports, runtime_ports, [] { return 1'000U; });
+  AlwaysIdleMaintenanceGate maintenance_gate;
+  ManagerPlannedMaintenanceCoordinator planned_maintenance(
+      active_plan_source, maintenance_gate);
+  ManagerNamedApplyCoordinator coordinator(
+      journal, active_plan_source, *package.bundle_source,
+      *package.artifact_source, publication_store, scene_owner, nullptr,
+      kernel_fence, cell_admission, runtime_composition, runtime_ports,
+      runtime_ports, planned_maintenance,
+      RuntimeEpoch("manager-runtime.stale.1"), "linux", {"posix.1-2017"},
+      [] { return 1'000U; }, [] { return ApplyId("apply.stale.1"); },
+      [](const auto &, const auto &) {
+        return std::vector<core::AddObjectRequestDTO>{};
+      });
+  // The caller previewed against a predecessor that is no longer active.
+  auto stale_bundle =
+      predecessor.request.candidate_retained_bundle_id.value();
+  stale_bundle.back() = stale_bundle.back() == '0' ? '1' : '0';
+  const ManagerNamedApplyRequestDTO request{
+      intent_template.request_context,
+      package.bundle->value().deployment_artifact_id,
+      package.bundle->value().deployment_revision,
+      RetainedBundleId(stale_bundle),
+      predecessor.request.candidate_graph_revision,
+      package.bundle->retained_bundle_id(),
+      intent_template.prepared_activation,
+      core::AdmissionGeneration(7U),
+      std::nullopt,
+  };
+
+  EXPECT_THROW(static_cast<void>(coordinator.AcceptOrReplay(request)),
+               ManagerNamedApplyCoordinatorError);
+  EXPECT_FALSE(journal.ReadRequest(request.request_context.request_owner_epoch,
+                                   request.request_context.request_id)
+                   .has_value());
+  EXPECT_EQ(runtime_ports.ensure_calls, 0);
+  EXPECT_EQ(scene_owner.begin_calls, 0);
+  EXPECT_EQ(kernel_fence.acquire_calls, 0);
+  EXPECT_EQ(runtime_composition.calls, 0);
+  EXPECT_EQ(publication_store.publish_calls, 0);
 }
 
 TEST(ManagerNamedApplyCoordinator,
@@ -1641,7 +1917,7 @@ TEST(ManagerNamedApplyCoordinator,
       active_plan_source, runtime_ports, runtime_ports, [] { return 1'000U; });
   AlwaysIdleMaintenanceGate maintenance_gate;
   ManagerPlannedMaintenanceCoordinator planned_maintenance(
-      active_plan_source, active_runtime, maintenance_gate);
+      active_plan_source, maintenance_gate);
   const ManagerNamedApplyRequestDTO request{
       intent_template.request_context,
       package.bundle->value().deployment_artifact_id,

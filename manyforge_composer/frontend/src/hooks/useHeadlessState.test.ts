@@ -471,7 +471,7 @@ function receiveControlSnapshot(
 
 function wireObservation(sequence: number): Record<string, unknown> {
   return {
-    schema_version: 'manyforge.execution_observation_frame.v2',
+    schema_version: 'manyforge.execution_observation_frame.v3',
     owner_epoch: 'execution-owner.1',
     cell_id: 'cell-1',
     retained_bundle_id: 'bundle-1',
@@ -481,6 +481,7 @@ function wireObservation(sequence: number): Record<string, unknown> {
     received_at_monotonic_us: 10_000 + sequence,
     targets: [{
       controllable_component_id: 'robot-1', command_target_id: 'arm',
+      operation_capability_id: 'execution.trajectory.execute',
       source_epoch: 'arm-source.1', source_sequence: sequence,
       source_joint_names: ['joint1'], compiled_joint_names: ['robot__joint1'],
       coordinate_kinds: ['angular'], positions_si: [sequence / 100],
@@ -517,7 +518,9 @@ describe('HeadlessStateSource delivery scheduling', () => {
       cancelAnimationFrame: vi.fn(),
     });
     vi.stubGlobal('WebSocket', FakeWebSocket);
-    const sent = vi.fn(async (_url: string, _request: RequestInit) => ({
+    const sent = vi.fn<(url: string, request: RequestInit) => Promise<
+      Pick<Response, 'ok' | 'json'>
+    >>(async () => ({
       ok: true,
       json: async () => ({
         receipt: {
@@ -574,6 +577,13 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(() => parseExecutionObservationFrame(crossed)).toThrow(
       /joint vectors/,
     );
+    // H1a-IF.2: a cell may have no observable coordinate (for example only
+    // an unsupported capability); each target names its capability.
+    const empty = wireObservation(4);
+    empty.targets = [];
+    expect(parseExecutionObservationFrame(empty).targets).toEqual([]);
+    expect(parseExecutionObservationFrame(wireObservation(5)).targets[0].operationCapabilityId)
+      .toBe('execution.trajectory.execute');
   });
 
   it('uses the same UTF-8 identity byte bounds as the owner and proxy', () => {

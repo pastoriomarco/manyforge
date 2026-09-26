@@ -167,6 +167,23 @@ class ScopedTemporaryDirectory final {
                    ComponentLifecycleGeneration(4U), catalog)};
 }
 
+[[nodiscard]] std::vector<ComponentLifecycleCurrentSnapshotDTO> OrdinaryDisableSnapshots() {
+  const auto catalog = PrepareCatalog();
+  const auto current = Snapshot("snapshot.before.1",
+                                ComponentLifecycleStateDTO::kActive,
+                                ComponentLifecycleGeneration(3U), catalog);
+  auto accepted = current;
+  accepted.component_lifecycle_generation = ComponentLifecycleGeneration(4U);
+  const auto accepted_digest = ComputeComponentLifecycleCurrentSnapshotDigest(accepted);
+  if (!accepted_digest.ok()) {
+    ADD_FAILURE() << accepted_digest.error().code << ": "
+                  << accepted_digest.error().message;
+    throw std::runtime_error("failed to construct accepted Disable snapshot");
+  }
+  accepted.snapshot_digest = accepted_digest.value();
+  return {current, current, accepted};
+}
+
 [[nodiscard]] LifecyclePredicateDTO Predicate(ComponentLifecycleStateDTO state) {
   return {{state}, {}};
 }
@@ -1983,18 +2000,18 @@ TEST(ComponentLifecycleCoordinator,
 }
 
 TEST(ComponentLifecycleCoordinator,
-     NormalDisableContainsMutatesAndDurablyReleasesFenceExactlyOnce) {
+     OrdinaryDisableUsesIdleClaimAndNeverCallsTheKernelStopHandoff) {
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
   CCLCDomainReservationTable reservations;
-  FakeSnapshotSource snapshots(ResolvedDisableSnapshots());
+  FakeSnapshotSource snapshots(OrdinaryDisableSnapshots());
   FakeCatalogSource catalogs(DisableCatalog());
   auto port = std::make_shared<FakeBrandPort>(
       journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kActive,
                                                        ComponentLifecycleStateDTO::kDisabled});
   FakeResolver resolver(port);
-  FakeKernelDisablePort kernel(journal);
+  UnusedKernelPort kernel;
   FakeClock clock;
   clock.set(100);
   ManualScheduler scheduler;
@@ -2012,29 +2029,15 @@ TEST(ComponentLifecycleCoordinator,
       coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
   ASSERT_TRUE(status.ok());
   ASSERT_TRUE(status.value().has_value());
-  EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kSucceeded)
+      << (status.value()->error.has_value()
+              ? status.value()->error->code + ": " + status.value()->error->message
+              : "no terminal error recorded");
   EXPECT_EQ(status.value()->current_state, ComponentLifecycleStateDTO::kDisabled);
   EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
-  ASSERT_TRUE(status.value()->disable_handoff.has_value());
-  EXPECT_EQ(status.value()->disable_handoff->state, DisableHandoffStateDTO::kReady);
-  EXPECT_EQ(status.value()->disable_handoff->configuration_fence_handle.state,
-            ConfigurationFenceState::kHeld);
-  ASSERT_TRUE(status.value()->configuration_fence.has_value());
-  EXPECT_EQ(status.value()->configuration_fence->state, ConfigurationFenceState::kReleased);
-  EXPECT_EQ(status.value()->configuration_fence->configuration_fence_id,
-            status.value()->disable_handoff->configuration_fence_id);
-  EXPECT_EQ(status.value()->configuration_fence->configuration_fence_generation,
-            status.value()->disable_handoff->configuration_fence_generation);
-  EXPECT_EQ(status.value()->configuration_fence->scope, status.value()->disable_handoff->scope);
-  ASSERT_TRUE(status.value()->disable_fence_released.has_value());
-  EXPECT_TRUE(status.value()->disable_fence_released->matches(
-      status.value()->disable_fence_released->request));
-  EXPECT_EQ(kernel.admission_observation_count(), 2U);
-  EXPECT_EQ(kernel.begin_count(), 1U);
-  EXPECT_EQ(kernel.release_count(), 1U);
-  EXPECT_TRUE(kernel.saw_handoff_prepared());
-  EXPECT_TRUE(kernel.saw_release_prepared());
-  EXPECT_TRUE(kernel.terminal_candidate_locally_valid());
+  EXPECT_FALSE(status.value()->disable_handoff.has_value());
+  EXPECT_FALSE(status.value()->configuration_fence.has_value());
+  EXPECT_FALSE(status.value()->disable_fence_released.has_value());
   EXPECT_EQ(port->dispatch_count(), 1U);
   EXPECT_EQ(port->last_dispatched_primitive_id(), LifecyclePrimitiveId("disable"));
   EXPECT_TRUE(port->saw_prepared_status());
@@ -2042,7 +2045,7 @@ TEST(ComponentLifecycleCoordinator,
 }
 
 TEST(ComponentLifecycleCoordinator,
-     UnderFenceActiveConfigurationMismatchNeverDispatchesAndStillReleasesFence) {
+     ClaimedSnapshotMismatchNeverDispatchesAndReleasesTheIdleClaim) {
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
@@ -2059,7 +2062,7 @@ TEST(ComponentLifecycleCoordinator,
   auto port = std::make_shared<FakeBrandPort>(
       journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kActive});
   FakeResolver resolver(port);
-  FakeKernelDisablePort kernel(journal);
+  UnusedKernelPort kernel;
   FakeClock clock;
   clock.set(100);
   ManualScheduler scheduler;
@@ -2082,14 +2085,11 @@ TEST(ComponentLifecycleCoordinator,
   EXPECT_EQ(status.value()->terminal_result,
             ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);
   ASSERT_TRUE(status.value()->error.has_value());
-  EXPECT_EQ(status.value()->error->code, "component_lifecycle_disable_mutation_domain_mismatch");
+  EXPECT_EQ(status.value()->error->code, "component_lifecycle_snapshot_changed_under_claim");
   EXPECT_EQ(port->observation_count(), 0U);
   EXPECT_EQ(port->dispatch_count(), 0U);
-  EXPECT_EQ(kernel.begin_count(), 1U);
-  EXPECT_EQ(kernel.release_count(), 1U);
-  ASSERT_TRUE(status.value()->configuration_fence.has_value());
-  EXPECT_EQ(status.value()->configuration_fence->state, ConfigurationFenceState::kReleased);
-  EXPECT_TRUE(status.value()->disable_fence_released.has_value());
+  EXPECT_FALSE(status.value()->disable_handoff.has_value());
+  EXPECT_FALSE(status.value()->configuration_fence.has_value());
   EXPECT_TRUE(reservations.snapshot().empty());
 }
 
@@ -2463,8 +2463,7 @@ TEST(ComponentLifecycleCoordinator,
   ASSERT_TRUE(disable_admission.ok()) << disable_admission.error().message;
   const auto intent = DisableIntent(first_owner);
   const auto prepared = PrepareComponentLifecycleAdmission(
-      intent, RecoveryAdmissionCandidate("lifecycle.1", snapshot, {DisableCatalog()},
-                                         disable_admission.value()));
+      intent, RecoveryAdmissionCandidate("lifecycle.1", snapshot, {DisableCatalog()}));
   ASSERT_TRUE(prepared.ok()) << prepared.error().code << ": " << prepared.error().message;
   const auto seeded_claim =
       SeedLifecycleClaim(journal, first_owner, intent, prepared.value().acceptance);

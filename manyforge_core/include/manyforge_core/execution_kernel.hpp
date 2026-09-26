@@ -20,6 +20,7 @@
 #include <manyforge_core/kernel_flight_recorder.hpp>
 #include <manyforge_core/motion_trip_stop_coordinator.hpp>
 #include <manyforge_core/operator_stop_worker.hpp>
+#include <manyforge_core/resource_slot_table.hpp>
 #include <manyforge_core/ports/icollision_trajectory_projector.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/igripper_command_backend.hpp>
@@ -41,6 +42,7 @@
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/types/collision.hpp>
+#include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/execute_request.hpp>
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/kernel_event.hpp>
@@ -470,13 +472,34 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   void set_collision_validation_policy_snapshot(std::optional<CollisionPolicySnapshot> snapshot);
 
   /// Install role-owned collision resources. Production composition roots should
-  /// use this API: runtime monitoring owns `runtime_monitor_engine`, while
-  /// authoritative validation owns `validation_engines`.
+  /// use this once while constructing a private Kernel. Retained Kernel
+  /// replacements require the exact held Apply-fence API below. The bootstrap
+  /// publisher is borrowed and its composition owner must keep it alive until
+  /// an owned replacement has completed (and through Kernel teardown if none
+  /// is performed).
   void set_collision_resources(
       ICollisionWorldSnapshotPublisher& publisher,
       std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine,
       std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines,
       std::vector<std::shared_ptr<ICollisionQueryEngine>> runtime_lookahead_engines = {});
+
+  /// Replace collision resources on a retained Kernel while its exact Apply
+  /// fence is held. The call is accepted only at Idle with no active monitor
+  /// or operation, and candidate validation completes before publication.
+  /// Returned shared owners are the installed objects; generation identifies
+  /// this exact Kernel-local publication for immediate readback comparison.
+  [[nodiscard]] Result<CollisionPipelineResourceReadbackDTO>
+  replace_collision_resources_under_apply_fence(
+      const ConfigurationFenceId& apply_fence_id,
+      const ConfigurationFenceScopeDTO& apply_fence_scope,
+      const IResourceOperationAdmissionGate& admission_gate,
+      CollisionPipelineResourceOwners candidate);
+
+  /// Return the currently installed exact owned resource set. Initial legacy
+  /// bootstrap resources without a shared publisher owner cannot be returned
+  /// through this API.
+  [[nodiscard]] Result<CollisionPipelineResourceReadbackDTO>
+  collision_resource_set_readback() const;
 
   /// Optional pose-source / per-state retry configuration for the
   /// CollisionValidationCoordinator. Has no effect until a policy snapshot is
@@ -552,6 +575,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
  private:
   struct PreparedMotionSession;
+  [[nodiscard]] std::optional<ErrorDTO>
+  collision_resource_replacement_refusal_locked();
   [[nodiscard]] Result<void> retire_prepared_motion_membership();
   [[nodiscard]] ResetResultDTO reset_execution_backend();
   struct PlanningSuccess;
@@ -985,6 +1010,8 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   PoseSourceRetryConfig coordinator_retry_config_{};
   std::int64_t coordinator_per_state_timeout_ns_ = 0;
   CollisionResourceManager collision_resources_;
+  mutable std::mutex collision_resource_set_mutex_;
+  std::uint64_t collision_resource_set_generation_{};
   std::unique_ptr<ParallelCollisionValidationWorkerPool> collision_validation_worker_pool_;
   std::atomic<std::uint64_t> validation_collision_workers_effective_{0};
   mutable std::mutex runtime_collision_protection_mutex_;

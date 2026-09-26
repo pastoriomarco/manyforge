@@ -12484,11 +12484,76 @@ void ExecutionKernel::set_collision_validation_policy_snapshot(
   coordinator_policy_index_.reset();
 }
 
+std::optional<ErrorDTO> ExecutionKernel::collision_resource_replacement_refusal_locked() {
+  const auto reject = [](std::string reason, std::string message) {
+    return std::optional<ErrorDTO>{ErrorDTO{
+        std::string(to_string(ErrorCode::kInvalidStateTransition)), std::move(message),
+        {{"reason", std::move(reason)}}}};
+  };
+  if (sm_.status().state != ExecutionState::kIdle) {
+    return reject("collision_resource_kernel_not_idle",
+                  "Collision resources can change only while the Kernel is Idle");
+  }
+  if (runtime_collision_protection_snapshot().active ||
+      runtime_collision_query_session_.load(std::memory_order_acquire) != nullptr) {
+    return reject("collision_resource_runtime_monitor_active",
+                  "Collision resources cannot change while runtime monitoring is active");
+  }
+  if (operator_stop_command_active_.load(std::memory_order_acquire) ||
+      operator_stop_worker_.active() || motion_trip_stop_.active() ||
+      fault_preempt_stop_active() || fault_preempt_worker_.active()) {
+    return reject("collision_resource_stop_operation_active",
+                  "Collision resources cannot change while a Stop operation is active");
+  }
+  if (lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire) ||
+      planning_reset_requested_.load(std::memory_order_acquire) ||
+      lifecycle_reset_waiting_for_stop_.load(std::memory_order_acquire)) {
+    return reject("collision_resource_kernel_transition_active",
+                  "Collision resources cannot change during Kernel retirement or Reset");
+  }
+  {
+    std::lock_guard lock(validation_cancel_mutex_);
+    if (!active_validation_cancel_token_.expired()) {
+      return reject("collision_resource_validation_active",
+                    "Collision resources cannot change while validation work is active");
+    }
+  }
+  {
+    std::lock_guard lock(prepared_motion_session_mutex_);
+    if (active_prepared_motion_session_ != nullptr) {
+      return reject("collision_resource_prepared_operation_active",
+                    "Collision resources cannot change while a prepared operation is retained");
+    }
+  }
+  if (const auto lookahead =
+          runtime_collision_lookahead_session_.load(std::memory_order_acquire);
+      lookahead && !lookahead->quiescent_for_resource_replacement()) {
+    return reject("collision_resource_lookahead_active",
+                  "Collision resources cannot change while lookahead work is active");
+  }
+  return std::nullopt;
+}
+
 void ExecutionKernel::set_collision_resources(
     ICollisionWorldSnapshotPublisher& publisher,
     std::shared_ptr<ICollisionQueryEngine> runtime_monitor_engine,
     std::vector<std::shared_ptr<ICollisionQueryEngine>> validation_engines,
     std::vector<std::shared_ptr<ICollisionQueryEngine>> runtime_lookahead_engines) {
+  // This API is intentionally limited to the first private-Kernel install.
+  // A retained Kernel is replaced only by the exact Apply-fenced API below.
+  std::unique_lock lifecycle_lock(lifecycle_mutex_);
+  if (const auto refusal = collision_resource_replacement_refusal_locked()) {
+    throw std::logic_error(refusal->message + ": " + refusal->details.at("reason"));
+  }
+  std::unique_lock resource_set_lock(collision_resource_set_mutex_);
+  if (collision_resource_set_generation_ != 0U) {
+    throw std::logic_error(
+        "collision resources are already installed; retained replacement requires an Apply fence");
+  }
+  if (runtime_collision_lookahead_session_.load(std::memory_order_acquire) != nullptr) {
+    throw std::logic_error("initial collision resource install found an existing lookahead session");
+  }
+
   const auto capacity =
       CollisionResourceManager::inspect_validation_worker_capacity(validation_engines);
   if (config_.validation_collision_workers_declared &&
@@ -12566,19 +12631,272 @@ void ExecutionKernel::set_collision_resources(
   auto previous_lookahead = runtime_collision_lookahead_session_.exchange(
       std::move(next_lookahead), std::memory_order_acq_rel);
   if (previous_lookahead) {
-    previous_lookahead->disarm();
+    std::terminate();
   }
-  const auto protection = runtime_collision_protection_snapshot();
-  if (protection.active) {
-    runtime_collision_query_session_.store(nullptr, std::memory_order_release);
-    std::lock_guard<std::mutex> error_lock(runtime_collision_query_prepare_error_mutex_);
-    runtime_collision_query_prepare_error_ =
-        ErrorDTO{kErrorValidationCollision,
-                 "Runtime collision resources changed while monitoring was active",
-                 {{"reason", "runtime_collision_resources_changed_while_active"}}};
-  }
+  ++collision_resource_set_generation_;
+  resource_set_lock.unlock();
+  lifecycle_lock.unlock();
   std::map<std::string, std::string> ignored_details;
   (void)refresh_published_runtime_collision_snapshot(&ignored_details);
+}
+
+Result<CollisionPipelineResourceReadbackDTO>
+ExecutionKernel::collision_resource_set_readback() const {
+  std::lock_guard resource_set_lock(collision_resource_set_mutex_);
+  const auto installed = collision_resources_.snapshot();
+  if (collision_resource_set_generation_ == 0U) {
+    return Result<CollisionPipelineResourceReadbackDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                 "Collision resources have not been installed",
+                 {{"reason", "collision_resource_set_not_installed"}}});
+  }
+  if (!installed.snapshot_publisher_owner ||
+      installed.snapshot_publisher_owner.get() != installed.snapshot_publisher) {
+    return Result<CollisionPipelineResourceReadbackDTO>::Err(
+        ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
+                 "Installed collision publisher is not owned by the Kernel",
+                 {{"reason", "collision_resource_publisher_owner_missing"}}});
+  }
+  CollisionPipelineResourceOwners owners;
+  owners.snapshot_publisher = installed.snapshot_publisher_owner;
+  owners.runtime_monitor_engine = installed.runtime_monitor_engine;
+  owners.validation_engines = installed.validation_engines;
+  owners.runtime_lookahead_engines = installed.runtime_lookahead_engines;
+  std::shared_ptr<const CollisionPolicySnapshot> policy_snapshot;
+  std::shared_ptr<const CollisionPolicyIndex> policy_index;
+  {
+    std::lock_guard policy_lock(coordinator_mutex_);
+    policy_snapshot = coordinator_policy_snapshot_;
+    policy_index = coordinator_policy_index_;
+  }
+  return Result<CollisionPipelineResourceReadbackDTO>::Ok(
+      CollisionPipelineResourceReadbackDTO{collision_resource_set_generation_,
+                                           std::move(owners),
+                                           std::move(policy_snapshot),
+                                           std::move(policy_index)});
+}
+
+Result<CollisionPipelineResourceReadbackDTO>
+ExecutionKernel::replace_collision_resources_under_apply_fence(
+    const ConfigurationFenceId& apply_fence_id,
+    const ConfigurationFenceScopeDTO& apply_fence_scope,
+    const IResourceOperationAdmissionGate& admission_gate,
+    CollisionPipelineResourceOwners candidate) {
+  const auto refuse = [](ErrorCode code, std::string reason, std::string message,
+                         std::map<std::string, std::string> additional = {}) {
+    additional["reason"] = std::move(reason);
+    return Result<CollisionPipelineResourceReadbackDTO>::Err(
+        ErrorDTO{std::string(to_string(code)), std::move(message), std::move(additional)});
+  };
+  if (apply_fence_id.empty() || !apply_fence_scope.valid()) {
+    return refuse(ErrorCode::kInvalidRequest, "configuration_fence_identity_invalid",
+                  "Collision resource replacement requires a valid Apply fence identity");
+  }
+  std::shared_ptr<std::recursive_mutex> admission_mutex;
+  try {
+    admission_mutex = admission_gate.shared_admission_mutex();
+  } catch (...) {
+    return refuse(ErrorCode::kInvalidRequest, "configuration_fence_mutex_unavailable",
+                  "Apply fence admission mutex is unavailable");
+  }
+  if (!admission_mutex) {
+    return refuse(ErrorCode::kInvalidRequest, "configuration_fence_mutex_unavailable",
+                  "Apply fence admission mutex is unavailable");
+  }
+  std::unique_lock admission_lock(*admission_mutex);
+  try {
+    if (!admission_gate.exact_fence_is_held(apply_fence_id, apply_fence_scope)) {
+      return refuse(ErrorCode::kInvalidStateTransition, "configuration_fence_not_held",
+                    "The exact Apply fence is not held for collision resource replacement");
+    }
+  } catch (...) {
+    return refuse(ErrorCode::kInvalidStateTransition, "configuration_fence_verification_failed",
+                  "The exact Apply fence could not be verified");
+  }
+
+  std::unique_lock lifecycle_lock(lifecycle_mutex_);
+  if (const auto refusal = collision_resource_replacement_refusal_locked()) {
+    return Result<CollisionPipelineResourceReadbackDTO>::Err(*refusal);
+  }
+  std::unique_lock resource_set_lock(collision_resource_set_mutex_);
+  if (collision_resource_set_generation_ == std::numeric_limits<std::uint64_t>::max()) {
+    return refuse(ErrorCode::kInvariantViolation, "collision_resource_generation_exhausted",
+                  "Collision resource publication generation is exhausted");
+  }
+  if (!candidate.snapshot_publisher) {
+    return refuse(ErrorCode::kInvalidRequest, "collision_resource_publisher_missing",
+                  "Candidate collision resources require an owned snapshot publisher");
+  }
+  if (!candidate.runtime_monitor_engine) {
+    return refuse(ErrorCode::kInvalidRequest, "collision_resource_candidate_engine_missing",
+                  "Candidate collision resources require a runtime monitor engine",
+                  {{"candidate_role", "runtime_monitor"}});
+  }
+  if (candidate.validation_engines.empty()) {
+    return refuse(ErrorCode::kInvalidRequest, "collision_resource_candidate_engine_missing",
+                  "Candidate collision resources require at least one validation engine",
+                  {{"candidate_role", "validation"}});
+  }
+  const auto contains_null_engine = [](const auto& engines) {
+    return std::any_of(engines.begin(), engines.end(),
+                       [](const auto& engine) { return !engine; });
+  };
+  if (contains_null_engine(candidate.validation_engines)) {
+    return refuse(ErrorCode::kInvalidRequest, "collision_resource_candidate_engine_missing",
+                  "Candidate validation engine inventory contains a missing entry",
+                  {{"candidate_role", "validation"}});
+  }
+  if (contains_null_engine(candidate.runtime_lookahead_engines)) {
+    return refuse(ErrorCode::kInvalidRequest, "collision_resource_candidate_engine_missing",
+                  "Candidate lookahead engine inventory contains a missing entry",
+                  {{"candidate_role", "runtime_lookahead"}});
+  }
+
+  CollisionPipelineResources prepared_resources;
+  prepared_resources.snapshot_publisher = candidate.snapshot_publisher.get();
+  prepared_resources.snapshot_publisher_owner = candidate.snapshot_publisher;
+  prepared_resources.runtime_monitor_engine = candidate.runtime_monitor_engine;
+  prepared_resources.validation_engines = candidate.validation_engines;
+  prepared_resources.runtime_lookahead_engines = candidate.runtime_lookahead_engines;
+  CollisionValidationAdmission admission;
+  CollisionValidationWorkerCapacity validation_capacity;
+  CollisionValidationWorkerCapacity lookahead_capacity;
+  try {
+    admission = CollisionResourceManager::validate_admission(prepared_resources, true);
+    validation_capacity = CollisionResourceManager::inspect_validation_worker_capacity(
+        candidate.validation_engines);
+    lookahead_capacity = CollisionResourceManager::inspect_validation_worker_capacity(
+        candidate.runtime_lookahead_engines);
+  } catch (const std::exception& error) {
+    return refuse(ErrorCode::kInvalidRequest, "collision_resource_candidate_inspection_failed",
+                  "Candidate collision engine capabilities could not be verified",
+                  {{"exception", error.what()}});
+  } catch (...) {
+    return refuse(ErrorCode::kInvalidRequest, "collision_resource_candidate_inspection_failed",
+                  "Candidate collision engine capabilities could not be verified");
+  }
+  if (!admission.admitted()) {
+    return refuse(ErrorCode::kInvalidRequest, "collision_resource_candidate_invalid",
+                  "Candidate collision resource roles are not independently usable",
+                  {{"candidate_reason", admission.resource_conflict_reason}});
+  }
+
+  if (config_.validation_collision_workers_declared &&
+      (validation_capacity.mismatch_reason ||
+       validation_capacity.effective_contexts !=
+           static_cast<std::size_t>(config_.validation_collision_workers))) {
+    return refuse(
+        ErrorCode::kInvalidRequest, "collision_resource_validation_capacity_mismatch",
+        "Candidate validation engines do not satisfy the declared worker capacity",
+        {{"requested", std::to_string(config_.validation_collision_workers)},
+         {"effective", std::to_string(validation_capacity.effective_contexts)},
+         {"capacity_reason", validation_capacity.mismatch_reason.value_or("count_mismatch")}});
+  }
+  if ((!candidate.runtime_lookahead_engines.empty() &&
+       (lookahead_capacity.mismatch_reason ||
+        lookahead_capacity.effective_contexts !=
+            static_cast<std::size_t>(config_.runtime_collision_lookahead_workers))) ||
+      (config_.runtime_collision_lookahead_workers_declared &&
+       candidate.runtime_lookahead_engines.empty())) {
+    return refuse(
+        ErrorCode::kInvalidRequest, "collision_resource_lookahead_capacity_mismatch",
+        "Candidate lookahead engines do not satisfy the declared worker capacity",
+        {{"requested", std::to_string(config_.runtime_collision_lookahead_workers)},
+         {"effective", std::to_string(lookahead_capacity.effective_contexts)},
+         {"capacity_reason", lookahead_capacity.mismatch_reason.value_or(
+                                 candidate.runtime_lookahead_engines.empty()
+                                     ? "missing_contexts"
+                                     : "count_mismatch")}});
+  }
+
+  auto published_bundle =
+      load_published_runtime_collision_query_bundle(*candidate.snapshot_publisher);
+  if (!published_bundle.ok()) {
+    auto details = published_bundle.error().details;
+    details["candidate_phase"] = "collision_resource_preflight";
+    details["reason"] = "collision_resource_candidate_snapshot_unavailable";
+    return Result<CollisionPipelineResourceReadbackDTO>::Err(ErrorDTO{
+        published_bundle.error().code, published_bundle.error().message, std::move(details)});
+  }
+  const auto& bundle = published_bundle.value();
+  if (!bundle || !bundle->world || !bundle->policy || !bundle->policy_index ||
+      !bundle->lookup_order_valid || !bundle->distance_selection_order_valid) {
+    return refuse(ErrorCode::kInvalidRequest, "collision_resource_candidate_snapshot_invalid",
+                  "Candidate collision publisher did not provide a complete runtime snapshot");
+  }
+
+  // Prepare the complete readback before mutating Kernel state. The policy and
+  // index are taken from the exact same immutable bundle as the candidate
+  // world, rather than re-sampled from a second publisher surface later.
+  const auto next_generation = collision_resource_set_generation_ + 1U;
+  CollisionPipelineResourceReadbackDTO readback{
+      next_generation, candidate, bundle->policy, bundle->policy_index};
+
+  std::shared_ptr<RuntimeCollisionLookaheadSession> next_lookahead;
+  if (!candidate.runtime_lookahead_engines.empty()) {
+    const auto* progress = execution_backend_.execution_progress_publication();
+    if (progress == nullptr) {
+      return refuse(ErrorCode::kInvalidRequest, "collision_resource_progress_authority_missing",
+                    "Candidate lookahead resources require backend progress authority");
+    }
+    RuntimeCollisionLookaheadSession::Config lookahead_config;
+    lookahead_config.cycle_budget_ns = config_.runtime_collision_lookahead_cycle_budget_ns;
+    lookahead_config.horizon_ns = config_.runtime_collision_lookahead_horizon_ns;
+    lookahead_config.max_samples = config_.runtime_collision_lookahead_max_samples;
+    lookahead_config.workers = config_.runtime_collision_lookahead_workers;
+    lookahead_config.min_waypoints_for_parallel =
+        config_.runtime_collision_lookahead_min_waypoints_for_parallel;
+    lookahead_config.query_budget_ns = config_.runtime_collision_lookahead_query_budget_ns;
+    lookahead_config.dynamic_body_max_age_cap_ns = config_.runtime_dynamic_body_max_age_cap_ns;
+    try {
+      next_lookahead = std::make_shared<RuntimeCollisionLookaheadSession>(
+          lookahead_config, clock_, scheduler_, *candidate.snapshot_publisher, *progress,
+          candidate.runtime_lookahead_engines,
+          [this](const RuntimeCollisionLookaheadSession* source_session,
+                 RuntimeCollisionLookaheadResult result) {
+            (void)source_session;
+            emit_runtime_collision_lookahead_evidence(std::move(result));
+          },
+          [this](const RuntimeCollisionLookaheadSession* source_session,
+                 RuntimeCollisionLookaheadResult& result) {
+            return apply_runtime_collision_lookahead_authority(result, source_session);
+          });
+    } catch (const std::exception& error) {
+      return refuse(ErrorCode::kInvalidRequest, "collision_resource_lookahead_prepare_failed",
+                    "Candidate lookahead session could not be prepared",
+                    {{"exception", error.what()}});
+    } catch (...) {
+      return refuse(ErrorCode::kInvalidRequest, "collision_resource_lookahead_prepare_failed",
+                    "Candidate lookahead session could not be prepared");
+    }
+  }
+
+  const auto previous_resources = collision_resources_.snapshot();
+  std::shared_ptr<RuntimeCollisionLookaheadSession> previous_lookahead;
+  {
+    std::lock_guard policy_lock(coordinator_mutex_);
+    collision_resources_.configure(std::move(prepared_resources));
+    coordinator_policy_snapshot_ = bundle->policy;
+    coordinator_policy_index_ = bundle->policy_index;
+    previous_lookahead = runtime_collision_lookahead_session_.exchange(
+        std::move(next_lookahead), std::memory_order_acq_rel);
+    validation_collision_workers_effective_.store(validation_capacity.effective_contexts,
+                                                  std::memory_order_relaxed);
+    ++collision_resource_set_generation_;
+  }
+  resource_set_lock.unlock();
+  lifecycle_lock.unlock();
+  admission_lock.unlock();
+
+  // The old worker borrows its publisher by reference. Keep the prior resource
+  // snapshot alive until disarm and worker join finish, after all Kernel locks
+  // have been released so a stale callback can exit without a lock cycle.
+  if (previous_lookahead) {
+    previous_lookahead->disarm();
+    previous_lookahead.reset();
+  }
+  (void)previous_resources;
+  return Result<CollisionPipelineResourceReadbackDTO>::Ok(std::move(readback));
 }
 
 std::optional<ErrorDTO> ExecutionKernel::collision_validation_admission_error() const {

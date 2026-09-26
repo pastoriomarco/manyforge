@@ -6,6 +6,7 @@
 #include <variant>
 
 #include "manyforge_deployment/artifact_codec.hpp"
+#include "manyforge_deployment/activation_preparation_request.hpp"
 #include "manyforge_deployment/canonical_value.hpp"
 
 namespace manyforge::deployment {
@@ -148,6 +149,27 @@ TEST(ArtifactCodec, EnforcesFixedResourceBounds) {
 
   const std::string too_many_bytes(kMaxArtifactEncodedBytes + 1U, 'x');
   EXPECT_THROW(parse_strict_json_model_yaml(too_many_bytes), ArtifactCodecError);
+}
+
+TEST(ArtifactCodec, AppliesDedicatedLimitToAggregatePreparationEnvelope) {
+  constexpr std::size_t kRows = 8193U;
+  constexpr std::size_t kScalarBytes = 2048U;
+  const std::string scalar(kScalarBytes, 'x');
+  std::string request = "[";
+  for (std::size_t index = 0U; index < kRows; ++index) {
+    if (index != 0U) request.push_back(',');
+    request.push_back('"');
+    request += scalar;
+    request.push_back('"');
+  }
+  request.push_back(']');
+  ASSERT_GT(request.size(), kMaxArtifactEncodedBytes);
+  ASSERT_LT(request.size(), kMaxActivationPreparationRequestBytes);
+
+  EXPECT_THROW(parse_strict_json_model_yaml(request), ArtifactCodecError);
+  const auto envelope = parse_strict_json_model_yaml(
+      request, kMaxActivationPreparationRequestBytes);
+  EXPECT_EQ(envelope.root().as_array().size(), kRows);
 }
 
 TEST(ArtifactCodec, HandlesNearLimitWideMappingWithBoundedKeyWork) {

@@ -42,8 +42,11 @@ export function candidateObservationEpoch(
   if (frame === null || status === null || frame.ownerEpoch !== status.ownerEpoch
     || frame.cellId !== status.cellId || frame.retainedBundleId !== status.retainedBundleId
     || frame.graphRevision !== status.graphRevision) return null;
-  const arm = frame.targets.find((target) => target.controllableComponentId === status.directControl.controllableComponentId
-    && target.commandTargetId === status.directControl.commandTargetId);
+  // A selection may have no motion target (gripper-only, H1a-IF.2).
+  const motion = status.directControl;
+  const arm = motion === null ? null : frame.targets.find((target) => (
+    target.controllableComponentId === motion.controllableComponentId
+    && target.commandTargetId === motion.commandTargetId));
   const gripper = status.directControlGripper;
   const tool = gripper?.sourceKind !== 'model_role' ? null : frame.targets.find((target) => (
     target.controllableComponentId === gripper.controllableComponentId
@@ -51,7 +54,7 @@ export function candidateObservationEpoch(
     && target.sourceJointNames.includes(gripper.sourceCoordinateName)
   ));
   if (arm === undefined || tool === undefined) return null;
-  return JSON.stringify([frame.ownerEpoch, frame.sourceEpoch, arm.sourceEpoch, tool?.sourceEpoch]);
+  return JSON.stringify([frame.ownerEpoch, frame.sourceEpoch, arm?.sourceEpoch, tool?.sourceEpoch]);
 }
 
 export interface MeasuredRobotPresentation {
@@ -157,11 +160,8 @@ export function executionRobotPresentation(
     positions.set(compiledJointName, position);
     return true;
   };
-  const observedMotions = status.observedMotions?.length
-    ? status.observedMotions : [status.observedMotion];
-  const motionDescriptors = status.directControlTargets?.length
-    ? status.directControlTargets.map((target) => target.targetDescriptor)
-    : [status.directControl.targetDescriptor];
+  const observedMotions = status.observedMotions;
+  const motionDescriptors = status.directControlTargets.map((target) => target.targetDescriptor);
   for (const observed of observedMotions) {
     const descriptor = motionDescriptors.find((candidate) => (
       candidate.controllableComponentId === observed.controllableComponentId
@@ -194,7 +194,8 @@ export function executionRobotPresentation(
     ? status.observedGrippers
     : status.observedGripper == null ? [] : [status.observedGripper];
   const gripperTargets = status.directControlGripperTargets?.length
-    ? status.directControlGripperTargets : [status.directControlGripper];
+    ? status.directControlGripperTargets
+    : status.directControlGripper === null ? [] : [status.directControlGripper];
   for (const observed of observedGrippers) {
     if (!observed.complete) return null;
     const target = gripperTargets.find((candidate) => (
@@ -219,7 +220,27 @@ export function executionRobotPresentation(
     }
   }
   const linkTransforms = measuredLinkTransforms(manifest, positions);
-  const observed = status.observedMotion;
+  // The presentation is sourced from the selected observation: motion when
+  // present, otherwise the first observed tool (gripper-only cell).
+  const motionSource = status.observedMotion;
+  const toolSource = status.observedGrippers[0];
+  const observed = motionSource !== null
+    ? {
+      controllableComponentId: motionSource.controllableComponentId,
+      commandTargetId: motionSource.commandTargetId,
+      sourceEpoch: motionSource.sourceEpoch,
+      sequence: motionSource.sequence,
+    }
+    : toolSource?.controllableComponentId !== undefined
+      && toolSource.commandTargetId !== undefined
+      ? {
+        controllableComponentId: toolSource.controllableComponentId,
+        commandTargetId: toolSource.commandTargetId,
+        sourceEpoch: toolSource.sourceEpoch,
+        sequence: toolSource.sequence,
+      }
+      : null;
+  if (observed === null) return null;
   return linkTransforms === null ? null : {
     objectId: observed.controllableComponentId,
     sourceId: `execution:${observed.commandTargetId}`,
@@ -860,7 +881,8 @@ export function candidateGripperPresentation(
 ): CandidateRobotPresentation | null {
   const gripper = status.directControlGripper;
   if (
-    status.cellId !== sourceModel.cell_id
+    gripper === null
+    || status.cellId !== sourceModel.cell_id
     || status.cellId !== manifest.cell_id
     || receipt.retainedBundleId !== sourceModel.retained_bundle_id
     || receipt.retainedBundleId !== manifest.retained_bundle_id
@@ -947,9 +969,14 @@ export function candidateToolPresentation(
     || status.retainedBundleId !== manifest.retained_bundle_id
     || status.graphRevision !== sourceModel.graph_revision
     || status.graphRevision !== manifest.graph_revision) return null;
-  const tcpFrames = status.directControl.targetDescriptor.frames.filter(
-    (frame) => frame.frameRoleId === status.directControl.tcpFrameRoleId,
+  // A carried object needs a motion target's TCP.
+  const motion = status.directControl;
+  if (motion === null) return null;
+  const tcpFrames = motion.targetDescriptor.frames.filter(
+    (frame) => frame.frameRoleId === motion.tcpFrameRoleId,
   );
+  // An arm-only component carries nothing through a gripper.
+  if (status.directControlGripper === null) return null;
   const gripper = status.directControlGripper.targetDescriptor;
   const targets = sourceModel.targets.filter((target) => (
     target.component_id === gripper.controllableComponentId

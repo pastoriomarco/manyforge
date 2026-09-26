@@ -45,6 +45,18 @@ struct RetainedStopSurveillanceSourceInput final {
   RetainedNoActiveGoalEvidenceSource no_active_goal_evidence_source;
 };
 
+/// Empty-source policy for a Stop surveillance owner. The ordinary mode
+/// requires a verified non-empty source table. The bootstrap mode is reserved
+/// for the stable observer owned by a managed cell: it may begin empty and
+/// later return to empty from the Kernel's held-state publication callback,
+/// immediately before the empty registration commit. That callback is the
+/// coherent publication boundary; the subsequent Kernel readback verifies the
+/// commit.
+enum class RetainedStopSurveillanceEmptySourceMode {
+  kRequireNonEmpty,
+  kManagedCellBootstrapEmpty,
+};
+
 /// Command-free native surveillance and recovery-facts owner. It reads only
 /// retained addressed-state publications and never invokes a controller,
 /// backend Stop, planner, discovery surface, or journal.
@@ -53,7 +65,9 @@ class RetainedStopSurveillanceOwner final
 public:
   explicit RetainedStopSurveillanceOwner(
       std::vector<RetainedStopSurveillanceSourceInput> sources,
-      core::IClock *clock = nullptr);
+      core::IClock *clock = nullptr,
+      RetainedStopSurveillanceEmptySourceMode empty_source_mode =
+          RetainedStopSurveillanceEmptySourceMode::kRequireNonEmpty);
 
   RetainedStopSurveillanceOwner(const RetainedStopSurveillanceOwner &) = delete;
   RetainedStopSurveillanceOwner &
@@ -67,6 +81,12 @@ public:
   /// publication/readback. Previously copied readers remain lifetime-safe.
   [[nodiscard]] core::Result<void>
   ReplaceSources(std::vector<RetainedStopSurveillanceSourceInput> sources);
+
+  /// Return a lifetime-safe copy of the currently published source table.
+  /// This is used when a stable Kernel/observer owner is handed to a new
+  /// retained root; callers cannot mutate the observer through the snapshot.
+  [[nodiscard]] std::vector<RetainedStopSurveillanceSourceInput>
+  SnapshotSources() const;
 
   [[nodiscard]] core::StopSurveillanceObservationSampleDTO Observe(
       const core::StopSurveillanceObservationQueryDTO &query) noexcept override;
@@ -91,6 +111,8 @@ public:
 
 private:
   core::IClock *clock_{};
+  RetainedStopSurveillanceEmptySourceMode empty_source_mode_{
+      RetainedStopSurveillanceEmptySourceMode::kRequireNonEmpty};
   mutable std::mutex mutex_;
   std::vector<RetainedStopSurveillanceSourceInput> sources_;
 };

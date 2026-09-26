@@ -206,7 +206,7 @@ def test_pinned_lite6_moveit_source_without_jerk_does_not_invent_limits():
 
 
 @pytest.mark.parametrize(
-    "enabled,machine_required,two_robots,unit_index",
+    "enabled,machine_required,two_robots,target_index",
     [
         (False, False, False, 0),
         (True, False, False, 0),
@@ -216,7 +216,7 @@ def test_pinned_lite6_moveit_source_without_jerk_does_not_invent_limits():
     ],
 )
 def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
-    tmp_path, enabled, machine_required, two_robots, unit_index
+    tmp_path, enabled, machine_required, two_robots, target_index
 ):
     source = json.loads(
         (
@@ -240,10 +240,29 @@ def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
                         for value in row.values()
                     )
                 )
-        assert len(source["graph"]["runtime_units"]) == 2
-    target = source["graph"]["runtime_units"][unit_index]["configuration"][
-        "motion_target_limits"
-    ][0]
+        # Both components share the stable native cell host. Duplicate their
+        # addressed configuration rows inside that host, as the compiler does.
+        configuration = source["graph"]["runtime_units"][0]["configuration"]
+        for name in (
+            "motion_target_limits",
+            "direct_control_joint_limits",
+            "gripper_target_configurations",
+        ):
+            rows = configuration[name]
+            rows.extend(
+                json.loads(json.dumps(row).replace("lite6_robot", "peer_robot"))
+                for row in list(rows)
+            )
+        configuration["initial_joint_positions_rad"] *= 2
+    native_units = source["graph"]["runtime_units"]
+    assert len(native_units) == 1
+    assert native_units[0]["runtime_unit_id"] == "robot_cell.native_execution"
+    configuration = native_units[0]["configuration"]
+    targets = configuration["motion_target_limits"]
+    assert [row["controllable_component_id"] for row in targets] == (
+        ["lite6_robot", "peer_robot"] if two_robots else ["lite6_robot"]
+    )
+    target = targets[target_index]
     assert target["ordinary_motion_jerk"]["enabled"] is False
     settings = {
         "enabled": enabled,
@@ -278,10 +297,10 @@ def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
             path=[
                 "graph",
                 "runtime_units",
-                unit_index,
+                0,
                 "configuration",
                 "motion_target_limits",
-                0,
+                target_index,
                 "ordinary_motion_jerk",
             ],
             value=settings,
@@ -293,10 +312,10 @@ def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
         jerk_path = [
             "graph",
             "runtime_units",
-            unit_index,
+            0,
             "configuration",
             "motion_target_limits",
-            0,
+            target_index,
             "ordinary_motion_jerk",
         ]
         for suffix, value in [
@@ -338,22 +357,21 @@ def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
     reopened = compile_deployment_document(saved.read_text())
     assert reopened.document == opened_again.json()["draft"]["document"]
     assert (
-        reopened.document["graph"]["runtime_units"][unit_index]["configuration"][
+        reopened.document["graph"]["runtime_units"][0]["configuration"][
             "motion_target_limits"
-        ][0]["ordinary_motion_jerk"]
+        ][target_index]["ordinary_motion_jerk"]
         == settings
     )
     # Off retains the numbers but does not activate them; the independent
     # controlled-Stop choices are unchanged in either case.
     assert reopened.document["policies"] == source["policies"]
-    if two_robots:
-        untouched = source["graph"]["runtime_units"][1 - unit_index]
-        peer = next(
-            unit
-            for unit in reopened.document["graph"]["runtime_units"]
-            if unit["runtime_unit_id"] == untouched["runtime_unit_id"]
-        )
-        assert peer == untouched
+    expected_native_unit = deepcopy(native_units[0])
+    expected_native_unit["configuration"]["motion_target_limits"][target_index][
+        "ordinary_motion_jerk"
+    ] = settings
+    # The selected target changes; every peer and host configuration field
+    # survives the Save/Open round trip exactly.
+    assert reopened.document["graph"]["runtime_units"] == [expected_native_unit]
     restored = DeploymentDraftSession()
     restored.restore_retained_state(state.deployment_draft_session.retained_state())
     assert restored.snapshot() == state.deployment_draft_session.snapshot()
@@ -781,6 +799,7 @@ class _Coordinator:
         validate_under_claim=None,
         expected_identity=None,
         project=None,
+        prepare_project_under_claim=None,
         **_kwargs,
     ):
         if validate_under_claim is not None:
@@ -792,6 +811,8 @@ class _Coordinator:
                 project=project,
             )
         elif session == "project":
+            if prepare_project_under_claim is not None:
+                project = prepare_project_under_claim()
             snapshot = workspace.commit_project(
                 expected_identity=expected_identity,
                 facts=project,
@@ -942,7 +963,10 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
         "retained_bundle_id": _DIGEST,
         "graph_revision": _DIGEST,
         "program_revision": _DIGEST,
-        "program_binding_id": _DIGEST,
+        "program_outcome": {
+            "kind": "bound",
+            "program_binding_id": _DIGEST,
+        },
     }
     captured = state._captured_deployment_context(
         {
@@ -1395,7 +1419,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
         prepare_only=False,
     ):
         prepared_activation = {
-            "schema_version": "manyforge.prepared_activation_input.v2",
+            "schema_version": "manyforge.prepared_activation_input.v3",
             "prepared_activation_id": "sha256:" + "9" * 64,
             "source_document_digest": intent["source_document_digest"],
             "captured_input_digest": intent["captured_input_digest"],
@@ -1405,7 +1429,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
             "graph_revision": "sha256:" + "7" * 64,
             "program_id": program["program_id"],
             "program_revision": program["program_revision"],
-            "program_binding_id": "sha256:" + "b" * 64,
+            "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "b" * 64},
             "node_environment_digest": "sha256:" + "d" * 64,
             "assistant_mode": "forbidden",
             "typed_parameter_overrides": {},
@@ -1524,7 +1548,7 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
         "candidate_graph_revision": "sha256:" + "5" * 64,
     }
     prepared_activation = {
-        "schema_version": "manyforge.prepared_activation_input.v2",
+        "schema_version": "manyforge.prepared_activation_input.v3",
         "scenario_id": "scenario-a",
         "prepared_activation_id": "sha256:" + "6" * 64,
         "source_document_digest": "sha256:" + "7" * 64,
@@ -1535,7 +1559,7 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
         "graph_revision": receipt["candidate_graph_revision"],
         "program_id": "program-a",
         "program_revision": "sha256:" + "a" * 64,
-        "program_binding_id": "sha256:" + "b" * 64,
+        "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "b" * 64},
         "node_environment_digest": "sha256:" + "c" * 64,
         "assistant_mode": "forbidden",
         "typed_parameter_overrides": {},
@@ -1593,8 +1617,8 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
     )
 
     assert result["status"] == "accepted"
-    assert manager_requests[0]["prepared_activation"]["program_binding_id"] == (
-        prepared_activation["program_binding_id"]
+    assert manager_requests[0]["prepared_activation"]["program_outcome"] == (
+        prepared_activation["program_outcome"]
     )
     assert "expected_admission_generation" not in manager_requests[0]
     assert manager_requests[0]["parent_authoring_claim"] == parent_claim
@@ -1857,6 +1881,83 @@ def test_deployment_draft_retained_state_round_trips_exactly() -> None:
 
     assert restored.retained_state() == retained
     assert restored.snapshot() == source.snapshot()
+
+
+def test_save_as_path_rebase_matches_saved_scenario_but_real_edits_do_not() -> None:
+    from manyforge_composer.backend.authoring_workspace import scenario_project_facts
+    from manyforge_composer.backend.deployment_intent import (
+        rebase_deployment_intent_sources,
+    )
+
+    state = ComposerState()
+    source_root = Path("/workspace/source/cell")
+    destination_root = Path("/workspace/copies/deep/cell")
+    deployment = {
+        "api_version": "manyforge.deployment_intent.v1",
+        "deployment_artifact_id": "fixture_deployment",
+        "cell_id": "fixture_cell",
+        "name": "Fixture deployment",
+        "components": [
+            {
+                "component_id": "fixture_robot",
+                "component_profile_id": "fixture_native_v1",
+                "model_source": {
+                    "urdf": {"project_path": "../models/fixture.urdf"},
+                    "package_roots": {},
+                },
+                "root_pose_in_cell": {
+                    "position_m": [0.0, 0.0, 0.0],
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+                "target_settings": {},
+                "configuration": {},
+            }
+        ],
+        "attachments": [],
+        "policies": {},
+    }
+    compiled = state.deployment_draft_session.preview_source(json.dumps(deployment))
+    opened = state.deployment_draft_session.prepare_open_replacement(
+        compiled, str(source_root / "deployment.yaml")
+    )
+    state.deployment_draft_session.install_prepared_replacement(opened)
+    assert state.deployment_source_project_path == str(source_root)
+
+    saved_deployment = rebase_deployment_intent_sources(
+        compiled.document,
+        source_project_root=source_root,
+        destination_project_root=destination_root,
+    )
+    saved_document = {
+        "scenario_id": "fixture_cell",
+        "name": "Fixture cell",
+        "description": "",
+        "program_draft": None,
+        "deployment_draft": saved_deployment,
+        "program_role_assignment": None,
+        "typed_parameter_overrides": {},
+    }
+    state.authoring_workspace.remember_project(
+        document=saved_document,
+        document_path=str(destination_root),
+        source_document_digest=_DIGEST,
+    )
+
+    # Save As changes only the relative spelling needed to keep the same
+    # physical model source. The unsaved-draft guard compares that meaning,
+    # not the path spelling, while Apply still resolves from the old root.
+    assert state.current_drafts_match_remembered_scenario()
+
+    draft = state.deployment_draft_session.retained_state()
+    edited = deepcopy(compiled.document)
+    edited["name"] = "An actual edit"
+    changed = state.deployment_draft_session.preview_source(json.dumps(edited))
+    state.deployment_draft_session.commit_compiled(
+        changed,
+        draft_id=draft["draft_id"],
+        expected_revision=draft["draft_revision"],
+    )
+    assert not state.current_drafts_match_remembered_scenario()
 
 
 def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():

@@ -66,6 +66,27 @@ namespace {
 namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
 
+[[nodiscard]] bool canonical_empty_runtime_units_match(
+    const std::vector<core::RuntimeUnitDTO> &candidate,
+    const std::vector<core::RuntimeUnitDTO> &empty) {
+  if (candidate.size() != empty.size()) {
+    return false;
+  }
+  if (candidate.size() == 1U &&
+      candidate.front().runtime_profile_id.value() ==
+          deployment::native_execution_runtime_contract::kRuntimeProfileId) {
+    const auto &candidate_host = candidate.front();
+    const auto &empty_host = empty.front();
+    return candidate_host.runtime_unit_id == empty_host.runtime_unit_id &&
+           candidate_host.runtime_profile_id == empty_host.runtime_profile_id &&
+           candidate_host.runtime_profile_revision ==
+               empty_host.runtime_profile_revision &&
+           candidate_host.dependency_runtime_unit_ids ==
+               empty_host.dependency_runtime_unit_ids;
+  }
+  return candidate == empty;
+}
+
 struct Options final {
   std::filesystem::path workspace_root;
   std::optional<std::filesystem::path> package_root;
@@ -646,7 +667,7 @@ struct ScenarioProduct final {
   core::DeploymentRevision deployment_revision;
   deployment::ScenarioDeploymentCompatibilityDTO deployment_compatibility;
   std::shared_ptr<const deployment::RetainedBundle> bundle;
-  deployment::VerifiedRetainedModelMap model_map;
+  std::optional<deployment::VerifiedRetainedModelMap> model_map;
   std::filesystem::path canonical_empty_admission_filename;
   std::shared_ptr<const deployment::RetainedBundle> canonical_empty_bundle;
 };
@@ -960,37 +981,42 @@ materialize_scenarios(const std::filesystem::path &root,
             qualified, manifest_repository, input_source, selected_preparations,
             catalog_store, raw_store, bundle_repository);
     if (bundle == nullptr ||
-        bundle->value().compiled_products.symbol_role_maps.size() != 1U) {
-      throw std::logic_error("scenario did not retain one exact model map");
+        bundle->value().compiled_products.symbol_role_maps.size() > 1U) {
+      throw std::logic_error("scenario retained an invalid model-map set");
     }
-    const deployment::RetainedModelMapQuery map_query{
-        bundle->retained_bundle_id(),
-        bundle->value().compiled_products.symbol_role_maps.front().product_id};
     std::optional<deployment::VerifiedRetainedModelMap> model_map;
-    if (memory_stores != nullptr) {
+    if (!bundle->value().compiled_products.symbol_role_maps.empty()) {
       const auto &product =
           bundle->value().compiled_products.symbol_role_maps.front();
       if (product.artifact_refs.size() != 1U) {
         throw std::logic_error(
             "scenario model map has an incoherent artifact set");
       }
-      const auto &artifact = product.artifact_refs.front();
-      const auto bytes = memory_stores->raw.get_verified(
-          artifact.content_addressed_store_key, artifact.content_digest,
-          artifact.byte_size);
-      if (bytes.has_value()) {
-        model_map = deployment::detail::
-            RetainedModelMapVerificationAuthority::verify(*bundle, map_query,
-                                                          *bytes);
+      const deployment::RetainedModelMapQuery map_query{
+          bundle->retained_bundle_id(), product.product_id};
+      if (memory_stores != nullptr) {
+        const auto &artifact = product.artifact_refs.front();
+        const auto bytes = memory_stores->raw.get_verified(
+            artifact.content_addressed_store_key, artifact.content_digest,
+            artifact.byte_size);
+        if (bytes.has_value()) {
+          model_map = deployment::detail::
+              RetainedModelMapVerificationAuthority::verify(*bundle, map_query,
+                                                            *bytes);
+        }
+      } else {
+        const deployment::FilesystemVerifiedRetainedModelMapSource map_source(
+            package_root);
+        model_map = map_source.get_verified(map_query);
       }
-    } else {
-      const deployment::FilesystemVerifiedRetainedModelMapSource map_source(
-          package_root);
-      model_map = map_source.get_verified(map_query);
-    }
-    if (!model_map.has_value()) {
+      if (!model_map.has_value()) {
+        throw std::logic_error(
+            "scenario model map cannot be independently reloaded");
+      }
+    } else if (!bundle->value().cell_graph.controllable_components.empty() ||
+               !bundle->value().cell_graph.model_instances.empty()) {
       throw std::logic_error(
-          "scenario model map cannot be independently reloaded");
+          "populated scenario does not retain its exact model map");
     }
 
     std::filesystem::path admission_filename;
@@ -1025,14 +1051,30 @@ materialize_scenarios(const std::filesystem::path &root,
           materialize_store_and_reload_production(
               empty_qualified, manifest_repository, input_source, {},
               catalog_store, raw_store, bundle_repository);
-      if (empty_bundle == nullptr ||
-          empty_bundle->value().cell_graph.runtime_units !=
-              bundle->value().cell_graph.runtime_units ||
+      if (empty_bundle == nullptr) {
+        throw std::logic_error(
+            "cell-scoped canonical predecessor could not be materialized");
+      }
+      if (!canonical_empty_runtime_units_match(
+              bundle->value().cell_graph.runtime_units,
+              empty_bundle->value().cell_graph.runtime_units) ||
           empty_bundle->value().compiled_products.runtime_unit_products !=
               bundle->value().compiled_products.runtime_unit_products) {
         throw std::logic_error(
             "cell-scoped canonical predecessor does not retain the "
             "candidate's exact execution host product");
+      }
+      if (bundle->value().cell_graph.runtime_units.size() == 1U &&
+          bundle->value().cell_graph.runtime_units.front()
+                  .runtime_profile_id.value() ==
+              deployment::native_execution_runtime_contract::
+                  kRuntimeProfileId) {
+        const auto &empty_host =
+            empty_bundle->value().cell_graph.runtime_units.front();
+        static_cast<void>(
+            deployment::native_execution_runtime_contract::
+                require_configuration(*empty_bundle,
+                                     empty_host.runtime_unit_id));
       }
       admission_filename =
           deployment::cell_scoped_canonical_empty_admission_filename(
@@ -1050,8 +1092,10 @@ materialize_scenarios(const std::filesystem::path &root,
         }
       }
     }
-    verify_gripper_resource_semantics(scenario, verified.graph().graph(),
-                                      *model_map);
+    if (model_map.has_value()) {
+      verify_gripper_resource_semantics(scenario, verified.graph().graph(),
+                                        *model_map);
+    }
     if (!result
              .emplace(
                  std::string(scenario.source),
@@ -1059,7 +1103,7 @@ materialize_scenarios(const std::filesystem::path &root,
                      verified.deployment_artifact_id(),
                      verified.deployment_revision(),
                      deployment::scenario_deployment_compatibility(verified),
-                     bundle, std::move(*model_map), admission_filename,
+                     bundle, std::move(model_map), admission_filename,
                      std::move(canonical_empty_bundle)})
              .second) {
       throw std::logic_error("scenario product source is duplicated");
@@ -1327,6 +1371,10 @@ load_maintained_scenario_inputs(const std::filesystem::path &root) {
             "Scenario has no exact materialized Deployment");
       }
       const auto &context = product->second;
+      if (!context.model_map.has_value()) {
+        throw std::logic_error(
+            "maintained Program binding requires an exact model map");
+      }
       const std::string canonical_program =
           deployment::canonical_json(row.program);
       const auto contract = deployment::verify_program_binding_contract(
@@ -1334,12 +1382,12 @@ load_maintained_scenario_inputs(const std::filesystem::path &root) {
       (void)program_repository.put_if_absent(contract, *context.bundle);
 
       const auto binding = deployment::compile_program_binding(
-          *contract, row.assignment, *context.bundle, context.model_map,
+          *contract, row.assignment, *context.bundle, *context.model_map,
           catalog_store);
       verify_resolved_program_binding(*binding, *context.bundle,
-                                      context.model_map);
+                                      *context.model_map);
       if (!repository.put_if_absent(binding, *context.bundle,
-                                    context.model_map)) {
+                                    *context.model_map)) {
         throw std::logic_error(
             "maintained Program Binding identity is unexpectedly duplicated");
       }
@@ -1369,9 +1417,13 @@ load_maintained_scenario_inputs(const std::filesystem::path &root) {
       throw std::logic_error(
           "stored Program Binding lost its deployment context");
     }
+    if (!product->second.model_map.has_value()) {
+      throw std::logic_error(
+          "maintained Program Binding lost its exact model map");
+    }
     const auto binding = reopened.get_verified(record.program_binding_id,
                                                *product->second.bundle,
-                                               product->second.model_map);
+                                               *product->second.model_map);
     if (binding == nullptr ||
         binding->value().program_id != record.program_id ||
         binding->value().program_revision != record.program_revision) {
@@ -1387,7 +1439,7 @@ load_maintained_scenario_inputs(const std::filesystem::path &root) {
           "durable maintained Program did not reload exactly");
     }
     verify_resolved_program_binding(*binding, *product->second.bundle,
-                                    product->second.model_map);
+                                    *product->second.model_map);
   }
   // The obligation is that the same verified Program is reusable across two
   // retained products. Ordinary source/catalog edits must not require another

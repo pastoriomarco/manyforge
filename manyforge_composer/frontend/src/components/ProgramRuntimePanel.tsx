@@ -187,6 +187,37 @@ export function ProgramRuntimePanel({
         </div>
       )}
 
+      {enabled && state.nonExecutable !== null && (
+        <div className="program-feedback" role="alert" aria-label="Applied Program not executable">
+          <p>
+            Applied Program <strong>{state.nonExecutable.programId}</strong> is not
+            executable in the active Deployment. It is kept unchanged; edit it and
+            Apply again to run it.
+          </p>
+          <ul>
+            {state.nonExecutable.unresolvedReferences.map((reference) => (
+              <li key={`${reference.component_role_id}/${reference.target_role_id ?? ''}`}>
+                {reference.target_role_id !== null
+                  ? <>Target role <code>{reference.target_role_id}</code></>
+                  : <>Component role <code>{reference.component_role_id}</code></>}
+                {' → '}
+                <code>{reference.controllable_component_id}</code>
+                {reference.command_target_id !== null && <code>/{reference.command_target_id}</code>}
+                {': '}
+                {reference.reason.replaceAll('_', ' ')}
+              </li>
+            ))}
+          </ul>
+          {state.nonExecutable.affectedNodes.length > 0 && (
+            <p>
+              Affected steps: {state.nonExecutable.affectedNodes.join(', ')}
+              {state.nonExecutable.affectedExecutionGroups.length > 0
+                && `; groups: ${state.nonExecutable.affectedExecutionGroups.join(', ')}`}
+            </p>
+          )}
+        </div>
+      )}
+
       {enabled && state.observationError !== null && (
         <div className="program-feedback" role="status">
           Runtime facts are reconnecting automatically: {state.observationError}
@@ -197,11 +228,15 @@ export function ProgramRuntimePanel({
         <div className="program-runtime-grid">
           <div className="program-runtime-fact">
             <span>Applied Program</span>
-            <strong>{state.applied?.programId ?? 'none'}</strong>
+            <strong>
+              {state.applied?.programId ?? state.nonExecutable?.programId ?? 'none'}
+            </strong>
             <small>
               {state.applied
                 ? `${state.applied.scenarioId} · ${shortIdentity(state.applied.programRevision)}`
-                : 'Apply a validated Draft before Execute.'}
+                : state.nonExecutable !== null
+                  ? `${state.nonExecutable.scenarioId} · not executable in this Deployment`
+                  : 'Apply a validated Draft before Execute.'}
             </small>
             {state.applied && (
               <a
@@ -640,10 +675,11 @@ function manualRecoveryTarget(
     ));
   const gripper = gripperTarget !== undefined
     || (motionTarget === undefined
-      && operation.programRunId === nativeStatus?.directControlGripper.programRunId);
+      && nativeStatus?.directControlGripper != null
+      && operation.programRunId === nativeStatus.directControlGripper.programRunId);
   const target = gripper
-    ? (gripperTarget ?? nativeStatus?.directControlGripper)
-    : (motionTarget ?? nativeStatus?.directControl);
+    ? (gripperTarget ?? nativeStatus?.directControlGripper ?? undefined)
+    : (motionTarget ?? nativeStatus?.directControl ?? undefined);
   return { motionTarget, gripperTarget, gripper, target };
 }
 

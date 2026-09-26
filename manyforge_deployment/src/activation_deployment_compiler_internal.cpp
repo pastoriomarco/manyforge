@@ -18,6 +18,7 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
+#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 
 namespace manyforge::deployment::detail {
 namespace {
@@ -314,6 +315,19 @@ struct ComponentProjection final {
                                     profile.model_asset_id));
   const auto &configuration = member(component.configuration,
                                      "runtime_configuration", "configuration");
+  const auto arm_resource_count =
+      array(resource_bindings(component.component_id, "arm", profile),
+            "arm resource bindings")
+          .size();
+  const auto &initial_joint_positions = array(
+      member(configuration, "initial_joint_positions_rad",
+             "runtime configuration"),
+      "initial_joint_positions_rad");
+  if (initial_joint_positions.size() != arm_resource_count) {
+    fail(component.component_id +
+         " initial_joint_positions_rad count does not match its "
+         "arm resource bindings");
+  }
   CanonicalValue runtime_configuration = object_with(
       configuration, "motion_target_limits", motion_limits(component));
   if (component.configuration.find_object_member(
@@ -501,10 +515,8 @@ CanonicalValue compile_activation_deployment(
   const auto &runtime_ref = catalog.require(
       core::CatalogRecordKind::kRuntimeProfile,
       "manyforge.native_execution_runtime");
-  const std::string runtime_id = intent.components.size() == 1U
-                                     ? intent.components.front().component_id +
-                                           ".native_execution"
-                                     : "robot_cell.native_execution";
+  const std::string runtime_id(
+      native_execution_runtime_contract::kCellHostRuntimeUnitId);
   std::vector<ComponentProjection> projections;
   projections.reserve(intent.components.size());
   for (std::size_t index = 0; index < intent.components.size(); ++index) {
@@ -515,7 +527,8 @@ CanonicalValue compile_activation_deployment(
 
   CanonicalValue runtime_configuration = projections.front().runtime_configuration;
   if (projections.size() > 1U) {
-    for (const std::string_view name : {"execution_tick_hz",
+    for (const std::string_view name : {"planner_rng_seed",
+                                        "execution_tick_hz",
                                         "collision_monitor_period_ms", "mode"}) {
       const auto &expected = member(runtime_configuration, name, "runtime configuration");
       for (const auto &projection : projections) {

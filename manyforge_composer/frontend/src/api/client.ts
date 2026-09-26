@@ -2,6 +2,7 @@ import {
   parseAuthoringWorkspaceSnapshot,
   parseCatalogResponse,
   parseAppliedProgramSelection,
+  parseAppliedProgramStatus,
   parseCapabilityCommandPreviewResponse,
   parseDraftMutationResponse,
   parseDeploymentCandidateOperationResponse,
@@ -53,6 +54,7 @@ import {
 import type {
   ArtifactKind,
   AppliedProgramSelection,
+  AppliedProgramStatus,
   AuthoringWorkspaceSnapshot,
   CatalogResponse,
   DraftFenceRequest,
@@ -287,6 +289,21 @@ function sameRuntimeScaleSelector(
   const returnedTargets = new Set(returned.groupTargets.map(identity));
   return requestedTargets.size === returnedTargets.size
     && [...requestedTargets].every((target) => returnedTargets.has(target));
+}
+
+/** The owner-issued error code carried by an API error, if any. */
+export function apiErrorCode(error: unknown): string | null {
+  if (!(error instanceof ApiError)) return null;
+  const payload = error.payload;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    return null;
+  }
+  const detail = (payload as Record<string, unknown>).detail;
+  if (detail === null || typeof detail !== 'object' || Array.isArray(detail)) {
+    return null;
+  }
+  const code = (detail as Record<string, unknown>).code;
+  return typeof code === 'string' ? code : null;
 }
 
 export class ApiError extends Error {
@@ -851,6 +868,8 @@ export const api = {
       requestJson('/api/scenarios/current', parseCurrentScenarioResponse, signal),
     applied: (signal?: AbortSignal): Promise<AppliedProgramSelection> =>
       requestJson('/api/program/applied', parseAppliedProgramSelection, signal),
+    appliedStatus: (signal?: AbortSignal): Promise<AppliedProgramStatus> =>
+      requestJson('/api/program/applied/status', parseAppliedProgramStatus, signal),
   },
   manager: {
     status: (signal?: AbortSignal): Promise<ManagerStatusProjection> => requestJson(

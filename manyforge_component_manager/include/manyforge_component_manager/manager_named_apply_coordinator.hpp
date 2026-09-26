@@ -153,6 +153,8 @@ private:
   IManagerActiveRuntimePlanSource &active_plan_source_;
   const manyforge::deployment::IVerifiedRetainedBundleSource
       &retained_bundle_source_;
+  const manyforge::deployment::IVerifiedRetainedProductArtifactSource
+      &artifact_source_;
   manyforge::core::IManagerSceneProjectionMaintenancePort &scene_owner_;
   manyforge::core::IManagerKernelApplyFencePort &kernel_fence_;
   manyforge::core::IKernelCellAdmissionPort &cell_admission_;

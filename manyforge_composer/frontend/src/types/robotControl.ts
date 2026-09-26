@@ -283,6 +283,17 @@ export interface CellStopActionStatus {
   } | null;
 }
 
+/** One component listed by the execution owner (H1a-IF.2). A present but
+ * ineligible component stays listed; the backend refuses its commands. */
+export interface ExecutionComponentStatus {
+  controllableComponentId: string;
+  commandEligible: boolean;
+  /** An existing owner refusal code exactly when not command-eligible. */
+  unavailableReason: string | null;
+  /** Advertised but unsupported capabilities: visible, never commandable. */
+  unsupportedTargets: Array<{ commandTargetId: string; operationCapabilityId: string }>;
+}
+
 export interface ExecutionOwnerStatus {
   ownerEpoch: string;
   cellId: string;
@@ -290,16 +301,18 @@ export interface ExecutionOwnerStatus {
   graphRevision: string;
   retainedBundleId: string;
   sceneRevision: SceneRevisionValue;
-  directControl: DirectControlMotionStatus;
-  directControlGripper: DirectControlGripperStatus;
-  /** All addressed manual targets. The singular fields above remain the
-   * compatibility/primary aliases for older projections. */
-  directControlTargets?: DirectControlMotionStatus[];
-  directControlGripperTargets?: DirectControlGripperStatus[];
-  observedMotion: ObservedMotionTarget;
+  components: ExecutionComponentStatus[];
+  /** The selected motion/gripper target (a UI projection, not a wire
+   * primary). Null when the selected component has no such capability. */
+  directControl: DirectControlMotionStatus | null;
+  directControlGripper: DirectControlGripperStatus | null;
+  /** Every addressed target, each owned by one listed component. */
+  directControlTargets: DirectControlMotionStatus[];
+  directControlGripperTargets: DirectControlGripperStatus[];
+  observedMotion: ObservedMotionTarget | null;
   observedGripper: ObservedGripperTarget | null;
-  observedMotions?: ObservedMotionTarget[];
-  observedGrippers?: ObservedGripperTarget[];
+  observedMotions: ObservedMotionTarget[];
+  observedGrippers: ObservedGripperTarget[];
   manualOperations: (OperationObservation & { programRunId: string })[];
   cellStopAction: CellStopActionStatus;
   runtimeScaleControl: RuntimeScaleControlStatus | null;
@@ -313,13 +326,6 @@ export interface ExecutionIdentity {
   graphRevision: string;
   retainedBundleId: string;
   sceneRevision: SceneRevisionValue;
-  programId: string;
-  programRevision: string;
-  programBindingId: string;
-  motionTargetRoleId: string;
-  gripperTargetRoleId: string;
-  gripperCommandSchemaId: string;
-  gripperCommandSchemaRevision: string;
 }
 
 export type DirectControlMotionSpec =

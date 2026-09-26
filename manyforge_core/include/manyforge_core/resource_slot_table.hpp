@@ -303,6 +303,12 @@ class IResourceOperationAdmissionGate {
                                                 const std::vector<ResourceId>& /*resources*/) const {
     return false;
   }
+
+  /// Exact held scope check, including empty-scope Applies that only re-seal
+  /// product bindings. Coverage by a different or wider fence is insufficient.
+  [[nodiscard]] virtual bool exact_fence_is_held(
+      const ConfigurationFenceId& /*fence_id*/,
+      const ConfigurationFenceScopeDTO& /*scope*/) const { return false; }
 };
 
 }  // namespace manyforge::core
