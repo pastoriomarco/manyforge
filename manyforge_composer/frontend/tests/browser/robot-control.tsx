@@ -12,7 +12,7 @@ import type { ProgramRuntimeController } from '../../src/hooks/useProgramRuntime
 import type { ComposerHeadlessState } from '../../src/types/headless';
 import type { ExecutionOwnerStatus, OperationObservation } from '../../src/types/robotControl';
 import { statusFixture, receiptFixture, gripperReceiptFixture } from '../../src/testFixtures/robotControl';
-import '../../src/index.css';
+import '../../src/styles/index.css';
 
 let controller: RobotControlController;
 let publish: (status: ExecutionOwnerStatus) => void;

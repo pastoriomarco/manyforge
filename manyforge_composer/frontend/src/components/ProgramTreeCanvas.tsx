@@ -69,9 +69,10 @@ import {
   type ProgramNoticeInput,
 } from './ProgramNoticeRail';
 import { statusEdgePath } from './StatusEdge';
+import { CANVAS_COLORS, STATUS_COLORS } from '../styles/tokens';
 
-const NODE_MIN_WIDTH = 156;
-const NODE_MAX_WIDTH = 288;
+// UI6-I-VC D3: every node has the same fixed size (--mf-node-width/height).
+const NODE_WIDTH = 200;
 const NODE_BASE_HEIGHT = 70;
 const STAGE_PADDING = 48;
 
@@ -81,16 +82,7 @@ function acceptsChildCount(entry: CatalogEntry | undefined, count: number): bool
     && (entry.childrenMax < 0 || count <= entry.childrenMax);
 }
 
-function estimatedNodeSize(label: string, catalogId: string): { width: number; height: number } {
-  const width = Math.min(
-    NODE_MAX_WIDTH,
-    Math.max(NODE_MIN_WIDTH, Math.ceil(Math.max(label.length, catalogId.length) * 7.4 + 34)),
-  );
-  const charactersPerLine = Math.max(12, Math.floor((width - 30) / 7.4));
-  const wrappedLines = Math.max(0, Math.ceil(label.length / charactersPerLine) - 1)
-    + Math.max(0, Math.ceil(catalogId.length / charactersPerLine) - 1);
-  return { width, height: NODE_BASE_HEIGHT + wrappedLines * 16 };
-}
+const NODE_SIZE = { width: NODE_WIDTH, height: NODE_BASE_HEIGHT } as const;
 
 interface ProgramFlowNodeData extends Record<string, unknown> {
   presentation: BtNodePresentation;
@@ -154,21 +146,17 @@ function ProgramStatusEdge({
   sourceY,
   targetX,
   targetY,
+  sourcePosition,
+  targetPosition,
   markerEnd,
   data,
 }: EdgeProps<ProgramFlowEdge>) {
   const edgeStyle = data?.edgeStyle ?? 'default';
-  const stroke = data?.targetStatus === 'running'
-    ? '#fbbf24'
-    : data?.targetStatus === 'success'
-      ? '#4ade80'
-      : data?.targetStatus === 'failure'
-        ? '#f87171'
-        : '#6b7280';
+  const stroke = STATUS_COLORS[data?.targetStatus ?? 'idle'];
   return (
     <BaseEdge
       path={statusEdgePath(
-        { sourceX, sourceY, targetX, targetY },
+        { sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition },
         edgeStyle,
         data?.layoutDirection ?? 'vertical',
       )}
@@ -273,8 +261,7 @@ export function ProgramTreeCanvas({
     const orderById = new Map(orderedIds.map((id, order) => [id, order]));
     const seeds: AuthoringGraphNode[] = flat.map((row, fallbackOrder) => {
       const id = row.node.instance_id;
-      const dimensions = nodeMeasurements[id]
-        ?? estimatedNodeSize(id, row.node.node_id);
+      const dimensions = nodeMeasurements[id] ?? NODE_SIZE;
       const order = orderById.get(id) ?? fallbackOrder;
       return {
         id,
@@ -284,7 +271,7 @@ export function ProgramTreeCanvas({
         childrenMin: catalog.get(row.node.node_id)?.childrenMin,
         childrenMax: catalog.get(row.node.node_id)?.childrenMax,
         position: graphDirection === 'vertical'
-          ? { x: order * (NODE_MAX_WIDTH + 24), y: row.depth * 150 }
+          ? { x: order * (NODE_WIDTH + 24), y: row.depth * 150 }
           : { x: row.depth * 340, y: order * (NODE_BASE_HEIGHT + 40) },
       };
     });
@@ -480,15 +467,13 @@ export function ProgramTreeCanvas({
   const graphWidth = Math.max(
     720,
     ...graphNodes.map((node) => node.position.x
-      + (nodeMeasurements[node.id]?.width
-        ?? estimatedNodeSize(node.id, flatById.get(node.id)?.node.node_id ?? '').width)
+      + (nodeMeasurements[node.id]?.width ?? NODE_SIZE.width)
       + STAGE_PADDING),
   );
   const graphHeight = Math.max(
     320,
     ...graphNodes.map((node) => node.position.y
-      + (nodeMeasurements[node.id]?.height
-        ?? estimatedNodeSize(node.id, flatById.get(node.id)?.node.node_id ?? '').height)
+      + (nodeMeasurements[node.id]?.height ?? NODE_SIZE.height)
       + STAGE_PADDING),
   );
 
@@ -904,7 +889,7 @@ export function ProgramTreeCanvas({
           fitView
           proOptions={{ hideAttribution: true }}
         >
-          <Background color="#29404d" gap={24} />
+          <Background color={CANVAS_COLORS.grid} gap={24} />
           <Controls showInteractive />
         </ReactFlow>
         {selectedRow && (

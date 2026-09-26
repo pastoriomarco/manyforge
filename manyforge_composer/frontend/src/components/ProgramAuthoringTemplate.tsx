@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from 'react';
 
 import type { JsonValue, ProgramAuthoringDocument } from '../types/api';
 import { OverlayPanel } from './OverlayPanel';
+import { ProgramKindSymbol } from './programNodeGlyphs';
 
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
 
@@ -148,7 +149,7 @@ export function ProgramAuthoringTemplate({
           disabled={busy}
           onClick={() => openTemplate('pick')}
         >
-          <span aria-hidden="true">◇</span>
+          <span className="program-template-symbol" aria-hidden="true"><ProgramKindSymbol kind="authoring_macro" /></span>
           <span><strong>Pick subtree</strong><small>Visible ordinary nodes</small></span>
         </button>
         <button
@@ -157,7 +158,7 @@ export function ProgramAuthoringTemplate({
           disabled={busy}
           onClick={() => openTemplate('place')}
         >
-          <span aria-hidden="true">◇</span>
+          <span className="program-template-symbol" aria-hidden="true"><ProgramKindSymbol kind="authoring_macro" /></span>
           <span><strong>Place subtree</strong><small>Visible ordinary nodes</small></span>
         </button>
       </div>

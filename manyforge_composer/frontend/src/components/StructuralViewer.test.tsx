@@ -22,6 +22,7 @@ import {
 } from './StructuralViewer';
 import type { LogicalSceneObject } from '../types/api';
 import type { AttachedObjectPresentation } from '../state/runtimeScenePresentation';
+import { readStyleSource } from '../styles/readStyleSource';
 
 function sceneObject(
   shape: LogicalSceneObject['collision_shapes'][number],
@@ -130,7 +131,7 @@ describe('viewer failure isolation', () => {
   });
 
   it('keeps viewer layers in one bounded inspector panel at narrow widths', () => {
-    const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
+    const css = readStyleSource();
     const source = readFileSync(
       new URL('./StructuralViewer.tsx', import.meta.url),
       'utf8',
@@ -147,7 +148,7 @@ describe('viewer failure isolation', () => {
   });
 
   it('keeps camera and transform commands in the compact viewer header', () => {
-    const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
+    const css = readStyleSource();
     const source = readFileSync(
       new URL('./StructuralViewer.tsx', import.meta.url),
       'utf8',
@@ -173,7 +174,7 @@ describe('viewer failure isolation', () => {
     expect(css).toMatch(/\.viewer-surface-launchers\s*\{[^}]*margin-left:\s*auto/s);
     expect(source.slice(launchers, stage).match(/aria-pressed=\{inspectorPanel ===/g)).toHaveLength(3);
     expect(css).toMatch(
-      /\.viewer-surface-launchers > button\[aria-pressed='true'\]\s*\{[^}]*border-color:\s*#68cadd;[^}]*background:\s*#153c49;/s,
+      /\.viewer-surface-launchers > button\[aria-pressed='true'\]\s*\{[^}]*border-color:\s*#68cadd;[^}]*background:\s*#17404c;/s,
     );
     expect(css).toMatch(
       /\.program-inspector\.central-inspector-section\s*\{[^}]*border-left:\s*0;/s,
@@ -509,7 +510,7 @@ describe('viewer failure isolation', () => {
 
   it('publishes viewer conditions to the one notification stack above the controls', () => {
     const source = readFileSync(new URL('./StructuralViewer.tsx', import.meta.url), 'utf8');
-    const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
+    const css = readStyleSource();
     expect(source).toContain("usePublishWorkbenchNotices('viewer', viewerNotices({");
     expect(source).not.toContain('viewer-notice-stack');
     expect(css).not.toContain('.viewer-notice-stack');

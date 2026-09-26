@@ -204,7 +204,7 @@ change the public status DTO.
 To derive an editable Saved Program from maintained package content:
 
 1. Open the packaged Program as a Draft in Composer.
-2. Choose **Save As** and select a new `*.program.yaml` path under the
+2. Choose **Save as** and select a new `*.program.yaml` path under the
    instance `program-workspace`.
 3. Continue editing and use **Save** for that workspace copy.
 4. Stop and restart the native stack with the same `STATE_ROOT` and

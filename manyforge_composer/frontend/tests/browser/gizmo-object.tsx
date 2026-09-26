@@ -3,7 +3,7 @@ import { StrictMode, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { StructuralViewer } from '../../src/components/StructuralViewer';
 import type { LogicalSceneObject } from '../../src/types/api';
-import '../../src/index.css';
+import '../../src/styles/index.css';
 
 const commits: unknown[] = [];
 Object.assign(window, { objectGizmoHarness: { commits } });

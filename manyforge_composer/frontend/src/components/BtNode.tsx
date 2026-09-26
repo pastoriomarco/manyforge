@@ -8,6 +8,8 @@ import {
   isProgramCanvasFormTarget,
   programCanvasKeyIntent,
 } from '../utils/programCanvasInteraction';
+import { programCategoryFamily } from '../styles/tokens';
+import { ProgramCategoryIcon, ProgramKindSymbol, ProgramNodeName } from './programNodeGlyphs';
 
 export interface BtNodePresentation {
   id: string;
@@ -40,13 +42,6 @@ export function btNodeConnectionAvailability(node: Pick<
   };
 }
 
-function childHint(kind: string, childrenMax: number): string {
-  if (kind === 'decorator') return '1 child';
-  if (childrenMax === 0) return 'leaf';
-  if (childrenMax < 0) return 'n children';
-  return `${childrenMax} max`;
-}
-
 /** Catalog-node presentation with graph handles and no topology authority. */
 interface BtNodeProps {
   node: BtNodePresentation;
@@ -68,11 +63,20 @@ export function BtNode({
   const connections = btNodeConnectionAvailability(node);
   const updateNodeInternals = useUpdateNodeInternals();
   const targetConnectable = connections.targetConnectable;
-  const glyph = node.kind === 'composite'
-    ? '◆'
-    : node.kind === 'decorator'
-      ? '◇'
-      : '•';
+  const disposition = node.executionDisposition
+    ?? (node.executionAvailable ? 'executable' : 'unavailable');
+  const availabilityLabel = disposition === 'executable'
+    ? 'Execution available'
+    : disposition === 'configuration_required'
+      ? 'Configuration required'
+      : 'Execution unavailable';
+  const availabilityDetail = node.invalid
+    ? 'This node needs valid required configuration before execution.'
+    : node.executionDisposition === 'executable'
+      ? 'Executable for the exact current Applied Program and Binding.'
+      : node.executionDisposition === 'configuration_required'
+        ? 'Execution implementation is available; complete the required node configuration.'
+        : `Authorable here; execution unavailable${node.executionReason ? `: ${node.executionReason}` : '.'}`;
   useLayoutEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       updateNodeInternals(node.id);
@@ -89,20 +93,16 @@ export function BtNode({
   return (
     <div
       ref={elementRef}
-      className={`bt-node category-${node.category} status-${node.status}${node.invalid ? ' invalid' : ''}${node.selected ? ' selected' : ''}`}
+      className={`bt-node status-${node.status}${node.invalid ? ' invalid' : ''}${node.selected ? ' selected' : ''}`}
+      data-category={node.category}
+      data-category-family={programCategoryFamily(node.category)}
       data-node-id={node.id}
       data-layout-direction={node.layoutDirection}
       role="button"
       tabIndex={0}
       aria-pressed={node.selected}
       aria-label={`${node.label} Program node`}
-      title={node.invalid
-        ? 'This node needs valid required configuration before execution.'
-        : node.executionDisposition === 'executable'
-          ? 'Executable for the exact current Applied Program and Binding.'
-          : node.executionDisposition === 'configuration_required'
-            ? 'Execution implementation is available; complete the required node configuration.'
-            : `Authorable here; execution unavailable${node.executionReason ? `: ${node.executionReason}` : '.'}`}
+      title={`${node.label}\n${availabilityDetail}`}
       onClick={() => onSelect?.(node.id)}
       onFocus={() => onFocus?.(node.id)}
       onKeyDown={(event) => {
@@ -128,12 +128,12 @@ export function BtNode({
         className={`bt-node-react-flow-handle${targetConnectable ? '' : ' disabled'}`}
         aria-label={`Connect ${node.label} as child`}
       />
-      <span className="bt-node-kind" aria-hidden="true">{glyph}</span>
-      <small>{node.catalogId}</small>
-      <strong>{node.label}</strong>
-      <span className="bt-node-child-hint">
-        {childHint(node.kind, node.childrenMax)}
+      {/* UI6-I-VC D3: icon band, name, empty band of the same width. */}
+      <span className="bt-node-band" aria-hidden="true">
+        <ProgramCategoryIcon category={node.category} />
       </span>
+      <strong className="bt-node-name"><ProgramNodeName name={node.label} /></strong>
+      <span className="bt-node-band" aria-hidden="true" />
       {node.childrenMax !== 0 && (
         <Handle
           type="source"
@@ -143,14 +143,13 @@ export function BtNode({
           aria-label={`Connect ${node.label} as parent`}
         />
       )}
-      <span
-        className={`node-availability-dot ${node.executionDisposition ?? (node.executionAvailable ? 'executable' : 'unavailable')}`}
-        aria-label={node.executionDisposition === 'executable'
-          ? 'Execution available'
-          : node.executionDisposition === 'configuration_required'
-            ? 'Configuration required'
-            : 'Execution unavailable'}
-      />
+      {/* The kind symbol appears only when execution is not available. */}
+      {disposition !== 'executable' && (
+        <span className={`bt-node-status ${disposition}`} aria-hidden="true">
+          <ProgramKindSymbol kind={node.kind} />
+        </span>
+      )}
+      <span className="sr-only">{availabilityLabel}</span>
     </div>
   );
 }

@@ -4,6 +4,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
 import App from './App';
+import { readStyleSource } from './styles/readStyleSource';
 
 describe('Composer shell continuity', () => {
   it('renders one compact application spine without duplicate authority surfaces', () => {
@@ -44,7 +45,7 @@ describe('Composer shell continuity', () => {
 
   it('keeps the canvas fixed and gives scrolling to bounded side surfaces', () => {
     const markup = renderToStaticMarkup(<App />);
-    const css = readFileSync(new URL('./index.css', import.meta.url), 'utf8');
+    const css = readStyleSource();
     const source = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
     const workspaceSource = readFileSync(
       new URL('./components/ProgramWorkspace.tsx', import.meta.url),

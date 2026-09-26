@@ -684,7 +684,7 @@ export function HeadlessRuntimeSurfacesView({
         onClose={() => setBulkFence(null)}
         returnFocusRef={acknowledgeAllButton}
       >
-        <div className="program-dialog-copy runtime-bulk-confirmation">
+        <div className="dialog-copy runtime-bulk-confirmation">
           <p>
             Acknowledge the exact current set of {attentionCount} attention messages?
           </p>
@@ -692,7 +692,7 @@ export function HeadlessRuntimeSurfacesView({
             Active backend conditions remain active. Composer messages are dismissed.
             This does not resume motion or otherwise change execution.
           </p>
-          <div className="program-dialog-actions">
+          <div className="dialog-actions">
             <button type="button" disabled={bulkBusy} onClick={() => setBulkFence(null)}>
               Cancel
             </button>

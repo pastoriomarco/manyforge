@@ -239,7 +239,7 @@ export function CCLCPanelView({
         compact
         onClose={() => setConfirmation(null)}
       >
-        <div className="program-dialog-copy program-compact-confirmation">
+        <div className="dialog-copy compact-confirmation">
           <p>{confirmation?.detail}</p>
           <p>This uses a fresh owner snapshot immediately before submission.</p>
           <button type="button" className="primary-action" onClick={() => void confirm()}>

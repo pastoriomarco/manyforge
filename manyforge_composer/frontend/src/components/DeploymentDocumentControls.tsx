@@ -139,8 +139,8 @@ export function DeploymentDocumentControls({
   };
   return (
     <>
-      <div className="program-document-controls" aria-label="Deployment document controls">
-        <div className="program-document-identity">
+      <div className="document-controls" aria-label="Deployment document controls">
+        <div className="document-identity">
           <strong title={workspace?.saved.path ?? workspace?.draft.deploymentRevision ?? undefined}>
             {workspace?.draft.deploymentArtifactId ?? 'No Deployment'}
           </strong>
@@ -156,7 +156,7 @@ export function DeploymentDocumentControls({
           </span>
           <span className="document-identity-divider document-settings-divider" aria-hidden="true" />
         </div>
-        <div className="program-document-actions">
+        <div className="document-actions">
           <button
             type="button"
             disabled={!controller.mutationAvailable || controller.busy}
@@ -169,7 +169,7 @@ export function DeploymentDocumentControls({
             title={blockReason ?? (!workspace?.draft.document
               ? 'No Deployment Draft is loaded.'
               : !workspace.saved.path
-                ? 'The Draft has no saved file yet; use Save As.'
+                ? 'The Draft has no saved file yet; use Save as.'
                 : !workspace.draft.differsFromSaved
                   ? 'Draft already matches Saved.'
                   : 'Save the current Deployment Draft.')}
@@ -182,7 +182,7 @@ export function DeploymentDocumentControls({
               ? 'No Deployment Draft is loaded.'
               : 'Save the current Deployment Draft to another file.')}
             onClick={() => setAction('save_as')}
-          >Save As</button>
+          >Save as</button>
           <button
             type="button"
             disabled={!controller.mutationAvailable || controller.busy || !hasUnappliedChanges}
@@ -231,13 +231,13 @@ export function DeploymentDocumentControls({
       {action !== null && (
         <OverlayPanel
           open
-          title={action === 'open' ? 'Open Deployment as Draft' : action === 'save_as' ? 'Save Deployment As' : action === 'revert' ? 'Revert to Saved Deployment?' : 'Discard Deployment changes?'}
+          title={action === 'open' ? 'Open Deployment as Draft' : action === 'save_as' ? 'Save Deployment as' : action === 'revert' ? 'Revert to saved Deployment?' : 'Discard Deployment changes?'}
           titleId="deployment-document-dialog-title"
           onClose={close}
           compact={action === 'discard' || action === 'revert'}
         >
           {action === 'open' && (
-            <div className="program-document-dialog">
+            <div className="document-dialog">
               <ArtifactBrowser lockedKind="deployment" onSelectionChange={chooseArtifact} />
               {workspace?.draft.differsFromSaved && (
                 <label className="confirmation-check">
@@ -256,7 +256,7 @@ export function DeploymentDocumentControls({
             </div>
           )}
           {action === 'save_as' && (
-            <div className="program-dialog-copy">
+            <div className="dialog-copy">
               <label>Deployment path<input value={saveAsPath} onChange={(event) => setSaveAsPath(event.target.value)} /></label>
               <label className="confirmation-check">
                 <input type="checkbox" checked={confirmOverwrite} onChange={(event) => setConfirmOverwrite(event.target.checked)} />
@@ -267,19 +267,19 @@ export function DeploymentDocumentControls({
                 className="primary-action"
                 disabled={!saveAsPath.trim()}
                 onClick={() => { void complete(() => controller.saveAs(saveAsPath.trim(), confirmOverwrite)); }}
-              >Save As</button>
+              >Save as</button>
             </div>
           )}
           {action === 'discard' && (
-            <div className="program-dialog-copy program-compact-confirmation">
+            <div className="dialog-copy compact-confirmation">
               <p>Discard the unsaved Deployment Draft changes?</p>
               <button type="button" className="primary-action" onClick={() => { void complete(controller.discard); }}>Discard changes</button>
             </div>
           )}
           {action === 'revert' && (
-            <div className="program-dialog-copy program-compact-confirmation">
+            <div className="dialog-copy compact-confirmation">
               <p>Replace Draft and Manager Applied with the Saved Deployment?</p>
-              <button type="button" className="primary-action" onClick={() => { void complete(controller.revert); }}>Revert to Saved</button>
+              <button type="button" className="primary-action" onClick={() => { void complete(controller.revert); }}>Revert to saved</button>
             </div>
           )}
         </OverlayPanel>
@@ -292,7 +292,7 @@ export function DeploymentDocumentControls({
           onClose={controller.cancelApplyConfirmation}
           compact
         >
-          <div className="program-dialog-copy program-compact-confirmation">
+          <div className="dialog-copy compact-confirmation">
             <p>
               Applying this exact Deployment Draft will reconfigure active runtime
               components. Running operations remain protected by Manager admission.
@@ -313,7 +313,7 @@ export function DeploymentDocumentControls({
               disabled={!controller.mutationAvailable || controller.busy}
               title={blockReason ?? 'Apply the validated Deployment to runtime.'}
               onClick={() => { void controller.confirmApply(); }}
-            >{controller.applying ? 'Applying Deployment' : 'Confirm Apply'}</button>
+            >{controller.applying ? 'Applying Deployment' : 'Confirm apply'}</button>
           </div>
         </OverlayPanel>
       )}

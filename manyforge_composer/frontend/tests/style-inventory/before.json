@@ -1,0 +1,1931 @@
+{
+  "schema_version": "manyforge.composer_style_inventory.v1",
+  "stylesheets": [
+    {
+      "path": "src/index.css",
+      "lines": 8686
+    }
+  ],
+  "counts": {
+    "hex_distinct": 531,
+    "hex_groups_within_8": 184,
+    "rgb_distinct": 70,
+    "duplicate_selectors": 161,
+    "classes_defined": 642,
+    "classes_used_without_rule": 37,
+    "classes_never_referenced": 127,
+    "ts_color_literals": 40
+  },
+  "histograms": {
+    "font_size": {
+      "0.68rem": 51,
+      "0.72rem": 32,
+      "0.7rem": 24,
+      "0.62rem": 15,
+      "0.65rem": 14,
+      "0.78rem": 14,
+      "0.66rem": 13,
+      "0.58rem": 12,
+      "0.67rem": 11,
+      "0.75rem": 10,
+      "0.76rem": 10,
+      "var(--inspector-label-font-size)": 9,
+      "0.8rem": 7,
+      "0.74rem": 7,
+      "0.64rem": 6,
+      "0.82rem": 5,
+      "0.6rem": 5,
+      "0.84rem": 4,
+      "var(--inspector-help-font-size)": 4,
+      "1rem": 3,
+      "0.56rem": 3,
+      "0.61rem": 3,
+      "0.69rem": 2,
+      "0.88rem": 2,
+      "0.96rem": 2,
+      "0.85rem": 2,
+      "0.59rem": 2,
+      "1.25rem": 1,
+      "1.05rem": 1,
+      "1.2rem": 1,
+      "clamp(1.25rem, 2.4vw, 1.75rem)": 1,
+      "1.12rem": 1,
+      "1.08rem": 1,
+      "0.79rem": 1,
+      "0.52rem": 1,
+      "0.57rem": 1,
+      "0.63rem": 1,
+      "0.86rem": 1,
+      "0.94rem": 1,
+      "1.3rem": 1,
+      "var(--inspector-control-font-size)": 1,
+      "0.71rem": 1,
+      "0.73rem": 1,
+      "inherit": 1,
+      "0": 1
+    },
+    "font_weight": {
+      "700": 8,
+      "650": 6,
+      "680": 4,
+      "600": 4,
+      "720": 2,
+      "760": 2,
+      "740": 2,
+      "400": 2,
+      "800": 1,
+      "620": 1,
+      "850": 1
+    },
+    "border_radius": {
+      "0.45rem": 22,
+      "0.4rem": 20,
+      "0": 17,
+      "999px": 17,
+      "0.55rem": 15,
+      "0.35rem": 11,
+      "0.3rem": 7,
+      "0.5rem": 6,
+      "0.42rem": 5,
+      "0.7rem": 3,
+      "0.65rem": 3,
+      "0.28rem": 3,
+      "0.8rem": 2,
+      "0.75rem": 2,
+      "0.9rem": 2,
+      "0.38rem": 2,
+      "50%": 2,
+      "4px": 1,
+      "0.4rem 0 0 0.4rem": 1,
+      "0.6rem": 1,
+      "0.2rem": 1,
+      "0.18rem": 1
+    },
+    "gap": {
+      "0.35rem": 35,
+      "0.4rem": 33,
+      "0.25rem": 29,
+      "0.55rem": 28,
+      "0.45rem": 25,
+      "0.5rem": 17,
+      "0.3rem": 17,
+      "0.2rem": 13,
+      "0.75rem": 12,
+      "0.6rem": 11,
+      "0.7rem": 11,
+      "0.65rem": 10,
+      "1rem": 9,
+      "0.12rem": 6,
+      "0.15rem": 6,
+      "0.28rem": 5,
+      "0.18rem": 4,
+      "0.32rem": 4,
+      "0": 4,
+      "0.1rem": 3,
+      "0.42rem": 3,
+      "var(--inspector-section-gap)": 3,
+      "0.85rem": 2,
+      "0.8rem": 2,
+      "0.05rem": 2,
+      "0.35rem 0.6rem": 1,
+      "0.55rem 1.2rem": 1,
+      "0.25rem 0.65rem": 1,
+      "0.45rem 0.8rem": 1,
+      "0.3rem 0.7rem": 1,
+      "0.35rem 0.65rem": 1,
+      "0.14rem": 1,
+      "0.45rem 0.65rem": 1,
+      "0.45rem 1rem": 1,
+      "0.35rem 0.7rem": 1,
+      "0.4rem 1rem": 1,
+      "1px": 1,
+      "0.45rem 0.4rem": 1,
+      "0.4rem 0.7rem": 1,
+      "0.5rem 0.4rem": 1
+    },
+    "z_index": {
+      "12": 6,
+      "20": 4,
+      "4": 4,
+      "1": 4,
+      "8": 1,
+      "50": 1,
+      "15": 1,
+      "22": 1,
+      "2": 1,
+      "100": 1,
+      "90": 1,
+      "16": 1,
+      "110": 1
+    }
+  },
+  "near_duplicate_color_groups": [
+    [
+      "#061019",
+      "#071019",
+      "#07131b",
+      "#07141d",
+      "#07151e",
+      "#07161e",
+      "#08151d",
+      "#08151e",
+      "#081720",
+      "#081821",
+      "#09151c",
+      "#09151e",
+      "#091720",
+      "#091821",
+      "#0a151c",
+      "#0a1720",
+      "#0b1720",
+      "#0b1721",
+      "#0b1821"
+    ],
+    [
+      "#091922",
+      "#091923",
+      "#0a1922",
+      "#0a1d26",
+      "#0a211f",
+      "#0b1922",
+      "#0b1a23",
+      "#0b1b24",
+      "#0c1922",
+      "#0c1a23",
+      "#0c2029",
+      "#0d1c25",
+      "#0d1d27",
+      "#0d1e27",
+      "#0d2029",
+      "#0e1d26",
+      "#0f202a",
+      "#101e27",
+      "#101f29",
+      "#111b22",
+      "#111f29"
+    ],
+    [
+      "#0c222c",
+      "#10232d",
+      "#10242e",
+      "#122530",
+      "#122a34",
+      "#13232d",
+      "#132733"
+    ],
+    [
+      "#102a35",
+      "#102b35",
+      "#12313c",
+      "#142b37",
+      "#15313d",
+      "#16242e",
+      "#162d38",
+      "#17303b",
+      "#17313d",
+      "#182733",
+      "#18313d"
+    ],
+    [
+      "#12313e",
+      "#16343f",
+      "#173342",
+      "#18313e",
+      "#1a2c38"
+    ],
+    [
+      "#12382f",
+      "#143b34"
+    ],
+    [
+      "#153c49",
+      "#17404c"
+    ],
+    [
+      "#1b303d",
+      "#1c303c",
+      "#1d3540",
+      "#1e3440",
+      "#20333e",
+      "#20343f",
+      "#203542",
+      "#203743",
+      "#213744",
+      "#233845"
+    ],
+    [
+      "#20191b",
+      "#281b1b"
+    ],
+    [
+      "#203945",
+      "#243e49",
+      "#253a47",
+      "#263b47",
+      "#263b48",
+      "#263c48",
+      "#263c4b",
+      "#263e4b",
+      "#263f4b"
+    ],
+    [
+      "#244354",
+      "#274451",
+      "#274653",
+      "#29404d",
+      "#29414d",
+      "#29414f",
+      "#29434f",
+      "#294550",
+      "#294552",
+      "#294553",
+      "#294652",
+      "#294653",
+      "#294753",
+      "#294a58",
+      "#2a4554",
+      "#2a4854",
+      "#2c4655",
+      "#2c4855"
+    ],
+    [
+      "#292316",
+      "#2b1b1a",
+      "#2b1c1a",
+      "#2b2416",
+      "#311d1c",
+      "#312710"
+    ],
+    [
+      "#2c1819",
+      "#321d1b"
+    ],
+    [
+      "#2d424e",
+      "#314855",
+      "#343b49"
+    ],
+    [
+      "#304957",
+      "#304b59",
+      "#304b5a",
+      "#314d5b",
+      "#31505d",
+      "#324c59",
+      "#334b59",
+      "#344c5c",
+      "#34515e",
+      "#35515e",
+      "#38505c"
+    ],
+    [
+      "#315160",
+      "#315667",
+      "#335566",
+      "#35525e",
+      "#355464",
+      "#355865",
+      "#365463",
+      "#365563",
+      "#385061",
+      "#385766",
+      "#39505c",
+      "#395867"
+    ],
+    [
+      "#327263",
+      "#397760"
+    ],
+    [
+      "#351918",
+      "#351d1b",
+      "#3b211f"
+    ],
+    [
+      "#376070",
+      "#376477",
+      "#396475",
+      "#3a6573",
+      "#3b5968"
+    ],
+    [
+      "#382b17",
+      "#3b2e17"
+    ],
+    [
+      "#3c5663",
+      "#3c5b67",
+      "#405764",
+      "#40596a"
+    ],
+    [
+      "#426171",
+      "#426573",
+      "#436373",
+      "#496574"
+    ],
+    [
+      "#452426",
+      "#452a2a"
+    ],
+    [
+      "#478b9e",
+      "#4e8998"
+    ],
+    [
+      "#4b381d",
+      "#51401e"
+    ],
+    [
+      "#4b7889",
+      "#4f7d8b",
+      "#527486"
+    ],
+    [
+      "#4f7180",
+      "#557788"
+    ],
+    [
+      "#55c49a",
+      "#56bd96"
+    ],
+    [
+      "#587985",
+      "#607d8b"
+    ],
+    [
+      "#58b9d0",
+      "#58bdd7",
+      "#5fc0d8",
+      "#60bed5"
+    ],
+    [
+      "#5ec2dc",
+      "#65c9df",
+      "#66c7dc",
+      "#66c7df"
+    ],
+    [
+      "#5fc39f",
+      "#65c59b"
+    ],
+    [
+      "#657d8a",
+      "#667b86",
+      "#677b87",
+      "#6d818a"
+    ],
+    [
+      "#67c8df",
+      "#68cadd",
+      "#6dc8dd"
+    ],
+    [
+      "#70493d",
+      "#704943",
+      "#714740",
+      "#764942"
+    ],
+    [
+      "#708692",
+      "#708793",
+      "#708894",
+      "#708b98",
+      "#718994",
+      "#728995",
+      "#728a96",
+      "#748b96",
+      "#748c98",
+      "#758c98",
+      "#768e9a"
+    ],
+    [
+      "#725d3b",
+      "#7a643c"
+    ],
+    [
+      "#72c5dc",
+      "#78c8d8"
+    ],
+    [
+      "#754b47",
+      "#754b4a"
+    ],
+    [
+      "#759aa6",
+      "#78939f",
+      "#7894a0",
+      "#7894a1",
+      "#7898a7",
+      "#7b929e"
+    ],
+    [
+      "#788f9b",
+      "#788f9c",
+      "#78909c",
+      "#78909e",
+      "#78919d",
+      "#7c8d94",
+      "#7d8d96",
+      "#7f96a3",
+      "#8096a2"
+    ],
+    [
+      "#7d673e",
+      "#806440",
+      "#80663c"
+    ],
+    [
+      "#7f4c3b",
+      "#824d41"
+    ],
+    [
+      "#7f96a4",
+      "#7f9ba8",
+      "#8097a4",
+      "#8196a0",
+      "#8196a4",
+      "#8197a3",
+      "#8198a5",
+      "#8299a5",
+      "#829aa7",
+      "#829aa8",
+      "#829ba7",
+      "#839aa6",
+      "#8499a6"
+    ],
+    [
+      "#7fa2b1",
+      "#86a4b1",
+      "#86a5b9",
+      "#87a5b3"
+    ],
+    [
+      "#805047",
+      "#80574c",
+      "#854d47",
+      "#86524c"
+    ],
+    [
+      "#844d50",
+      "#8a4f49"
+    ],
+    [
+      "#88a8b5",
+      "#8ba3af",
+      "#8da3b0",
+      "#8da4af",
+      "#8ea4af",
+      "#8eb0ba",
+      "#8fa4af",
+      "#8fa4b0",
+      "#8fa5b1",
+      "#8fa8b5"
+    ],
+    [
+      "#89652c",
+      "#8b682a"
+    ],
+    [
+      "#8ba1ac",
+      "#91a4ae",
+      "#91a5af",
+      "#91a5b2",
+      "#91a6b3",
+      "#91a7b2",
+      "#91a8b3"
+    ],
+    [
+      "#8db1bd",
+      "#8fb4bf",
+      "#91aab5",
+      "#93a9b6",
+      "#93b5c2",
+      "#94b7c3"
+    ],
+    [
+      "#94a9b4",
+      "#9aabb5",
+      "#9bb0bb"
+    ],
+    [
+      "#9a6338",
+      "#9d6038"
+    ],
+    [
+      "#9ab2bd",
+      "#9bb2bd",
+      "#9bb8c1",
+      "#9cb6c1",
+      "#9db0bc",
+      "#9db1bf",
+      "#9eb2bc",
+      "#9eb2bd",
+      "#9eb4c0",
+      "#9eb8c4",
+      "#9fb1bb",
+      "#9fb4be"
+    ],
+    [
+      "#9bc4cf",
+      "#9ec4cc"
+    ],
+    [
+      "#a47a38",
+      "#a57738",
+      "#a67a30"
+    ],
+    [
+      "#a8bbc5",
+      "#a8bec8",
+      "#a9bbc4",
+      "#a9c0ca",
+      "#abc0c9",
+      "#aebdc4",
+      "#aebdc6",
+      "#aebfc9"
+    ],
+    [
+      "#a9d4c5",
+      "#a9d9c5"
+    ],
+    [
+      "#b2c4cb",
+      "#b2c7cf",
+      "#b7cad3",
+      "#b8c6cd",
+      "#b8c8d2",
+      "#b8cad2",
+      "#b9cbd3"
+    ],
+    [
+      "#b46a5b",
+      "#b96b61"
+    ],
+    [
+      "#b6dce5",
+      "#b7d7df",
+      "#b7dce7",
+      "#b8d8e2",
+      "#b8dfe8",
+      "#b9dbe3",
+      "#bce0e8",
+      "#bdd7dd"
+    ],
+    [
+      "#b7cad5",
+      "#b9cbd4",
+      "#b9ccd4",
+      "#b9ceda",
+      "#bcd2dc",
+      "#bdd0d9"
+    ],
+    [
+      "#b98b3d",
+      "#c18b3c"
+    ],
+    [
+      "#c2dce4",
+      "#c4dce5",
+      "#c5d7df",
+      "#c5d7e2",
+      "#c6d6dd",
+      "#c7d7de",
+      "#c7d8de",
+      "#c7d8df",
+      "#c7dce4",
+      "#c7e0e5",
+      "#c8d8df",
+      "#c8e1e7",
+      "#c9d6dc",
+      "#c9d9e2"
+    ],
+    [
+      "#c3d3d9",
+      "#c5d4da",
+      "#c6d3d9",
+      "#cbd8df"
+    ],
+    [
+      "#c6e6ed",
+      "#c7e8ef",
+      "#cce0e7"
+    ],
+    [
+      "#cbdde4",
+      "#cfe4e8",
+      "#d1e1e6",
+      "#d2e0e6"
+    ],
+    [
+      "#d5a34b",
+      "#d6a244",
+      "#d6a64a"
+    ],
+    [
+      "#d5e9ed",
+      "#d6e2e8",
+      "#d6e6ec",
+      "#d7e7ed",
+      "#d8e7ec",
+      "#d8e7ed",
+      "#d8e8ee",
+      "#d9e5ea",
+      "#d9e6ec",
+      "#dbe7ec",
+      "#dbe8ee",
+      "#dce8ee"
+    ],
+    [
+      "#d66d61",
+      "#d86f66",
+      "#d9695f"
+    ],
+    [
+      "#d6a99d",
+      "#daa998"
+    ],
+    [
+      "#d9f4fa",
+      "#dff4f8",
+      "#dff8ff",
+      "#dff9ff",
+      "#dffaff",
+      "#e1f0f4",
+      "#e1f2f6"
+    ],
+    [
+      "#e0b6ad",
+      "#e4b0a8",
+      "#e4b4a7"
+    ],
+    [
+      "#e3f2f6",
+      "#e3f7fb",
+      "#e4edf1",
+      "#e4f7fb",
+      "#e5edf1",
+      "#e5f7fb",
+      "#e6f6fa",
+      "#e7eff3",
+      "#e8f0f7",
+      "#e9f5f8"
+    ],
+    [
+      "#ead39d",
+      "#edd3a5",
+      "#f0d59f"
+    ],
+    [
+      "#ead3ad",
+      "#f2d9a7"
+    ],
+    [
+      "#edc8c2",
+      "#f2c2ba"
+    ],
+    [
+      "#edf5f8",
+      "#eef6f9",
+      "#eef6fb",
+      "#f0f6fa",
+      "#f1f6fa",
+      "#f5f9fc"
+    ],
+    [
+      "#efb3a6",
+      "#efb7ac"
+    ],
+    [
+      "#efb8b2",
+      "#f0bbb0",
+      "#f1c0b6"
+    ],
+    [
+      "#f0a398",
+      "#f1a099"
+    ],
+    [
+      "#f1d28f",
+      "#f5d995"
+    ],
+    [
+      "#ffaaa2",
+      "#ffaaa4",
+      "#ffb0a8"
+    ],
+    [
+      "#ffd1ad",
+      "#ffd2ae"
+    ],
+    [
+      "#fff2eb",
+      "#fff5ec"
+    ]
+  ],
+  "duplicate_selectors": [
+    {
+      "selector": "|button",
+      "count": 2
+    },
+    {
+      "selector": "|input",
+      "count": 2
+    },
+    {
+      "selector": "|select",
+      "count": 3
+    },
+    {
+      "selector": "|textarea",
+      "count": 3
+    },
+    {
+      "selector": "|.node-palette-item",
+      "count": 2
+    },
+    {
+      "selector": "|.node-palette-icon",
+      "count": 2
+    },
+    {
+      "selector": "|.node-palette-copy strong",
+      "count": 3
+    },
+    {
+      "selector": "|.node-palette-copy small",
+      "count": 2
+    },
+    {
+      "selector": "|.canvas-view-controls",
+      "count": 2
+    },
+    {
+      "selector": "|.canvas-view-controls button",
+      "count": 2
+    },
+    {
+      "selector": "|.canvas-view-controls select",
+      "count": 2
+    },
+    {
+      "selector": "|.history-panel > header",
+      "count": 2
+    },
+    {
+      "selector": "|.history-event",
+      "count": 2
+    },
+    {
+      "selector": "|.kernel-error-panel p",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-capabilities",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-components",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-components > div",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-components strong",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-components small",
+      "count": 4
+    },
+    {
+      "selector": "|.app-shell",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-workspace",
+      "count": 5
+    },
+    {
+      "selector": "|.workbench-commands",
+      "count": 2
+    },
+    {
+      "selector": "|.pane-divider",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-pane",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-pane > .panel",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-workspace .panel",
+      "count": 2
+    },
+    {
+      "selector": "|.pane-toolbar",
+      "count": 3
+    },
+    {
+      "selector": "|.pane-toolbar button",
+      "count": 2
+    },
+    {
+      "selector": "|.app-header",
+      "count": 2
+    },
+    {
+      "selector": "|.availability-meta",
+      "count": 2
+    },
+    {
+      "selector": "|.robot-control-panel",
+      "count": 2
+    },
+    {
+      "selector": "|.robot-control-boundary",
+      "count": 2
+    },
+    {
+      "selector": "|.robot-control-pose-note",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-header-controls",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-options",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-options > summary",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-axes-list strong",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-axes-list small",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-controls",
+      "count": 2
+    },
+    {
+      "selector": "|.toggle-control",
+      "count": 2
+    },
+    {
+      "selector": "|.program-workspace",
+      "count": 3
+    },
+    {
+      "selector": "|.program-workspace-header-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.scene-authoring-workspace",
+      "count": 2
+    },
+    {
+      "selector": "|.source-occurrence-panel",
+      "count": 2
+    },
+    {
+      "selector": "|.scene-authoring-heading",
+      "count": 2
+    },
+    {
+      "selector": "|.source-occurrence-facts",
+      "count": 2
+    },
+    {
+      "selector": "|.scene-owner-identity",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-role-controls label",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-source-row strong",
+      "count": 2
+    },
+    {
+      "selector": "|.scene-commit-error",
+      "count": 2
+    },
+    {
+      "selector": "|.scene-commit-success",
+      "count": 2
+    },
+    {
+      "selector": "|.program-tree-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.program-staging-heading",
+      "count": 2
+    },
+    {
+      "selector": "|.program-property-heading",
+      "count": 2
+    },
+    {
+      "selector": "|.program-node-identity",
+      "count": 3
+    },
+    {
+      "selector": "|.program-feedback",
+      "count": 2
+    },
+    {
+      "selector": "|.program-apply-blocked",
+      "count": 2
+    },
+    {
+      "selector": "|.program-save-as-path",
+      "count": 2
+    },
+    {
+      "selector": "|.program-confirmation",
+      "count": 4
+    },
+    {
+      "selector": "|h3)",
+      "count": 2
+    },
+    {
+      "selector": "|.program-authoring-grid",
+      "count": 2
+    },
+    {
+      "selector": "|.program-palette",
+      "count": 5
+    },
+    {
+      "selector": "|.program-tree-surface",
+      "count": 5
+    },
+    {
+      "selector": "|.program-properties",
+      "count": 2
+    },
+    {
+      "selector": "|.program-declarations",
+      "count": 3
+    },
+    {
+      "selector": "|.program-authoring-empty",
+      "count": 2
+    },
+    {
+      "selector": "|.program-empty-guidance",
+      "count": 2
+    },
+    {
+      "selector": "|.program-tree-empty",
+      "count": 2
+    },
+    {
+      "selector": "|.program-subpanel-header",
+      "count": 2
+    },
+    {
+      "selector": "|.program-subpanel-header h3",
+      "count": 3
+    },
+    {
+      "selector": "|.program-declarations h4",
+      "count": 2
+    },
+    {
+      "selector": "|.program-palette-list h4",
+      "count": 2
+    },
+    {
+      "selector": "|.program-filter",
+      "count": 3
+    },
+    {
+      "selector": "|.program-palette-list",
+      "count": 2
+    },
+    {
+      "selector": "|.program-palette-list section + section",
+      "count": 2
+    },
+    {
+      "selector": "|.program-staging-card",
+      "count": 2
+    },
+    {
+      "selector": "|.program-tree-react-flow",
+      "count": 3
+    },
+    {
+      "selector": "|.program-inline-message",
+      "count": 2
+    },
+    {
+      "selector": "|.program-property-list",
+      "count": 2
+    },
+    {
+      "selector": "|.program-node-identity > span",
+      "count": 2
+    },
+    {
+      "selector": "|.program-node-identity > span:last-child",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-editor",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-actions-row",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-help",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-blocked",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-fieldset",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-actions legend",
+      "count": 2
+    },
+    {
+      "selector": "|.program-policy-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.program-variant-editor",
+      "count": 2
+    },
+    {
+      "selector": "|.program-waypoint",
+      "count": 4
+    },
+    {
+      "selector": "|.program-variant-editor label",
+      "count": 2
+    },
+    {
+      "selector": "|.program-vector-editor",
+      "count": 2
+    },
+    {
+      "selector": "|.program-form-hint",
+      "count": 2
+    },
+    {
+      "selector": "|.program-declaration-columns",
+      "count": 2
+    },
+    {
+      "selector": "|.program-declaration-list small",
+      "count": 2
+    },
+    {
+      "selector": "|.program-parameter-constraints label > span",
+      "count": 2
+    },
+    {
+      "selector": "|.catalog-entry-list button.selected",
+      "count": 2
+    },
+    {
+      "selector": "|.assistant-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.program-template-form",
+      "count": 2
+    },
+    {
+      "selector": "|.contact-policy-checks",
+      "count": 2
+    },
+    {
+      "selector": "|.robot-control-move-to",
+      "count": 2
+    },
+    {
+      "selector": "|.entry-copy strong",
+      "count": 2
+    },
+    {
+      "selector": "|.entry-copy small",
+      "count": 2
+    },
+    {
+      "selector": "@media (max-width: 76rem)|.workbench-navigation",
+      "count": 2
+    },
+    {
+      "selector": "@media (max-width: 76rem)|.workbench-workspace",
+      "count": 3
+    },
+    {
+      "selector": "@media (max-width: 76rem)|.workbench-commands",
+      "count": 2
+    },
+    {
+      "selector": "@media (max-width: 48rem)|.program-policy-actions",
+      "count": 2
+    },
+    {
+      "selector": "@media (max-width: 48rem)|.catalog-browser",
+      "count": 2
+    },
+    {
+      "selector": "|.workspace-switcher",
+      "count": 2
+    },
+    {
+      "selector": "|.program-document-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.program-document-identity",
+      "count": 2
+    },
+    {
+      "selector": "|.program-document-controls",
+      "count": 2
+    },
+    {
+      "selector": "|.program-subpanel-title",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-status-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.program-dialog-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-inspector",
+      "count": 2
+    },
+    {
+      "selector": "|.central-inspector-header",
+      "count": 2
+    },
+    {
+      "selector": "|.central-inspector-body",
+      "count": 2
+    },
+    {
+      "selector": "|.central-inspector-warning",
+      "count": 2
+    },
+    {
+      "selector": "|.workbench-commands .workbench-pane",
+      "count": 2
+    },
+    {
+      "selector": "|.program-inspector",
+      "count": 3
+    },
+    {
+      "selector": "|.node-info-button",
+      "count": 2
+    },
+    {
+      "selector": "|.program-canvas-toolbar",
+      "count": 3
+    },
+    {
+      "selector": "|.program-canvas-help",
+      "count": 4
+    },
+    {
+      "selector": "|.program-tree-react-flow .program-tree-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.program-tree-react-flow .program-tree-actions button",
+      "count": 2
+    },
+    {
+      "selector": "|.program-tree-react-flow .program-tree-actions select",
+      "count": 2
+    },
+    {
+      "selector": "|.program-declaration-navigator button strong",
+      "count": 2
+    },
+    {
+      "selector": "|.program-declaration-navigator button small",
+      "count": 2
+    },
+    {
+      "selector": "|.program-notice-rail",
+      "count": 2
+    },
+    {
+      "selector": "|.program-canvas-toolbar .canvas-view-controls button",
+      "count": 2
+    },
+    {
+      "selector": "|.program-schema-list",
+      "count": 2
+    },
+    {
+      "selector": "|.program-schema-object",
+      "count": 3
+    },
+    {
+      "selector": "|.runtime-status-summary",
+      "count": 2
+    },
+    {
+      "selector": "|.program-settings-editor",
+      "count": 2
+    },
+    {
+      "selector": "|.program-settings-section",
+      "count": 2
+    },
+    {
+      "selector": "|.program-motion-number",
+      "count": 2
+    },
+    {
+      "selector": "|.runtime-status-summary small",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-document-actions",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-run-gate",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-field-error",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-binding-row",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-binding-row strong",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-binding-row span",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-advanced-document",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-runtime-unit",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-joint-effective",
+      "count": 2
+    },
+    {
+      "selector": "|.deployment-focused-field > textarea",
+      "count": 2
+    },
+    {
+      "selector": "|.transport-group-column button",
+      "count": 2
+    },
+    {
+      "selector": "|.transport-group-scale",
+      "count": 2
+    },
+    {
+      "selector": "|.transport-group-scale span",
+      "count": 2
+    },
+    {
+      "selector": "|.transport-group-scale output",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-object-quick-panel",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-object-quick-panel dl",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-inspector-section .viewer-options-body",
+      "count": 2
+    },
+    {
+      "selector": "|.viewer-inspector-section .viewer-object-quick-panel",
+      "count": 2
+    },
+    {
+      "selector": "|.central-inspector-section :is( .central-inspector-body",
+      "count": 9
+    },
+    {
+      "selector": "|.robot-control-preset",
+      "count": 2
+    },
+    {
+      "selector": "|.robot-control-stored-move",
+      "count": 2
+    },
+    {
+      "selector": "|.cclc-provider-card",
+      "count": 2
+    }
+  ],
+  "classes_used_without_rule": [
+    {
+      "class": "artifact-panel",
+      "files": [
+        "src/components/ArtifactBrowser.tsx"
+      ]
+    },
+    {
+      "class": "assistant-warnings",
+      "files": [
+        "src/components/AssistantOverlay.tsx"
+      ]
+    },
+    {
+      "class": "authoring-unavailable-notice",
+      "files": [
+        "src/components/DeploymentCompositionPanel.tsx"
+      ]
+    },
+    {
+      "class": "button-row",
+      "files": [
+        "src/components/CCLCPanel.tsx",
+        "src/components/DeploymentFocusedEditor.tsx",
+        "src/components/ExecutionHistoryPanel.tsx",
+        "src/components/HistoryDiscovery.tsx",
+        "src/components/StructuralViewer.tsx"
+      ]
+    },
+    {
+      "class": "catalog-panel",
+      "files": [
+        "src/components/CatalogPanel.tsx"
+      ]
+    },
+    {
+      "class": "confirmation-check",
+      "files": [
+        "src/components/DeploymentDocumentControls.tsx"
+      ]
+    },
+    {
+      "class": "deployment-applied-comparison",
+      "files": [
+        "src/components/DeploymentFocusedEditor.tsx"
+      ]
+    },
+    {
+      "class": "deployment-apply-impact",
+      "files": [
+        "src/components/DeploymentDocumentControls.tsx"
+      ]
+    },
+    {
+      "class": "deployment-composition-panel",
+      "files": [
+        "src/components/DeploymentCompositionPanel.tsx"
+      ]
+    },
+    {
+      "class": "error-banner",
+      "files": [
+        "src/components/ProgramRuntimePanel.tsx"
+      ]
+    },
+    {
+      "class": "field-error",
+      "files": [
+        "src/components/ProgramRuntimePanel.tsx"
+      ]
+    },
+    {
+      "class": "history-correlation-filters",
+      "files": [
+        "src/components/ExecutionHistoryPanel.tsx"
+      ]
+    },
+    {
+      "class": "history-retention",
+      "files": [
+        "src/components/ExecutionHistoryPanel.tsx"
+      ]
+    },
+    {
+      "class": "inline-fields",
+      "files": [
+        "src/components/CCLCPanel.tsx"
+      ]
+    },
+    {
+      "class": "overlay-actions",
+      "files": [
+        "src/components/ProgramAuthoringTemplate.tsx"
+      ]
+    },
+    {
+      "class": "overlay-close",
+      "files": [
+        "src/components/OverlayPanel.tsx"
+      ]
+    },
+    {
+      "class": "palette-error",
+      "files": [
+        "src/components/ProgramNodePalette.tsx"
+      ]
+    },
+    {
+      "class": "program-dialog-context",
+      "files": [
+        "src/components/ProgramDocumentControls.tsx"
+      ]
+    },
+    {
+      "class": "program-document-source-notice",
+      "files": [
+        "src/components/ProgramDocumentControls.tsx"
+      ]
+    },
+    {
+      "class": "program-history-list",
+      "files": [
+        "src/components/DeploymentCompositionPanel.tsx"
+      ]
+    },
+    {
+      "class": "program-motion-bindings",
+      "files": [
+        "src/components/ProgramSettingsEditor.tsx"
+      ]
+    },
+    {
+      "class": "program-motion-defaults",
+      "files": [
+        "src/components/ProgramSettingsEditor.tsx"
+      ]
+    },
+    {
+      "class": "program-notice-dismiss",
+      "files": [
+        "src/components/ProgramNoticeRail.tsx"
+      ]
+    },
+    {
+      "class": "program-notice-dismiss-all",
+      "files": [
+        "src/components/ProgramNoticeRail.tsx"
+      ]
+    },
+    {
+      "class": "program-notice-expand",
+      "files": [
+        "src/components/ProgramNoticeRail.tsx"
+      ]
+    },
+    {
+      "class": "program-palette-category-toggle",
+      "files": [
+        "src/components/ProgramNodePalette.tsx"
+      ]
+    },
+    {
+      "class": "program-schema-tuple",
+      "files": [
+        "src/components/property/ProgramSchemaValueEditor.tsx"
+      ]
+    },
+    {
+      "class": "program-side-rail-left",
+      "files": [
+        "src/components/ProgramWorkspace.tsx"
+      ]
+    },
+    {
+      "class": "program-topology-node-type",
+      "files": [
+        "src/components/ProgramTreeCanvas.tsx"
+      ]
+    },
+    {
+      "class": "program-tree-action-row-placement",
+      "files": [
+        "src/components/ProgramTreeCanvas.tsx"
+      ]
+    },
+    {
+      "class": "program-tree-action-row-type-commands",
+      "files": [
+        "src/components/ProgramTreeCanvas.tsx"
+      ]
+    },
+    {
+      "class": "runtime-detail-group",
+      "files": [
+        "src/components/ProgramRuntimePanel.tsx"
+      ]
+    },
+    {
+      "class": "scene-shape-fields",
+      "files": [
+        "src/components/SceneAuthoringWorkspace.tsx"
+      ]
+    },
+    {
+      "class": "transport-full-stop",
+      "files": [
+        "src/components/ProgramRuntimePanel.tsx"
+      ]
+    },
+    {
+      "class": "transport-group-stop",
+      "files": [
+        "src/components/ProgramRuntimePanel.tsx"
+      ]
+    },
+    {
+      "class": "transport-settings-button",
+      "files": [
+        "src/components/ProgramRuntimePanel.tsx"
+      ]
+    },
+    {
+      "class": "viewer-inspector-slot",
+      "files": [
+        "src/App.tsx"
+      ]
+    }
+  ],
+  "classes_never_referenced": [
+    "app-footer",
+    "app-title",
+    "artifact-browser-panel",
+    "attention-error",
+    "attention-warning",
+    "availability-connected",
+    "availability-copy",
+    "availability-details",
+    "availability-dot",
+    "availability-meta",
+    "availability-notice",
+    "boundary-dot",
+    "boundary-dot-connected",
+    "bt-node-handle",
+    "category-control_flow",
+    "category-logic",
+    "category-motion",
+    "category-scene",
+    "collapsed-rail-slot",
+    "commands-collapsed",
+    "declaration-error",
+    "deployment-candidate-summary",
+    "deployment-document-action-divider",
+    "deployment-document-actions",
+    "deployment-document-bar",
+    "deployment-document-identity",
+    "deployment-document-state",
+    "document-operation-status",
+    "execution-ready",
+    "gate-list",
+    "header-boundary",
+    "health-error",
+    "identity-current",
+    "identity-dirty",
+    "identity-refreshing",
+    "identity-unavailable",
+    "inspector-collapsed",
+    "lower-grid",
+    "message-error",
+    "navigation-collapsed",
+    "notice-error",
+    "overlay-info",
+    "overlay-status",
+    "pane-toolbar",
+    "phase-failed",
+    "phase-intervention_required",
+    "phase-unavailable",
+    "program-actions-disclosure",
+    "program-actions-popover",
+    "program-apply-actions",
+    "program-artifact-actions",
+    "program-canvas-message",
+    "program-canvas-node-button",
+    "program-canvas-shortcuts",
+    "program-empty-state",
+    "program-identity-strip",
+    "program-inline-message",
+    "program-policy-actions-row",
+    "program-policy-blocked",
+    "program-settings-summary",
+    "program-staging-card",
+    "program-staging-heading",
+    "program-tree-edges",
+    "program-tree-scroll",
+    "program-tree-stage",
+    "program-workspace-header",
+    "program-workspace-header-actions",
+    "react-flow",
+    "react-flow__controls",
+    "react-flow__controls-button",
+    "react-flow__handle",
+    "react-flow__node",
+    "react-flow__pane",
+    "readiness-degraded",
+    "readiness-fault",
+    "readiness-offline",
+    "readiness-ready",
+    "readiness-waiting",
+    "robot-control-boundary",
+    "robot-control-evidence",
+    "runtime-observability-overlay",
+    "runtime-status-panel",
+    "scenario-deployment-browser",
+    "scenario-status-changed",
+    "scenario-status-incomplete",
+    "scenario-status-ready",
+    "scenario-status-unsupported",
+    "scenario-status-version_changed",
+    "scene-authoring-grid",
+    "scene-owner-identity",
+    "severity-critical",
+    "severity-error",
+    "severity-info",
+    "severity-warning",
+    "stability-deprecated",
+    "stability-experimental",
+    "stability-stable",
+    "standing-alarm-chip",
+    "state-applied",
+    "state-different",
+    "state-incomplete",
+    "state-modified",
+    "state-saved",
+    "state-unavailable",
+    "state-unsaved",
+    "status-degraded",
+    "status-error",
+    "status-failure",
+    "status-fault",
+    "status-healthy",
+    "status-offline",
+    "status-pill-connected",
+    "status-ready",
+    "status-running",
+    "status-success",
+    "status-waiting",
+    "status-warning",
+    "structural-scope",
+    "unavailable-banner",
+    "unavailable-copy",
+    "unavailable-icon",
+    "viewer-contract",
+    "viewer-controls",
+    "viewer-options",
+    "viewer-options-popover",
+    "viewer-state-overlay",
+    "workbench-navigation"
+  ],
+  "ts_color_literals": [
+    {
+      "file": "src/components/ProgramTreeCanvas.tsx",
+      "color": "#fbbf24"
+    },
+    {
+      "file": "src/components/ProgramTreeCanvas.tsx",
+      "color": "#4ade80"
+    },
+    {
+      "file": "src/components/ProgramTreeCanvas.tsx",
+      "color": "#f87171"
+    },
+    {
+      "file": "src/components/ProgramTreeCanvas.tsx",
+      "color": "#6b7280"
+    },
+    {
+      "file": "src/components/ProgramTreeCanvas.tsx",
+      "color": "#29404d"
+    },
+    {
+      "file": "src/components/StatusEdge.tsx",
+      "color": "#6b7280"
+    },
+    {
+      "file": "src/components/StatusEdge.tsx",
+      "color": "#fbbf24"
+    },
+    {
+      "file": "src/components/StatusEdge.tsx",
+      "color": "#4ade80"
+    },
+    {
+      "file": "src/components/StatusEdge.tsx",
+      "color": "#f87171"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#65d3f2"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#144c62"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#5fa84a"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#173d16"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#e4ac55"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#573411"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#43d7ec"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#0c5060"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#8c6fe0"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#251a48"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#ffb44a"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#6f2a12"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#ef766f"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#aebdcc"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#ffb44a"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#6f2a12"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#ff7066"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#f2bb56"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#58ddff"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#62421d"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#153c49"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#43d7ec"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#0c5060"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#75d7ff"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#ffffff"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#081019"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#081019"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#dbeaff"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#121d27"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#243341"
+    },
+    {
+      "file": "src/components/StructuralViewer.tsx",
+      "color": "#496071"
+    }
+  ]
+}

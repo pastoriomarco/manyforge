@@ -6,14 +6,7 @@ import {
   type ProgramPaletteActivation,
 } from '../utils/programCanvasInteraction';
 import { OverlayPanel } from './OverlayPanel';
-
-const KIND_ICONS: Record<string, string> = {
-  leaf: '⬤',
-  composite: '◆',
-  decorator: '◇',
-  macro: '▦',
-  authoring_macro: '▦',
-};
+import { ProgramKindSymbol } from './programNodeGlyphs';
 
 interface NodePaletteItemProps {
   entry: CatalogEntry;
@@ -70,7 +63,7 @@ export function NodePaletteItem({
           : `Double-click or drag to add ${entry.name}`}
       >
         <span className="node-palette-icon" aria-hidden="true">
-          {KIND_ICONS[entry.kind] || '●'}
+          <ProgramKindSymbol kind={entry.kind} />
         </span>
         <span className="node-palette-copy">
           <strong>{entry.name}</strong>

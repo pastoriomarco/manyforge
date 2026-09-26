@@ -1,54 +1,50 @@
 import type { CSSProperties } from 'react';
+import {
+  Position,
+  getBezierPath,
+  getSimpleBezierPath,
+  getSmoothStepPath,
+  getStraightPath,
+} from '@xyflow/react';
 import type {
   EdgeStyle,
   LayoutDirection,
   NodePresentationStatus,
 } from '../store/composerStore';
+import { STATUS_COLORS } from '../styles/tokens';
 
-const EDGE_STATUS_COLORS: Record<NodePresentationStatus, string> = {
-  idle: '#6b7280',
-  running: '#fbbf24',
-  success: '#4ade80',
-  failure: '#f87171',
-};
+// Edges share the node border status colours (UI6-I-VC).
+const EDGE_STATUS_COLORS: Record<NodePresentationStatus, string> = STATUS_COLORS;
 
 export interface StatusEdgeGeometry {
   sourceX: number;
   sourceY: number;
   targetX: number;
   targetY: number;
+  sourcePosition?: Position;
+  targetPosition?: Position;
 }
 
+// Same path helpers and corner radii as the pre-relocation StatusEdge. The
+// canvas passes React Flow's handle positions; without them, handles sit
+// left/right in the vertical layout and top/bottom in the horizontal one.
 export function statusEdgePath(
   geometry: StatusEdgeGeometry,
   style: EdgeStyle,
   layoutDirection: LayoutDirection = 'vertical',
 ): string {
-  const { sourceX, sourceY, targetX, targetY } = geometry;
-  if (style === 'straight') return `M ${sourceX} ${sourceY} L ${targetX} ${targetY}`;
-  const middleX = (sourceX + targetX) / 2;
-  const middleY = (sourceY + targetY) / 2;
-  if (style === 'step') {
-    return layoutDirection === 'vertical'
-      ? `M ${sourceX} ${sourceY} L ${middleX} ${sourceY} L ${middleX} ${targetY} L ${targetX} ${targetY}`
-      : `M ${sourceX} ${sourceY} L ${sourceX} ${middleY} L ${targetX} ${middleY} L ${targetX} ${targetY}`;
-  }
-  if (style === 'smoothstep') {
-    return layoutDirection === 'vertical'
-      ? `M ${sourceX} ${sourceY} C ${middleX} ${sourceY}, ${middleX} ${targetY}, ${targetX} ${targetY}`
-      : `M ${sourceX} ${sourceY} C ${sourceX} ${middleY}, ${targetX} ${middleY}, ${targetX} ${targetY}`;
-  }
-  if (style === 'simplebezier') {
-    return layoutDirection === 'vertical'
-      ? `M ${sourceX} ${sourceY} C ${middleX} ${sourceY}, ${middleX} ${targetY}, ${targetX} ${targetY}`
-      : `M ${sourceX} ${sourceY} C ${sourceX} ${middleY}, ${targetX} ${middleY}, ${targetX} ${targetY}`;
-  }
-  if (layoutDirection === 'vertical') {
-    const offset = Math.max(40, Math.abs(targetX - sourceX) * 0.45);
-    return `M ${sourceX} ${sourceY} C ${sourceX + offset} ${sourceY}, ${targetX - offset} ${targetY}, ${targetX} ${targetY}`;
-  }
-  const offset = Math.max(40, Math.abs(targetY - sourceY) * 0.45);
-  return `M ${sourceX} ${sourceY} C ${sourceX} ${sourceY + offset}, ${targetX} ${targetY - offset}, ${targetX} ${targetY}`;
+  const params = {
+    ...geometry,
+    sourcePosition: geometry.sourcePosition
+      ?? (layoutDirection === 'vertical' ? Position.Right : Position.Bottom),
+    targetPosition: geometry.targetPosition
+      ?? (layoutDirection === 'vertical' ? Position.Left : Position.Top),
+  };
+  if (style === 'straight') return getStraightPath(params)[0];
+  if (style === 'simplebezier') return getSimpleBezierPath(params)[0];
+  if (style === 'smoothstep') return getSmoothStepPath({ ...params, borderRadius: 18 })[0];
+  if (style === 'step') return getSmoothStepPath({ ...params, borderRadius: 0 })[0];
+  return getBezierPath(params)[0];
 }
 
 interface StatusEdgeProps extends StatusEdgeGeometry {

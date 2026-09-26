@@ -438,7 +438,8 @@ def check_jerk_authoring(endpoint, stack, workbench, *, pending_scene_apply=Fals
 
     def action(label):
         click_xpath(
-            "//div[@class='deployment-document-actions']/button[normalize-space(.)="
+            "//div[@aria-label='Deployment document controls']"
+            "//div[@class='document-actions']/button[normalize-space(.)="
             + json.dumps(label)
             + "]"
         )
@@ -451,7 +452,7 @@ def check_jerk_authoring(endpoint, stack, workbench, *, pending_scene_apply=Fals
             "//button[@role='listitem'][.//strong[text()='query.deployment.yaml']]"
         )
         browser.click(
-            ".program-document-dialog > button.primary-action", "Open as Draft"
+            ".document-dialog > button.primary-action", "Open as Draft"
         )
         browser.wait(
             "loaded Deployment", lambda: workspace()["draft"]["document"] is not None

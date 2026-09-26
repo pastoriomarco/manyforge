@@ -101,6 +101,7 @@ import {
 } from '../utils/viewerPerformance';
 import { usePublishWorkbenchNotices } from '../state/workbenchNotices';
 import { viewerNotices } from '../state/viewerNotices';
+import { VIEWPORT_COLORS } from '../styles/tokens';
 
 interface StructuralViewerProps {
   viewerActive: boolean;
@@ -236,36 +237,36 @@ export function sceneObjectMaterial(
   renderOrder: number;
 } {
   if (selected) return {
-    color: '#65d3f2',
-    emissive: '#144c62',
+    color: VIEWPORT_COLORS.objectSelected,
+    emissive: VIEWPORT_COLORS.objectSelectedEmissive,
     opacity: 1,
     transparent: false,
     renderOrder: 12,
   };
   if (appearance === 'attached') return {
-    color: '#5fa84a',
-    emissive: '#173d16',
+    color: VIEWPORT_COLORS.objectAttached,
+    emissive: VIEWPORT_COLORS.objectAttachedEmissive,
     opacity: 0.85,
     transparent: true,
     renderOrder: 13,
   };
   if (appearance === 'draft') return {
-    color: '#e4ac55',
-    emissive: '#573411',
+    color: VIEWPORT_COLORS.objectDraft,
+    emissive: VIEWPORT_COLORS.objectDraftEmissive,
     opacity: 0.62,
     transparent: true,
     renderOrder: 14,
   };
   if (appearance === 'comparison') return {
-    color: '#43d7ec',
-    emissive: '#0c5060',
+    color: VIEWPORT_COLORS.objectComparison,
+    emissive: VIEWPORT_COLORS.objectComparisonEmissive,
     opacity: 0.45,
     transparent: true,
     renderOrder: 16,
   };
   return {
-    color: '#8c6fe0',
-    emissive: '#251a48',
+    color: VIEWPORT_COLORS.object,
+    emissive: VIEWPORT_COLORS.objectEmissive,
     opacity: 1,
     transparent: false,
     renderOrder: 8,
@@ -505,8 +506,8 @@ function CollisionMesh({ url }: { url: string }) {
         : [mesh.material];
       const collisionMaterials = sourceMaterials.map((source) => {
         const material = source.clone() as THREE.MeshStandardMaterial;
-        material.color?.set('#ffb44a');
-        material.emissive?.set('#6f2a12');
+        material.color?.set(VIEWPORT_COLORS.collision);
+        material.emissive?.set(VIEWPORT_COLORS.collisionEmissive);
         material.transparent = true;
         material.opacity = 0.42;
         material.wireframe = true;
@@ -666,7 +667,7 @@ function SceneObjectMesh({
     ? (
       <mesh renderOrder={20}>
         <boxGeometry args={[0.06, 0.06, 0.06]} />
-        <meshBasicMaterial color="#ef766f" wireframe />
+        <meshBasicMaterial color={VIEWPORT_COLORS.error} wireframe />
       </mesh>
     )
     : url === null
@@ -741,7 +742,7 @@ function PrimitiveVisual({ primitive }: { primitive: SceneUrdfPrimitive }) {
   return (
     <mesh rotation={cylinderRotation}>
       <PrimitiveGeometry primitive={primitive} />
-      <meshStandardMaterial color="#aebdcc" metalness={0.18} roughness={0.62} />
+      <meshStandardMaterial color={VIEWPORT_COLORS.primitive} metalness={0.18} roughness={0.62} />
     </mesh>
   );
 }
@@ -755,8 +756,8 @@ function PrimitiveCollision({ primitive }: { primitive: SceneUrdfPrimitive }) {
     <mesh rotation={cylinderRotation} renderOrder={10}>
       <PrimitiveGeometry primitive={primitive} />
       <meshStandardMaterial
-        color="#ffb44a"
-        emissive="#6f2a12"
+        color={VIEWPORT_COLORS.collision}
+        emissive={VIEWPORT_COLORS.collisionEmissive}
         transparent
         opacity={0.42}
         wireframe
@@ -1406,7 +1407,9 @@ function MeasuredRuntimeLink({
 }
 
 export function candidateGhostColor(receiptDigest: string | null, stale: boolean, rejected = false): string {
-  return rejected ? '#ff7066' : stale || receiptDigest === null ? '#f2bb56' : '#58ddff';
+  return rejected
+    ? VIEWPORT_COLORS.previewRejected
+    : stale || receiptDigest === null ? VIEWPORT_COLORS.previewPending : VIEWPORT_COLORS.previewCurrent;
 }
 
 function CandidateRobotGhost({
@@ -1916,7 +1919,7 @@ function CandidateTcpGhost({
           <sphereGeometry args={[Math.max(axesSizeM * 0.08, 0.006), 18, 12]} />
           <meshStandardMaterial
             color={candidateGhostColor(robot?.receiptDigest ?? null, stale || dragVisible, !dragVisible && rejected)}
-            emissive={dragVisible || robot === null ? '#62421d' : '#153c49'}
+            emissive={dragVisible || robot === null ? VIEWPORT_COLORS.previewTargetEmissive : VIEWPORT_COLORS.previewSolvedEmissive}
             transparent
             opacity={0.82}
             depthWrite={false}
@@ -2026,8 +2029,8 @@ function MeasuredTcpMarker({
       <mesh renderOrder={18}>
         <octahedronGeometry args={[Math.max(axesSizeM * 0.1, 0.008), 0]} />
         <meshStandardMaterial
-          color="#43d7ec"
-          emissive="#0c5060"
+          color={VIEWPORT_COLORS.frameTarget}
+          emissive={VIEWPORT_COLORS.frameTargetEmissive}
           transparent={false}
           opacity={1}
           depthWrite
@@ -2076,7 +2079,7 @@ function PointCloudPoints({ frame }: { frame: PointCloudFrame }) {
   return (
     <points geometry={geometry} frustumCulled renderOrder={6}>
       <pointsMaterial
-        color={frame.colors === null ? '#75d7ff' : '#ffffff'}
+        color={frame.colors === null ? VIEWPORT_COLORS.pointCloud : VIEWPORT_COLORS.pointCloudVertexTint}
         vertexColors={frame.colors !== null}
         size={0.006}
         sizeAttenuation
@@ -2687,13 +2690,13 @@ const ViewerCanvas = memo(function ViewerCanvas({
           return JSON.stringify(current) === JSON.stringify(next) ? current : next;
         });
       }}
-      style={{ background: '#081019' }}
+      style={{ background: VIEWPORT_COLORS.background }}
     >
       <ViewerQualificationProfiler
         enabled={qualificationEnabled}
         onRender={onViewerCommit}
       >
-      <color attach="background" args={['#081019']} />
+      <color attach="background" args={[VIEWPORT_COLORS.background]} />
       <PerspectiveCamera
         makeDefault
         up={[0, 0, 1]}
@@ -2703,17 +2706,17 @@ const ViewerCanvas = memo(function ViewerCanvas({
         far={250}
       />
       <ambientLight intensity={0.9} />
-      <hemisphereLight args={['#dbeaff', '#121d27', 0.75]} />
+      <hemisphereLight args={[VIEWPORT_COLORS.hemisphereSky, VIEWPORT_COLORS.hemisphereGround, 0.75]} />
       <directionalLight position={[5, -4, 9]} intensity={1.45} />
       <directionalLight position={[-4, 5, 5]} intensity={0.55} />
       <Grid
         args={[12, 12]}
         cellSize={0.1}
         cellThickness={0.35}
-        cellColor="#243341"
+        cellColor={VIEWPORT_COLORS.gridCell}
         sectionSize={1}
         sectionThickness={0.85}
-        sectionColor="#496071"
+        sectionColor={VIEWPORT_COLORS.gridSection}
         fadeDistance={12}
         fadeStrength={1.6}
         infiniteGrid={false}

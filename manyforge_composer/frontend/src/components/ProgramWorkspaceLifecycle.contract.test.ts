@@ -87,7 +87,7 @@ describe('Program workspace lifecycle controls', () => {
 
     expect(source).toContain('New Program');
     expect(source).toContain('newDraft(confirmDiscard)');
-    expect(source).toContain('Revert to Saved');
+    expect(source).toContain('Revert to saved');
     expect(source).toContain('Discard changes');
     expect(source).toContain('return to the Applied Program');
     expect(source).toContain(

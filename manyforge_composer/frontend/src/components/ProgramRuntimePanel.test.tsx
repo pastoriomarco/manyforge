@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -15,6 +14,7 @@ import {
   ProgramRuntimePanel,
   ProgramTransportControls,
 } from './ProgramRuntimePanel';
+import { readStyleSource } from '../styles/readStyleSource';
 
 function ordinaryMotionStopOffer(): CycleRecoveryOffer {
   return {
@@ -681,7 +681,7 @@ describe('Program runtime projection', () => {
     expect(velocityIndex).toBeLessThan(groupNameIndex);
     expect(markup).toContain('>Halt</button>');
 
-    const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
+    const css = readStyleSource();
     const transport = css.slice(
       css.indexOf('.viewer-transport {'),
       css.indexOf('.transport-velocity {'),
@@ -699,7 +699,7 @@ describe('Program runtime projection', () => {
     expect(css).not.toContain('.transport-guidance');
     expect(transport).toMatch(/\.transport-control-layout \{[^}]*display: contents;/s);
     expect(transport).toMatch(
-      /\.transport-motion-panel \{[^}]*border: 1px solid #365463;[^}]*background: rgb\(8 23 32 \/ 94%\);/s,
+      /\.transport-motion-panel \{[^}]*border: 1px solid #365563;[^}]*background: rgb\(8 23 32 \/ 94%\);/s,
     );
     expect(transport).toMatch(
       /\.transport-motion-panel \{[^}]*width: var\(--viewer-transport-motion-panel-width\);/s,
@@ -711,10 +711,10 @@ describe('Program runtime projection', () => {
       /\.transport-group-column \{[^}]*padding: 0;[^}]*border: 0;[^}]*background: transparent;/s,
     );
     expect(transport).toMatch(
-      /\.transport-group-scale \{[^}]*border: 1px solid #385061;[^}]*border-radius: 0\.45rem;/s,
+      /\.transport-group-scale \{[^}]*border: 1px solid #405764;[^}]*border-radius: 0\.45rem;/s,
     );
     expect(transport).toMatch(
-      /\.transport-unique-column \{[^}]*border: 1px solid #365463;[^}]*background: rgb\(8 23 32 \/ 94%\);[^}]*margin-left: auto;/s,
+      /\.transport-unique-column \{[^}]*border: 1px solid #365563;[^}]*background: rgb\(8 23 32 \/ 94%\);[^}]*margin-left: auto;/s,
     );
   });
 
@@ -737,7 +737,7 @@ describe('Program runtime projection', () => {
     expect(markup).toContain('robot_group controls');
     expect(markup).toContain('transport-hidden-group-count');
 
-    const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8');
+    const css = readStyleSource();
     expect(css).toMatch(
       /\.transport-unique-icons \{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s,
     );

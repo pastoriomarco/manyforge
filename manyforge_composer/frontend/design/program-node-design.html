@@ -1,0 +1,780 @@
+<title>Program Node Palettes</title>
+<style>
+  /* Single dark look, copied from the Composer app (index.css). */
+  :root {
+    color-scheme: dark;
+    --app-bg: #071019;
+    --canvas-bg: #07131b;
+    --canvas-grid: rgb(37 59 70 / 26%);
+    --panel: #0b1a23;
+    --panel-border: #203542;
+    --text: #e8f0f7;
+    --text-muted: #91a5af;
+    --text-soft: #b7cad5;
+    --accent: #64cae8;
+    /* Node constants from .bt-node */
+    --node-border: #677b87;
+    --node-text: #e7eff3;
+    --node-default: #263b48;
+    --status-running: #e2b94e;
+    --status-success: #65c59b;
+    --status-failure: #df7169;
+    --status-invalid: #d86f66;
+    --selected: #e6f6fa;
+    /* Availability colors from .node-availability-dot */
+    --avail-executable: #56bd96;
+    --avail-config: #d5a34b;
+    --avail-unavailable: #7d8d96;
+    /* Edge colors as drawn today by StatusEdge.tsx */
+    --edge-idle: #6b7280;
+    --edge-running: #fbbf24;
+    --edge-success: #4ade80;
+    --edge-failure: #f87171;
+  }
+  body {
+    background: var(--app-bg);
+    color: var(--text);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding-inline: clamp(16px, 3vw, 40px);
+    padding-block: 28px 48px;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; display: grid; gap: 28px; }
+  header { display: grid; gap: 8px; }
+  h1 { margin: 0; font-size: 1.35rem; font-weight: 700; text-wrap: balance; }
+  h2 { margin: 0; font-size: 0.95rem; font-weight: 650; }
+  p { margin: 0; color: var(--text-soft); line-height: 1.5; max-width: 72ch; font-size: 0.86rem; }
+  code { font: 0.8rem "SFMono-Regular", Consolas, "Liberation Mono", monospace; color: var(--text-soft); }
+  .eyebrow { color: var(--accent); font-size: 0.68rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  .note { font-size: 0.78rem; color: var(--text-muted); line-height: 1.45; }
+
+  section.block { display: grid; gap: 14px; padding: 18px; border: 1px solid var(--panel-border); border-radius: 0.55rem; background: var(--panel); }
+  .block-head { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; justify-content: space-between; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+  .control-label { font-size: 0.72rem; color: var(--text-muted); }
+
+  /* Overview grid: palettes as columns */
+  .overview { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .palette-col { display: grid; gap: 10px; align-content: start; padding: 12px; border: 1px solid var(--panel-border); border-radius: 0.45rem; background: var(--canvas-bg);
+    background-image: linear-gradient(var(--canvas-grid) 1px, transparent 1px), linear-gradient(90deg, var(--canvas-grid) 1px, transparent 1px);
+    background-size: 24px 24px; cursor: pointer; }
+  .palette-col.chosen { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .palette-name { font-size: 0.82rem; font-weight: 650; }
+  .palette-desc { font-size: 0.72rem; color: var(--text-muted); line-height: 1.4; min-height: 2.8em; }
+  .palette-col .bt-node { width: 100%; min-width: 0; }
+  .cat-label { font-size: 0.64rem; color: var(--text-muted); margin-bottom: -6px; }
+  .hexes { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font: 0.66rem "SFMono-Regular", Consolas, "Liberation Mono", monospace; color: var(--text-muted); }
+  .hexes span:nth-child(odd) { color: var(--text-soft); }
+
+  /* Node, faithful to .bt-node in index.css, plus the treatment variables */
+  .bt-node {
+    position: relative;
+    display: grid;
+    align-content: center;
+    min-width: 11.25rem;
+    min-height: 4.4rem;
+    justify-items: center;
+    padding: 0.65rem 0.8rem;
+    border: 2px solid var(--status-color, var(--node-border));
+    border-radius: 0.45rem;
+    color: var(--node-text);
+    background: var(--fill, var(--node-default));
+    text-align: center;
+    box-sizing: border-box;
+    box-shadow: var(--band, 0 0 transparent), var(--ring, 0 0 transparent), var(--glow, 0 0 transparent);
+  }
+  .bt-node.status-running { --status-color: var(--status-running); --glow: 0 0 0.8rem rgb(226 185 78 / 28%); }
+  .bt-node.status-success { --status-color: var(--status-success); }
+  .bt-node.status-failure { --status-color: var(--status-failure); }
+  .bt-node.invalid { --status-color: var(--status-invalid); --glow: 0 0 0 1px rgb(216 111 102 / 35%); }
+  .bt-node.selected { outline: 2px solid var(--selected); outline-offset: 0.2rem; }
+  /* Detached ring: neutral border, status drawn as a ring with a gap
+     (canvas-colored spacer), selection moved further out. */
+  /* Ring mode: the node border carries the category color (band color),
+     the detached ring carries the execution status. */
+  .bt-node.ring-mode { border-color: var(--cat-border, var(--node-border)); }
+  .bt-node.ring-mode.status-running,
+  .bt-node.ring-mode.status-success,
+  .bt-node.ring-mode.status-failure,
+  .bt-node.ring-mode.invalid {
+    --ring: 0 0 0 2px var(--canvas-bg), 0 0 0 4px var(--status-color);
+  }
+  .bt-node.ring-mode.status-running { --glow: 0 0 1rem rgb(226 185 78 / 26%); }
+  .bt-node.ring-mode.invalid { --glow: 0 0 transparent; }
+  /* Selection in ring mode: the node border is unchanged; the status ring
+     becomes thicker. An idle selected node gets the thick ring in idle grey. */
+  .bt-node.ring-mode.selected {
+    outline: none;
+    --ring: 0 0 0 2px var(--canvas-bg), 0 0 0 6px var(--status-color, var(--node-border));
+  }
+  .bt-node-kind, .bt-node small, .bt-node-child-hint { color: #91a5af; font-size: 0.65rem; }
+  .bt-node strong { font-size: 0.82rem; }
+  .bt-node.simple strong { font-size: 0.86rem; padding-inline: 0.9rem; }
+  .bt-node small { max-width: 100%; overflow-wrap: anywhere; }
+  /* Current availability dot */
+  .dot { position: absolute; top: 0.35rem; right: 0.35rem; width: 0.48rem; height: 0.48rem; border-radius: 999px; background: var(--avail); }
+  /* Proposed: kind symbol in the corner, colored by availability */
+  .kind-mark {
+    --mark-size: 0.8rem;
+    position: absolute;
+    top: calc(var(--corner-center) - var(--mark-size) / 2);
+    right: calc(var(--corner-center) - var(--mark-size) / 2);
+    width: var(--mark-size); height: var(--mark-size);
+    color: var(--avail);
+  }
+  .kind-mark svg { display: block; width: 100%; height: 100%; overflow: visible; }
+  /* Category icons: 16px line icons drawn in the family color. */
+  :root { --icon-size: 40px; --node-icon-size: 31px; --node-w: 200px; --band-w: 44px; --status-offset: 2px; --name-margin: 0px; }
+  /* Fixed corner geometry: the category icon keeps its top-left corner at
+     --corner-inset; the status symbol is centered where the default 22px
+     icon's center is. Resizing the icon moves neither anchor. */
+  .bt-node { --corner-inset: 0.3rem; --corner-center: calc(11px + 0.3rem); }
+  .cat-icon { display: inline-block; width: var(--node-icon-size); height: var(--node-icon-size); flex: 0 0 auto; color: var(--cat-color, var(--text-muted)); }
+  /* Each icon is a square; its drawing is fitted to the same inner area and the
+     line width depends only on the icon size, never on the fitting scale. */
+  .cat-icon { --icon-px: var(--node-icon-size); }
+  .icon-gallery .cat-icon { --icon-px: var(--icon-size); }
+  .cat-icon svg { display: block; width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: calc(var(--icon-px) * 0.094); stroke-linecap: round; stroke-linejoin: round; }
+  .cat-icon svg .glyph > * { vector-effect: non-scaling-stroke; }
+  .guides .cat-icon { outline: 1px dashed rgb(226 185 78 / 60%); }
+  .cat-icon svg .solid { fill: currentColor; stroke: none; }
+  .cat-icon.corner {
+    position: absolute;
+    top: var(--corner-inset);
+    left: var(--corner-inset);
+    width: var(--node-icon-size); height: var(--node-icon-size);
+  }
+  .bt-node .name-row { display: inline-flex; align-items: center; gap: 0.4rem; max-width: 100%; }
+  .bt-node .name-row strong { min-width: 0; }
+  .handle { position: absolute; width: 0.8rem; height: 0.8rem; border: 2px solid #0a1720; border-radius: 999px; background: #c6d3d9; left: 50%; transform: translateX(-50%); }
+  .handle.top { top: -0.45rem; }
+  .handle.bottom { bottom: -0.45rem; }
+
+  /* Buttons */
+  .seg { display: flex; flex-wrap: wrap; gap: 6px; }
+  .seg button {
+    font: inherit; font-size: 0.76rem; padding: 0.4rem 0.7rem; border-radius: 0.45rem;
+    border: 1px solid #385061; background: #182733; color: var(--text); cursor: pointer;
+  }
+  .seg button:hover { border-color: #5b8498; background: #213744; }
+  .seg button[aria-pressed="true"] { border-color: var(--accent); background: #16404c; }
+  .seg button:focus-visible, .palette-col:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* Realistic canvas */
+  .canvas-scroll { overflow-x: auto; border: 1px solid var(--panel-border); border-radius: 0.45rem; }
+  .canvas {
+    position: relative; width: 980px; height: 470px;
+    background: var(--canvas-bg);
+    background-image: linear-gradient(var(--canvas-grid) 1px, transparent 1px), linear-gradient(90deg, var(--canvas-grid) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+  .canvas svg.edges { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .canvas .bt-node { position: absolute; }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 0.74rem; color: var(--text-muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 0.8rem; height: 0.8rem; border-radius: 0.2rem; border: 2px solid; }
+  .legend .kind-mark { position: static; }
+  .canvas .bt-node { width: var(--node-w); min-width: 0; }
+  .canvas .bt-node strong { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
+  /* Word breaks, 2 lines: fixed node height like the app's canvas, the name
+     uses the full width below the corner symbols, and breaks preferably at
+     _ / camelCase / digit boundaries (marked with <wbr>). */
+  .bt-node.names-smart { height: 4.4rem; min-height: 4.4rem; padding: 0.35rem 0.5rem; align-content: center; }
+  .bt-node.names-smart.icon-corner { padding-top: calc(var(--corner-inset) + var(--node-icon-size) + 0.1rem); padding-bottom: 0.3rem; }
+  .bt-node.names-smart strong {
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+    overflow: hidden; overflow-wrap: anywhere; white-space: normal;
+    max-width: 100%; padding-inline: 0; font-size: 0.82rem; line-height: 1.18;
+  }
+  .bt-node.names-smart .name-row { width: 100%; justify-content: center; }
+  /* Side band: [icon band][name]. The icon is centered in the band; the status
+     symbol sits --status-offset from the top-right corner (x and y); the name
+     keeps clear of both. */
+  .bt-node.icon-bands {
+    /* Icon band, name, and an empty band of the same width on the right so the
+       name is centered on the node. */
+    /* A band is never narrower than the icon, so the icon cannot spill out
+       and both bands stay equal. */
+    --band-eff: max(var(--band-w), var(--node-icon-size));
+    grid-template-columns: var(--band-eff) minmax(0, 1fr) var(--band-eff);
+    justify-items: stretch; align-items: center;
+    padding-left: 0;
+    padding-right: 0;
+  }
+  /* The name fills the whole space right of the band and is centered in it,
+     with the same small inset on both sides. */
+  .bt-node.icon-bands > strong {
+    grid-column: 2; justify-self: stretch; width: 100%; box-sizing: border-box;
+    text-align: center; padding-inline: var(--name-margin);
+  }
+  .bt-node.icon-bands .band { align-self: stretch; position: relative; min-width: 0; }
+  /* Layout guides: dashed = icon band, dotted = name area. */
+  .guides .bt-node.icon-bands .band { outline: 1px dashed rgb(100 202 232 / 70%); outline-offset: -1px; }
+  .guides .bt-node.icon-bands > strong { outline: 1px dotted rgb(226 185 78 / 75%); outline-offset: -1px; }
+  .bt-node.icon-bands .band-right { grid-column: 3; }
+  .bt-node.icon-bands .band > .cat-icon { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+  .bt-node.icon-bands .band-left { grid-column: 1; }
+  /* The status symbol floats on its own layer; it never changes the name layout. */
+  .bt-node.icon-bands .kind-mark { top: var(--status-offset); right: var(--status-offset); z-index: 2; }
+  .bt-node.names-smart .name-row strong { text-align: left; }
+  .icon-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(calc(110px + var(--icon-size)), 1fr)); gap: 10px; }
+  .icon-gallery div { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--panel-border); border-radius: 0.45rem; background: var(--canvas-bg); font-size: 0.8rem; color: var(--text-soft); }
+  .icon-gallery .cat-icon { width: var(--icon-size); height: var(--icon-size); }
+  .size-control { display: inline-flex; align-items: center; gap: 8px; font-size: 0.74rem; color: var(--text-muted); }
+  .size-control input { width: 10rem; accent-color: var(--accent); }
+  .size-control output { min-width: 3.2em; color: var(--text-soft); font-variant-numeric: tabular-nums; }
+  .icon-gallery small { display: block; color: var(--text-muted); font-size: 0.66rem; }
+  .findings { display: grid; gap: 6px; padding-left: 1.1rem; margin: 0; font-size: 0.8rem; color: var(--text-soft); line-height: 1.45; }
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="eyebrow">ManyForge Composer · UI6-I-VC decision D3</span>
+    <h1>Program node colors and content</h1>
+    <p><strong>Approved 2026-09-26 (UI6-I-VC D3):</strong> the page opens on the approved design: Five families palette, Icon only treatment, category icon in a side band (31 px icon, 44 px bands), simplified content, word breaks with 2 lines, status border as today, status symbol offset 2 px, name margin 0, node width 200 px. The controls stay for future comparison; the app itself uses these values fixed.</p>
+    <p>Every node uses the exact node styling from the Composer stylesheet, including the status borders and the selection outline. Only the category treatment and the node content change. Nothing is applied to the app until you approve it.</p>
+    <p class="note">The catalog has eleven categories. Today only four (motion, logic, control flow, scene) have their own color; the other seven use the default blue-grey. The "Dull cool" palette colors all eleven; the reference palettes show "none" for the categories they leave uncolored.</p>
+  </header>
+
+  <section class="block" aria-labelledby="overview-title">
+    <div class="block-head">
+      <h2 id="overview-title">Palettes, idle nodes</h2>
+      <div class="controls">
+        <span class="control-label" id="treatment-label-1">Treatment</span>
+        <div class="seg treatment-switch" role="group" aria-labelledby="treatment-label-1"></div>
+        <span class="control-label" id="icon-label-1">Category icon</span>
+        <div class="seg icon-switch" role="group" aria-labelledby="icon-label-1"></div>
+        <span class="control-label" id="content-label-1">Node content</span>
+        <div class="seg content-switch" role="group" aria-labelledby="content-label-1"></div>
+      </div>
+    </div>
+    <p class="note">Each column is a palette; the treatment switch shows all of them in the same style. Click a column to show it in the example program below.</p>
+    <div class="overview" id="overview"></div>
+  </section>
+
+  <section class="block" aria-labelledby="canvas-title">
+    <div class="block-head">
+      <h2 id="canvas-title">Example program with execution states</h2>
+      <div class="controls">
+        <span class="control-label" id="names-label">Long names</span>
+        <div class="seg" id="names-switch" role="group" aria-labelledby="names-label"></div>
+        <label class="size-control" for="node-icon-size">Icon size <input id="node-icon-size" type="range" min="12" max="40" step="1"> <output></output></label>
+        <label class="size-control" for="show-guides"><input id="show-guides" type="checkbox"> Show layout guides</label>
+        <label class="size-control" for="name-margin">Name margin <input id="name-margin" type="range" min="0" max="16" step="1"> <output></output></label>
+        <label class="size-control" for="status-offset">Status offset <input id="status-offset" type="range" min="-12" max="24" step="1"> <output></output></label>
+        <label class="size-control" for="band-width">Band width <input id="band-width" type="range" min="20" max="64" step="2"> <output></output></label>
+        <label class="size-control" for="node-width">Node width <input id="node-width" type="range" min="140" max="280" step="10"> <output></output></label>
+        <span class="control-label" id="icon-label-2">Category icon</span>
+        <div class="seg icon-switch" role="group" aria-labelledby="icon-label-2"></div>
+        <span class="control-label" id="content-label-2">Node content</span>
+        <div class="seg content-switch" role="group" aria-labelledby="content-label-2"></div>
+        <span class="control-label" id="status-label">Status display</span>
+        <div class="seg" id="status-switch" role="group" aria-labelledby="status-label"></div>
+      </div>
+    </div>
+    <div class="controls">
+      <span class="control-label" id="palette-label">Palette</span>
+      <div class="seg" id="picker" role="group" aria-labelledby="palette-label"></div>
+      <span class="control-label" id="treatment-label-2">Treatment</span>
+      <div class="seg treatment-switch" role="group" aria-labelledby="treatment-label-2"></div>
+    </div>
+    <div class="legend" aria-label="State legend">
+      <span><i class="sw" style="border-color:var(--node-border)"></i>Idle</span>
+      <span><i class="sw" style="border-color:var(--status-running)"></i>Running</span>
+      <span><i class="sw" style="border-color:var(--status-success)"></i>Success</span>
+      <span><i class="sw" style="border-color:var(--status-failure)"></i>Failure</span>
+      <span><i class="sw" style="border-color:var(--status-invalid)"></i>Invalid configuration</span>
+      <span><i class="sw" style="border-color:var(--selected)"></i><span id="selected-legend">Selected (outline)</span></span>
+    </div>
+    <div class="legend" aria-label="Kind and availability legend" id="mark-legend"></div>
+    <div class="canvas-scroll">
+      <div class="canvas" id="canvas"></div>
+    </div>
+    <p class="note">Edges keep today's colors, which come from a separate palette in <code>StatusEdge.tsx</code>. The unification step aligns them with the node borders independently of this decision.</p>
+  </section>
+
+  <section class="block" aria-labelledby="icons-title">
+    <div class="block-head">
+      <h2 id="icons-title">Category icons</h2>
+    </div>
+    <p class="note">One line icon per category. Every icon is a square of the same size; each drawing is scaled and centered so its longer side fills the same area, with transparent space around it. Drawn on a 16 px grid in the category's color (grey where a palette leaves the category uncolored). Shown here at 40 px; inside nodes they follow the icon size slider (default 22 px). The recovery icon is a circular arrow, deliberately not a stop sign.</p>
+    <div class="icon-gallery" id="icon-gallery"></div>
+  </section>
+
+  <section class="block" aria-labelledby="notes-title">
+    <h2 id="notes-title">Notes on the simplified content</h2>
+    <ul class="findings">
+      <li>Symbols exist only per kind, not per category. In the app the canvas uses • for a leaf while the node palette uses ⬤ (and ▦ for templates); the proposal uses one drawn set for both.</li>
+      <li>The corner symbol shows the node <em>kind</em>: filled diamond = composite (many children), outlined diamond = decorator (one child), circle = leaf. The exit handle still shows whether children are allowed.</li>
+      <li>The symbol takes the availability color that the dot has today. The three symbols are drawn in the same box, so they look the same size.</li>
+      <li>"Configuration required" is amber (<code>#d5a34b</code>) and "unavailable" is grey (<code>#7d8d96</code>), the app's availability colors. Compare the Add scene object and Command gripper position nodes below. The tooltip keeps the text, so the meaning never relies on color alone.</li>
+      <li>The catalog id (for example <code>motion.move_to_pose</code>) stays visible in the inspector when the node is selected.</li>
+    </ul>
+  </section>
+</div>
+
+<script>
+  const CATEGORIES = [
+    { key: 'control_flow', label: 'Control flow', sample: ['sequence', 'Sequence', 'composite'] },
+    { key: 'motion', label: 'Motion', sample: ['motion.move_to_pose', 'Move to pose', 'leaf'] },
+    { key: 'recovery', label: 'Recovery', sample: ['kernel.stop_operation', 'Stop operation', 'leaf'] },
+    { key: 'logic', label: 'Logic', sample: ['logic.check_bool', 'Check boolean', 'leaf'] },
+    { key: 'scene', label: 'Scene', sample: ['scene.add_object', 'Add scene object', 'leaf'] },
+    { key: 'assistant', label: 'Assistant', sample: ['assistant.query_model', 'Query model', 'leaf'] },
+    { key: 'gripper', label: 'Gripper', sample: ['gripper.command_position', 'Command gripper position', 'leaf'] },
+    { key: 'io', label: 'I/O', sample: ['io.set_output', 'Set output', 'leaf'] },
+    { key: 'model', label: 'Model', sample: ['model.get_frame_pose', 'Get frame pose', 'leaf'] },
+    { key: 'geometry', label: 'Geometry', sample: ['geometry.check_pose_distance', 'Check pose distance', 'leaf'] },
+    { key: 'simulation', label: 'Simulation', sample: ['simulation.step', 'Step simulation', 'leaf'] },
+  ];
+
+  const BASE = '#263b48';
+  const neutralFill = new Proxy({}, { get: () => BASE });
+
+  // Each palette: band = category accent color, tint = light category fill.
+  const ALL_KEYS = CATEGORIES.map((c) => c.key);
+  // Categories a palette does not color get no band and the default fill.
+  const complete = (band, tint) => ({
+    band: Object.fromEntries(ALL_KEYS.map((k) => [k, band[k] ?? null])),
+    tint: Object.fromEntries(ALL_KEYS.map((k) => [k, tint[k] ?? BASE])),
+  });
+
+  const FAMILY = {
+    exec: { band: '#9daab4', tint: '#323c44' },
+    motion: { band: '#6798c1', tint: '#293c4c' },
+    gripper: { band: '#b07088', tint: '#4a2c37' },
+    world: { band: '#9674b4', tint: '#3c2a4c' },
+    logic: { band: '#b7a78f', tint: '#483d2d' },
+  };
+  const FAMILY_OF = {
+    control_flow: 'exec', recovery: 'exec', motion: 'motion', gripper: 'gripper',
+    scene: 'world', model: 'world', geometry: 'world', simulation: 'world',
+    logic: 'logic', io: 'logic', assistant: 'logic',
+  };
+  const familyMap = (field) => Object.fromEntries(ALL_KEYS.map((k) => [k, FAMILY[FAMILY_OF[k]][field]]));
+
+  const PALETTES = [
+    { id: 'five', name: 'Five families',
+      desc: 'Execution control (control flow, recovery) \u00b7 Motion \u00b7 Gripper \u00b7 World and simulation (scene, model, geometry, simulation) \u00b7 Logic, signals and AI (logic, I/O, assistant).',
+      ...complete(familyMap('band'), familyMap('tint')) },
+    { id: 'dull-all', name: 'Dull cool, all categories',
+      desc: 'Every category its own color. Too many to tell apart at a glance. For reference.',
+      ...complete(
+        { control_flow: '#9daab4', motion: '#6798c1', recovery: '#5969a6', logic: '#989ccd', scene: '#9674b4',
+          assistant: '#8c6293', gripper: '#c48db7', io: '#a86b82', model: '#b7a78f', geometry: '#907b6f', simulation: '#599ea6' },
+        { control_flow: '#323c44', motion: '#293c4c', recovery: '#2a304c', logic: '#292b4c', scene: '#3c2a4c',
+          assistant: '#442e47', gripper: '#4c2944', io: '#4a2c37', model: '#483d2d', geometry: '#443832', simulation: '#2a484c' }) },
+    { id: 'cool', name: 'Earlier cool', desc: 'The previous cool set: four categories only; scene teal is close to the success green. For reference.',
+      ...complete(
+        { motion: '#4f9fd8', logic: '#8e88dc', control_flow: '#8fa6b3', scene: '#3fb0a4' },
+        { motion: '#1d4a5e', logic: '#2f3d5f', control_flow: '#34424c', scene: '#224a44' }) },
+    { id: 'warm', name: 'Current hues', desc: 'Today\u2019s four colored categories: brown, olive and purple, close to running amber. For reference.',
+      ...complete(
+        { motion: '#c07a4c', logic: '#a8a046', control_flow: '#a8a046', scene: '#9a78c8' },
+        { motion: '#704229', logic: '#555020', control_flow: '#555020', scene: '#51346d' }) },
+  ];
+
+  // band: 'top' | 'left' | null; tint: use the palette tint as fill.
+  const TREATMENTS = [
+    { id: 'tint-side', name: 'Tint + side band', tint: true, band: 'left' },
+    { id: 'side', name: 'Side band', tint: false, band: 'left' },
+    { id: 'tint-stripe', name: 'Tint + stripe', tint: true, band: 'top' },
+    { id: 'stripe', name: 'Stripe', tint: false, band: 'top' },
+    { id: 'tint', name: 'Tint only', tint: true, band: null },
+    { id: 'icon-only', name: 'Icon only', tint: false, band: null },
+  ];
+
+  function optionFor(paletteId) {
+    const p = PALETTES.find((x) => x.id === paletteId);
+    const t = TREATMENTS.find((x) => x.id === treatment);
+    return { id: p.id, name: p.name, desc: p.desc, fill: t.tint ? p.tint : neutralFill,
+      band: t.band, bandColor: p.band, tintShown: t.tint };
+  }
+
+  const AVAIL = {
+    executable: { color: 'var(--avail-executable)', label: 'Execution available' },
+    config: { color: 'var(--avail-config)', label: 'Configuration required' },
+    unavailable: { color: 'var(--avail-unavailable)', label: 'Execution unavailable' },
+  };
+
+  // Per-viewer convenience: remember the last choices across reloads.
+  const saved = (() => { try { return JSON.parse(localStorage.getItem('node-palette-choices-v4') || '{}'); } catch { return {}; } })();
+  let chosen = saved.chosen || 'five';
+  let nodeWidth = Number(saved.nodeWidth) || 200;
+  let nameMode = saved.nameMode || 'smart';
+  let bandWidth = Number(saved.bandWidth) || 44;
+  let nodeIconSize = Number(saved.nodeIconSize) || 31;
+  let guides = saved.guides === true;
+  let nameMargin = Number.isFinite(Number(saved.nameMargin)) && saved.nameMargin !== undefined ? Number(saved.nameMargin) : 0;
+  let statusOffset = Number.isFinite(Number(saved.statusOffset)) && saved.statusOffset !== undefined ? Number(saved.statusOffset) : 2;
+  let iconMode = saved.iconMode || 'bands';
+
+  let treatment = saved.treatment || 'icon-only';
+  let content = saved.content || 'simple';
+  let statusMode = saved.statusMode || 'border';
+  const remember = () => { try { localStorage.setItem('node-palette-choices-v4', JSON.stringify({ chosen, treatment, content, statusMode, iconMode, nodeWidth, nameMode, bandWidth, nodeIconSize, statusOffset, guides, nameMargin })); } catch { /* storage unavailable */ } };
+
+  const glyph = (kind) => kind === 'composite' ? '◆' : kind === 'decorator' ? '◇' : '•';
+  const hint = (kind) => kind === 'composite' ? 'n children' : kind === 'decorator' ? '1 child' : 'leaf';
+
+  // 16x16 line icons, one per category.
+  const CATEGORY_ICONS = {
+    control_flow: '<path d="M4 2.5v11"/><path d="M4 6.5c0 2.5 2 3.5 4.5 3.5H12"/><path d="M10.5 8 12.5 10l-2 2"/>',
+    recovery: '<path d="M13 8a5 5 0 1 1-1.6-3.7"/><path d="M11.8 1.8v2.8H9"/>',
+    motion: '<circle class="solid" cx="3" cy="14" r="1.3"/><path d="M3 14h6.5a2.8 2.8 0 0 0 0-5.6h-3a2.8 2.8 0 0 1 0-5.6h5.4"/><path d="M10.2 0.9 12.3 2.8 10.2 4.7"/>',
+    gripper: '<rect x="2.5" y="1.8" width="11" height="3.6" rx="1"/><path d="M4.6 5.4v5.4l2.1 2.6"/><path d="M11.4 5.4v5.4l-2.1 2.6"/><path d="M4.6 8.2h1.4"/><path d="M11.4 8.2H10"/>',
+    scene: '<path d="M8 1.8 13.6 5v6L8 14.2 2.4 11V5z"/><path d="M2.4 5 8 8.2 13.6 5"/><path d="M8 8.2v6"/>',
+    model: '<path d="M6 10V2.4"/><path d="M4.4 4 6 2.4 7.6 4"/><path d="M6 10h7.6"/><path d="M12 8.4l1.6 1.6-1.6 1.6"/><path d="M6 10l-3.8 3.8"/><path d="M4.4 13.8H2.2v-2.2"/><circle class="solid" cx="6" cy="10" r="1"/>',
+    geometry: '<path d="M2.5 13.5h11"/><path d="M2.5 13.5 10 3"/><path d="M8 13.5a5.5 5.5 0 0 0-2.3-4.48"/>',
+    logic: '<rect x="1.5" y="4.5" width="13" height="7" rx="3.5"/><circle class="solid" cx="11" cy="8" r="2"/>',
+    io: '<path d="M2.6 3.6v8.8"/><path d="M8.6 3.2 5.4 12.8"/><ellipse cx="11.9" cy="8" rx="2.4" ry="4.4"/>',
+    simulation: '<rect x="2" y="3" width="12" height="10" rx="1.5"/><path class="solid" d="M6.6 5.8v4.4L10.4 8z"/>',
+    assistant: '<path d="M2.5 3.5h11v7H7.2l-3 2.5v-2.5H2.5z"/><circle class="solid" cx="5.8" cy="7" r="0.9"/><circle class="solid" cx="8" cy="7" r="0.9"/><circle class="solid" cx="10.2" cy="7" r="0.9"/>',
+  };
+  const catIcon = (cat, cls = '') =>
+    `<span class="cat-icon${cls}" aria-hidden="true"><svg viewBox="0 0 16 16"><g class="glyph">${CATEGORY_ICONS[cat]}</g></svg></span>`;
+
+  // Fit every icon drawing to the same square area: the longer side of its
+  // drawn shape becomes FIT units inside the 16-unit box, centered.
+  const FIT = 12;
+  function normalizeIcons() {
+    for (const g of document.querySelectorAll('.cat-icon svg .glyph:not([data-fitted])')) {
+      let box;
+      try { box = g.getBBox(); } catch { continue; }
+      if (!box.width && !box.height) continue;
+      const scale = FIT / Math.max(box.width, box.height);
+      const tx = 8 - scale * (box.x + box.width / 2);
+      const ty = 8 - scale * (box.y + box.height / 2);
+      g.setAttribute('transform', `translate(${tx.toFixed(3)} ${ty.toFixed(3)}) scale(${scale.toFixed(4)})`);
+      g.setAttribute('data-fitted', '');
+    }
+  }
+
+  const escapeHtml = (text) => text.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // Mark preferred break points without changing the text: after "_",
+  // before a capital that follows a lowercase letter, and at letter/digit edges.
+  function withWordBreaks(name) {
+    return escapeHtml(name)
+      .replace(/_/g, '_<wbr>')
+      .replace(/([a-z])([A-Z])/g, '$1<wbr>$2')
+      .replace(/([A-Za-z])([0-9])/g, '$1<wbr>$2')
+      .replace(/([0-9])([A-Za-z])/g, '$1<wbr>$2');
+  }
+
+  function kindSvg(kind) {
+    // Same 12x12 box for every kind so the marks read as one family.
+    if (kind === 'composite') return '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M6 0.6 11.4 6 6 11.4 0.6 6Z" fill="currentColor"/></svg>';
+    if (kind === 'decorator') return '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M6 1.4 10.6 6 6 10.6 1.4 6Z" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>';
+    return '<svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="4" fill="currentColor"/></svg>';
+  }
+
+  function bandShadow(option, cat) {
+    if (!option.band || !option.bandColor[cat]) return null;
+    const c = option.bandColor[cat];
+    return option.band === 'top' ? `inset 0 0.28rem ${c}` : `inset 0.32rem 0 ${c}`;
+  }
+
+  function makeNode(option, cat, opts = {}) {
+    const [id, catalogLabel, kind] = opts.sample || CATEGORIES.find((c) => c.key === cat).sample;
+    const label = opts.name || catalogLabel;
+    const avail = AVAIL[opts.avail || 'executable'];
+    const el = document.createElement('div');
+    el.className = 'bt-node' + (content === 'simple' ? ' simple' : '')
+      + (opts.status ? ' status-' + opts.status : '')
+      + (opts.invalid ? ' invalid' : '') + (opts.selected ? ' selected' : '')
+      + (statusMode === 'ring' ? ' ring-mode' : '')
+      + (nameMode === 'smart' && content === 'simple' ? ' names-smart' : '') + ' icon-' + iconMode;
+    el.style.setProperty('--fill', option.fill[cat]);
+    const band = bandShadow(option, cat);
+    if (band) el.style.setProperty('--band', band);
+    if (option.band && option.bandColor[cat]) el.style.setProperty('--cat-border', option.bandColor[cat]);
+    el.style.setProperty('--avail', avail.color);
+    if (option.bandColor[cat]) el.style.setProperty('--cat-color', option.bandColor[cat]);
+    el.setAttribute('role', 'img');
+    el.setAttribute('aria-label', `${label}, ${cat.replace('_', ' ')}, ${kind}, ${avail.label}`);
+    el.title = `${label} \u00b7 ${avail.label}`;
+    const labelHtml = nameMode === 'smart' ? withWordBreaks(label) : escapeHtml(label);
+    const top = opts.handles ? '<span class="handle top"></span>' : '';
+    const bottom = opts.handles && kind !== 'leaf' ? '<span class="handle bottom"></span>' : '';
+    // The status symbol appears only when it is not green (not executable).
+    const showStatus = (opts.avail || 'executable') !== 'executable';
+    const statusMark = showStatus ? `<span class="kind-mark">${kindSvg(kind)}</span>` : '';
+    const statusDot = showStatus ? '<span class="dot"></span>' : '';
+    const name = iconMode === 'before'
+      ? `<span class="name-row">${catIcon(cat)}<strong>${labelHtml}</strong></span>`
+      : `<strong>${labelHtml}</strong>`;
+    const corner = iconMode === 'corner' ? catIcon(cat, ' corner') : '';
+    if (iconMode === 'bands' && content === 'simple') {
+      el.innerHTML = `${top}<span class="band band-left">${catIcon(cat)}</span><strong>${labelHtml}</strong>`
+        + `<span class="band band-right" aria-hidden="true"></span>${statusMark}${bottom}`;
+      return el;
+    }
+    el.innerHTML = content === 'simple'
+      ? `${top}${corner}${name}${bottom}${statusMark}`
+      : `${top}${corner}<span class="bt-node-kind" aria-hidden="true">${glyph(kind)}</span>
+         <small>${id}</small>${name}
+         <span class="bt-node-child-hint">${hint(kind)}</span>${bottom}${statusDot}`;
+    return el;
+  }
+
+  function renderContentSwitches() {
+    for (const root of document.querySelectorAll('.content-switch')) {
+      root.innerHTML = '';
+      for (const [value, text] of [['simple', 'Simplified'], ['current', 'Current (4 rows)']]) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = text;
+        b.setAttribute('aria-pressed', String(content === value));
+        b.addEventListener('click', () => { content = value; renderAll(); });
+        root.appendChild(b);
+      }
+    }
+  }
+
+  function renderTreatmentSwitches() {
+    for (const root of document.querySelectorAll('.treatment-switch')) {
+      root.innerHTML = '';
+      for (const t of TREATMENTS) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = t.name;
+        b.setAttribute('aria-pressed', String(treatment === t.id));
+        b.addEventListener('click', () => { treatment = t.id; renderAll(); });
+        root.appendChild(b);
+      }
+    }
+  }
+
+  function renderIconSwitches() {
+    for (const root of document.querySelectorAll('.icon-switch')) {
+      root.innerHTML = '';
+      for (const [value, text] of [['corner', 'Top-left corner'], ['before', 'Before name'], ['bands', 'Side band'], ['off', 'Off']]) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = text;
+        b.setAttribute('aria-pressed', String(iconMode === value));
+        b.addEventListener('click', () => { iconMode = value; renderAll(); });
+        root.appendChild(b);
+      }
+    }
+  }
+
+  function renderNamesSwitch() {
+    const root = document.getElementById('names-switch');
+    root.innerHTML = '';
+    for (const [value, text] of [['smart', 'Word breaks, 2 lines'], ['anywhere', 'Break anywhere (today)']]) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = text;
+      b.setAttribute('aria-pressed', String(nameMode === value));
+      b.addEventListener('click', () => { nameMode = value; renderAll(); });
+      root.appendChild(b);
+    }
+  }
+
+  function renderStatusSwitch() {
+    const root = document.getElementById('status-switch');
+    root.innerHTML = '';
+    for (const [value, text] of [['ring', 'Detached ring'], ['border', 'Border (today)']]) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = text;
+      b.setAttribute('aria-pressed', String(statusMode === value));
+      b.addEventListener('click', () => { statusMode = value; renderAll(); });
+      root.appendChild(b);
+    }
+  }
+
+  function renderOverview() {
+    const root = document.getElementById('overview');
+    root.innerHTML = '';
+    for (const o of PALETTES.map((p) => optionFor(p.id))) {
+      const col = document.createElement('div');
+      col.className = 'palette-col' + (o.id === chosen ? ' chosen' : '');
+      col.tabIndex = 0;
+      col.setAttribute('role', 'button');
+      col.setAttribute('aria-pressed', String(o.id === chosen));
+      col.innerHTML = `<div class="palette-name">${o.name}</div><div class="palette-desc">${o.desc}</div>`;
+      for (const c of CATEGORIES) {
+        col.insertAdjacentHTML('beforeend', `<div class="cat-label">${c.label}</div>`);
+        col.appendChild(makeNode(o, c.key));
+      }
+      const hexes = document.createElement('div');
+      hexes.className = 'hexes';
+      for (const c of CATEGORIES) {
+        const parts = [];
+        if (o.tintShown) parts.push('fill ' + o.fill[c.key]);
+        parts.push(o.bandColor[c.key] ? 'band ' + o.bandColor[c.key] : 'none');
+        hexes.insertAdjacentHTML('beforeend', `<span>${c.label}</span><span>${parts.join(' · ')}</span>`);
+      }
+      col.appendChild(hexes);
+      const pick = () => { chosen = o.id; renderAll(); };
+      col.addEventListener('click', pick);
+      col.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+      root.appendChild(col);
+    }
+  }
+
+  function renderPicker() {
+    const root = document.getElementById('picker');
+    root.innerHTML = '';
+    for (const o of PALETTES) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = o.name;
+      b.setAttribute('aria-pressed', String(o.id === chosen));
+      b.addEventListener('click', () => { chosen = o.id; renderAll(); });
+      root.appendChild(b);
+    }
+  }
+
+  function renderMarkLegend() {
+    const root = document.getElementById('mark-legend');
+    if (content !== 'simple') {
+      root.innerHTML = `<span><i class="sw" style="border-color:var(--avail-executable);background:var(--avail-executable);border-radius:999px"></i>Execution available</span>
+        <span><i class="sw" style="border-color:var(--avail-config);background:var(--avail-config);border-radius:999px"></i>Configuration required</span>
+        <span><i class="sw" style="border-color:var(--avail-unavailable);background:var(--avail-unavailable);border-radius:999px"></i>Execution unavailable</span>`;
+      return;
+    }
+    const mark = (kind, avail) => `<span class="kind-mark" style="--avail:${AVAIL[avail].color}">${kindSvg(kind)}</span>`;
+    root.innerHTML = `<span>${mark('composite', 'executable')}Composite</span>
+      <span>${mark('decorator', 'executable')}Decorator</span>
+      <span>${mark('leaf', 'executable')}Leaf</span>
+      <span>Execution available: no symbol</span>
+      <span>${mark('leaf', 'config')}Configuration required</span>
+      <span>${mark('leaf', 'unavailable')}Execution unavailable</span>`;
+  }
+
+  // Example tree with one node per category; columns follow the node width.
+  const TREE = [
+    { id: 'root', cat: 'control_flow', col: 3.5, y: 30, status: 'running', sample: ['sequence', 'Sequence', 'composite'] },
+    { id: 'move', cat: 'motion', name: 'moveToPickApproachPose', col: 0, y: 200, status: 'success', parent: 'root' },
+    { id: 'check', cat: 'logic', name: 'check_part_present_on_conveyor', col: 1, y: 200, status: 'success', parent: 'root' },
+    { id: 'frame', cat: 'model', name: 'get_tcp_frame_pose', col: 2, y: 200, status: 'success', parent: 'root' },
+    { id: 'out', cat: 'io', name: 'SetGripperValveOpen', col: 3, y: 200, status: 'success', parent: 'root' },
+    { id: 'fallback', cat: 'control_flow', col: 4, y: 200, status: 'running', parent: 'root', sample: ['fallback', 'Fallback', 'composite'] },
+    { id: 'sim', cat: 'simulation', col: 5, y: 200, parent: 'root' },
+    { id: 'inv', cat: 'control_flow', col: 6, y: 200, selected: true, parent: 'root', sample: ['inverter', 'Inverter', 'decorator'] },
+    { id: 'ask', cat: 'assistant', name: 'querypartclassifiermodel', col: 7, y: 200, parent: 'root' },
+    { id: 'scene', cat: 'scene', col: 3, y: 370, status: 'failure', avail: 'unavailable', parent: 'fallback' },
+    { id: 'dist', cat: 'geometry', name: 'checkPoseDistanceWithinToleranceOfTarget', col: 4, y: 370, status: 'running', parent: 'fallback' },
+    { id: 'stop', cat: 'recovery', col: 5, y: 370, parent: 'fallback' },
+    { id: 'grip', cat: 'gripper', name: 'command_gripper_close_on_detected_part_A12', col: 6, y: 370, invalid: true, avail: 'config', parent: 'inv' },
+  ];
+  const NODE_H = 70, CANVAS_H = 470;
+  const colX = (col) => 20 + col * (nodeWidth + 16);
+  const edgeColor = (n) => n.status === 'running' ? 'var(--edge-running)' : n.status === 'success' ? 'var(--edge-success)' : n.status === 'failure' ? 'var(--edge-failure)' : 'var(--edge-idle)';
+
+  function renderCanvas() {
+    const option = optionFor(chosen);
+    const root = document.getElementById('canvas');
+    root.innerHTML = '';
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('class', 'edges');
+    const CANVAS_W = colX(7) + nodeWidth + 20;
+    const NODE_W = nodeWidth;
+    svg.setAttribute('viewBox', `0 0 ${CANVAS_W} ${CANVAS_H}`);
+    root.style.width = CANVAS_W + 'px';
+    root.style.height = CANVAS_H + 'px';
+    svg.setAttribute('aria-hidden', 'true');
+    for (const n of TREE) {
+      if (!n.parent) continue;
+      const parent = TREE.find((q) => q.id === n.parent);
+      const x1 = colX(parent.col) + NODE_W / 2, y1 = parent.y + NODE_H + 6;
+      const x2 = colX(n.col) + NODE_W / 2, y2 = n.y - 6;
+      const my = (y1 + y2) / 2;
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`);
+      path.setAttribute('fill', 'none');
+      path.setAttribute('stroke', edgeColor(n));
+      path.setAttribute('stroke-width', '2');
+      svg.appendChild(path);
+    }
+    root.appendChild(svg);
+    for (const n of TREE) {
+      const el = makeNode(option, n.cat, { status: n.status, invalid: n.invalid, selected: n.selected, sample: n.sample, avail: n.avail, name: n.name, handles: true });
+      el.style.left = colX(n.col) + 'px';
+      el.style.top = n.y + 'px';
+      root.appendChild(el);
+    }
+  }
+
+  const widthInput = document.getElementById('node-width');
+  widthInput.addEventListener('input', () => { nodeWidth = Number(widthInput.value); renderAll(); });
+  const iconInput = document.getElementById('node-icon-size');
+  iconInput.addEventListener('input', () => { nodeIconSize = Number(iconInput.value); applyNodeIconSize(); applyBandWidth(); remember(); });
+  function applyNodeIconSize() {
+    nodeIconSize = Math.min(40, Math.max(12, nodeIconSize));
+    document.documentElement.style.setProperty('--node-icon-size', nodeIconSize + 'px');
+    iconInput.value = String(nodeIconSize);
+    iconInput.nextElementSibling.textContent = nodeIconSize + ' px';
+  }
+  const guidesInput = document.getElementById('show-guides');
+  guidesInput.addEventListener('change', () => { guides = guidesInput.checked; applyGuides(); remember(); });
+  function applyGuides() {
+    guidesInput.checked = guides;
+    document.body.classList.toggle('guides', guides);
+    guidesInput.closest('label').style.opacity = iconMode === 'bands' ? '1' : '0.5';
+  }
+  const marginInput = document.getElementById('name-margin');
+  marginInput.addEventListener('input', () => { nameMargin = Number(marginInput.value); applyNameMargin(); remember(); });
+  function applyNameMargin() {
+    nameMargin = Math.min(16, Math.max(0, nameMargin));
+    document.documentElement.style.setProperty('--name-margin', nameMargin + 'px');
+    marginInput.value = String(nameMargin);
+    marginInput.nextElementSibling.textContent = nameMargin + ' px';
+    marginInput.closest('label').style.opacity = iconMode === 'bands' ? '1' : '0.5';
+  }
+  const offsetInput = document.getElementById('status-offset');
+  offsetInput.addEventListener('input', () => { statusOffset = Number(offsetInput.value); applyStatusOffset(); remember(); });
+  function applyStatusOffset() {
+    statusOffset = Math.min(24, Math.max(-12, statusOffset));
+    document.documentElement.style.setProperty('--status-offset', statusOffset + 'px');
+    offsetInput.value = String(statusOffset);
+    offsetInput.nextElementSibling.textContent = statusOffset + ' px';
+    offsetInput.closest('label').style.opacity = iconMode === 'bands' ? '1' : '0.5';
+  }
+  const bandInput = document.getElementById('band-width');
+  bandInput.addEventListener('input', () => { bandWidth = Number(bandInput.value); applyBandWidth(); remember(); });
+  function applyBandWidth() {
+    bandWidth = Math.min(64, Math.max(20, bandWidth));
+    document.documentElement.style.setProperty('--band-w', bandWidth + 'px');
+    bandInput.value = String(bandWidth);
+    const effective = Math.max(bandWidth, nodeIconSize);
+    bandInput.nextElementSibling.textContent = effective > bandWidth
+      ? `${bandWidth} px (min ${effective} for the icon)` : bandWidth + ' px';
+    bandInput.closest('label').style.opacity = iconMode === 'bands' ? '1' : '0.5';
+  }
+  function applyNodeWidth() {
+    nodeWidth = Math.min(280, Math.max(140, nodeWidth));
+    document.documentElement.style.setProperty('--node-w', nodeWidth + 'px');
+    widthInput.value = String(nodeWidth);
+    widthInput.nextElementSibling.textContent = nodeWidth + ' px';
+  }
+
+  function renderIconGallery() {
+    const option = optionFor(chosen);
+    const root = document.getElementById('icon-gallery');
+    root.innerHTML = CATEGORIES.map((c) => {
+      const color = option.bandColor[c.key];
+      return `<div style="${color ? `--cat-color:${color}` : ''}">${catIcon(c.key)}<span>${c.label}<small>${c.sample[1]}</small></span></div>`;
+    }).join('');
+  }
+
+  function renderAll() {
+    if (!PALETTES.some((p) => p.id === chosen)) chosen = PALETTES[0].id;
+    if (!['before', 'corner', 'bands', 'off'].includes(iconMode)) iconMode = 'corner';
+    if (!TREATMENTS.some((t) => t.id === treatment)) treatment = TREATMENTS[0].id;
+    applyNodeWidth();
+    applyBandWidth();
+    applyNodeIconSize();
+    applyStatusOffset();
+    applyGuides();
+    applyNameMargin();
+    remember();
+    document.getElementById('selected-legend').textContent =
+      statusMode === 'ring' ? 'Selected (thicker status ring)' : 'Selected (outline)';
+    renderContentSwitches(); renderTreatmentSwitches(); renderIconSwitches(); renderNamesSwitch(); renderStatusSwitch(); renderOverview(); renderPicker(); renderMarkLegend(); renderCanvas(); renderIconGallery();
+    normalizeIcons();
+  }
+  renderAll();
+</script>

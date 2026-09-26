@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
+import { readStyleSource } from '../styles/readStyleSource';
 
 function source(path: string): string {
   return readFileSync(new URL(path, import.meta.url), 'utf8');
@@ -10,7 +11,7 @@ describe('UI4 application and viewport composition', () => {
   it('keeps one persistent viewer and moves detailed surfaces into the split inspector', () => {
     const app = source('../App.tsx');
     const viewer = source('./StructuralViewer.tsx');
-    const styles = source('../index.css');
+    const styles = readStyleSource();
 
     expect(app.match(/<SceneAuthoringWorkspace/g)).toHaveLength(1);
     expect(app).toContain('className="global-surface-launchers"');
@@ -60,7 +61,7 @@ describe('UI4 application and viewport composition', () => {
   it('keeps explicit group columns separate from unique cell controls', () => {
     const transport = source('./ProgramRuntimePanel.tsx');
     const robotControl = source('../hooks/useRobotControl.ts');
-    const styles = source('../index.css');
+    const styles = readStyleSource();
 
     expect(transport).toContain('program.resumeMotion([group.groupId])');
     expect(transport).toContain('program.stopMotion([group.groupId])');
@@ -97,16 +98,16 @@ describe('UI4 application and viewport composition', () => {
     expect(transport).not.toContain('transport-guidance');
     expect(styles).toMatch(/\.viewer-transport \{[^}]*padding: 0;[^}]*overflow: visible;/s);
     expect(styles).not.toMatch(/\.viewer-transport \{[^}]*(?:border|background):/s);
-    expect(styles).toMatch(/\.transport-motion-panel \{[^}]*border: 1px solid #365463;[^}]*background: rgb\(8 23 32 \/ 94%\);/s);
+    expect(styles).toMatch(/\.transport-motion-panel \{[^}]*border: 1px solid #365563;[^}]*background: rgb\(8 23 32 \/ 94%\);/s);
     expect(styles).toMatch(/\.transport-group-grid \{[^}]*justify-content: flex-start;[^}]*padding: 0;[^}]*overflow-x: auto;/s);
-    expect(styles).toMatch(/\.transport-panel-title \{[^}]*font-size: 0\.94rem;[^}]*line-height: 1\.2rem;/s);
-    expect(styles).toMatch(/\.transport-unique-column \{[^}]*border: 1px solid #365463;[^}]*background: rgb\(8 23 32 \/ 94%\);[^}]*margin-left: auto;/s);
+    expect(styles).toMatch(/\.transport-panel-title \{[^}]*font-size: 0\.96rem;[^}]*line-height: 1\.2rem;/s);
+    expect(styles).toMatch(/\.transport-unique-column \{[^}]*border: 1px solid #365563;[^}]*background: rgb\(8 23 32 \/ 94%\);[^}]*margin-left: auto;/s);
     expect(styles).toContain('--viewer-transport-control-height: 2.85rem;');
     expect(styles).toContain('--viewer-transport-column-width: 7rem;');
     expect(styles).toMatch(/\.viewer-transport button \{[\s\S]*?height: var\(--viewer-transport-control-height\);[\s\S]*?font-size: 0\.84rem;/);
     expect(styles).toMatch(/\.transport-group-scale \{[\s\S]*?"label output"[\s\S]*?"slider slider";/);
     expect(styles).toMatch(/\.transport-group-scale input \{[\s\S]*?grid-area: slider;[\s\S]*?width: 100%;/);
-    expect(styles).toMatch(/\.transport-group-scale \{[^}]*border: 1px solid #385061;[^}]*border-radius: 0\.45rem;/s);
+    expect(styles).toMatch(/\.transport-group-scale \{[^}]*border: 1px solid #405764;[^}]*border-radius: 0\.45rem;/s);
     expect(styles).toMatch(/\.transport-unique-icons \{[\s\S]*?grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
   });
 
