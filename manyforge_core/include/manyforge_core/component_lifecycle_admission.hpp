@@ -21,9 +21,6 @@ struct ComponentLifecycleAdmissionCandidate final {
   /// first-admission seed. Caller expectations never populate this field.
   ComponentLifecycleGeneration durable_component_generation_predecessor;
   std::int64_t accepted_at_ns;
-  /// Legacy bounded value retained in the admission DTO/codec; ordinary
-  /// Disable uses the selected provider plan timeout, not a Stop handoff.
-  std::int64_t containment_only_disable_timeout_duration_ns;
   std::optional<ComponentLifecycleCurrentSnapshotDTO> current_snapshot;
   std::vector<BrandLifecyclePlanCatalogDTO> lifecycle_plan_catalogs;
   std::optional<DisableHandoffAdmissionSnapshotDTO> disable_handoff_admission;
@@ -40,12 +37,9 @@ struct PreparedComponentLifecycleAdmission final {
   /// True when the current component snapshot and exact provider/catalog
   /// closure permit mutation under the ordinary idle lifecycle claim.
   bool lifecycle_mutation_eligible;
-  /// Retained only for decoding pre-cutover Stop-bearing Disable records;
-  /// fresh admissions never carry a Kernel Stop handoff.
-  std::optional<DisableHandoffAdmissionSnapshotDTO> disable_handoff_admission;
 };
 
-/// Derive the historical Stop-handoff expectation for read-only recovery.
+/// Derive the historical Stop-handoff expectation for durable-effect recovery.
 [[nodiscard]] Result<DisableHandoffComponentScopeExpectationDTO>
 BuildDisableHandoffComponentScopeExpectation(const ComponentLifecycleCurrentSnapshotDTO& snapshot);
 

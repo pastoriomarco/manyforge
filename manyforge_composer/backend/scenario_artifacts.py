@@ -43,7 +43,6 @@ from .deployment_intent import (
 
 
 SCENARIO_API_VERSION = "manyforge.scenario.authoring.v2"
-LEGACY_SCENARIO_API_VERSION = "manyforge.scenario.authoring.v1"
 SCENARIO_SUFFIXES = (".scenario.yaml", ".scenario.yml")
 SCENARIO_PROJECT_API_VERSION = "manyforge.scenario.project.v1"
 SCENARIO_MANIFEST = "scenario.yaml"
@@ -224,36 +223,6 @@ def _validate_saved_status(value: Any, *, source: str) -> dict[str, str]:
     return deepcopy(value)
 
 
-def _convert_legacy_scenario_document(value: dict[str, Any], *, source: str) -> dict[str, Any]:
-    expected = {
-        "api_version",
-        "scenario_id",
-        "name",
-        "description",
-        "base_scenario_id",
-        "program_draft",
-        "deployment_draft",
-        "saved_status",
-    }
-    if set(value) != expected:
-        _fail(
-            "scenario_artifact_invalid",
-            f"{source}: Scenario fields do not match {LEGACY_SCENARIO_API_VERSION}",
-        )
-    saved = _validate_saved_status(value["saved_status"], source=source)
-    return build_scenario_document(
-        scenario_id=value["scenario_id"],
-        name=value["name"],
-        description=value["description"],
-        program_draft=value["program_draft"],
-        deployment_draft=value["deployment_draft"],
-        program_role_assignment=None,
-        typed_parameter_overrides={},
-        manyforge_version=saved["manyforge_version"],
-        last_known_status="incomplete",
-    )
-
-
 def validate_scenario_document(
     value: Any,
     *,
@@ -272,8 +241,6 @@ def validate_scenario_document(
     }
     if type(value) is not dict:
         _fail("scenario_artifact_invalid", f"{source}: Scenario must be an object")
-    if value.get("api_version") == LEGACY_SCENARIO_API_VERSION:
-        return _convert_legacy_scenario_document(value, source=source)
     if set(value) != expected:
         _fail(
             "scenario_artifact_invalid",
@@ -549,12 +516,6 @@ def _existing_project(raw_path: str, roots: list[str]) -> Path:
     except (OSError, RuntimeError, ValueError) as error:
         _fail("scenario_artifact_path_invalid", str(error))
     if not resolved.is_dir():
-        if resolved.is_file() and resolved.name.lower().endswith(SCENARIO_SUFFIXES):
-            _fail(
-                "scenario_legacy_conversion_required",
-                "Legacy Scenario files require explicit conversion to a project folder",
-                status_code=409,
-            )
         _fail("scenario_artifact_path_invalid", "Scenario project is not a directory")
     if not is_path_within_roots(resolved, roots):
         _fail(
@@ -1218,45 +1179,6 @@ def export_scenario_artifact(
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-
-
-def convert_legacy_scenario_artifact(
-    raw_source_path: str,
-    raw_destination_path: str,
-    *,
-    allowed_roots: list[str],
-    overwrite: bool,
-) -> str:
-    """Explicitly convert one legacy single-file Scenario into a project."""
-
-    source = Path(raw_source_path)
-    if not source.name.lower().endswith(SCENARIO_SUFFIXES):
-        _fail(
-            "scenario_artifact_suffix_invalid",
-            "Legacy Scenario file must end in .scenario.yaml or .scenario.yml",
-        )
-    roots = _roots(allowed_roots)
-    try:
-        resolved = normalize_existing_file_path(
-            raw_source_path, roots, kind_label="Legacy Scenario artifact"
-        )
-        raw = resolved.read_bytes()
-        value = load_strict_json_yaml_bytes(raw, source=str(resolved))
-    except HTTPException as error:
-        _fail(
-            "scenario_artifact_path_invalid",
-            str(error.detail),
-            status_code=error.status_code,
-        )
-    except (OSError, StrictArtifactError) as error:
-        _fail("scenario_artifact_invalid", f"{raw_source_path}: {error}")
-    document = validate_scenario_document(value, source=str(resolved))
-    return save_scenario_artifact(
-        document,
-        raw_destination_path,
-        allowed_roots=allowed_roots,
-        overwrite=overwrite,
-    )
 
 
 def scenario_directory(

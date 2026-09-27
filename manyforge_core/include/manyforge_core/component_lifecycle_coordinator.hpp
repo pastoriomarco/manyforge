@@ -30,7 +30,6 @@ struct ComponentLifecycleCoordinatorConfig final {
   std::size_t lifecycle_worker_count;
   std::size_t kernel_worker_count;
   std::int64_t observation_poll_period_ns;
-  std::int64_t containment_only_disable_timeout_duration_ns;
   std::int64_t route_selection_timeout_duration_ns{30'000'000'000LL};
 
   [[nodiscard]] bool locally_valid() const noexcept;

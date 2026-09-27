@@ -42,7 +42,6 @@ from .scenario_artifacts import (
     build_scenario_document,
     capture_scenario_artifact,
     capture_scenario_artifact_with_diagnostics,
-    convert_legacy_scenario_artifact,
     discover_scenario_artifacts,
     export_scenario_artifact,
     normalize_scenario_save_path,
@@ -109,16 +108,6 @@ class SaveScenarioDocumentRequest(_ScenarioFence):
 class LoadScenarioDocumentRequest(_ScenarioFence):
     path: str = Field(min_length=1, max_length=4096)
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
-
-
-class ConvertLegacyScenarioDocumentRequest(BaseModel):
-    model_config = _DTO
-
-    source_path: str = Field(alias="sourcePath", min_length=1, max_length=4096)
-    destination_path: str = Field(
-        alias="destinationPath", min_length=1, max_length=4096
-    )
-    confirm_overwrite: bool = Field(default=False, alias="confirmOverwrite")
 
 
 class ExportScenarioDocumentRequest(_ScenarioFence):
@@ -787,25 +776,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "workspace": committed_snapshot.identity.as_dict(),
                     },
                 ) from error
-            _raise(error)
-
-    @router.post("/api/scenario-documents/convert-legacy")
-    def convert_legacy_document(
-        body: ConvertLegacyScenarioDocumentRequest,
-    ) -> dict[str, Any]:
-        try:
-            saved_path = convert_legacy_scenario_artifact(
-                body.source_path,
-                body.destination_path,
-                allowed_roots=state.allowed_fs_roots,
-                overwrite=body.confirm_overwrite,
-            )
-            return {
-                "status": "converted",
-                "source_path": str(Path(body.source_path).expanduser().resolve()),
-                "path": saved_path,
-            }
-        except Exception as error:
             _raise(error)
 
     @router.post("/api/scenario-documents/export")

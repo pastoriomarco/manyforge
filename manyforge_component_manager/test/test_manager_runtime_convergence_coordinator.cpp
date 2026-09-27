@@ -156,11 +156,16 @@ MaterializeRuntimePackage(const std::filesystem::path &root,
 }
 
 [[nodiscard]] RuntimePackage
-MaterializeNativeRuntimePackage(const std::filesystem::path &root) {
+MaterializeNativeRuntimePackage(const std::filesystem::path &root,
+                                bool shared_domain = false) {
   static_cast<void>(std::filesystem::create_directories(root));
-  auto fixture =
-      deployment::test::make_lite6_native_motion_retention_fixture_for_cell(
-          "runtime_only_cell");
+  auto fixture = shared_domain
+      ? deployment::test::make_lite6_controllable_retention_fixture(
+            false, false, 2U, false, true, "runtime_only_cell", false,
+            false, "resource", false, {}, {}, false, false, {}, false,
+            std::nullopt, true)
+      : deployment::test::make_lite6_native_motion_retention_fixture_for_cell(
+            "runtime_only_cell");
   const deployment::test::Lite6ControllableCompilerInputArtifactSource
       input_source(fixture);
   deployment::FilesystemBuildManifestRepository manifests(root);
@@ -1888,6 +1893,71 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(kernel_fence.acquire_calls, 0);
   EXPECT_EQ(runtime_composition.calls, 0);
   EXPECT_EQ(publication_store.publish_calls, 0);
+}
+
+TEST(ManagerNamedApplyCoordinator,
+     SharedNativeDomainIsRefusedBeforeFenceOrPredecessorEffects) {
+  ScopedPackageRoot package_root;
+  ScopedPackageRoot state_root;
+  auto previous = MaterializeRuntimePackage(package_root.path());
+  auto candidate = MaterializeNativeRuntimePackage(package_root.path(), true);
+  const auto predecessor = PredecessorPublication(ApplyIntent(*previous.bundle));
+  const auto intent = ApplyIntent(*candidate.bundle);
+  const auto database = state_root.path() / "unsupported-topology.sqlite3";
+  SqliteManagerApplyJournal journal(database, intent.cell_id);
+  SqliteManagerApplyJournal reader(database, intent.cell_id);
+  ScriptedPublicationStore publication_store(predecessor, &reader);
+  FixedActiveRuntimePlanSource active_plan_source(
+      predecessor, BuildVerifiedRuntimeConvergencePlan(
+          *previous.bundle, *previous.artifact_source, "linux", {"posix.1-2017"}));
+  ScriptedRuntimePorts runtime_ports(reader);
+  MaintenanceSceneOwner scene_owner(predecessor.request.candidate_projection_revision);
+  AggregateFencePort kernel_fence(reader, predecessor);
+  ScriptedRuntimeCompositionPort runtime_composition;
+  ScriptedCellAdmissionPort cell_admission;
+  AlwaysIdleMaintenanceGate maintenance_gate;
+  ManagerPlannedMaintenanceCoordinator maintenance(active_plan_source, maintenance_gate);
+  ManagerNamedApplyCoordinator coordinator(
+      journal, active_plan_source, *candidate.bundle_source,
+      *candidate.artifact_source, publication_store, scene_owner, nullptr,
+      kernel_fence, cell_admission, runtime_composition, runtime_ports,
+      runtime_ports, maintenance, RuntimeEpoch("manager.topology.1"),
+      "linux", {"posix.1-2017"}, [] { return 1'000U; },
+      [] { return ApplyId("apply.topology.1"); },
+      [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
+  const ManagerNamedApplyRequestDTO request{
+      intent.request_context, candidate.bundle->value().deployment_artifact_id,
+      candidate.bundle->value().deployment_revision,
+      predecessor.request.candidate_retained_bundle_id,
+      predecessor.request.candidate_graph_revision, candidate.bundle->retained_bundle_id(),
+      intent.prepared_activation, AdmissionGeneration(7U), std::nullopt};
+  const auto accepted = coordinator.AcceptOrReplay(request);
+  ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
+  const auto failed = coordinator.RecoverIncompleteApply();
+  ASSERT_TRUE(failed.has_value());
+  ASSERT_EQ(failed->state, ManagerNamedApplyResultState::kFailed);
+  ASSERT_TRUE(failed->terminal_outcome.has_value());
+  ASSERT_TRUE(failed->terminal_outcome->failure.has_value());
+  EXPECT_EQ(failed->terminal_outcome->failure->failure_code,
+            "native_shared_domain_unsupported");
+  EXPECT_EQ(failed->terminal_outcome->failure->effect_disposition,
+            ManagerApplyEffectDisposition::kKnown);
+  EXPECT_FALSE(journal.ReadFenceAttempt(accepted.apply_id, accepted.apply_generation).has_value());
+  EXPECT_EQ(kernel_fence.acquire_calls, 0);
+  EXPECT_EQ(kernel_fence.release_calls, 0);
+  EXPECT_EQ(runtime_ports.stop_calls, 0);
+  EXPECT_EQ(runtime_ports.ensure_calls, 0);
+  EXPECT_EQ(runtime_composition.calls, 0);
+  EXPECT_EQ(scene_owner.begin_calls, 0);
+  EXPECT_EQ(scene_owner.CurrentProjectionRevision(), predecessor.request.candidate_projection_revision);
+  EXPECT_EQ(publication_store.publish_calls, 0);
+  EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+  ASSERT_TRUE(cell_admission.last_release.has_value());
+  const auto replay = coordinator.AcceptOrReplay(request);
+  EXPECT_TRUE(replay.request_replayed);
+  EXPECT_EQ(replay.state, ManagerNamedApplyResultState::kFailed);
+  EXPECT_EQ(kernel_fence.acquire_calls, 0);
+  EXPECT_EQ(runtime_ports.stop_calls, 0);
 }
 
 TEST(ManagerNamedApplyCoordinator,

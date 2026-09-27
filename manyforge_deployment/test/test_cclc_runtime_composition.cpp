@@ -254,7 +254,7 @@ configuration(const std::filesystem::path &root, const core::CellId &cell_id,
           run_root,
           cell_id,
           {core::RequestOwnerEpoch("cclc-owner." + owner_suffix), 128U, 1U, 1U,
-           1'000'000LL, 30'000'000'000LL, 30'000'000'000LL}};
+           1'000'000LL, 30'000'000'000LL}};
 }
 
 [[nodiscard]] std::vector<ControllerLifecycleSourceOccurrenceDTO>

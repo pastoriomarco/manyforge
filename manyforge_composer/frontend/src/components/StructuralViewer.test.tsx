@@ -516,8 +516,8 @@ describe('viewer failure isolation', () => {
     expect(css).not.toContain('.viewer-notice-stack');
     expect(css).not.toContain('.viewer-model-state');
     const layout = css.match(/\.workbench-notification-stack\s*\{([^}]+)\}/)?.[1];
-    // Below the floating controls (2.85rem + 2 × 0.65rem inset), same side insets.
-    expect(layout).toContain('top: calc(2.85rem + 2 * 0.65rem)');
+    // Below the floating controls (1.9rem toolbar + 2 × 0.65rem inset), same side insets.
+    expect(layout).toContain('top: calc(1.9rem + 2 * 0.65rem)');
     expect(layout).toContain('left: 0.65rem');
     expect(layout).toContain('right: 0.65rem');
     expect(layout).toContain('pointer-events: none');

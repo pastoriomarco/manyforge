@@ -138,7 +138,7 @@ export function FailureCapturePanel({ open }: { open: boolean }) {
         </div>
         <button type="button" disabled={loading} onClick={load}>Refresh</button>
       </header>
-      {error !== null && <p className="error-state" role="alert">{error}</p>}
+      {error !== null && <p className="error-state notice severity-error" role="alert">{error}</p>}
       {loading && captures.length === 0 && <p className="muted">Loading failure captures…</p>}
       {!loading && error === null && captures.length === 0 && (
         <p className="muted">No failure capture is retained.</p>

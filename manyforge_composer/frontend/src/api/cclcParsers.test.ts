@@ -113,6 +113,13 @@ describe('CCLC closed response parsers', () => {
     };
     expect(parseCCLCRouteTemplateSet(value).templates).toHaveLength(1);
 
+    const disabled = structuredClone(value);
+    disabled.templates[0].component_expectations[0].expected_component_lifecycle_state = 'disabled';
+    expect(parseCCLCRouteTemplateSet(disabled).templates[0].component_expectations[0]
+      .expected_component_lifecycle_state).toBe('disabled');
+    disabled.templates[0].component_expectations[0].expected_component_lifecycle_state = 'faulted';
+    expect(() => parseCCLCRouteTemplateSet(disabled)).toThrow('prepared, active or disabled');
+
     const widened = structuredClone(value);
     (widened.templates[0] as Record<string, unknown>).caller_override = true;
     expect(() => parseCCLCRouteTemplateSet(widened)).toThrow('closed fields');

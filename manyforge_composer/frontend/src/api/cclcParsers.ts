@@ -258,8 +258,8 @@ function expectationAt(value: unknown, path: string): CCLCComponentExpectation {
     row.expected_component_lifecycle_state,
     `${path}.expected_component_lifecycle_state`,
   );
-  if (state !== 'prepared' && state !== 'active') {
-    fail(`${path}.expected_component_lifecycle_state`, 'prepared or active');
+  if (state !== 'prepared' && state !== 'active' && state !== 'disabled') {
+    fail(`${path}.expected_component_lifecycle_state`, 'prepared, active or disabled');
   }
   return {
     controllable_component_id: textAt(

@@ -213,7 +213,7 @@ function RobotNumberInput({
   );
   return limitUnit === undefined ? input : <span className="robot-control-limit-input">
     {input}
-    {invalidMessage !== null && <span id={errorId} className="robot-control-limit-error" role="status">{invalidMessage}</span>}
+    {invalidMessage !== null && <span id={errorId} className="robot-control-limit-error inline-message severity-error" role="status">{invalidMessage}</span>}
   </span>;
 }
 
@@ -712,7 +712,7 @@ export function RobotControlPanelView({
       {enabled && status !== null && displayedTarget !== undefined && displayedTarget !== null && (
         <>
           {programActive && !controller.manualControlAllowed && !state.operation?.resident && (
-            <p className="central-inspector-notice" role="status">
+            <p className="central-inspector-notice notice severity-info notice-strip" role="status">
               <strong>Manual control unavailable.</strong>{' '}
               {controller.manualControlUnavailableReason}
               {' '}<button type="button" onClick={retry}>Check again</button>
@@ -720,7 +720,7 @@ export function RobotControlPanelView({
           )}
           {!state.poseDragging && state.phase === 'blocked' && dismissedPreviewNotice !== previewNoticeKey && (
             <div
-              className="central-inspector-notice central-inspector-notice-warning robot-control-preview-notice"
+              className="central-inspector-notice notice severity-warning notice-floating robot-control-preview-notice"
               role={expectedTargetRejection ? 'status' : 'alert'}
             >
               <div>
@@ -1139,7 +1139,7 @@ export function RobotControlPanelView({
                       </span>
                     </label>
                   ))}
-                  <p className="robot-control-limits robot-control-pose-note">
+                  <p className="robot-control-limits robot-control-pose-note hint">
                     Absolute TCP target in{' '}
                     <code>{(() => {
                       if (motion === null) return '';
@@ -1162,7 +1162,7 @@ export function RobotControlPanelView({
 
               {state.mode === 'gripper' && gripper !== null && (
                 <div className="robot-control-gripper-editor">
-                <p className="robot-control-pose-note">
+                <p className="robot-control-pose-note hint">
                   Completion confirms the observed coordinate, not an object grasp.
                 </p>
                 {gripper.targetDescriptor.namedPresets.length > 0 && (
@@ -1319,10 +1319,10 @@ export function RobotControlPanelView({
               </div>
 
               {state.error !== null && state.phase !== 'blocked' && (
-                <p className="robot-control-error" role="alert">{state.error}</p>
+                <p className="robot-control-error notice severity-error" role="alert">{state.error}</p>
               )}
               {state.ownerNotice !== null && (
-                <p className="robot-control-owner-notice">{state.ownerNotice}</p>
+                <p className="notice severity-info">{state.ownerNotice}</p>
               )}
               {recoveryRequired && (
                 <p className="robot-control-recovery-guidance">
@@ -1442,7 +1442,7 @@ export function RobotControlPanelView({
             <p>A red tool marks an unvalidated TCP target, not a solved robot configuration or proof of collision. Preview rejection does not mean the Program or robot has faulted.</p>
             <p>Joint velocity/acceleration caps and the TCP speed ceiling are configured in Deployment → Robot model and target limits. The runtime Velocity slider is separate from those limits.</p>
             {state.mode === 'cartesian_path' && <p>Cartesian preview currently requests 0.1 m/s linear speed, 0.5 m/s² linear acceleration, 0.5 rad/s angular speed and 2.5 rad/s² angular acceleration, subject to the backend limits. Per-move editing of these values is not yet available.</p>}
-            {state.error !== null && <p className="robot-control-error">{state.error}</p>}
+            {state.error !== null && <p className="robot-control-error notice severity-error">{state.error}</p>}
             {state.previewIssue != null && <p>{state.previewIssue}</p>}
             {state.ghost !== null && <>
               <dl className="robot-control-ghost-joints">

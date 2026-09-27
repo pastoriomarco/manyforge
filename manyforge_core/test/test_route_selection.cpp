@@ -545,6 +545,16 @@ TEST(RouteSelectionAdmission, RejectsSingularRouteAndInvalidComponentState) {
   auto invalid_state = Intent();
   invalid_state.component_expectations.front().expected_component_lifecycle_state =
       ComponentLifecycleStateDTO::kDisabled;
+  EXPECT_TRUE(invalid_state.locally_valid());
+  auto disabled_candidate = Candidate();
+  disabled_candidate.current_component_expectations = invalid_state.component_expectations;
+  result = PrepareRouteSelectionAdmission(invalid_state, disabled_candidate);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "route_selection_component_not_ready");
+  result = PrepareRouteSelectionAdmission(invalid_state, disabled_candidate, true);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  invalid_state.component_expectations.front().expected_component_lifecycle_state =
+      ComponentLifecycleStateDTO::kFaulted;
   EXPECT_FALSE(invalid_state.locally_valid());
 }
 

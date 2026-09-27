@@ -736,11 +736,6 @@ describe('structural API client', () => {
         authoringWorkspace: authoringWorkspaceFixture(),
       }))
       .mockResolvedValueOnce(response({
-        status: 'converted',
-        source_path: '/workspace/examples/legacy.scenario.yaml',
-        path: '/workspace/examples/cell',
-      }))
-      .mockResolvedValueOnce(response({
         status: 'exported',
         path: '/workspace/exports/cell',
       }));
@@ -761,11 +756,6 @@ describe('structural API client', () => {
     });
     await api.scenarioDocuments.load(
       scenarioFence,
-      '/workspace/examples/cell',
-      true,
-    );
-    await api.scenarioDocuments.convertLegacy(
-      '/workspace/examples/legacy.scenario.yaml',
       '/workspace/examples/cell',
       true,
     );
@@ -794,18 +784,11 @@ describe('structural API client', () => {
       path: '/workspace/examples/cell',
       confirmDiscard: true,
     });
-    expect(JSON.parse(String(
-      (fetchMock.mock.calls[3]?.[1] as RequestInit).body,
-    ))).toEqual({
-      sourcePath: '/workspace/examples/legacy.scenario.yaml',
-      destinationPath: '/workspace/examples/cell',
-      confirmOverwrite: true,
-    });
-    expect(fetchMock.mock.calls[4]?.[0]).toBe(
+    expect(fetchMock.mock.calls[3]?.[0]).toBe(
       '/api/scenario-documents/export',
     );
     expect(JSON.parse(String(
-      (fetchMock.mock.calls[4]?.[1] as RequestInit).body,
+      (fetchMock.mock.calls[3]?.[1] as RequestInit).body,
     ))).toEqual({
       ...scenarioFence,
       destinationPath: '/workspace/exports/cell',

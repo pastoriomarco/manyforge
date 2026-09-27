@@ -1601,8 +1601,45 @@ void ExpectExactControlledStopPlan(
             "manyforge.stop.software_hard");
 }
 
-TEST(RetainedNativeCCLCRuntime,
-     RetainedProductPublishesRepositoryReadBackReadiness) {
+class RestartReadinessPort final : public core::ICCLCComponentCommandReadinessPort {
+public:
+  explicit RestartReadinessPort(core::ResourceAddressedExecutionKernel &kernel,
+                                bool fail)
+      : kernel_(kernel), fail_(fail) {}
+
+  core::Result<core::ComponentCommandReadinessDTO> CloseComponentCommandEligibility(
+      const core::LifecycleTransactionId &,
+      const core::ControllableComponentId &) override {
+    ADD_FAILURE() << "Restart must not dispatch a lifecycle close";
+    return core::Result<core::ComponentCommandReadinessDTO>::Err(
+        {"unexpected_close", "unexpected lifecycle effect", {}});
+  }
+  core::Result<core::ComponentCommandReadinessDTO> PublishComponentCommandReadiness(
+      const core::ComponentCommandReadinessPublicationDTO &publication) override {
+    ++publications;
+    EXPECT_EQ(publication.authority,
+              core::ComponentReadinessAuthorityDTO::kRestartExclusion);
+    if (fail_) {
+      return core::Result<core::ComponentCommandReadinessDTO>::Err(
+          {"injected_readiness_failure", "restart readback unavailable",
+           {{"reason", "injected_readiness_failure"}}});
+    }
+    return kernel_.publish_component_command_readiness(publication);
+  }
+  core::Result<core::ComponentCommandReadinessDTO> ReadComponentCommandReadiness(
+      const core::ControllableComponentId &component) const override {
+    return kernel_.component_command_readiness(component);
+  }
+  std::size_t publications{};
+
+private:
+  core::ResourceAddressedExecutionKernel &kernel_;
+  bool fail_;
+};
+
+enum class ReadinessCase { kPublication, kFailedRestart, kRepeatedReconciliation };
+
+void CheckRetainedProductReadiness(ReadinessCase test_case) {
   const std::filesystem::path fixture_root =
       MANYFORGE_CCLC_READINESS_FIXTURE_ROOT;
   auto bundle = load_fixture_bundle(fixture_root);
@@ -1645,7 +1682,7 @@ TEST(RetainedNativeCCLCRuntime,
       {state_root,
        plan_root,
        bundle->value().cell_graph.cell_id,
-       {owner, 128U, 2U, 2U, 1'000'000LL, 1'000'000'000LL, 1'000'000'000LL}},
+       {owner, 128U, 2U, 2U, 1'000'000LL, 1'000'000'000LL}},
       1'000'000'000LL};
 
   const core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
@@ -1803,6 +1840,73 @@ TEST(RetainedNativeCCLCRuntime,
             "component_command_not_eligible");
   EXPECT_EQ(publication_owner.execute_count(), 0U);
 
+  if (test_case != ReadinessCase::kPublication) {
+    // Close and reopen the real durable CCLC owner while retaining the route
+    // and engine. Inject only the readiness port result, not recovery logic.
+    composition.value().reset();
+    ASSERT_TRUE(publication_owner.kernel().SetRouteRecoveryPending(true).ok());
+    const auto held_generation =
+        publication_owner.kernel().GetAuthoringAdmission().admission_generation;
+    RestartReadinessPort readiness(
+        publication_owner.kernel(), test_case == ReadinessCase::kFailedRestart);
+    config.composition.coordinator.request_owner_epoch =
+        core::RequestOwnerEpoch("cclc.native.readiness.restarted");
+    std::function<core::Result<void>()> reconcile;
+    auto recovered = CreateRecoveredRetainedNativeCellCCLCRuntime(
+        config, bundle, publication_store, publication.value(), artifacts,
+        catalogs, {{occurrence, brand_port}}, {runtime.binding}, kernel_ports,
+        kernel_ports, kernel_ports, publication_owner, readiness,
+        publication_owner.kernel(), clock, scheduler,
+        [](const core::ActiveControlConfigurationDTO &) {
+          ADD_FAILURE() << "Exact installed route must not be republished";
+          return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+              {"unexpected_adoption", "route should already be current", {}});
+        }, [] { return core::Result<void>::Ok(); }, reconcile);
+    EXPECT_EQ(readiness.publications, 1U);
+    EXPECT_EQ(brand_port->dispatch_count(), 2U);
+    if (test_case == ReadinessCase::kFailedRestart) {
+      ASSERT_FALSE(recovered.ok());
+      EXPECT_EQ(recovered.error().code, "injected_readiness_failure");
+      EXPECT_FALSE(reconcile);
+      EXPECT_FALSE(publication_owner.kernel().GetAuthoringAdmission().authoring_allowed);
+      EXPECT_EQ(publication_owner.kernel().GetAuthoringAdmission().admission_generation,
+                held_generation);
+      // Prove the restart exclusion itself is still held, not merely that
+      // another missing readiness fact happens to block commands.
+      const auto under_exclusion = publication_owner.kernel().publish_component_command_readiness(
+          {core::ComponentReadinessAuthorityDTO::kRestartExclusion, std::nullopt,
+           std::nullopt, runtime.component->controllable_component_id,
+           enabled_status.value()->acceptance.component_lifecycle_generation, false});
+      ASSERT_TRUE(under_exclusion.ok()) << under_exclusion.error().message;
+      EXPECT_FALSE(publication_owner.kernel().execute(motion_operation(runtime.binding)).ok());
+      EXPECT_EQ(publication_owner.execute_count(), 0U);
+    } else {
+      ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+      ASSERT_TRUE(reconcile);
+      const auto before = readiness.ReadComponentCommandReadiness(
+          runtime.component->controllable_component_id);
+      ASSERT_TRUE(before.ok());
+      EXPECT_TRUE(before.value().command_eligible);
+      const auto released_generation =
+          publication_owner.kernel().GetAuthoringAdmission().admission_generation;
+      for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto result = reconcile();
+        ASSERT_TRUE(result.ok()) << result.error().message;
+      }
+      EXPECT_EQ(readiness.publications, 1U);
+      EXPECT_EQ(brand_port->dispatch_count(), 2U);
+      EXPECT_EQ(publication_owner.kernel().GetAuthoringAdmission().admission_generation,
+                released_generation);
+      const auto after = readiness.ReadComponentCommandReadiness(
+          runtime.component->controllable_component_id);
+      ASSERT_TRUE(after.ok());
+      EXPECT_EQ(after.value(), before.value());
+      EXPECT_TRUE(publication_owner.kernel().execute(motion_operation(runtime.binding)).ok());
+      EXPECT_EQ(publication_owner.execute_count(), 1U);
+    }
+    return;
+  }
+
   // Publish the committed Active result as owner reconstruction would, under
   // the Kernel's restart exclusion and at the lifecycle generation.
   ASSERT_TRUE(publication_owner.kernel().SetRouteRecoveryPending(true).ok());
@@ -1837,6 +1941,18 @@ TEST(RetainedNativeCCLCRuntime,
       core::MotionInterruptStopMode::kSpringBackHold, false, std::nullopt);
 }
 
+TEST(RetainedNativeCCLCRuntime, RetainedProductPublishesRepositoryReadBackReadiness) {
+  CheckRetainedProductReadiness(ReadinessCase::kPublication);
+}
+
+TEST(RetainedNativeCCLCRuntime, FailedRestartReadinessKeepsAdmissionAndCommandsClosed) {
+  CheckRetainedProductReadiness(ReadinessCase::kFailedRestart);
+}
+
+TEST(RetainedNativeCCLCRuntime, RepeatedReconciliationAfterReleaseDoesNotReconstructOrDispatch) {
+  CheckRetainedProductReadiness(ReadinessCase::kRepeatedReconciliation);
+}
+
 TEST(RetainedNativeCCLCRuntime,
      RecoveredCellRejectsStalePhysicalBindingBeforeReadingOrPublishingRoutes) {
   const std::filesystem::path fixture_root =
@@ -1861,8 +1977,7 @@ TEST(RetainedNativeCCLCRuntime,
       {state_root,
        run_root,
        bundle->value().cell_graph.cell_id,
-       {owner, 128U, 2U, 2U, 1'000'000LL, 1'000'000'000LL,
-        1'000'000'000LL}},
+       {owner, 128U, 2U, 2U, 1'000'000LL, 1'000'000'000LL}},
       1'000'000'000LL};
   const deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(
       fixture_root / "retained-package");

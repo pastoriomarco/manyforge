@@ -236,6 +236,15 @@
   .pal-col > p { font-size: 0.72rem; color: var(--text-muted); }
   .pal { width: 100%; max-width: 280px; border: 1px solid #203542; border-radius: 0.45rem; background: #0a1720; overflow: hidden; }
   .pal-filter { padding: 0.38rem 0.42rem; border-bottom: 1px solid #203542; }
+  /* Pick/Place templates: compact buttons (option B) and today's cards (C). */
+  .pal-tpl-buttons { display: flex; gap: 0.35rem; padding: 0.38rem 0.42rem; border-bottom: 1px solid #203542; }
+  .pal-tpl-buttons > span { display: inline-flex; flex: 1 1 0; align-items: center; justify-content: center; gap: 0.35rem; min-height: 1.85rem; border: 1px solid #405764; border-radius: 0.4rem; color: #dbe8ee; background: #142b37; font-size: 0.74rem; font-weight: 650; }
+  .pal-tpl-buttons .cat-icon { --icon-px: 15px; width: 15px; height: 15px; }
+  .pal-tpl-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 0.45rem; padding: 0.38rem 0.42rem; border-bottom: 1px solid #203542; }
+  .pal-tpl-cards > span { position: relative; display: grid; justify-items: center; align-content: center; min-height: 5.6rem; padding: 0.35rem; border: 1px solid #405764; border-radius: 0.55rem; color: #e8f0f7; background: #142b37; text-align: center; }
+  .pal-tpl-cards strong { font-size: 1.05rem; line-height: 1.15; }
+  .pal-tpl-cards small { color: #87a5b3; font-size: 0.62rem; }
+  .pal-tpl-cards i { position: absolute; top: 0.25rem; left: 0.35rem; font-style: normal; font-size: 0.7rem; color: #c6d6dd; }
   .pal-filter span { display: block; min-height: 1.85rem; box-sizing: border-box; padding: 0.35rem 0.45rem; border: 1px solid #405764; border-radius: 0.4rem; color: #718994; font-size: 0.65rem; background: #0a1720; }
   .pal-list { padding: 0.22rem; }
   .pal-list section + section { margin-top: 0.35rem; }
@@ -363,9 +372,11 @@
         <div class="seg" id="pal-mark-switch" role="group" aria-labelledby="pal-mark-label"></div>
         <span class="control-label" id="pal-accent-label">Category accent</span>
         <div class="seg" id="pal-accent-switch" role="group" aria-labelledby="pal-accent-label"></div>
+        <span class="control-label" id="pal-tpl-label">Pick &amp; place templates</span>
+        <div class="seg" id="pal-tpl-switch" role="group" aria-labelledby="pal-tpl-label"></div>
       </div>
     </div>
-    <p class="note"><strong>Approved 2026-09-27:</strong> borderless rows, node icon in its family color, family-colored category accent. The palette as it was (left) and two lighter row styles, with the category header, filter, hover and the availability "i" unchanged. The leading mark switch shows today's kind symbol or the node icon from the canvas, in its family color or grey. The category accent switch colors the header's left bar and tint with the category's family color, matching its icons. Timer shows the amber "i" of a node that cannot execute; Move to pose shows the hover.</p>
+    <p class="note"><strong>Approved 2026-09-27:</strong> borderless rows, node icon in its family color, family-colored category accent. The palette as it was (left) and two lighter row styles, with the category header, filter, hover and the availability "i" unchanged. The leading mark switch shows today's kind symbol or the node icon from the canvas, in its family color or grey. The category accent switch colors the header's left bar and tint with the category's family color, matching its icons. The templates switch compares ways to show the Pick/Place subtree launchers (compact buttons approved 2026-09-27): a Templates category with ordinary rows, compact buttons under the filter, or today's cards. The templates open a short form and insert ordinary nodes; their icons use the gripper family color. Timer shows the amber "i" of a node that cannot execute; Move to pose shows the hover.</p>
     <div class="pal-grid" id="pal-grid"></div>
   </section>
 
@@ -480,7 +491,7 @@
   let treatment = saved.treatment || 'icon-only';
   let content = saved.content || 'simple';
   let statusMode = saved.statusMode || 'border';
-  const remember = () => { try { localStorage.setItem('node-palette-choices-v4', JSON.stringify({ chosen, treatment, content, statusMode, iconMode, nodeWidth, nameMode, bandWidth, nodeIconSize, statusOffset, guides, nameMargin, nodeIcons, paletteMark, paletteAccent, catFade })); } catch { /* storage unavailable */ } };
+  const remember = () => { try { localStorage.setItem('node-palette-choices-v4', JSON.stringify({ chosen, treatment, content, statusMode, iconMode, nodeWidth, nameMode, bandWidth, nodeIconSize, statusOffset, guides, nameMargin, nodeIcons, paletteMark, paletteAccent, catFade, paletteTemplates })); } catch { /* storage unavailable */ } };
 
   const glyph = (kind) => kind === 'composite' ? '◆' : kind === 'decorator' ? '◇' : '•';
   const hint = (kind) => kind === 'composite' ? 'n children' : kind === 'decorator' ? '1 child' : 'leaf';
@@ -893,6 +904,14 @@
 
   let paletteMark = saved.paletteMark || 'icon';
   let paletteAccent = saved.paletteAccent || 'family';
+  let paletteTemplates = saved.paletteTemplates || 'buttons';
+  // Template pictograms: an object lifted off a surface / set down onto it.
+  const TEMPLATE_ICONS = {
+    pick: '<path d="M2.5 14h11"/><rect x="5" y="9.5" width="6" height="4.5" rx="0.8"/><path d="M8 7.5V1.8"/><path d="M5.8 4 8 1.8 10.2 4"/>',
+    place: '<path d="M2.5 14h11"/><rect x="5" y="9.5" width="6" height="4.5" rx="0.8"/><path d="M8 1.8v5.7"/><path d="M5.8 5.3 8 7.5l2.2-2.2"/>',
+  };
+  const templateIcon = (kind) =>
+    `<span class="cat-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><g class="glyph">${TEMPLATE_ICONS[kind]}</g></svg></span>`;
   const PALETTE_SAMPLE = [
     ['control_flow', 'Control flow', [['sequence', 'Sequence', 'composite', 'ok'], ['fallback', 'Fallback', 'composite', 'ok'], ['parallel', 'Parallel', 'composite', 'ok'], ['inverter', 'Inverter', 'decorator', 'ok'], ['repeat', 'Repeat', 'decorator', 'ok'], ['retry', 'Retry', 'decorator', 'ok'], ['timer', 'Timer', 'leaf', 'warn']]],
     ['motion', 'Motion', [['motion.move_to_joint_target', 'Move to joint target', 'leaf', 'ok'], ['motion.move_to_pose', 'Move to pose', 'leaf', 'ok', 'hover'], ['motion.follow_cartesian_path', 'Follow Cartesian path', 'leaf', 'ok'], ['motion.move_until_signal', 'Move until signal', 'leaf', 'ok']]],
@@ -928,6 +947,27 @@
       b.addEventListener('click', () => { paletteAccent = value; renderAll(); });
       accentRoot.appendChild(b);
     }
+    const tplRoot = document.getElementById('pal-tpl-switch');
+    tplRoot.innerHTML = '';
+    for (const [value, text] of [['buttons', 'Compact buttons (approved)'], ['category', 'Templates category'], ['today', 'Today (cards)']]) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = text;
+      b.setAttribute('aria-pressed', String(paletteTemplates === value));
+      b.addEventListener('click', () => { paletteTemplates = value; renderAll(); });
+      tplRoot.appendChild(b);
+    }
+    const tplColor = option.bandColor.gripper;
+    const templates = paletteTemplates === 'category'
+      ? `<section><header class="pal-cat"${tplColor ? ` style="--cat-color:${tplColor}"` : ''}><strong>Templates</strong><div><small>2</small><i>⌄</i></div></header>`
+        + ['pick', 'place'].map((kind) => `<div class="pal-row" title="Opens a short form, then inserts ordinary nodes you can edit (gripper, motion, scene)."><span class="pal-item"><span class="pal-mark" style="${tplColor ? `--cat-color:${tplColor}` : ''}">${templateIcon(kind)}</span><strong>${kind === 'pick' ? 'Pick subtree' : 'Place subtree'}</strong></span><span class="pal-info">i</span></div>`).join('')
+        + '</section>'
+      : '';
+    const templatesAboveList = paletteTemplates === 'buttons'
+      ? `<div class="pal-tpl-buttons" style="${tplColor ? `--cat-color:${tplColor}` : ''}"><span>${templateIcon('pick')}Pick</span><span>${templateIcon('place')}Place</span></div>`
+      : paletteTemplates === 'today'
+        ? '<div class="pal-tpl-cards"><span><i>⊞</i><strong>Pick subtree</strong><small>Visible ordinary nodes</small></span><span><i>⊞</i><strong>Place subtree</strong><small>Visible ordinary nodes</small></span></div>'
+        : '';
     const mark = (cat, id, kind) => paletteMark === 'kind'
       ? `<span class="pal-mark">${kindSvg(kind)}</span>`
       : `<span class="pal-mark" style="${option.bandColor[cat] ? `--cat-color:${option.bandColor[cat]}` : ''}">${catIcon(cat, '', id)}</span>`;
@@ -938,8 +978,9 @@
         `<div class="pal-row${state ? ' ' + state : ''}"><span class="pal-item">${mark(cat, id, kind)}<strong>${escapeHtml(name)}</strong></span><span class="pal-info${info ? ' ' + info : ''}">i</span></div>`).join('');
       return `<section>${header}${rows}</section>`;
     }).join('');
+    const listWithTemplates = templates + list;
     document.getElementById('pal-grid').innerHTML = PALETTE_ROWS.map(([rows, title, text]) =>
-      `<div class="pal-col"><h3>${title}</h3><p>${text}</p><div class="pal rows-${rows} mark-${paletteMark} accent-${paletteAccent}"><div class="pal-filter"><span>Find a node</span></div><div class="pal-list">${list}</div></div></div>`).join('');
+      `<div class="pal-col"><h3>${title}</h3><p>${text}</p><div class="pal rows-${rows} mark-${paletteMark} accent-${paletteAccent}"><div class="pal-filter"><span>Find a node</span></div>${templatesAboveList}<div class="pal-list">${listWithTemplates}</div></div></div>`).join('');
   }
 
   function renderAll() {

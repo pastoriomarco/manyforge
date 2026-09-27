@@ -608,7 +608,7 @@ export function HeadlessRuntimeSurfacesView({
           />
           ))}
           {actionError !== null && (
-          <p className="error-state" role="alert">{actionError}</p>
+          <p className="error-state notice severity-error" role="alert">{actionError}</p>
           )}
           {error !== null && (
           <button type="button" className="text-button" onClick={reconnect}>

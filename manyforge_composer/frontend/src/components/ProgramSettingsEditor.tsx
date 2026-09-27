@@ -506,9 +506,9 @@ export function ProgramSettingsEditor({
           control further scales current and subsequent compatible moves for
           the addressed target without changing these Program values.
         </p>
-        {motionError && <p className="program-settings-error" role="alert">{motionError}</p>}
+        {motionError && <p className="inline-message severity-error" role="alert">{motionError}</p>}
         {!motionConfiguration.available || motion === null ? (
-          <p className="program-settings-error" role="status">
+          <p className="inline-message severity-error" role="status">
             Program-wide motion controls are unavailable. {motionConfiguration.available
               ? 'The current values could not be read.'
               : motionConfiguration.reason}

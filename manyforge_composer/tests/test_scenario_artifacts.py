@@ -28,7 +28,6 @@ from manyforge_composer.backend.scenario_artifacts import (
     build_scenario_document,
     capture_scenario_artifact,
     capture_scenario_artifact_with_diagnostics,
-    convert_legacy_scenario_artifact,
     discover_scenario_artifacts,
     export_scenario_artifact,
     load_scenario_artifact,
@@ -771,26 +770,13 @@ def test_capture_reads_one_source_identity(tmp_path: Path) -> None:
     assert digest.startswith("sha256:")
 
 
-def test_legacy_file_requires_explicit_conversion(tmp_path: Path) -> None:
+def test_single_file_scenario_is_not_a_project(tmp_path: Path) -> None:
     source = tmp_path / "legacy.scenario.yaml"
     source.write_text(json.dumps(_document()), encoding="utf-8")
 
     with pytest.raises(ScenarioArtifactError) as direct:
         load_scenario_artifact(str(source), allowed_roots=[str(tmp_path)])
-    assert direct.value.code == "scenario_legacy_conversion_required"
-
-    destination = convert_legacy_scenario_artifact(
-        str(source),
-        str(tmp_path / "converted"),
-        allowed_roots=[str(tmp_path)],
-        overwrite=False,
-    )
-    loaded, loaded_path = load_scenario_artifact(
-        destination, allowed_roots=[str(tmp_path)]
-    )
-    assert loaded == _document()
-    assert loaded_path == str((tmp_path / "converted").resolve())
-    assert source.is_file()
+    assert direct.value.code == "scenario_artifact_path_invalid"
 
 
 def test_valid_hand_edit_is_loaded_and_reported_changed(tmp_path: Path) -> None:

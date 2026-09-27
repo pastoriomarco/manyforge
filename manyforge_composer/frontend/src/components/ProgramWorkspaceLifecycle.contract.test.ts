@@ -84,9 +84,13 @@ describe('Program workspace lifecycle controls', () => {
       new URL('./ProgramDocumentControls.tsx', import.meta.url),
       'utf8',
     );
+    const scenarioSource = readFileSync(
+      new URL('./ScenarioDocumentCommands.tsx', import.meta.url),
+      'utf8',
+    );
 
-    expect(source).toContain('New Program');
-    expect(source).toContain('newDraft(confirmDiscard)');
+    expect(scenarioSource).toContain('New Scenario');
+    expect(scenarioSource).toContain('newDraft(confirmDiscard)');
     expect(source).toContain('Revert to saved');
     expect(source).toContain('Discard changes');
     expect(source).toContain('return to the Applied Program');
@@ -189,17 +193,21 @@ describe('Program workspace lifecycle controls', () => {
       new URL('./ProgramDocumentControls.tsx', import.meta.url),
       'utf8',
     );
+    const scenarioSource = readFileSync(
+      new URL('./ScenarioDocumentCommands.tsx', import.meta.url),
+      'utf8',
+    );
     expect(source).toContain('Apply this Program Draft to');
     expect(source).toContain('Its Deployment will not change.');
-    expect(source).toContain('loadScenarioDocument(');
-    expect(source).not.toContain('loadScenario(');
+    expect(scenarioSource).toContain('loadScenarioDocument(');
+    expect(scenarioSource).not.toContain('loadScenario(');
     expect(source).toContain('currentScenarioProjection?.currentScenario');
     expect(source).not.toContain('applyDraft(selectedScenario');
     expect(source).not.toContain('Load and Apply Program');
-    expect(source).toContain('Load replaces the current Scenario and applies its Deployment, Scene and Program.');
-    expect(source).toContain('Replace current unsaved or unapplied Draft changes');
-    expect(source).not.toContain('Open as Draft only');
-    expect(source).not.toContain('confirmScenarioDeployment');
+    expect(scenarioSource).toContain('Load replaces the current Scenario and applies its Deployment, Scene and Program.');
+    expect(scenarioSource).toContain('Replace current unsaved or unapplied Draft changes');
+    expect(scenarioSource).not.toContain('Open as Draft only');
+    expect(scenarioSource).not.toContain('confirmScenarioDeployment');
   });
 
   it('reflects backend idle admission instead of silently dropping UI actions', () => {

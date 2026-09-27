@@ -12,16 +12,6 @@
   font-size: var(--mf-font-size-068);
 }
 
-.catalog-notice {
-  margin: 0;
-  padding: 0.68rem 1rem;
-  border-bottom: 1px solid var(--mf-border-neutral-19);
-  color: var(--mf-text-neutral-68);
-  background: var(--mf-bg-neutral-08);
-  font-size: var(--mf-font-size-076);
-  line-height: 1.45;
-}
-
 .catalog-filters {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(10rem, 0.4fr);

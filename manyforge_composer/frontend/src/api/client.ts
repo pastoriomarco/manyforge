@@ -31,7 +31,6 @@ import {
   parseRuntimeScaleControlStatus,
   parseScenarioDocumentIndexResponse,
   parseScenarioDocumentExportResponse,
-  parseScenarioDocumentConversionResponse,
   parseScenarioDocumentLoadResponse,
   parseScenarioDocumentSaveResponse,
   parseSceneTransactionResponse,
@@ -78,7 +77,6 @@ import type {
   RuntimeOverrideMaterializationResponse,
   ScenarioDocumentFenceRequest,
   ScenarioDocumentExportResponse,
-  ScenarioDocumentConversionResponse,
   ScenarioDocumentIndexResponse,
   ScenarioDocumentLoadResponse,
   ScenarioDocumentSaveResponse,
@@ -708,20 +706,6 @@ export const api = {
           path,
           confirmDiscard,
         }),
-      },
-    ),
-    convertLegacy: (
-      sourcePath: string,
-      destinationPath: string,
-      confirmOverwrite: boolean,
-      signal?: AbortSignal,
-    ): Promise<ScenarioDocumentConversionResponse> => requestJson(
-      '/api/scenario-documents/convert-legacy',
-      parseScenarioDocumentConversionResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({ sourcePath, destinationPath, confirmOverwrite }),
       },
     ),
     export: (

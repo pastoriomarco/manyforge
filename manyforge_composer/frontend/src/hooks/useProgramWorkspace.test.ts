@@ -18,7 +18,6 @@ const apiMock = vi.hoisted(() => ({
   scenarioDocuments: {
     save: vi.fn(),
     load: vi.fn(),
-    convertLegacy: vi.fn(),
   },
 }));
 

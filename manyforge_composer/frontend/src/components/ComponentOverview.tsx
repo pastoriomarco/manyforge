@@ -54,7 +54,7 @@ export function ComponentOverview({
             <small>{connectionDetail}</small>
           </div>
         </header>
-        {error !== null && <p className="error-state" role="alert">{error}</p>}
+        {error !== null && <p className="error-state notice severity-error" role="alert">{error}</p>}
         {status === null ? (
           <p className="muted">Waiting for current owner projections.</p>
         ) : (

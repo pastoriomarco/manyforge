@@ -58,13 +58,9 @@
   white-space: nowrap;
 }
 
-.deployment-run-gate,
-.deployment-field-error {
+.deployment-run-gate {
   color: var(--mf-text-danger-77);
   background: var(--mf-bg-danger-16);
-}
-
-.deployment-run-gate {
   padding: 0.42rem 0.7rem;
   border-bottom: 1px solid var(--mf-border-danger-35);
   font-size: var(--mf-font-size-068);
@@ -242,18 +238,6 @@
 
 .deployment-field-error {
   grid-column: 2;
-  padding: 0.25rem 0.4rem;
-  border-radius: var(--mf-radius-xs);
-  font-size: var(--mf-font-size-065);
-}
-
-.deployment-field-error button {
-  min-height: auto;
-  padding: 0;
-  border: 0;
-  color: inherit;
-  background: transparent;
-  text-decoration: underline;
 }
 
 .deployment-array-row {
@@ -687,15 +671,6 @@
 .cclc-lifecycle-actions {
   flex-wrap: wrap;
   justify-content: flex-start;
-}
-
-/* Info notice; the same look as .workbench-notice.severity-info. */
-.authoring-unavailable-notice {
-  padding: 0.42rem 0.7rem;
-  border-bottom: 1px solid var(--mf-border-neutral-34);
-  color: var(--mf-text-neutral-81);
-  background: var(--mf-bg-neutral-15);
-  font-size: var(--mf-font-size-068);
 }
 
 .inline-fields {

@@ -616,7 +616,7 @@ export function ProgramPropertyEditor({
                 </div>
               ) : repairMode ? (
                 <>
-                  <p className="program-form-error" role="alert">
+                  <p className="program-form-error inline-message severity-error" role="alert">
                     Catalog-invalid value: {literalValidation}. Repair it as strict JSON; specialized controls are disabled to preserve every represented field.
                   </p>
                   <DraftTextarea

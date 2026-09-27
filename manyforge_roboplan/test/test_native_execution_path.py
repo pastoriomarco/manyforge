@@ -335,8 +335,10 @@ def _wait_for_cclc_component(execution_run_root: Path) -> dict[str, Any]:
     raise RuntimeError(f"native CCLC socket did not become ready: {last_error}")
 
 
-def _cclc_active_routes_are_current(snapshot: Mapping[str, Any]) -> bool:
-    if snapshot.get("component_lifecycle_state") != "active":
+def _cclc_routes_are_current(
+    snapshot: Mapping[str, Any], *, expected_state: str = "active"
+) -> bool:
+    if snapshot.get("component_lifecycle_state") != expected_state:
         return False
     provider_epochs = {
         (
@@ -350,6 +352,7 @@ def _cclc_active_routes_are_current(snapshot: Mapping[str, Any]) -> bool:
     return bool(domains) and all(
         isinstance(domain, Mapping)
         and isinstance(active := domain.get("active_control_configuration"), Mapping)
+        and active.get("state") == "reconciled"
         and provider_epochs.get(
             (
                 domain.get("control_domain_id"),
@@ -381,6 +384,8 @@ def _wait_for_component_lifecycle_management(execution_run_root: Path) -> None:
 
 def _wait_for_current_cclc_routes(
     execution_run_root: Path,
+    *,
+    expected_state: str = "active",
 ) -> dict[str, Any]:
     client = CCLCOpenRequestClient(execution_run_root, timeout_seconds=1.0)
     execution = ExecutionCommandClient(execution_run_root, timeout_seconds=1.0)
@@ -390,9 +395,10 @@ def _wait_for_current_cclc_routes(
         try:
             last_snapshot = client.component_snapshot("lite6_arm")
             identity = execution.identity()["identity"]
-            if _cclc_active_routes_are_current(last_snapshot) and identity[
-                "control_management_mode"
-            ] == "component_lifecycle":
+            if (
+                _cclc_routes_are_current(last_snapshot, expected_state=expected_state)
+                and identity["control_management_mode"] == "component_lifecycle"
+            ):
                 return last_snapshot
         except HeadlessApiError:
             pass
@@ -1393,10 +1399,14 @@ def test_native_disable_closes_arm_and_gripper_dispatch(
             fixture_root, state_root, run_root, manifest, qualify_cclc=False
         )
         _wait_for_component_lifecycle_management(run_root)
+        _wait_for_current_cclc_routes(run_root, expected_state="disabled")
         restarted_snapshot = CCLCOpenRequestClient(run_root).component_snapshot(
             "lite6_arm"
         )
         assert restarted_snapshot["component_lifecycle_state"] == "disabled"
+        assert restarted_snapshot["component_lifecycle_generation"] == (
+            snapshot["component_lifecycle_generation"]
+        )
         assert all(
             domain["active_control_configuration"] is not None
             for domain in restarted_snapshot["domains"]
@@ -1411,19 +1421,22 @@ def test_native_disable_closes_arm_and_gripper_dispatch(
                     positions_rad=arm_positions,
                 )
             )
-        # The Disabled component's adopted route is installed but not current,
-        # which is the first refusal; its eligibility is closed as well.
-        assert refused_after_restart.value.details.get("reason") in {
-            "runtime_route_publication_required",
-            "runtime_route_configuration_not_ready",
-        }, refused_after_restart.value.details
+        # Route verification did not grant command permission or Enable it.
+        assert refused_after_restart.value.details.get("reason") == (
+            "component_command_not_eligible"
+        ), refused_after_restart.value.details
+        with pytest.raises(HeadlessClientError) as gripper_refused_after_restart:
+            headless.execute(_direct_control_gripper_operation(
+                restarted, request_id="disabled.gripper.after-restart", position=0.02
+            ))
+        assert gripper_refused_after_restart.value.details.get("reason") == (
+            "component_command_not_eligible"
+        ), gripper_refused_after_restart.value.details
 
         _submit_native_cclc_lifecycle(
             run_root, intent_kind="prepare", request_id="process.lifecycle.reprepare"
         )
-        # The restarted owner kept the Disabled component's routes adopted but
-        # not current; Enable requires current routes, so select them first.
-        _submit_native_cclc_routes(run_root)
+        # No manual route selection is needed after verified reconstruction.
         _submit_native_cclc_lifecycle(
             run_root, intent_kind="enable", request_id="process.lifecycle.reenable"
         )

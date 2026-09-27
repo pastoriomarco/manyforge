@@ -78,7 +78,7 @@ export interface CCLCDesiredConfiguration {
 export interface CCLCComponentExpectation {
   controllable_component_id: string;
   expected_component_lifecycle_generation: number;
-  expected_component_lifecycle_state: 'prepared' | 'active';
+  expected_component_lifecycle_state: 'prepared' | 'active' | 'disabled';
 }
 
 export interface CCLCRouteTemplate {

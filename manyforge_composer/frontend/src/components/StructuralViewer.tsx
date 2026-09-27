@@ -3320,7 +3320,11 @@ function StructuralViewerContent({
               onClick={() => issueCameraCommand('frame_all')}
               title="Frame all visible content"
             >
-              <span className="viewer-camera-icon" aria-hidden="true">⊞</span>
+              {/* Drawn, like the crosshair, so it is centered regardless of font metrics. */}
+              <svg className="viewer-camera-icon" viewBox="0 0 16 16" aria-hidden="true">
+                <rect x="2.25" y="2.25" width="11.5" height="11.5" rx="1.5" />
+                <path d="M8 2.25v11.5M2.25 8h11.5" />
+              </svg>
             </button>
             <button
               type="button"
@@ -3344,7 +3348,10 @@ function StructuralViewerContent({
               onClick={() => issueCameraCommand('reset')}
               title="Reset camera"
             >
-              <span className="viewer-camera-icon" aria-hidden="true">↺</span>
+              <svg className="viewer-camera-icon" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M2.7 8.3a5.3 5.3 0 1 0 1.55-3.75" />
+                <path d="M4.25 1.75v2.8h2.8" />
+              </svg>
             </button>
             {(inspectorPanel === 'object' || inspectorPanel === 'robot') && (
               <>

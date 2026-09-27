@@ -127,11 +127,6 @@ struct RuntimeEpochRouteReconciliation final {
   core::RuntimeEpoch source_runtime_epoch;
   std::optional<core::RouteSelectionTransactionId> transaction_id;
   bool settled{};
-  /// The retained component is explicitly Disabled. Route selection admits
-  /// only Prepared/Active expectations, so its adopted predecessor stays
-  /// installed and command-closed; Prepare, route selection and Enable later
-  /// establish a current route.
-  bool retained_disabled{};
 };
 
 struct RuntimeEpochRouteReconciliationState final {
@@ -264,21 +259,12 @@ adopt_durable_route_configurations(
           return core::Result<std::vector<RuntimeEpochRouteReconciliation>>::
               Err(adopted.error());
         }
-        const auto retained_fact = std::find_if(
-            facts.value().components.begin(), facts.value().components.end(),
-            [&](const auto &candidate) {
-              return candidate.controllable_component_id == *current_component_id;
-            });
         reconciliations.push_back({
             .predecessor = active,
             .controllable_component_id = *current_component_id,
             .source_runtime_epoch = *current_source_epoch,
             .transaction_id = std::nullopt,
             .settled = false,
-            .retained_disabled =
-                retained_fact != facts.value().components.end() &&
-                retained_fact->current_state ==
-                    core::ComponentLifecycleStateDTO::kDisabled,
         });
         continue;
       }
@@ -451,12 +437,6 @@ adopt_durable_route_configurations(
     auto &required = reconciliations[index];
     if (required.settled)
       continue;
-    if (required.retained_disabled) {
-      // Keep the adopted predecessor installed and command-closed; no
-      // controller recovery runs for an explicitly Disabled component.
-      required.settled = true;
-      continue;
-    }
     if (!required.transaction_id) {
       if (!composition.coordinator().accepting_new_requests()) {
         return reject<void>("native_cclc_restart_recovery_pending",

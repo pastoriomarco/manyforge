@@ -295,7 +295,7 @@ export function ExecutionHistoryPanel({
       </details>}
       <div className="history-events">
         {loading && <p className="muted">Loading history…</p>}
-        {error && <p className="error-state" role="alert">{error}</p>}
+        {error && <p className="error-state notice severity-error" role="alert">{error}</p>}
         {!loading && !error && events.length === 0 && (
           <p className="muted">No events match these filters.</p>
         )}
@@ -336,7 +336,7 @@ export function ExecutionHistoryPanel({
       {(detailLoading || detailError !== null || selectedDetail !== null) && (
         <section className="history-detail" aria-label="Selected history event detail">
           {detailLoading && <p className="muted">Loading exact event detail…</p>}
-          {detailError && <p className="error-state" role="alert">{detailError}</p>}
+          {detailError && <p className="error-state notice severity-error" role="alert">{detailError}</p>}
           {selectedDetail && (
             <>
               <header>

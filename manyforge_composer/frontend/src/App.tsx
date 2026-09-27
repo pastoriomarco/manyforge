@@ -14,6 +14,7 @@ import {
   shouldCloseAutomaticRuntimeAttention,
 } from './components/RuntimeAttentionAutoOpen';
 import { ProgramDocumentControls } from './components/ProgramDocumentControls';
+import { ScenarioDocumentCommands } from './components/ScenarioDocumentCommands';
 import { OverlayPanel } from './components/OverlayPanel';
 import { PaneDivider } from './components/PaneDivider';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
@@ -76,7 +77,6 @@ const PROGRAM_ACTION_LABELS: Partial<Record<ProgramWorkspaceActionName, string>>
   revert: 'Submitting Program Revert',
   load: 'Loading Program',
   load_scenario_document: 'Submitting Scenario Load',
-  convert_legacy_scenario_document: 'Converting legacy Scenario',
   export_scenario_document: 'Exporting Scenario',
   save: 'Saving Program',
   save_as: 'Saving Program as',
@@ -821,6 +821,14 @@ export default function App() {
   const deploymentTitle = programInvalidEdit
     ? `Review or discard the invalid Program field edit first. Component status: ${deploymentStatus.accessibleLabel}. ${deploymentStatus.detail}`
     : `${deploymentStatus.accessibleLabel}. ${deploymentStatus.detail}`;
+  // New/Save/Save as/Load act on the whole Scenario in every workspace.
+  const scenarioCommands = (
+    <ScenarioDocumentCommands
+      controller={programController}
+      deploymentDirty={deploymentController.workspace?.draft.differsFromSaved === true}
+      localInvalidEdit={programInvalidEdit}
+    />
+  );
 
   return (
     <main className="app-shell">
@@ -893,10 +901,14 @@ export default function App() {
           </button>
         </nav>
         {activeWorkspace === 'deployment' ? (
-          <DeploymentDocumentControls controller={deploymentController} />
+          <DeploymentDocumentControls
+            controller={deploymentController}
+            scenarioCommands={scenarioCommands}
+          />
         ) : (
           <ProgramDocumentControls
             controller={programController}
+            scenarioCommands={scenarioCommands}
             runtime={programRuntime}
             catalogEntries={catalog.status === 'ready' ? catalog.data.entries : []}
             localInvalidEdit={programInvalidEdit}

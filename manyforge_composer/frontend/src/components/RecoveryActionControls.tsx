@@ -78,7 +78,7 @@ export function RecoveryCommandNotice({
   onDismiss: () => void;
 }) {
   return (
-    <div role="alert" className="recovery-command-notice">
+    <div role="alert" className="recovery-command-notice notice severity-warning">
       <span>
         <strong>Recovery action did not start.</strong> {message}
       </span>

@@ -25,8 +25,7 @@
 }
 
 .assistant-mode-description,
-.assistant-status,
-.assistant-notice {
+.assistant-status {
   margin: 0;
 }
 
@@ -69,10 +68,6 @@
   margin-bottom: 0;
 }
 
-.assistant-error {
-  color: var(--mf-text-danger-81);
-}
-
 .assistant-draft-provenance {
   color: var(--mf-text-warning-69);
   font-weight: var(--mf-font-weight-semibold);
@@ -106,12 +101,5 @@
 
 .assistant-proposal-actions span {
   color: var(--mf-text-neutral-64b);
-  font-size: var(--mf-font-size-068);
-}
-
-.assistant-warnings {
-  margin: 0;
-  padding-left: 1.1rem;
-  color: var(--mf-text-warning-79);
   font-size: var(--mf-font-size-068);
 }

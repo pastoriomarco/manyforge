@@ -548,7 +548,7 @@ function NumberDraft({
         />
         {unit && <small>{unit}</small>}
       </span>
-      {invalid && <small className="deployment-field-error">Value was rejected.</small>}
+      {invalid && <small className="deployment-field-error inline-message severity-error">Value was rejected.</small>}
     </label>
   );
 }
@@ -618,7 +618,7 @@ function OptionalNumberDraft({
         />
         <small>{unit}</small>
       </span>
-      {invalid && <small className="deployment-field-error">
+      {invalid && <small className="deployment-field-error inline-message severity-error">
         {maximum === 0 ? 'Enable ordinary jerk shaping first, or leave blank.'
           : minimum !== undefined ? `Use at least ${minimum}${maximum === undefined ? '' : ` and at most ${maximum}`}, or clear the manual jerk cap first.`
           : maximum === undefined ? 'Enter a positive value, or leave blank.'
@@ -1515,7 +1515,7 @@ function GripperSection({
                     />
                   </label>
                 </div>
-                {error !== null && <p className="deployment-field-error" role="alert">{error}</p>}
+                {error !== null && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
                 <div className="button-row">
                   <button
                     type="button"

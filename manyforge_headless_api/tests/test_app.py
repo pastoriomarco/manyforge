@@ -29,6 +29,7 @@ from manyforge_headless_api.app import (
 )
 from manyforge_headless_api.cell_admission import CellAdmissionError
 from manyforge_headless_api.control_state import HeadlessControlStateSource
+from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.models import (
     ManagerApplyRequest,
     ProgramCycleResetRequest,
@@ -233,6 +234,63 @@ def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("deployment_candidate_cell_mismatch") == 409
     assert _error_status("manual_operation_scope_stale") == 409
     assert _error_status("program_required_component_not_active") == 409
+    assert _error_status("route_selection_component_not_ready") == 409
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_status"),
+    [
+        ("execution_owner_not_ready", 503),
+        ("execution_command_response_invalid", 502),
+        ("headless_api_internal_failure", 500),
+        ("unexpected_owner_failure", 500),
+    ],
+)
+@pytest.mark.parametrize(
+    "projection", ["identity", "targets", "control_state", "diagnostics"]
+)
+@pytest.mark.parametrize("raise_error", [False, True])
+def test_execution_projection_refusal_preserves_http_class_and_owner_details(
+    code: str,
+    expected_status: int,
+    projection: str,
+    raise_error: bool,
+) -> None:
+    execution = FakeExecution()
+    message = "the managed execution owner has no active physical product"
+    details = {"owner_epoch": "native-owner.empty"}
+
+    envelope = {
+        "api_version": "manyforge.execution_command_response.v1",
+        "ok": False,
+        "error": {"code": code, "message": message, "details": details},
+    }
+
+    def refuse() -> dict[str, Any]:
+        # Projection reads return the owner envelope; typed callers can raise it.
+        if raise_error:
+            return ExecutionCommandClient.require_success(envelope)
+        return envelope
+
+    setattr(execution, projection, refuse)
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/execution/" + projection.replace("_", "-"),
+            headers={"X-Request-ID": "empty-runtime-check"},
+        )
+    assert response.status_code == expected_status
+    if raise_error:
+        assert response.json()["detail"] == {
+            "code": code,
+            "message": message,
+            "details": details,
+            "request_id": "empty-runtime-check",
+        }
+    else:
+        assert response.json() == envelope
+    assert response.headers["X-Request-ID"] == "empty-runtime-check"
+    assert execution.requests == []
 
 
 def test_full_native_applied_program_projection_is_accepted() -> None:

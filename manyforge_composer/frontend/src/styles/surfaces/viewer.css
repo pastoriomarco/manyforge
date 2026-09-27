@@ -32,14 +32,14 @@
 
 .viewer-scene-source-toggle {
   flex: 0 0 auto;
-  height: var(--mf-viewer-control-height);
+  height: var(--mf-toolbar-control-height);
   box-sizing: border-box;
-  padding: 0.38rem 0.8rem;
+  padding: 0.28rem 0.6rem;
   border: 1px solid var(--mf-border-warning-43);
   border-radius: var(--mf-radius-md);
   color: var(--mf-text-warning-77);
   background: var(--mf-bg-warning-17);
-  font-size: var(--mf-font-size-076);
+  font-size: var(--mf-font-size-068);
   white-space: nowrap;
 }
 
@@ -219,9 +219,9 @@
 }
 
 .viewer-tool-strip {
-  --viewer-tool-size: calc(var(--mf-viewer-control-height) - 0.36rem - 2px);
+  --viewer-tool-size: calc(var(--mf-toolbar-control-height) - 0.36rem - 2px);
   display: flex;
-  height: var(--mf-viewer-control-height);
+  height: var(--mf-toolbar-control-height);
   box-sizing: border-box;
   align-items: center;
   gap: 0.25rem;
@@ -239,7 +239,9 @@
   height: var(--viewer-tool-size);
   min-height: var(--viewer-tool-size);
   place-items: center;
-  padding: 0.2rem;
+  /* No padding: the icon must fit the button, or grid centering overflows
+     toward the bottom right instead of centering. */
+  padding: 0;
   font-size: var(--mf-font-size-072);
   line-height: 1;
 }
@@ -259,11 +261,11 @@
 
 .viewer-camera-icon {
   display: block;
-  width: 1.35rem;
-  height: 1.35rem;
+  width: 1.05rem;
+  height: 1.05rem;
   flex: none;
-  font-size: 1.25rem;
-  line-height: 1.35rem;
+  font-size: 1rem;
+  line-height: 1.05rem;
   text-align: center;
 }
 
@@ -338,7 +340,7 @@ svg.viewer-camera-icon {
 
 .viewer-target-status {
   position: absolute;
-  top: calc(var(--mf-viewer-control-height) + 2 * var(--mf-viewer-overlay-inset));
+  top: calc(var(--mf-toolbar-control-height) + 2 * var(--mf-viewer-overlay-inset));
   left: 0.65rem;
   z-index: var(--mf-z-controls);
   display: flex;
@@ -464,10 +466,10 @@ svg.viewer-camera-icon {
 
 .viewer-surface-launchers > button,
 .viewer-options > summary {
-  height: var(--mf-viewer-control-height);
+  height: var(--mf-toolbar-control-height);
   box-sizing: border-box;
-  padding: 0.38rem 0.8rem;
-  font-size: var(--mf-font-size-076);
+  padding: 0.28rem 0.6rem;
+  font-size: var(--mf-font-size-068);
 }
 
 .viewer-surface-launchers > button[aria-pressed='true'] {

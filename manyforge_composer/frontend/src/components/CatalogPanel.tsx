@@ -150,7 +150,7 @@ export function CatalogPanel({ catalog, onRetry }: CatalogPanelProps) {
               environment {shortDigest(catalog.data.environmentDigest)}
             </span>
           </div>
-          <p className="catalog-notice">
+          <p className="notice severity-info notice-strip">
             Schema and execution declarations are shown for authoring reference;
             they do not assert that an implementation or runtime is available.
           </p>

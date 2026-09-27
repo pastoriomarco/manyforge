@@ -37,7 +37,6 @@ import {
   parseProgramCycleStatus,
   parseProgramRuntimeControlProjection,
   parseScenarioDocumentIndexResponse,
-  parseScenarioDocumentConversionResponse,
   parseScenarioDocumentExportResponse,
   parseScenarioDocumentLoadResponse,
   parseScenarioDocumentSaveResponse,
@@ -210,18 +209,6 @@ describe('editable Scenario document transport', () => {
       workspace: workspaceFixture(),
       authoringWorkspace: authoringWorkspaceFixture(),
     })).toThrow('status');
-  });
-
-  it('parses explicit legacy conversion without treating it as a Load', () => {
-    expect(parseScenarioDocumentConversionResponse({
-      status: 'converted',
-      source_path: '/workspace/legacy.scenario.yaml',
-      path: '/workspace/cell',
-    })).toEqual({
-      status: 'converted',
-      sourcePath: '/workspace/legacy.scenario.yaml',
-      path: '/workspace/cell',
-    });
   });
 
   it('parses an explicit portable project export', () => {

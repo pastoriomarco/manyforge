@@ -222,8 +222,6 @@ Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
       !candidate.durable_component_generation_predecessor.nonzero() ||
       candidate.durable_component_generation_predecessor.value() ==
           std::numeric_limits<std::uint64_t>::max() ||
-      candidate.containment_only_disable_timeout_duration_ns <= 0 ||
-      candidate.containment_only_disable_timeout_duration_ns > kMaxLifecycleTransactionTimeoutNs ||
       intent.expected_component_lifecycle_generation.value() ==
           std::numeric_limits<std::uint64_t>::max()) {
     return reject("component_lifecycle_admission_invalid",
@@ -347,8 +345,7 @@ Result<PreparedComponentLifecycleAdmission> PrepareComponentLifecycleAdmission(
 
   return Result<PreparedComponentLifecycleAdmission>::Ok(
       {std::move(acceptance), std::move(initial_status), std::move(reserved_domains),
-       std::move(qualified_catalogs), lifecycle_mutation_eligible,
-       candidate.disable_handoff_admission});
+       std::move(qualified_catalogs), lifecycle_mutation_eligible});
 }
 
 }  // namespace manyforge::core

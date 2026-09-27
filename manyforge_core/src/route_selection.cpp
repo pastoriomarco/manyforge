@@ -284,7 +284,8 @@ bool RouteSelectionComponentExpectationDTO::locally_valid() const noexcept {
   return bounded_identity(controllable_component_id) &&
          expected_component_lifecycle_generation.nonzero() &&
          (expected_component_lifecycle_state == ComponentLifecycleStateDTO::kPrepared ||
-          expected_component_lifecycle_state == ComponentLifecycleStateDTO::kActive);
+          expected_component_lifecycle_state == ComponentLifecycleStateDTO::kActive ||
+          expected_component_lifecycle_state == ComponentLifecycleStateDTO::kDisabled);
 }
 
 bool CanonicalRouteSelectionComponentExpectationLess(
@@ -903,7 +904,8 @@ bool CCLCRouteSelectionRequestResultDTO::locally_valid() const noexcept {
 }
 
 Result<PreparedRouteSelectionAdmission> PrepareRouteSelectionAdmission(
-    const RouteSelectionIntentDTO& intent, const RouteSelectionAdmissionCandidate& candidate) {
+    const RouteSelectionIntentDTO& intent, const RouteSelectionAdmissionCandidate& candidate,
+    bool observation_only_recovery) {
   if (!intent.locally_valid() || !intent.expected_admission_generation ||
       !bounded_identity(candidate.route_selection_transaction_id) ||
       !candidate.route_selection_transaction_generation.nonzero() ||
@@ -930,6 +932,16 @@ Result<PreparedRouteSelectionAdmission> PrepareRouteSelectionAdmission(
     return reject("route_selection_current_snapshot_mismatch",
                   "the complete current contributing-component set differs from the request",
                   "component_expectations_changed");
+  }
+  if (!observation_only_recovery &&
+      std::any_of(intent.component_expectations.begin(), intent.component_expectations.end(),
+                  [](const auto& row) {
+                    return row.expected_component_lifecycle_state ==
+                           ComponentLifecycleStateDTO::kDisabled;
+                  })) {
+    return reject("route_selection_component_not_ready",
+                  "ordinary route selection requires Prepared or Active components",
+                  "component_disabled");
   }
   if (candidate.expected_controller_domain.desired_configuration != intent.desired_configuration ||
       !observation_query_matches_configuration(

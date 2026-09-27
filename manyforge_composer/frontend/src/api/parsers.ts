@@ -82,7 +82,6 @@ import type {
   ProgramWorkspaceTransitionResponse,
   ScenarioDocumentDisplayStatus,
   ScenarioDocumentExportResponse,
-  ScenarioDocumentConversionResponse,
   ScenarioDocumentIndexResponse,
   ScenarioDocumentLoadResponse,
   ScenarioDocumentSaveResponse,
@@ -3445,21 +3444,6 @@ export function parseScenarioDocumentExportResponse(
   const status = stringAt(record.status, `${path}.status`);
   if (status !== 'exported') return fail(`${path}.status`, 'exported');
   return { status, path: stringAt(record.path, `${path}.path`) };
-}
-
-export function parseScenarioDocumentConversionResponse(
-  value: unknown,
-): ScenarioDocumentConversionResponse {
-  const path = 'scenarioDocumentConversion';
-  const record = objectAt(value, path);
-  exactKeysAt(record, ['path', 'source_path', 'status'], path);
-  const status = stringAt(record.status, `${path}.status`);
-  if (status !== 'converted') return fail(`${path}.status`, 'converted');
-  return {
-    status,
-    sourcePath: stringAt(record.source_path, `${path}.source_path`),
-    path: stringAt(record.path, `${path}.path`),
-  };
 }
 
 export function parseDeploymentWorkspaceResponse(

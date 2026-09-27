@@ -199,7 +199,7 @@ export function DeploymentCompositionPanel({
       )}
 
       {deploymentController.mutationUnavailableReason && (
-        <div className="authoring-unavailable-notice">
+        <div className="notice severity-info notice-strip">
           {deploymentController.mutationUnavailableReason}
         </div>
       )}

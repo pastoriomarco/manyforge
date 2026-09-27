@@ -689,7 +689,7 @@
   width: 100%;
   height: 100%;
   min-height: 0;
-  --program-canvas-control-height: 2.05rem;
+  --program-canvas-control-height: var(--mf-toolbar-control-height);
 }
 
 .program-canvas-topbar {
@@ -737,13 +737,15 @@
   box-sizing: border-box;
 }
 
+/* Square: as wide as the toolbar's inner control height. */
 .program-canvas-toolbar .canvas-view-controls button {
   display: grid;
+  width: calc(var(--program-canvas-control-height) - 0.48rem);
   place-items: center;
   line-height: 1;
 }
 
-.program-canvas-toolbar .canvas-fit-icon {
+.program-canvas-toolbar .canvas-tool-icon {
   width: 0.92rem;
   height: 0.92rem;
   fill: none;

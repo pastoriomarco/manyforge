@@ -67,7 +67,10 @@
   font-size: var(--mf-font-size-072);
 }
 
+/* Same measurements as the node catalog's category header. */
 .central-inspector-header {
+  min-height: 2.15rem;
+  padding: 0.24rem 0.3rem 0.24rem 0.42rem;
   border-bottom-color: var(--mf-border-neutral-30);
   background:
     linear-gradient(90deg, var(--mf-bg-neutral-55-a10), transparent 48%),
@@ -97,9 +100,10 @@
 }
 
 .central-inspector-actions button {
-  width: 1.75rem;
-  height: 1.75rem;
+  width: 1.55rem;
+  height: 1.55rem;
   padding: 0;
+  border-radius: var(--mf-radius-md-sm);
   border-color: var(--mf-border-neutral-32);
   background: var(--mf-bg-neutral-15);
 }
@@ -117,17 +121,10 @@
   padding: 0.55rem;
 }
 
+/* Inspector notices use the shared .notice look; this keeps their text
+   size where the notice is not inside .central-inspector-section. */
 .central-inspector-notice {
-  margin: 0;
-  padding: var(--inspector-content-padding) 0.6rem;
-  font-size: var(--inspector-label-font-size);
-  line-height: 1.4;
-}
-
-.central-inspector-notice-warning {
-  border-bottom: 1px solid var(--mf-border-warning-37);
-  color: var(--mf-text-warning-79);
-  background: var(--mf-bg-warning-13);
+  font-size: var(--inspector-label-font-size, var(--mf-font-size-068));
 }
 
 .central-inspector-state,

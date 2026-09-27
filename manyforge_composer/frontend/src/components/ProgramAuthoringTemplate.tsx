@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from 'react';
 
 import type { JsonValue, ProgramAuthoringDocument } from '../types/api';
 import { OverlayPanel } from './OverlayPanel';
-import { ProgramKindSymbol } from './programNodeGlyphs';
+import { ProgramTemplateIcon } from './programNodeGlyphs';
 
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
 
@@ -132,6 +132,8 @@ export function ProgramAuthoringTemplate({
     && placePosition.every(Number.isFinite)
     && placeOrientation.every(Number.isFinite);
 
+  // Collapsed by default, like a catalog category the user has not opened.
+  const [templatesCollapsed, setTemplatesCollapsed] = useState(true);
   const openTemplate = (kind: 'pick' | 'place') => {
     setOperation(kind);
     setNamespaceId('planning');
@@ -142,24 +144,45 @@ export function ProgramAuthoringTemplate({
 
   return (
     <section className="program-template-entry" aria-label="Composer authoring templates">
-      <div className="program-template-grid">
+      {/* The catalog's category header, so templates read as their own group. */}
+      <header className="program-palette-category" data-category-family="gripper">
+        <strong>Templates</strong>
+        <div>
+          <small>2</small>
+          <button
+            type="button"
+            className="icon-button program-palette-category-toggle"
+            aria-label={`${templatesCollapsed ? 'Expand' : 'Collapse'} Templates`}
+            aria-expanded={!templatesCollapsed}
+            title={`${templatesCollapsed ? 'Expand' : 'Collapse'} Templates`}
+            onClick={() => setTemplatesCollapsed((collapsed) => !collapsed)}
+          >
+            {templatesCollapsed ? '⌃' : '⌄'}
+          </button>
+        </div>
+      </header>
+      <div className="program-template-buttons" hidden={templatesCollapsed}>
         <button
           ref={pickButton}
           type="button"
           disabled={busy}
+          aria-label="Pick subtree"
+          title="Pick subtree: opens a short form, then inserts ordinary nodes you can edit."
           onClick={() => openTemplate('pick')}
         >
-          <span className="program-template-symbol" aria-hidden="true"><ProgramKindSymbol kind="authoring_macro" /></span>
-          <span><strong>Pick subtree</strong><small>Visible ordinary nodes</small></span>
+          <ProgramTemplateIcon kind="pick" />
+          Pick
         </button>
         <button
           ref={placeButton}
           type="button"
           disabled={busy}
+          aria-label="Place subtree"
+          title="Place subtree: opens a short form, then inserts ordinary nodes you can edit."
           onClick={() => openTemplate('place')}
         >
-          <span className="program-template-symbol" aria-hidden="true"><ProgramKindSymbol kind="authoring_macro" /></span>
-          <span><strong>Place subtree</strong><small>Visible ordinary nodes</small></span>
+          <ProgramTemplateIcon kind="place" />
+          Place
         </button>
       </div>
       <OverlayPanel
@@ -213,7 +236,7 @@ export function ProgramAuthoringTemplate({
             content after insertion.
           </p>
           {!available && (
-            <p className="scene-commit-error" role="status">
+            <p className="scene-commit-error inline-message severity-error" role="status">
               The template needs a Program scene resource, pose-capable arm,
               gripper target and frame/body roles. Pick also needs a contact policy.
             </p>

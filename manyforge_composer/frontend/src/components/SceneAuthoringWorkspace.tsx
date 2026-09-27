@@ -661,7 +661,7 @@ function AttachObjectControls({
       >
         Attach {object.scene_resource_id}
       </button>
-      {error !== null && <span className="scene-commit-error" role="alert">{error}</span>}
+      {error !== null && <span className="scene-commit-error inline-message severity-error" role="alert">{error}</span>}
     </div>
   );
 }
@@ -708,7 +708,7 @@ function MeshResourceBrowser({
       onPointerDownCapture={(event) => event.preventDefault()}
     >
       {state.kind === 'loading' && <span className="muted">Reading approved mesh files…</span>}
-      {state.kind === 'error' && <span className="scene-commit-error" role="alert">{state.message}</span>}
+      {state.kind === 'error' && <span className="scene-commit-error inline-message severity-error" role="alert">{state.message}</span>}
       {state.kind === 'ready' && (
         <>
           <div className="scene-mesh-browser-path">
@@ -1176,12 +1176,12 @@ function ProgramSceneEditor({
               ))}
             </div>
           )}
-          <p className="scene-contract-note">
+          <p className="scene-contract-note hint">
             Frame: <code>{staged.pose.frame_ref.kind}</code> · shape:{' '}
             <code>{staged.shape.type}</code>
           </p>
           {stagedError !== null && (
-            <p className="scene-commit-error" role="alert">{stagedError}</p>
+            <p className="scene-commit-error inline-message severity-error" role="alert">{stagedError}</p>
           )}
           <details className="scene-object-metadata">
             <summary>Roles and collision metadata</summary>
@@ -1224,7 +1224,7 @@ function ProgramSceneEditor({
           </div>
         </>
       )}
-      <p className="scene-contract-note">
+      <p className="scene-contract-note hint">
         Save persists this Draft. Runtime Apply, Revert-to-Saved, and
         Discard-to-Applied remain unavailable at their named scene-workflow gate.
       </p>
@@ -1358,7 +1358,7 @@ function ViewerMetadataEditor({
           />
         </label>
       </div>
-      {dirty && <p className="scene-contract-note">Valid edits commit on blur, Tab, or Enter.</p>}
+      {dirty && <p className="scene-contract-note hint">Valid edits commit on blur, Tab, or Enter.</p>}
     </div>
   );
 }
@@ -1464,7 +1464,7 @@ function SourceOccurrencePanel({
               {source.buffered && <span>buffered</span>}
             </div>
             {source.quality === 'unknown' && (
-              <span className="scene-commit-error">{source.payload.source_error.detail}</span>
+              <span className="scene-commit-error inline-message severity-error">{source.payload.source_error.detail}</span>
             )}
           </div>
         ))}
@@ -1504,7 +1504,7 @@ function SourceOccurrencePanel({
           </details>
         )}
       </div>
-      <p className="scene-contract-note">
+      <p className="scene-contract-note hint">
         Names remain the original URDF/SRDF names for this occurrence. The authored-neutral mesh below is not claimed as an active multi-instance pose.
       </p>
     </div>
@@ -2775,7 +2775,7 @@ export function SceneAuthoringWorkspace({
             </dl>
           </details>
           {runtimeStatus.warnings.map((warning) => (
-            <p className="scene-contract-note warning-state" key={warning} role="status">
+            <p className="scene-contract-note inline-message severity-warning" key={warning} role="status">
               Measured overlay: {warning}
             </p>
           ))}
@@ -2847,12 +2847,12 @@ export function SceneAuthoringWorkspace({
             </>
           )}
           {(editReason ?? selectedMutationAvailability?.transformReason ?? null) !== null && (
-            <p className="scene-contract-note warning-state">
+            <p className="scene-contract-note inline-message severity-warning">
               {editReason ?? selectedMutationAvailability?.transformReason}
             </p>
           )}
           {selectedObject !== null && liveShape === null && (
-            <p className="scene-contract-note">
+            <p className="scene-contract-note hint">
               Shape editing is available only for an object with exactly one canonical shape;
               pose editing remains independent.
             </p>
@@ -2972,7 +2972,7 @@ export function SceneAuthoringWorkspace({
           </div>
           {commitState.message !== null && (
             <p
-              className={commitState.kind === 'error' ? 'scene-commit-error' : 'scene-commit-success'}
+              className={commitState.kind === 'error' ? 'scene-commit-error inline-message severity-error' : 'scene-commit-success'}
               role={commitState.kind === 'error' ? 'alert' : 'status'}
             >{commitState.message}</p>
           )}
@@ -3221,7 +3221,7 @@ export function SceneAuthoringWorkspace({
 
         {activeSceneTool === 'viewer'
           && ghostVisible && cellGhost !== null && !cellGhost.available && (
-          <p className="scene-contract-note warning-state" role="status">
+          <p className="scene-contract-note inline-message severity-warning" role="status">
             Candidate marker unavailable: {cellGhost.reason}
           </p>
         )}

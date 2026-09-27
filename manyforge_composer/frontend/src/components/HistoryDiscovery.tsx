@@ -40,7 +40,7 @@ export function HistoryDiscovery({ onSelect }: {
       <button type="button" disabled={loading} onClick={() => { void load(); }}>Find</button>
       <button type="button" disabled={loading || !page?.nextAfter} onClick={() => { if (page?.nextAfter) void load(page.nextAfter); }}>More</button>
     </div>
-    {error && <p role="alert" className="error-state">{error}</p>}
+    {error && <p role="alert" className="error-state notice severity-error">{error}</p>}
     {loading && <p className="muted">Loading retained values…</p>}
     {page && <select aria-label="Use retained history value" disabled={loading} value="" onChange={(event) => onSelect(kind, event.target.value)}>
       <option value="">{page.values.length ? 'Choose a retained value' : 'No retained values'}</option>

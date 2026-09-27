@@ -963,7 +963,7 @@ class FakeKernelDisablePort final : public ICCLCKernelDisableHandoffPort,
 };
 
 [[nodiscard]] ComponentLifecycleCoordinatorConfig Config() {
-  return {RequestOwnerEpoch("cclc-owner.1"), 8U, 2U, 2U, 1'000, 10'000};
+  return {RequestOwnerEpoch("cclc-owner.1"), 8U, 2U, 2U, 1'000};
 }
 
 [[nodiscard]] ComponentLifecycleAdmissionCandidate RecoveryAdmissionCandidate(
@@ -974,7 +974,6 @@ class FakeKernelDisablePort final : public ICCLCKernelDisableHandoffPort,
           LifecycleTransactionGeneration(1U),
           ComponentLifecycleGeneration(3U),
           100,
-          Config().containment_only_disable_timeout_duration_ns,
           std::move(snapshot),
           std::move(catalogs),
           std::move(disable_admission)};

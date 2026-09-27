@@ -407,30 +407,30 @@ export function ProgramWorkspace({
     <section className="panel program-workspace" aria-label="Program authoring workspace">
       <div className="program-workspace-notices">
         {state.status === 'loading' && workspace === null && (
-          <div className="program-workspace-notice" role="status">
+          <div className="program-workspace-notice notice severity-info notice-floating" role="status">
             Reading the Program workspace…
           </div>
         )}
         {state.status === 'error' && workspace === null && (
-          <div className="program-workspace-notice error-state" role="alert">
+          <div className="program-workspace-notice error-state notice severity-error notice-floating" role="alert">
             <span><strong>Program workspace unavailable.</strong> {state.error}</span>
             <button type="button" onClick={refresh}>Retry workspace</button>
           </div>
         )}
         {catalog.status !== 'ready' && (
-          <div className="program-workspace-notice error-state" role="alert">
+          <div className="program-workspace-notice error-state notice severity-error notice-floating" role="alert">
             <span><strong>Node catalog unavailable.</strong> {catalog.status === 'error' || catalog.status === 'absent' ? catalog.message : 'Loading…'}</span>
             <button type="button" onClick={onRetryCatalog}>Retry catalog</button>
           </div>
         )}
         {environment.status !== 'ready' && (
-          <div className="program-workspace-notice error-state" role="alert">
+          <div className="program-workspace-notice error-state notice severity-error notice-floating" role="alert">
             <span><strong>Authoring availability unavailable.</strong> {environment.status === 'error' || environment.status === 'absent' ? environment.message : 'Loading…'}</span>
             <button type="button" onClick={onRetryEnvironment}>Retry environment</button>
           </div>
         )}
         {catalog.status === 'ready' && environment.status === 'ready' && !environmentAligned && (
-          <div className="program-workspace-notice error-state" role="alert">
+          <div className="program-workspace-notice error-state notice severity-error notice-floating" role="alert">
             <span><strong>Catalog identity mismatch.</strong> Editing remains disabled.</span>
             <button type="button" onClick={onRetryCatalog}>Retry catalog</button>
             <button type="button" onClick={onRetryEnvironment}>Retry environment</button>
@@ -584,7 +584,7 @@ export function ProgramWorkspace({
               </div>
             </header>
             {inspectorActive && !inspectorMinimized && inspectorReadOnlyReason !== null && (
-              <p className="central-inspector-notice central-inspector-notice-warning" role="status">
+              <p className="central-inspector-notice notice severity-warning notice-strip" role="status">
                 <strong>Editing is unavailable.</strong> {inspectorReadOnlyReason}
               </p>
             )}

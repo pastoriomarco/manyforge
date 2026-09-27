@@ -412,8 +412,6 @@ bool ComponentLifecycleCoordinatorConfig::locally_valid() const noexcept {
          kernel_worker_count > 0U && kernel_worker_count <= kMaxKernelWorkerCount &&
          observation_poll_period_ns > 0 &&
          observation_poll_period_ns <= kMaxLifecycleTransactionTimeoutNs &&
-         containment_only_disable_timeout_duration_ns > 0 &&
-         containment_only_disable_timeout_duration_ns <= kMaxLifecycleTransactionTimeoutNs &&
          route_selection_timeout_duration_ns > 0 &&
          route_selection_timeout_duration_ns <= kMaxRouteSelectionTimeoutNs;
 }
@@ -1308,7 +1306,6 @@ class ComponentLifecycleCoordinator::Impl final {
   struct AdmissionFacts final {
     std::optional<ComponentLifecycleCurrentSnapshotDTO> current_snapshot;
     std::vector<BrandLifecyclePlanCatalogDTO> catalogs;
-    std::optional<DisableHandoffAdmissionSnapshotDTO> disable_admission;
   };
 
   struct RuntimeState final {
@@ -1685,7 +1682,8 @@ class ComponentLifecycleCoordinator::Impl final {
         current.expected_controller_domain,
         current.configuration_fence_scope,
         fence_snapshot.value()};
-    const auto prepared = PrepareRouteSelectionAdmission(intent, candidate);
+    const auto prepared =
+        PrepareRouteSelectionAdmission(intent, candidate, recovery_predecessor != nullptr);
     if (!prepared.ok()) {
       return Result<CCLCRouteSelectionRequestResultDTO>::Err(prepared.error());
     }
@@ -3354,10 +3352,9 @@ class ComponentLifecycleCoordinator::Impl final {
         LifecycleTransactionGeneration(next_generation),
         ComponentLifecycleGeneration(predecessor_value),
         accepted_at_ns,
-        config_.containment_only_disable_timeout_duration_ns,
         facts.current_snapshot,
         facts.catalogs,
-        facts.disable_admission};
+        std::nullopt};
     const auto prepared = PrepareComponentLifecycleAdmission(intent, candidate);
     if (!prepared.ok()) {
       return Result<CCLCLifecycleRequestResultDTO>::Err(prepared.error());
@@ -3440,7 +3437,7 @@ class ComponentLifecycleCoordinator::Impl final {
     try {
       runtime = std::make_shared<RuntimeState>(
           prepared.value().initial_status, prepared.value().qualified_lifecycle_plan_catalogs,
-          prepared.value().lifecycle_mutation_eligible, prepared.value().disable_handoff_admission,
+          prepared.value().lifecycle_mutation_eligible, std::nullopt,
           prepared.value().reserved_control_domains, facts.current_snapshot);
     } catch (...) {
       release_on_failure();
@@ -3566,10 +3563,7 @@ class ComponentLifecycleCoordinator::Impl final {
         accepted.value().acceptance->component_lifecycle_generation.value();
 
     try {
-      if (runtime->permanent_containment_only ||
-          (runtime->disable_admission.has_value() &&
-           runtime->disable_admission->scope_resolution ==
-               DisableHandoffScopeResolutionDTO::kPromotedToFull)) {
+      if (runtime->permanent_containment_only) {
         AcquireOwnerWideContainmentGateLocked(runtime);
       }
       {
@@ -3578,9 +3572,8 @@ class ComponentLifecycleCoordinator::Impl final {
       }
       // Ordinary Disable is an idle lifecycle mutation under the same exact
       // cell claim as Prepare and Enable. The Kernel Stop worker remains for
-      // read-only recovery of durable pre-cutover handoff records.
-      auto& initial_pool = worker_pool_;
-      if (!initial_pool.Submit(
+      // reconciliation and release of durable pre-cutover handoff records.
+      if (!worker_pool_.Submit(
               [this, runtime](std::stop_token cancellation) { Process(runtime, cancellation); })) {
         CloseAdmissionLocked();
         // Durable acceptance is already authoritative. Reporting rejection
@@ -3744,16 +3737,10 @@ class ComponentLifecycleCoordinator::Impl final {
       }
       runtime->recovering = false;
       runtime->lifecycle_mutation_eligible = false;
-      if (!runtime->status.disable_handoff.has_value()) {
-        if (!RefreshDisableAdmission(runtime)) {
-          // No external effect has been prepared. Keep recovery and the
-          // admission gate in place while retrying only the read-only Kernel
-          // admission observation under the replacement owner.
-          ScheduleDisableHandoffSuccessor(runtime);
-          return;
-        }
-        StartDisableHandoff(runtime);
-      } else if (runtime->status.disable_handoff->state == DisableHandoffStateDTO::kStopping) {
+      // This branch resumes an existing durable handoff. Owner adoption
+      // preserves it; only prepared-effect reconciliation above may establish
+      // a successor after proving the previous effect absent.
+      if (runtime->status.disable_handoff->state == DisableHandoffStateDTO::kStopping) {
         ScheduleKernelPoll(runtime);
       } else if (runtime->status.disable_handoff->state == DisableHandoffStateDTO::kReady) {
         const bool domains_resolved = std::all_of(

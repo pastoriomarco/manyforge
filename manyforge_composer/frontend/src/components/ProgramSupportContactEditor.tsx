@@ -228,7 +228,7 @@ export function ProgramSupportContactEditor({
         evidence is required. Current contact evidence remains read-only.
       </p>
       {objectIds.length < 2 ? (
-        <p className="scene-commit-error" role="status">
+        <p className="scene-commit-error inline-message severity-error" role="status">
           Add at least two Program scene resources to author a support contact.
         </p>
       ) : (

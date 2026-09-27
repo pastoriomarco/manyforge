@@ -190,11 +190,3 @@
   }
 
 }
-
-/* Inline error text; the same look as .program-form-error. */
-.error-banner,
-.field-error {
-  margin: 0;
-  color: var(--mf-text-danger-73);
-  font-size: var(--mf-font-size-068);
-}

@@ -7,7 +7,6 @@ namespace manyforge::core {
 namespace {
 
 constexpr std::int64_t kAcceptedAtNs = 100;
-constexpr std::int64_t kUnresolvedDisableTimeoutNs = 9'000;
 
 [[nodiscard]] std::string Sha(char value) {
   return std::string("sha256:") + std::string(64U, value);
@@ -175,7 +174,6 @@ constexpr std::int64_t kUnresolvedDisableTimeoutNs = 9'000;
           LifecycleTransactionGeneration(8U),
           durable_predecessor,
           kAcceptedAtNs,
-          kUnresolvedDisableTimeoutNs,
           std::move(snapshot),
           std::move(catalogs),
           std::move(disable_admission)};
@@ -303,7 +301,6 @@ TEST(ComponentLifecycleAdmission,
       Candidate(snapshot, {catalog}));
   ASSERT_TRUE(prepared.ok()) << prepared.error().message;
   EXPECT_TRUE(prepared.value().lifecycle_mutation_eligible);
-  EXPECT_FALSE(prepared.value().disable_handoff_admission.has_value());
   EXPECT_FALSE(prepared.value().initial_status.disable_handoff.has_value());
   EXPECT_EQ(prepared.value().initial_status.requested_state.state,
             ComponentLifecycleStateDTO::kDisabled);

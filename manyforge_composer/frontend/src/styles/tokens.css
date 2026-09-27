@@ -346,5 +346,8 @@
   /* 3D viewer overlays: one control height and one edge inset for the
      floating viewport controls (top) and the transport (bottom). */
   --mf-viewer-control-height: 2.85rem;
+  /* Floating canvas toolbars (tree editor, 3D viewer top): the same height
+     as the application header buttons. */
+  --mf-toolbar-control-height: 1.9rem;
   --mf-viewer-overlay-inset: 0.65rem;
 }

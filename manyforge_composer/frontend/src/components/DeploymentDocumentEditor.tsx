@@ -105,7 +105,7 @@ function ScalarEditor({
         />
       )}
       {invalid && (
-        <span className="deployment-field-error">
+        <span className="deployment-field-error inline-message severity-error">
           Invalid value. Correct it or <button type="button" onClick={discard}>discard edit</button>.
         </span>
       )}

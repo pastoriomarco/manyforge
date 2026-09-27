@@ -1,0 +1,114 @@
+/* shared/notices: one look per message kind and severity (UI6-I-VC VC4).
+   Approved on frontend/design/shared-looks.html. Surface classes on the same
+   element keep only layout (position, grid placement, width).
+
+   notice          a box: text in the first column, an action on the right
+   inline-message  text next to the field or action it belongs to
+   hint            muted help text, no severity
+   Each of notice and inline-message takes severity-info|warning|error. */
+
+.notice {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 0.6rem;
+  row-gap: 0.25rem;
+  margin: 0;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid;
+  border-radius: var(--mf-radius-md-sm);
+  font-size: var(--mf-font-size-072);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.notice > * {
+  grid-column: 1;
+}
+
+.notice > button {
+  grid-row: 1;
+  grid-column: 2;
+  min-height: 1.6rem;
+  padding: 0.2rem 0.55rem;
+  font-size: var(--mf-font-size-068);
+}
+
+.notice ul {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.notice.severity-info {
+  border-color: var(--mf-border-neutral-34);
+  color: var(--mf-text-neutral-81);
+  background: var(--mf-bg-neutral-15);
+}
+
+.notice.severity-warning {
+  border-color: var(--mf-border-warning-37);
+  color: var(--mf-text-warning-79);
+  background: var(--mf-bg-warning-13);
+}
+
+.notice.severity-error {
+  border-color: var(--mf-border-danger-38);
+  color: var(--mf-text-danger-81);
+  background: var(--mf-bg-danger-16);
+}
+
+/* A band under a panel or section header. */
+.notice.notice-strip {
+  border-width: 0 0 1px;
+  border-radius: 0;
+}
+
+/* An overlay on a canvas or viewer. */
+.notice.notice-floating {
+  box-shadow: 0 0.55rem 1.2rem var(--mf-shadow-neutral-00-a28);
+}
+
+/* Inside the central inspector, boxes follow its compact spacing tokens. */
+.central-inspector-section .notice {
+  padding: var(--inspector-content-padding) 0.6rem;
+  font-size: var(--inspector-label-font-size);
+}
+
+.inline-message {
+  margin: 0;
+  font-size: var(--mf-font-size-068);
+  line-height: 1.4;
+}
+
+ul.inline-message {
+  padding-left: 1.1rem;
+}
+
+.inline-message.severity-info {
+  color: var(--mf-text-neutral-68);
+}
+
+.inline-message.severity-warning {
+  color: var(--mf-text-warning-79);
+}
+
+.inline-message.severity-error {
+  color: var(--mf-text-danger-73);
+}
+
+.inline-message button {
+  min-height: auto;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font-size: inherit;
+  text-decoration: underline;
+}
+
+.hint {
+  margin: 0;
+  color: var(--mf-text-neutral-57);
+  font-size: var(--mf-font-size-068);
+  line-height: 1.45;
+}

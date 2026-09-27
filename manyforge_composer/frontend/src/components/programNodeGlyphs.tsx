@@ -194,6 +194,37 @@ export function ProgramCategoryIcon({ category, catalogId }: { category: string;
   );
 }
 
+const TEMPLATE_ICONS: Readonly<Record<'pick' | 'place', CategoryIconDrawing>> = {
+  pick: {
+    transform: 'translate(0.131 0.230) scale(0.9836)',
+    shapes: (
+      <><path d="M2.5 14h11" /><rect x="5" y="9.5" width="6" height="4.5" rx="0.8" /><path d="M8 7.5V1.8" /><path d="M5.8 4 8 1.8 10.2 4" /></>
+    ),
+  },
+  place: {
+    transform: 'translate(0.131 0.230) scale(0.9836)',
+    shapes: (
+      <><path d="M2.5 14h11" /><rect x="5" y="9.5" width="6" height="4.5" rx="0.8" /><path d="M8 1.8v5.7" /><path d="M5.8 5.3 8 7.5l2.2-2.2" /></>
+    ),
+  },
+};
+
+/** Pick/Place template pictograms: an object lifted off / set down on a surface. */
+export function ProgramTemplateIcon({ kind }: { kind: 'pick' | 'place' }) {
+  const drawing = TEMPLATE_ICONS[kind];
+  return (
+    <svg
+      className="program-category-icon"
+      data-category-family="gripper"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <g transform={drawing.transform}>{drawing.shapes}</g>
+    </svg>
+  );
+}
+
 /** One drawn kind symbol set for the canvas and the node palette. */
 export function ProgramKindSymbol({ kind }: { kind: string }) {
   return (

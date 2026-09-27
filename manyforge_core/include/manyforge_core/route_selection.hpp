@@ -511,7 +511,10 @@ struct PreparedRouteSelectionAdmission final {
 
 /// Pure preparation after replay classification and source reads, but before
 /// the shared reservation or durable journal CAS.
+/// observation_only_recovery is supplied only by the private coordinator path
+/// after matching the exact durable predecessor; it is not a caller wire field.
 [[nodiscard]] Result<PreparedRouteSelectionAdmission> PrepareRouteSelectionAdmission(
-    const RouteSelectionIntentDTO& intent, const RouteSelectionAdmissionCandidate& candidate);
+    const RouteSelectionIntentDTO& intent, const RouteSelectionAdmissionCandidate& candidate,
+    bool observation_only_recovery = false);
 
 }  // namespace manyforge::core

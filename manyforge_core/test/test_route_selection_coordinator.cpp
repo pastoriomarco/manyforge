@@ -178,7 +178,7 @@ class WaitableManualScheduler final : public IScheduler {
 
 [[nodiscard]] ComponentLifecycleCoordinatorConfig Config(
     RequestOwnerEpoch owner = RequestOwnerEpoch("cclc-owner.1")) {
-  return {std::move(owner), 8U, 2U, 2U, 1'000, 10'000, 1'000'000};
+  return {std::move(owner), 8U, 2U, 2U, 1'000, 1'000'000};
 }
 
 [[nodiscard]] RouteConfigurationFenceAdmissionSnapshotDTO FenceAdmissionSnapshot(
@@ -288,6 +288,10 @@ class UnusedDisablePort final : public ICCLCKernelDisableHandoffPort,
 
 class FakeRouteSnapshotSource final : public ICCLCRouteSelectionCurrentSnapshotSource {
  public:
+  void SetComponentState(ComponentLifecycleStateDTO state) {
+    std::lock_guard lock(mutex_);
+    component_state_ = state;
+  }
   void SetActiveConfiguration(std::optional<ActiveControlConfigurationDTO> configuration) {
     std::lock_guard lock(mutex_);
     active_configuration_ = std::move(configuration);
@@ -307,6 +311,11 @@ class FakeRouteSnapshotSource final : public ICCLCRouteSelectionCurrentSnapshotS
       std::lock_guard lock(mutex_);
       snapshot.active_control_configuration = active_configuration_;
       snapshot.expected_controller_domain.source_runtime_epoch = runtime_epoch_;
+      if (component_state_) {
+        for (auto& component : snapshot.component_expectations) {
+          component.expected_component_lifecycle_state = *component_state_;
+        }
+      }
     }
     if (snapshot.retained_bundle_id != bundle_id || snapshot.graph_revision != graph_revision ||
         snapshot.expected_controller_domain.desired_configuration != desired) {
@@ -323,6 +332,7 @@ class FakeRouteSnapshotSource final : public ICCLCRouteSelectionCurrentSnapshotS
   mutable std::mutex mutex_;
   std::optional<ActiveControlConfigurationDTO> active_configuration_;
   RuntimeEpoch runtime_epoch_{"runtime-epoch.1"};
+  std::optional<ComponentLifecycleStateDTO> component_state_;
 };
 
 class FakeControllerPort final : public IControllerLifecyclePort {
@@ -956,7 +966,7 @@ TEST(RouteSelectionCoordinator, ObservationRejectsMissingReadServicesBeforeStart
   EXPECT_TRUE(reservations.snapshot().empty());
 }
 
-TEST(RouteSelectionCoordinator, PrivateRecoveryUsesExactSavedRouteWithoutOrdinaryAdmission) {
+void CheckPrivateRecoveryUsesExactSavedRoute(bool disabled) {
   ScopedTemporaryDirectory temporary;
   SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
                             8U);
@@ -990,8 +1000,18 @@ TEST(RouteSelectionCoordinator, PrivateRecoveryUsesExactSavedRouteWithoutOrdinar
       saved.value()->active_control_configuration_generation};
   auto intent = Intent(coordinator.request_owner_epoch());
   intent.expected_active_control_configuration = expected;
+  if (disabled) {
+    snapshots.SetComponentState(ComponentLifecycleStateDTO::kDisabled);
+    for (auto& component : intent.component_expectations) {
+      component.expected_component_lifecycle_state = ComponentLifecycleStateDTO::kDisabled;
+    }
+  }
   intent.request_context.request_id = RequestId("ordinary.closed");
-  ASSERT_FALSE(coordinator.SubmitRouteSelection(intent).ok());
+  const auto ordinary = coordinator.SubmitRouteSelection(intent);
+  ASSERT_FALSE(ordinary.ok());
+  if (disabled) {
+    EXPECT_EQ(ordinary.error().code, "route_selection_component_not_ready");
+  }
   EXPECT_EQ(admission.recovery_acquisitions, 0U);
   intent.request_context.request_id = RequestId("recovery.foreign");
   auto foreign = *saved.value();
@@ -1014,6 +1034,7 @@ TEST(RouteSelectionCoordinator, PrivateRecoveryUsesExactSavedRouteWithoutOrdinar
   ASSERT_TRUE(status.ok() && status.value());
   EXPECT_EQ(status.value()->terminal_result, RouteSelectionTerminalResultDTO::kSucceeded);
   EXPECT_EQ(status.value()->effect, RouteSelectionEffectDTO::kKnownNoEffect);
+  EXPECT_EQ(status.value()->acceptance.component_expectations, intent.component_expectations);
   EXPECT_TRUE(status.value()->controller_transition_results.empty());
   EXPECT_EQ(controller->dispatch_count(), 0U);
   EXPECT_TRUE(reservations.snapshot().empty());
@@ -1053,6 +1074,14 @@ TEST(RouteSelectionCoordinator, PrivateRecoveryUsesExactSavedRouteWithoutOrdinar
   EXPECT_EQ(controller->dispatch_count(), 0U);
   EXPECT_TRUE(reservations.snapshot().empty());
   EXPECT_FALSE(admission.GetAuthoringAdmission().authoring_allowed);
+}
+
+TEST(RouteSelectionCoordinator, PrivateRecoveryUsesExactSavedRouteWithoutOrdinaryAdmission) {
+  CheckPrivateRecoveryUsesExactSavedRoute(false);
+}
+
+TEST(RouteSelectionCoordinator, DisabledRecoveryObservesWithoutCommandsAndRefusesOrdinarySelection) {
+  CheckPrivateRecoveryUsesExactSavedRoute(true);
 }
 
 TEST(RouteSelectionCoordinator, RetainsPublicationFailureWithoutFloodingAndClearsOnRecovery) {

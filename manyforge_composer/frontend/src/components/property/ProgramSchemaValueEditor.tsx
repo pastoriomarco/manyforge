@@ -291,7 +291,7 @@ function ArrayEditor(props: ProgramSchemaValueEditorProps) {
         >
           Add row
         </button>
-        {error && <p className="program-form-error" role="alert">{error}</p>}
+        {error && <p className="program-form-error inline-message severity-error" role="alert">{error}</p>}
       </div>
     </details>
   );
@@ -356,7 +356,7 @@ function ObjectEditor(props: ProgramSchemaValueEditorProps) {
           </div>
         );
       })}
-      {error && <p className="program-form-error" role="alert">{error}</p>}
+      {error && <p className="program-form-error inline-message severity-error" role="alert">{error}</p>}
     </fieldset>
   );
 }
@@ -460,7 +460,7 @@ function MapEditor(props: ProgramSchemaValueEditorProps) {
           Add
         </button>
       </div>
-      {error && <p className="program-form-error" role="alert">{error}</p>}
+      {error && <p className="program-form-error inline-message severity-error" role="alert">{error}</p>}
     </fieldset>
   );
 }

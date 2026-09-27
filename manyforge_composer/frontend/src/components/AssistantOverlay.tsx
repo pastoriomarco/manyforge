@@ -445,7 +445,7 @@ export function AssistantOverlay({
         <p className="panel-intro">Configure the assistant bridge to start bounded conversations.</p>
       )}
       {modeError && (
-        <div className="assistant-error" role="alert">
+        <div className="notice severity-error" role="alert">
           <span>{modeError}</span>
           <button type="button" onClick={() => loadModes()}>Retry discovery</button>
         </div>
@@ -496,7 +496,7 @@ export function AssistantOverlay({
                   <code>{item.mode}</code>
                 </header>
                 {item.text && <p>{item.text}</p>}
-                {item.error && <p className="assistant-error" role="alert">{item.error}</p>}
+                {item.error && <p className="notice severity-error" role="alert">{item.error}</p>}
                 {item.response?.draftMutated && (
                   <p className="assistant-draft-provenance">Draft changed by assistant; Saved and Applied were not changed.</p>
                 )}
@@ -557,7 +557,7 @@ export function AssistantOverlay({
                   </details>
                 )}
                 {item.response && item.response.warnings.length > 0 && (
-                  <ul className="assistant-warnings">
+                  <ul className="inline-message severity-warning">
                     {item.response.warnings.map((warning, index) => (
                       <li key={`${item.id}.warning.${index}`}>{warning}</li>
                     ))}
@@ -595,7 +595,7 @@ export function AssistantOverlay({
             )}
           </div>
           {active && <p className="assistant-status">Request <code>{active.requestId}</code>: {active.state}</p>}
-          {notice && <p className="assistant-notice" role="status">{notice}</p>}
+          {notice && <p className="notice severity-info" role="status">{notice}</p>}
         </>
       )}
     </section>

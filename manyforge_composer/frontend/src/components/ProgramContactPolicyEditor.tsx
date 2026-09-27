@@ -279,7 +279,7 @@ export function ProgramContactPolicyEditor({
         </select>
       </label>
       {options.length === 0 || keys.length === 0 ? (
-        <p className="scene-commit-error" role="status">
+        <p className="scene-commit-error inline-message severity-error" role="status">
           A contact policy needs one declared collision-body target and one
           scene_resource blackboard key.
         </p>

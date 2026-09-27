@@ -316,7 +316,7 @@ export const ProgramNodePalette = memo(function ProgramNodePalette({
         })}
       </div>
 
-      {error && <p className="program-form-error palette-error" role="alert">{error}</p>}
+      {error && <p className="program-form-error inline-message severity-error palette-error" role="alert">{error}</p>}
     </section>
   );
 });

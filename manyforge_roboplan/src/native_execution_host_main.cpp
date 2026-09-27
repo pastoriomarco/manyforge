@@ -11574,7 +11574,7 @@ void AttachRetainedNativeCCLC(Composition &composition,
       config.execution_run_root,
       core::CellId(config.cell_id),
       {core::RequestOwnerEpoch(RandomToken("cclc-owner-")), 1024U, 2U, 2U,
-       10'000'000LL, 30'000'000'000LL, 30'000'000'000LL}};
+       10'000'000LL, 30'000'000'000LL}};
   auto cclc = [&]() -> core::Result<
       std::unique_ptr<deployment::CCLCRuntimeComposition>> {
 #if !defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)

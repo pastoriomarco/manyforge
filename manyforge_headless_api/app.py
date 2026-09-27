@@ -337,6 +337,7 @@ def _error_status(code: str) -> int:
             "program_run_admission_failed",
             "program_run_already_active",
             "program_required_component_not_active",
+            "route_selection_component_not_ready",
             "program_applied_non_executable",
             "prepared_activation_unverified",
             "authoring_not_ready",
@@ -351,6 +352,7 @@ def _error_status(code: str) -> int:
     if "unavailable" in code or code in {
         "headless_api_closed",
         "kernel_owner_unavailable",
+        "execution_owner_not_ready",
         "operator_alarm_state_unavailable",
         "program_applied_selection_not_active",
         "program_runner_unavailable",

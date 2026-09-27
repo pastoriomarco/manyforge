@@ -384,26 +384,13 @@
   overflow-wrap: anywhere;
 }
 
-.scene-contract-note,
-.scene-commit-error,
 .scene-commit-success {
   margin: 0;
-  color: var(--mf-text-neutral-57);
   font-size: var(--mf-font-size-072);
   line-height: 1.5;
-}
-
-.scene-contract-note.warning-state {
-  color: var(--mf-text-warning-79);
-}
-
-.scene-commit-error {
-  color: var(--mf-text-danger-81);
-}
-
-.scene-commit-success {
   color: var(--mf-text-success-76);
 }
+
 
 .scene-authoring-actions button {
   padding: 0.5rem 0.7rem;

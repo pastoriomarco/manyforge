@@ -489,12 +489,6 @@ export interface ScenarioDocumentExportResponse {
   path: string;
 }
 
-export interface ScenarioDocumentConversionResponse {
-  status: 'converted';
-  sourcePath: string;
-  path: string;
-}
-
 export interface DeploymentScenarioCandidate {
   scenarioId: string;
   sourceDocumentDigest: string;

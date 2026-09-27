@@ -1,0 +1,306 @@
+<title>Composer Shared Looks</title>
+<!-- UI6-I-VC VC4 comparison page. Open directly in a browser (file://). It loads
+     the app's real stylesheet, so the "Today" column is the current look; the
+     "Proposed" column adds the shared classes defined below. Lint, build, tests
+     and packaging ignore this folder. -->
+<link rel="stylesheet" href="../src/styles/index.css">
+<style>
+  /* ---- Page layout (sl-*) -------------------------------------------- */
+  body { margin: 0; padding: 28px clamp(16px, 3vw, 40px) 48px; overflow: auto; }
+  .sl-wrap { max-width: 1180px; margin: 0 auto; display: grid; gap: 26px; }
+  .sl-wrap > header { display: grid; gap: 8px; }
+  .sl-wrap h1 { margin: 0; font-size: 1.3rem; }
+  .sl-wrap h2 { margin: 0; font-size: 0.95rem; }
+  .sl-lead { margin: 0; max-width: 78ch; color: var(--mf-text-neutral-68); font-size: 0.84rem; line-height: 1.5; }
+  .sl-block { display: grid; gap: 10px; padding: 16px; border: 1px solid var(--mf-border-neutral-23); border-radius: var(--mf-radius-lg); background: var(--mf-bg-neutral-08); }
+  .sl-block > p { margin: 0; max-width: 80ch; color: var(--mf-text-neutral-63); font-size: 0.78rem; line-height: 1.45; }
+  .sl-head, .sl-row { display: grid; grid-template-columns: 13rem minmax(0, 1fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+  .sl-head { color: var(--mf-text-neutral-57); font-size: 0.68rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  .sl-row { padding-top: 10px; border-top: 1px solid var(--mf-border-neutral-19); }
+  .sl-label { display: grid; gap: 3px; color: var(--mf-text-neutral-82); font-size: 0.78rem; }
+  .sl-label code { color: var(--mf-text-neutral-57); font-size: 0.66rem; overflow-wrap: anywhere; }
+  .sl-label small { color: var(--mf-text-neutral-57); font-size: 0.66rem; }
+  /* A neutral panel surface so each sample sits on the app's usual ground. */
+  /* Each sample cell is a containing block (so overlay-positioned messages
+     stay in their row) and carries a typical panel text size, since some
+     classes take their size from the surrounding panel in the app. */
+  .sl-cell { container-type: inline-size; position: relative; transform: translateZ(0); min-width: 0; min-height: 2.6rem; padding: 8px; border-radius: var(--mf-radius-md-sm); background: var(--mf-bg-neutral-06-a52); font-size: var(--mf-font-size-076); }
+  .sl-cell > .central-inspector-section { display: block; border: 1px solid var(--mf-border-neutral-23); }
+  @media (max-width: 760px) {
+    .sl-head { display: none; }
+    .sl-row { grid-template-columns: 1fr; }
+  }
+
+  /* ---- Proposed shared looks (only inside .sl-proposed) --------------- */
+  /* Notice box: one look per severity, the workbench notice palette. */
+  /* Text in the first column (multi-part messages stack there); an action
+     sits on the right, level with the first line. */
+  .sl-proposed .notice {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    column-gap: 0.6rem;
+    row-gap: 0.25rem;
+    margin: 0;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid;
+    border-radius: var(--mf-radius-md-sm);
+    font-size: var(--mf-font-size-072);
+    line-height: 1.4;
+  }
+  .sl-proposed .notice.severity-info {
+    border-color: var(--mf-border-neutral-34);
+    color: var(--mf-text-neutral-81);
+    background: var(--mf-bg-neutral-15);
+  }
+  .sl-proposed .notice.severity-warning {
+    border-color: var(--mf-border-warning-37);
+    color: var(--mf-text-warning-79);
+    background: var(--mf-bg-warning-13);
+  }
+  .sl-proposed .notice.severity-error {
+    border-color: var(--mf-border-danger-38);
+    color: var(--mf-text-danger-81);
+    background: var(--mf-bg-danger-16);
+  }
+  .sl-proposed .notice > * { grid-column: 1; }
+  .sl-proposed .notice ul { margin: 0; padding-left: 1.1rem; }
+  .sl-proposed .notice > button {
+    grid-row: 1;
+    grid-column: 2;
+    min-height: 1.6rem;
+    padding: 0.2rem 0.55rem;
+    font-size: var(--mf-font-size-068);
+  }
+  @container (max-width: 18rem) {
+    .sl-proposed .notice { grid-template-columns: minmax(0, 1fr); }
+    .sl-proposed .notice > button { grid-row: auto; grid-column: 1; justify-self: start; }
+  }
+  /* Band under a panel or section header. */
+  .sl-proposed .notice.notice-strip { border-width: 0 0 1px; border-radius: 0; }
+  /* Overlay on a canvas. */
+  .sl-proposed .notice.notice-floating { box-shadow: 0 0.55rem 1.2rem var(--mf-shadow-neutral-00-a28); }
+  /* Inspector density comes from its own tokens. */
+  .sl-proposed .central-inspector-section .notice {
+    padding: var(--inspector-content-padding) 0.6rem;
+    font-size: var(--inspector-label-font-size);
+  }
+  .sl-proposed .central-inspector-section .notice.notice-strip { border-width: 0 0 1px; }
+
+  /* Inline message: text only, one color per severity. */
+  .sl-proposed .inline-message {
+    margin: 0;
+    font-size: var(--mf-font-size-068);
+    line-height: 1.4;
+  }
+  .sl-proposed .inline-message.severity-info { color: var(--mf-text-neutral-68); }
+  .sl-proposed .inline-message.severity-warning { color: var(--mf-text-warning-79); }
+  .sl-proposed .inline-message.severity-error { color: var(--mf-text-danger-73); }
+  .sl-proposed ul.inline-message { padding-left: 1.1rem; }
+  .sl-proposed .inline-message button {
+    min-height: auto;
+    padding: 0;
+    border: 0;
+    color: inherit;
+    background: transparent;
+    font-size: inherit;
+    text-decoration: underline;
+  }
+
+  /* Section header: the node catalog's category header, reused. */
+  .sl-proposed .central-inspector-header {
+    min-height: 2.15rem;
+    padding: 0.24rem 0.3rem 0.24rem 0.42rem;
+  }
+  .sl-proposed .central-inspector-actions button {
+    width: 1.55rem;
+    height: 1.55rem;
+    border-radius: var(--mf-radius-md-sm);
+  }
+
+  /* Hint: muted help text next to a control or section. */
+  .sl-proposed .hint {
+    margin: 0;
+    color: var(--mf-text-neutral-57);
+    font-size: var(--mf-font-size-068);
+    line-height: 1.45;
+  }
+</style>
+
+<div class="sl-wrap">
+  <header>
+    <h1>Shared looks: notices, warnings, errors and section headers</h1>
+    <p class="sl-lead">UI6-I-VC step VC4. Each row shows one message that exists in the Composer today, rendered with its real classes on the left and with the proposed shared look on the right. Only the look changes: text, placement, role and severity stay as they are. The proposed look reuses the workbench notification colors, so a warning is the same amber box wherever it appears.</p>
+    <p class="sl-lead">Three shared classes replace about 25 separate looks: <code>notice</code> (a box, with a band variant under headers and a floating variant over canvases), <code>inline-message</code> (text only) and <code>hint</code> (muted help text). Each takes <code>severity-info</code>, <code>severity-warning</code> or <code>severity-error</code>. Inside the central inspector, boxes follow its compact spacing tokens.</p>
+  </header>
+
+  <section class="sl-block" id="headers">
+    <h2>Section headers</h2>
+    <p>The node catalog's category header is the reference. The Program inspector and Viewer tools headers already share its text, tint and accent bar, but are taller, with more padding and larger buttons. The proposal gives them the catalog's measurements; without a category they keep the default accent.</p>
+    <div class="sl-head"><span>Where</span><span>Today</span><span>Proposed</span></div>
+    <div class="sl-row">
+      <div class="sl-label">Node catalog: category<code>program-palette-category</code><small>reference, unchanged</small></div>
+      <div class="sl-cell"><header class="program-palette-category"><strong>Control Flow</strong><div><small>7</small><button type="button" class="icon-button program-palette-category-toggle">⌄</button></div></header></div>
+      <div class="sl-cell"><header class="program-palette-category"><strong>Control Flow</strong><div><small>7</small><button type="button" class="icon-button program-palette-category-toggle">⌄</button></div></header></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Program inspector<code>central-inspector-header</code></div>
+      <div class="sl-cell"><section class="central-inspector-section"><header class="central-inspector-header"><strong>Program inspector</strong><div class="central-inspector-actions"><button type="button">□</button><button type="button">⌄</button></div></header></section></div>
+      <div class="sl-cell sl-proposed"><section class="central-inspector-section"><header class="central-inspector-header"><strong>Program inspector</strong><div class="central-inspector-actions"><button type="button">□</button><button type="button">⌄</button></div></header></section></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Viewer tools<code>central-inspector-header</code></div>
+      <div class="sl-cell"><section class="central-inspector-section"><header class="central-inspector-header"><strong>Viewer tools</strong><div class="central-inspector-actions"><button type="button">□</button><button type="button">⌄</button><button type="button">×</button></div></header></section></div>
+      <div class="sl-cell sl-proposed"><section class="central-inspector-section"><header class="central-inspector-header"><strong>Viewer tools</strong><div class="central-inspector-actions"><button type="button">□</button><button type="button">⌄</button><button type="button">×</button></div></header></section></div>
+    </div>
+  </section>
+
+  <section class="sl-block" id="info">
+    <h2>Information notices</h2>
+    <p>Neutral status that needs no action.</p>
+    <div class="sl-head"><span>Where</span><span>Today</span><span>Proposed</span></div>
+    <div class="sl-row">
+      <div class="sl-label">Robot panel: manual control unavailable<code>central-inspector-notice</code><small>inspector</small></div>
+      <div class="sl-cell"><section class="central-inspector-section"><div class="central-inspector-body"><p class="central-inspector-notice" role="status"><strong>Manual control unavailable.</strong> The execution owner has no active physical product.</p></div></section></div>
+      <div class="sl-cell sl-proposed"><section class="central-inspector-section"><div class="central-inspector-body"><p class="notice severity-info notice-strip" role="status"><span><strong>Manual control unavailable.</strong> The execution owner has no active physical product.</span></p></div></section></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Program canvas: reading the workspace<code>program-workspace-notice</code><small>floating over the canvas</small></div>
+      <div class="sl-cell"><div class="program-workspace-notice" role="status">Reading the Program workspace…</div></div>
+      <div class="sl-cell sl-proposed"><div class="notice severity-info notice-floating" role="status">Reading the Program workspace…</div></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Deployment: editing unavailable<code>authoring-unavailable-notice</code><small>band under the header</small></div>
+      <div class="sl-cell"><div class="authoring-unavailable-notice">Editing is unavailable while the Program is running.</div></div>
+      <div class="sl-cell sl-proposed"><div class="notice severity-info notice-strip">Editing is unavailable while the Program is running.</div></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Catalog: reference note<code>catalog-notice</code><small>band under the header</small></div>
+      <div class="sl-cell"><p class="catalog-notice">Schema and execution declarations are shown for authoring reference; they do not assert that an implementation or runtime is available.</p></div>
+      <div class="sl-cell sl-proposed"><p class="notice severity-info notice-strip">Schema and execution declarations are shown for authoring reference; they do not assert that an implementation or runtime is available.</p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Assistant: status<code>assistant-notice</code></div>
+      <div class="sl-cell"><p class="assistant-notice" role="status">Draft updated with 2 nodes. Review them before Apply.</p></div>
+      <div class="sl-cell sl-proposed"><p class="notice severity-info" role="status">Draft updated with 2 nodes. Review them before Apply.</p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Robot panel: owner notice<code>robot-control-owner-notice</code></div>
+      <div class="sl-cell"><p class="robot-control-owner-notice">The owner accepted the move and is planning it.</p></div>
+      <div class="sl-cell sl-proposed"><p class="notice severity-info">The owner accepted the move and is planning it.</p></div>
+    </div>
+  </section>
+
+  <section class="sl-block" id="warnings">
+    <h2>Warnings</h2>
+    <p>Something needs attention but nothing failed. Today they use at least five different ambers, and one inspector warning was drawn in the error red until VC4's earlier correction.</p>
+    <div class="sl-head"><span>Where</span><span>Today</span><span>Proposed</span></div>
+    <div class="sl-row">
+      <div class="sl-label">Robot panel: target preview<code>central-inspector-notice-warning robot-control-preview-notice</code><small>floating over the viewer; a warning with an error-red border today</small></div>
+      <div class="sl-cell" style="height: 9rem; --inspector-content-padding: 0.5rem; --inspector-label-font-size: 0.68rem"><p class="central-inspector-notice central-inspector-notice-warning robot-control-preview-notice" role="status"><span>The target is outside the reachable workspace; no preview is available.</span></p></div>
+      <div class="sl-cell sl-proposed" style="height: 9rem"><p class="robot-control-preview-notice notice severity-warning notice-floating" role="status"><span>The target is outside the reachable workspace; no preview is available.</span></p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Program header: sources changed<code>document-source-notice</code></div>
+      <div class="sl-cell"><div class="document-source-notice" role="status"><strong>Referenced sources changed since the last Save.</strong><ul><li>wall_mesh: file digest differs from the saved reference</li></ul><span>Apply will capture and validate the current source contents.</span></div></div>
+      <div class="sl-cell sl-proposed"><div class="notice severity-warning" role="status"><strong>Referenced sources changed since the last Save.</strong><ul><li>wall_mesh: file digest differs from the saved reference</li></ul><span>Apply will capture and validate the current source contents.</span></div></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Recovery: action did not start<code>recovery-command-notice</code></div>
+      <div class="sl-cell"><div role="alert" class="recovery-command-notice"><span><strong>Recovery action did not start.</strong> The offer changed; review the current offer.</span><button type="button">Dismiss</button></div></div>
+      <div class="sl-cell sl-proposed"><div role="alert" class="notice severity-warning"><span><strong>Recovery action did not start.</strong> The offer changed; review the current offer.</span><button type="button">Dismiss</button></div></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Scene editor: contract warning<code>scene-contract-note warning-state</code><small>inline text</small></div>
+      <div class="sl-cell"><p class="scene-contract-note warning-state" role="status">The mesh has no collision geometry; it will be ignored by planning.</p></div>
+      <div class="sl-cell sl-proposed"><p class="inline-message severity-warning" role="status">The mesh has no collision geometry; it will be ignored by planning.</p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Assistant: response warnings<code>assistant-warnings</code><small>inline list</small></div>
+      <div class="sl-cell"><ul class="assistant-warnings"><li>One parameter was left at its default.</li><li>The gripper target is not yet assigned.</li></ul></div>
+      <div class="sl-cell sl-proposed"><ul class="inline-message severity-warning"><li>One parameter was left at its default.</li><li>The gripper target is not yet assigned.</li></ul></div>
+    </div>
+  </section>
+
+  <section class="sl-block" id="errors">
+    <h2>Errors</h2>
+    <p>Something failed or a value was rejected. Boxes where the whole area is affected; inline text next to the field or action it belongs to.</p>
+    <div class="sl-head"><span>Where</span><span>Today</span><span>Proposed</span></div>
+    <div class="sl-row">
+      <div class="sl-label">Program canvas: workspace read failed<code>program-workspace-notice error-state</code><small>floating over the canvas</small></div>
+      <div class="sl-cell"><div class="program-workspace-notice error-state" role="alert">Could not read the Program workspace. <button type="button">Retry</button></div></div>
+      <div class="sl-cell sl-proposed"><div class="notice severity-error notice-floating" role="alert"><span>Could not read the Program workspace.</span><button type="button">Retry</button></div></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Assistant: discovery failed<code>assistant-error</code></div>
+      <div class="sl-cell"><div class="assistant-error" role="alert"><span>Assistant modes could not be discovered.</span><button type="button">Retry discovery</button></div></div>
+      <div class="sl-cell sl-proposed"><div class="notice severity-error" role="alert"><span>Assistant modes could not be discovered.</span><button type="button">Retry discovery</button></div></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Transport: Stop fault<code>error-banner</code><small>inline text</small></div>
+      <div class="sl-cell"><p class="error-banner" role="alert">Stop fault latched: stop_delivery_timeout · recovery offered</p></div>
+      <div class="sl-cell sl-proposed"><p class="inline-message severity-error" role="alert">Stop fault latched: stop_delivery_timeout · recovery offered</p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Component overview: read failed<code>error-state</code><small>the whole panel is affected: box</small></div>
+      <div class="sl-cell"><p class="error-state" role="alert">Component overview is unavailable: owner projection read failed.</p></div>
+      <div class="sl-cell sl-proposed"><p class="notice severity-error" role="alert">Component overview is unavailable: owner projection read failed.</p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Palette: insertion failed<code>program-form-error</code><small>inline text</small></div>
+      <div class="sl-cell"><p class="program-form-error palette-error" role="alert">This catalog node is not available for portable authoring.</p></div>
+      <div class="sl-cell sl-proposed"><p class="inline-message severity-error" role="alert">This catalog node is not available for portable authoring.</p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Program settings: motion error<code>program-settings-error</code><small>inline text</small></div>
+      <div class="sl-cell"><p class="program-settings-error" role="alert">Motion defaults could not be read from the Applied Deployment.</p></div>
+      <div class="sl-cell sl-proposed"><p class="inline-message severity-error" role="alert">Motion defaults could not be read from the Applied Deployment.</p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Robot panel: command failed<code>robot-control-error</code><small>a whole action failed: box</small></div>
+      <div class="sl-cell"><p class="robot-control-error" role="alert">Move rejected: target is in collision with wall.</p></div>
+      <div class="sl-cell sl-proposed"><p class="notice severity-error" role="alert">Move rejected: target is in collision with wall.</p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Robot panel: joint limit<code>robot-control-limit-error</code><small>inline text</small></div>
+      <div class="sl-cell"><span class="robot-control-limit-error" role="status">Outside the joint limit (−3.14 to 3.14 rad).</span></div>
+      <div class="sl-cell sl-proposed"><span class="inline-message severity-error" role="status">Outside the joint limit (−3.14 to 3.14 rad).</span></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Template: cannot insert<code>scene-commit-error</code><small>inline text</small></div>
+      <div class="sl-cell"><p class="scene-commit-error" role="status">The template needs a Program scene resource, pose-capable arm, gripper target and frame/body roles.</p></div>
+      <div class="sl-cell sl-proposed"><p class="inline-message severity-error" role="status">The template needs a Program scene resource, pose-capable arm, gripper target and frame/body roles.</p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Deployment: field rejected<code>deployment-field-error</code><small>inline, with action</small></div>
+      <div class="sl-cell"><span class="deployment-field-error">Invalid value. Correct it or <button type="button">discard edit</button>.</span></div>
+      <div class="sl-cell sl-proposed"><span class="inline-message severity-error">Invalid value. Correct it or <button type="button">discard edit</button>.</span></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Runtime panel: field error<code>field-error</code><small>inline text</small></div>
+      <div class="sl-cell"><p class="field-error">Blackboard value must be a number.</p></div>
+      <div class="sl-cell sl-proposed"><p class="inline-message severity-error">Blackboard value must be a number.</p></div>
+    </div>
+  </section>
+
+  <section class="sl-block" id="hints">
+    <h2>Notes and hints</h2>
+    <p>Help text next to a control. These are not status messages, so they stay quiet and carry no severity.</p>
+    <div class="sl-head"><span>Where</span><span>Today</span><span>Proposed</span></div>
+    <div class="sl-row">
+      <div class="sl-label">Node policies: defaults note<code>program-policy-note</code></div>
+      <div class="sl-cell"><p class="program-policy-note">Effective canonical defaults are shown when fields are omitted. Defaults are saved by omission.</p></div>
+      <div class="sl-cell sl-proposed"><p class="hint">Effective canonical defaults are shown when fields are omitted. Defaults are saved by omission.</p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Robot panel: pose frame<code>robot-control-pose-note</code></div>
+      <div class="sl-cell"><p class="robot-control-limits robot-control-pose-note">Absolute TCP target in <code>ur5e_robot.base</code>.</p></div>
+      <div class="sl-cell sl-proposed"><p class="hint">Absolute TCP target in <code>ur5e_robot.base</code>.</p></div>
+    </div>
+    <div class="sl-row">
+      <div class="sl-label">Scene editor: staged object<code>scene-contract-note</code></div>
+      <div class="sl-cell"><p class="scene-contract-note">Frame: <code>cell</code> · shape: <code>box</code></p></div>
+      <div class="sl-cell sl-proposed"><p class="hint">Frame: <code>cell</code> · shape: <code>box</code></p></div>
+    </div>
+  </section>
+</div>

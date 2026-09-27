@@ -491,26 +491,6 @@ export function useProgramWorkspace(
     });
   }, [run, scenarioFence]);
 
-  const convertLegacyScenarioDocument = useCallback((input: {
-    sourcePath: string;
-    destinationPath: string;
-    confirmOverwrite: boolean;
-  }) => {
-    const current = requireWorkspace();
-    if (current === null) return;
-    void run('convert_legacy_scenario_document', async () => {
-      await api.scenarioDocuments.convertLegacy(
-        input.sourcePath,
-        input.destinationPath,
-        input.confirmOverwrite,
-      );
-      return workspaceResult(
-        current,
-        'Legacy Scenario converted to a project; the source file and runtime state were unchanged.',
-      );
-    });
-  }, [requireWorkspace, run]);
-
   const updateNodePolicies = useCallback((
     instanceId: string,
     modificationPolicy: ProgramNodeModificationPolicy,
@@ -547,11 +527,15 @@ export function useProgramWorkspace(
     revert,
     saveScenarioDocument,
     loadScenarioDocument,
-    convertLegacyScenarioDocument,
     exportScenarioDocument,
     // The selected project path and its source diagnostics are shared project
     // facts of the one publication, not per-hook state.
     scenarioDocumentPath: project === null ? null : project.documentPath,
+    scenarioDocument: {
+      id: project?.documentId ?? null,
+      name: project?.documentName ?? null,
+      description: project?.documentDescription ?? null,
+    },
     scenarioSourceDiagnostics: project === null ? [] : project.sourceDiagnostics,
     updateNodePolicies,
     clearFeedback,
@@ -562,7 +546,6 @@ export function useProgramWorkspace(
     clearFeedback,
     discard,
     loadScenarioDocument,
-    convertLegacyScenarioDocument,
     exportScenarioDocument,
     mutate,
     mutationAvailable,

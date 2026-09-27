@@ -528,7 +528,8 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                         bool qualified_motion_controlled_stop = false,
                         std::string_view lifecycle_semantic_digest = {},
                         bool ros2_control_execution = false,
-                        bool controlled_stop_deadline_envelope = false) {
+                        bool controlled_stop_deadline_envelope = false,
+                        std::string_view provider_id = "lite6_arm_provider") {
   const bool expanded_stop_deadline =
       qualified_motion_controlled_stop || controlled_stop_deadline_envelope;
   const std::string_view primary_capability_id =
@@ -1087,7 +1088,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
   CanonicalValue::Object provider_root{
       {"api_version",
        CanonicalValue(std::string(core::kProviderManifestApiVersion))},
-      {"provider_manifest_id", CanonicalValue("lite6_arm_provider")},
+      {"provider_manifest_id", CanonicalValue(std::string(provider_id))},
       {"offered_capabilities", CanonicalValue(std::move(offered_capabilities))},
       {"provider_contracts", CanonicalValue(std::move(provider_contracts))},
   };
@@ -1110,7 +1111,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
   const core::ContentAddressedStoreKey provider_key(
       catalog_key("provider", provider_digest.value()));
   const core::ProviderManifestCatalogRecordRefDTO provider_ref{
-      core::ProviderManifestId("lite6_arm_provider"),
+      core::ProviderManifestId(std::string(provider_id)),
       core::ProviderManifestRevision(
           revision_from_document(provider_bytes, "provider_manifest_revision")),
       core::SchemaId(std::string(core::kProviderManifestApiVersion)),
@@ -1388,7 +1389,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
       catalog_artifact("catalog://controller_topology/" + topology_id,
                        topology_bytes, topology));
   artifacts.push_back(
-      catalog_artifact("catalog://provider_manifest/lite6_arm_provider",
+      catalog_artifact("catalog://provider_manifest/" + std::string(provider_id),
                        provider_bytes, provider));
   for (std::size_t index = 0U; index < lifecycle_capabilities.size(); ++index) {
     artifacts.push_back(catalog_artifact(
@@ -2008,7 +2009,8 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
            std::size_t instance_count = 1U, std::string_view cell_id = {},
            std::string_view containment_granularity = "resource",
            bool gripper_only = false,
-           std::optional<double> initial_joint1_position_rad = std::nullopt) {
+           std::optional<double> initial_joint1_position_rad = std::nullopt,
+           bool shared_native_domain = false) {
   const bool aggregate = catalog.gripper_capability.has_value();
   if (gripper_only && (!aggregate || instance_count != 1U)) {
     throw std::logic_error(
@@ -2051,7 +2053,8 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
         indexed_id(kLite6ControllableModelInstanceId, instance);
     const std::string component_id =
         indexed_id(kLite6ControllableComponentId, instance);
-    const std::string domain_id = indexed_id(kLite6ArmDomainId, instance);
+    const std::string domain_id = indexed_id(kLite6ArmDomainId,
+                                             shared_native_domain ? 0U : instance);
     const std::string binding_id = indexed_id(kLite6ArmBindingId, instance);
     const std::string runtime_unit_id =
         indexed_id(ros2_control_execution ? kLite6Ros2ControlExecutionRuntimeId
@@ -2311,6 +2314,23 @@ make_graph(const Lite6StructuralRetentionFixture &structural,
     }
   }
 
+  if (shared_native_domain) {
+    // Generic graph qualification permits shared domains. Construct that
+    // externally supplied topology before hashing so Manager's native-specific
+    // refusal can be tested without forging an already verified bundle.
+    if (!native_motion || aggregate || instance_count != 2U) {
+      throw std::logic_error("shared native domain fixture requires two arms");
+    }
+    auto shared = std::get<CanonicalValue::Object>(domains.front().storage());
+    for (auto &[name, value] : shared) {
+      if (name == "runtime_unit_ids") {
+        value = text_array({indexed_id(kLite6NativeExecutionRuntimeId, 0U),
+                            indexed_id(kLite6NativeExecutionRuntimeId, 1U)});
+      }
+    }
+    domains.clear();
+    domains.emplace_back(std::move(shared));
+  }
   const std::string selected_cell_id =
       cell_id.empty()
           ? (gripper_only           ? "i6_lite6_gripper_only_cell"
@@ -2725,7 +2745,8 @@ make_lite6_controllable_retention_fixture(
     bool ros2_control_execution = false, bool operator_confirmation = false,
     const std::vector<core::StopTimingParametersDTO> &stop_timings = {},
     bool gripper_only = false,
-    std::optional<double> initial_joint1_position_rad = std::nullopt) {
+    std::optional<double> initial_joint1_position_rad = std::nullopt,
+    bool shared_native_domain = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (gripper_only &&
       (!aggregate_gripper || !native_motion || !stoppable ||
@@ -2764,7 +2785,8 @@ make_lite6_controllable_retention_fixture(
   auto catalog = fixture_detail::qualify_control_catalog(
       chained, native_motion, stoppable, containment_granularity,
       qualified_motion_controlled_stop, arm_lifecycle_semantic_digest,
-      ros2_control_execution, qualified_motion_controlled_stop);
+      ros2_control_execution, qualified_motion_controlled_stop,
+      shared_native_domain ? "manyforge.provider.native_control" : "lite6_arm_provider");
   if (aggregate_gripper && stoppable && qualified_motion_controlled_stop) {
     auto gripper_stop_catalog = fixture_detail::qualify_control_catalog(
         false, true, true, "resource", false, {}, false, true);
@@ -2788,7 +2810,7 @@ make_lite6_controllable_retention_fixture(
   }
   const auto graph = fixture_detail::make_graph(
       structural, catalog, instance_count, cell_id, containment_granularity,
-      gripper_only, initial_joint1_position_rad);
+      gripper_only, initial_joint1_position_rad, shared_native_domain);
   const std::optional<fixture_detail::AssistantOverlayFixture>
       assistant_overlay =
           assistant_enabled

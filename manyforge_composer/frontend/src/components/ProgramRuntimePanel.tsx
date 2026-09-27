@@ -375,7 +375,7 @@ export function ProgramRuntimePanel({
                 }}
               />
             </label>
-            {manualError && <p className="field-error">{manualError}</p>}
+            {manualError && <p className="inline-message severity-error">{manualError}</p>}
             <div className="runtime-control-actions">
               {(['succeeded', 'failed'] as const).map((outcome) => (
                 <button
@@ -512,7 +512,7 @@ export function ProgramRuntimePanel({
               }}
             />
           </label>
-          {blackboardError && <p className="field-error">{blackboardError}</p>}
+          {blackboardError && <p className="inline-message severity-error">{blackboardError}</p>}
           <button
             type="button"
             disabled={
@@ -1439,7 +1439,7 @@ export function ProgramTransportControls({
             </p>
           )}
           {fullCellStop?.fault && (
-            <p className="error-banner" role="alert">
+            <p className="inline-message severity-error" role="alert">
               Stop fault {fullCellStop.fault.state}: {fullCellStop.fault.reasonCode}
               {' · recovery '}{fullCellStop.fault.recoveryStatus}
             </p>

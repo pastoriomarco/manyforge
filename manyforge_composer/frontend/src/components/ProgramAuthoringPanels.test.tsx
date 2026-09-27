@@ -17,6 +17,7 @@ import type {
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { ProgramDocumentControls } from './ProgramDocumentControls';
+import { ScenarioDocumentCommands } from './ScenarioDocumentCommands';
 import { NodePaletteItem } from './NodePaletteItem';
 import {
   ProgramNodePalette,
@@ -743,8 +744,8 @@ describe('Program authoring panels', () => {
       saveScenarioDocument: vi.fn(),
       exportScenarioDocument: vi.fn(),
       loadScenarioDocument: vi.fn(),
-      convertLegacyScenarioDocument: vi.fn(),
       scenarioDocumentPath: null,
+      scenarioDocument: { id: null, name: null, description: null },
       scenarioSourceDiagnostics: [],
       updateNodePolicies: vi.fn(),
       clearFeedback: vi.fn(),
@@ -931,8 +932,8 @@ describe('Program authoring panels', () => {
       saveScenarioDocument: vi.fn(),
       exportScenarioDocument: vi.fn(),
       loadScenarioDocument: vi.fn(),
-      convertLegacyScenarioDocument: vi.fn(),
       scenarioDocumentPath: null,
+      scenarioDocument: { id: null, name: null, description: null },
       scenarioSourceDiagnostics: [],
       updateNodePolicies: vi.fn(),
       clearFeedback: vi.fn(),
@@ -981,7 +982,11 @@ describe('Program authoring panels', () => {
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <div>
-        <ProgramDocumentControls controller={controller} runtime={runtime} />
+        <ProgramDocumentControls
+          controller={controller}
+          runtime={runtime}
+          scenarioCommands={<ScenarioDocumentCommands controller={controller} />}
+        />
         <ProgramWorkspace
           controller={controller}
           runtime={runtime}
@@ -1009,7 +1014,9 @@ describe('Program authoring panels', () => {
     );
 
     expect(markup).toContain('>Apply</button>');
-    expect(markup).toContain('Save');
+    expect(markup).toContain('aria-label="Save Scenario (choose a project folder)"');
+    expect(markup).toContain('aria-label="Load Scenario"');
+    expect(markup).not.toContain('>Open</button>');
     expect(controlsSource).toContain('!workspace?.applicability.applyReady');
     expect(controlsSource).toContain('Affected nodes:');
     expect(controlsSource).toContain('workspace?.applicability.unavailableReason?.message');

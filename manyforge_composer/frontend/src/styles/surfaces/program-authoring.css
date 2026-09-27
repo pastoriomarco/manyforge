@@ -233,14 +233,10 @@
   justify-content: space-between;
 }
 
-.program-inline-message,
-.program-form-error {
+.program-inline-message {
   margin: 0;
   color: var(--mf-text-danger-73);
   font-size: var(--mf-font-size-068);
-}
-
-.program-inline-message {
   padding: 0 0.75rem 0.55rem;
 }
 
@@ -374,7 +370,6 @@
   font-size: var(--mf-font-size-065);
 }
 
-.program-policy-note,
 .program-policy-help,
 .program-policy-blocked {
   margin: 0;
@@ -753,34 +748,41 @@
   min-height: 15rem;
 }
 
+/* Aligned with the palette list, whose category headers sit 0.22rem in; the
+   bottom padding plus the list's 0.22rem gives the 0.35rem category gap. */
 .program-template-entry {
-  padding: 0.3rem 0.4rem;
-  border-bottom: 1px solid var(--mf-border-neutral-19);
-}
-
-.program-template-entry > button {
-  display: flex;
-  width: 100%;
-  align-items: center;
-  gap: 0.45rem;
-  padding: 0.38rem 0.45rem;
-  text-align: left;
-}
-
-.program-template-entry > button > span:last-child {
   display: grid;
-  min-width: 0;
+  gap: 0.35rem;
+  padding: 0.22rem 0.22rem 0.13rem;
 }
 
-.program-template-symbol .program-kind-symbol {
-  display: block;
-  width: 0.62rem;
-  height: 0.62rem;
+/* Compact Pick/Place template launchers under the palette filter. */
+.program-template-buttons {
+  display: flex;
+  gap: 0.35rem;
+  padding-inline: 0.2rem;
 }
 
-.program-template-entry small {
-  color: var(--mf-text-neutral-55);
-  font-size: var(--mf-font-size-058);
+.program-template-buttons[hidden] {
+  display: none;
+}
+
+.program-template-buttons > button {
+  display: inline-flex;
+  flex: 1 1 0;
+  min-height: 1.85rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  padding: 0.24rem 0.5rem;
+  font-size: var(--mf-font-size-072);
+  font-weight: var(--mf-font-weight-semibold);
+}
+
+.program-template-buttons .program-category-icon {
+  --program-icon-size: 0.95rem;
+  width: 0.95rem;
+  height: 0.95rem;
 }
 
 .program-template-form,
@@ -1005,25 +1007,14 @@
   pointer-events: none;
 }
 
+/* Overlay placement only; the look is the shared floating .notice. */
 .program-workspace-notice {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.6rem;
   margin-top: 0.3rem;
-  padding: 0.4rem 0.55rem;
-  border: 1px solid var(--mf-border-neutral-32);
-  border-radius: var(--mf-radius-md-sm);
-  color: var(--mf-text-neutral-73);
-  background: var(--mf-bg-neutral-08-a95);
-  box-shadow: 0 0.55rem 1.2rem var(--mf-shadow-neutral-00-a28);
-  font-size: var(--mf-font-size-065);
   pointer-events: auto;
-}
-
-.program-workspace-notice button {
-  flex: 0 0 auto;
-  padding: 0.24rem 0.4rem;
 }
 
 .program-authoring-grid,
@@ -1472,9 +1463,7 @@
   margin-top: 0.6rem;
 }
 
-.program-settings-error {
-  color: var(--danger-text, var(--mf-text-danger-82));
-}
+
 
 .program-motion-conflict-backdrop {
   position: fixed;

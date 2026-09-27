@@ -772,12 +772,12 @@
 .workbench-notification-stack {
   position: absolute;
   z-index: var(--mf-z-popover);
-  top: calc(var(--mf-viewer-control-height) + 2 * var(--mf-viewer-overlay-inset));
+  top: calc(var(--mf-toolbar-control-height) + 2 * var(--mf-viewer-overlay-inset));
   right: var(--mf-viewer-overlay-inset);
   left: var(--mf-viewer-overlay-inset);
   display: flex;
   max-height: calc(
-    100% - var(--mf-viewer-control-height) - 2 * var(--mf-viewer-overlay-inset) - 4.95rem
+    100% - var(--mf-toolbar-control-height) - 2 * var(--mf-viewer-overlay-inset) - 4.95rem
   );
   flex-direction: column;
   gap: 0.35rem;

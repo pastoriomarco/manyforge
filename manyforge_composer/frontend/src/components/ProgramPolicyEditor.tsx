@@ -290,7 +290,7 @@ export function ProgramPolicyEditor({
             <h4 id={fieldId(id, 'title')}>Node policy</h4>
           </div>
         </div>
-        <p className="program-policy-note">
+        <p className="program-policy-note hint">
           Effective canonical defaults are shown when fields are omitted. Defaults
           are saved by omission. These values are authored for future Run behavior;
           they are not currently applied to the runtime. Saving policy changes only
@@ -478,7 +478,7 @@ export function ProgramPolicyEditor({
           {ALLOWED_SKILLS_UNAVAILABLE_MESSAGE}
         </p>
         {form.recovery_policy.allowed_skills.length > 0 && (
-          <p className="program-form-error" role="alert">
+          <p className="program-form-error inline-message severity-error" role="alert">
             Imported authored Allowed skills ({form.recovery_policy.allowed_skills.join(', ')})
             are a blocking applicability error in this editor. Refresh or retry after
             the retained referent contract is available.
