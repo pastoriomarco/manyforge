@@ -15,7 +15,7 @@ from manyforge_behavior.canonical_artifact import (
 )
 
 
-DEPLOYMENT_INTENT_API_VERSION = "manyforge.deployment_intent.v1"
+DEPLOYMENT_INTENT_API_VERSION = "manyforge.deployment_intent.v2"
 _PORTABLE_ID = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
 _PACKAGE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,127}$")
 _MAX_COMPONENTS = 128
@@ -299,7 +299,6 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
     required = {
         "api_version",
         "deployment_artifact_id",
-        "cell_id",
         "name",
         "components",
         "attachments",
@@ -316,7 +315,6 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
         "deployment_artifact_id": _require_id(
             intent["deployment_artifact_id"], f"{source}: deployment_artifact_id"
         ),
-        "cell_id": _require_id(intent["cell_id"], f"{source}: cell_id"),
         "name": _require_text(intent["name"], f"{source}: name", 256),
     }
     if "description" in intent:

@@ -38,7 +38,7 @@ ZERO_DIGEST: Final = "sha256:" + "0" * 64
 DESCRIPTION_API: Final = "manyforge.maintained_deployment_sources.v1"
 ASSISTANT_API: Final = "manyforge.maintained_assistant_profiles.v1"
 SCENARIO_PROJECT_API: Final = "manyforge.scenario.project.v1"
-DEPLOYMENT_INTENT_API: Final = "manyforge.deployment_intent.v1"
+DEPLOYMENT_INTENT_API: Final = "manyforge.deployment_intent.v2"
 SCENARIO_SOURCE_SNAPSHOT_API: Final = "manyforge.scenario.source_snapshot.v1"
 CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1\0"
 NATIVE_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
@@ -3134,7 +3134,6 @@ def _deployment_intent(
     result: dict[str, Any] = {
         "api_version": DEPLOYMENT_INTENT_API,
         "deployment_artifact_id": deployment["deployment_artifact_id"],
-        "cell_id": deployment["cell_id"],
         "name": deployment["name"],
         "description": deployment["description"],
         "components": [

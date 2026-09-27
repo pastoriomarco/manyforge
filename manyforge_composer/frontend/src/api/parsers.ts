@@ -3504,7 +3504,7 @@ export function parseDeploymentWorkspaceResponse(
     deploymentRevision,
     graphRevision,
   ].filter((identity) => identity === null).length;
-  const authoredIntent = document?.api_version === 'manyforge.deployment_intent.v1';
+  const authoredIntent = document?.api_version === 'manyforge.deployment_intent.v2';
   if (
     (document === null && missingDraftIdentities !== 3)
     || (document !== null && !authoredIntent && missingDraftIdentities !== 0)
@@ -3517,7 +3517,7 @@ export function parseDeploymentWorkspaceResponse(
     // Source-referenced authoring intent has no compiler-issued identities.
     // Those belong to the prepared activation, never to the mutable Draft.
     allowedKeysAt(document,
-      ['api_version', 'deployment_artifact_id', 'cell_id', 'name',
+      ['api_version', 'deployment_artifact_id', 'name',
         'components', 'attachments', 'policies'],
       ['description', 'assistant_profile_id', 'compatibility'],
       `${path}.draft.document`);
@@ -3525,7 +3525,6 @@ export function parseDeploymentWorkspaceResponse(
       `${path}.draft.document.deployment_artifact_id`) !== deploymentArtifactId) {
       return fail(`${path}.draft`, 'one exact authored Deployment identity');
     }
-    stringAt(document.cell_id, `${path}.draft.document.cell_id`);
     stringAt(document.name, `${path}.draft.document.name`);
     boundedArrayAt(document.components, `${path}.draft.document.components`, 4096);
     boundedArrayAt(document.attachments, `${path}.draft.document.attachments`, 4096);

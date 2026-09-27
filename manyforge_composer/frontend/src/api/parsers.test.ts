@@ -1364,9 +1364,9 @@ describe('Deployment workspace parser', () => {
     const fixture = deploymentWorkspaceFixture();
     Object.assign(fixture.draft as Record<string, unknown>, {
       document: {
-        api_version: 'manyforge.deployment_intent.v1',
+        api_version: 'manyforge.deployment_intent.v2',
         deployment_artifact_id: 'deployment.fixture',
-        cell_id: 'cell.fixture', name: 'Fixture',
+        name: 'Fixture',
         components: [], attachments: [], policies: {},
       },
       deploymentRevision: null, graphRevision: null,
@@ -1376,7 +1376,7 @@ describe('Deployment workspace parser', () => {
     fixture.savedScenarioCandidates = [];
     fixture.saved = { path: '/workspace/deployment.yaml', deploymentRevision: null };
     const parsed = parseDeploymentWorkspaceResponse(fixture);
-    expect(parsed.draft.document?.api_version).toBe('manyforge.deployment_intent.v1');
+    expect(parsed.draft.document?.api_version).toBe('manyforge.deployment_intent.v2');
     expect(parsed.draft.graphRevision).toBeNull();
     expect(parsed.saved.path).toBe('/workspace/deployment.yaml');
     expect(parsed.saved.deploymentRevision).toBeNull();

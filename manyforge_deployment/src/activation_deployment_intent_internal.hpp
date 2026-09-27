@@ -21,7 +21,6 @@ struct ActivationDeploymentComponent final {
 
 struct ActivationDeploymentIntent final {
   std::string deployment_artifact_id;
-  std::string cell_id;
   std::string name;
   std::optional<std::string> description;
   std::optional<std::string> assistant_profile_id;

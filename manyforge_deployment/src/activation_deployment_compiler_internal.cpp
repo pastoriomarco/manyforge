@@ -494,6 +494,7 @@ struct ComponentProjection final {
 
 CanonicalValue compile_activation_deployment(
     const ActivationDeploymentIntent &intent,
+    const core::CellId &runtime_cell_id,
     const std::vector<ActivationComponentProfile> &component_profiles,
     const std::vector<ActivationPreparedModel> &prepared_models,
     const std::vector<core::CatalogRecordRefDTO> &catalog_records,
@@ -591,7 +592,7 @@ CanonicalValue compile_activation_deployment(
   CanonicalValue graph(Object{
       {"api_version", CanonicalValue(std::string(core::kCellGraphApiVersion))},
       {"graph_revision", CanonicalValue(std::string(kZeroDigest))},
-      {"cell_id", CanonicalValue(intent.cell_id)},
+      {"cell_id", CanonicalValue(runtime_cell_id.value())},
       {"runtime_units", CanonicalValue(Array{CanonicalValue(Object{
           {"runtime_unit_id", CanonicalValue(runtime_id)},
           {"runtime_profile_id", CanonicalValue("manyforge.native_execution_runtime")},
@@ -808,7 +809,7 @@ CanonicalValue compile_activation_deployment(
     std::replace(normalized.begin(), normalized.end(), '.', '-');
     Object row{
         {"capability_provider_binding_id", CanonicalValue(
-            intent.cell_id + "." + normalized + ".provider")},
+            runtime_cell_id.value() + "." + normalized + ".provider")},
         {"capability_provider_binding_revision", CanonicalValue(std::string(kZeroDigest))},
     };
     const auto selected_capability = selector(catalog, capability);
@@ -817,8 +818,8 @@ CanonicalValue compile_activation_deployment(
     }
     row.insert(row.end(), {
         {"scope", CanonicalValue("cell_global")},
-        {"target", CanonicalValue(Object{{"cell_id", CanonicalValue(intent.cell_id)}})},
-        {"provider_instance_id", CanonicalValue(intent.cell_id + ".logical_scene")},
+        {"target", CanonicalValue(Object{{"cell_id", CanonicalValue(runtime_cell_id.value())}})},
+        {"provider_instance_id", CanonicalValue(runtime_cell_id.value() + ".logical_scene")},
         {"provider_manifest_id", CanonicalValue("manyforge.provider.logical_scene")},
         {"provider_manifest_revision", CanonicalValue(revision(logical))},
         {"endpoint_bindings", CanonicalValue(Array{CanonicalValue(Object{
@@ -862,7 +863,7 @@ CanonicalValue compile_activation_deployment(
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"deployment_artifact_id", CanonicalValue(intent.deployment_artifact_id)},
       {"deployment_revision", CanonicalValue(std::string(kZeroDigest))},
-      {"cell_id", CanonicalValue(intent.cell_id)},
+      {"cell_id", CanonicalValue(runtime_cell_id.value())},
       {"name", CanonicalValue(intent.name)},
       {"catalogs", catalog.selected_value()},
       {"graph", CanonicalValue(std::move(authored_graph))},

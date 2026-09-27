@@ -1113,7 +1113,7 @@ def test_pose_only_controllable_component_edit_remains_draftable(
 
 def test_draft_composition_classifier_uses_model_identity_not_placement_fields() -> None:
     intent_before = {
-        "api_version": "manyforge.deployment_intent.v1",
+        "api_version": "manyforge.deployment_intent.v2",
         "components": [
             {
                 "component_id": "robot",
@@ -1166,7 +1166,7 @@ def test_controllable_add_remove_and_replacement_are_activation_only() -> None:
 
     def intent(*components: dict[str, Any]) -> dict[str, Any]:
         return {
-            "api_version": "manyforge.deployment_intent.v1",
+            "api_version": "manyforge.deployment_intent.v2",
             "components": list(components),
             "attachments": [],
         }
@@ -1189,7 +1189,7 @@ def test_draft_composition_classifier_fails_closed_on_mixed_or_unknown_schema() 
     unknown = deepcopy(compiled)
     unknown["api_version"] = "manyforge.deployment.v2"
     intent = {
-        "api_version": "manyforge.deployment_intent.v1",
+        "api_version": "manyforge.deployment_intent.v2",
         "components": [],
         "attachments": [],
     }
@@ -1200,7 +1200,7 @@ def test_draft_composition_classifier_fails_closed_on_mixed_or_unknown_schema() 
 
 def test_opaque_runtime_or_controller_configuration_is_not_draft_classified() -> None:
     intent = {
-        "api_version": "manyforge.deployment_intent.v1",
+        "api_version": "manyforge.deployment_intent.v2",
         "components": [
             {
                 "component_id": "robot",
@@ -1584,7 +1584,7 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
     parent_claim = {"intent": {"owner_role": "authoring_owner"}}
     result = state.execute_authored_deployment_candidate(
         {
-            "deployment": {"api_version": "manyforge.deployment_intent.v1"},
+            "deployment": {"api_version": "manyforge.deployment_intent.v2"},
             "model_source_closure": {},
             "program_role_assignment": {},
             "typed_parameter_overrides": {},
@@ -1893,9 +1893,8 @@ def test_save_as_path_rebase_matches_saved_scenario_but_real_edits_do_not() -> N
     source_root = Path("/workspace/source/cell")
     destination_root = Path("/workspace/copies/deep/cell")
     deployment = {
-        "api_version": "manyforge.deployment_intent.v1",
+        "api_version": "manyforge.deployment_intent.v2",
         "deployment_artifact_id": "fixture_deployment",
-        "cell_id": "fixture_cell",
         "name": "Fixture deployment",
         "components": [
             {

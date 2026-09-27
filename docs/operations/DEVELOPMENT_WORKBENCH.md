@@ -32,6 +32,17 @@ The setup script may recreate stale or modified dependency directories under
 Selected projects are read through the ordinary Scenario-project loader and
 validated before activation.
 
+The workbench owns one stable internal runtime identity, independent of which
+Scenario is selected. Portable `manyforge.deployment_intent.v2` documents do not
+contain `cell_id`. Starting empty and starting with a project both establish
+the same command-closed native host before ordinary Load/Apply. Loading another
+Scenario changes its equipment, Scene and Program, not the runtime identity.
+Multiple instances competing for the same equipment are unsupported.
+
+Existing v1 authored Deployment files must be migrated explicitly: change their
+intent version to v2 and remove the authored `cell_id`. Do not remove cell IDs
+from compiled Deployment artifacts or rename existing runtime journals.
+
 ## Start, inspect, and stop
 
 Start an empty authoring workbench:

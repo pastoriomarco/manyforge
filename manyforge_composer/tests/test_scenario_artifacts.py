@@ -45,9 +45,8 @@ _PROGRAM_FIXTURE = from_program(
 
 def _deployment_intent() -> dict:
     return {
-        "api_version": "manyforge.deployment_intent.v1",
+        "api_version": "manyforge.deployment_intent.v2",
         "deployment_artifact_id": "fixture_deployment",
-        "cell_id": "fixture_cell",
         "name": "Fixture deployment",
         "components": [
             {

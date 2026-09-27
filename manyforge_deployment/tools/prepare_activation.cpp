@@ -281,14 +281,14 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
           deployment::kMaxActivationPreparationRequestBytes);
   const auto &root = request.root();
   require_exact_fields(root,
-                       {"schema_version", "source_document_digest",
+                       {"schema_version", "runtime_cell_id", "source_document_digest",
                         "scenario_id", "captured_input_digest", "deployment",
                         "model_source_closure", "prepared_model_closure",
                         "program",
                         "program_role_assignment", "typed_parameter_overrides"},
                        "activation preparation request");
   if (text(member(root, "schema_version", "request"), "schema_version") !=
-      "manyforge.activation_preparation_request.v1") {
+      "manyforge.activation_preparation_request.v2") {
     throw std::invalid_argument("unsupported activation preparation request");
   }
   const auto &source_digest =
@@ -308,6 +308,17 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
         "preparation digests must be SHA-256 identities");
   }
   const auto &deployment_value = member(root, "deployment", "request");
+  // Startup configuration owns this identity, never the portable Scenario.
+  const core::CellId runtime_cell_id(text(
+      member(root, "runtime_cell_id", "request"), "runtime_cell_id"));
+  const auto &cell_text = runtime_cell_id.value();
+  if (cell_text.size() > 128U || cell_text.front() < 'a' || cell_text.front() > 'z' ||
+      !std::all_of(cell_text.begin(), cell_text.end(), [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+               c == '_' || c == '-' || c == '.';
+      })) {
+    throw std::invalid_argument("runtime_cell_id must be a bounded portable identifier");
+  }
   const auto &model_source_closure =
       member(root, "model_source_closure", "request");
   const auto &prepared_model_closure =
@@ -358,7 +369,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
 
   const auto materialized = deployment::detail::materialize_prepared_activation(
       options.capability_root, std::move(prepared_models),
-      deployment_intent, component_profiles, options.publish_canonical_empty);
+      deployment_intent, runtime_cell_id, component_profiles, options.publish_canonical_empty);
   const auto program = deployment::verify_program_binding_contract(
       deployment::canonical_json(program_value), *materialized.bundle);
   const auto mode = assistant_mode(program_value);

@@ -33,6 +33,7 @@
 
 #include "canonical_empty_admission_internal.hpp"
 #include "content_identity_internal.hpp"
+#include "native_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -104,6 +105,32 @@ class ScopedTrustedRoot final {
   inline static std::atomic<std::uint64_t> sequence_{0U};
   std::filesystem::path path_;
 };
+
+TEST(CanonicalEmptyAdmission, NativeBootstrapOwnsInfrastructureWithoutAScenario) {
+  ScopedTrustedRoot root("native-infrastructure");
+  const core::CellId cell("runtime_owned_cell");
+  const auto profile = detail::native_execution_runtime_profile_document();
+  const auto admission = detail::generate_native_empty_package(root.path(), cell, profile);
+  const auto &graph = admission.retained_bundle().value().cell_graph;
+  EXPECT_EQ(graph.cell_id, cell);
+  ASSERT_EQ(graph.runtime_units.size(), 1U);
+  EXPECT_TRUE(graph.controllable_components.empty());
+  EXPECT_TRUE(graph.model_instances.empty());
+  EXPECT_TRUE(graph.control_domains.empty());
+  EXPECT_TRUE(graph.control_bindings.empty());
+  EXPECT_TRUE(graph.component_attachments.empty());
+  EXPECT_TRUE(admission.retained_bundle().value().desired_control_configurations.empty());
+  const auto replay = detail::generate_native_empty_package(root.path(), cell, profile);
+  EXPECT_EQ(replay.canonical_bytes(), admission.canonical_bytes());
+  ScopedTrustedRoot other_root("other-native-infrastructure");
+  const auto other = detail::generate_native_empty_package(
+      other_root.path(), core::CellId("other_runtime"), profile);
+  EXPECT_NE(other.retained_bundle_id(), admission.retained_bundle_id());
+  // Infrastructure is the same installed host, not equipment selected by a
+  // Scenario. Cell placement changes its graph, not its process product.
+  EXPECT_EQ(other.retained_bundle().value().compiled_products.runtime_unit_products,
+            admission.retained_bundle().value().compiled_products.runtime_unit_products);
+}
 
 class ScopedRootSymlinkSubstitution final {
  public:

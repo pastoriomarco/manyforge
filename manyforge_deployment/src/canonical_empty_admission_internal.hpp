@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "manyforge_deployment/canonical_empty_admission.hpp"
 #include "manyforge_deployment/deployment_artifact_codec.hpp"
@@ -69,5 +70,12 @@ publish_cell_scoped_canonical_empty_admission(
 /// The output root is placement only; every semantic identity is build-owned.
 [[nodiscard]] CanonicalEmptyRetainedBundleAdmission
 generate_canonical_empty_package(const std::filesystem::path &output_root);
+
+/// Workbench startup infrastructure, independent of any selected Scenario.
+/// Retains only the native host, never a controller, model or Program.
+[[nodiscard]] CanonicalEmptyRetainedBundleAdmission
+generate_native_empty_package(const std::filesystem::path &output_root,
+                              const core::CellId &cell_id,
+                              std::string_view runtime_profile_bytes);
 
 } // namespace manyforge::deployment::detail

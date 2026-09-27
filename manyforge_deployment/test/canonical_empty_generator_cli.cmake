@@ -57,7 +57,7 @@ if(NOT EXISTS
     "successful generator invocation omitted the commit record")
 endif()
 
-# The exact same invocation is the only accepted idempotent replay.
+# The exact same invocation is an idempotent replay.
 execute_process(
   COMMAND
     "${MANYFORGE_GENERATOR}"
@@ -69,6 +69,32 @@ if(NOT result EQUAL 0)
   message(FATAL_ERROR
     "exact idempotent CLI replay failed; "
     "stdout=${output}; stderr=${error}")
+endif()
+
+file(MAKE_DIRECTORY "${MANYFORGE_TEST_ROOT}/native")
+expect_generator_failure("invalid runtime identity"
+  --output-root "${MANYFORGE_TEST_ROOT}/native"
+  --cell-id "../foreign" --native-runtime-profile "${MANYFORGE_NATIVE_PROFILE}")
+set(native_args --output-root "${MANYFORGE_TEST_ROOT}/native"
+  --cell-id native_test_runtime --native-runtime-profile "${MANYFORGE_NATIVE_PROFILE}")
+foreach(attempt RANGE 1 2)
+  execute_process(COMMAND "${MANYFORGE_GENERATOR}" ${native_args}
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+  if(NOT result EQUAL 0)
+    message(FATAL_ERROR "native bootstrap ${attempt} failed: ${error}")
+  endif()
+  if(attempt EQUAL 1)
+    set(first_output "${output}")
+  elseif(NOT output STREQUAL first_output)
+    message(FATAL_ERROR "native bootstrap replay changed its identity")
+  endif()
+endforeach()
+string(JSON runtime_cell GET "${output}" cell_id)
+if(NOT runtime_cell STREQUAL "native_test_runtime")
+  message(FATAL_ERROR "native bootstrap ignored the configured runtime identity")
+endif()
+if(NOT EXISTS "${MANYFORGE_TEST_ROOT}/native/canonical-empty-admission.native_test_runtime.json")
+  message(FATAL_ERROR "native bootstrap omitted its exact admission")
 endif()
 
 file(REMOVE_RECURSE "${MANYFORGE_TEST_ROOT}")

@@ -197,11 +197,11 @@ def _controllable_composition_change_kinds(
         return None
     after_schema = after.get("api_version")
     if before is None:
-        if after_schema == "manyforge.deployment_intent.v1":
+        if after_schema == "manyforge.deployment_intent.v2":
             # The first Deployment Open is still a before/after comparison:
             # every authored component compiles to a controllable component.
             before = {
-                "api_version": "manyforge.deployment_intent.v1",
+                "api_version": "manyforge.deployment_intent.v2",
                 "components": [],
                 "attachments": [],
             }
@@ -224,7 +224,7 @@ def _controllable_composition_change_kinds(
     if before_schema != after_schema:
         return None
 
-    if after_schema == "manyforge.deployment_intent.v1":
+    if after_schema == "manyforge.deployment_intent.v2":
         def intent_components(
             document: dict[str, Any],
         ) -> dict[str, dict[str, Any]] | None:

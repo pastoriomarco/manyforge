@@ -6,6 +6,7 @@ from copy import deepcopy
 import json
 import hashlib
 import logging
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -229,9 +230,15 @@ class ActivationPreparer:
         executable: Path,
         capability_root: Path,
         activation_root: Path,
+        runtime_cell_id: str,
         timeout_seconds: float | None,
         publish_canonical_empty: bool = False,
     ) -> None:
+        if not isinstance(runtime_cell_id, str) or re.fullmatch(
+            r"[a-z][a-z0-9_.-]{0,127}", runtime_cell_id
+        ) is None:
+            raise ValueError("runtime_cell_id must be a bounded portable identifier")
+        self._runtime_cell_id = runtime_cell_id
         self._executable = executable
         self._capability_root = capability_root
         self._activation_root = activation_root
@@ -279,7 +286,8 @@ class ActivationPreparer:
                 profiles=self._profiles,
             )
             request = {
-                "schema_version": "manyforge.activation_preparation_request.v1",
+                "schema_version": "manyforge.activation_preparation_request.v2",
+                "runtime_cell_id": self._runtime_cell_id,
                 "source_document_digest": source_document_digest,
                 "scenario_id": scenario_id,
                 "captured_input_digest": captured_input_digest,
@@ -348,7 +356,8 @@ class ActivationPreparer:
                 detail = stderr.read().decode("utf-8", errors="replace").strip()
             if completed.returncode != 0:
                 logging.getLogger(__name__).error(
-                    "Activation preparation failed: scenario=%s input=%s detail=%s",
+                    "Activation preparation failed: runtime=%s scenario=%s input=%s detail=%s",
+                    self._runtime_cell_id,
                     scenario_id,
                     captured_input_digest,
                     detail[:4096],

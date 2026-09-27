@@ -31,62 +31,28 @@ def test_repository_bootstrap_uses_the_exact_source_owned_generator(
 
     def run(command: tuple[str, ...], **_kwargs: Any) -> None:
         observed.append(command)
-        bootstrap.mkdir(parents=True, exist_ok=True)
-        (bootstrap / "canonical-empty-admission.json").write_text("{}")
+        selected_root = Path(command[2])
+        selected_root.mkdir(parents=True, exist_ok=True)
+        (selected_root / "canonical-empty-admission.c1_build_authority_cell.json").write_text("{}")
 
     monkeypatch.setattr(dev_workbench, "CANONICAL_EMPTY_GENERATOR", generator)
+    monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
     monkeypatch.setattr(dev_workbench, "BOOTSTRAP_ROOT", bootstrap)
     monkeypatch.setattr(dev_workbench, "_run", run)
 
-    assert dev_workbench._ensure_repository_bootstrap_package() == bootstrap
+    root = dev_workbench._ensure_repository_bootstrap_package()
+    assert root.parent == bootstrap
     assert observed == [
-        (str(generator), "--output-root", str(bootstrap)),
+        (str(generator), "--output-root", str(root),
+         "--cell-id", "c1_build_authority_cell", "--native-runtime-profile",
+         str(dev_workbench.WORKSPACE / "manyforge_deployment/resources/maintained/catalog/"
+             "runtime_profile/manyforge.native_execution_runtime.json")),
     ]
+    assert dev_workbench._ensure_repository_bootstrap_package() == root
+    generator.write_text("updated generator", encoding="utf-8")
+    assert dev_workbench._ensure_repository_bootstrap_package() != root
+    assert (root / "canonical-empty-admission.c1_build_authority_cell.json").exists()
 
-
-def test_selected_project_bootstrap_uses_the_project_cell_identity(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    from manyforge_composer.backend.scenario_artifacts import (
-        capture_scenario_artifact,
-    )
-    from manyforge_headless_api.activation_preparer import ActivationPreparer
-
-    project_path = REPOSITORY_ROOT / "examples/ur5e_lite6_wall_grouped.scenario"
-    document, resolved, source_digest = capture_scenario_artifact(
-        str(project_path), allowed_roots=[str(REPOSITORY_ROOT)]
-    )
-    observed: dict[str, Any] = {}
-
-    def prepare(self: ActivationPreparer, **kwargs: Any) -> dict[str, Any]:
-        observed.update(kwargs)
-        filename = (
-            "canonical-empty-admission.ui6i_ur5e_lite6_wall_cell.json"
-        )
-        self._activation_root.mkdir(parents=True, exist_ok=True)
-        (self._activation_root / filename).write_text("{}", encoding="utf-8")
-        return {"prepared_activation_id": "sha256:" + ("1" * 64)}
-
-    monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
-    monkeypatch.setattr(dev_workbench, "NODE_CATALOG", (
-        REPOSITORY_ROOT / "manyforge_behavior/resources/node_catalog.yaml"
-    ))
-    monkeypatch.setattr(dev_workbench, "BOOTSTRAP_ROOT", tmp_path / "bootstrap")
-    monkeypatch.setattr(ActivationPreparer, "prepare", prepare)
-
-    root, admission, cell_id = dev_workbench._ensure_project_bootstrap_package(
-        document=document,
-        project_path=resolved,
-        source_document_digest=source_digest,
-    )
-
-    assert root.parent == tmp_path / "bootstrap"
-    assert admission == (
-        "canonical-empty-admission.ui6i_ur5e_lite6_wall_cell.json"
-    )
-    assert cell_id == "ui6i_ur5e_lite6_wall_cell"
-    assert observed["scenario_id"] == "ur5e_lite6_wall_grouped"
-    assert observed["deployment"]["cell_id"] == cell_id
 
 def test_status_reads_the_backend_derived_scenario_without_reducing_it_again(
     monkeypatch: Any,

@@ -4158,12 +4158,12 @@ private:
                 client.get(),
                 ErrorResponse(
                     "deployment_candidate_cell_mismatch",
-                    "The selected Deployment belongs to cell '" +
+                    "The compiled Deployment targets runtime '" +
                         candidate_bundle->value().cell_graph.cell_id.value() +
                         "', but this runtime owns cell '" +
                         current_bundle->value().cell_graph.cell_id.value() +
-                        "'. Loading another cell requires an explicit cell "
-                        "handover, which is not currently supported."));
+                        "'. Prepare the portable Scenario for this runtime; "
+                        "foreign-runtime compiled artifacts cannot be installed."));
             return false;
           }
           const auto host_continuity =

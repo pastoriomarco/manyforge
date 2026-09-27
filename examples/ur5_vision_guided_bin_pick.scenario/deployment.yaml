@@ -1,8 +1,7 @@
 {
-  "api_version": "manyforge.deployment_intent.v1",
+  "api_version": "manyforge.deployment_intent.v2",
   "assistant_profile_id": "vision_bin_selection",
   "attachments": [],
-  "cell_id": "ur5_vision_bin_pick_cell",
   "compatibility": {
     "lane": "manyforge-only",
     "provides": [

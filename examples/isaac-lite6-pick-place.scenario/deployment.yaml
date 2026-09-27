@@ -1,8 +1,7 @@
 {
-  "api_version": "manyforge.deployment_intent.v1",
+  "api_version": "manyforge.deployment_intent.v2",
   "assistant_profile_id": null,
   "attachments": [],
-  "cell_id": "isaac_lite6_pick_place_cell",
   "compatibility": {
     "lane": "isaac-sim",
     "provides": [

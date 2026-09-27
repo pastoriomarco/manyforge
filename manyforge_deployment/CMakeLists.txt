@@ -1636,6 +1636,10 @@ if(BUILD_TESTING)
     PrepareActivationSingleDocument
     "examples/lite6_pick_and_place.scenario")
   manyforge_add_prepare_activation_test(
+    PrepareActivationRuntimeIdentity
+    "examples/lite6_pick_and_place.scenario"
+    --runtime-identity)
+  manyforge_add_prepare_activation_test(
     PrepareActivationDualDocument
     "examples/ur5e_lite6_wall_grouped.scenario")
   manyforge_add_prepare_activation_test(
@@ -1954,6 +1958,7 @@ if(BUILD_TESTING)
       "${CMAKE_COMMAND}"
       "-DMANYFORGE_GENERATOR=$<TARGET_FILE:manyforge_generate_canonical_empty_package>"
       "-DMANYFORGE_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/canonical_empty_cli_package"
+      "-DMANYFORGE_NATIVE_PROFILE=${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/catalog/runtime_profile/manyforge.native_execution_runtime.json"
       -P
       "${CMAKE_CURRENT_SOURCE_DIR}/test/canonical_empty_generator_cli.cmake")
 

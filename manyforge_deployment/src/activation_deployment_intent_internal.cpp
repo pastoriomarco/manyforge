@@ -16,7 +16,7 @@ namespace {
 using Array = CanonicalValue::Array;
 using Object = CanonicalValue::Object;
 
-constexpr std::string_view kApiVersion = "manyforge.deployment_intent.v1";
+constexpr std::string_view kApiVersion = "manyforge.deployment_intent.v2";
 constexpr std::size_t kMaximumComponents = 128U;
 constexpr std::size_t kMaximumAttachments = 256U;
 constexpr std::size_t kMaximumPackageRoots = 128U;
@@ -212,7 +212,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     const CanonicalValue &value,
     std::vector<CapturedComponentModelSource> captured_sources) {
   require_fields(value,
-                 {"api_version", "attachments", "cell_id", "components",
+                 {"api_version", "attachments", "components",
                   "deployment_artifact_id", "name", "policies"},
                  {"assistant_profile_id", "compatibility", "description"},
                  "root");
@@ -284,14 +284,11 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   const auto &deployment_id = portable_identifier(
       member(value, "deployment_artifact_id", "root"),
       "deployment_artifact_id");
-  const auto &cell_id =
-      portable_identifier(member(value, "cell_id", "root"), "cell_id");
   const auto &name = text(member(value, "name", "root"), "name");
   if (name.size() > 256U) fail("name exceeds its byte bound");
 
   return ActivationDeploymentIntent{
       deployment_id,
-      cell_id,
       name,
       optional_text(value.find_object_member("description"), "description",
                     4096U),

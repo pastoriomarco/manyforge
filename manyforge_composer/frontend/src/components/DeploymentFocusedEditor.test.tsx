@@ -128,9 +128,8 @@ describe('DeploymentFocusedEditor', () => {
   it('renders authored intent without requiring a compiled graph projection', () => {
     const value = controller();
     value.workspace!.draft.document = {
-      api_version: 'manyforge.deployment_intent.v1',
+      api_version: 'manyforge.deployment_intent.v2',
       deployment_artifact_id: 'cell-a',
-      cell_id: 'cell-a',
       name: 'Cell A',
       components: [{
         component_id: 'robot',

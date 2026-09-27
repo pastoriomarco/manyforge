@@ -32,6 +32,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--negative-matrix", action="store_true")
     parser.add_argument("--intent-rejections", action="store_true")
     parser.add_argument("--source-closure-rejections", action="store_true")
+    parser.add_argument("--runtime-identity", action="store_true")
     return parser.parse_args()
 
 
@@ -86,7 +87,8 @@ def _request(
         "typed_parameter_overrides": document["typed_parameter_overrides"],
     }
     request = {
-        "schema_version": "manyforge.activation_preparation_request.v1",
+        "schema_version": "manyforge.activation_preparation_request.v2",
+        "runtime_cell_id": "activation_test_runtime",
         **captured,
         "captured_input_digest": raw_sha256_digest(canonical_json_bytes(captured)),
     }
@@ -345,6 +347,8 @@ def _run(
     if not payload["raw_artifacts"] or not payload["catalog_artifacts"]:
         raise AssertionError("preparer omitted its exact artifact closure")
     bundle = payload["retained_bundle"]
+    if bundle["cell_graph"]["cell_id"] != request["runtime_cell_id"]:
+        raise AssertionError("candidate did not use the configured runtime identity")
     policies = bundle["retained_policy_records"]
     if len(policies) != 1 or policies[0]["record_kind"] != "runtime_policy":
         raise AssertionError("motion bundle has no single verified runtime policy")
@@ -419,6 +423,7 @@ def _rehash_request(request: dict[str, object]) -> None:
         for key, value in request.items()
         if key not in {
             "schema_version",
+            "runtime_cell_id",
             "captured_input_digest",
             "prepared_model_closure",
         }
@@ -568,6 +573,28 @@ def main() -> int:
             publish_canonical_empty=True,
         )
         assert prepared is not None
+        if args.runtime_identity:
+            replay = _run(args, request, temporary / "exact-replay",
+                          publish_canonical_empty=True)
+            assert replay == prepared
+            other_runtime = copy.deepcopy(request)
+            other_runtime["runtime_cell_id"] = "another_runtime"
+            other = _run(args, other_runtime, temporary / "other-runtime")
+            assert other is not None
+            assert other["captured_input_digest"] == prepared["captured_input_digest"]
+            assert other["source_document_digest"] == prepared["source_document_digest"]
+            for field in ("prepared_activation_id", "retained_bundle_id", "graph_revision"):
+                assert other[field] != prepared[field], field
+            forbidden = copy.deepcopy(request)
+            forbidden["deployment"]["cell_id"] = "authored_override"
+            _rehash_request(forbidden)
+            _run(args, forbidden, temporary / "authored-cell",
+                 expect_error="unexpected field cell_id")
+            missing = copy.deepcopy(request)
+            del missing["runtime_cell_id"]
+            _run(args, missing, temporary / "missing-runtime",
+                 expect_error="missing runtime_cell_id")
+            return 0
         if not args.negative_matrix:
             if len(request["deployment"]["components"]) == 1:
                 dual_path = "examples/ur5e_lite6_wall_grouped.scenario"
@@ -576,12 +603,9 @@ def main() -> int:
                     raise AssertionError(
                         "stable-host regression requires the maintained dual fixture"
                     )
-                # Re-seal the dual authored candidate under the single fixture's
-                # CellId so both products describe the same native host scope.
-                dual_request["deployment"]["cell_id"] = request["deployment"][
-                    "cell_id"
-                ]
-                _rehash_request(dual_request)
+                # Portable Scenarios naturally compile for the same runtime;
+                # never rewrite an authored Scenario to make switching work.
+                assert dual_request["runtime_cell_id"] == request["runtime_cell_id"]
                 dual_prepared = _run(
                     args,
                     dual_request,

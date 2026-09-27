@@ -43,6 +43,10 @@ HEADLESS_BUILD = BUILD_ROOT / "headless"
 ROBOPLAN_BUILD = BUILD_ROOT / "roboplan"
 DEPLOYMENT_AUTHORING_BUILD = BUILD_ROOT / "deployment-authoring"
 BOOTSTRAP_ROOT = CACHE_ROOT / "repository-bootstrap-package"
+# Installation configuration, independent of the optional startup project.
+# Preserve the existing workbench identity; never mint one per Load or restart.
+WORKBENCH_CELL_ID = "c1_build_authority_cell"
+BOOTSTRAP_ADMISSION = f"canonical-empty-admission.{WORKBENCH_CELL_ID}.json"
 NATIVE_EXECUTION_HOST = ROBOPLAN_BUILD / "manyforge_native_execution_host"
 NATIVE_CANDIDATE_WORKER = ROBOPLAN_BUILD / "manyforge_roboplan_candidate_worker"
 ACTIVATION_PREPARER = (
@@ -269,122 +273,38 @@ def _ensure_activation_preparer() -> Path:
 
 
 def _ensure_repository_bootstrap_package() -> Path:
-    """Materialize the source-owned empty Manager baseline idempotently."""
+    """Materialize native infrastructure without selecting any Scenario."""
 
-    BOOTSTRAP_ROOT.mkdir(parents=True, exist_ok=True)
+    profile = (
+        WORKSPACE / "manyforge_deployment/resources/maintained/catalog/"
+        "runtime_profile/manyforge.native_execution_runtime.json"
+    )
+    # Cache placement only, not a semantic artifact identity. Never overwrite
+    # an immutable admission created by an older compiler/profile.
+    digest = hashlib.sha256(f"native-workbench:{WORKBENCH_CELL_ID}\0".encode())
+    for source in (CANONICAL_EMPTY_GENERATOR, profile):
+        with source.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    package_root = BOOTSTRAP_ROOT / digest.hexdigest()
+    package_root.mkdir(parents=True, exist_ok=True)
     _run(
         (
             str(CANONICAL_EMPTY_GENERATOR),
             "--output-root",
-            str(BOOTSTRAP_ROOT),
+            str(package_root),
+            "--cell-id",
+            WORKBENCH_CELL_ID,
+            "--native-runtime-profile",
+            str(profile),
         )
     )
     _regular_file(
-        BOOTSTRAP_ROOT / "canonical-empty-admission.json",
+        package_root / BOOTSTRAP_ADMISSION,
         "repository canonical-empty admission",
     )
-    return BOOTSTRAP_ROOT
-
-
-def _ensure_project_bootstrap_package(
-    *,
-    document: dict[str, Any],
-    project_path: str,
-    source_document_digest: str,
-) -> tuple[Path, str, str]:
-    """Prepare one project and publish its exact cell-scoped empty baseline."""
-
-    from manyforge_behavior.canonical_artifact import (
-        canonical_json_bytes,
-        raw_sha256_digest,
-    )
-    from manyforge_behavior.catalog import NodeCatalog
-    from manyforge_behavior.model_source_capture import (
-        ModelSourceCaptureError,
-        capture_deployment_model_sources,
-    )
-    from manyforge_composer.backend.authoring_forest import (
-        AuthoringForestError,
-        derive_candidate,
-        validate_invariants,
-    )
-    from manyforge_headless_api.activation_preparer import ActivationPreparer
-    from manyforge_headless_api.native import HeadlessApiError
-
-    deployment = document.get("deployment_draft")
-    authoring = document.get("program_draft")
-    assignment = document.get("program_role_assignment")
-    overrides = document.get("typed_parameter_overrides")
-    scenario_id = document.get("scenario_id")
-    if (
-        not isinstance(deployment, dict)
-        or not isinstance(authoring, dict)
-        or not isinstance(assignment, dict)
-        or not isinstance(overrides, dict)
-        or not isinstance(scenario_id, str)
-    ):
-        raise WorkbenchError(
-            "selected startup project must contain Program, Deployment, "
-            "assignment, and overrides"
-        )
-    cell_id = deployment.get("cell_id")
-    if not isinstance(cell_id, str) or not cell_id:
-        raise WorkbenchError("selected startup project has no cell identity")
-    try:
-        catalog = NodeCatalog(NODE_CATALOG)
-        validate_invariants(authoring, catalog)
-        program, _diagnostics = derive_candidate(authoring, catalog)
-        source_closure = capture_deployment_model_sources(
-            deployment, project_root=Path(project_path)
-        )
-    except (AuthoringForestError, ModelSourceCaptureError) as error:
-        raise WorkbenchError(str(error)) from error
-    captured_input_digest = raw_sha256_digest(
-        canonical_json_bytes(
-            {
-                "scenario_id": scenario_id,
-                "source_document_digest": source_document_digest,
-                "deployment": deployment,
-                "model_source_closure": source_closure,
-                "program": program.to_dict(),
-                "program_role_assignment": assignment,
-                "typed_parameter_overrides": overrides,
-            }
-        )
-    )
-    project_bootstrap_root = BOOTSTRAP_ROOT / source_document_digest.removeprefix(
-        "sha256:"
-    )
-    project_bootstrap_root.mkdir(parents=True, exist_ok=True)
-    try:
-        ActivationPreparer(
-            executable=ACTIVATION_PREPARER,
-            capability_root=WORKSPACE,
-            activation_root=project_bootstrap_root,
-            timeout_seconds=None,
-            publish_canonical_empty=True,
-        ).prepare(
-            source_document_digest=source_document_digest,
-            scenario_id=scenario_id,
-            captured_input_digest=captured_input_digest,
-            deployment=deployment,
-            model_source_closure=source_closure,
-            program=program.to_dict(),
-            program_role_assignment=assignment,
-            typed_parameter_overrides=overrides,
-        )
-    except HeadlessApiError as error:
-        detail = error.details.get("preparer_detail") if error.details else None
-        raise WorkbenchError(
-            "selected startup project could not be prepared: "
-            f"{detail or error}"
-        ) from error
-    admission_filename = f"canonical-empty-admission.{cell_id}.json"
-    _regular_file(
-        project_bootstrap_root / admission_filename,
-        "selected project canonical-empty admission",
-    )
-    return project_bootstrap_root, admission_filename, cell_id
+    return package_root
 
 
 def _regular_file(path: Path, label: str, *, executable: bool = False) -> None:
@@ -609,8 +529,8 @@ class Workbench:
         current_native_targets = _ensure_current_native_backend()
         activation_preparer = _ensure_activation_preparer()
         bootstrap_root: Path
-        bootstrap_admission = "canonical-empty-admission.json"
-        cell_id = "c1_build_authority_cell"
+        bootstrap_admission = BOOTSTRAP_ADMISSION
+        cell_id = WORKBENCH_CELL_ID
         if self.project_path is not None:
             from manyforge_composer.backend.scenario_artifacts import (
                 ScenarioArtifactError,
@@ -618,7 +538,7 @@ class Workbench:
             )
 
             try:
-                project, project_path, source_document_digest = capture_scenario_artifact(
+                project, project_path, _source_document_digest = capture_scenario_artifact(
                     self.project_path,
                     allowed_roots=[str(self.artifact_root)],
                 )
@@ -626,15 +546,7 @@ class Workbench:
                 raise WorkbenchError(str(error)) from error
             self.project_path = project_path
             self.scenario_id = project["scenario_id"]
-            bootstrap_root, bootstrap_admission, cell_id = (
-                _ensure_project_bootstrap_package(
-                    document=project,
-                    project_path=project_path,
-                    source_document_digest=source_document_digest,
-                )
-            )
-        else:
-            bootstrap_root = _ensure_repository_bootstrap_package()
+        bootstrap_root = _ensure_repository_bootstrap_package()
         _regular_file(
             MANAGER_BINARY,
             "current Manager executable",

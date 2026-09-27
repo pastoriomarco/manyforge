@@ -170,7 +170,7 @@ def test_both_variants_are_registered_as_qualified_scenarios() -> None:
         manifest = load_strict_json_yaml(path / "scenario.yaml")
         assert manifest["scenario_id"] == f"ur5e_lite6_wall_{variant}"
         deployment = load_strict_json_yaml(path / "deployment.yaml")
-        assert deployment["api_version"] == "manyforge.deployment_intent.v1"
+        assert deployment["api_version"] == "manyforge.deployment_intent.v2"
         assert deployment["deployment_artifact_id"] == "ur5e_lite6_wall"
         assert {row["component_id"] for row in deployment["components"]} == {
             "lite6_robot",

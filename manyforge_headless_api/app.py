@@ -442,6 +442,7 @@ def create_app(
                 executable=config.activation_preparer_path,
                 capability_root=config.activation_preparer_capability_root,
                 activation_root=config.activation_preparer_activation_root,
+                runtime_cell_id=config.cell_id,
                 timeout_seconds=config.activation_preparer_timeout_seconds,
             )
         service = HeadlessService(

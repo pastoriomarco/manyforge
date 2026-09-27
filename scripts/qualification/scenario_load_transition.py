@@ -2,7 +2,7 @@
 """Explicit live, non-motion Scenario Load regression; run inside the dev container.
 
 Each PROJECT is a path visible to Composer. This mutates the simulated workbench:
-it requires an idle, ready baseline and stops on the first failure, never retries
+it requires an idle baseline (which may be empty) and stops on the first failure, never retries
 a Load or restarts a component. It does not qualify motion or external providers.
 """
 from __future__ import annotations
@@ -32,9 +32,7 @@ def main() -> None:
             response.raise_for_status()
             return response.json()
 
-        baseline = read(f"{args.composer}/api/scenarios/current")
-        if baseline.get("ready") is not True:
-            raise RuntimeError("A ready baseline is required; no Load was issued")
+        baseline_cell_id = read(f"{args.headless}/api/manager/status")["status"]["cell_id"]
         for project in args.projects:
             workspace = read(f"{args.composer}/api/authoring/workspace")
             admission = read(f"{args.headless}/api/cell/authoring-admission")
@@ -64,6 +62,10 @@ def main() -> None:
             if accepted.get("status") != "accepted":
                 raise RuntimeError(f"Load did not accept activation: {accepted}")
             selected = accepted["activation"]["prepared_activation"]
+            selected = {
+                **selected,
+                "program_binding_id": selected["program_outcome"]["program_binding_id"],
+            }
             deadline = time.monotonic() + args.timeout
             current: dict = {}
             while time.monotonic() < deadline:
@@ -91,7 +93,11 @@ def main() -> None:
                 }
                 raise RuntimeError(f"Load {request_id} never became ready: "
                                    f"{current}; Apply={summary}")
+            cell_id = read(f"{args.headless}/api/manager/status")["status"]["cell_id"]
+            if cell_id != baseline_cell_id:
+                raise RuntimeError("Scenario Load changed the runtime identity")
             print(json.dumps({"request_id": request_id, "project": project,
+                              "runtime_cell_id": cell_id,
                               "current_scenario": current["current_scenario"],
                               "ready": True}), flush=True)
 

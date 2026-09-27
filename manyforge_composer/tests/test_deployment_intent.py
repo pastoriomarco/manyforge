@@ -18,11 +18,19 @@ from manyforge_composer.backend.deployment_intent import (
 from manyforge_composer.backend.deployment_draft import DeploymentDraftSession
 
 
+def test_deployment_intent_is_portable_and_rejects_authored_runtime_identity() -> None:
+    intent = _intent()
+    normalized = validate_deployment_intent(intent, source="test")
+    assert "cell_id" not in normalized
+    intent["cell_id"] = "foreign_runtime"
+    with pytest.raises(DeploymentIntentError, match="cell_id"):
+        validate_deployment_intent(intent, source="test")
+
+
 def _intent() -> dict:
     return {
         "api_version": DEPLOYMENT_INTENT_API_VERSION,
         "deployment_artifact_id": "dual_robot_cell",
-        "cell_id": "cell_a",
         "name": "Dual robot cell",
         "description": "Editable source intent",
         "components": [

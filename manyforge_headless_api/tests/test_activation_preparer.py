@@ -62,6 +62,16 @@ def test_headless_config_accepts_source_owned_activation_preparer(
     assert config.activation_preparer_capability_root == root / "capabilities"
 
 
+@pytest.mark.parametrize("cell_id", ["", "../runtime", "Uppercase", "a" * 129])
+def test_preparer_rejects_invalid_runtime_configuration(tmp_path: Path, cell_id: str) -> None:
+    with pytest.raises(ValueError, match="runtime_cell_id"):
+        ActivationPreparer(
+            executable=tmp_path / "preparer", capability_root=tmp_path,
+            activation_root=tmp_path / "artifacts", runtime_cell_id=cell_id,
+            timeout_seconds=3.0,
+        )
+
+
 def _preparer(tmp_path: Path) -> ActivationPreparer:
     capabilities = tmp_path / "capabilities"
     executable = tmp_path / "preparer"
@@ -71,6 +81,7 @@ def _preparer(tmp_path: Path) -> ActivationPreparer:
         executable=executable,
         capability_root=capabilities,
         activation_root=tmp_path / "artifacts",
+        runtime_cell_id="cell_a",
         timeout_seconds=3.0,
     )
 
@@ -133,7 +144,8 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
     expected.pop("activation_payload")
     assert result == expected
     assert observed["input"] == {
-        "schema_version": "manyforge.activation_preparation_request.v1",
+        "schema_version": "manyforge.activation_preparation_request.v2",
+        "runtime_cell_id": "cell_a",
         "source_document_digest": _DIGEST,
         "scenario_id": "scenario_a",
         "captured_input_digest": _DIGEST,
@@ -230,7 +242,7 @@ def test_preparer_rejects_an_oversized_encoded_request_before_spawning(
             source_document_digest=_DIGEST,
             scenario_id="scenario_a",
             captured_input_digest=_DIGEST,
-            deployment={"api_version": "manyforge.deployment_intent.v1"},
+            deployment={"api_version": "manyforge.deployment_intent.v2"},
             model_source_closure=_CLOSURE,
             program={"api_version": "manyforge.program.v2"},
             program_role_assignment={"component_roles": [], "target_roles": []},

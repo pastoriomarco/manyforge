@@ -76,7 +76,7 @@ function numberValue(value: JsonValue | undefined): number | null {
 function runtimeConfigurations(
   document: Record<string, JsonValue> | null,
 ): RuntimeConfiguration[] {
-  if (document?.api_version === 'manyforge.deployment_intent.v1') {
+  if (document?.api_version === 'manyforge.deployment_intent.v2') {
     const components = document.components;
     if (!Array.isArray(components)) return [];
     return components.flatMap((value, index) => {
@@ -262,7 +262,7 @@ interface ControlledStopTarget {
 }
 
 function controlledStopTargets(document: Record<string, JsonValue> | null): ControlledStopTarget[] {
-  if (document?.api_version === 'manyforge.deployment_intent.v1') {
+  if (document?.api_version === 'manyforge.deployment_intent.v2') {
     return (Array.isArray(document.components) ? document.components : []).flatMap((componentValue) => {
       const component = objectValue(componentValue);
       const componentId = component?.component_id;

@@ -1,8 +1,7 @@
 {
-  "api_version": "manyforge.deployment_intent.v1",
+  "api_version": "manyforge.deployment_intent.v2",
   "assistant_profile_id": null,
   "attachments": [],
-  "cell_id": "ui6i_ur5e_lite6_wall_cell",
   "compatibility": {
     "lane": "manyforge-only",
     "provides": [],

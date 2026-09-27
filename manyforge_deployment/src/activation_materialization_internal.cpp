@@ -2398,6 +2398,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
     const std::filesystem::path &capability_root,
     std::vector<ActivationPreparedModel> prepared_models,
     const ActivationDeploymentIntent &intent,
+    const core::CellId &runtime_cell_id,
     const std::vector<ActivationComponentProfile> &component_profiles,
     const bool prepare_canonical_empty) {
   Options options;
@@ -2417,7 +2418,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
   CanonicalValue compiled;
   try {
     compiled = compile_activation_deployment(
-        intent, component_profiles, prepared_models, catalog_records,
+        intent, runtime_cell_id, component_profiles, prepared_models, catalog_records,
         catalog.runtime_profiles, runtime_policy);
   } catch (const std::bad_alloc &) {
     throw std::runtime_error(

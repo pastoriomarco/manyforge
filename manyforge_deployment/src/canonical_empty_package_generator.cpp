@@ -8,12 +8,16 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "build_manifest_internal.hpp"
 #include "manyforge_deployment/build_manifest.hpp"
 #include "manyforge_deployment/cell_applicability.hpp"
 #include "manyforge_deployment/cell_compiler.hpp"
 #include "manyforge_deployment/cell_composition.hpp"
+#include "manyforge_deployment/closed_schema.hpp"
+#include "manyforge_deployment/content_identity.hpp"
+#include "manyforge_deployment/runtime_profile_codec.hpp"
 #include "manyforge_deployment/native_execution_runtime_contract.hpp"
 #include "manyforge_deployment/retention_qualified_deployment.hpp"
 #include "manyforge_deployment/ros2_control_execution_runtime_contract.hpp"
@@ -148,7 +152,9 @@ require_root_local_filename(const std::filesystem::path &filename) {
 }
 
 [[nodiscard]] RetentionQualifiedDeployment
-compile_fixed_deployment(const RevisionVerifiedDeploymentArtifact &deployment) {
+compile_fixed_deployment(
+    const RevisionVerifiedDeploymentArtifact &deployment,
+    std::span<const QualifiedRuntimeProfile> profiles = {}) {
   const CompositionQualifiedCellIr composition = compose_cell_occurrences(
       deployment.graph(), std::span<const SourceVerifiedModelAsset>{},
       std::span<const QualifiedComponentType>{});
@@ -159,7 +165,7 @@ compile_fixed_deployment(const RevisionVerifiedDeploymentArtifact &deployment) {
           nullptr);
   const ApplicabilityQualifiedCellIr applicability = qualify_cell_applicability(
       composition, deployment.applicability_inputs(),
-      std::span<const QualifiedRuntimeProfile>{},
+      profiles,
       std::span<const QualifiedRuntimePolicy>{},
       std::span<const QualifiedCommandSchema>{},
       std::span<const QualifiedCapabilityDefinition>{},
@@ -408,6 +414,124 @@ generate_canonical_empty_package(const std::filesystem::path &output_root) {
     fail(std::string("canonical-empty package generation failed: ") +
          error.what());
   }
+}
+
+CanonicalEmptyRetainedBundleAdmission generate_native_empty_package(
+    const std::filesystem::path &output_root, const core::CellId &cell_id,
+    std::string_view runtime_profile_bytes) {
+  using Object = CanonicalValue::Object;
+  using Array = CanonicalValue::Array;
+  // Validate before creating any artifact repositories or admission locator.
+  const auto &cell_text = cell_id.value();
+  if (cell_text.empty() || cell_text.size() > 128U ||
+      cell_text.front() < 'a' || cell_text.front() > 'z' ||
+      !std::all_of(cell_text.begin(), cell_text.end(), [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+               c == '_' || c == '-' || c == '.';
+      })) {
+    fail("native bootstrap cell_id must be a bounded portable identifier");
+  }
+  const auto root = normalize_canonical_empty_package_root(output_root);
+  const auto parsed = parse_strict_json_model_yaml(runtime_profile_bytes);
+  const auto &profile_root = parsed.root();
+  const auto kind = core::CatalogRecordKind::kRuntimeProfile;
+  const auto *schema = build_qualified_closed_schema_registry()
+                           .find_catalog_schema_family(kind);
+  if (schema == nullptr || schema->compiled_schema() == nullptr) {
+    fail("native bootstrap runtime profile schema is unavailable");
+  }
+  const std::string digest = sha256_digest(runtime_profile_bytes);
+  const core::RuntimeProfileCatalogRecordRefDTO reference{
+      core::RuntimeProfileId(require_member(profile_root, "runtime_profile_id", "profile").as_string()),
+      core::RuntimeProfileRevision(require_member(profile_root, "runtime_profile_revision", "profile").as_string()),
+      core::SchemaId("manyforge.runtime_profile.v1"),
+      schema->compiled_schema()->schema_revision(),
+      core::ContentDigest(digest),
+      core::ContentAddressedStoreKey("catalog/native-bootstrap/" + digest.substr(7U)),
+  };
+  const auto profile = resolve_and_qualify_runtime_profile(
+      reference, reference.content_addressed_store_key, runtime_profile_bytes);
+  if (profile.value().runtime_profile_id.value() !=
+      native_execution_runtime_contract::kRuntimeProfileId) {
+    fail("native bootstrap requires the native execution profile");
+  }
+  const std::vector<QualifiedRuntimeProfile> profiles{profile};
+  const CanonicalValue catalog_reference(Object{
+      {"record_kind", CanonicalValue("runtime_profile")},
+      {"record_id", CanonicalValue(reference.record_id.value())},
+      {"record_revision", CanonicalValue(reference.record_revision.value())},
+      {"schema_id", CanonicalValue(reference.schema_id.value())},
+      {"schema_revision", CanonicalValue(reference.schema_revision.value())},
+      {"content_digest", CanonicalValue(digest)},
+      {"content_addressed_store_key", CanonicalValue(reference.content_addressed_store_key.value())},
+  });
+  // These are workbench infrastructure settings, not controller defaults.
+  // An incompatible infrastructure change remains a pre-effect Apply refusal.
+  const CanonicalValue configuration(Object{
+      {"mode", CanonicalValue("simulated")},
+      {"planner_rng_seed", CanonicalValue(12345.0)},
+      {"execution_tick_hz", CanonicalValue(100.0)},
+      {"collision_monitor_period_ms", CanonicalValue(50.0)},
+      {"initial_joint_positions_rad", CanonicalValue(Array{})},
+      {"motion_target_limits", CanonicalValue(Array{})},
+      {"direct_control_joint_limits", CanonicalValue(Array{})},
+      {"gripper_target_configurations", CanonicalValue(Array{})},
+  });
+  const CanonicalValue runtime(Object{
+      {"runtime_unit_id", CanonicalValue(std::string(native_execution_runtime_contract::kCellHostRuntimeUnitId))},
+      {"runtime_profile_id", CanonicalValue(reference.record_id.value())},
+      {"runtime_profile_revision", CanonicalValue(reference.record_revision.value())},
+      {"dependency_runtime_unit_ids", CanonicalValue(Array{})},
+      {"configuration", configuration},
+  });
+  const auto deployment = compute_deployment_artifact_revision(
+      parse_strict_json_model_yaml(canonical_json(CanonicalValue(Object{
+          {"api_version", CanonicalValue("manyforge.deployment.v1")},
+          {"deployment_artifact_id", CanonicalValue("native_workbench_bootstrap")},
+          {"deployment_revision", CanonicalValue(std::string(kPlaceholderDigest))},
+          {"cell_id", CanonicalValue(cell_id.value())},
+          {"name", CanonicalValue("Native workbench infrastructure")},
+          {"catalogs", CanonicalValue(Object{{"records", CanonicalValue(Array{catalog_reference})}})},
+          {"graph", CanonicalValue(Object{
+              {"runtime_units", CanonicalValue(Array{runtime})},
+              {"model_instances", CanonicalValue(Array{})},
+              {"controllable_components", CanonicalValue(Array{})},
+              {"control_domains", CanonicalValue(Array{})},
+              {"control_bindings", CanonicalValue(Array{})},
+              {"component_attachments", CanonicalValue(Array{})},
+          })},
+          {"desired_control_configurations", CanonicalValue(Array{})},
+          {"capability_provider_bindings", CanonicalValue(Array{})},
+      }))), profiles);
+  const auto qualified = compile_fixed_deployment(deployment, profiles);
+  FilesystemBuildManifestRepository manifests(root);
+  FilesystemRawArtifactStore artifacts(root);
+  FilesystemRetainedBundleRepository bundles(root);
+  FilesystemCatalogArtifactStore catalogs(root);
+  class ProfileSource final : public ICompilerInputArtifactSource {
+   public:
+    ProfileSource(const core::RuntimeProfileCatalogRecordRefDTO &ref,
+                  std::string_view value) : reference_(ref), bytes_(value) {}
+    std::optional<std::string> get_verified(
+        const core::ContentAddressedStoreKey &key,
+        const core::ContentDigest &expected,
+        std::optional<std::uint64_t> size) const override {
+      if (key != reference_.content_addressed_store_key ||
+          expected != reference_.content_digest ||
+          (size.has_value() && *size != bytes_.size())) return std::nullopt;
+      return bytes_;
+    }
+   private:
+    core::RuntimeProfileCatalogRecordRefDTO reference_;
+    std::string bytes_;
+  } source(reference, runtime_profile_bytes);
+  const auto bundle = RetainedBundleMaterializer::materialize_store_and_reload_production(
+      qualified, manifests, source, {}, catalogs, artifacts, bundles);
+  if (bundle == nullptr) fail("native bootstrap retained product is unavailable");
+  static_cast<void>(native_execution_runtime_contract::require_configuration(
+      *bundle, bundle->value().cell_graph.runtime_units.front().runtime_unit_id));
+  return publish_cell_scoped_canonical_empty_admission(
+      root, cell_scoped_canonical_empty_admission_filename(cell_id), *bundle);
 }
 
 } // namespace manyforge::deployment::detail

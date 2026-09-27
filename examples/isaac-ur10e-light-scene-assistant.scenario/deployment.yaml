@@ -1,8 +1,7 @@
 {
-  "api_version": "manyforge.deployment_intent.v1",
+  "api_version": "manyforge.deployment_intent.v2",
   "assistant_profile_id": "assistant_scene_authoring",
   "attachments": [],
-  "cell_id": "isaac_ur10e_assistant_cell",
   "compatibility": {
     "lane": "isaac-sim",
     "provides": [

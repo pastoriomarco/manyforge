@@ -40,6 +40,7 @@ struct PreparedActivationMaterialization final {
     const std::filesystem::path &capability_root,
     std::vector<ActivationPreparedModel> prepared_models,
     const ActivationDeploymentIntent &intent,
+    const core::CellId &runtime_cell_id,
     const std::vector<ActivationComponentProfile> &component_profiles,
     bool prepare_canonical_empty = false);
 

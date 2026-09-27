@@ -20,6 +20,7 @@ namespace manyforge::deployment::detail {
 /// never selects or reopens a generated Deployment occurrence.
 [[nodiscard]] CanonicalValue compile_activation_deployment(
     const ActivationDeploymentIntent &intent,
+    const core::CellId &runtime_cell_id,
     const std::vector<ActivationComponentProfile> &component_profiles,
     const std::vector<ActivationPreparedModel> &prepared_models,
     const std::vector<core::CatalogRecordRefDTO> &catalog_records,
