@@ -96,6 +96,37 @@ class ControlSemanticContext:
     execution_control_revision: int | None = None
 
 
+def _runtime_payload_key(name: str, payload: Any) -> str:
+    """Match the native control-file hint's observation-only exclusions.
+
+    Keep this aligned with runtime_snapshot.cpp::ControlPayload. The hint
+    wakes collection; this key governs both publication and session deltas.
+    Dropping a semantic change here would strand already-connected clients.
+    """
+    if isinstance(payload, dict):
+        payload = dict(payload)
+        if name == "manager" and isinstance(payload.get("runtime"), dict):
+            runtime = dict(payload["runtime"])
+            rows = runtime.get("observed_units")
+            if isinstance(rows, list):
+                runtime["observed_units"] = [
+                    {
+                        key: value for key, value in row.items()
+                        if key not in {
+                            "process_observation_sequence", "source_report_sequence"
+                        }
+                    } if isinstance(row, dict) else row
+                    for row in rows
+                ]
+            payload["runtime"] = runtime
+        elif name == "scene_runtime" and isinstance(payload.get("state"), dict):
+            payload["state"] = {
+                key: value for key, value in payload["state"].items()
+                if key not in {"pose_sources", "updated_at_ns"}
+            }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
 def _meaningful_runtime_key(runtime: dict[str, Any]) -> tuple[Any, ...]:
     """Ignore aggregate receiver heartbeats while retaining owner changes."""
 
@@ -113,6 +144,7 @@ def _meaningful_runtime_key(runtime: dict[str, Any]) -> tuple[Any, ...]:
             row.get("source_owner_epoch"),
             row.get("source_generation") if generation else None,
             row.get("source_content_digest") if generation else None,
+            _runtime_payload_key(name, row.get("payload")) if not generation else None,
         )
 
     return (
@@ -124,8 +156,8 @@ def _meaningful_runtime_key(runtime: dict[str, Any]) -> tuple[Any, ...]:
         source("manager", False),
         source("logical_scene", True),
         # Scene-runtime generations also advance for high-rate pose samples.
-        # Initialization/error meaning remains in the rest of the section;
-        # motion itself belongs to the capacity-one Viewer stream.
+        # Preserve initialization/error meaning in the payload key; motion
+        # itself belongs to the capacity-one Viewer stream.
         source("scene_runtime", False),
     )
 

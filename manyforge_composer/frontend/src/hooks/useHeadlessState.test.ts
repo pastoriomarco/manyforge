@@ -199,6 +199,40 @@ describe('Headless owner-frame admission', () => {
     expect(sameViewerProjection(current, heartbeat)).toBe(false);
   });
 
+  it.each([
+    ['Apply completion', { apply: { records: [{ incomplete: false }] } }],
+    ['missing Apply evidence', { apply: { records: [{}] } }],
+    ['readiness loss', { manager_ready: false }],
+    ['convergence loss', { runtime: { converged: false } }],
+    ['composition change', { active: { retained_bundle_id: 'bundle.2', graph_revision: 'graph.2' } }],
+    ['cell identity change', { cell_id: 'cell.2' }],
+  ])('invalidates the viewer on %s without a Scene change', (_name, change) => {
+    const current = state('receiver.epoch.1', 2);
+    current.runtime.sections.manager.payload = {
+      cell_id: 'cell.1',
+      manager_ready: true,
+      runtime: { converged: true },
+      active: { retained_bundle_id: 'bundle.1', graph_revision: 'graph.1' },
+      apply: { records: [{ incomplete: true }] },
+    };
+    const next = structuredClone(current);
+    Object.assign(next.runtime.sections.manager.payload!, change);
+    expect(sameViewerProjection(current, next)).toBe(false);
+  });
+
+  it('invalidates the viewer when Manager evidence becomes unavailable', () => {
+    const current = state('receiver.epoch.1', 2);
+    for (const change of [
+      { available: false }, { freshness: 'stale' as const },
+      { knownGaps: ['lost_update'] }, { sourceOwnerEpoch: 'manager.epoch.2' },
+      { sourceOwnerId: 'other.manager' }, { sourceGeneration: null },
+    ]) {
+      const next = structuredClone(current);
+      Object.assign(next.runtime.sections.manager, change);
+      expect(sameViewerProjection(current, next)).toBe(false);
+    }
+  });
+
   it('accepts forward stream frames and a replacement receiver epoch', () => {
     expect(admitHeadlessState(null, state('runtime.epoch.1', 2)).accepted).toBe(true);
     expect(admitHeadlessState(
@@ -976,6 +1010,10 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.setEnabled(true);
     synchronizeControl(FakeWebSocket.shell);
     const first = wireState(1);
+    const manager = (first.runtime as {
+      sections: { manager: { payload: Record<string, unknown> } };
+    }).sections.manager;
+    manager.payload = { apply: { records: [{ incomplete: true }] } };
     receiveControlSnapshot(FakeWebSocket.shell, first);
     animationFrames[0]!(16);
     const presented = source.getViewerSnapshot().snapshot;
@@ -1015,6 +1053,23 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(source.getPresentedRuntimeFrame()).toEqual({
       ownerEpoch: 'runtime.epoch.1', generation: 3,
     });
+
+    // The Scene has already published. Apply completion must independently
+    // reach the viewer rather than leave it holding the pending snapshot.
+    const completed = structuredClone(sceneChange);
+    completed.snapshot_sequence = 5;
+    const completedRuntime = completed.runtime as typeof sceneRuntime;
+    completedRuntime.projection_generation = 4;
+    const completedSections = completedRuntime.sections as typeof sceneSections;
+    completedSections.manager = {
+      ...completedSections.manager,
+      payload: { apply: { records: [{ incomplete: false }] } },
+    };
+    receiveControlSnapshot(FakeWebSocket.shell, completed);
+    expect(animationFrames).toHaveLength(3);
+    animationFrames[2]!(48);
+    expect(source.getViewerSnapshot().snapshot?.runtime.sections.manager.payload)
+      .toEqual({ apply: { records: [{ incomplete: false }] } });
     source.dispose();
   });
 

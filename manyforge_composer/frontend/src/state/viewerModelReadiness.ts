@@ -40,7 +40,7 @@ function recordValue(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function pendingManagerApply(payload: Record<string, unknown>): boolean | null {
+export function pendingManagerApply(payload: Record<string, unknown>): boolean | null {
   const apply = recordValue(payload.apply);
   if (apply === null || !Array.isArray(apply.records)) return null;
   for (const value of apply.records) {

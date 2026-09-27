@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
+import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
 import {
   parseAuthoringWorkspaceIdentity,
   parseComposerHeadlessState,
@@ -401,6 +402,10 @@ export function sameViewerProjection(
 ): boolean {
   if (current === null) return false;
   return current.receiverEpoch === candidate.receiverEpoch
+    // Manager completion can arrive after the final Scene update. Publish
+    // the same identity/readiness facts that wake the structural model reads,
+    // without waking the viewer for source counters or observation ages.
+    && viewerModelRefreshKey(current) === viewerModelRefreshKey(candidate)
     && current.runtime.projectionOwnerEpoch === candidate.runtime.projectionOwnerEpoch
     && current.runtime.projectionOwnerId === candidate.runtime.projectionOwnerId
     && current.runtime.complete === candidate.runtime.complete

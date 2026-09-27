@@ -1,4 +1,5 @@
 import type { ComposerHeadlessState } from '../types/headless';
+import { pendingManagerApply } from './viewerModelReadiness';
 
 function objectValue(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -67,6 +68,9 @@ export function viewerModelRefreshKey(
       available: manager.available,
       freshness: manager.freshness,
       knownGaps: manager.knownGaps,
+      cellId: typeof payload?.cell_id === 'string' ? payload.cell_id : null,
+      pendingApply: payload === null ? null : pendingManagerApply(payload),
+      hasSourceGeneration: manager.sourceGeneration !== null,
       managerReady: typeof payload?.manager_ready === 'boolean'
         ? payload.manager_ready
         : null,

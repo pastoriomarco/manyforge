@@ -94,6 +94,27 @@ describe('nodeEnvironmentRefreshKey', () => {
 });
 
 describe('viewerModelRefreshKey', () => {
+  it('refreshes after Apply settles, but ignores terminal history and heartbeat churn', () => {
+    const pending = snapshot();
+    pending.runtime.sections.manager.sourceGeneration = 1;
+    pending.runtime.sections.manager.payload!.apply = {
+      records: [{ incomplete: true }],
+    };
+    const settled = structuredClone(pending);
+    settled.runtime.sections.manager.payload!.apply = {
+      records: [{ incomplete: false }],
+    };
+    expect(viewerModelRefreshKey(settled)).not.toBe(viewerModelRefreshKey(pending));
+
+    const heartbeat = structuredClone(settled);
+    heartbeat.runtime.sections.manager.sourceGeneration = 2;
+    heartbeat.runtime.sections.manager.receiverAgeNs = 500;
+    heartbeat.runtime.sections.manager.payload!.apply = {
+      records: [{ incomplete: false }, { incomplete: false }],
+    };
+    expect(viewerModelRefreshKey(heartbeat)).toBe(viewerModelRefreshKey(settled));
+  });
+
   it('re-reads source-model and manifest when a dual-robot composition becomes single-robot', () => {
     const dualRobot = snapshot();
     const dualActive = dualRobot.runtime.sections.manager.payload?.active as Record<string, unknown>;

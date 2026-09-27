@@ -1065,6 +1065,58 @@ def test_virtual_heartbeat_churn_never_reads_or_reduces_owner_state() -> None:
         ingress.close()
 
 
+@pytest.mark.parametrize("section,path,value", [
+    ("manager", ("apply", "records", 0, "incomplete"), False),
+    ("manager", ("apply", "records", 0, "phase"), "terminal"),
+    ("manager", ("apply", "records", 0, "terminal_state"), "failed"),
+    ("manager", ("apply", "mutation_available"), False),
+    ("manager", ("manager_ready",), True),
+    ("manager", ("runtime", "converged"), True),
+    ("manager", ("runtime", "observed_units", 0, "source_health"), "faulted"),
+    ("manager", ("runtime", "observed_units", 0, "critical_progress_sequence"), 2),
+    ("manager", ("active", "graph_revision"), "graph.2"),
+    ("scene_runtime", ("state", "state"), "open"),
+    ("scene_runtime", ("state", "error"), "initialization_failed"),
+    ("scene_runtime", ("state", "initialization_generation"), 2),
+])
+def test_runtime_semantics_reach_existing_session_delta(section, path, value) -> None:
+    ingress = _ingress([])
+    cycle = _cycle()
+    shell = _shell_for_cycle(cycle)
+    sections = shell["runtime"]["sections"]
+    sections["manager"]["payload"] = {
+        "manager_ready": False,
+        "active": {"graph_revision": "graph.1"},
+        "apply": {"mutation_available": True, "records": [{
+            "apply_id": "apply.1", "incomplete": True,
+            "phase": "runtime_converged", "terminal_state": None,
+        }]},
+        "runtime": {"converged": False, "observed_units": [{
+            "source_health": "healthy", "critical_progress_sequence": 1,
+        }]},
+    }
+    sections["scene_runtime"]["payload"] = {"state": {
+        "state": "initializing", "error": None, "initialization_generation": 1,
+    }}
+    previous = replace(_frame(ingress), shell=shell)
+    changed = json.loads(json.dumps(shell))
+    target = changed["runtime"]["sections"][section]["payload"]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    current = replace(previous, generation=2, shell=changed)
+    session = ExecutionControlSession(object(), _Source(previous), ingress)
+    try:
+        # No Scene revision or metadata change accompanies the owner change.
+        # Both assembler publication and an existing session must carry it.
+        assert _shell_key(changed) != _shell_key(shell)
+        delta = session._delta_message(current, previous)  # noqa: SLF001
+        assert delta.shell == {"complete": False, "runtime": changed["runtime"]}
+        assert {**shell, **{k: v for k, v in delta.shell.items() if k != "complete"}} == changed
+    finally:
+        ingress.close()
+
+
 def test_volatile_receiver_counters_do_not_create_a_cold_state_change() -> None:
     cycle = _cycle()
     first = _shell_for_cycle(cycle)
@@ -1073,6 +1125,12 @@ def test_volatile_receiver_counters_do_not_create_a_cold_state_change() -> None:
     first_runtime["projection_generation"] = 41
     first_runtime["sections"]["manager"]["receiver_age_ns"] = 10
     first_runtime["sections"]["manager"]["source_generation"] = 80
+    first_runtime["sections"]["manager"]["payload"] = {"runtime": {
+        "observed_units": [{"process_observation_sequence": 1, "source_report_sequence": 1}],
+    }}
+    first_runtime["sections"]["scene_runtime"]["payload"] = {"state": {
+        "state": "open", "updated_at_ns": 1, "pose_sources": [{"source_sequence": 1}],
+    }}
     first["alarms"]["state_revision"] = 20
 
     later = json.loads(json.dumps(first))
@@ -1084,8 +1142,23 @@ def test_volatile_receiver_counters_do_not_create_a_cold_state_change() -> None:
         "source_content_digest"
     ] = "pose-only-change"
     later["alarms"]["state_revision"] = 21
+    later["runtime"]["sections"]["manager"]["source_content_digest"] = "idle-report"
+    later["runtime"]["sections"]["manager"]["payload"]["runtime"]["observed_units"][0].update(
+        process_observation_sequence=2, source_report_sequence=2,
+    )
+    later["runtime"]["sections"]["scene_runtime"]["payload"]["state"].update(
+        updated_at_ns=2, pose_sources=[{"source_sequence": 2}],
+    )
 
     assert _shell_key(later) == _shell_key(first)
+    ingress = _ingress([])
+    previous = replace(_frame(ingress), shell=first)
+    session = ExecutionControlSession(object(), _Source(previous), ingress)
+    try:
+        delta = session._delta_message(replace(previous, shell=later), previous)
+        assert delta.shell == {"complete": False}
+    finally:
+        ingress.close()
 
     alarm_change = json.loads(json.dumps(later))
     alarm_change["alarms"]["generation"] += 1
