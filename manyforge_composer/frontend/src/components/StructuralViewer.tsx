@@ -3306,7 +3306,7 @@ function StructuralViewerContent({
   return (
     <section className="panel viewer-panel" aria-labelledby="viewer-title">
       <header className="panel-header viewer-header">
-        <strong id="viewer-title">3D viewer</strong>
+        <strong id="viewer-title" className="sr-only">3D viewer</strong>
         <div className="viewer-header-controls">
           <div className="viewer-tool-strip" aria-label="Scene viewport controls">
             <button
@@ -3371,7 +3371,7 @@ function StructuralViewerContent({
                   disabled={!generalTransformEnabled}
                   onClick={() => gizmo.update({ space: transformSpace === 'world' ? 'local' : 'world' })}
                   title="Toggle local/world coordinates (Q)"
-                >{transformSpace}</button>
+                >{transformSpace === 'world' ? 'World' : 'Local'}</button>
                 <button type="button" className="viewer-text-control" aria-pressed={gizmo.settings.snap}
                   disabled={!generalTransformEnabled || (inspectorPanel === 'object' && transformMode === 'scale')}
                   onClick={() => gizmo.update({ snap: !gizmo.settings.snap })}

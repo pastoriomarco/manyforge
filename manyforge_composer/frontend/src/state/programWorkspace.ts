@@ -66,6 +66,7 @@ export type ProgramWorkspaceStateAction =
       generation: number;
       error: string;
     }
+  | { type: 'request_refused'; generation: number; message: string }
   | { type: 'clear_feedback' }
   | {
       type: 'authoring_synced';
@@ -127,6 +128,17 @@ export function programWorkspaceReducer(
     return { ...state, workspace: action.workspace };
   }
   if (action.generation !== state.requestGeneration) return state;
+  if (action.type === 'request_refused') {
+    if (state.workspace === null) return {
+      ...state, status: 'error', pendingAction: null, message: null,
+      transitionStatus: null, error: action.message,
+    };
+    return {
+      status: 'ready', requestGeneration: action.generation,
+      pendingAction: null, workspace: state.workspace,
+      message: action.message, transitionStatus: null, error: null,
+    };
+  }
   if (action.type === 'request_succeeded') {
     return {
       status: 'ready',

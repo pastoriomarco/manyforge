@@ -7,7 +7,7 @@ import {
   useState,
 } from 'react';
 
-import { api, isStaleWorkspaceError } from '../api/client';
+import { api, authoringRefusalMessage, isStaleWorkspaceError } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
 import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
@@ -189,6 +189,11 @@ export function useProgramWorkspace(
       }
       return result;
     } catch (error: unknown) {
+      const refusal = action === 'refresh' ? null : authoringRefusalMessage(error);
+      if (refusal !== null) {
+        if (mounted.current) dispatch({ type: 'request_refused', generation: current, message: refusal });
+        return null;
+      }
       if (mounted.current) {
         dispatch({
           type: 'request_failed',

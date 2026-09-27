@@ -6,7 +6,7 @@ import {
   type ProgramPaletteActivation,
 } from '../utils/programCanvasInteraction';
 import { OverlayPanel } from './OverlayPanel';
-import { ProgramKindSymbol } from './programNodeGlyphs';
+import { ProgramCategoryIcon } from './programNodeGlyphs';
 
 interface NodePaletteItemProps {
   entry: CatalogEntry;
@@ -63,7 +63,7 @@ export function NodePaletteItem({
           : `Double-click or drag to add ${entry.name}`}
       >
         <span className="node-palette-icon" aria-hidden="true">
-          <ProgramKindSymbol kind={entry.kind} />
+          <ProgramCategoryIcon category={entry.category} catalogId={entry.id} />
         </span>
         <span className="node-palette-copy">
           <strong>{entry.name}</strong>

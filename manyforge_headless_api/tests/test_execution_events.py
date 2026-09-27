@@ -1180,7 +1180,6 @@ class _PagedExecution:
 
     def identity(self) -> dict[str, Any]:
         return {
-            "admission_generation": self.admission_generation,
             "api_version": "manyforge.execution_command_response.v1",
             "command": "identity",
             "ok": True,
@@ -1406,6 +1405,20 @@ def test_event_pump_wakes_cold_state_when_kernel_admission_advances() -> None:
 
     assert core.ingested == []
     assert len(wakes) == baseline + 1
+
+
+def test_event_pump_logs_only_error_transitions(caplog) -> None:
+    pump = ExecutionEventPump(_RecordingCore(), _StreamingExecution())
+    error = HeadlessApiError("execution_command_unavailable", "host lost")
+    with caplog.at_level("INFO", logger="manyforge_headless_api.execution"):
+        assert pump._record_error(error)  # noqa: SLF001
+        assert not pump._record_error(error)  # noqa: SLF001
+        assert pump._record_error(None)  # noqa: SLF001
+        assert not pump._record_error(None)  # noqa: SLF001
+    assert len(caplog.records) == 2
+    assert "execution_command_unavailable" in caplog.records[0].message
+    assert caplog.records[1].message == "Execution event pump recovered"
+    assert pump.last_error is None
 
 
 def test_event_pump_records_progress_without_rebuilding_control_projection() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import socket
 import sys
@@ -2183,7 +2184,15 @@ class ExecutionEventPump:
                 if isinstance(code, str) and code:
                     prefix += f"{code}: "
                 self._last_error = prefix + str(error)
-            return previous != self._last_error
+            current = self._last_error
+        if previous == current:
+            return False
+        logger = logging.getLogger(__name__)
+        if current is not None:
+            logger.error("Execution event pump unavailable: %s", current)
+        else:
+            logger.info("Execution event pump recovered")
+        return True
 
     @staticmethod
     def _control_projection_key(event: dict[str, Any]) -> tuple[Any, ...]:
@@ -2354,18 +2363,18 @@ class ExecutionEventPump:
             try:
                 if owner_epoch is None:
                     identity_response = self._execution.identity()
-                    next_admission_generation = self._admission_generation(
-                        identity_response
-                    )
-                    if admission_generation != next_admission_generation:
-                        admission_generation = next_admission_generation
-                        control_projection_changed = True
                     if identity_response.get("ok") is not True:
                         idle_epoch = self._idle_owner_epoch(identity_response)
                         if idle_epoch is None:
                             ExecutionCommandClient._raise_error_response(
                                 identity_response
                             )
+                        next_admission_generation = self._admission_generation(
+                            identity_response
+                        )
+                        if admission_generation != next_admission_generation:
+                            admission_generation = next_admission_generation
+                            control_projection_changed = True
                         if source_high_water_epoch != idle_epoch:
                             source_high_water_epoch = idle_epoch
                             source_high_water = 0

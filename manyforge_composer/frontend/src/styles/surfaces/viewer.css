@@ -6,31 +6,40 @@
 }
 
 .viewer-panel {
+  position: relative;
   margin-bottom: 1rem;
 }
 
+/* No header bar: the viewport controls float over the top of the scene, like
+   the Program canvas toolbar and the transport at the bottom. The empty space
+   between the controls stays transparent to the camera. */
 .viewer-header {
-  position: relative;
+  position: absolute;
   z-index: var(--mf-z-canvas-overlay);
-  min-height: 2.55rem;
-  padding: 0.32rem 0.55rem;
+  top: 0;
+  right: 0;
+  left: 0;
+  min-height: 0;
+  padding: var(--mf-viewer-overlay-inset);
+  border-bottom: 0;
+  background: none;
+  pointer-events: none;
 }
 
-.viewer-header > strong {
-  flex: 0 0 auto;
-  color: var(--mf-text-neutral-90);
-  font-size: var(--mf-font-size-076);
-  letter-spacing: 0.02em;
+.viewer-header-controls > * {
+  pointer-events: auto;
 }
 
 .viewer-scene-source-toggle {
   flex: 0 0 auto;
-  padding: 0.3rem 0.55rem;
+  height: var(--mf-viewer-control-height);
+  box-sizing: border-box;
+  padding: 0.38rem 0.8rem;
   border: 1px solid var(--mf-border-warning-43);
-  border-radius: var(--mf-radius-md-sm);
+  border-radius: var(--mf-radius-md);
   color: var(--mf-text-warning-77);
   background: var(--mf-bg-warning-17);
-  font-size: var(--mf-font-size-072);
+  font-size: var(--mf-font-size-076);
   white-space: nowrap;
 }
 
@@ -210,7 +219,10 @@
 }
 
 .viewer-tool-strip {
+  --viewer-tool-size: calc(var(--mf-viewer-control-height) - 0.36rem - 2px);
   display: flex;
+  height: var(--mf-viewer-control-height);
+  box-sizing: border-box;
   align-items: center;
   gap: 0.25rem;
   min-width: 0;
@@ -222,10 +234,10 @@
 
 .viewer-tool-strip button {
   display: grid;
-  width: 1.75rem;
-  min-width: 1.75rem;
-  height: 1.75rem;
-  min-height: 1.75rem;
+  width: var(--viewer-tool-size);
+  min-width: var(--viewer-tool-size);
+  height: var(--viewer-tool-size);
+  min-height: var(--viewer-tool-size);
   place-items: center;
   padding: 0.2rem;
   font-size: var(--mf-font-size-072);
@@ -247,10 +259,12 @@
 
 .viewer-camera-icon {
   display: block;
-  width: 0.95rem;
-  height: 0.95rem;
+  width: 1.35rem;
+  height: 1.35rem;
   flex: none;
-  line-height: 0.95rem;
+  font-size: 1.25rem;
+  line-height: 1.35rem;
+  text-align: center;
 }
 
 svg.viewer-camera-icon {
@@ -324,7 +338,7 @@ svg.viewer-camera-icon {
 
 .viewer-target-status {
   position: absolute;
-  top: 0.65rem;
+  top: calc(var(--mf-viewer-control-height) + 2 * var(--mf-viewer-overlay-inset));
   left: 0.65rem;
   z-index: var(--mf-z-controls);
   display: flex;
@@ -418,11 +432,9 @@ svg.viewer-camera-icon {
 }
 
 .viewer-slot > .viewer-panel .viewer-header {
-  flex: 0 0 auto;
   align-items: center;
   flex-direction: row;
   gap: 0.5rem;
-  padding: 0.32rem 0.55rem;
 }
 
 .viewer-slot > .viewer-panel .viewer-stage,
@@ -452,10 +464,10 @@ svg.viewer-camera-icon {
 
 .viewer-surface-launchers > button,
 .viewer-options > summary {
-  min-height: 1.9rem;
+  height: var(--mf-viewer-control-height);
   box-sizing: border-box;
-  padding: 0.38rem 0.58rem;
-  font-size: var(--mf-font-size-068);
+  padding: 0.38rem 0.8rem;
+  font-size: var(--mf-font-size-076);
 }
 
 .viewer-surface-launchers > button[aria-pressed='true'] {
@@ -527,16 +539,16 @@ svg.viewer-camera-icon {
 }
 
 .viewer-transport {
-  --viewer-transport-control-height: 2.85rem;
+  --viewer-transport-control-height: var(--mf-viewer-control-height);
   --viewer-transport-column-width: 7rem;
   --viewer-transport-motion-panel-width: 7.725rem;
   position: absolute;
   z-index: var(--mf-z-dropdown-2);
   right: 50%;
-  bottom: 0.65rem;
+  bottom: var(--mf-viewer-overlay-inset);
   display: grid;
-  width: min(58rem, calc(100% - 1.2rem));
-  max-width: calc(100% - 1.2rem);
+  width: min(58rem, calc(100% - 2 * var(--mf-viewer-overlay-inset)));
+  max-width: calc(100% - 2 * var(--mf-viewer-overlay-inset));
   grid-template-columns:
     var(--viewer-transport-motion-panel-width)
     minmax(0, 1fr)

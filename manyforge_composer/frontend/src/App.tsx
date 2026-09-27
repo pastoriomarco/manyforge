@@ -42,7 +42,7 @@ import {
   useOperationalErrorMirror,
   useOperationalErrors,
 } from './state/operationalErrors';
-import { authoringUnavailableCause } from './state/authoringWorkspace';
+import { authoringUnavailableCause, requiredComponentFaultNotices } from './state/authoringWorkspace';
 import { sameManagerApply, type ManagerApplyIdentity } from './state/managerApply';
 import {
   activeViewerIncidentKinds,
@@ -535,7 +535,7 @@ export default function App() {
     ? authoringUnavailableCause(authoringWorkspace.published, headlessSnapshot)
     : null;
   const operationNotices = useMemo<WorkbenchNotice[]>(() => {
-    const notices: WorkbenchNotice[] = [];
+    const notices: WorkbenchNotice[] = requiredComponentFaultNotices(headlessSnapshot);
     const label = pendingProgramAction === null
       ? undefined
       : PROGRAM_ACTION_LABELS[pendingProgramAction];
@@ -573,14 +573,13 @@ export default function App() {
         message: reason,
         busy: true,
       });
-    } else if (authoringCause === 'not_admitted') {
+    } else if (authoringCause === 'not_admitted' && maintenance === null && !deploymentController.applying && pendingProgramAction === null) {
       notices.push({
         id: 'authoring.unavailable',
-        severity: 'error',
+        severity: 'info',
         domain: 'program_authoring',
-        title: 'Authoring not admitted',
+        title: 'Authoring locked',
         message: reason,
-        expectedDuringTransition: true,
       });
     } else if (authoringCause === 'disconnected' && controlNotices.length === 0) {
       notices.push({
@@ -599,6 +598,8 @@ export default function App() {
     deploymentController.applying,
     deploymentController.busy,
     pendingProgramAction,
+    headlessSnapshot,
+    maintenance,
   ]);
   const publishedNotices = usePublishedWorkbenchNotices();
   const workbenchNotices = useMemo(() => [

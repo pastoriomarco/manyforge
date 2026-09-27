@@ -51,6 +51,12 @@ from .authoring_admission import (
 from .authoring_workspace import (
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
+    scenario_project_facts,
+)
+from .scenario_artifacts import (
+    SCENARIO_PROJECT_MEMBERS,
+    ScenarioArtifactError,
+    save_scenario_member,
 )
 from .authoring_workspace_fence import (
     commit_local_authoring,
@@ -209,7 +215,7 @@ class _AppliedContext:
 
 
 def _raise_workspace_error(error: Exception) -> NoReturn:
-    if isinstance(error, (DraftSessionError, ProgramArtifactError)):
+    if isinstance(error, (DraftSessionError, ProgramArtifactError, ScenarioArtifactError)):
         detail: dict[str, Any] = {
             "code": error.code,
             "message": str(error),
@@ -1395,13 +1401,32 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             target_path=target_path,
             confirm_overwrite=confirm_overwrite,
         )
-        if _published_program_revision(state, prepared.target_path) == (
-            prepared.program.program_revision
-        ):
-            # This exact content is already published at the target, so a lost
-            # response is resolved without repeating the write.
-            saved_path = prepared.resolved_target
-        else:
+        captured_workspace = state.authoring_workspace.snapshot().as_dict()
+        project_path = captured_workspace["project"]["document_path"]
+        scenario_member = (
+            target_path is None and project_path is not None
+            and prepared.resolved_target == str(
+                Path(project_path) / SCENARIO_PROJECT_MEMBERS["program_draft"]
+            )
+        )
+        saved_path = prepared.resolved_target
+        artifact_written = not scenario_member
+
+        def prepare_saved_project() -> dict[str, Any]:
+            nonlocal artifact_written
+            document, path, digest = save_scenario_member(
+                project_path, "program_draft", captured_workspace["program"]["authoring"],
+                allowed_roots=state.allowed_fs_roots,
+            )
+            artifact_written = True
+            return scenario_project_facts(
+                document, document_path=path, source_document_digest=digest
+            )
+
+        # Scenario members are written with their manifest under the claim below.
+        if not scenario_member and _published_program_revision(
+            state, prepared.target_path
+        ) != prepared.program.program_revision:
             saved_path = save_program_artifact(
                 prepared.program,
                 prepared.target_path,
@@ -1413,12 +1438,16 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 state,
                 body,
                 operation_kind=prepared.tool_id,
+                session="whole-workspace" if scenario_member else "program",
+                prepare_project_under_claim=(
+                    prepare_saved_project if scenario_member else None
+                ),
                 install=lambda: state.draft_session.install_prepared_save(
                     prepared, saved_path=saved_path
                 ),
             )
         except AuthoringWorkspaceError as error:
-            if error.code != "composer_workspace_stale":
+            if error.code != "composer_workspace_stale" or not artifact_written:
                 raise
             # The Program artifact is correctly written; only the Saved
             # baseline is refused, so newer in-memory content is never labelled

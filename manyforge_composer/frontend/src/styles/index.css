@@ -3,6 +3,7 @@
 @import './tokens.css';
 @import './base.css';
 @import './shared/buttons.css';
+@import './shared/panels.css';
 @import './shared/status.css';
 @import './surfaces/document-controls.css';
 @import './surfaces/scene.css';

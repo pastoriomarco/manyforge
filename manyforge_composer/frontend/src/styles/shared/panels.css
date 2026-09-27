@@ -1,0 +1,61 @@
+/* shared/panels: generic panel chrome. Imported before every surface so
+   surface classes on the same element (for example .viewer-header) refine it. */
+
+.panel {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--mf-border-neutral-23);
+  border-radius: var(--mf-radius-2xl);
+  background: var(--mf-bg-neutral-08-a94);
+  box-shadow: 0 1.2rem 3.5rem var(--mf-shadow-neutral-00-a16);
+}
+
+.panel-header {
+  display: flex;
+  min-height: 4.35rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.95rem 1.1rem;
+  border-bottom: 1px solid var(--mf-border-neutral-19);
+  background: linear-gradient(180deg, var(--mf-bg-neutral-15-a60), var(--mf-bg-neutral-09-a25));
+}
+
+.panel-header h2 {
+  margin: 0;
+  color: var(--mf-text-neutral-97);
+  font-size: var(--mf-font-size-112);
+  line-height: 1.15;
+}
+
+.panel-state {
+  display: flex;
+  min-height: 9rem;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 1.5rem;
+  color: var(--mf-text-neutral-68);
+  text-align: center;
+}
+
+.panel-state button {
+  margin-top: 0.35rem;
+  padding: 0.55rem 0.8rem;
+}
+
+.panel-intro {
+  margin: 0;
+  padding: 0.85rem 1rem 0;
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-080);
+  line-height: 1.5;
+}
+
+@media (max-width: 48rem) {
+  .panel-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

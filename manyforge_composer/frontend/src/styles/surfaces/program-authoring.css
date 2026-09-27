@@ -943,8 +943,6 @@
 }
 
 .program-settings-button {
-  width: 1.55rem;
-  height: 1.55rem;
   flex: 0 0 auto;
   padding: 0;
   font-size: var(--mf-font-size-076);

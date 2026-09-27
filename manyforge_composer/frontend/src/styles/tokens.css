@@ -343,4 +343,8 @@
   --mf-node-icon-size: 31px;
   --mf-node-status-offset: 2px;
   --mf-node-status-size: 0.8rem;
+  /* 3D viewer overlays: one control height and one edge inset for the
+     floating viewport controls (top) and the transport (bottom). */
+  --mf-viewer-control-height: 2.85rem;
+  --mf-viewer-overlay-inset: 0.65rem;
 }

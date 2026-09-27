@@ -946,6 +946,41 @@ def save_scenario_artifact(
             os.close(parent_fd)
 
 
+def save_scenario_member(
+    project_path: str,
+    field: str,
+    value: dict[str, Any],
+    *,
+    allowed_roots: list[str],
+) -> tuple[dict[str, Any], str, str]:
+    """Save one authored member through the project's manifest-owning writer.
+
+    Other members come from disk, never from unrelated unsaved Drafts. Capture
+    rejects an interrupted project rather than overwriting its evidence.
+    """
+    if field not in {"program_draft", "deployment_draft"}:
+        raise ValueError("unsupported Scenario member")
+    document, path, digest = capture_scenario_artifact(
+        project_path, allowed_roots=allowed_roots
+    )
+    if document[field] == value:
+        return document, path, digest
+    document[field] = deepcopy(value)
+    document["saved_status"] = {
+        **document["saved_status"],
+        "last_known_status": "unknown",
+        "checked_content_digest": scenario_content_digest(
+            document["program_draft"], document["deployment_draft"],
+            document["program_role_assignment"], document["typed_parameter_overrides"],
+        ),
+    }
+    save_scenario_artifact(
+        document, path, allowed_roots=allowed_roots, overwrite=True,
+        source_project_path=path,
+    )
+    return capture_scenario_artifact(path, allowed_roots=allowed_roots)
+
+
 def _export_relative_path(*parts: str) -> str:
     path = PurePosixPath(*parts)
     if any(part in {"", ".", ".."} for part in path.parts):

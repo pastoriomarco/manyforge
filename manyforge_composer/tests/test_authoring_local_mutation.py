@@ -290,7 +290,8 @@ def test_validated_no_op_does_not_advance_or_wake(tmp_path) -> None:
     assert workspace.revision == 1
 
 
-def test_under_claim_project_preparation_runs_between_acquire_and_commit(tmp_path) -> None:
+@pytest.mark.parametrize("session", ["project", "whole-workspace"])
+def test_under_claim_project_preparation_runs_between_acquire_and_commit(tmp_path, session) -> None:
     workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
     workspace.set_observer(lambda: headless.events.append("wake"))
 
@@ -311,6 +312,10 @@ def test_under_claim_project_preparation_runs_between_acquire_and_commit(tmp_pat
             source_document_digest="sha256:" + "a" * 64,
         )
 
+    def install() -> bool:
+        headless.events.append("install")
+        return program.install_no_op()
+
     commit = coordinator.execute_local_mutation(
         _envelope(),
         operation_kind="save_scenario_document",
@@ -318,20 +323,23 @@ def test_under_claim_project_preparation_runs_between_acquire_and_commit(tmp_pat
         draft_revision=program.revision,
         payload={"path": "scenario.test"},
         workspace=workspace,
-        session="project",
+        session=session,
+        install=install if session == "whole-workspace" else None,
         prepare_project_under_claim=prepare_project,
     )
 
     assert headless.events == [
         "acquire",
         "prepare_project",
+        *(["install"] if session == "whole-workspace" else []),
         "settle:owner_commit",
         "wake",
     ]
     assert commit.snapshot.project["document_id"] == "saved-scenario"
 
 
-def test_stale_generation_refuses_before_under_claim_project_effect(tmp_path) -> None:
+@pytest.mark.parametrize("session", ["project", "whole-workspace"])
+def test_stale_generation_refuses_before_under_claim_project_effect(tmp_path, session) -> None:
     workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
     headless.generation = 8
     effects: list[str] = []
@@ -345,7 +353,8 @@ def test_stale_generation_refuses_before_under_claim_project_effect(tmp_path) ->
             draft_revision=program.revision,
             payload={"path": "scenario.test"},
             workspace=workspace,
-            session="project",
+            session=session,
+            install=program.install_no_op if session == "whole-workspace" else None,
             prepare_project_under_claim=lambda: effects.append("write")
             or scenario_project_facts(None),
         )

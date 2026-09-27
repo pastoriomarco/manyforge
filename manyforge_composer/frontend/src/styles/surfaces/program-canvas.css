@@ -4,10 +4,6 @@
   cursor: grab;
 }
 
-.node-palette-item:hover {
-  background: var(--mf-bg-neutral-15);
-}
-
 .node-palette-item.disabled {
   cursor: not-allowed;
   opacity: 0.5;
@@ -150,11 +146,12 @@
 /* Category icons: one square per icon, line width relative to the icon size
    (not scaled by the per-icon fit). */
 .program-category-icon {
+  --program-icon-size: var(--mf-node-icon-size);
   display: block;
-  color: var(--mf-category-unknown);
+  color: var(--mf-category-color, var(--mf-category-unknown));
   fill: none;
   stroke: currentColor;
-  stroke-width: calc(var(--mf-node-icon-size) * 0.094);
+  stroke-width: calc(var(--program-icon-size) * 0.094);
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -163,29 +160,39 @@
   vector-effect: non-scaling-stroke;
 }
 
+/* Dashes scale with the icon, like the line width (simulation trajectory). */
+.program-category-icon .dashed {
+  stroke-dasharray: calc(var(--program-icon-size) * 0.0625) calc(var(--program-icon-size) * 0.15);
+}
+
 .program-category-icon .solid {
   fill: currentColor;
   stroke: none;
 }
 
-.program-category-icon[data-category-family="execution_control"] {
-  color: var(--mf-category-execution-control);
+/* One family colour for the node icon and the palette category header. */
+[data-category-family="execution_control"] {
+  --mf-category-color: var(--mf-category-execution-control);
 }
 
-.program-category-icon[data-category-family="motion"] {
-  color: var(--mf-category-motion);
+[data-category-family="motion"] {
+  --mf-category-color: var(--mf-category-motion);
 }
 
-.program-category-icon[data-category-family="gripper"] {
-  color: var(--mf-category-gripper);
+[data-category-family="gripper"] {
+  --mf-category-color: var(--mf-category-gripper);
 }
 
-.program-category-icon[data-category-family="world"] {
-  color: var(--mf-category-world);
+[data-category-family="world"] {
+  --mf-category-color: var(--mf-category-world);
 }
 
-.program-category-icon[data-category-family="logic"] {
-  color: var(--mf-category-logic);
+[data-category-family="logic"] {
+  --mf-category-color: var(--mf-category-logic);
+}
+
+[data-category-family="unknown"] {
+  --mf-category-color: var(--mf-category-unknown);
 }
 
 .bt-node-handle {
@@ -455,6 +462,13 @@
   box-shadow: inset 2px 0 var(--mf-shadow-neutral-45);
 }
 
+.program-palette-category[data-category-family] {
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--mf-category-color) 16%, transparent), transparent 48%),
+    var(--mf-bg-neutral-12);
+  box-shadow: inset 2px 0 var(--mf-category-color);
+}
+
 .program-palette-category > strong {
   color: var(--mf-text-neutral-90);
   font-size: var(--mf-font-size-076);
@@ -487,16 +501,19 @@
   background: var(--mf-bg-neutral-15);
 }
 
+/* Borderless rows; the whole row shows the hover. */
 .node-palette-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 1.65rem;
   align-items: center;
   gap: 0;
   overflow: hidden;
-  margin: 0.22rem 0.12rem;
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-md);
-  background: var(--mf-bg-neutral-08);
+  margin: 0 0.12rem;
+  border-radius: var(--mf-radius-md-sm);
+}
+
+.node-palette-row:hover {
+  background: var(--mf-bg-neutral-15);
 }
 
 .node-palette-item {
@@ -520,11 +537,11 @@
   font-size: var(--mf-font-size-058);
 }
 
-/* Drawn kind symbol shared with the canvas (UI6-I-VC D3). */
-.node-palette-icon .program-kind-symbol {
-  display: block;
-  width: 0.62rem;
-  height: 0.62rem;
+/* The node's canvas icon, in its family colour, at palette size. */
+.node-palette-icon .program-category-icon {
+  --program-icon-size: 1rem;
+  width: 1rem;
+  height: 1rem;
 }
 
 .node-palette-copy strong {
@@ -650,7 +667,6 @@
 }
 
 .program-tree-empty {
-  display: grid;
   align-content: center;
   justify-items: center;
   gap: 0.5rem;

@@ -804,6 +804,8 @@ class _Coordinator:
     ):
         if validate_under_claim is not None:
             validate_under_claim()
+        if prepare_project_under_claim is not None:
+            project = prepare_project_under_claim()
         if session == "whole-workspace":
             snapshot = workspace.replace(
                 expected_identity=expected_identity,
@@ -811,8 +813,6 @@ class _Coordinator:
                 project=project,
             )
         elif session == "project":
-            if prepare_project_under_claim is not None:
-                project = prepare_project_under_claim()
             snapshot = workspace.commit_project(
                 expected_identity=expected_identity,
                 facts=project,

@@ -11,6 +11,7 @@ import type {
   AuthoringWorkspaceIdentity,
   ComposerHeadlessState,
 } from '../types/headless';
+import type { WorkbenchNotice } from './workbenchNotices';
 
 /**
  * One installed composite authoring publication.
@@ -60,7 +61,7 @@ export function publicationIsCurrent(
 }
 
 const ADMISSION_REASON_ALLOWED =
-  'The backend has not admitted authoring; execution must be Idle and required components healthy.';
+  'Authoring is currently locked by the backend.';
 const ADMISSION_REASON_DISCONNECTED =
   'Backend status is disconnected or has not arrived.';
 
@@ -75,24 +76,26 @@ export function authoringUnavailableReason(
   published: PublishedAuthoringWorkspace | null,
   snapshot: ComposerHeadlessState | null,
 ): string | null {
-  if (snapshot === null) return ADMISSION_REASON_DISCONNECTED;
-  if (published === null) {
-    return 'The shared authoring workspace has not been read yet.';
+  switch (authoringUnavailableCause(published, snapshot)) {
+    case 'disconnected': return ADMISSION_REASON_DISCONNECTED;
+    case 'not_read': return 'The shared authoring workspace has not been read yet.';
+    case 'synchronizing': return 'The displayed workspace is still synchronizing with the backend.';
+    case 'execution_active':
+      return `Program execution is ${snapshot!.programCycle.state.replaceAll('_', ' ')}; authoring requires Idle.`;
+    case 'not_admitted':
+      return snapshot?.executionControlStatus?.manualOperations.some((operation) => (
+        operation.resident && ['queued', 'resolving', 'planning', 'validating', 'prepared', 'dispatching', 'executing', 'paused', 'stopping'].includes(operation.state)
+      ))
+        ? 'Authoring is locked while a manual operation is active.'
+        : ADMISSION_REASON_ALLOWED;
+    case null: return null;
   }
-  if (!publicationIsCurrent(published, snapshot)) {
-    return 'The displayed workspace is still synchronizing with the backend.';
-  }
-  if (snapshot.programCycle.state !== 'idle_after_reset') {
-    return `Program execution is ${snapshot.programCycle.state.replaceAll('_', ' ')}; authoring requires Idle.`;
-  }
-  if (!snapshot.authoringAdmission.authoringAllowed) return ADMISSION_REASON_ALLOWED;
-  return null;
 }
 
 /**
  * The typed cause behind :func:`authoringUnavailableReason`, so presentation
  * can distinguish normal execution/synchronization (information) from lost
- * authoritative state or refused admission (error) without parsing text.
+ * authoritative state without treating a closed permission gate as a fault.
  */
 export type AuthoringUnavailableCause =
   | 'disconnected'
@@ -111,6 +114,19 @@ export function authoringUnavailableCause(
   if (snapshot.programCycle.state !== 'idle_after_reset') return 'execution_active';
   if (!snapshot.authoringAdmission.authoringAllowed) return 'not_admitted';
   return null;
+}
+
+/** Owner-reported faults remain errors independently of the authoring gate. */
+export function requiredComponentFaultNotices(snapshot: ComposerHeadlessState | null): WorkbenchNotice[] {
+  return (snapshot?.componentOverview.components ?? [])
+    .filter((component) => component.required && ['fault', 'offline'].includes(component.status))
+    .map((component) => ({
+      id: `component.health.${component.id}`,
+      severity: 'error',
+      domain: 'runtime',
+      title: `${component.label} unavailable`,
+      message: component.detail,
+    }));
 }
 
 export function programLocalFence(

@@ -13,6 +13,7 @@ order:** when two rules have the same specificity, the later file wins.
 | `tokens.css` | Every raw value: colors, font sizes, weights, radii, z-index, the monospace stack, Program node dimensions. |
 | `base.css` | Element defaults (`button`, `input`, `select`, …), focus outlines, reduced motion, `.muted`, `.sr-only`. |
 | `shared/buttons.css` | `primary-action`, `danger-button`, `quiet-button`, `text-button`, `icon-button`, `segmented-control`, `button-row`. |
+| `shared/panels.css` | Generic panel chrome (`.panel`, `.panel-header`, `.panel-state`, `.panel-intro`). It comes before the surfaces, because surface classes on the same element refine it (for example `.viewer-header`). |
 | `shared/status.css` | Status pills, readiness dots, inline error text. |
 | `surfaces/*.css` | One file per surface family: layout and the few looks that belong only to that surface. |
 

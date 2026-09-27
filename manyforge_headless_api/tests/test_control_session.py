@@ -38,6 +38,7 @@ from manyforge_headless_api.control_state import (
 )
 from manyforge_headless_api.component_overview import ComponentOverviewFacts
 from manyforge_headless_api.execution_control import ExecutionControlIngress
+from manyforge_headless_api.execution import ExecutionEventPump
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlLane,
@@ -402,6 +403,80 @@ def _facts_for_cycle(cycle: dict[str, Any]) -> ComponentOverviewFacts:
         execution_control_response={},
         errors={},
     )
+
+
+def test_event_pump_reopens_admission_for_existing_session_without_events() -> None:
+    async def exercise() -> None:
+        admission = {"admission_generation": 29, "allowed": False}
+        identity_reads: list[None] = []
+        ingested: list[dict[str, Any]] = []
+        loop = asyncio.get_running_loop()
+        baseline_observed = asyncio.Event()
+
+        def identity():
+            identity_reads.append(None)
+            # Ready identity deliberately has no admission generation.
+            return {"ok": True, "identity": {"owner_epoch": "execution.1"}}
+
+        def events(owner_epoch, after_sequence, *, limit):
+            return {
+                "admission_generation": admission["admission_generation"],
+                "events": [],
+                "has_more": False,
+                "next_after_sequence": after_sequence,
+            }
+
+        def facts(*, program_cycle, cancelled=None):
+            if identity_reads and admission["admission_generation"] == 29:
+                loop.call_soon_threadsafe(baseline_observed.set)
+            return replace(
+                _facts_for_cycle(program_cycle), authoring_admission=dict(admission)
+            )
+
+        ingress = _ingress([])
+        source = HeadlessControlStateSource(
+            SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=facts),
+            ingress,
+            program_runner_websocket_url=None,
+        )
+        pump = ExecutionEventPump(
+            SimpleNamespace(
+                ingest_operation_event=lambda **row: ingested.append(row),
+                complete_operation_event_snapshot=lambda **kwargs: None,
+                mark_operation_event_source_unknown=lambda **kwargs: None,
+            ),
+            SimpleNamespace(
+                identity=identity,
+                events=events,
+                stop_fault=lambda: {"ok": True, "stop_fault": None},
+            ),
+            poll_seconds=0.01,
+        )
+        pump.set_change_observer(source.notify_cold)
+        subscription = await source.subscribe()
+        try:
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            previous = source.take(subscription)
+            assert previous.shell["authoring_admission"] == admission
+            pump.start()
+            await asyncio.wait_for(baseline_observed.wait(), 1)
+            # Reset has finished; only the Kernel admission generation advances.
+            admission = {"admission_generation": 30, "allowed": True}
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            current = source.take(subscription)
+            session = ExecutionControlSession(object(), source, ingress)
+            delta = session._delta_message(current, previous)  # noqa: SLF001
+            assert delta.shell["authoring_admission"] == admission
+            assert current.shell["program_cycle"] == previous.shell["program_cycle"]
+            assert identity_reads == [None]  # no reconnect
+            assert ingested == []
+            assert pump.last_error is None
+        finally:
+            pump.shutdown()
+            await source.unsubscribe(subscription)
+            ingress.close()
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize(

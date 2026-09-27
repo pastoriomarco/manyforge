@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   authoringUnavailableCause,
   authoringUnavailableReason,
+  requiredComponentFaultNotices,
   authoringWorkspaceIdentity,
   programLocalFence,
   projectFacts,
@@ -191,8 +192,34 @@ describe('authoringWorkspace', () => {
         }),
       ),
     ).toBe(
-      'The backend has not admitted authoring; execution must be Idle and required components healthy.',
+      'Authoring is currently locked by the backend.',
     );
+  });
+
+  it('explains only live manual operations and keeps owner faults visible', () => {
+    const installed = published(workspaceSnapshot(5, 3, 4));
+    const state = headlessState(5, {}, {
+      authoringAdmission: { authoringAllowed: false, admissionGeneration: 7 },
+    });
+    for (const operationState of ['executing', 'paused', 'stopping']) {
+      state.executionControlStatus = {
+        manualOperations: [{ resident: true, state: operationState }],
+      } as never;
+      expect(authoringUnavailableReason(installed, state)).toContain('manual operation is active');
+    }
+    state.executionControlStatus = {
+      manualOperations: [{ resident: false, state: 'completed' }],
+    } as never;
+    expect(authoringUnavailableReason(installed, state)).toBe('Authoring is currently locked by the backend.');
+    state.componentOverview = {
+      components: [{ id: 'arm', label: 'Arm', required: true, status: 'fault', detail: 'Owner reports a fault' }],
+    } as never;
+    expect(requiredComponentFaultNotices(state)).toEqual([expect.objectContaining({
+      severity: 'error', title: 'Arm unavailable', message: 'Owner reports a fault',
+    })]);
+    state.authoringAdmission.authoringAllowed = true;
+    expect(authoringUnavailableCause(installed, state)).toBeNull();
+    expect(requiredComponentFaultNotices(state)).toHaveLength(1);
   });
 
   it('builds the one local fence and its Scenario extension from the publication', () => {

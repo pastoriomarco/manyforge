@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, isStaleWorkspaceError } from '../api/client';
+import { api, authoringRefusalMessage, isStaleWorkspaceError } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
 import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
@@ -165,6 +165,11 @@ export function useDeploymentWorkspace(
       return next;
     } catch (reason: unknown) {
       const message = errorMessage(reason, 'Deployment authoring request failed.');
+      const refusal = authoringRefusalMessage(reason);
+      if (refusal !== null) {
+        if (mounted.current) setFeedback(refusal);
+        return null;
+      }
       if (isStaleWorkspaceError(reason)) {
         const latest = await refresh();
         if (mounted.current && latest !== null) setError(message);
@@ -229,6 +234,11 @@ export function useDeploymentWorkspace(
       // A terminal request failure must return the UI to the ordinary Apply
       // action instead of leaving a disabled confirmation overlay behind.
       if (mounted.current) setPendingApplyConfirmation(null);
+      const refusal = authoringRefusalMessage(reason);
+      if (refusal !== null) {
+        if (mounted.current) setFeedback(refusal);
+        return null;
+      }
       if (isStaleWorkspaceError(reason)) {
         const latest = await refresh();
         if (mounted.current && latest !== null) setError(message);

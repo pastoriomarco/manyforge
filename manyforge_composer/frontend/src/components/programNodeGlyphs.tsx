@@ -69,9 +69,9 @@ const CATEGORY_ICONS: Readonly<Record<string, CategoryIconDrawing>> = {
     ),
   },
   simulation: {
-    transform: 'translate(0.000 0.000) scale(1.0000)',
+    transform: 'translate(0.615 0.116) scale(0.9231)',
     shapes: (
-      <><rect x="2" y="3" width="12" height="10" rx="1.5" /><path className="solid" d="M6.6 5.8v4.4L10.4 8z" /></>
+      <><path d="M1.5 14 5 10.5h9.5L11 14z" /><path className="dashed" d="M2.8 8.2C3.8 3.6 7.6 2.2 10 3.6" /><circle cx="12" cy="5" r="1.9" /></>
     ),
   },
   assistant: {
@@ -82,14 +82,105 @@ const CATEGORY_ICONS: Readonly<Record<string, CategoryIconDrawing>> = {
   },
 };
 
+// Dedicated icons for the control-flow and recovery nodes, keyed by catalog
+// id; they take precedence over the category icon and use the same fitting
+// rule. Sequence (→) and Parallel (⇉) are the standard behavior-tree symbols;
+// a cross means failure (Fallback, Retry). Stop, pause and resume share a
+// circle; Full Stop uses an octagon because it stops the whole cell.
+const NODE_ICONS: Readonly<Record<string, CategoryIconDrawing>> = {
+  sequence: {
+    transform: 'translate(-0.087 -0.348) scale(1.0435)',
+    shapes: (
+      <><path d="M2 8h11" /><path d="M9 3.5 13.5 8 9 12.5" /></>
+    ),
+  },
+  fallback: {
+    transform: 'translate(0.000 -0.150) scale(1.0000)',
+    shapes: (
+      <><path d="M2 4.5h6" /><path d="M10 2.8l3.4 3.4M13.4 2.8 10 6.2" /><path d="M5 4.5V10a1.5 1.5 0 0 0 1.5 1.5H14" /><path d="M12 9.5l2 2-2 2" /></>
+    ),
+  },
+  parallel: {
+    transform: 'translate(0.742 0.258) scale(0.9677)',
+    shapes: (
+      <><path d="M2 4h11" /><path d="M10.8 1.8 13 4l-2.2 2.2" /><path d="M2 12h11" /><path d="M10.8 9.8 13 12l-2.2 2.2" /></>
+    ),
+  },
+  inverter: {
+    transform: 'translate(-0.727 -0.727) scale(1.0909)',
+    shapes: (
+      <><circle cx="8" cy="8" r="5.5" /><path className="solid" d="M8 2.5a5.5 5.5 0 0 1 0 11z" /></>
+    ),
+  },
+  repeat: {
+    transform: 'translate(0.381 0.381) scale(0.9524)',
+    shapes: (
+      <><path d="M2.5 8.5V6A2.5 2.5 0 0 1 5 3.5h8.3" /><path d="M11.5 1.7 13.3 3.5l-1.8 1.8" /><path d="M13.5 7.5V10a2.5 2.5 0 0 1-2.5 2.5H2.7" /><path d="M4.5 10.7 2.7 12.5l1.8 1.8" /></>
+    ),
+  },
+  retry: {
+    transform: 'translate(0.080 0.560) scale(0.9600)',
+    shapes: (
+      <><path d="M2 2.5l3 3M5 2.5l-3 3" /><path d="M7.5 4H11a3.5 3.5 0 0 1 0 7H4" /><path d="M6 9l-2 2 2 2" /></>
+    ),
+  },
+  timer: {
+    transform: 'translate(0.615 0.615) scale(0.9231)',
+    shapes: (
+      <><circle cx="8" cy="9" r="5.5" /><path d="M8 3.5v-2" /><path d="M6.3 1.5h3.4" /><path d="M8 9l2.4-2.4" /><path d="M12.3 4.7l1-1" /></>
+    ),
+  },
+  'kernel.stop_operation': {
+    transform: 'translate(0.000 0.000) scale(1.0000)',
+    shapes: (
+      <><circle cx="8" cy="8" r="6" /><rect className="solid" x="5.6" y="5.6" width="4.8" height="4.8" rx="0.6" /></>
+    ),
+  },
+  'kernel.full_stop': {
+    transform: 'translate(0.000 0.000) scale(1.0000)',
+    shapes: (
+      <><path d="M5.5 2h5L14 5.5v5L10.5 14h-5L2 10.5v-5z" /><rect className="solid" x="5.6" y="5.6" width="4.8" height="4.8" rx="0.6" /></>
+    ),
+  },
+  'kernel.pause_operation': {
+    transform: 'translate(0.000 0.000) scale(1.0000)',
+    shapes: (
+      <><circle cx="8" cy="8" r="6" /><path d="M6.5 5.6v4.8M9.5 5.6v4.8" /></>
+    ),
+  },
+  'kernel.resume_operation': {
+    transform: 'translate(0.000 0.000) scale(1.0000)',
+    shapes: (
+      <><circle cx="8" cy="8" r="6" /><path d="M6.7 5.4v5.2L10.6 8z" /></>
+    ),
+  },
+  'kernel.reset_operation': {
+    transform: 'translate(-0.736 0.034) scale(1.0922)',
+    shapes: (
+      <><path d="M3.2 8a4.8 4.8 0 1 0 1.4-3.4" /><path d="M4.4 1.8v2.9h2.9" /><circle className="solid" cx="8" cy="8" r="1.3" /></>
+    ),
+  },
+  'recovery.apply_offered_action': {
+    transform: 'translate(0.000 0.000) scale(1.0000)',
+    shapes: (
+      <><circle cx="8" cy="8" r="6" /><circle cx="8" cy="8" r="2.6" /><path d="M3.8 3.8l2.4 2.4M12.2 3.8 9.8 6.2M3.8 12.2l2.4-2.4M12.2 12.2 9.8 9.8" /></>
+    ),
+  },
+};
+
 const UNKNOWN_CATEGORY_ICON: CategoryIconDrawing = {
   transform: 'translate(0 0) scale(1)',
   shapes: <rect x="2" y="2" width="12" height="12" rx="2.5" />,
 };
 
-/** Category icon in its family colour (colour set by CSS on the family). */
-export function ProgramCategoryIcon({ category }: { category: string }) {
-  const drawing = CATEGORY_ICONS[category] ?? UNKNOWN_CATEGORY_ICON;
+/**
+ * Node icon in its category family colour (colour set by CSS on the family):
+ * the node's own icon when it has one, otherwise its category icon.
+ */
+export function ProgramCategoryIcon({ category, catalogId }: { category: string; catalogId?: string }) {
+  const drawing = (catalogId === undefined ? undefined : NODE_ICONS[catalogId])
+    ?? CATEGORY_ICONS[category]
+    ?? UNKNOWN_CATEGORY_ICON;
   return (
     <svg
       className="program-category-icon"

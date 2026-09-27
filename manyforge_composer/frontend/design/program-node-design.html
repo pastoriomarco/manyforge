@@ -128,6 +128,10 @@
      --corner-inset; the status symbol is centered where the default 22px
      icon's center is. Resizing the icon moves neither anchor. */
   .bt-node { --corner-inset: 0.3rem; --corner-center: calc(11px + 0.3rem); }
+  /* Category fade: the palette header's family-color fade, on the node. */
+  .cat-fade .bt-node[style*="--cat-color"] {
+    background: linear-gradient(90deg, color-mix(in srgb, var(--cat-color) 16%, transparent), transparent 48%), var(--fill, var(--node-default));
+  }
   .cat-icon { display: inline-block; width: var(--node-icon-size); height: var(--node-icon-size); flex: 0 0 auto; color: var(--cat-color, var(--text-muted)); }
   /* Each icon is a square; its drawing is fitted to the same inner area and the
      line width depends only on the icon size, never on the fitting scale. */
@@ -137,6 +141,8 @@
   .cat-icon svg .glyph > * { vector-effect: non-scaling-stroke; }
   .guides .cat-icon { outline: 1px dashed rgb(226 185 78 / 60%); }
   .cat-icon svg .solid { fill: currentColor; stroke: none; }
+  /* Dashes scale with the icon like the line width (simulation trajectory). */
+  .cat-icon svg .dashed { stroke-dasharray: calc(var(--icon-px) * 0.0625) calc(var(--icon-px) * 0.15); }
   .cat-icon.corner {
     position: absolute;
     top: var(--corner-inset);
@@ -222,6 +228,44 @@
   .size-control { display: inline-flex; align-items: center; gap: 8px; font-size: 0.74rem; color: var(--text-muted); }
   .size-control input { width: 10rem; accent-color: var(--accent); }
   .size-control output { min-width: 3.2em; color: var(--text-soft); font-variant-numeric: tabular-nums; }
+  .toggle-line { display: inline-flex; align-items: center; gap: 0.45rem; margin: 0 0 0.7rem; color: var(--text-soft); font-size: 0.8rem; }
+  /* Node palette mock: values copied from the app's program-canvas.css. */
+  .pal-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+  .pal-col { display: grid; gap: 6px; align-content: start; }
+  .pal-col > h3 { margin: 0; font-size: 0.8rem; font-weight: 650; color: var(--text-soft); }
+  .pal-col > p { font-size: 0.72rem; color: var(--text-muted); }
+  .pal { width: 100%; max-width: 280px; border: 1px solid #203542; border-radius: 0.45rem; background: #0a1720; overflow: hidden; }
+  .pal-filter { padding: 0.38rem 0.42rem; border-bottom: 1px solid #203542; }
+  .pal-filter span { display: block; min-height: 1.85rem; box-sizing: border-box; padding: 0.35rem 0.45rem; border: 1px solid #405764; border-radius: 0.4rem; color: #718994; font-size: 0.65rem; background: #0a1720; }
+  .pal-list { padding: 0.22rem; }
+  .pal-list section + section { margin-top: 0.35rem; }
+  .pal-cat { display: flex; min-height: 2.15rem; box-sizing: border-box; align-items: center; justify-content: space-between; gap: 0.4rem; padding: 0.24rem 0.3rem 0.24rem 0.42rem; border-bottom: 1px solid #365563; color: #c6d6dd;
+    background: linear-gradient(90deg, rgb(82 174 197 / 10%), transparent 48%), #10232d; box-shadow: inset 2px 0 #478b9e; }
+  .pal.accent-family .pal-cat[style] { box-shadow: inset 2px 0 var(--cat-color);
+    background: linear-gradient(90deg, color-mix(in srgb, var(--cat-color) 16%, transparent), transparent 48%), #10232d; }
+  .pal-cat strong { color: #dbe8ee; font-size: 0.76rem; font-weight: 700; letter-spacing: 0.012em; }
+  .pal-cat div { display: flex; align-items: center; gap: 0.25rem; }
+  .pal-cat small { color: #718994; font-size: 0.58rem; }
+  .pal-cat i { display: grid; place-items: center; width: 1.55rem; height: 1.55rem; box-sizing: border-box; border: 1px solid #405764; border-radius: 0.4rem; background: #142b37; font-style: normal; font-size: 0.8rem; color: #c6d6dd; }
+  .pal-row { display: grid; grid-template-columns: minmax(0, 1fr) 1.65rem; align-items: center; overflow: hidden; }
+  .pal-item { display: flex; min-height: 2rem; box-sizing: border-box; align-items: center; gap: 0.35rem; padding: 0.28rem 0.32rem; color: #dbe8ee; font-size: 0.76rem; font-weight: 700; line-height: 1.15; cursor: grab; }
+  .pal-item strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+  .pal-row:hover, .pal-row.hover { background: #142b37; }
+  .pal-info { display: grid; place-items: center; width: 1.65rem; height: 1.65rem; color: #87a5b3; font-size: 0.76rem; font-weight: 700; }
+  .pal-info.ok { color: #5fc39f; }
+  .pal-info.warn { color: #d6a64a; }
+  .pal-mark { display: grid; place-items: center; flex: 0 0 auto; color: #78aabc; }
+  .pal-mark svg { display: block; width: 0.62rem; height: 0.62rem; }
+  .pal-mark .cat-icon { --icon-px: 16px; width: 16px; height: 16px; }
+  .pal-mark .cat-icon svg { width: 100%; height: 100%; }
+  .pal.mark-icon-grey .pal-mark .cat-icon { color: #87a5b3; }
+  /* Row styles. */
+  .pal.rows-cards .pal-row { margin: 0.22rem 0.12rem; border: 1px solid #29404d; border-radius: 0.45rem; background: #0a1720; }
+  .pal.rows-cards .pal-row:hover, .pal.rows-cards .pal-row.hover { background: #142b37; }
+  .pal.rows-plain .pal-row { margin: 0 0.12rem; border-radius: 0.4rem; }
+  .pal.rows-separators .pal-row { margin: 0 0.12rem; }
+  .pal.rows-separators .pal-row + .pal-row { border-top: 1px solid #1a2d38; }
+  .gallery-subhead { margin: 1.2rem 0 0.3rem; font-size: 0.9rem; }
   .icon-gallery small { display: block; color: var(--text-muted); font-size: 0.66rem; }
   .findings { display: grid; gap: 6px; padding-left: 1.1rem; margin: 0; font-size: 0.8rem; color: var(--text-soft); line-height: 1.45; }
 </style>
@@ -259,6 +303,7 @@
         <div class="seg" id="names-switch" role="group" aria-labelledby="names-label"></div>
         <label class="size-control" for="node-icon-size">Icon size <input id="node-icon-size" type="range" min="12" max="40" step="1"> <output></output></label>
         <label class="size-control" for="show-guides"><input id="show-guides" type="checkbox"> Show layout guides</label>
+        <label class="size-control" for="cat-fade"><input id="cat-fade" type="checkbox"> Category fade (reviewed, not chosen)</label>
         <label class="size-control" for="name-margin">Name margin <input id="name-margin" type="range" min="0" max="16" step="1"> <output></output></label>
         <label class="size-control" for="status-offset">Status offset <input id="status-offset" type="range" min="-12" max="24" step="1"> <output></output></label>
         <label class="size-control" for="band-width">Band width <input id="band-width" type="range" min="20" max="64" step="2"> <output></output></label>
@@ -296,8 +341,32 @@
     <div class="block-head">
       <h2 id="icons-title">Category icons</h2>
     </div>
-    <p class="note">One line icon per category. Every icon is a square of the same size; each drawing is scaled and centered so its longer side fills the same area, with transparent space around it. Drawn on a 16 px grid in the category's color (grey where a palette leaves the category uncolored). Shown here at 40 px; inside nodes they follow the icon size slider (default 22 px). The recovery icon is a circular arrow, deliberately not a stop sign.</p>
+    <p class="note">One line icon per category. Every icon is a square of the same size; each drawing is scaled and centered so its longer side fills the same area, with transparent space around it. Drawn on a 16 px grid in the category's color (grey where a palette leaves the category uncolored). Shown here at 40 px; inside nodes they follow the icon size slider (default 31 px). The recovery icon is a circular arrow, deliberately not a stop sign.</p>
     <div class="icon-gallery" id="icon-gallery"></div>
+    <h3 class="gallery-subhead">Control-flow node icons (approved 2026-09-27)</h3>
+    <p class="note">One icon per control-flow node instead of the shared control-flow icon, in the same line style and family color. Sequence (→) and Parallel (⇉) use the standard behavior-tree symbols from Colledanchise and Ögren, also used by BehaviorTree.CPP/Groot; Fallback keeps a drawn fork instead of the standard ? (the first path fails, the next is taken). Decorators have no standard per-node symbol (the notation only draws a diamond), so Inverter, Repeat, Retry and Timer use common pictograms. A cross means failure (Fallback, Retry). The repeat loop is rectangular so it never reads as the circular recovery arrow. Every drawing is fitted with the same rule as the category icons: its longer side fills 12 of 16 units, centered.</p>
+    <label class="toggle-line"><input type="checkbox" id="node-icons-toggle"> Use node icons in the example tree</label>
+    <div class="icon-gallery" id="node-icon-gallery"></div>
+    <h3 class="gallery-subhead">Operation control node icons (approved 2026-09-27)</h3>
+    <p class="note">One icon per node of the Operation control category (catalog id <code>recovery</code>), in the execution-control color. Stop, pause and resume share a circle with the familiar operation symbol inside; Full Stop uses an octagon because it stops the whole cell, not one operation. Reset is a counter-clockwise arrow around a start point, and Apply offered recovery is a lifebuoy: taking the recovery the owner offers.</p>
+    <div class="icon-gallery" id="recovery-icon-gallery"></div>
+    <h3 class="gallery-subhead">Simulation icon alternatives (A6 approved 2026-09-27)</h3>
+    <p class="note">Today's simulation icon (a play button in a frame) reads as a video player. Option A (a ball thrown over a ground plane) was preferred; A2–A5 are variations on it. Orbit, digital twin and monitor alternatives were reviewed and not chosen.</p>
+    <div class="icon-gallery" id="sim-icon-gallery"></div>
+  </section>
+
+  <section class="block" aria-labelledby="palette-mock-title">
+    <div class="block-head">
+      <h2 id="palette-mock-title">Node palette</h2>
+      <div class="controls">
+        <span class="control-label" id="pal-mark-label">Leading mark</span>
+        <div class="seg" id="pal-mark-switch" role="group" aria-labelledby="pal-mark-label"></div>
+        <span class="control-label" id="pal-accent-label">Category accent</span>
+        <div class="seg" id="pal-accent-switch" role="group" aria-labelledby="pal-accent-label"></div>
+      </div>
+    </div>
+    <p class="note"><strong>Approved 2026-09-27:</strong> borderless rows, node icon in its family color, family-colored category accent. The palette as it was (left) and two lighter row styles, with the category header, filter, hover and the availability "i" unchanged. The leading mark switch shows today's kind symbol or the node icon from the canvas, in its family color or grey. The category accent switch colors the header's left bar and tint with the category's family color, matching its icons. Timer shows the amber "i" of a node that cannot execute; Move to pose shows the hover.</p>
+    <div class="pal-grid" id="pal-grid"></div>
   </section>
 
   <section class="block" aria-labelledby="notes-title">
@@ -316,7 +385,7 @@
   const CATEGORIES = [
     { key: 'control_flow', label: 'Control flow', sample: ['sequence', 'Sequence', 'composite'] },
     { key: 'motion', label: 'Motion', sample: ['motion.move_to_pose', 'Move to pose', 'leaf'] },
-    { key: 'recovery', label: 'Recovery', sample: ['kernel.stop_operation', 'Stop operation', 'leaf'] },
+    { key: 'recovery', label: 'Operation control', sample: ['kernel.stop_operation', 'Stop operation', 'leaf'] },
     { key: 'logic', label: 'Logic', sample: ['logic.check_bool', 'Check boolean', 'leaf'] },
     { key: 'scene', label: 'Scene', sample: ['scene.add_object', 'Add scene object', 'leaf'] },
     { key: 'assistant', label: 'Assistant', sample: ['assistant.query_model', 'Query model', 'leaf'] },
@@ -411,7 +480,7 @@
   let treatment = saved.treatment || 'icon-only';
   let content = saved.content || 'simple';
   let statusMode = saved.statusMode || 'border';
-  const remember = () => { try { localStorage.setItem('node-palette-choices-v4', JSON.stringify({ chosen, treatment, content, statusMode, iconMode, nodeWidth, nameMode, bandWidth, nodeIconSize, statusOffset, guides, nameMargin })); } catch { /* storage unavailable */ } };
+  const remember = () => { try { localStorage.setItem('node-palette-choices-v4', JSON.stringify({ chosen, treatment, content, statusMode, iconMode, nodeWidth, nameMode, bandWidth, nodeIconSize, statusOffset, guides, nameMargin, nodeIcons, paletteMark, paletteAccent, catFade })); } catch { /* storage unavailable */ } };
 
   const glyph = (kind) => kind === 'composite' ? '◆' : kind === 'decorator' ? '◇' : '•';
   const hint = (kind) => kind === 'composite' ? 'n children' : kind === 'decorator' ? '1 child' : 'leaf';
@@ -427,11 +496,35 @@
     geometry: '<path d="M2.5 13.5h11"/><path d="M2.5 13.5 10 3"/><path d="M8 13.5a5.5 5.5 0 0 0-2.3-4.48"/>',
     logic: '<rect x="1.5" y="4.5" width="13" height="7" rx="3.5"/><circle class="solid" cx="11" cy="8" r="2"/>',
     io: '<path d="M2.6 3.6v8.8"/><path d="M8.6 3.2 5.4 12.8"/><ellipse cx="11.9" cy="8" rx="2.4" ry="4.4"/>',
-    simulation: '<rect x="2" y="3" width="12" height="10" rx="1.5"/><path class="solid" d="M6.6 5.8v4.4L10.4 8z"/>',
+    simulation: '<path d="M1.5 14 5 10.5h9.5L11 14z"/><path class="dashed" d="M2.8 8.2C3.8 3.6 7.6 2.2 10 3.6"/><circle cx="12" cy="5" r="1.9"/>',
     assistant: '<path d="M2.5 3.5h11v7H7.2l-3 2.5v-2.5H2.5z"/><circle class="solid" cx="5.8" cy="7" r="0.9"/><circle class="solid" cx="8" cy="7" r="0.9"/><circle class="solid" cx="10.2" cy="7" r="0.9"/>',
   };
-  const catIcon = (cat, cls = '') =>
-    `<span class="cat-icon${cls}" aria-hidden="true"><svg viewBox="0 0 16 16"><g class="glyph">${CATEGORY_ICONS[cat]}</g></svg></span>`;
+  // Proposal: a dedicated icon per control-flow node, in the same line style.
+  // A cross always means failure; arrows show the order children run in.
+  const NODE_ICONS = {
+    sequence: { label: 'Sequence', note: 'standard BT symbol →', svg: '<path d="M2 8h11"/><path d="M9 3.5 13.5 8 9 12.5"/>' },
+    fallback: { label: 'Fallback', note: 'first fails, take the next', svg: '<path d="M2 4.5h6"/><path d="M10 2.8l3.4 3.4M13.4 2.8 10 6.2"/><path d="M5 4.5V10a1.5 1.5 0 0 0 1.5 1.5H14"/><path d="M12 9.5l2 2-2 2"/>' },
+    parallel: { label: 'Parallel', note: 'standard BT symbol ⇉', svg: '<path d="M2 4h11"/><path d="M10.8 1.8 13 4l-2.2 2.2"/><path d="M2 12h11"/><path d="M10.8 9.8 13 12l-2.2 2.2"/>' },
+    inverter: { label: 'Inverter', note: 'result flipped', svg: '<circle cx="8" cy="8" r="5.5"/><path class="solid" d="M8 2.5a5.5 5.5 0 0 1 0 11z"/>' },
+    repeat: { label: 'Repeat', note: 'loop N times', svg: '<path d="M2.5 8.5V6A2.5 2.5 0 0 1 5 3.5h8.3"/><path d="M11.5 1.7 13.3 3.5l-1.8 1.8"/><path d="M13.5 7.5V10a2.5 2.5 0 0 1-2.5 2.5H2.7"/><path d="M4.5 10.7 2.7 12.5l1.8 1.8"/>' },
+    retry: { label: 'Retry', note: 'failed, go back and try again', svg: '<path d="M2 2.5l3 3M5 2.5l-3 3"/><path d="M7.5 4H11a3.5 3.5 0 0 1 0 7H4"/><path d="M6 9l-2 2 2 2"/>' },
+    timer: { label: 'Timer', note: 'wait a bounded time', svg: '<circle cx="8" cy="9" r="5.5"/><path d="M8 3.5v-2"/><path d="M6.3 1.5h3.4"/><path d="M8 9l2.4-2.4"/><path d="M12.3 4.7l1-1"/>' },
+  };
+  // Proposal: dedicated icons for the recovery nodes. Stop, pause and resume
+  // share a circle; Full Stop uses an octagon because it stops the whole cell.
+  const RECOVERY_ICONS = {
+    'kernel.stop_operation': { label: 'Stop operation', note: 'stop one operation', svg: '<circle cx="8" cy="8" r="6"/><rect class="solid" x="5.6" y="5.6" width="4.8" height="4.8" rx="0.6"/>' },
+    'kernel.full_stop': { label: 'Full Stop', note: 'stop the whole cell', svg: '<path d="M5.5 2h5L14 5.5v5L10.5 14h-5L2 10.5v-5z"/><rect class="solid" x="5.6" y="5.6" width="4.8" height="4.8" rx="0.6"/>' },
+    'kernel.pause_operation': { label: 'Pause operation', note: 'pause one operation', svg: '<circle cx="8" cy="8" r="6"/><path d="M6.5 5.6v4.8M9.5 5.6v4.8"/>' },
+    'kernel.resume_operation': { label: 'Resume operation', note: 'continue a paused operation', svg: '<circle cx="8" cy="8" r="6"/><path d="M6.7 5.4v5.2L10.6 8z"/>' },
+    'kernel.reset_operation': { label: 'Reset operation', note: 'back to a clean start', svg: '<path d="M3.2 8a4.8 4.8 0 1 0 1.4-3.4"/><path d="M4.4 1.8v2.9h2.9"/><circle class="solid" cx="8" cy="8" r="1.3"/>' },
+    'recovery.apply_offered_action': { label: 'Apply offered recovery', note: 'take the offered way out', svg: '<circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.6"/><path d="M3.8 3.8l2.4 2.4M12.2 3.8 9.8 6.2M3.8 12.2l2.4-2.4M12.2 12.2 9.8 9.8"/>' },
+  };
+  let nodeIcons = saved.nodeIcons !== false;
+  const catIcon = (cat, cls = '', id = null) => {
+    const glyph = (nodeIcons && id && (NODE_ICONS[id] ?? RECOVERY_ICONS[id])?.svg) || CATEGORY_ICONS[cat];
+    return `<span class="cat-icon${cls}" aria-hidden="true"><svg viewBox="0 0 16 16"><g class="glyph">${glyph}</g></svg></span>`;
+  };
 
   // Fit every icon drawing to the same square area: the longer side of its
   // drawn shape becomes FIT units inside the 16-unit box, centered.
@@ -500,11 +593,11 @@
     const statusMark = showStatus ? `<span class="kind-mark">${kindSvg(kind)}</span>` : '';
     const statusDot = showStatus ? '<span class="dot"></span>' : '';
     const name = iconMode === 'before'
-      ? `<span class="name-row">${catIcon(cat)}<strong>${labelHtml}</strong></span>`
+      ? `<span class="name-row">${catIcon(cat, '', id)}<strong>${labelHtml}</strong></span>`
       : `<strong>${labelHtml}</strong>`;
-    const corner = iconMode === 'corner' ? catIcon(cat, ' corner') : '';
+    const corner = iconMode === 'corner' ? catIcon(cat, ' corner', id) : '';
     if (iconMode === 'bands' && content === 'simple') {
-      el.innerHTML = `${top}<span class="band band-left">${catIcon(cat)}</span><strong>${labelHtml}</strong>`
+      el.innerHTML = `${top}<span class="band band-left">${catIcon(cat, '', id)}</span><strong>${labelHtml}</strong>`
         + `<span class="band band-right" aria-hidden="true"></span>${statusMark}${bottom}`;
       return el;
     }
@@ -708,6 +801,13 @@
     iconInput.value = String(nodeIconSize);
     iconInput.nextElementSibling.textContent = nodeIconSize + ' px';
   }
+  let catFade = saved.catFade === true;
+  const fadeInput = document.getElementById('cat-fade');
+  fadeInput.addEventListener('change', () => { catFade = fadeInput.checked; applyCatFade(); remember(); });
+  function applyCatFade() {
+    fadeInput.checked = catFade;
+    document.body.classList.toggle('cat-fade', catFade);
+  }
   const guidesInput = document.getElementById('show-guides');
   guidesInput.addEventListener('change', () => { guides = guidesInput.checked; applyGuides(); remember(); });
   function applyGuides() {
@@ -760,6 +860,88 @@
     }).join('');
   }
 
+  const SIMULATION_ALTERNATIVES = [
+    ['Before', 'play in a frame', '<rect x="2" y="3" width="12" height="10" rx="1.5"/><path class="solid" d="M6.6 5.8v4.4L10.4 8z"/>'],
+    ['A · Physics world', 'dotted throw over a ground plane', '<path d="M1.5 14 5 10.5h9.5L11 14z"/><path d="M2.8 8.2C3.8 3.6 7.6 2.2 10 3.6" stroke-dasharray="0.01 5.5"/><circle cx="12" cy="5" r="1.9"/>'],
+    ['A6 · Short dashes (approved)', 'A with a short-dashed arc', '<path d="M1.5 14 5 10.5h9.5L11 14z"/><path class="dashed" d="M2.8 8.2C3.8 3.6 7.6 2.2 10 3.6"/><circle cx="12" cy="5" r="1.9"/>'],
+    ['A7 · Long dashes', 'A with a long-dashed arc', '<path d="M1.5 14 5 10.5h9.5L11 14z"/><path d="M2.8 8.2C3.8 3.6 7.6 2.2 10 3.6" stroke-dasharray="5 6"/><circle cx="12" cy="5" r="1.9"/>'],
+    ['A2 · Solid throw', 'solid arc, no dots', '<path d="M1.5 14 5 10.5h9.5L11 14z"/><path d="M2.8 8.2C3.8 3.6 7.6 2.2 10 3.6"/><circle cx="12" cy="5" r="1.9"/>'],
+    ['A3 · Bounce', 'ball bouncing on the plane', '<path d="M1.5 14 5 10.5h9.5L11 14z"/><path d="M2.6 9C3.4 5.2 5.4 5.2 6.2 9"/><path d="M6.2 9C7 3.4 9.4 2.4 10.6 4"/><circle cx="12.1" cy="5.3" r="1.8"/>'],
+    ['A4 · Ball and shadow', 'ball above its shadow on the plane', '<path d="M1.5 14 5 10.5h9.5L11 14z"/><ellipse class="solid" cx="8.4" cy="12.25" rx="1.7" ry="0.55"/><circle cx="9" cy="3.8" r="2.2"/>'],
+    ['A5 · Grid plane', 'dotted throw over a gridded plane', '<path d="M1.5 14 5 10.5h9.5L11 14z"/><path d="M8.25 10.5 6.25 14M3.25 12.25h9.5"/><path d="M2.8 8.2C3.8 3.6 7.6 2.2 10 3.6" stroke-dasharray="0.01 5.5"/><circle cx="12" cy="5" r="1.9"/>'],
+  ];
+  function renderSimulationAlternatives() {
+    const color = optionFor(chosen).bandColor.simulation;
+    document.getElementById('sim-icon-gallery').innerHTML = SIMULATION_ALTERNATIVES.map(([label, note, svg]) =>
+      `<div style="${color ? `--cat-color:${color}` : ''}"><span class="cat-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><g class="glyph">${svg}</g></svg></span><span>${label}<small>${note}</small></span></div>`).join('');
+  }
+
+  function renderRecoveryIconGallery() {
+    const color = optionFor(chosen).bandColor.recovery;
+    document.getElementById('recovery-icon-gallery').innerHTML = Object.values(RECOVERY_ICONS).map((icon) =>
+      `<div style="${color ? `--cat-color:${color}` : ''}"><span class="cat-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><g class="glyph">${icon.svg}</g></svg></span><span>${icon.label}<small>${icon.note}</small></span></div>`).join('');
+  }
+
+  function renderNodeIconGallery() {
+    const color = optionFor(chosen).bandColor.control_flow;
+    document.getElementById('node-icon-gallery').innerHTML = Object.entries(NODE_ICONS).map(([id, icon]) =>
+      `<div style="${color ? `--cat-color:${color}` : ''}"><span class="cat-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><g class="glyph">${icon.svg}</g></svg></span><span>${icon.label}<small>${icon.note}</small></span></div>`).join('');
+    const toggle = document.getElementById('node-icons-toggle');
+    toggle.checked = nodeIcons;
+    toggle.onchange = () => { nodeIcons = toggle.checked; renderAll(); };
+  }
+
+  let paletteMark = saved.paletteMark || 'icon';
+  let paletteAccent = saved.paletteAccent || 'family';
+  const PALETTE_SAMPLE = [
+    ['control_flow', 'Control flow', [['sequence', 'Sequence', 'composite', 'ok'], ['fallback', 'Fallback', 'composite', 'ok'], ['parallel', 'Parallel', 'composite', 'ok'], ['inverter', 'Inverter', 'decorator', 'ok'], ['repeat', 'Repeat', 'decorator', 'ok'], ['retry', 'Retry', 'decorator', 'ok'], ['timer', 'Timer', 'leaf', 'warn']]],
+    ['motion', 'Motion', [['motion.move_to_joint_target', 'Move to joint target', 'leaf', 'ok'], ['motion.move_to_pose', 'Move to pose', 'leaf', 'ok', 'hover'], ['motion.follow_cartesian_path', 'Follow Cartesian path', 'leaf', 'ok'], ['motion.move_until_signal', 'Move until signal', 'leaf', 'ok']]],
+    ['gripper', 'Gripper', [['gripper.command_position', 'Command gripper position', 'leaf', 'ok'], ['gripper.check_status', 'Check gripper status', 'leaf', 'ok'], ['gripper.wait_for_status', 'Wait for gripper status', 'leaf', 'ok']]],
+    ['logic', 'Logic', [['logic.check_bool', 'Check boolean', 'leaf', 'ok'], ['logic.set_bool', 'Set boolean', 'leaf', 'ok']]],
+    ['recovery', 'Operation control', [['kernel.stop_operation', 'Stop operation', 'leaf', 'ok'], ['kernel.full_stop', 'Full Stop', 'leaf', 'ok'], ['kernel.pause_operation', 'Pause operation', 'leaf', 'ok'], ['kernel.resume_operation', 'Resume operation', 'leaf', 'ok'], ['kernel.reset_operation', 'Reset operation', 'leaf', 'ok'], ['recovery.apply_offered_action', 'Apply offered recovery', 'leaf', 'ok']]],
+    ['scene', 'Scene', null],
+  ];
+  const PALETTE_ROWS = [
+    ['cards', 'Bordered cards (today)', 'Each node is a separate card with its own border.'],
+    ['plain', 'Borderless', 'Rows without border or fill; hover shows the row.'],
+    ['separators', 'Separators', 'Borderless rows divided by a thin horizontal line.'],
+  ];
+  function renderPaletteMock() {
+    const option = optionFor(chosen);
+    const markRoot = document.getElementById('pal-mark-switch');
+    markRoot.innerHTML = '';
+    for (const [value, text] of [['kind', 'Kind symbol (today)'], ['icon', 'Node icon'], ['icon-grey', 'Node icon, grey']]) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = text;
+      b.setAttribute('aria-pressed', String(paletteMark === value));
+      b.addEventListener('click', () => { paletteMark = value; renderAll(); });
+      markRoot.appendChild(b);
+    }
+    const accentRoot = document.getElementById('pal-accent-switch');
+    accentRoot.innerHTML = '';
+    for (const [value, text] of [['today', 'Today (cyan)'], ['family', 'Family color']]) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = text;
+      b.setAttribute('aria-pressed', String(paletteAccent === value));
+      b.addEventListener('click', () => { paletteAccent = value; renderAll(); });
+      accentRoot.appendChild(b);
+    }
+    const mark = (cat, id, kind) => paletteMark === 'kind'
+      ? `<span class="pal-mark">${kindSvg(kind)}</span>`
+      : `<span class="pal-mark" style="${option.bandColor[cat] ? `--cat-color:${option.bandColor[cat]}` : ''}">${catIcon(cat, '', id)}</span>`;
+    const list = PALETTE_SAMPLE.map(([cat, label, items]) => {
+      const color = option.bandColor[cat];
+      const header = `<header class="pal-cat"${color ? ` style="--cat-color:${color}"` : ''}><strong>${label}</strong><div><small>${items ? items.length : 6}</small><i>${items ? '⌄' : '⌃'}</i></div></header>`;
+      const rows = (items || []).map(([id, name, kind, info, state]) =>
+        `<div class="pal-row${state ? ' ' + state : ''}"><span class="pal-item">${mark(cat, id, kind)}<strong>${escapeHtml(name)}</strong></span><span class="pal-info${info ? ' ' + info : ''}">i</span></div>`).join('');
+      return `<section>${header}${rows}</section>`;
+    }).join('');
+    document.getElementById('pal-grid').innerHTML = PALETTE_ROWS.map(([rows, title, text]) =>
+      `<div class="pal-col"><h3>${title}</h3><p>${text}</p><div class="pal rows-${rows} mark-${paletteMark} accent-${paletteAccent}"><div class="pal-filter"><span>Find a node</span></div><div class="pal-list">${list}</div></div></div>`).join('');
+  }
+
   function renderAll() {
     if (!PALETTES.some((p) => p.id === chosen)) chosen = PALETTES[0].id;
     if (!['before', 'corner', 'bands', 'off'].includes(iconMode)) iconMode = 'corner';
@@ -769,11 +951,12 @@
     applyNodeIconSize();
     applyStatusOffset();
     applyGuides();
+    applyCatFade();
     applyNameMargin();
     remember();
     document.getElementById('selected-legend').textContent =
       statusMode === 'ring' ? 'Selected (thicker status ring)' : 'Selected (outline)';
-    renderContentSwitches(); renderTreatmentSwitches(); renderIconSwitches(); renderNamesSwitch(); renderStatusSwitch(); renderOverview(); renderPicker(); renderMarkLegend(); renderCanvas(); renderIconGallery();
+    renderContentSwitches(); renderTreatmentSwitches(); renderIconSwitches(); renderNamesSwitch(); renderStatusSwitch(); renderOverview(); renderPicker(); renderMarkLegend(); renderCanvas(); renderIconGallery(); renderNodeIconGallery(); renderRecoveryIconGallery(); renderSimulationAlternatives(); renderPaletteMock();
     normalizeIcons();
   }
   renderAll();

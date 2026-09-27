@@ -6,6 +6,23 @@ import {
   programWorkspaceReducer,
 } from './programWorkspace';
 
+it('keeps the draft and reports a refused edit without an error or success', () => {
+  const current = workspace('draft-1', 7);
+  const ready = programWorkspaceReducer(INITIAL_PROGRAM_WORKSPACE_STATE, {
+    type: 'request_succeeded', generation: 0, workspace: current,
+    message: null, transitionStatus: null,
+  });
+  const started = programWorkspaceReducer(ready, { type: 'request_started', generation: 1, action: 'mutate' });
+  const refused = programWorkspaceReducer(started, {
+    type: 'request_refused', generation: 1, message: 'Edit not applied',
+  });
+  expect(refused.workspace).toBe(current);
+  expect(refused.error).toBeNull();
+  expect(refused.message).toBe('Edit not applied');
+  expect(refused.pendingAction).toBeNull();
+  expect(refused.transitionStatus).toBeNull();
+});
+
 function workspace(draftId: string, revision: number): ProgramWorkspaceResponse {
   return {
     schemaVersion: 'manyforge.composer_program_workspace.v2',

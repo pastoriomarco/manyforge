@@ -130,7 +130,7 @@ export function BtNode({
       />
       {/* UI6-I-VC D3: icon band, name, empty band of the same width. */}
       <span className="bt-node-band" aria-hidden="true">
-        <ProgramCategoryIcon category={node.category} />
+        <ProgramCategoryIcon category={node.category} catalogId={node.catalogId} />
       </span>
       <strong className="bt-node-name"><ProgramNodeName name={node.label} /></strong>
       <span className="bt-node-band" aria-hidden="true" />

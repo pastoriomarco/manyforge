@@ -33,11 +33,18 @@ from .deployment_artifacts import (
     save_deployment_artifact,
 )
 from .deployment_draft import DeploymentDraftError
+from .deployment_intent import DeploymentIntentError, rebase_deployment_intent_sources
 from .draft_session import DraftSessionError
 from .state import ComposerState, _controllable_composition_change_kinds
 from .authoring_workspace import (
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
+    scenario_project_facts,
+)
+from .scenario_artifacts import (
+    SCENARIO_PROJECT_MEMBERS,
+    ScenarioArtifactError,
+    save_scenario_member,
 )
 from .authoring_workspace_fence import (
     commit_local_authoring,
@@ -253,7 +260,7 @@ def _raise(error: Exception) -> NoReturn:
             status_code=503,
             detail={"code": error.code, "message": str(error)},
         ) from error
-    if isinstance(error, DeploymentDraftError):
+    if isinstance(error, (DeploymentDraftError, ScenarioArtifactError)):
         raise HTTPException(
             status_code=error.status_code,
             detail={"code": error.code, "message": str(error)},
@@ -623,13 +630,44 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     else True
                 ),
             )
-            if _published_deployment_canonical(state, prepared.target_path) == (
-                prepared.canonical_json
-            ):
-                # This exact content is already published at the target, so a
-                # lost response is resolved without repeating the write.
-                saved_path = prepared.resolved_target
-            else:
+            project_path = state.authoring_workspace.snapshot().project["document_path"]
+            scenario_member = (
+                target is None and project_path is not None
+                and prepared.resolved_target == str(
+                    Path(project_path) / SCENARIO_PROJECT_MEMBERS["deployment_draft"]
+                )
+            )
+            saved_path = prepared.resolved_target
+            artifact_written = not scenario_member
+            source_root = state.deployment_draft_session.source_project_root
+
+            def prepare_saved_project() -> dict[str, Any]:
+                nonlocal artifact_written
+                deployment = json.loads(prepared.canonical_json)
+                if source_root is not None and source_root != project_path:
+                    try:
+                        deployment = rebase_deployment_intent_sources(
+                            deployment,
+                            source_project_root=Path(source_root),
+                            destination_project_root=Path(project_path),
+                        )
+                    except DeploymentIntentError as error:
+                        raise DeploymentDraftError(
+                            "scenario_deployment_intent_invalid", str(error),
+                            status_code=400,
+                        ) from error
+                document, path, digest = save_scenario_member(
+                    project_path, "deployment_draft", deployment,
+                    allowed_roots=state.allowed_fs_roots,
+                )
+                artifact_written = True
+                return scenario_project_facts(
+                    document, document_path=path, source_document_digest=digest
+                )
+
+            if not scenario_member and _published_deployment_canonical(
+                state, prepared.target_path
+            ) != prepared.canonical_json:
                 saved_path = save_deployment_artifact(
                     prepared.canonical_json,
                     prepared.target_path,
@@ -641,13 +679,16 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     state,
                     body,
                     operation_kind=prepared.tool_id,
-                    session="deployment",
+                    session="whole-workspace" if scenario_member else "deployment",
+                    prepare_project_under_claim=(
+                        prepare_saved_project if scenario_member else None
+                    ),
                     install=lambda: state.deployment_draft_session.install_prepared_save(
                         prepared, saved_path=saved_path
                     ),
                 )
             except AuthoringWorkspaceError as error:
-                if error.code != "composer_workspace_stale":
+                if error.code != "composer_workspace_stale" or not artifact_written:
                     raise
                 raise HTTPException(
                     status_code=409,

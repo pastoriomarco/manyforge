@@ -439,10 +439,9 @@ class AuthoringWorkspace:
     ) -> AuthoringWorkspaceSnapshot:
         """Commit one already-prepared Scenario project-facts replacement.
 
-        The project counterpart of :meth:`commit_program` and
-        :meth:`commit_deployment`: no Program or Deployment Draft identity
-        changes, so the authoring-only Scenario Save adopts its written Saved
-        baseline through this single composite commit.
+        This replaces only project metadata. A Save that also adopts Program
+        or Deployment Saved baselines uses :meth:`replace` to commit those
+        session changes and the matching project facts together.
         """
 
         _require_project_shape(facts)
@@ -559,7 +558,8 @@ class AuthoringWorkspace:
         Used by whole-project Load, New and Discard-style replacements whose
         prepared value already contains the successor Draft identities. An
         optional ``project`` payload installs the matching Scenario project
-        facts in the same single-commit boundary.
+        facts in the same single-commit boundary. Save uses the same boundary
+        without rotating Draft identities, adopting the written Saved baselines.
         """
 
         if project is not None:

@@ -22,7 +22,8 @@ const apiMock = vi.hoisted(() => ({
   },
 }));
 
-vi.mock('../api/client', () => ({
+vi.mock('../api/client', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../api/client')>(),
   api: apiMock,
   // The hook reads the shared publication through the controller, not through an
   // independent identity read, so the only client surface it needs is the
@@ -42,6 +43,7 @@ import {
 } from '../state/authoringWorkspace';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
 import { useProgramWorkspace } from './useProgramWorkspace';
+import { ApiError } from '../api/client';
 
 /**
  * A real shared-publication controller for this hook's tests.
@@ -468,6 +470,20 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     await act(async () => resynchronized.resolve(workspace(2)));
     expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
     expect(latest?.state.pendingAction).toBeNull();
+  });
+
+  it.each(['authoring_not_ready', 'stale_generation'])('does not retry or report a fault for %s', async (code) => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
+    await act(async () => initial.resolve(workspace(1)));
+    apiMock.programWorkspace.mutate.mockRejectedValueOnce(new ApiError('refused', 409, { detail: { code } }));
+    await act(async () => {
+      await latest?.mutate('program_draft_update_node_policies', {});
+    });
+    expect(apiMock.programWorkspace.mutate).toHaveBeenCalledTimes(1);
+    expect(latest?.state.error).toBeNull();
+    expect(latest?.state.message).toContain('Edit not applied');
+    expect(latest?.state.workspace?.draft.draftRevision).toBe(1);
   });
 
   it('uses the ordinary Draft mutation path for node policies', async () => {

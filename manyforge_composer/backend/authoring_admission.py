@@ -285,6 +285,11 @@ class AuthoringAdmissionCoordinator:
                     "a project commit requires exactly one prepared project value "
                     "or under-claim project preparer"
                 )
+        elif session == "whole-workspace":
+            if not callable(install):
+                raise TypeError("local mutation install must be callable")
+            if project is not None and prepare_project_under_claim is not None:
+                raise TypeError("a workspace commit accepts only one project source")
         elif project is not None or prepare_project_under_claim is not None:
             raise TypeError("project facts are only valid for a project commit")
         elif not callable(install):

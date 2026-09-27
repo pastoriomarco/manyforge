@@ -15,6 +15,7 @@ import {
   type ProgramPaletteActivation,
 } from '../utils/programCanvasInteraction';
 import { NodePaletteItem } from './NodePaletteItem';
+import { programCategoryFamily } from '../styles/tokens';
 import { OverlayPanel } from './OverlayPanel';
 import { ProgramAuthoringTemplate } from './ProgramAuthoringTemplate';
 
@@ -84,7 +85,14 @@ function authoringAvailable(
     .some((row) => row.authoringAvailable);
 }
 
+// Display names that differ from the catalog category id.
+const CATEGORY_LABELS: Readonly<Record<string, string>> = {
+  recovery: 'Operation control',
+};
+
 function categoryLabel(category: string): string {
+  const label = CATEGORY_LABELS[category];
+  if (label !== undefined) return label;
   return category.split(/[_-]+/).filter(Boolean).map((part) => (
     part.length <= 2
       ? part.toLocaleUpperCase()
@@ -267,7 +275,7 @@ export const ProgramNodePalette = memo(function ProgramNodePalette({
           const collapsed = collapsedCategories.has(category);
           return (
           <section key={category}>
-            <header className="program-palette-category">
+            <header className="program-palette-category" data-category-family={programCategoryFamily(category)}>
               <strong>{categoryLabel(category)}</strong>
               <div>
                 <small>{entries.length}</small>

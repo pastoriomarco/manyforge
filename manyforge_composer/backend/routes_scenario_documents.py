@@ -37,6 +37,7 @@ from .deployment_draft import DeploymentDraftError
 from .draft_session import DraftSessionError
 from .routes_draft import _workspace as program_workspace
 from .scenario_artifacts import (
+    SCENARIO_PROJECT_MEMBERS,
     ScenarioArtifactError,
     build_scenario_document,
     capture_scenario_artifact,
@@ -361,6 +362,40 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 current_target is not None
                 and str(Path(target).expanduser().resolve()) == current_target
             )
+            program_save = (
+                state.draft_session.prepare_save(
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                    target_path=str(Path(target) / SCENARIO_PROJECT_MEMBERS["program_draft"]),
+                    confirm_overwrite=True,
+                )
+                if captured_workspace["program"]["candidateAvailable"] else None
+            )
+            deployment_save = (
+                state.deployment_draft_session.prepare_save(
+                    draft_id=body.deployment_draft_id,
+                    expected_revision=body.expected_deployment_draft_revision,
+                    target_path=str(Path(target) / SCENARIO_PROJECT_MEMBERS["deployment_draft"]),
+                    confirm_overwrite=True,
+                )
+                if deployment is not None else None
+            )
+
+            def install_saved_baselines() -> bool:
+                assert saved_path is not None
+                program_changed = (
+                    state.draft_session.install_prepared_save(
+                        program_save,
+                        saved_path=str(Path(saved_path) / SCENARIO_PROJECT_MEMBERS["program_draft"]),
+                    ) if program_save is not None else False
+                )
+                deployment_changed = (
+                    state.deployment_draft_session.install_prepared_save(
+                        deployment_save,
+                        saved_path=str(Path(saved_path) / SCENARIO_PROJECT_MEMBERS["deployment_draft"]),
+                    ) if deployment_save is not None else False
+                )
+                return program_changed or deployment_changed
 
             def prepare_saved_project() -> dict[str, Any]:
                 nonlocal saved_path
@@ -397,7 +432,8 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 body,
                 operation_kind="save_scenario_document",
                 captured_identity=snapshot.identity,
-                session="project",
+                session="whole-workspace",
+                install=install_saved_baselines,
                 prepare_project_under_claim=prepare_saved_project,
             )
             if saved_path is None:
@@ -482,6 +518,17 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     "only a complete v2 Scenario document can be loaded",
                     status_code=409,
                 )
+            # Load establishes Saved from the exact captured source, independently
+            # of whether the subsequent Apply succeeds.
+            post_state["program"].update(
+                saved_path=str(Path(source_path) / SCENARIO_PROJECT_MEMBERS["program_draft"]),
+                saved_program_revision=program.program_revision,
+                saved_document=program.to_dict(),
+            )
+            post_state["deployment"].update(
+                saved_path=str(Path(source_path) / SCENARIO_PROJECT_MEMBERS["deployment_draft"]),
+                saved_document=deepcopy(deployment),
+            )
             if state.headless_client is None:
                 raise ScenarioArtifactError(
                     "scenario_activation_unavailable",

@@ -1,11 +1,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiError,
+  authoringRefusalMessage,
   HISTORIAN_PAGE_LIMIT,
   api,
   historianListPath,
   resolveStructuralAssetUrl,
 } from './client';
+
+it('classifies only exact authoring admission refusals', () => {
+  for (const code of ['authoring_not_ready', 'stale_generation']) {
+    expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: { code } })))
+      .toContain('Edit not applied');
+  }
+  expect(authoringRefusalMessage(new ApiError('fault', 409, { detail: { code: 'component_fault' } }))).toBeNull();
+  expect(authoringRefusalMessage(new ApiError('failure', 500, { detail: { code: 'authoring_not_ready' } }))).toBeNull();
+  expect(authoringRefusalMessage(new Error('authoring_not_ready'))).toBeNull();
+});
 import type {
   DraftFenceRequest,
   LocalWorkspaceFenceRequest,

@@ -94,7 +94,7 @@ describe('Composer shell continuity', () => {
     expect(source).toContain('Math.round(window.innerWidth * 0.45)');
     expect(css).toMatch(/\.viewer-transport\s*\{[\s\S]*?display: grid;/);
     expect(css).toMatch(
-      /\.viewer-transport\s*\{[\s\S]*?width: min\(58rem, calc\(100% - 1\.2rem\)\);/,
+      /\.viewer-transport\s*\{[\s\S]*?width: min\(58rem, calc\(100% - 2 \* 0\.65rem\)\);/,
     );
     expect(css).toMatch(/\.transport-control-layout\s*\{[\s\S]*?justify-content: space-between;/);
     expect(css).toContain('--inspector-control-height: 1.9rem');

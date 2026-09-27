@@ -17,7 +17,9 @@ from manyforge_composer.backend.routes_scenario_documents import (
     create_scenario_document_router,
 )
 from manyforge_composer.backend.authoring_admission import LocalAuthoringCommit
-from manyforge_composer.backend.authoring_forest import from_program
+from manyforge_composer.backend.authoring_forest import from_program, derive_candidate
+from manyforge_composer.backend.routes_draft import create_draft_router
+from manyforge_composer.backend.routes_deployment_draft import create_deployment_draft_router
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
 from manyforge_headless_api.client import HeadlessClientError
@@ -94,6 +96,113 @@ def test_persisted_document_identity_includes_authorable_metadata() -> None:
     )
 
 
+def test_scenario_save_adopts_both_baselines_and_member_saves_preserve_other_draft(
+    tmp_path: Path,
+) -> None:
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
+    authoring = deepcopy(_PROGRAM_FIXTURE)
+    program, diagnostics = derive_candidate(authoring, state.node_catalog)
+    post = routes_scenario_documents._workspace_post_state(
+        state, authoring, program, diagnostics, _deployment_intent()
+    )
+    state.draft_session.install_prepared_replacement(
+        state.draft_session.prepare_load_replacement(post["program"], state.node_catalog)
+    )
+    state.deployment_draft_session.install_prepared_replacement(
+        state.deployment_draft_session.prepare_load_replacement(post["deployment"])
+    )
+    app = FastAPI()
+    app.include_router(create_scenario_document_router(state))
+    app.include_router(create_draft_router(state))
+    app.include_router(create_deployment_draft_router(state))
+    client = TestClient(app)
+    target = tmp_path / "saved"
+    before = state.authoring_workspace.identity()
+    response = client.post("/api/scenario-documents/save", json={
+        **_fence(state), "path": str(target), "scenarioId": "saved_cell",
+        "name": "Saved cell", "description": "", "confirmOverwrite": False,
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["workspace"]["hasUnsavedChanges"] is False
+    assert response.json()["workspace"]["applied"]["available"] is False
+    saved = state.authoring_workspace.snapshot().as_dict()
+    assert saved["workspaceRevision"] == before.workspace_revision + 1
+    assert saved["program"]["saved"]["matchesDraft"] is True
+    assert saved["deployment"]["differsFromSaved"] is False
+    assert state.current_drafts_match_remembered_scenario()
+
+    # Two unrelated unsaved edits. Save Program must not persist Deployment.
+    program_state = state.draft_session.retained_state()
+    program_state["authoring"]["name"] = "Edited Program"
+    edited, diagnostics = derive_candidate(program_state["authoring"], state.node_catalog)
+    assert edited is not None
+    program_state["program"] = edited.to_dict()
+    program_state["diagnostics"] = diagnostics
+    program_state["draft_revision"] += 1
+    state.draft_session.install_prepared_replacement(
+        state.draft_session.prepare_load_replacement(program_state, state.node_catalog)
+    )
+    deployment_state = state.deployment_draft_session.retained_state()
+    deployment_state["document"]["name"] = "Edited Deployment"
+    deployment_state["draft_revision"] += 1
+    state.deployment_draft_session.install_prepared_replacement(
+        state.deployment_draft_session.prepare_load_replacement(deployment_state)
+    )
+
+    def member_fence(*, deployment: bool = False) -> dict:
+        fence = _fence(state)
+        if deployment:
+            fence["draftId"] = fence["deploymentDraftId"]
+            fence["expectedDraftRevision"] = fence["expectedDeploymentDraftRevision"]
+        del fence["deploymentDraftId"], fence["expectedDeploymentDraftRevision"]
+        return fence
+
+    response = client.post("/api/program/save", json=member_fence())
+    assert response.status_code == 200, response.text
+    disk, _ = load_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
+    assert disk["program_draft"]["name"] == "Edited Program"
+    assert disk["deployment_draft"]["name"] == "Fixture deployment"
+    saved = state.authoring_workspace.snapshot().as_dict()
+    assert saved["program"]["saved"]["matchesDraft"] is True
+    assert saved["deployment"]["differsFromSaved"] is True
+    assert not state.current_drafts_match_remembered_scenario()
+    response = client.post("/api/deployment/save", json=member_fence(deployment=True))
+    assert response.status_code == 200, response.text
+    disk, _ = load_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
+    assert disk["deployment_draft"]["name"] == "Edited Deployment"
+    assert state.current_drafts_match_remembered_scenario()
+    assert state.authoring_workspace.snapshot().deployment["differsFromSaved"] is False
+    assert sorted(path.name for path in target.iterdir()) == [
+        "assignment.yaml", "deployment.yaml", "overrides.yaml", "program.yaml", "scenario.yaml"
+    ]
+
+    # Save As changes the project location, not the referenced model. A later
+    # Deployment-only Save must keep the same source after rebasing as well.
+    (tmp_path / "nested").mkdir()
+    copy = tmp_path / "nested" / "copy"
+    response = client.post("/api/scenario-documents/save", json={
+        **_fence(state), "path": str(copy), "scenarioId": "saved_copy",
+        "name": "Saved copy", "description": "", "confirmOverwrite": False,
+    })
+    assert response.status_code == 200, response.text
+    deployment_state = state.deployment_draft_session.retained_state()
+    deployment_state["document"]["name"] = "Edited after Save As"
+    deployment_state["draft_revision"] += 1
+    state.deployment_draft_session.install_prepared_replacement(
+        state.deployment_draft_session.prepare_load_replacement(
+            deployment_state,
+            source_project_root=state.deployment_draft_session.source_project_root,
+        )
+    )
+    response = client.post("/api/deployment/save", json=member_fence(deployment=True))
+    assert response.status_code == 200, response.text
+    disk, _ = load_scenario_artifact(str(copy), allowed_roots=[str(tmp_path)])
+    reference = disk["deployment_draft"]["components"][0]["model_source"]["urdf"]["project_path"]
+    assert (copy / reference).resolve() == tmp_path / "model.urdf"
+    assert state.current_drafts_match_remembered_scenario()
+
+
 @pytest.fixture(autouse=True)
 def _fixture_model_source(tmp_path: Path) -> None:
     (tmp_path / "model.urdf").write_text(
@@ -135,6 +244,8 @@ class _PassThroughAdmission:
     ):
         """Commit through the real composite owner; only the Kernel is stubbed."""
 
+        if prepare_project_under_claim is not None:
+            project = prepare_project_under_claim()
         if session == "whole-workspace":
             snapshot = workspace.replace(
                 expected_identity=expected_identity,
@@ -142,8 +253,6 @@ class _PassThroughAdmission:
                 project=project,
             )
         elif session == "project":
-            if prepare_project_under_claim is not None:
-                project = prepare_project_under_claim()
             snapshot = workspace.commit_project(
                 expected_identity=expected_identity,
                 facts=project,
@@ -611,6 +720,11 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
     assert admission.events == ["validate", "commit", "submit", "wake"]
     assert observed_generations == [(1, None), (1, None), (1, 2)]
     assert state.scenario_document_id == "cell_fixture"
+    loaded = state.authoring_workspace.snapshot().as_dict()
+    assert loaded["program"]["saved"]["matchesDraft"] is True
+    assert loaded["program"]["saved"]["path"] == str(target / "program.yaml")
+    assert loaded["deployment"]["differsFromSaved"] is False
+    assert loaded["deployment"]["savedPath"] == str(target / "deployment.yaml")
 
 
 def test_capture_reads_one_source_identity(tmp_path: Path) -> None:

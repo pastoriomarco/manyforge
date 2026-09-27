@@ -318,6 +318,15 @@ export class ApiError extends Error {
   }
 }
 
+/** Only for authoring requests; never retry an edit after a refused fence. */
+export function authoringRefusalMessage(error: unknown): string | null {
+  if (!(error instanceof ApiError) || error.status !== 409) return null;
+  const code = apiErrorCode(error);
+  if (code === 'authoring_not_ready') return 'Edit not applied: authoring is currently unavailable.';
+  if (code === 'stale_generation') return 'Edit not applied: backend state changed. Review the current state before trying again.';
+  return null;
+}
+
 const STALE_WORKSPACE_CODES = new Set([
   // The composite workspace or a Draft identity moved under this request.
   'composer_workspace_stale',
