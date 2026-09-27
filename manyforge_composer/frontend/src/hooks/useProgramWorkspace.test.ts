@@ -527,6 +527,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       mutation: 'program_draft_update_node_policies',
       details: { updated_instance_id: 'root' },
       workspace: workspace(2),
+      authoringWorkspace: testPublication(workspace(2)).snapshot,
     }));
     expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
     expect(latest?.state.pendingAction).toBeNull();

@@ -248,20 +248,10 @@ export default function App() {
   // One shared authoring publication for the whole workbench: Program,
   // Deployment and Scenario authoring all read this single snapshot, so no
   // consumer establishes an independent authoring identity.
-  const authoringWorkspace = useAuthoringWorkspace(headlessSnapshot);
-  // A reconnect can restore the shell before the composite authoring read has
-  // completed.  Re-read that one authoritative publication once the control
-  // channel is healthy so a browser reconnect never leaves stale Draft/Saved
-  // controls mounted against an older workspace revision.
-  const previousTransportStatus = useRef(headlessState.transportStatus);
-  useEffect(() => {
-    const previous = previousTransportStatus.current;
-    previousTransportStatus.current = headlessState.transportStatus;
-    if (headlessState.transportStatus !== 'connected'
-      || previous === 'connected'
-      || !headlessEnabled) return;
-    void authoringWorkspace.refresh();
-  }, [authoringWorkspace.refresh, headlessEnabled, headlessState.transportStatus]);
+  const authoringWorkspace = useAuthoringWorkspace(
+    headlessSnapshot,
+    headlessState.transportStatus,
+  );
   const deploymentController = useDeploymentWorkspace(
     headlessEnabled,
     headlessSnapshot,

@@ -1785,18 +1785,23 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     ),
     [motionDescriptor, readyManifest, source, sourceValue],
   );
-  const executionPresentation = useMemo(() => executionRobotPresentation(
-    robotControl.selectedStatus,
-    sourceValue,
-    readyManifest,
-  ), [readyManifest, robotControl.selectedStatus, sourceValue]);
+  // The measured robot pose comes only from the live observation stream. The
+  // control-state copy of observed joints is refreshed only at control changes
+  // and motion ends, so it can be older than the robot (and than a pose
+  // changed by external forces); it is never a rendering source.
   // The measured-model driver can only subscribe after it is mounted. Wake
   // this parent only while it still needs a first valid observation, so a
   // frame that arrives during neutral bootstrap can promote the model without
   // rerendering the whole authoring surface for every steady-state sample.
   const [observationBootstrapRevision, setObservationBootstrapRevision] = useState(0);
   const lastBootstrapFrame = useRef(source.getLatestExecutionObservation());
-  const needsObservationBootstrap = executionPresentation === null
+  const liveExecutionPresentation = useMemo(
+    () => executionObservationPresentation.readMeasuredRobotPresentation(),
+    [executionObservationPresentation, observationBootstrapRevision],
+  );
+  // Wake only until the first usable live frame (or after a model change that
+  // leaves none): steady-state samples are applied by the viewer directly.
+  const needsObservationBootstrap = liveExecutionPresentation === null
     && sceneRuntimePresentation.measuredRobot === null;
   useEffect(() => {
     if (!needsObservationBootstrap) return undefined;
@@ -1813,19 +1818,15 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     // the subscription owner).
     return () => { void unsubscribe(); };
   }, [needsObservationBootstrap, source]);
-  const liveExecutionPresentation = useMemo(
-    () => executionObservationPresentation.readMeasuredRobotPresentation(),
-    [executionObservationPresentation, observationBootstrapRevision],
-  );
   const runtimePresentation = useMemo(() => (
-    (executionPresentation ?? liveExecutionPresentation) !== null
+    liveExecutionPresentation !== null
       && sceneRuntimePresentation.measuredRobot === null
       ? {
           ...sceneRuntimePresentation,
-          measuredRobot: executionPresentation ?? liveExecutionPresentation,
+          measuredRobot: liveExecutionPresentation,
         }
       : sceneRuntimePresentation
-  ), [executionPresentation, liveExecutionPresentation, sceneRuntimePresentation]);
+  ), [liveExecutionPresentation, sceneRuntimePresentation]);
   const candidates = useMemo(() => {
     if (readyManifest === null || motionDescriptor === null) return null;
     const observation = source.getLatestExecutionObservation();

@@ -32,7 +32,7 @@ def _stream_status(
     clients: int = 2,
 ) -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.execution_observation_stream_status.v2",
+        "schema_version": "manyforge.execution_observation_stream_status.v3",
         "source": {
             "connection_count": 1,
             "wake_count": wakes,

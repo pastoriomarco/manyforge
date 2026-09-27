@@ -1105,6 +1105,7 @@ describe('Program product projections', () => {
       prepared_activation: {
         schema_version: 'manyforge.prepared_activation_input.v3',
         prepared_activation_id: digestC,
+        scenario_id: 'fixture',
         source_document_digest: digestA,
         captured_input_digest: digestB,
         deployment_artifact_id: 'deployment.fixture',
@@ -1316,6 +1317,7 @@ describe('Deployment workspace parser', () => {
     const preparedActivation = {
       schema_version: 'manyforge.prepared_activation_input.v3',
       prepared_activation_id: digestC,
+      scenario_id: 'fixture',
       source_document_digest: digestA,
       captured_input_digest: digestB,
       deployment_artifact_id: 'deployment.fixture',
@@ -1349,6 +1351,7 @@ describe('Deployment workspace parser', () => {
       preview_ms: 8.25,
     });
     expect(parsed.result.applyId).toBe('apply-1');
+    expect(parsed.result.preparedActivation.scenarioId).toBe('fixture');
   });
 
   it('accepts the authored graph without embedding its compiler-issued revision', () => {

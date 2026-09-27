@@ -103,6 +103,18 @@ MAX_EXECUTION_RESPONSE_BYTES = 4 * 1024 * 1024
 # are removed as their control event is ingested, so this is a concurrent
 # owner-state bound rather than lifetime retention.
 MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS = 4096
+# Operation states in which the target no longer moves under this operation.
+_OPERATION_REST_STATES = frozenset(
+    {
+        "paused",
+        "completed",
+        "stopped",
+        "failed",
+        "interrupted",
+        "intervention_required",
+        "cancelled_pre_dispatch",
+    }
+)
 MOTION_PREVIEW_RESPONSE_KEYS = frozenset(
     {"api_version", "command", "ok", "preview_receipt"}
 )
@@ -2132,11 +2144,29 @@ class ExecutionEventPump:
         self._last_error: str | None = None
         self._health_lock = threading.Lock()
         self._change_observer: Callable[[], None] | None = None
+        self._settled_observer: Callable[[], None] | None = None
 
     def set_change_observer(self, observer: Callable[[], None] | None) -> None:
         if observer is not None and not callable(observer):
             raise TypeError("execution event change observer must be callable")
         self._change_observer = observer
+
+    def set_settled_observer(self, observer: Callable[[], None] | None) -> None:
+        """Observe any operation of any target coming to rest (see below)."""
+        if observer is not None and not callable(observer):
+            raise TypeError("execution event settled observer must be callable")
+        self._settled_observer = observer
+
+    def _notify_motion_settled(self) -> None:
+        observer = self._settled_observer
+        if observer is None:
+            return
+        try:
+            observer()
+        except Exception:
+            # Like _notify_change: a missed refresh is repaired by the next
+            # meaningful control change and never backpressures ingestion.
+            pass
 
     def _notify_change(self) -> None:
         observer = self._change_observer
@@ -2268,6 +2298,21 @@ class ExecutionEventPump:
             ),
             scale_key,
         )
+
+    @staticmethod
+    def _operation_is_settled(event: dict[str, Any]) -> bool:
+        """Whether this event leaves its operation's robot at rest.
+
+        The control projection ignores joint samples, so the rest pose after a
+        motion would otherwise stay at whatever sample the last unrelated
+        control change captured (for example another robot's operation end).
+        """
+
+        if event["record_kind"] == "stop_terminal_projected":
+            return True
+        payload = event.get("payload")
+        operation = payload.get("operation_state") if isinstance(payload, dict) else None
+        return isinstance(operation, dict) and operation.get("state") in _OPERATION_REST_STATES
 
     @staticmethod
     def _operation_is_released(event: dict[str, Any]) -> bool:
@@ -2446,11 +2491,15 @@ class ExecutionEventPump:
                         if operation_control_keys.get(operation_id) != key:
                             operation_control_keys[operation_id] = key
                             control_projection_changed = True
+                            if self._operation_is_settled(event):
+                                self._notify_motion_settled()
                         if self._operation_is_released(event):
                             operation_control_keys.pop(operation_id, None)
                     else:
                         # The only operation-less events are sparse Stop facts.
                         control_projection_changed = True
+                        if self._operation_is_settled(event):
+                            self._notify_motion_settled()
                 if page["next_after_sequence"] != after_sequence:
                     raise HeadlessApiError(
                         "execution_command_response_invalid",

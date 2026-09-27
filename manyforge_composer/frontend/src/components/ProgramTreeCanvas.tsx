@@ -6,6 +6,7 @@ import {
   useState,
   type DragEvent,
   type KeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
 } from 'react';
 import {
   BaseEdge,
@@ -49,6 +50,7 @@ import {
 } from '../utils/authoringGraph';
 import {
   flattenProgramForest,
+  type FlatProgramNode,
 } from '../utils/programAuthoring';
 import {
   isProgramCanvasFormTarget,
@@ -58,10 +60,19 @@ import {
   programDetachedInsertionMutation,
   programInsertionMutation,
   programMoveMutation,
+  programSubtreeCopy,
+  programSubtreeInsertionMutation,
+  programUnwrapMutation,
   programWrapMutation,
   readProgramPaletteDrag,
+  type ProgramInsertionPlacement,
 } from '../utils/programCanvasInteraction';
 import { BtNode, type BtNodePresentation } from './BtNode';
+import {
+  CanvasContextMenu,
+  type CanvasMenuEntry,
+  type CanvasMenuItem,
+} from './CanvasContextMenu';
 import { CanvasViewControls } from './CanvasViewControls';
 import {
   ProgramNoticeRail,
@@ -83,6 +94,18 @@ function acceptsChildCount(entry: CatalogEntry | undefined, count: number): bool
 }
 
 const NODE_SIZE = { width: NODE_WIDTH, height: NODE_BASE_HEIGHT } as const;
+
+// The copied subtree lives for the browser session, across Program switches;
+// every paste inserts a fresh copy with new instance ids.
+let programClipboard: ProgramTreeNode | null = null;
+
+interface ProgramCanvasMenu {
+  x: number;
+  y: number;
+  /** Where the pointer was on the canvas, for "Paste here" and "Add node here". */
+  flowPosition: XYPosition;
+  instanceId: string | null;
+}
 
 interface ProgramFlowNodeData extends Record<string, unknown> {
   presentation: BtNodePresentation;
@@ -195,6 +218,9 @@ export function ProgramTreeCanvas({
     Record<string, { width: number; height: number }>
   >({});
   const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
+  const [clipboard, setClipboard] = useState<ProgramTreeNode | null>(programClipboard);
+  const [menu, setMenu] = useState<ProgramCanvasMenu | null>(null);
+  const closeMenu = useCallback(() => setMenu(null), []);
   const flowInstance = useRef<ReactFlowInstance<ProgramFlowNode, ProgramFlowEdge> | null>(null);
   const nodeElements = useRef<Record<string, HTMLDivElement | null>>({});
   const pendingPositionChanges = useRef<Record<string, XYPosition>>({});
@@ -328,6 +354,17 @@ export function ProgramTreeCanvas({
     nodeElements.current[id] = element;
   }, []);
 
+  const deleteRow = useCallback((row: FlatProgramNode) => {
+    if (authoringDisabled) return;
+    const validationError = validateAuthoringDeletion(laidOut, row.node.instance_id);
+    if (validationError) {
+      showCanvasMessage(validationError, 'error');
+      return;
+    }
+    const mutation = programDeleteMutation(row.node.instance_id);
+    onMutate(mutation.mutation, mutation.args);
+  }, [authoringDisabled, laidOut, onMutate, showCanvasMessage]);
+
   const deleteSelectedNode = useCallback((
     event?: KeyboardEvent<HTMLDivElement>,
   ) => {
@@ -339,17 +376,8 @@ export function ProgramTreeCanvas({
     ) return;
     event?.preventDefault();
     event?.stopPropagation();
-    const validationError = validateAuthoringDeletion(
-      laidOut,
-      selectedRow.node.instance_id,
-    );
-    if (validationError) {
-      showCanvasMessage(validationError, 'error');
-      return;
-    }
-    const mutation = programDeleteMutation(selectedRow.node.instance_id);
-    onMutate(mutation.mutation, mutation.args);
-  }, [authoringDisabled, laidOut, onMutate, selectedRow, showCanvasMessage]);
+    deleteRow(selectedRow);
+  }, [authoringDisabled, deleteRow, selectedRow]);
 
   const onNodeDelete = useCallback((
     event: KeyboardEvent<HTMLDivElement>,
@@ -689,12 +717,12 @@ export function ProgramTreeCanvas({
         selectedRow.node.instance_id,
       ) === null);
 
-  const moveSelected = async (newParentId: string, index: number) => {
-    if (!selectedRow || authoringDisabled) return;
+  const moveRow = async (movedRow: FlatProgramNode, newParentId: string, index: number) => {
+    if (authoringDisabled) return;
     const orderedIds = authoringReorderedIds(
       flat.map((row) => ({ id: row.node.instance_id, parentId: row.parentId })),
       newParentId,
-      selectedRow.node.instance_id,
+      movedRow.node.instance_id,
       index,
     );
     if (orderedIds === null) return;
@@ -703,7 +731,7 @@ export function ProgramTreeCanvas({
       aligned.map((node) => [node.id, node.position]),
     );
     const mutation = programMoveMutation(
-      selectedRow.node.instance_id,
+      movedRow.node.instance_id,
       newParentId,
       index,
       nextPositions,
@@ -713,6 +741,9 @@ export function ProgramTreeCanvas({
       setPresentationPositions(nextPositions);
       showCanvasMessage('Order updated and aligned.', 'info');
     }
+  };
+  const moveSelected = async (newParentId: string, index: number) => {
+    if (selectedRow !== null) await moveRow(selectedRow, newParentId, index);
   };
 
   const topologyEntries = catalogEntries.filter(
@@ -801,6 +832,237 @@ export function ProgramTreeCanvas({
     showCanvasMessage(`Node type changed to ${topologyEntry.name} without dropping parameters.`, 'info');
   };
 
+  // ---- Right-click menu and copy/paste shortcuts -------------------------
+
+  const instanceIds = flat.map((row) => row.node.instance_id);
+  const parentEntryOf = (row: FlatProgramNode) => {
+    const parent = row.parentId === null ? null : flatById.get(row.parentId) ?? null;
+    return { parent, entry: parent === null ? undefined : catalog.get(parent.node.node_id) };
+  };
+  const canInsertAfter = (row: FlatProgramNode) => {
+    const { parent, entry } = parentEntryOf(row);
+    return parent === null || acceptsChildCount(entry, parent.node.children.length + 1);
+  };
+  const canInsertChild = (row: FlatProgramNode) => acceptsChildCount(
+    catalog.get(row.node.node_id),
+    row.node.children.length + 1,
+  );
+
+  const insertSubtree = async (
+    subtree: ProgramTreeNode,
+    placement: ProgramInsertionPlacement,
+    message: string,
+  ) => {
+    if (authoringDisabled) return;
+    const mutation = programSubtreeInsertionMutation(subtree, placement);
+    if (await onMutate(mutation.mutation, mutation.args) === null) return;
+    onSelect(subtree.instance_id);
+    showCanvasMessage(message, 'info');
+  };
+  const duplicateRow = (row: FlatProgramNode) => {
+    if (!canInsertAfter(row)) {
+      showCanvasMessage('The parent cannot take another child, so the node cannot be duplicated here.', 'error');
+      return;
+    }
+    void insertSubtree(
+      programSubtreeCopy(row.node, instanceIds),
+      { kind: 'after', siblingInstanceId: row.node.instance_id },
+      `${row.node.instance_id} duplicated.`,
+    );
+  };
+  const copyRow = (row: FlatProgramNode) => {
+    programClipboard = structuredClone(row.node);
+    setClipboard(programClipboard);
+    showCanvasMessage(`${row.node.instance_id} copied.`, 'info');
+  };
+  const pasteAt = (placement: ProgramInsertionPlacement) => {
+    if (clipboard === null) return;
+    void insertSubtree(
+      programSubtreeCopy(clipboard, instanceIds),
+      placement,
+      `${clipboard.instance_id} pasted.`,
+    );
+  };
+  const pasteAfter = (row: FlatProgramNode) => {
+    if (!canInsertAfter(row)) {
+      showCanvasMessage('The parent cannot take another child here.', 'error');
+      return;
+    }
+    pasteAt({ kind: 'after', siblingInstanceId: row.node.instance_id });
+  };
+  const pasteAsRoot = (position: XYPosition) => {
+    pasteAt({ kind: 'root', index: roots.length, position });
+  };
+  const wrapRow = async (row: FlatProgramNode, entry: CatalogEntry) => {
+    if (authoringDisabled) return;
+    const mutation = programWrapMutation(entry, instanceIds, row.node.instance_id);
+    if (await onMutate(mutation.mutation, mutation.args) === null) return;
+    const wrapper = mutation.args.wrapper as Record<string, JsonValue>;
+    onSelect(String(wrapper.instance_id));
+    showCanvasMessage(`${entry.name} now wraps ${row.node.instance_id}.`, 'info');
+  };
+  const unwrapRow = async (row: FlatProgramNode) => {
+    const child = row.node.children[0];
+    if (authoringDisabled || child === undefined || row.node.children.length !== 1) return;
+    const mutation = programUnwrapMutation(row.node);
+    if (await onMutate(mutation.mutation, mutation.args) === null) return;
+    onSelect(child.instance_id);
+    showCanvasMessage(`${row.node.instance_id} removed; its child keeps its place.`, 'info');
+  };
+  const changeRowKind = async (row: FlatProgramNode, entry: CatalogEntry) => {
+    if (authoringDisabled) return;
+    const mutation = programChangeKindMutation(entry, row.node.instance_id, [
+      ...Object.keys(row.node.parameters),
+      ...Object.keys(row.node.value_sources ?? {}),
+    ]);
+    if (await onMutate(mutation.mutation, mutation.args) === null) return;
+    showCanvasMessage(`Node type changed to ${entry.name} without dropping parameters.`, 'info');
+  };
+  const detachRow = (row: FlatProgramNode) => {
+    if (authoringDisabled || row.parentId === null) return;
+    const mutation = programMoveMutation(
+      row.node.instance_id,
+      null,
+      roots.length,
+      Object.fromEntries(positions),
+    );
+    onMutate(mutation.mutation, mutation.args);
+  };
+  const insertCatalogNodeAt = (entry: CatalogEntry, position: XYPosition) => {
+    if (authoringDisabled) return;
+    const mutation = programDetachedInsertionMutation(entry, instanceIds, roots.length, position);
+    onMutate(mutation.mutation, mutation.args);
+    onSelect(String((mutation.args.node as Record<string, JsonValue>).instance_id));
+  };
+
+  const byKindThenName = (left: CatalogEntry, right: CatalogEntry) => (
+    (left.kind === 'decorator' ? 0 : 1) - (right.kind === 'decorator' ? 0 : 1)
+    || left.name.localeCompare(right.name)
+  );
+  const wrapperEntries = topologyEntries
+    .filter((entry) => acceptsChildCount(entry, 1))
+    .sort(byKindThenName);
+
+  const nodeMenuEntries = (row: FlatProgramNode): CanvasMenuEntry[] => {
+    const retained = [
+      ...Object.keys(row.node.parameters),
+      ...Object.keys(row.node.value_sources ?? {}),
+    ];
+    const replacements = topologyEntries
+      .filter((entry) => entry.id !== row.node.node_id
+        && acceptsChildCount(entry, row.node.children.length)
+        && retained.every((name) => entry.parameters.some((parameter) => parameter.id === name)))
+      .sort(byKindThenName);
+    const siblings = row.parentId === null
+      ? roots.length
+      : flatById.get(row.parentId)?.node.children.length ?? 1;
+    const item = (label: string, onSelectItem: () => void, disabled = false, extra: Partial<CanvasMenuItem> = {}): CanvasMenuItem => ({
+      label,
+      onSelect: onSelectItem,
+      disabled: authoringDisabled || disabled,
+      ...extra,
+    });
+    return [
+      item('Duplicate', () => duplicateRow(row), !canInsertAfter(row), { shortcut: 'Ctrl+D' }),
+      { label: 'Copy', onSelect: () => copyRow(row), shortcut: 'Ctrl+C' },
+      item('Paste after', () => pasteAfter(row), clipboard === null || !canInsertAfter(row), { shortcut: 'Ctrl+V' }),
+      item('Paste as child', () => pasteAt({
+        kind: 'child',
+        parentInstanceId: row.node.instance_id,
+        index: row.node.children.length,
+      }), clipboard === null || !canInsertChild(row)),
+      'separator',
+      {
+        label: 'Wrap in',
+        disabled: authoringDisabled,
+        items: wrapperEntries.map((entry) => item(entry.name, () => { void wrapRow(row, entry); })),
+      },
+      item('Unwrap', () => { void unwrapRow(row); }, row.node.children.length !== 1, {
+        title: 'Remove this node and put its only child in its place.',
+      }),
+      {
+        label: 'Change type',
+        disabled: authoringDisabled,
+        items: replacements.map((entry) => item(entry.name, () => { void changeRowKind(row, entry); })),
+      },
+      'separator',
+      item('Move earlier', () => {
+        if (row.parentId !== null) void moveRow(row, row.parentId, row.index - 1);
+      }, row.parentId === null || row.index === 0),
+      item('Move later', () => {
+        if (row.parentId !== null) void moveRow(row, row.parentId, row.index + 1);
+      }, row.parentId === null || row.index >= siblings - 1),
+      item('Detach', () => detachRow(row), row.parentId === null, {
+        title: 'Disconnect this subtree from its parent and keep it as a separate root.',
+      }),
+      'separator',
+      item('Delete', () => deleteRow(row), false, { danger: true, shortcut: 'Del' }),
+    ];
+  };
+  const paneMenuEntries = (position: XYPosition): CanvasMenuEntry[] => [
+    {
+      label: 'Paste here',
+      onSelect: () => pasteAsRoot(position),
+      disabled: authoringDisabled || clipboard === null,
+      shortcut: 'Ctrl+V',
+    },
+    {
+      label: 'Add node here',
+      disabled: authoringDisabled,
+      items: [...topologyEntries]
+        .sort((left, right) => left.name.localeCompare(right.name))
+        .map((entry) => ({
+          label: entry.name,
+          onSelect: () => insertCatalogNodeAt(entry, position),
+        })),
+    },
+    'separator',
+    { label: 'Auto-layout', onSelect: autoLayout },
+    { label: 'Fit view', onSelect: fitView },
+  ];
+
+  const openMenu = (
+    event: ReactMouseEvent | globalThis.MouseEvent,
+    instanceId: string | null,
+  ) => {
+    event.preventDefault();
+    const flow = flowInstance.current;
+    const flowPosition = flow?.screenToFlowPosition({ x: event.clientX, y: event.clientY })
+      ?? { x: 0, y: 0 };
+    if (instanceId !== null) {
+      // Right-click selects the node too, which opens its Properties.
+      onSelect(instanceId);
+      setFocusedNodeId(instanceId);
+    }
+    setMenu({ x: event.clientX, y: event.clientY, flowPosition, instanceId });
+  };
+
+  const onCanvasShortcut = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+    if (isProgramCanvasFormTarget(event.target)) return;
+    const key = event.key.toLocaleLowerCase();
+    if (key !== 'c' && key !== 'd' && key !== 'v') return;
+    if (key === 'v') {
+      event.preventDefault();
+      if (clipboard === null) return;
+      if (selectedRow !== null) {
+        pasteAfter(selectedRow);
+      } else {
+        const bounds = event.currentTarget.getBoundingClientRect();
+        pasteAsRoot(flowInstance.current?.screenToFlowPosition({
+          x: bounds.left + bounds.width / 2,
+          y: bounds.top + bounds.height / 2,
+        }) ?? { x: 0, y: 0 });
+      }
+      return;
+    }
+    if (selectedRow === null) return;
+    event.preventDefault();
+    if (key === 'c') copyRow(selectedRow);
+    else duplicateRow(selectedRow);
+  };
+  const menuRow = menu?.instanceId == null ? null : flatById.get(menu.instanceId) ?? null;
+
   return (
     <section className="program-tree-surface" aria-label="Program tree canvas">
       <h3 className="sr-only">Program tree canvas</h3>
@@ -817,6 +1079,7 @@ export function ProgramTreeCanvas({
           // future canvas shortcut from escaping into surrounding workbench
           // controls or form fields.
           if (intent?.type === 'delete') event.stopPropagation();
+          onCanvasShortcut(event);
         }}
       >
         <div className="program-canvas-topbar">
@@ -824,7 +1087,7 @@ export function ProgramTreeCanvas({
             type="button"
             className="icon-button program-canvas-help"
             aria-label="Program canvas keyboard help"
-            title="Focus a node, use arrow keys to navigate, Enter or Space to select, and Delete or Backspace to remove it. Double-click a link, or select it and press Delete, to detach it."
+            title="Focus a node, use arrow keys to navigate, Enter or Space to select, and Delete or Backspace to remove it. Double-click a link, or select it and press Delete, to detach it. Right-click a node or the canvas for more actions; Ctrl+D duplicates the selected node, Ctrl+C copies it and Ctrl+V pastes after it (or on the canvas when nothing is selected)."
           >
             ?
           </button>
@@ -868,6 +1131,9 @@ export function ProgramTreeCanvas({
             setFocusedNodeId(null);
             onSelect(null);
           }}
+          onNodeContextMenu={(event, node) => openMenu(event, node.id)}
+          onPaneContextMenu={(event) => openMenu(event, null)}
+          onMoveStart={closeMenu}
           onDragOver={onDragOver}
           onDrop={onDrop}
           onInit={(instance) => {
@@ -892,6 +1158,16 @@ export function ProgramTreeCanvas({
           <Background color={CANVAS_COLORS.grid} gap={24} />
           <Controls showInteractive />
         </ReactFlow>
+        {menu !== null && (menu.instanceId === null || menuRow !== null) && (
+          <CanvasContextMenu
+            x={menu.x}
+            y={menu.y}
+            heading={menuRow?.node.instance_id}
+            label={menuRow === null ? 'Program canvas actions' : `Actions for ${menuRow.node.instance_id}`}
+            entries={menuRow === null ? paneMenuEntries(menu.flowPosition) : nodeMenuEntries(menuRow)}
+            onClose={closeMenu}
+          />
+        )}
         {selectedRow && (
           <div
             className="program-tree-actions"

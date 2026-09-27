@@ -11,6 +11,7 @@ import {
 } from '../state/authoringWorkspace';
 import type { AuthoringWorkspaceProjectFacts } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
+import { sameAuthoringWorkspaceIdentity, type ControlTransportStatus } from './useHeadlessState';
 
 /**
  * One shared authoring-workspace read for the whole workbench.
@@ -27,7 +28,10 @@ import type { ComposerHeadlessState } from '../types/headless';
  * poll loop. Applied, Manager and runtime truth stay in their existing owner
  * projections; this controller deliberately publishes authoring state only.
  */
-export function useAuthoringWorkspace(snapshot: ComposerHeadlessState | null) {
+export function useAuthoringWorkspace(
+  snapshot: ComposerHeadlessState | null,
+  transportStatus: ControlTransportStatus = 'connected',
+) {
   const [published, setPublished] = useState<PublishedAuthoringWorkspace | null>(
     null,
   );
@@ -37,6 +41,7 @@ export function useAuthoringWorkspace(snapshot: ComposerHeadlessState | null) {
   const sequence = useRef(0);
   const inFlight = useRef(new Map<string, Promise<void>>());
   const installedKey = useRef<string | null>(null);
+  const reconnectPending = useRef(false);
 
   const observed = snapshot === null ? null : snapshot.authoringWorkspace;
   const observedKey = observed === null
@@ -60,7 +65,12 @@ export function useAuthoringWorkspace(snapshot: ComposerHeadlessState | null) {
         return;
       }
       installedKey.current = responseKey;
-      setPublished({ identity, snapshot: next });
+      // This owner publication is immutable at its full identity. A reconnect
+      // may verify it again without replacing every downstream document object.
+      setPublished((previous) => previous !== null
+        && sameAuthoringWorkspaceIdentity(previous.identity, identity)
+        ? previous
+        : { identity, snapshot: next });
       setError(null);
     } catch (reason: unknown) {
       if (!mounted.current || sequence.current !== current) return;
@@ -75,6 +85,16 @@ export function useAuthoringWorkspace(snapshot: ComposerHeadlessState | null) {
     }
   }, []);
 
+  const read = useCallback((identityKey: string): Promise<void> => {
+    const existing = inFlight.current.get(identityKey);
+    if (existing !== undefined) return existing;
+    const request = install(identityKey).finally(() => {
+      inFlight.current.delete(identityKey);
+    });
+    inFlight.current.set(identityKey, request);
+    return request;
+  }, [install]);
+
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -85,13 +105,8 @@ export function useAuthoringWorkspace(snapshot: ComposerHeadlessState | null) {
   useEffect(() => {
     if (observedKey === null) return;
     if (installedKey.current === observedKey) return;
-    const existing = inFlight.current.get(observedKey);
-    if (existing !== undefined) return;
-    const request = install(observedKey).finally(() => {
-      inFlight.current.delete(observedKey);
-    });
-    inFlight.current.set(observedKey, request);
-  }, [install, observedKey]);
+    void read(observedKey);
+  }, [read, observedKey]);
 
   /**
    * Read the newest observed identity once, discarding any older response.
@@ -102,8 +117,20 @@ export function useAuthoringWorkspace(snapshot: ComposerHeadlessState | null) {
   const refresh = useCallback(async (): Promise<void> => {
     if (observedKey === null) return;
     installedKey.current = null;
-    await install(observedKey);
-  }, [install, observedKey]);
+    await read(observedKey);
+  }, [read, observedKey]);
+
+  useEffect(() => {
+    if (transportStatus === 'connecting' || transportStatus === 'disconnected') {
+      reconnectPending.current = true;
+    }
+    // Delayed/stale recovery on the same connection changes admission, not
+    // document identity. Remember a real reconnect through intermediate states.
+    if (transportStatus !== 'connected' || observedKey === null
+      || !reconnectPending.current) return;
+    reconnectPending.current = false;
+    void refresh();
+  }, [observedKey, refresh, transportStatus]);
 
   const current = publicationIsCurrent(published, snapshot);
   const unavailableReason = authoringUnavailableReason(published, snapshot);

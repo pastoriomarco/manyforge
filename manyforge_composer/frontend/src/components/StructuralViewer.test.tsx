@@ -508,7 +508,7 @@ describe('viewer failure isolation', () => {
     expect(source).toContain('endFailedRetry();\n    setAssetError(error);');
   });
 
-  it('publishes viewer conditions to the one notification stack above the controls', () => {
+  it('publishes viewer conditions to the one notification stack below the controls', () => {
     const source = readFileSync(new URL('./StructuralViewer.tsx', import.meta.url), 'utf8');
     const css = readStyleSource();
     expect(source).toContain("usePublishWorkbenchNotices('viewer', viewerNotices({");
@@ -516,8 +516,10 @@ describe('viewer failure isolation', () => {
     expect(css).not.toContain('.viewer-notice-stack');
     expect(css).not.toContain('.viewer-model-state');
     const layout = css.match(/\.workbench-notification-stack\s*\{([^}]+)\}/)?.[1];
-    expect(layout).toContain('top: 0.55rem');
-    expect(layout).toContain('max-height: calc(100% - 5.5rem)');
+    // Below the floating controls (2.85rem + 2 × 0.65rem inset), same side insets.
+    expect(layout).toContain('top: calc(2.85rem + 2 * 0.65rem)');
+    expect(layout).toContain('left: 0.65rem');
+    expect(layout).toContain('right: 0.65rem');
     expect(layout).toContain('pointer-events: none');
   });
 

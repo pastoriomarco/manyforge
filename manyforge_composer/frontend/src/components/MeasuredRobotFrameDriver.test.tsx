@@ -30,9 +30,7 @@ afterEach(() => {
   frameLoop.invalidate.mockClear();
 });
 
-it('credits the rendered reader A and preserves reader B until its own render', async () => {
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
-
+function installFakeReactDom() {
   // The driver renders no DOM. Reuse the tiny React DOM host pattern from
   // useHeadlessState.test.ts so real commit/layout effects run with no new
   // DOM package or synthetic copy of the driver's scheduling logic.
@@ -97,6 +95,13 @@ it('credits the rendered reader A and preserves reader B until its own render', 
   vi.stubGlobal('window', window);
   vi.stubGlobal('document', document);
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+  return makeNode;
+}
+
+it('credits the rendered reader A and preserves reader B until its own render', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+
+  const makeNode = installFakeReactDom();
 
   const presentationA: MeasuredRobotPresentation = {
     objectId: 'robot',
@@ -187,4 +192,54 @@ it('credits the rendered reader A and preserves reader B until its own render', 
   expect(listenersB.size).toBe(0);
   expect(latestFrameAppliers.size).toBe(0);
   expect(vi.getTimerCount()).toBe(0);
+});
+
+it('never re-applies a stored presentation over a live reader without a usable frame', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+  const makeNode = installFakeReactDom();
+  const stored = (x: number): MeasuredRobotPresentation => ({
+    objectId: 'robot',
+    sourceId: 'arm',
+    sourceEpoch: 'owner:source',
+    sourceSequence: x,
+    observedAtNs: String(1000 + x),
+    linkTransforms: {
+      arm: { position_m: [x, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
+    },
+  });
+  // The live reader exists but its latest frame is not usable (for example a
+  // model refresh in progress): it returns no presentation.
+  const live: MeasuredRobotPresentationReader = {
+    readMeasuredRobotPresentation: () => null,
+    subscribeMeasuredRobotPresentation: () => () => undefined,
+    markMeasuredRobotPresentationApplied: vi.fn(),
+  };
+  const group = new THREE.Group();
+  group.position.set(9, 0, 0); // the pose the robot is currently shown at
+  const linkGroups = new Map([['arm', { current: group }]]);
+  const { createRoot } = await import('react-dom/client');
+  const root = createRoot(makeNode('div') as unknown as Element);
+  const render = (presentation: MeasuredRobotPresentation, reader?: MeasuredRobotPresentationReader) => (
+    root.render(<MeasuredRobotFrameDriver
+      manifestModelKey="model"
+      linkGroups={linkGroups}
+      presentation={presentation}
+      livePresentation={reader}
+      latestFrameAppliers={new Set()}
+      interpolationDurationMs={0}
+      minimumCreditIntervalMs={40}
+    />)
+  );
+  try {
+    // An older stored pose arrives while the live frame is unusable.
+    await act(async () => { render(stored(2), live); });
+    expect(group.position.x).toBe(9);
+    await act(async () => { render(stored(3), live); });
+    expect(group.position.x).toBe(9);
+    // Without a live stream the stored presentation remains the source.
+    await act(async () => { render(stored(4)); });
+    expect(group.position.x).toBe(4);
+  } finally {
+    await act(async () => root.unmount());
+  }
 });

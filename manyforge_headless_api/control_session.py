@@ -42,6 +42,7 @@ from .control_state import (
     ControlStateSubscription,
     HeadlessControlStateSource,
     control_shell_fact_key,
+    execution_observation_values_key,
 )
 from .execution_control import (
     ExecutionControlBusyError,
@@ -251,6 +252,16 @@ class ExecutionControlSession:
                 != control_shell_fact_key(prior, name)
             ):
                 shell[name] = value
+        # Joint samples are excluded from the meaningful key. A frame published
+        # because a motion settled (or for any other reason) still carries the
+        # current rest pose, so a session never keeps an older sample.
+        if (
+            "execution_control_state" not in shell
+            and "execution_control_state" in current
+            and execution_observation_values_key(current["execution_control_state"])
+            != execution_observation_values_key(prior.get("execution_control_state"))
+        ):
+            shell["execution_control_state"] = current["execution_control_state"]
         # Targets are immutable within their validated execution identity. A
         # target replacement still carries its matching control capture; an
         # ordinary control-state change can reuse the already-validated target.

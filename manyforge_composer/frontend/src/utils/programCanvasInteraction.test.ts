@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import type { CatalogEntry } from '../types/api';
+import type { CatalogEntry, ProgramTreeNode } from '../types/api';
 import {
   authoringMoveIntent,
   type AuthoringGraphEdge,
@@ -9,6 +9,10 @@ import {
 import {
   programCanvasKeyIntent,
   programChangeKindMutation,
+  programCopyInstanceId,
+  programSubtreeCopy,
+  programSubtreeInsertionMutation,
+  programUnwrapMutation,
   programDeleteMutation,
   programDetachedInsertionMutation,
   programInsertionMutation,
@@ -212,4 +216,55 @@ describe('Program canvas interaction intents', () => {
     });
   });
 
+});
+
+describe('Program canvas subtree edits', () => {
+  const subtree: ProgramTreeNode = {
+    node_id: 'retry',
+    instance_id: 'retry_pick',
+    parameters: { num_attempts: 3 },
+    children: [{
+      node_id: 'move',
+      instance_id: 'pick_approach',
+      parameters: { speed: 0.2 },
+      value_sources: { target: { kind: 'program_parameter', reference: 'pick_pose' } },
+      children: [],
+    }],
+  };
+
+  it('names a copy after the original', () => {
+    expect(programCopyInstanceId('pick_approach', new Set())).toBe('pick_approach_2');
+    expect(programCopyInstanceId('pick_approach_2', new Set(['pick_approach_2'])))
+      .toBe('pick_approach_3');
+    expect(programCopyInstanceId('moveToPose', new Set(['moveToPose_2']))).toBe('moveToPose_3');
+  });
+
+  it('copies a whole subtree with fresh ids and unchanged content', () => {
+    const copy = programSubtreeCopy(subtree, ['retry_pick', 'pick_approach']);
+    expect(copy.instance_id).toBe('retry_pick_2');
+    expect(copy.children[0]?.instance_id).toBe('pick_approach_2');
+    expect(copy.parameters).toEqual({ num_attempts: 3 });
+    expect(copy.children[0]?.value_sources).toEqual(subtree.children[0]?.value_sources);
+    copy.children[0]!.parameters.speed = 1;
+    expect(subtree.children[0]?.parameters.speed).toBe(0.2);
+  });
+
+  it('inserts a subtree in one edit at the chosen place', () => {
+    const copy = programSubtreeCopy(subtree, ['retry_pick', 'pick_approach']);
+    expect(programSubtreeInsertionMutation(copy, { kind: 'after', siblingInstanceId: 'retry_pick' }))
+      .toEqual({
+        mutation: 'tree_draft_insert_node',
+        args: { after_instance_id: 'retry_pick', node: copy },
+      });
+    expect(programSubtreeInsertionMutation(copy, { kind: 'root', index: 2, position: { x: 10, y: 20 } }).args)
+      .toEqual({ index: 2, position: { x: 10, y: 20 }, node: copy });
+  });
+
+  it('unwraps a single-child node by replacing it with its child', () => {
+    expect(programUnwrapMutation(subtree)).toEqual({
+      mutation: 'tree_draft_replace_subtree',
+      args: { instance_id: 'retry_pick', subtree: subtree.children[0] },
+    });
+    expect(() => programUnwrapMutation(subtree.children[0]!)).toThrow();
+  });
 });

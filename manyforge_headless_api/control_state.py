@@ -215,6 +215,29 @@ def _meaningful_execution_control_key(control_response: Any) -> str:
     return json.dumps(control, sort_keys=True, separators=(",", ":"))
 
 
+def execution_observation_values_key(control_response: Any) -> str:
+    """Return only the observed joint values that the meaningful key drops.
+
+    Samples are not published while a motion runs, but a robot that has come
+    to rest must not leave an older sample as its control-state pose.  This
+    key detects that difference for a settle refresh and for session deltas.
+    """
+
+    control = control_response if isinstance(control_response, dict) else {}
+    state = control.get("control_state")
+    rows = state.get("observed_targets") if isinstance(state, dict) else None
+    values = [
+        (
+            row.get("controllable_component_id"),
+            row.get("command_target_id"),
+            row.get("observed"),
+        )
+        for row in rows
+        if isinstance(row, dict)
+    ] if isinstance(rows, list) else []
+    return json.dumps(values, sort_keys=True, separators=(",", ":"))
+
+
 def control_shell_fact_key(shell: dict[str, Any], name: str) -> Any:
     """Return one immutable domain's operator-relevant equality key."""
 
@@ -367,6 +390,10 @@ class HeadlessControlStateSource:
         self._facts: ComponentOverviewFacts | None = None
         self._shell: dict[str, Any] | None = None
         self._shell_key: tuple[Any, ...] | None = None
+        # Joint values last published to clients, and whether a motion has
+        # settled since (see notify_motion_settled).
+        self._published_observation_key: str | None = None
+        self._observation_refresh_requested = False
         self._cold_wake: asyncio.Event | None = None
         self._program_wake: asyncio.Event | None = None
         self._program_source_current = False
@@ -705,6 +732,25 @@ class HeadlessControlStateSource:
         if loop is not None and wake is not None:
             loop.call_soon_threadsafe(wake.set)
 
+    def notify_motion_settled(self) -> None:
+        """Publish the rest pose once after any motion operation settles.
+
+        Called from the execution event thread when an operation of any target
+        reaches a resting state.  The next cold reduction then publishes if the
+        observed joint values differ from the last published ones, even though
+        the meaningful control key (which ignores samples) is unchanged.
+        """
+
+        loop = self._loop
+        if loop is None:
+            return
+        loop.call_soon_threadsafe(self._request_observation_refresh)
+
+    def _request_observation_refresh(self) -> None:
+        self._observation_refresh_requested = True
+        if self._cold_wake is not None:
+            self._cold_wake.set()
+
     def notify_control(self) -> None:
         """Refresh non-Program facts after one accepted control effect.
 
@@ -833,6 +879,9 @@ class HeadlessControlStateSource:
         self._generation += 1
         self._publications[event_class] += 1
         frame = self._frame(event_class)
+        self._published_observation_key = execution_observation_values_key(
+            frame.shell.get("execution_control_state")
+        )
         for subscription in self._subscriptions:
             if subscription.closed:
                 continue
@@ -1067,6 +1116,8 @@ class HeadlessControlStateSource:
             await wake.wait()
             wake.clear()
             await asyncio.sleep(CONTROL_COLD_COMBINE_NS / 1_000_000_000)
+            observation_refresh = self._observation_refresh_requested
+            self._observation_refresh_requested = False
             try:
                 facts, shell, key = await self._assemble_shell()
             except ControlStateUnavailableError as error:
@@ -1076,6 +1127,7 @@ class HeadlessControlStateSource:
                     # by HeadlessService. They are an incident too, not just
                     # failures that happen to escape as an I/O exception.
                     self._invalidate_source("cold_projection")
+                self._observation_refresh_requested |= observation_refresh
                 await asyncio.sleep(retry_seconds)
                 retry_seconds = min(retry_seconds * 2, _SOURCE_RETRY_MAX_SECONDS)
                 wake.set()
@@ -1083,6 +1135,7 @@ class HeadlessControlStateSource:
             except (HeadlessApiError, OSError, ValueError):
                 self._semantic_reason = "control_projection_source_unavailable"
                 self._invalidate_source("cold_projection")
+                self._observation_refresh_requested |= observation_refresh
                 await asyncio.sleep(retry_seconds)
                 retry_seconds = min(retry_seconds * 2, _SOURCE_RETRY_MAX_SECONDS)
                 wake.set()
@@ -1093,8 +1146,20 @@ class HeadlessControlStateSource:
                 _LOGGER.exception("Unexpected control projection failure")
                 raise
             if not self._program_source_current or not self._watch_source_current:
+                # Keep a pending settle refresh for the next current reduction.
+                self._observation_refresh_requested |= observation_refresh
                 continue
-            changed = key != self._shell_key or self._facts is None
+            observation_key = execution_observation_values_key(
+                shell.get("execution_control_state")
+            )
+            changed = (
+                key != self._shell_key
+                or self._facts is None
+                or (
+                    observation_refresh
+                    and observation_key != self._published_observation_key
+                )
+            )
             self._facts = facts
             self._shell = shell
             self._shell_key = key

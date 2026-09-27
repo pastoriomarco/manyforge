@@ -540,6 +540,7 @@ export interface DeploymentWorkspaceResponse {
 export interface PreparedActivationInput {
   schemaVersion: 'manyforge.prepared_activation_input.v3';
   preparedActivationId: string;
+  scenarioId: string;
   sourceDocumentDigest: string;
   capturedInputDigest: string;
   deploymentArtifactId: string;
@@ -906,6 +907,7 @@ export interface RuntimeOverrideMaterializationResponse {
   mutation: string;
   details: Record<string, JsonValue>;
   workspace: ProgramWorkspaceResponse;
+  authoringWorkspace: AuthoringWorkspaceSnapshot;
 }
 
 export type ProgramWorkspaceTransitionStatus =
@@ -1704,6 +1706,7 @@ export interface DraftMutationResponse {
   mutation: string;
   details: Record<string, JsonValue>;
   workspace: ProgramWorkspaceResponse;
+  authoringWorkspace: AuthoringWorkspaceSnapshot;
 }
 
 export type Vector3Tuple = [number, number, number];

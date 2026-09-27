@@ -438,6 +438,85 @@ def test_source_coalesces_visual_heartbeats_but_retains_the_latest_cursor() -> N
     asyncio.run(exercise())
 
 
+def test_source_reports_idle_wait_separately_from_processing(monkeypatch) -> None:
+    async def exercise() -> None:
+        now = 0.0
+        client = _Client()
+        source = stream.ExecutionObservationSource(client, monotonic=lambda: now)
+        original = source._admit_response
+
+        def measured_admit(response, cancel):
+            nonlocal now
+            now += 0.004
+            original(response, cancel)
+
+        monkeypatch.setattr(source, "_admit_response", measured_admit)
+        subscription = source.subscribe()
+        try:
+            source.grant_credit(subscription, None)
+            assert await _next_cursor(client) is None
+            now = 900.0  # Intentional owner wait, no actual sleep.
+            client.responses.put(_status(sequence=1))
+            await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
+            source.take_payload(subscription)
+            source.grant_credit(subscription, ("execution-owner.1", "joint-source.1", 1))
+            await _next_cursor(client)  # Processing and metric publication completed.
+            status = source.status()
+            assert status["schema_version"] == "manyforge.execution_observation_stream_status.v3"
+            metrics = status["source"]
+            assert metrics["last_source_wait_duration_us"] == 900_000_000
+            assert metrics["max_source_wait_duration_us"] == 900_000_000
+            assert metrics["last_processing_duration_us"] == 4_000
+            assert metrics["max_processing_duration_us"] == 4_000
+            assert "last_wake_duration_us" not in metrics
+            now += 0.010
+            client.responses.put(_status(sequence=2, position=0.2))
+            await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
+            source.take_payload(subscription)
+            source.grant_credit(subscription, ("execution-owner.1", "joint-source.1", 2))
+            await _next_cursor(client)
+            metrics = source.status()["source"]
+            assert metrics["last_source_wait_duration_us"] == 10_000
+            assert metrics["max_source_wait_duration_us"] == 900_000_000
+            assert metrics["last_processing_duration_us"] == 4_000
+        finally:
+            source.unsubscribe(subscription)
+            source.close()
+
+    asyncio.run(exercise())
+
+
+def test_source_records_processing_time_even_when_projection_fails(monkeypatch) -> None:
+    async def exercise() -> None:
+        now = 0.0
+        client = _Client()
+        source = stream.ExecutionObservationSource(client, monotonic=lambda: now)
+
+        def fail_admit(response, cancel):
+            nonlocal now
+            now += 0.006
+            raise ValueError("invalid observation")
+
+        monkeypatch.setattr(source, "_admit_response", fail_admit)
+        subscription = source.subscribe()
+        try:
+            source.grant_credit(subscription, None)
+            await _next_cursor(client)
+            now = 12.0
+            client.responses.put(_status(sequence=1))
+            await _wait_for_error(source)
+            metrics = source.status()["source"]
+            assert metrics["last_source_wait_duration_us"] == 12_000_000
+            assert metrics["last_processing_duration_us"] == 6_000
+            assert metrics["max_processing_duration_us"] == 6_000
+            assert metrics["error_count"] == 1
+        finally:
+            source.unsubscribe(subscription)
+            source.close()
+
+    asyncio.run(exercise())
+
+
 def test_static_visible_credit_over_24_hours_creates_no_periodic_source_work() -> None:
     async def exercise() -> None:
         now = 0.0

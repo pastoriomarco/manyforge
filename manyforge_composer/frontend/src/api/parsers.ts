@@ -3726,8 +3726,8 @@ function parsePreparedActivationInput(
 ): PreparedActivationInput {
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'schema_version', 'prepared_activation_id', 'source_document_digest',
-    'captured_input_digest', 'deployment_artifact_id',
+    'schema_version', 'prepared_activation_id', 'scenario_id',
+    'source_document_digest', 'captured_input_digest', 'deployment_artifact_id',
     'deployment_revision', 'retained_bundle_id', 'graph_revision',
     'program_id', 'program_revision', 'program_outcome',
     'node_environment_digest', 'assistant_mode', 'typed_parameter_overrides',
@@ -3759,6 +3759,7 @@ function parsePreparedActivationInput(
     schemaVersion: 'manyforge.prepared_activation_input.v3',
     preparedActivationId: digestAt(record.prepared_activation_id,
       `${path}.prepared_activation_id`),
+    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
     sourceDocumentDigest: digestAt(record.source_document_digest,
       `${path}.source_document_digest`),
     capturedInputDigest: digestAt(record.captured_input_digest,
@@ -5041,12 +5042,17 @@ export function parseRuntimeOverrideMaterializationResponse(
 ): RuntimeOverrideMaterializationResponse {
   const path = 'runtimeOverrideMaterialization';
   const record = objectAt(value, path);
-  exactKeysAt(record, ['proposalId', 'mutation', 'details', 'workspace'], path);
+  exactKeysAt(
+    record,
+    ['proposalId', 'mutation', 'details', 'workspace', 'authoringWorkspace'],
+    path,
+  );
   return {
     proposalId: digestAt(record.proposalId, `${path}.proposalId`),
     mutation: stringAt(record.mutation, `${path}.mutation`),
     details: jsonRecordAt(record.details, `${path}.details`),
     workspace: parseProgramWorkspaceResponse(record.workspace),
+    authoringWorkspace: parseAuthoringWorkspaceSnapshot(record.authoringWorkspace),
   };
 }
 
@@ -6713,11 +6719,17 @@ export function parseSceneTransactionResponse(value: unknown): SceneTransactionR
 
 export function parseDraftMutationResponse(value: unknown): DraftMutationResponse {
   const record = objectAt(value, 'draftMutation');
-  exactKeysAt(record, ['mutation', 'details', 'workspace'], 'draftMutation');
+  exactKeysAt(
+    record,
+    ['mutation', 'details', 'workspace', 'authoringWorkspace'],
+    'draftMutation',
+  );
   return {
     mutation: stringAt(record.mutation, 'draftMutation.mutation'),
     details: jsonRecordAt(record.details, 'draftMutation.details'),
     workspace: parseProgramWorkspaceResponse(record.workspace),
+    // The shared authoring publication this edit committed.
+    authoringWorkspace: parseAuthoringWorkspaceSnapshot(record.authoringWorkspace),
   };
 }
 

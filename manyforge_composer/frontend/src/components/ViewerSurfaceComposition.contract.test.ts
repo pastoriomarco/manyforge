@@ -53,7 +53,8 @@ describe('UI4 application and viewport composition', () => {
     expect(styles).toMatch(/\.central-inspector-section \.program-property \{[\s\S]*?padding: var\(--inspector-row-padding\) 0;/);
     expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-joint \{[\s\S]*?padding: var\(--inspector-row-padding\) 0;/);
     expect(styles).toContain('.central-inspector-notice-warning');
-    expect(styles).toMatch(/\.workbench-notification-stack \{[\s\S]*?top: 0\.55rem;[\s\S]*?left: 50%;/);
+    // Notifications sit below the floating viewer controls with their insets.
+    expect(styles).toMatch(/\.workbench-notification-stack \{[\s\S]*?top: calc\(2\.85rem \+ 2 \* 0\.65rem\);[\s\S]*?left: 0\.65rem;/);
     expect(styles).toMatch(/\.workbench-notification-stack > \.runtime-observability-surface \{[^}]*position: static;/);
     expect(styles).not.toContain('.viewer-slot > .runtime-observability-surface');
   });

@@ -2414,3 +2414,104 @@ def test_standalone_overview_reuses_active_control_fact_reduction() -> None:
     source._subscriptions.clear()  # noqa: SLF001
     assert source.current_component_overview() is None
     ingress.close()
+
+
+def _control_with_pose(positions: list[float]) -> tuple[dict[str, Any], dict[str, Any]]:
+    identity = {"owner_epoch": "execution.1"}
+    row = {
+        "controllable_component_id": "ur5e_robot",
+        "command_target_id": "arm",
+        "observed": {"kind": "joint_positions", "positions_rad": positions},
+    }
+    return (
+        {"ok": True, "identity": identity, "targets": []},
+        {"ok": True, "identity": identity, "control_state": {"observed_targets": [row]}},
+    )
+
+
+def test_settled_motion_publishes_rest_pose_that_samples_alone_do_not() -> None:
+    async def exercise() -> None:
+        pose = [-0.25, -1.43, 1.0]
+
+        def facts(*, program_cycle, cancelled=None):
+            targets, control = _control_with_pose(list(pose))
+            return replace(
+                _facts_for_cycle(program_cycle),
+                execution_targets_response=targets,
+                execution_control_response=control,
+            )
+
+        ingress = _ingress([])
+        source = HeadlessControlStateSource(
+            SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=facts),
+            ingress,
+            program_runner_websocket_url=None,
+        )
+        subscription = await source.subscribe()
+        try:
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            previous = source.take(subscription)
+
+            async def reduced(count: int) -> None:
+                while source.diagnostics()["reductions"] < count:
+                    await asyncio.sleep(0.005)
+
+            # A moving robot's samples alone never publish.
+            pose[:] = [-0.35, -1.39, 1.1]
+            reductions = source.diagnostics()["reductions"]
+            source.notify_cold()
+            await asyncio.wait_for(reduced(reductions + 1), 1)
+            assert not subscription.wake.is_set()
+
+            # Once a motion settles, the rest pose is published and delivered.
+            pose[:] = [-0.45, -1.35, 1.2]
+            source.notify_motion_settled()
+            await asyncio.wait_for(subscription.wake.wait(), 1)
+            current = source.take(subscription)
+            rows = current.shell["execution_control_state"]["control_state"]["observed_targets"]
+            assert rows[0]["observed"]["positions_rad"] == [-0.45, -1.35, 1.2]
+            session = ExecutionControlSession(object(), source, ingress)  # type: ignore[arg-type]
+            delta = session._delta_message(current, previous)  # noqa: SLF001
+            assert delta.shell["execution_control_state"] == current.shell["execution_control_state"]
+
+            # A second settle with an unchanged pose publishes nothing new.
+            reductions = source.diagnostics()["reductions"]
+            source.notify_motion_settled()
+            await asyncio.wait_for(reduced(reductions + 1), 1)
+            assert not subscription.wake.is_set()
+        finally:
+            await source.unsubscribe(subscription)
+            ingress.close()
+
+    asyncio.run(exercise())
+
+
+def test_control_delta_carries_changed_rest_pose_without_meaningful_change() -> None:
+    ingress = _ingress([])
+    cycle = _cycle()
+    shell = {**_shell_for_cycle(cycle), "program_cycle": cycle}
+    _targets, before = _control_with_pose([-0.25, -1.43, 1.0])
+    _targets, after = _control_with_pose([-0.45, -1.35, 1.2])
+    previous = ControlStateFrame(
+        generation=1,
+        event_class="cold",
+        control=build_control_projection(cycle, ingress),
+        shell={**shell, "execution_control_state": before},
+    )
+    current = ControlStateFrame(
+        generation=2,
+        event_class="cold",
+        control=build_control_projection(cycle, ingress),
+        shell={**shell, "execution_control_state": after},
+    )
+    session = ExecutionControlSession(  # type: ignore[arg-type]
+        object(), _Source(previous), ingress
+    )
+    try:
+        message = session._delta_message(current, previous)  # noqa: SLF001
+        unchanged = session._delta_message(previous, previous)  # noqa: SLF001
+    finally:
+        ingress.close()
+
+    assert message.shell == {"complete": False, "execution_control_state": after}
+    assert unchanged.shell == {"complete": False}

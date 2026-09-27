@@ -305,8 +305,10 @@ class ExecutionObservationSource:
         self._sent = 0
         self._coalesced = 0
         self._errors = 0
-        self._last_wake_duration_us = 0
-        self._max_wake_duration_us = 0
+        self._last_source_wait_duration_us = 0
+        self._max_source_wait_duration_us = 0
+        self._last_processing_duration_us = 0
+        self._max_processing_duration_us = 0
         self._last_error: dict[str, str] | None = None
 
     def subscribe(self) -> ExecutionObservationSubscription:
@@ -412,7 +414,7 @@ class ExecutionObservationSource:
         with self._condition:
             last_error = None if self._last_error is None else dict(self._last_error)
             return {
-                "schema_version": "manyforge.execution_observation_stream_status.v2",
+                "schema_version": "manyforge.execution_observation_stream_status.v3",
                 "source": {
                     "active": self._active_upstream_cancel is not None,
                     "mode": "change_driven",
@@ -420,8 +422,10 @@ class ExecutionObservationSource:
                     "wake_count": self._source_wakes,
                     "published_count": self._published,
                     "error_count": self._errors,
-                    "last_wake_duration_us": self._last_wake_duration_us,
-                    "max_wake_duration_us": self._max_wake_duration_us,
+                    "last_source_wait_duration_us": self._last_source_wait_duration_us,
+                    "max_source_wait_duration_us": self._max_source_wait_duration_us,
+                    "last_processing_duration_us": self._last_processing_duration_us,
+                    "max_processing_duration_us": self._max_processing_duration_us,
                     "last_error": last_error,
                     "periodic_http_requests": 0,
                 },
@@ -592,12 +596,26 @@ class ExecutionObservationSource:
                         )
                         with self._condition:
                             self._source_wakes += 1
-                            self._last_wake_duration_us = elapsed_us
-                            self._max_wake_duration_us = max(
-                                self._max_wake_duration_us,
+                            # The upstream read intentionally waits for change;
+                            # it is not a measure of projection/encoding work.
+                            self._last_source_wait_duration_us = elapsed_us
+                            self._max_source_wait_duration_us = max(
+                                self._max_source_wait_duration_us,
                                 elapsed_us,
                             )
-                        self._admit_response(response, cancel)
+                        processing_started = self._monotonic()
+                        try:
+                            self._admit_response(response, cancel)
+                        finally:
+                            processing_us = max(
+                                0,
+                                round((self._monotonic() - processing_started) * 1_000_000),
+                            )
+                            with self._condition:
+                                self._last_processing_duration_us = processing_us
+                                self._max_processing_duration_us = max(
+                                    self._max_processing_duration_us, processing_us
+                                )
             except Exception as error:
                 failure = error
             finally:

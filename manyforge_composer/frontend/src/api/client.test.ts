@@ -428,6 +428,7 @@ function appliedResultFixture(): Record<string, unknown> {
     prepared_activation: {
       schema_version: 'manyforge.prepared_activation_input.v3',
       prepared_activation_id: digestC,
+      scenario_id: 'fixture',
       source_document_digest: digestA,
       captured_input_digest: digestB,
       deployment_artifact_id: 'cell-a',
@@ -601,6 +602,7 @@ describe('structural API client', () => {
       mutation: 'tree_draft_update_node_params',
       details: { updated_instance_id: 'wait' },
       workspace: workspaceFixture(),
+      authoringWorkspace: authoringWorkspaceFixture(),
     }));
     vi.stubGlobal('fetch', fetchMock);
 
@@ -626,6 +628,7 @@ describe('structural API client', () => {
       },
     });
     expect(result.workspace.saved.matchesDraft).toBe(true);
+    expect(result.authoringWorkspace.workspaceRevision).toBe(3);
   });
 
   it('forwards Apply without client-owned state', async () => {

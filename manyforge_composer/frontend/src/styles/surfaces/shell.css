@@ -767,17 +767,20 @@
 /* One notification location in the viewer stage: errors (with the
    Runtime/history view), then warnings, then activity. It is bounded above
    the transport controls; only the rows themselves take pointer input. */
+/* Below the floating viewer controls, with their side insets, so the
+   notifications line up with the controls instead of covering them. */
 .workbench-notification-stack {
   position: absolute;
   z-index: var(--mf-z-popover);
-  top: 0.55rem;
-  left: 50%;
+  top: calc(var(--mf-viewer-control-height) + 2 * var(--mf-viewer-overlay-inset));
+  right: var(--mf-viewer-overlay-inset);
+  left: var(--mf-viewer-overlay-inset);
   display: flex;
-  width: min(48rem, calc(100% - 1.1rem));
-  max-height: calc(100% - 5.5rem);
+  max-height: calc(
+    100% - var(--mf-viewer-control-height) - 2 * var(--mf-viewer-overlay-inset) - 4.95rem
+  );
   flex-direction: column;
   gap: 0.35rem;
-  transform: translateX(-50%);
   pointer-events: none;
 }
 

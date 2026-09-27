@@ -97,7 +97,7 @@ def _viewer_status(composer_backend_url: str) -> dict[str, Any]:
     fanout = value.get("fanout")
     if (
         value.get("schema_version")
-        != "manyforge.execution_observation_stream_status.v2"
+        != "manyforge.execution_observation_stream_status.v3"
         or not isinstance(source, dict)
         or not isinstance(fanout, dict)
     ):

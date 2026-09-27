@@ -23,6 +23,7 @@ vi.mock('../api/client', () => ({
 }));
 
 import { useAuthoringWorkspace } from './useAuthoringWorkspace';
+import type { ControlTransportStatus } from './useHeadlessState';
 
 type FakeNode = {
   nodeType: number;
@@ -178,7 +179,10 @@ function headlessSnapshot(
 let root: { render: (value: ReactNode) => void; unmount: () => void } | null = null;
 let latest: ReturnType<typeof useAuthoringWorkspace> | null = null;
 
-async function mountHarness(initialSnapshot: ComposerHeadlessState | null) {
+async function mountHarness(
+  initialSnapshot: ComposerHeadlessState | null,
+  initialTransport: ControlTransportStatus = 'connected',
+) {
   const document = {
     nodeType: 9,
     documentElement: null,
@@ -220,10 +224,12 @@ async function mountHarness(initialSnapshot: ComposerHeadlessState | null) {
   root = createRoot(makeNode('div') as unknown as Element);
   function Harness({
     currentSnapshot,
+    transport,
   }: {
     currentSnapshot: ComposerHeadlessState | null;
+    transport: ControlTransportStatus;
   }) {
-    const controller = useAuthoringWorkspace(currentSnapshot);
+    const controller = useAuthoringWorkspace(currentSnapshot, transport);
     useEffect(() => {
       latest = controller;
       return () => {
@@ -233,11 +239,16 @@ async function mountHarness(initialSnapshot: ComposerHeadlessState | null) {
     return null;
   }
   await act(async () => {
-    root?.render(createElement(Harness, { currentSnapshot: initialSnapshot }));
+    root?.render(createElement(Harness, {
+      currentSnapshot: initialSnapshot, transport: initialTransport,
+    }));
   });
-  return async (nextSnapshot: ComposerHeadlessState | null) => {
+  return async (
+    nextSnapshot: ComposerHeadlessState | null,
+    transport: ControlTransportStatus = 'connected',
+  ) => {
     await act(async () => {
-      root?.render(createElement(Harness, { currentSnapshot: nextSnapshot }));
+      root?.render(createElement(Harness, { currentSnapshot: nextSnapshot, transport }));
     });
   };
 }
@@ -263,6 +274,50 @@ describe('useAuthoringWorkspace', () => {
     root = null;
     latest = null;
     vi.unstubAllGlobals();
+  });
+
+  it('keeps the installed publication through same-session delayed and stale recovery', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    const installed = latest?.published;
+    for (const status of ['delayed', 'stale', 'connected', 'delayed', 'connected'] as const) {
+      await rerender(headlessSnapshot(1), status);
+    }
+    expect(apiMock.authoringWorkspace.get).toHaveBeenCalledTimes(1);
+    expect(latest?.published).toBe(installed);
+  });
+
+  it('reads once after a real reconnect, even through delay, and retains identical objects', async () => {
+    apiMock.authoringWorkspace.get.mockImplementation(async () => snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    const installed = latest?.published;
+    for (const status of ['disconnected', 'connecting', 'delayed', 'stale', 'connected'] as const) {
+      await rerender(headlessSnapshot(1), status);
+    }
+    await flush();
+    expect(apiMock.authoringWorkspace.get).toHaveBeenCalledTimes(2);
+    expect(latest?.published).toBe(installed);
+    await rerender(headlessSnapshot(1));
+    expect(apiMock.authoringWorkspace.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('coalesces reconnect and identity reads while a newer publication is pending', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValueOnce(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    const installed = latest?.published;
+    await rerender(headlessSnapshot(1), 'disconnected');
+    const next = deferred<AuthoringWorkspaceSnapshot>();
+    apiMock.authoringWorkspace.get.mockReturnValueOnce(next.promise);
+    await rerender(headlessSnapshot(2), 'connected');
+    expect(apiMock.authoringWorkspace.get).toHaveBeenCalledTimes(2);
+    expect(latest?.current).toBe(false);
+    next.resolve(snapshotFixture(2, 3, 4, '/workspace/cell'));
+    await flush();
+    expect(latest?.published).not.toBe(installed);
+    expect(latest?.current).toBe(true);
   });
 
   it('reads the composite snapshot once per observed identity', async () => {

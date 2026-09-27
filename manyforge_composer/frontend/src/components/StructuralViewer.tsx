@@ -1228,9 +1228,14 @@ export function MeasuredRobotFrameDriver({
     // The slower structural/runtime projection is bootstrap-only after the
     // dedicated observation stream has supplied its first exact frame.
     if (!acceptLatestLivePresentation() && !acceptedLiveFrame.current) {
-      if (acceptPresentation(presentation)) wake();
+      // With a live stream, the stored presentation is only the pose the
+      // links were mounted with. Never re-apply it over live frames: a stored
+      // pose can be older than what the robot is doing now (sim and real
+      // lanes can move the robot without any control-state change). Keep the
+      // current pose until the next usable live frame.
+      if (livePresentation === undefined && acceptPresentation(presentation)) wake();
     }
-  }, [acceptLatestLivePresentation, acceptPresentation, presentation, wake]);
+  }, [acceptLatestLivePresentation, acceptPresentation, livePresentation, presentation, wake]);
 
   useLayoutEffect(() => {
     if (livePresentation === undefined) return undefined;

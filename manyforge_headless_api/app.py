@@ -506,6 +506,7 @@ def create_app(
     )
     if event_pump is not None:
         event_pump.set_change_observer(control_state_source.notify_cold)
+        event_pump.set_settled_observer(control_state_source.notify_motion_settled)
     service_cclc = getattr(service, "cclc", None)
     if cclc is None:
         cclc = service_cclc

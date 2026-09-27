@@ -1757,3 +1757,20 @@ def test_event_pump_marks_a_lost_current_source_unknown() -> None:
 
     assert pump.last_error is not None
     assert "execution_command_unavailable" in pump.last_error
+
+
+def test_operation_settled_classifies_rest_states_and_terminal_stop() -> None:
+    def event(state: str) -> dict[str, Any]:
+        return {"record_kind": "state_observed", "payload": {"operation_state": {"state": state}}}
+
+    for state in ("completed", "paused", "stopped", "failed", "interrupted",
+                  "intervention_required", "cancelled_pre_dispatch"):
+        assert ExecutionEventPump._operation_is_settled(event(state)), state  # noqa: SLF001
+    for state in ("queued", "planning", "validating", "prepared", "executing", "stopping"):
+        assert not ExecutionEventPump._operation_is_settled(event(state)), state  # noqa: SLF001
+    assert ExecutionEventPump._operation_is_settled(  # noqa: SLF001
+        {"record_kind": "stop_terminal_projected", "payload": {}}
+    )
+    assert not ExecutionEventPump._operation_is_settled(  # noqa: SLF001
+        {"record_kind": "stop_acceptance_projected", "payload": {}}
+    )
