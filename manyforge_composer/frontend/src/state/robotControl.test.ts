@@ -389,7 +389,7 @@ describe('addressed Robot Control state', () => {
     expect(restarted.motionSettings.velocityScale).toBe(1);
   });
 
-  it('bounds defaults by the Deployment TCP maximum and rejects larger requests before preview', () => {
+  it('bounds TCP defaults but preserves larger requests for backend capping', () => {
     const status = statusFixture();
     status.directControl!.targetDescriptor.operationalLimit = {
       maximumTcpLinearSpeedMps: 0.05,
@@ -403,8 +403,15 @@ describe('addressed Robot Control state', () => {
     ]) expect(intent.participants[0].payload).toMatchObject({
       speed_profile: { max_tcp_linear_speed_mps: 0.05 },
     });
+    const capped = robotControlReducer(loaded, {
+      type: 'edit_motion_settings', update: { tcpLinearSpeedMps: 0.06 },
+    });
+    expect(capped.motionSettings.tcpLinearSpeedMps).toBe(0.06);
+    expect(buildJointMotionIntent(status, [0.2, -0.4], 'capped', capped.motionSettings)
+      .participants[0].payload).toMatchObject({
+      speed_profile: { max_tcp_linear_speed_mps: 0.06 },
+    });
     const updates: Array<Partial<ManualMotionSettings>> = [
-      { tcpLinearSpeedMps: 0.06 },
       { jointLimits: { joint1: { max_velocity_rad_s: 1.6 } } },
       { jointLimits: { joint1: { max_acceleration_rad_s2: 2.6 } } },
       { jointLimits: { joint2: { max_velocity_rad_s: 2.1 } } },

@@ -696,9 +696,13 @@ TEST(SqliteOperationJournalTest,
               RuntimePolicyRevision(Digest('2').value()), SchemaId("manyforge.runtime_policy.v1"),
               SchemaRevision(Digest('3').value()), Digest('4'),
               ContentAddressedStoreKey("catalog/runtime-policy/cell/record")}},
-      0.12,
+      0.25,
       0.15,
-      0.12}};
+      0.15}};
+  auto incorrect = diagnostics;
+  incorrect.front().admitted_tcp_linear_speed_mps = 0.12;
+  EXPECT_FALSE(journal.RecordOperationState(epoch, state, nullptr,
+      "subordinate_motion_prepared", incorrect).ok());
   const auto recorded = journal.RecordOperationState(epoch, state, nullptr,
                                                      "subordinate_motion_prepared", diagnostics);
   ASSERT_TRUE(recorded.ok()) << recorded.error().message;
@@ -732,10 +736,10 @@ TEST(SqliteOperationJournalTest,
   EXPECT_NE(payload.find("\"content_addressed_store_key\":"
                          "\"catalog/runtime-policy/cell/record\""),
             std::string::npos);
-  EXPECT_NE(payload.find("\"requested_tcp_linear_speed_mps\":0.12"), std::string::npos);
+  EXPECT_NE(payload.find("\"requested_tcp_linear_speed_mps\":0.25"), std::string::npos);
   EXPECT_NE(payload.find("\"deployment_maximum_tcp_linear_speed_mps\":0.15"),
             std::string::npos);
-  EXPECT_NE(payload.find("\"admitted_tcp_linear_speed_mps\":0.12"), std::string::npos);
+  EXPECT_NE(payload.find("\"admitted_tcp_linear_speed_mps\":0.15"), std::string::npos);
 
   const auto reopened = [&]() {
     journal.Close();

@@ -1296,7 +1296,7 @@ class HeadlessService:
             or any(
                 not _bounded_text(instance_id, maximum_bytes=512)
                 or not isinstance(status, str)
-                or status not in {"idle", "running", "success", "failure"}
+                or status not in {"idle", "running", "held", "success", "failure"}
                 for instance_id, status in node_statuses.items()
             )
             or (

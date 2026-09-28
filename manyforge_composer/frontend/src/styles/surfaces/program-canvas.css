@@ -76,6 +76,38 @@
   border-color: var(--mf-status-failure);
 }
 
+/* Held: ticking, but its motion waits for Run. Magenta border (same width
+   as every status) plus a pause badge, so it does not rely on colour alone. */
+.bt-node.status-held {
+  border-color: var(--mf-status-held);
+}
+
+.bt-node-held-badge {
+  display: grid;
+  width: 13px;
+  height: 13px;
+  place-items: center;
+  border-radius: var(--mf-radius-pill);
+  color: var(--mf-bg-neutral-08);
+  background: var(--mf-status-held);
+}
+
+.bt-node-held-badge svg {
+  width: 60%;
+  height: 60%;
+  fill: currentColor;
+}
+
+.bt-node > .bt-node-held-badge {
+  position: absolute;
+  z-index: var(--mf-z-raised);
+  top: -9px;
+  right: -9px;
+  width: 18px;
+  height: 18px;
+  box-shadow: 0 0 0 2px var(--mf-bg-neutral-08);
+}
+
 .bt-node.invalid {
   border-color: var(--mf-status-failure);
   box-shadow: 0 0 0 1px var(--mf-shadow-danger-62-a35);
@@ -119,6 +151,165 @@
   white-space: normal;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+/* Collapse chevron of a composite, in the node's empty right band. Quiet:
+   no border, faint tile, shown when the node is hovered or the chevron is
+   focused. A collapsed node always shows it, since it is the way back. */
+.bt-node-fold {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  width: 1.35rem;
+  height: 1.35rem;
+  place-items: center;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  border: 0;
+  border-radius: var(--mf-radius-md-sm);
+  color: var(--mf-text-neutral-57);
+  background: var(--mf-bg-neutral-15-a60);
+  opacity: 0;
+  transition: opacity 120ms, background 120ms, color 120ms;
+}
+
+.bt-node-fold svg {
+  width: 0.8rem;
+  height: 0.8rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.bt-node:hover .bt-node-fold,
+.bt-node.collapsed .bt-node-fold,
+.bt-node-fold:focus-visible {
+  opacity: 1;
+}
+
+.bt-node:hover .bt-node-fold {
+  color: var(--mf-text-neutral-78);
+  background: var(--mf-bg-neutral-15);
+}
+
+.bt-node .bt-node-fold:hover,
+.bt-node .bt-node-fold:focus-visible {
+  color: var(--mf-text-neutral-94b);
+  background: var(--mf-bg-neutral-19);
+}
+
+/* Collapsed node: the usual header, then its whole subtree as a list. It
+   grows to fit the list, from the node width up to a cap; past the cap,
+   names end in an ellipsis (full name in the tooltip). */
+.bt-node.collapsed {
+  grid-template-rows: var(--mf-node-collapsed-header-height) auto;
+  width: max-content;
+  min-width: var(--mf-node-width);
+  max-width: var(--mf-node-collapsed-max-width);
+  height: auto;
+  padding-bottom: 6px;
+}
+
+.bt-node.collapsed .bt-node-name {
+  -webkit-line-clamp: 1;
+}
+
+/* Links attach at the header, not halfway down the list. */
+.bt-node.collapsed[data-layout-direction="vertical"] > .react-flow__handle {
+  top: calc(var(--mf-node-collapsed-header-height) / 2);
+}
+
+.bt-node-collapsed-list {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 3px;
+  margin: 0 6px;
+  padding-top: 5px;
+  border-top: 1px solid var(--mf-border-neutral-32);
+}
+
+/* Style D: border and left bar both in the item's execution status colour.
+   A composite item is a box that encloses its own children. */
+.bt-node-collapsed-item {
+  --item-status: var(--mf-status-idle);
+  border: 1.5px solid var(--item-status);
+  border-radius: 4px;
+  background: var(--mf-bg-neutral-15);
+  box-shadow: inset 4px 0 0 var(--item-status);
+}
+
+.bt-node-collapsed-item.group {
+  background: var(--mf-bg-neutral-11);
+}
+
+.bt-node-collapsed-item.status-running {
+  --item-status: var(--mf-status-running);
+}
+
+.bt-node-collapsed-item.status-held {
+  --item-status: var(--mf-status-held);
+}
+
+.bt-node-collapsed-item.status-success {
+  --item-status: var(--mf-status-success);
+}
+
+.bt-node-collapsed-item.status-failure,
+.bt-node-collapsed-item.invalid {
+  --item-status: var(--mf-status-failure);
+}
+
+/* Only a running leaf glows; a running box would light its whole group. */
+.bt-node-collapsed-item.leaf.status-running {
+  box-shadow: inset 4px 0 0 var(--item-status), 0 0 0.5rem var(--mf-shadow-warning-60-a28);
+}
+
+.bt-node-collapsed-item.selected {
+  outline: 1.5px solid var(--mf-border-neutral-94);
+  outline-offset: 1px;
+}
+
+.bt-node-collapsed-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 6px 0 9px;
+  font-size: var(--mf-font-size-072);
+  text-align: left;
+  cursor: pointer;
+}
+
+.bt-node-collapsed-row:hover {
+  filter: brightness(1.15);
+}
+
+.bt-node-collapsed-row > .program-category-icon {
+  --program-icon-size: 15px;
+  width: 15px;
+  height: 15px;
+}
+
+.bt-node-collapsed-name {
+  overflow: hidden;
+  color: var(--mf-text-neutral-90);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bt-node-collapsed-count {
+  color: var(--mf-text-neutral-57);
+  font-size: var(--mf-font-size-062);
+}
+
+.bt-node-collapsed-body {
+  display: grid;
+  gap: 3px;
+  padding: 0 4px 4px 12px;
 }
 
 /* Kind symbol in the availability colour, only when not executable. It sits
@@ -842,21 +1033,24 @@
   max-height: none;
   align-items: stretch;
   gap: 0.18rem;
-  overflow: hidden;
   padding: 0.18rem;
   border-radius: var(--mf-radius-md-sm);
   box-sizing: border-box;
-  white-space: nowrap;
 }
 
+/* Rows wrap instead of scrolling so every command stays visible. */
 .program-tree-react-flow .program-tree-action-row {
   display: flex;
   min-width: 0;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 0.35rem;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: thin;
+  gap: 0.25rem 0.35rem;
+  white-space: nowrap;
+}
+
+.program-tree-react-flow .program-tree-action-row + .program-tree-action-row {
+  padding-top: 0.18rem;
+  border-top: 1px solid var(--mf-border-neutral-19);
 }
 
 .program-tree-react-flow .program-tree-actions button,
@@ -871,9 +1065,16 @@
 
 .program-tree-react-flow .program-tree-actions .inline-select-label {
   display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
   align-items: center;
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   gap: 0.35rem;
+}
+
+.program-tree-react-flow .program-tree-actions .inline-select-label select {
+  min-width: 0;
+  max-width: 12rem;
 }
 
 .node-information,
@@ -939,4 +1140,158 @@
   color: var(--mf-text-accent-82);
   background: var(--mf-bg-neutral-08);
   font-size: var(--mf-font-size-062);
+}
+
+/* Tree editor help ("?" in the canvas top bar): a short how-to, collapsed by
+   default, then the legend of colours, marks, collapsing and shortcuts. */
+.program-canvas-help-panel {
+  display: grid;
+  max-width: 44rem;
+  gap: 0.9rem;
+  color: var(--mf-text-neutral-68);
+  font-size: var(--mf-font-size-076);
+  line-height: 1.45;
+}
+
+.program-canvas-help-panel h4 {
+  margin: 0 0 0.35rem;
+  color: var(--mf-text-neutral-90);
+  font-size: var(--mf-font-size-076);
+}
+
+.program-canvas-help-panel strong {
+  color: var(--mf-text-neutral-82);
+}
+
+.program-canvas-help-panel ul,
+.program-canvas-help-panel p {
+  margin: 0;
+}
+
+.program-canvas-help-panel ul {
+  display: grid;
+  gap: 0.3rem;
+  padding-left: 1.1rem;
+}
+
+.program-canvas-help-howto {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--mf-border-neutral-23);
+  border-radius: var(--mf-radius-md-sm);
+}
+
+.program-canvas-help-howto > summary {
+  color: var(--mf-text-neutral-90);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.program-canvas-help-howto[open] > summary {
+  margin-bottom: 0.45rem;
+}
+
+.program-canvas-help-panel .program-canvas-help-legend {
+  padding-left: 0;
+  list-style: none;
+}
+
+.program-canvas-help-legend > li {
+  display: grid;
+  grid-template-columns: 2.4rem minmax(0, 1fr);
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.program-canvas-help-legend + p {
+  margin-top: 0.35rem;
+}
+
+/* A small node border in each execution status, as on the canvas. */
+.program-canvas-help-swatch {
+  position: relative;
+  width: 2.2rem;
+  height: 1.3rem;
+  box-sizing: border-box;
+  border: 2px solid var(--mf-status-idle);
+  border-radius: var(--mf-radius-md-sm);
+  background: var(--mf-bg-neutral-23);
+}
+
+.program-canvas-help-swatch.status-running {
+  border-color: var(--mf-status-running);
+  box-shadow: 0 0 0.5rem var(--mf-shadow-warning-60-a28);
+}
+
+.program-canvas-help-swatch.status-held {
+  border-color: var(--mf-status-held);
+}
+
+.program-canvas-help-swatch > .bt-node-held-badge {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  box-shadow: 0 0 0 2px var(--mf-bg-neutral-08);
+}
+
+.program-canvas-help-swatch.status-success {
+  border-color: var(--mf-status-success);
+}
+
+.program-canvas-help-swatch.status-failure {
+  border-color: var(--mf-status-failure);
+}
+
+.program-canvas-help-swatch.invalid {
+  border-color: var(--mf-status-failure);
+  box-shadow: 0 0 0 1px var(--mf-shadow-danger-62-a35);
+}
+
+.program-canvas-help-icon {
+  justify-self: center;
+  width: 1.3rem;
+  height: 1.3rem;
+}
+
+.program-canvas-help-icon > .program-category-icon {
+  --program-icon-size: 1.3rem;
+  width: 100%;
+  height: 100%;
+}
+
+.program-canvas-help-mark {
+  justify-self: center;
+  width: var(--mf-node-status-size);
+  height: var(--mf-node-status-size);
+  color: var(--mf-availability-unavailable);
+}
+
+.program-canvas-help-mark.configuration_required {
+  color: var(--mf-availability-configuration-required);
+}
+
+.program-canvas-help-mark > .program-kind-symbol {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.program-canvas-help-keys {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+}
+
+.program-canvas-help-keys > div {
+  display: grid;
+  grid-template-columns: 11rem minmax(0, 1fr);
+  gap: 0.6rem;
+}
+
+.program-canvas-help-keys dd {
+  margin: 0;
+}
+
+.program-canvas-help-keys kbd {
+  color: var(--mf-text-neutral-82);
+  font: var(--mf-font-size-068) var(--mf-font-mono);
 }

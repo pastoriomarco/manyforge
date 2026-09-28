@@ -674,8 +674,13 @@ class ProgramRunTickHost:
             )
         return (
             snapshot.state is ProgramRunState.INTERVENTION_REQUIRED
-            and self._owner.operator_stop_observation_required(
-                snapshot.capture.program_run_id
+            and (
+                self._owner.operator_stop_observation_required(
+                    snapshot.capture.program_run_id
+                )
+                or self._owner.failure_pause_stop_pending(
+                    snapshot.capture.program_run_id
+                )
             )
         )
 

@@ -34,6 +34,16 @@ describe('UI4 application and viewport composition', () => {
     expect(viewer).toContain("inspectorPanel === 'robot' && robotControlBlocked");
     expect(viewer).toContain('aria-label="Robot control information"');
     expect(viewer).toContain('{props.runtimeOverlay}');
+    // A manual move forces Robot control open and keeps Stop at hand; it
+    // replaces the removed Cell Full Stop in the run details.
+    const workspace = source('./SceneAuthoringWorkspace.tsx');
+    const robotPanel = source('./RobotControlPanel.tsx');
+    expect(workspace).toContain('robotMotionActive={robotControlHasActiveOperation(robotControl.state)}');
+    expect(viewer).toContain("setInspectorPanel('robot');");
+    expect(viewer).toContain('if (robotPanelLocked) return;');
+    expect(viewer.match(/disabled=\{inspectorPanel === null \|\| robotPanelLocked\}/g)).toHaveLength(2);
+    expect(robotPanel).toContain('if (canStop) stopButton.current?.focus();');
+    expect(robotPanel).toContain('ref={stopButton}');
     expect(styles).toContain('.central-inspector-body.robot-inspector-body');
     // Shared panel geometry applies in docked and floating hosts. The real
     // Firefox qualification checks the resulting pinned footer at each size;
@@ -73,12 +83,12 @@ describe('UI4 application and viewport composition', () => {
     expect(transport).toContain("'Halting' : 'Halt'");
     expect(transport).toContain('program.fullStop()');
     expect(transport).toContain('program.resumeFullStop()');
-    expect(transport).toContain('Cell Full Stop');
+    // Cell Full Stop left the run details (operator decision 2026-09-28).
+    expect(transport).not.toContain("robot.fullStop()");
     expect(transport).not.toContain('transport-stop-disclosure');
     expect(transport).not.toContain("motionPaused ? robot.resume() : robot.pause()");
-    expect(transport).toContain("robot.fullStop()");
-    expect(transport).toContain('expectedStopGeneration');
-    expect(transport).toContain('Latest certificate');
+    expect(transport).toContain('robot.recoverStopFault()');
+    expect(transport).toContain('Closing or reloading Composer only stops watching');
     expect(transport).toContain('program.setGroupRuntimeScale');
     expect(robotControl).toContain("sendExecutionCommand(");
     expect(robotControl).toContain("'cell_full_stop'");
@@ -106,7 +116,7 @@ describe('UI4 application and viewport composition', () => {
     expect(styles).toMatch(/\.transport-unique-column \{[^}]*border: 1px solid #365563;[^}]*background: rgb\(8 23 32 \/ 94%\);[^}]*margin-left: auto;/s);
     expect(styles).toContain('--viewer-transport-control-height: 2.85rem;');
     expect(styles).toContain('--viewer-transport-column-width: 7rem;');
-    expect(styles).toMatch(/\.viewer-transport button \{[\s\S]*?height: var\(--viewer-transport-control-height\);[\s\S]*?font-size: 0\.84rem;/);
+    expect(styles).toMatch(/\.viewer-transport button:not\(\.overlay-panel \*\) \{[\s\S]*?height: var\(--viewer-transport-control-height\);[\s\S]*?font-size: 0\.84rem;/);
     expect(styles).toMatch(/\.transport-group-scale \{[\s\S]*?"label output"[\s\S]*?"slider slider";/);
     expect(styles).toMatch(/\.transport-group-scale input \{[\s\S]*?grid-area: slider;[\s\S]*?width: 100%;/);
     expect(styles).toMatch(/\.transport-group-scale \{[^}]*border: 1px solid #405764;[^}]*border-radius: 0\.45rem;/s);

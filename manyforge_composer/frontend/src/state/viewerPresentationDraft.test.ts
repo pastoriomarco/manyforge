@@ -18,7 +18,9 @@ describe('viewer presentation draft reducer', () => {
   it('shows a loaded Draft beside a nonempty Applied Scene without changing authority', () => {
     expect(sceneSourceIsDraft('auto', true, true, true, false)).toBe(true);
     expect(sceneSourceIsDraft('applied', true, true, true, false)).toBe(false);
-    expect(sceneSourceIsDraft('draft', true, true, false, false)).toBe(true);
+    expect(sceneSourceIsDraft('draft', true, true, true, false)).toBe(true);
+    // A leftover Draft choice cannot keep a hidden Draft view once they match.
+    expect(sceneSourceIsDraft('draft', true, true, false, false)).toBe(false);
     expect(sceneSourceIsDraft('draft', false, true, true, false)).toBe(false);
   });
 

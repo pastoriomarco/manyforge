@@ -61,7 +61,7 @@ export function programCurrentStatusSummary(
   const activeNodes = run === null
     ? []
     : Object.entries(run.nodeStatuses)
-      .filter(([, status]) => status === 'running' || status === 'failure')
+      .filter(([, status]) => status === 'running' || status === 'held' || status === 'failure')
       .slice(0, 6)
       .map(([node, status]) => `${node}=${status}`);
   const recovery = controls?.recoveryOffer ?? null;
@@ -362,32 +362,6 @@ export function buildProgramResetRequest(
     expected_claim_generation: cycle.cycleClaimGeneration,
     terminal_reference: cycle.terminalOrSettlementReference,
     settlement_evidence_digest: cycle.terminalOrSettlementReference,
-  };
-}
-
-export function buildProgramStopRequest(
-  snapshot: ComposerHeadlessState | null,
-  requestOwnerEpoch: string,
-  requestId: string,
-): Record<string, JsonValue> | null {
-  const cycle = snapshot?.programCycle;
-  const allowed = cycle?.allowedCommands.some(
-    (command) => command.commandKind === 'program_stop' && command.allowed,
-  ) ?? false;
-  if (
-    cycle === undefined
-    || !allowed
-    || !['starting', 'running'].includes(cycle.state)
-    || cycle.programRunId === null
-  ) return null;
-  return {
-    request_id: requestId,
-    request_owner_epoch: requestOwnerEpoch,
-    source_label: 'operator_ui',
-    correlation_id: requestId,
-    program_run_id: cycle.programRunId,
-    expected_owner_epoch: cycle.programRunnerOwnerEpoch,
-    reason: 'ordinary operator Program Stop',
   };
 }
 
@@ -937,29 +911,6 @@ export function useProgramRuntime(
     recordCommandFailure, refresh, snapshot,
   ]);
 
-  const stop = useCallback(async () => {
-    if (!state.runnerAvailable || ['stop', 'full-stop', 'reset']
-      .includes(state.pending ?? '')) return;
-    const requestId = identity('program-run-stop');
-    const request = buildProgramStopRequest(
-      snapshot, callerEpoch.current, requestId,
-    );
-    if (controlSource === null || request === null) return;
-    beginProgramCommand('stop', requestId);
-    try {
-      await controlSource.sendExecutionCommand(
-        'program_stop', request, requestId,
-      );
-    } catch (reason) {
-      await recordCommandFailure(
-        reason, 'Program Stop was rejected.', requestId, 'program', 'stop',
-      );
-    }
-  }, [
-    beginProgramCommand, controlSource,
-    recordCommandFailure,
-    snapshot, state.pending, state.runnerAvailable,
-  ]);
 
   const selectionCommand = useCallback(async (
     pending: 'start-motion' | 'motion-stop' | 'resume-motion', groupIds: string[],
@@ -1710,7 +1661,6 @@ export function useProgramRuntime(
     commitGroupRuntimeScale,
     fullStop,
     resumeFullStop,
-    stop,
     reset,
     applyRecoveryAction,
     stageObservationOverride,
@@ -1748,7 +1698,6 @@ export function useProgramRuntime(
     stageManualResult,
     stageObservationOverride,
     state,
-    stop,
     materializePromotion,
     promotionMaterializationReason,
     runtimeOverrideAction,

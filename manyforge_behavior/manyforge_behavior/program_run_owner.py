@@ -48,7 +48,10 @@ PROGRAM_RUN_INPUT_API: Final = "manyforge.program_run_input.v1"
 APPLIED_PROGRAM_SELECTION_API: Final = "manyforge.applied_program_selection.v2"
 _MAX_RETAINED_RUNS: Final = 4_096
 _MAX_NODE_STATUSES: Final = 100_000
-_NODE_STATUSES: Final = frozenset({"idle", "running", "success", "failure"})
+_NODE_STATUSES: Final = frozenset({"idle", "running", "held", "success", "failure"})
+_FAILURE_PAUSE_UNCONFIRMED: Final = (
+    "Stopping the Program's other motion is not confirmed yet."
+)
 
 
 class ProgramRunOwnerError(RuntimeError):
@@ -368,6 +371,9 @@ class _RunEntry:
     message: str = ""
     pending_diagnostic: dict[str, Any] | None = None
     stop_requested: bool = False
+    # A failure pause stops the Program's other motion, like Halt. Set when
+    # the pause is entered; applied after the tick, outside the run locks.
+    failure_pause_stop_pending: bool = False
     state_after_stop: ProgramRunState = ProgramRunState.STOPPED
     state_after_stop_reason_code: str | None = None
     state_after_stop_message: str = ""
@@ -1378,7 +1384,12 @@ class ProgramRunOwner:
                         and not selected_ordinary_held
                         else "mixed"
                     )
-                    reason = "selection_not_stopped"
+                    # Run and Resume are one release; stopped work in a mixed
+                    # group still needs its recovery to be available.
+                    reason = next(
+                        (blocked[node] for node in selected_held if node in blocked),
+                        None,
+                    )
                 else:
                     state = (
                         "running"
@@ -1393,6 +1404,15 @@ class ProgramRunOwner:
                     )
                     if not selected_held:
                         reason = "selection_not_held"
+                # Run and Resume are the same command.
+                release_allowed = (
+                    eligible
+                    and reason is None
+                    and state in {"ready", "held", "mixed"}
+                )
+                release_reason = (
+                    None if release_allowed else reason or "selection_not_releasable"
+                )
                 groups.append(
                     {
                         "group_id": group_id,
@@ -1400,13 +1420,10 @@ class ProgramRunOwner:
                         "held_node_count": len(selected_held),
                         "state": state,
                         "stop_allowed": eligible and state not in {"ready", "held"},
-                        "start_allowed": eligible and state == "ready",
-                        "start_unavailable_reason": (
-                            None if eligible and state == "ready" else
-                            "selection_not_ready"
-                        ),
-                        "resume_allowed": reason is None,
-                        "resume_unavailable_reason": reason,
+                        "start_allowed": release_allowed,
+                        "start_unavailable_reason": release_reason,
+                        "resume_allowed": release_allowed,
+                        "resume_unavailable_reason": release_reason,
                         "runtime_scale_selector": scale_selector,
                         "runtime_scale_unavailable_reason": scale_reason,
                     }
@@ -1446,65 +1463,16 @@ class ProgramRunOwner:
         group_id: str | list[str] = "all",
         reason: str | None = None,
     ) -> ProgramRunSnapshot:
-        """Release one initial Ready selection without recovery side effects."""
-
-        del reason
-        _text(request_id, field="request_id")
-        with self._lock:
-            transition_lock = self._entry(program_run_id).transition_lock
-        with transition_lock:
-            with self._lock:
-                entry = self._entry(program_run_id)
-                if (
-                    type(expected_run_revision) is not int
-                    or entry.revision != expected_run_revision
-                ):
-                    raise ProgramRunOwnerStaleRevisionError(
-                        expected_run_revision, entry.revision
-                    )
-                if entry.state is not ProgramRunState.RUNNING:
-                    raise ProgramRunOwnerError(
-                        "initial motion Run requires a current running Program"
-                    )
-                run = entry.run
-            selected = run.execution_selection(group_id)
-            scope = run.read_operator_stop_scope()
-            if (
-                type(expected_selection_revision) is not int
-                or scope["selection_revision"] != expected_selection_revision
-            ):
-                raise ProgramRunOwnerError(
-                    "initial motion Run identifies a stale selection"
-                )
-            ready = run.scope_node_ids(scope["ready_node_indices"])
-            selected &= ready
-            if not selected:
-                raise ProgramRunOwnerError("selected scope is not Ready")
-            try:
-                released = self._scope.start_selection(
-                    run.execution_selection_request(group_id, request_id),
-                    expected_selection_revision,
-                )
-                run.publish_operator_stop_scope(
-                    released,
-                    expected_revision=expected_selection_revision + 1,
-                    released_nodes=selected,
-                    notify_observation=False,
-                )
-            except ProgramSelectionReleaseRejectedError as error:
-                raise ProgramRunOwnerError(str(error)) from error
-            except Exception as error:
-                raise ProgramRunOwnerOutcomeUnknownError(
-                    f"initial selection release outcome is unconfirmed: {error}"
-                ) from error
-            with self._lock:
-                entry = self._entry(program_run_id)
-                if entry.run is not run or entry.state is not ProgramRunState.RUNNING:
-                    raise ProgramRunOwnerOutcomeUnknownError(
-                        "Program changed after initial selection release"
-                    )
-                entry.revision += 1
-                return self._snapshot(entry)
+        """Run is the same operation as Resume: release every never-started
+        and stopped node in the selection, recovering stopped work first."""
+        return self.resume_motion(
+            program_run_id,
+            expected_run_revision=expected_run_revision,
+            expected_selection_revision=expected_selection_revision,
+            request_id=request_id,
+            group_id=group_id,
+            reason=reason,
+        )
 
     def prepare_manual_handover(
         self,
@@ -1548,6 +1516,178 @@ class ProgramRunOwner:
             reason=reason,
             held_nodes=node_ids,
         )
+
+    def _recover_stopped_item(
+        self,
+        run: ExecutableProgramRun,
+        item: Any,
+        request_id: str,
+        reason: str | None,
+    ) -> None:
+        """Replan one Stop-interrupted task while its node stays held.
+
+        Cleanup cannot start motion: the Kernel still holds admission until
+        the caller's revision-fenced release.
+        """
+        owner_port = getattr(self._ports, item.owner_port_name)
+        result = owner_port.recover(
+            item.owner_task_id,
+            item.identity,
+            action="replan_from_stopped_state",
+            request_id="selection-resume:"
+            + sha256(
+                (request_id + ":" + item.identity.node_attempt_id).encode("utf-8")
+            ).hexdigest(),
+            reason=reason,
+        )
+        if not isinstance(result, Mapping) or type(result.get("accepted")) is not bool:
+            raise ProgramRunOwnerOutcomeUnknownError(
+                "selected owner recovery outcome is unknown"
+            )
+        if not result["accepted"]:
+            error = result.get("error")
+            raise ProgramRunOwnerError(
+                str(error.get("message"))
+                if isinstance(error, Mapping)
+                else "selected owner recovery was rejected"
+            )
+        # Consume successful cleanup once, even if a later item fails. The
+        # Kernel still holds all future admissions.
+        self._ports.program_interventions.resolve(item.identity, action="retry")
+        run.reconcile_full_stop_tasks(
+            node_ids=frozenset({item.identity.node_instance_id})
+        )
+
+    def retry_failure_pause(
+        self,
+        program_run_id: str,
+        *,
+        node_attempt_id: str,
+        action: str | None,
+        request_id: str,
+        reason: str | None,
+    ) -> ProgramRunSnapshot:
+        """Retry a node failure pause and release all Program motion.
+
+        One operation, in order: verify that the pause's containment Stop is
+        confirmed; capture the current selection revision; recover the
+        Stop-interrupted tasks and the failed step while every node stays
+        held; then release all Ready and Held motion against that revision,
+        so a Stop that lands meanwhile wins. The caller then resolves the
+        pause so the tree ticks again. ``action`` is the failed step's owner
+        recovery, or ``None`` for a step without an owner task.
+        """
+        _text(request_id, field="request_id")
+        with self._lock:
+            transition_lock = self._entry(program_run_id).transition_lock
+        with transition_lock:
+            interventions = self._ports.program_interventions
+            with self._lock:
+                entry = self._entry(program_run_id)
+                failure = (
+                    None
+                    if interventions is None
+                    else interventions.read(program_run_id)
+                )
+                if (
+                    entry.state is not ProgramRunState.INTERVENTION_REQUIRED
+                    or failure is None
+                    or failure.identity.node_attempt_id != node_attempt_id
+                    or failure.policy_parameter == "operator_stop_policy"
+                ):
+                    raise ProgramRunOwnerError("failure Retry attempt is stale")
+                if entry.failure_pause_stop_pending:
+                    raise ProgramRunOwnerError(
+                        "stopping the Program's other motion is not confirmed; "
+                        "Retry waits for it"
+                    )
+                run, run_revision = entry.run, entry.revision
+            scope = run.read_operator_stop_scope()
+            if run.scope_node_ids(
+                (*scope["stopping_node_indices"], *scope["faulted_node_indices"])
+            ):
+                raise ProgramRunOwnerError(
+                    "Program motion is still stopping or faulted; Retry waits for it"
+                )
+            captured_revision = scope["selection_revision"]
+            selected = run.execution_selection("all") & (
+                run.scope_node_ids(scope["held_node_indices"])
+                | run.scope_node_ids(scope["ready_node_indices"])
+            )
+            failed_node = failure.identity.node_instance_id
+            batch, blocked = self._selection_recovery_candidates(run, selected)
+            # The failed step is recovered below by this same operation.
+            blocked.pop(failed_node, None)
+            if blocked:
+                raise ProgramRunOwnerError(next(iter(blocked.values())))
+            cleanup_accepted = False
+            try:
+                for item in batch:
+                    self._recover_stopped_item(run, item, request_id, reason)
+                    cleanup_accepted = True
+                if action is not None:
+                    port = getattr(self._ports, failure.owner_port_name or "", None)
+                    recover = getattr(port, "recover", None)
+                    if failure.owner_task_id is None or not callable(recover):
+                        raise ProgramRunOwnerError(
+                            "the failed step has no addressed owner recovery"
+                        )
+                    # Allowed while held: this operation releases the hold
+                    # only after the recovery is prepared.
+                    result = recover(
+                        failure.owner_task_id,
+                        failure.identity,
+                        action=action,
+                        request_id=request_id,
+                        reason=reason,
+                    )
+                    if (
+                        not isinstance(result, Mapping)
+                        or type(result.get("accepted")) is not bool
+                    ):
+                        raise ProgramRunOwnerOutcomeUnknownError(
+                            "failed-step recovery outcome is unknown"
+                        )
+                    if not result["accepted"]:
+                        error = result.get("error")
+                        raise ProgramRunOwnerError(
+                            str(error.get("message"))
+                            if isinstance(error, Mapping)
+                            else "failed-step recovery was rejected"
+                        )
+                    cleanup_accepted = True
+                with self._lock:
+                    entry = self._entry(program_run_id)
+                    if entry.run is not run or entry.revision != run_revision:
+                        raise ProgramRunOwnerError(
+                            "Program changed during Retry; motion stays held"
+                        )
+                if selected:
+                    try:
+                        released = self._scope.release_selection(
+                            run.execution_selection_request("all", request_id),
+                            captured_revision,
+                        )
+                        run.publish_operator_stop_scope(
+                            released,
+                            expected_revision=captured_revision + 1,
+                            released_nodes=selected,
+                            notify_observation=False,
+                        )
+                    except ProgramSelectionReleaseRejectedError as error:
+                        raise ProgramRunOwnerError(str(error)) from error
+                    except Exception as error:
+                        raise ProgramRunOwnerOutcomeUnknownError(
+                            f"Retry release outcome is unconfirmed: {error}"
+                        ) from error
+            except ProgramRunOwnerOutcomeUnknownError:
+                raise
+            except ProgramRunOwnerError as error:
+                if cleanup_accepted:
+                    raise ProgramRunOwnerRecoveryIncompleteError(str(error)) from error
+                raise
+            with self._lock:
+                return self._snapshot(self._entry(program_run_id))
 
     def _recover_motion_selection(
         self,
@@ -1607,6 +1747,11 @@ class ProgramRunOwner:
             held = run.scope_node_ids(scope["held_node_indices"])
             if held_nodes is not None and not selected <= held:
                 raise ProgramRunOwnerError("manual handover producers are not all held")
+            if held_nodes is None:
+                # Run and Resume are one release: never-started (Ready) work
+                # is released with stopped work; only stopped work needs the
+                # recovery below.
+                held = held | run.scope_node_ids(scope["ready_node_indices"])
             selected &= held
             if not selected:
                 raise ProgramRunOwnerError("selected scope is not held")
@@ -1617,40 +1762,8 @@ class ProgramRunOwner:
             cleanup_accepted = False
             try:
                 for item in batch:
-                    owner_port = getattr(self._ports, item.owner_port_name)
-                    result = owner_port.recover(
-                        item.owner_task_id,
-                        item.identity,
-                        action="replan_from_stopped_state",
-                        request_id="selection-resume:"
-                        + sha256(
-                            (request_id + ":" + item.identity.node_attempt_id).encode(
-                                "utf-8"
-                            )
-                        ).hexdigest(),
-                        reason=reason,
-                    )
-                    if (
-                        not isinstance(result, Mapping)
-                        or type(result.get("accepted")) is not bool
-                    ):
-                        raise ProgramRunOwnerOutcomeUnknownError(
-                            "selected owner recovery outcome is unknown"
-                        )
-                    if not result["accepted"]:
-                        error = result.get("error")
-                        raise ProgramRunOwnerError(
-                            str(error.get("message"))
-                            if isinstance(error, Mapping)
-                            else "selected owner recovery was rejected"
-                        )
+                    self._recover_stopped_item(run, item, request_id, reason)
                     cleanup_accepted = True
-                    # Consume successful cleanup once, even if a later item
-                    # fails. The Kernel still holds all future admissions.
-                    interventions.resolve(item.identity, action="retry")
-                    run.reconcile_full_stop_tasks(
-                        node_ids=frozenset({item.identity.node_instance_id})
-                    )
                 with self._lock:
                     entry = self._entry(program_run_id)
                     if entry.run is not run or entry.revision != run_revision:
@@ -1904,7 +2017,13 @@ class ProgramRunOwner:
         request_id: str,
         reason: str | None = None,
     ) -> ProgramRunSnapshot:
-        """Recover every held occurrence, then schedule only fresh attempts."""
+        """Resume tree execution after a Program Halt without releasing motion.
+
+        Execute after Halt governs execution only. Interrupted work stays
+        held with its operator-stop intervention for a later group Resume,
+        and never-started work stays Ready for Run: the Kernel keeps every
+        node's motion hold when the whole-run Stop is released.
+        """
 
         _text(request_id, field="request_id", maximum_bytes=512)
         if reason is not None:
@@ -1921,98 +2040,27 @@ class ProgramRunOwner:
                         "Run requires the exact preserved Full Stop occurrence"
                     )
                 run = entry.run
-                maximum_recoveries = len(entry.node_statuses) + 1
                 captured_revision = entry.revision
             expected_stop = self._scope.capture_stop(program_run_id)
-            interventions = self._ports.program_interventions
-            for _index in range(maximum_recoveries):
-                active, held, unrecoverable = run.reconcile_full_stop_tasks()
-                if active:
-                    raise ProgramRunOwnerOutcomeUnknownError(
-                        "Full Stop task settlement is not yet observable"
-                    )
-                if unrecoverable:
-                    raise ProgramRunOwnerError(
-                        "preserved Full Stop work has no fresh-state recovery"
-                    )
-                intervention = (
-                    None
-                    if interventions is None
-                    else interventions.read(program_run_id)
-                )
-                if held == 0:
-                    if intervention is not None:
-                        raise ProgramRunOwnerOutcomeUnknownError(
-                            "Full Stop recovery registry and held tasks disagree"
-                        )
-                    break
-                if (
-                    intervention is None
-                    or intervention.policy_parameter != "operator_stop_policy"
-                    or intervention.owner_port_name is None
-                    or intervention.owner_task_id is None
-                ):
-                    raise ProgramRunOwnerOutcomeUnknownError(
-                        "Full Stop lost an exact stopped task identity"
-                    )
-                owner_port = getattr(self._ports, intervention.owner_port_name, None)
-                recover = getattr(owner_port, "recover", None)
-                if not callable(recover):
-                    raise ProgramRunOwnerError(
-                        "preserved Full Stop task does not support fresh-state recovery"
-                    )
-                recovery_request_id = (
-                    "full-stop-resume:"
-                    + sha256(
-                        (request_id + ":" + intervention.owner_task_id).encode("utf-8")
-                    ).hexdigest()
-                )
-                result = recover(
-                    intervention.owner_task_id,
-                    intervention.identity,
-                    action="replan_from_stopped_state",
-                    request_id=recovery_request_id,
-                    reason=reason,
-                )
-                if (
-                    not isinstance(result, Mapping)
-                    or type(result.get("accepted")) is not bool
-                ):
-                    raise ProgramRunOwnerOutcomeUnknownError(
-                        "Full Stop owner recovery returned an invalid result"
-                    )
-                if result["accepted"] is not True:
-                    error = result.get("error")
-                    message = (
-                        error.get("message")
-                        if isinstance(error, Mapping)
-                        and isinstance(error.get("message"), str)
-                        else "fresh current-state recovery was rejected"
-                    )
-                    raise ProgramRunOwnerError(message)
-                with self._lock:
-                    entry = self._entry(program_run_id)
-                    if (
-                        entry.state is not ProgramRunState.FULL_STOPPED
-                        or entry.revision != captured_revision
-                    ):
-                        raise ProgramRunOwnerOutcomeUnknownError(
-                            "Program state changed during Full Stop recovery"
-                        )
-                try:
-                    interventions.resolve(
-                        intervention.identity,
-                        action="retry",
-                    )
-                    run.reconcile_full_stop_tasks()
-                except Exception as error:
-                    raise ProgramRunOwnerOutcomeUnknownError(
-                        "accepted Full Stop recovery was not joined to its tree"
-                    ) from error
-            else:
+            active, _held, unrecoverable = run.reconcile_full_stop_tasks()
+            if active:
                 raise ProgramRunOwnerOutcomeUnknownError(
-                    "Full Stop recovery exceeded the captured Program-node bound"
+                    "Full Stop task settlement is not yet observable"
                 )
+            if unrecoverable:
+                raise ProgramRunOwnerError(
+                    "preserved Full Stop work has no fresh-state recovery"
+                )
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if (
+                    entry.state is not ProgramRunState.FULL_STOPPED
+                    or entry.revision != captured_revision
+                ):
+                    # A newer Halt landed meanwhile; never release it.
+                    raise ProgramRunOwnerOutcomeUnknownError(
+                        "Program state changed before Full Stop release"
+                    )
             released = (
                 self._scope.release_stop(program_run_id, expected_stop=expected_stop)
                 if expected_stop is not None
@@ -2227,6 +2275,59 @@ class ProgramRunOwner:
             return snapshot
 
     def advance_once(self, program_run_id: str) -> ProgramRunSnapshot:
+        snapshot = self._advance_once(program_run_id)
+        return self._stop_motion_for_failure_pause(program_run_id, snapshot)
+
+    def failure_pause_stop_pending(self, program_run_id: str) -> bool:
+        with self._lock:
+            return self._entry(program_run_id).failure_pause_stop_pending
+
+    def _stop_motion_for_failure_pause(
+        self, program_run_id: str, snapshot: ProgramRunSnapshot
+    ) -> ProgramRunSnapshot:
+        """A node failure that pauses for the operator also stops all other
+        Program motion, like Halt; the tree is already dormant. Retried on the
+        next tick if the Stop outcome is not confirmed."""
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if not entry.failure_pause_stop_pending:
+                return snapshot
+            if entry.state is not ProgramRunState.INTERVENTION_REQUIRED:
+                entry.failure_pause_stop_pending = False
+                return snapshot
+            entry.failure_pause_stop_pending = False
+            revision = entry.revision
+        try:
+            stopped = self.stop_motion(
+                program_run_id,
+                group_id="all",
+                reason="Program paused on a node failure",
+                stop_request_id=f"failure-pause-stop:{program_run_id}:{revision}",
+            )
+        except Exception:
+            # Keep the node's own failure, and say that containment is not
+            # confirmed; it is retried and Retry waits for it.
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.state is ProgramRunState.INTERVENTION_REQUIRED:
+                    entry.failure_pause_stop_pending = True
+                    if _FAILURE_PAUSE_UNCONFIRMED not in entry.message:
+                        entry.message = (
+                            f"{entry.message} {_FAILURE_PAUSE_UNCONFIRMED}".strip()
+                        )
+                        entry.revision += 1
+                return self._snapshot(entry)
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if _FAILURE_PAUSE_UNCONFIRMED in entry.message:
+                entry.message = entry.message.replace(
+                    _FAILURE_PAUSE_UNCONFIRMED, ""
+                ).strip()
+                entry.revision += 1
+                return self._snapshot(entry)
+        return stopped
+
+    def _advance_once(self, program_run_id: str) -> ProgramRunSnapshot:
         with self._lock:
             entry = self._entry(program_run_id)
             transition_lock = entry.transition_lock
@@ -2348,6 +2449,8 @@ class ProgramRunOwner:
                         and assessment.get("recovery_class")
                         == "ordinary_operator_stop"
                     )
+                    if intervention.policy_parameter != "operator_stop_policy":
+                        entry.failure_pause_stop_pending = True
                     self._capture_diagnostic(
                         entry,
                         "held" if ordinary_stop else "intervention_required",

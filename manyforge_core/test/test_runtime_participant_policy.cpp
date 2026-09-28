@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <limits>
 #include <manyforge_core/runtime_participant_policy.hpp>
 #include <optional>
 #include <string>
@@ -100,7 +101,7 @@ TEST(RuntimeParticipantPolicy, SealsExactTargetWithoutTcpSpeedAuthority) {
   EXPECT_EQ(selected.value().value().policy, policy());
 }
 
-TEST(RuntimeParticipantPolicy, DeploymentMaximumSelectsOrRejectsOperationRequest) {
+TEST(RuntimeParticipantPolicy, DeploymentMaximumCapsOperationRequest) {
   auto unspecified = apply_deployment_motion_speed_limit(0.25, {});
   ASSERT_TRUE(unspecified.ok());
   EXPECT_EQ(unspecified.value().max_tcp_linear_speed_mps, 0.25);
@@ -112,8 +113,24 @@ TEST(RuntimeParticipantPolicy, DeploymentMaximumSelectsOrRejectsOperationRequest
   EXPECT_EQ(applied.value().max_tcp_linear_speed_mps, 0.1);
   tighter.max_tcp_linear_speed_mps = 0.3;
   const auto excessive = apply_deployment_motion_speed_limit(0.25, tighter);
-  ASSERT_FALSE(excessive.ok());
-  EXPECT_EQ(excessive.error().details.at("reason"), "deployment_motion_speed_exceeded");
+  ASSERT_TRUE(excessive.ok());
+  EXPECT_EQ(excessive.value().max_tcp_linear_speed_mps, 0.25);
+  tighter.max_tcp_linear_speed_mps = 0.25;
+  EXPECT_EQ(apply_deployment_motion_speed_limit(0.25, tighter).value()
+                .max_tcp_linear_speed_mps, 0.25);
+  // Resolve the same authored request independently for each target.
+  EXPECT_EQ(apply_deployment_motion_speed_limit(0.15, tighter).value()
+                .max_tcp_linear_speed_mps, 0.15);
+  tighter.max_tcp_linear_speed_mps = 0.0;
+  EXPECT_FALSE(apply_deployment_motion_speed_limit(0.25, tighter).ok());
+  tighter.max_tcp_linear_speed_mps = -0.1;
+  EXPECT_FALSE(apply_deployment_motion_speed_limit(0.25, tighter).ok());
+  for (const double invalid : {std::numeric_limits<double>::infinity(),
+                               std::numeric_limits<double>::quiet_NaN()}) {
+    tighter.max_tcp_linear_speed_mps = invalid;
+    EXPECT_FALSE(apply_deployment_motion_speed_limit(0.25, tighter).ok());
+    EXPECT_FALSE(apply_deployment_motion_speed_limit(invalid, {}).ok());
+  }
   EXPECT_FALSE(apply_deployment_motion_speed_limit(0.0, {}).ok());
   EXPECT_FALSE(apply_deployment_motion_speed_limit(1000.1, {}).ok());
 }

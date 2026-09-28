@@ -135,7 +135,7 @@ describe('Program workspace lifecycle controls', () => {
     );
 
     expect(source).toContain('href="/api/program/applied"');
-    expect(source).toContain('Inspect exact Applied Program and Binding JSON');
+    expect(source).toContain('View Applied Program and Binding (JSON)');
     expect(source).not.toContain('JSON.stringify(state.applied');
   });
 
@@ -208,6 +208,9 @@ describe('Program workspace lifecycle controls', () => {
     expect(scenarioSource).toContain('Replace current unsaved or unapplied Draft changes');
     expect(scenarioSource).not.toContain('Open as Draft only');
     expect(scenarioSource).not.toContain('confirmScenarioDeployment');
+    expect(scenarioSource).toContain('The list shows saved metadata, not current readiness.');
+    expect(scenarioSource).toContain('The selected Scenario is validated when you load it.');
+    expect(scenarioSource).not.toContain('scenarioStatusLabel');
   });
 
   it('reflects backend idle admission instead of silently dropping UI actions', () => {

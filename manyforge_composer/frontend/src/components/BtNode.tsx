@@ -1,4 +1,4 @@
-import { useLayoutEffect, type KeyboardEvent, type Ref } from 'react';
+import { useLayoutEffect, type KeyboardEvent, type MouseEvent, type Ref } from 'react';
 import { Handle, Position, useUpdateNodeInternals } from '@xyflow/react';
 import type {
   LayoutDirection,
@@ -9,7 +9,13 @@ import {
   programCanvasKeyIntent,
 } from '../utils/programCanvasInteraction';
 import { programCategoryFamily } from '../styles/tokens';
-import { ProgramCategoryIcon, ProgramKindSymbol, ProgramNodeName } from './programNodeGlyphs';
+import type { CollapsedProgramItem } from '../utils/programCollapse';
+import {
+  ProgramCategoryIcon,
+  ProgramHeldBadge as HeldBadge,
+  ProgramKindSymbol,
+  ProgramNodeName,
+} from './programNodeGlyphs';
 
 export interface BtNodePresentation {
   id: string;
@@ -28,6 +34,10 @@ export interface BtNodePresentation {
   executionDisposition?: 'executable' | 'configuration_required' | 'unavailable';
   executionReason?: string;
   invalid?: boolean;
+  /** The node has children, so it can collapse. */
+  collapsible?: boolean;
+  /** When collapsed: its whole subtree, listed inside the node. */
+  collapsedItems?: CollapsedProgramItem[] | null;
 }
 
 export function btNodeConnectionAvailability(node: Pick<
@@ -50,6 +60,68 @@ interface BtNodeProps {
   onDelete?: (event: KeyboardEvent<HTMLDivElement>, instanceId: string) => void;
   onNavigate?: (instanceId: string, key: string) => void;
   elementRef?: Ref<HTMLDivElement>;
+  onToggleCollapse?: (instanceId: string) => void;
+  /** Right-click on a listed node of a collapsed subtree. */
+  onItemContextMenu?: (event: MouseEvent, instanceId: string) => void;
+}
+
+const FOLD_ICON = {
+  collapse: 'M4 6l4 4 4-4',
+  expand: 'M6 4l4 4-4 4',
+};
+
+/** A collapsed node's list: leaves are rows, composites enclose their children. */
+function CollapsedItems({
+  items,
+  onSelect,
+  onItemContextMenu,
+}: {
+  items: CollapsedProgramItem[];
+  onSelect?: (instanceId: string) => void;
+  onItemContextMenu?: (event: MouseEvent, instanceId: string) => void;
+}) {
+  return items.map((item) => {
+    const row = (
+      <div
+        className="bt-node-collapsed-row"
+        title={`${item.label} · ${item.status === 'held' ? 'waiting for Run' : item.status}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          onSelect?.(item.id);
+        }}
+        onContextMenu={(event) => {
+          event.stopPropagation();
+          onItemContextMenu?.(event, item.id);
+        }}
+      >
+        <ProgramCategoryIcon category={item.category} catalogId={item.catalogId} />
+        <span className="bt-node-collapsed-name">{item.label}</span>
+        <span className="bt-node-collapsed-count">
+          {item.status === 'held'
+            ? <HeldBadge />
+            : item.children.length > 0 ? item.descendantCount : ''}
+        </span>
+      </div>
+    );
+    return (
+      <div
+        key={item.id}
+        className={`bt-node-collapsed-item ${item.children.length > 0 ? 'group' : 'leaf'} status-${item.status}${item.invalid ? ' invalid' : ''}${item.selected ? ' selected' : ''}`}
+        data-category-family={programCategoryFamily(item.category)}
+      >
+        {row}
+        {item.children.length > 0 && (
+          <div className="bt-node-collapsed-body">
+            <CollapsedItems
+              items={item.children}
+              onSelect={onSelect}
+              onItemContextMenu={onItemContextMenu}
+            />
+          </div>
+        )}
+      </div>
+    );
+  });
 }
 
 export function BtNode({
@@ -59,7 +131,10 @@ export function BtNode({
   onDelete,
   onNavigate,
   elementRef,
+  onToggleCollapse,
+  onItemContextMenu,
 }: BtNodeProps) {
+  const collapsed = node.collapsedItems !== undefined && node.collapsedItems !== null;
   const connections = btNodeConnectionAvailability(node);
   const updateNodeInternals = useUpdateNodeInternals();
   const targetConnectable = connections.targetConnectable;
@@ -88,12 +163,13 @@ export function BtNode({
     node.id,
     node.label,
     node.layoutDirection,
+    collapsed,
     updateNodeInternals,
   ]);
   return (
     <div
       ref={elementRef}
-      className={`bt-node status-${node.status}${node.invalid ? ' invalid' : ''}${node.selected ? ' selected' : ''}`}
+      className={`bt-node status-${node.status}${node.invalid ? ' invalid' : ''}${node.selected ? ' selected' : ''}${collapsed ? ' collapsed' : ''}`}
       data-category={node.category}
       data-category-family={programCategoryFamily(node.category)}
       data-node-id={node.id}
@@ -102,7 +178,7 @@ export function BtNode({
       tabIndex={0}
       aria-pressed={node.selected}
       aria-label={`${node.label} Program node`}
-      title={`${node.label}\n${availabilityDetail}`}
+      title={`${node.label}${node.status === 'held' ? '\nWaiting for Run: its work starts when Run is pressed.' : ''}\n${availabilityDetail}`}
       onClick={() => onSelect?.(node.id)}
       onFocus={() => onFocus?.(node.id)}
       onKeyDown={(event) => {
@@ -133,7 +209,35 @@ export function BtNode({
         <ProgramCategoryIcon category={node.category} catalogId={node.catalogId} />
       </span>
       <strong className="bt-node-name"><ProgramNodeName name={node.label} /></strong>
-      <span className="bt-node-band" aria-hidden="true" />
+      {/* The empty right band holds the collapse chevron of a composite. */}
+      <span className="bt-node-band">
+        {node.collapsible && onToggleCollapse && (
+          <button
+            type="button"
+            className="bt-node-fold nodrag"
+            aria-label={`${collapsed ? 'Expand' : 'Collapse'} ${node.label}`}
+            aria-expanded={!collapsed}
+            title={collapsed ? 'Expand subtree' : 'Collapse subtree'}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleCollapse(node.id);
+            }}
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d={collapsed ? FOLD_ICON.expand : FOLD_ICON.collapse} />
+            </svg>
+          </button>
+        )}
+      </span>
+      {collapsed && (
+        <div className="bt-node-collapsed-list">
+          <CollapsedItems
+            items={node.collapsedItems ?? []}
+            onSelect={onSelect}
+            onItemContextMenu={onItemContextMenu}
+          />
+        </div>
+      )}
       {node.childrenMax !== 0 && (
         <Handle
           type="source"
@@ -143,6 +247,7 @@ export function BtNode({
           aria-label={`Connect ${node.label} as parent`}
         />
       )}
+      {node.status === 'held' && <HeldBadge />}
       {/* The kind symbol appears only when execution is not available. */}
       {disposition !== 'executable' && (
         <span className={`bt-node-status ${disposition}`} aria-hidden="true">

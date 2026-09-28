@@ -448,6 +448,38 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
     )
 
 
+def test_failure_retry_waits_for_confirmed_containment() -> None:
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    confirmed = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=_intervention(acknowledged=True),
+        policy=_policy(),
+    )
+    pending = controls.recovery_offer(
+        cycle_generation=6,
+        owner_epoch="runner.epoch.1",
+        intervention=_intervention(acknowledged=True),
+        policy=_policy(),
+        containment_pending=True,
+    )
+    assert confirmed is not None and pending is not None
+    retry = next(
+        action for action in confirmed["actions"]
+        if action["action_id"] == "retry_runtime_step"
+    )
+    assert retry["enabled"] is True
+    # A different offer: an earlier Retry click cannot land on it.
+    assert pending["offer_id"] != confirmed["offer_id"]
+    for action in pending["actions"]:
+        if action["action_id"] not in {"acknowledge_and_continue", "reset_cycle"}:
+            assert action["enabled"] is False
+            assert action["disabled_reason_code"] == (
+                "failure_pause_containment_unconfirmed"
+            )
+    assert pending["primary_action"] != "retry_runtime_step"
+
+
 def test_operator_stop_recovery_uses_owner_fence_not_failure_retry_policy() -> None:
     controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
     intervention = _intervention(

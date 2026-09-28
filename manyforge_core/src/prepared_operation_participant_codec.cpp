@@ -1076,17 +1076,16 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
       motion.deployment_maximum_tcp_linear_speed_mps <= 0.0 ||
       (motion.requested_tcp_linear_speed_mps.has_value() &&
        (!std::isfinite(*motion.requested_tcp_linear_speed_mps) ||
-        *motion.requested_tcp_linear_speed_mps <= 0.0 ||
-        *motion.requested_tcp_linear_speed_mps >
-            motion.deployment_maximum_tcp_linear_speed_mps)) ||
+        *motion.requested_tcp_linear_speed_mps <= 0.0)) ||
       !motion.plan_request.speed_profile.max_tcp_linear_speed_mps.has_value() ||
       !std::isfinite(*motion.plan_request.speed_profile.max_tcp_linear_speed_mps) ||
       *motion.plan_request.speed_profile.max_tcp_linear_speed_mps <= 0.0 ||
       *motion.plan_request.speed_profile.max_tcp_linear_speed_mps >
           motion.deployment_maximum_tcp_linear_speed_mps ||
       *motion.plan_request.speed_profile.max_tcp_linear_speed_mps !=
-          motion.requested_tcp_linear_speed_mps.value_or(
-              motion.deployment_maximum_tcp_linear_speed_mps) ||
+          std::min(motion.requested_tcp_linear_speed_mps.value_or(
+                       motion.deployment_maximum_tcp_linear_speed_mps),
+                   motion.deployment_maximum_tcp_linear_speed_mps) ||
       trajectory_metrics == nullptr || motion.trajectory.waypoints.empty() ||
       motion.trajectory.cartesian_fidelity_metrics !=
           trajectory_metrics->cartesian_fidelity_metrics ||

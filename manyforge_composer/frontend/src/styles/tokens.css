@@ -325,6 +325,7 @@
   /* Semantic tokens shared with tokens.ts (kept equal by tokens.test.ts). */
   --mf-status-idle: #677b87;
   --mf-status-running: #e2b94e;
+  --mf-status-held: #d45fc8;
   --mf-status-success: #65c59b;
   --mf-status-failure: #d86f66;
   --mf-availability-configuration-required: #d5a34b;
@@ -343,6 +344,9 @@
   --mf-node-icon-size: 31px;
   --mf-node-status-offset: 2px;
   --mf-node-status-size: 0.8rem;
+  /* A collapsed node grows to fit its list, up to this width. */
+  --mf-node-collapsed-max-width: 340px;
+  --mf-node-collapsed-header-height: 3.1rem;
   /* 3D viewer overlays: one control height and one edge inset for the
      floating viewport controls (top) and the transport (bottom). */
   --mf-viewer-control-height: 2.85rem;

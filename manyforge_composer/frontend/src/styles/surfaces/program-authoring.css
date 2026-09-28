@@ -160,9 +160,45 @@
   padding: 0.8rem 1rem;
 }
 
+.program-runtime-panel button {
+  min-height: 2rem;
+  padding: 0.35rem 0.75rem;
+  font-size: var(--mf-font-size-076);
+}
+
 .program-runtime-panel .panel-intro {
   margin: 0;
   padding: 0 1rem 0.9rem;
+}
+
+/* In the details dialog: two columns, and descriptions wrap instead of
+   being cut off. */
+.overlay-panel .program-runtime-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.overlay-panel .program-runtime-fact {
+  border-bottom: 1px solid var(--mf-border-neutral-19);
+}
+
+.overlay-panel .program-runtime-fact:nth-child(2n) {
+  border-right: 0;
+}
+
+.overlay-panel .program-runtime-fact:nth-last-child(-n + 2) {
+  border-bottom: 0;
+}
+
+.overlay-panel .program-runtime-fact span,
+.overlay-panel .program-runtime-fact small {
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.program-runtime-fact a {
+  color: var(--mf-text-accent-68);
+  font-size: var(--mf-font-size-068);
 }
 
 .program-authoring-grid {
@@ -1552,10 +1588,28 @@
   line-height: 1.45;
 }
 
-.program-halt-confirmation-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 0.45rem;
+/* Halt / Reset confirmations: compact text and ordinary-size buttons, not
+   the large transport buttons they are opened from. */
+.transport-confirmation ul {
+  display: grid;
+  gap: 0.2rem;
+  margin: -0.3rem 0 0;
+  padding-left: 1.1rem;
+  color: var(--mf-text-neutral-68);
+  font-size: var(--mf-font-size-072);
+  line-height: 1.45;
+}
+
+.transport-confirmation .dialog-actions {
+  margin-top: 0.2rem;
+}
+
+.transport-confirmation .dialog-actions > button {
+  min-width: 0;
+  min-height: 1.9rem;
+  height: auto;
+  padding: 0.3rem 0.8rem;
+  font-size: var(--mf-font-size-072);
 }
 
 .overlay-actions {

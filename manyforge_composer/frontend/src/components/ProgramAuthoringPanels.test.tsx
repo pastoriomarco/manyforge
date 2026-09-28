@@ -2,11 +2,15 @@ import { readFileSync } from 'node:fs';
 
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
+import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
+import { parseProgramBindingTransport } from '../api/programBindingTransport.generated';
+import { statusFixture } from '../testFixtures/robotControl';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type {
   BlackboardKeyDeclaration,
+  DeploymentWorkspaceResponse,
   CatalogEntry,
   NodeEnvironmentResponse,
   ProgramAuthoringDocument,
@@ -450,6 +454,57 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('The literal is absent while this exact source is bound.');
   });
 
+  it('explains backend TCP capping without rewriting literals or parameter references', () => {
+    const binding = parseProgramBindingTransport(nativeBindingFixture, 'binding');
+    const target = binding.target_role_bindings.find((row) => row.target_role_id === 'arm')!;
+    const descriptor = { ...statusFixture().directControl!.targetDescriptor,
+      controllableComponentId: target.controllable_component_id,
+      commandTargetId: target.command_target_id,
+      operationalLimit: { maximumTcpLinearSpeedMps: 0.15 },
+    };
+    const deployment: DeploymentWorkspaceResponse = {
+      schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+      authoringWorkspace: { workspaceEpoch: 'workspace', workspaceRevision: 1,
+        programDraftId: 'program', programDraftRevision: 1,
+        deploymentDraftId: 'deployment', deploymentDraftRevision: 1 },
+      draft: { id: 'deployment', revision: 1, document: null,
+        deploymentArtifactId: null, deploymentRevision: null, graphRevision: null,
+        differsFromSaved: false },
+      saved: { path: null, deploymentRevision: null },
+      managerApplied: { deploymentRevision: null, scenarioId: null },
+      runAdmission: { ready: false, reason: 'not_applied' },
+      binding, scenarioCandidates: [], savedScenarioCandidates: [], unavailableReasons: [],
+    };
+    const catalog: CatalogEntry = { ...timer, parameters: [{
+      id: 'max_tcp_linear_speed_mps', required: false,
+      schema: { type: 'number', exclusiveMinimum: 0 },
+      schemaHash: 'sha256:tcp-speed', hasDefault: false,
+    }] };
+    for (const referenced of [false, true]) {
+      const node: ProgramTreeNode = {
+        node_id: 'timer', instance_id: 'motion', children: [],
+        parameters: referenced ? { target_role: 'arm' }
+          : { target_role: 'arm', max_tcp_linear_speed_mps: 0.25 },
+        ...(referenced ? { value_sources: {
+          max_tcp_linear_speed_mps: { kind: 'program_parameter' as const, reference: 'speed' },
+        } } : {}),
+      };
+      const before = JSON.stringify(node);
+      const markup = renderToStaticMarkup(<ProgramPropertyEditor
+        roots={[node]} selectedId="motion" catalogEntries={[catalog]}
+        deploymentWorkspace={deployment} motionDescriptors={[descriptor]}
+        program={authoringProgram([node], [{ ...parameter, parameter_id: 'speed', default: 0.25 }])}
+        busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
+      />);
+      expect(markup).toContain('TCP speed ceiling');
+      expect(markup).toContain('effective ceiling is 0.15 m/s');
+      expect(markup).toContain(referenced ? 'parameter default' : 'With request');
+      expect(markup).not.toContain('exceeds Deployment');
+      expect(JSON.stringify(node)).toBe(before);
+      if (referenced) expect(markup).toContain('program_parameter:speed');
+    }
+  });
+
   it('keeps schema-invalid motion and gripper variants losslessly in JSON repair mode', () => {
     const variantSchemas: CatalogEntry = {
       ...timer,
@@ -780,7 +835,6 @@ describe('Program authoring panels', () => {
       commitGroupRuntimeScale: vi.fn(),
       fullStop: vi.fn(),
       resumeFullStop: vi.fn(),
-      stop: vi.fn(),
       reset: vi.fn(),
       applyRecoveryAction: vi.fn(),
       stageObservationOverride: vi.fn(),
@@ -968,7 +1022,6 @@ describe('Program authoring panels', () => {
       commitGroupRuntimeScale: vi.fn(),
       fullStop: vi.fn(),
       resumeFullStop: vi.fn(),
-      stop: vi.fn(),
       reset: vi.fn(),
       applyRecoveryAction: vi.fn(),
       stageObservationOverride: vi.fn(),

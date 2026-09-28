@@ -504,8 +504,10 @@ TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
             command_bytes.value());
 
   auto motion_inputs = Inputs(base, false);
+  auto capped_payload = MotionPayload(motion_inputs);
+  capped_payload.requested_tcp_linear_speed_mps = 0.75;
   auto motion = MakePreparedOperationParticipant(
-      Candidate(motion_inputs.binding, motion_inputs.readiness, MotionPayload(motion_inputs)),
+      Candidate(motion_inputs.binding, motion_inputs.readiness, capped_payload),
       motion_inputs.binding, motion_inputs.readiness, &*motion_inputs.runtime_policy,
       DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(motion.ok()) << motion.error().details.at("reason");
@@ -533,8 +535,9 @@ TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
   EXPECT_EQ(decoded_payload.runtime_policy.source_artifact.content_addressed_store_key.value(),
             "catalog/runtime-policy/runtime.policy.json");
   ASSERT_TRUE(decoded_payload.requested_tcp_linear_speed_mps.has_value());
-  EXPECT_DOUBLE_EQ(*decoded_payload.requested_tcp_linear_speed_mps, 0.5);
+  EXPECT_DOUBLE_EQ(*decoded_payload.requested_tcp_linear_speed_mps, 0.75);
   EXPECT_DOUBLE_EQ(decoded_payload.deployment_maximum_tcp_linear_speed_mps, 0.5);
+  EXPECT_EQ(decoded_payload.plan_request.speed_profile.max_tcp_linear_speed_mps, 0.5);
 }
 
 TEST(PreparedOperationParticipantCodecTest, RejectsCartesianMilestonesForAnotherIntent) {
@@ -679,6 +682,12 @@ TEST(PreparedOperationParticipantCodecTest,
       MotionInterruptNodeCategory::kGeneric);
   ASSERT_FALSE(weaker_result.ok());
   EXPECT_EQ(weaker_result.error().details.at("reason"), "motion_payload_join_invalid");
+  auto unexpectedly_lower = candidate;
+  std::get<PreparedMotionExecutionDTO>(unexpectedly_lower.payload)
+      .plan_request.speed_profile.max_tcp_linear_speed_mps = 0.25;
+  EXPECT_FALSE(MakePreparedOperationParticipant(
+      std::move(unexpectedly_lower), inputs.binding, inputs.readiness,
+      &*inputs.runtime_policy, DefaultLimits(), MotionInterruptNodeCategory::kGeneric).ok());
 }
 
 }  // namespace

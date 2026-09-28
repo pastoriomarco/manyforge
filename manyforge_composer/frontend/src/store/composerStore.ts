@@ -1,6 +1,6 @@
 import { useReducer } from 'react';
 
-export type NodePresentationStatus = 'idle' | 'running' | 'success' | 'failure';
+export type NodePresentationStatus = 'idle' | 'running' | 'held' | 'success' | 'failure';
 export type EdgeStyle =
   | 'smoothstep'
   | 'default'

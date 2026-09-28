@@ -500,7 +500,7 @@ export function ProgramWorkspace({
             </header>
             <div className="program-empty-guidance">
               <strong>Open a Draft to use the palette</strong>
-              <span>Use Open in the persistent header.</span>
+              <span>Use New or Load Scenario in the header.</span>
             </div>
           </section>
         )}
@@ -539,7 +539,7 @@ export function ProgramWorkspace({
         ) : (
           <section className="program-tree-surface program-tree-empty" aria-label="Program tree canvas">
             <strong>No Program Draft is open</strong>
-            <span>Choose New or Open in the persistent header.</span>
+            <span>Use New or Load Scenario in the header.</span>
           </section>
         )}
 
@@ -585,7 +585,7 @@ export function ProgramWorkspace({
             </header>
             {inspectorActive && !inspectorMinimized && inspectorReadOnlyReason !== null && (
               <p className="central-inspector-notice notice severity-warning notice-strip" role="status">
-                <strong>Editing is unavailable.</strong> {inspectorReadOnlyReason}
+                <span><strong>Editing is unavailable.</strong> {inspectorReadOnlyReason}</span>
               </p>
             )}
             {inspectorActive && !inspectorMinimized && (

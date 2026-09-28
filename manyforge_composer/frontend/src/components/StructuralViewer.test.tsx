@@ -138,7 +138,11 @@ describe('viewer failure isolation', () => {
     );
 
     expect(css).toContain('.viewer-options-body');
-    expect(source.match(/type="checkbox"/g)).toHaveLength(6);
+    expect(source.match(/type="checkbox"/g)).toHaveLength(7);
+    // Optional silhouette, off by default; it outlines the framed content.
+    expect(source).toContain('<span>Object outline</span>');
+    expect(source).toContain('const [outlineVisible, setOutlineVisible] = useState(false);');
+    expect(source).toContain('<SceneOutline multisample={renderer.antialias} componentByLink={outlineComponents} />');
     expect(source).toContain("toggleInspectorPanel('tools')");
     expect(source).toContain('Comparison ghost');
     expect(source).toContain('disabled={!comparisonGhostAvailable}');

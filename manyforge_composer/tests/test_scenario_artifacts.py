@@ -359,12 +359,12 @@ def test_save_load_and_discovery_preserve_one_editable_project(
             "description": "Editable Scenario fixture",
             "saved_manyforge_version": "1.0.0",
             "display_status": "ready",
-            "status_detail": "Configuration was load-ready when last checked.",
+            "status_detail": "Previously recorded as load-ready. Current files and model sources are validated when you load this Scenario.",
         }
     ]
 
 
-def test_external_content_and_version_changes_are_advisory(tmp_path: Path) -> None:
+def test_listing_reports_history_not_current_content_validation(tmp_path: Path) -> None:
     target = Path(
         save_scenario_artifact(
             _document(),
@@ -382,8 +382,8 @@ def test_external_content_and_version_changes_are_advisory(tmp_path: Path) -> No
         allowed_roots=[str(tmp_path)],
         manyforge_version="1.0.0",
     )
-    assert changed[0]["display_status"] == "changed"
-    assert changed[0]["status_detail"] == "Content changed since the recorded status."
+    assert changed[0]["display_status"] == "ready"
+    assert "Previously recorded" in changed[0]["status_detail"]
 
     save_scenario_artifact(
         _document(overrides={"speed": 0.5}),
@@ -397,6 +397,41 @@ def test_external_content_and_version_changes_are_advisory(tmp_path: Path) -> No
         manyforge_version="2.0.0",
     )
     assert version_changed[0]["display_status"] == "version_changed"
+
+
+@pytest.mark.parametrize("broken_member", ["program.yaml", "../model.urdf"])
+def test_discovery_reads_only_manifest_but_load_still_validates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broken_member: str,
+) -> None:
+    from manyforge_composer.backend import scenario_artifacts
+
+    target = Path(save_scenario_artifact(
+        _document(), str(tmp_path / "cell"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    ))
+    (target / broken_member).unlink()
+    original_read = scenario_artifacts._read_regular_at
+    reads: list[str] = []
+
+    def manifest_only(directory_fd: int, name: str, *, source: str) -> bytes:
+        reads.append(name)
+        assert name == "scenario.yaml"
+        return original_read(directory_fd, name, source=source)
+
+    def forbid_source_capture(*args: object, **kwargs: object) -> None:
+        pytest.fail("Discovery must not capture model resources")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(scenario_artifacts, "_read_regular_at", manifest_only)
+        patch.setattr(scenario_artifacts, "capture_deployment_model_sources", forbid_source_capture)
+        _, entries = discover_scenario_artifacts(
+            str(tmp_path), allowed_roots=[str(tmp_path)], manyforge_version="1.0.0",
+        )
+    assert reads == ["scenario.yaml"]
+    assert entries[0]["display_status"] == "ready"
+    assert "Previously recorded" in entries[0]["status_detail"]
+    with pytest.raises(ScenarioArtifactError):
+        load_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
 
 
 def test_discovery_exposes_broken_projects_without_listing_legacy_files(
@@ -779,7 +814,7 @@ def test_single_file_scenario_is_not_a_project(tmp_path: Path) -> None:
     assert direct.value.code == "scenario_artifact_path_invalid"
 
 
-def test_valid_hand_edit_is_loaded_and_reported_changed(tmp_path: Path) -> None:
+def test_valid_hand_edit_is_loaded_without_rechecking_during_discovery(tmp_path: Path) -> None:
     target = Path(
         save_scenario_artifact(
             _document(),
@@ -799,7 +834,7 @@ def test_valid_hand_edit_is_loaded_and_reported_changed(tmp_path: Path) -> None:
         allowed_roots=[str(tmp_path)],
         manyforge_version="1.0.0",
     )
-    assert entries[0]["display_status"] == "changed"
+    assert entries[0]["display_status"] == "ready"
 
 
 def test_save_as_rebases_project_source_references_without_copying(

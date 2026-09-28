@@ -683,7 +683,10 @@ class ProgramRuntimeControls:
         intervention,
         policy: Mapping[str, Any],
         selection_revision: int | None = None,
+        containment_pending: bool = False,
     ) -> dict[str, Any] | None:
+        """``containment_pending``: a failure pause has not yet confirmed that
+        the Program's other motion stopped; Retry waits for it."""
         if intervention is None:
             return None
         identity = intervention.identity
@@ -848,6 +851,13 @@ class ProgramRuntimeControls:
                 ),
             }
         )
+        if containment_pending and not operator_stop_recovery:
+            for action in actions:
+                if action["action_id"] not in {"acknowledge_and_continue", "reset_cycle"}:
+                    action["enabled"] = False
+                    action["disabled_reason_code"] = (
+                        "failure_pause_containment_unconfirmed"
+                    )
         material = {
             "cycle_generation": cycle_generation,
             "program_run_id": identity.program_run_id,

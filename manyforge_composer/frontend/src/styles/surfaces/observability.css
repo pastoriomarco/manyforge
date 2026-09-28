@@ -783,3 +783,105 @@
 .failure-capture-events > li.trigger {
   background: var(--mf-bg-danger-16);
 }
+
+/* Program run details ("i" in the Program transport). */
+.runtime-detail-group {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.9rem 1rem 0;
+}
+
+.runtime-detail-group h4 {
+  margin: 0;
+  color: var(--mf-text-neutral-90);
+  font-size: var(--mf-font-size-080);
+}
+
+.runtime-stop-levels {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+}
+
+.runtime-stop-levels > div {
+  display: grid;
+  grid-template-columns: 7.5rem minmax(0, 1fr);
+  gap: 0.6rem;
+  font-size: var(--mf-font-size-072);
+  line-height: 1.45;
+}
+
+.runtime-stop-levels dt {
+  color: var(--mf-text-neutral-86);
+  font-weight: 600;
+}
+
+.runtime-stop-levels dd {
+  margin: 0;
+  color: var(--mf-text-neutral-68);
+}
+
+.runtime-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.overlay-panel-body > .runtime-detail-button {
+  margin: 0.9rem 1rem 0.2rem;
+}
+
+/* Collapsed-by-default sections of the run details. */
+.runtime-detail-disclosure > summary,
+.runtime-advanced > summary {
+  color: var(--mf-text-neutral-90);
+  font-size: var(--mf-font-size-080);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.runtime-advanced {
+  display: grid;
+  gap: 0.6rem;
+  margin: 0.4rem 1rem 0.6rem;
+}
+
+.program-run-setup {
+  display: grid;
+  gap: 0.6rem;
+  color: var(--mf-text-neutral-68);
+  font-size: var(--mf-font-size-072);
+}
+
+.program-run-setup p {
+  margin: 0;
+}
+
+.program-run-setup-table-wrap {
+  overflow-x: auto;
+}
+
+.program-run-setup-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.program-run-setup-table caption {
+  padding-bottom: 0.3rem;
+  color: var(--mf-text-neutral-86);
+  font-weight: 600;
+  text-align: left;
+}
+
+.program-run-setup-table th,
+.program-run-setup-table td {
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid var(--mf-border-neutral-19);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.program-run-setup-table th {
+  color: var(--mf-text-neutral-57);
+  font-weight: 500;
+}

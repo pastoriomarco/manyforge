@@ -1903,11 +1903,15 @@ function parseManagerApplyRecord(
       'incomplete',
       'intent_digest',
       'phase',
+      'prepared_activation',
       'request',
       'terminal_state',
     ],
     path,
   );
+  // Status publishes the durable preparation receipt, even though this view
+  // only projects Apply progress. Validate it through the shared v3 contract.
+  parsePreparedActivationInput(record.prepared_activation, path + '.prepared_activation');
   const phase = stringAt(record.phase, path + '.phase');
   if (!MANAGER_APPLY_PHASES.has(phase as ManagerApplyPhase)) {
     return fail(path + '.phase', 'a supported Manager Apply phase');
@@ -4293,7 +4297,7 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     if (
       instanceId.length === 0
       || instanceId.length > 512
-      || !['idle', 'running', 'success', 'failure'].includes(status)
+      || !['idle', 'running', 'held', 'success', 'failure'].includes(status)
     ) {
       return fail(
         `${path}.node_statuses.${instanceId}`,
@@ -4956,9 +4960,11 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
       || (state === 'running' && heldNodeCount !== 0)
       || (state === 'held' && heldNodeCount !== nodeCount)
       || (state === 'mixed' && (heldNodeCount === 0 || heldNodeCount === nodeCount))
-      || (startAllowed && state !== 'ready')
+      // Run and Resume are one release of never-started and stopped work:
+      // the owner projects one eligibility for both.
+      || startAllowed !== resumeAllowed
+      || (startAllowed && !['ready', 'held', 'mixed'].includes(state))
       || startAllowed !== (startUnavailableReason === null)
-      || (resumeAllowed && (!['held', 'mixed'].includes(state) || heldNodeCount === 0))
       || resumeAllowed !== (resumeUnavailableReason === null)) {
       return fail(key, 'coherent bounded selection status and eligibility');
     }

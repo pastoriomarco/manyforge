@@ -31,10 +31,6 @@ function scenarioEntryKey(entry: ScenarioDocumentEntry): string {
   return `${entry.sourceKind}:${entry.path ?? entry.scenarioId ?? entry.name}`;
 }
 
-function scenarioStatusLabel(entry: ScenarioDocumentEntry): string {
-  return entry.displayStatus.replaceAll('_', ' ');
-}
-
 /** One icon-only header command; the tooltip shows at once on hover/focus. */
 function ScenarioIconButton({
   label,
@@ -111,6 +107,7 @@ export function ScenarioDocumentCommands({
       ? 'Another operation is in progress.'
       : mutationUnavailableReason;
   const blocked = busy || !mutationAvailable || localInvalidEdit || workspace === null;
+  const hasUnsavedChanges = workspace?.hasUnsavedChanges === true || deploymentDirty;
   const replaceNeedsConfirmation = workspace?.hasUnsavedChanges === true
     || workspace?.hasUnappliedChanges === true
     || deploymentDirty;
@@ -210,8 +207,8 @@ export function ScenarioDocumentCommands({
         </ScenarioIconButton>
         <ScenarioIconButton
           label={saveTarget ? 'Save Scenario' : 'Save Scenario (choose a project folder)'}
-          reason={blockReason}
-          disabled={blocked}
+          reason={blockReason ?? 'Scenario already matches Saved.'}
+          disabled={blocked || (saveTarget !== null && !hasUnsavedChanges)}
           onClick={(event) => {
             if (saveTarget === null) {
               beginAction('save_as', event);
@@ -383,7 +380,7 @@ export function ScenarioDocumentCommands({
                     disabled={entry.displayStatus === 'unsupported'}
                     title={entry.statusDetail}
                   >
-                    {entry.name} — {scenarioStatusLabel(entry)}
+                    {entry.name}
                   </option>
                 ))}
               </select>
@@ -397,6 +394,9 @@ export function ScenarioDocumentCommands({
                 )}
               </div>
             )}
+            <p>
+              The list shows saved metadata, not current readiness. The selected Scenario is validated when you load it.
+            </p>
             <p>
               Load replaces the current Scenario and applies its Deployment, Scene and Program. It does not start motion.
             </p>

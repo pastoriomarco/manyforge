@@ -566,6 +566,23 @@ function managerApplyRecordFixture(): Record<string, unknown> {
     incomplete: true,
     intent_digest: `sha256:${'f'.repeat(64)}`,
     phase: 'fence_held',
+    prepared_activation: {
+      schema_version: 'manyforge.prepared_activation_input.v3',
+      prepared_activation_id: `sha256:${'a'.repeat(64)}`,
+      scenario_id: 'fixture',
+      source_document_digest: `sha256:${'b'.repeat(64)}`,
+      captured_input_digest: `sha256:${'c'.repeat(64)}`,
+      deployment_artifact_id: 'deployment.fixture',
+      deployment_revision: `sha256:${'d'.repeat(64)}`,
+      retained_bundle_id: `sha256:${'e'.repeat(64)}`,
+      graph_revision: `sha256:${'f'.repeat(64)}`,
+      program_id: 'fixture-program',
+      program_revision: `sha256:${'a'.repeat(64)}`,
+      program_outcome: { kind: 'bound', program_binding_id: `sha256:${'b'.repeat(64)}` },
+      node_environment_digest: `sha256:${'c'.repeat(64)}`,
+      assistant_mode: 'forbidden',
+      typed_parameter_overrides: {},
+    },
     request: {
       correlation_id: null,
       request_id: 'request-3',
@@ -964,6 +981,15 @@ describe('Program product projections', () => {
     expect(status.capture.programRunId).toBe('program-run.1');
   });
 
+  it('accepts a node held until Run and refuses unknown node statuses', () => {
+    const held = runStatus();
+    held.node_statuses = { root: 'running', move: 'held' };
+    expect(parseProgramRunStatus(held).nodeStatuses.move).toBe('held');
+    const unknown = runStatus();
+    unknown.node_statuses = { root: 'paused' };
+    expect(() => parseProgramRunStatus(unknown)).toThrow(/supported presentation status/);
+  });
+
   it('accepts exact runtime controls when no recovery action is offered', () => {
     const projection = parseProgramRuntimeControlProjection(
       runtimeControlsProjection(),
@@ -971,6 +997,46 @@ describe('Program product projections', () => {
 
     expect(projection.recoveryOffer).toBeNull();
     expect(projection.programRunId).toBe('program-run.1');
+  });
+
+  it('accepts one Run/Resume eligibility for ready, held and mixed groups', () => {
+    const withGroup = (patch: Record<string, unknown>) => {
+      const input = runtimeControlsProjection();
+      const selections = input.execution_selections as { groups: Record<string, unknown>[] };
+      selections.groups[0] = { ...selections.groups[0], ...patch };
+      return input;
+    };
+    const releasable = {
+      stop_allowed: false,
+      start_allowed: true, start_unavailable_reason: null,
+      resume_allowed: true, resume_unavailable_reason: null,
+    };
+    // After Execute: never-started work waits for Run (the live shape that
+    // the old Run-only-when-ready / Resume-only-when-held rule rejected).
+    for (const [state, held] of [['ready', 0], ['held', 1]] as const) {
+      const parsed = parseProgramRuntimeControlProjection(
+        withGroup({ ...releasable, state, held_node_count: held }),
+      );
+      expect(parsed.executionSelections.groups[0]).toMatchObject({
+        state, startAllowed: true, resumeAllowed: true,
+      });
+    }
+    const mixed = runtimeControlsProjection();
+    (mixed.execution_selections as { groups: Record<string, unknown>[] }).groups[0] = {
+      ...(mixed.execution_selections as { groups: Record<string, unknown>[] }).groups[0],
+      ...releasable, state: 'mixed', node_count: 2, held_node_count: 1,
+    };
+    expect(parseProgramRuntimeControlProjection(mixed).executionSelections.groups[0].state)
+      .toBe('mixed');
+
+    // Run and Resume can never disagree, and nothing releases running work.
+    expect(() => parseProgramRuntimeControlProjection(withGroup({
+      ...releasable, state: 'ready',
+      resume_allowed: false, resume_unavailable_reason: 'selection_not_held',
+    }))).toThrow(/coherent bounded selection status and eligibility/);
+    expect(() => parseProgramRuntimeControlProjection(withGroup({
+      ...releasable, state: 'running',
+    }))).toThrow(/coherent bounded selection status and eligibility/);
   });
 
   it('accepts a bounded recent control trace after many events and rejects gaps', () => {
@@ -2229,6 +2295,17 @@ describe('headless projection parsers', () => {
     expect(status.status.apply.records[0]?.phase).toBe('fence_held');
     expect(graph.retainedBundleId).toBe('bundle.1');
     expect(diff.converged).toBe(true);
+
+    for (const receipt of [undefined, null, {}, {
+      ...(managerApplyRecordFixture().prepared_activation as Record<string, unknown>),
+      unexpected_field: true,
+    }]) {
+      const invalid = managerApplyRecordFixture();
+      if (receipt === undefined) delete invalid.prepared_activation;
+      else invalid.prepared_activation = receipt;
+      statusWire.status.apply.records = [invalid];
+      expect(() => parseManagerStatusProjection(statusWire)).toThrow();
+    }
 
     const terminal = managerApplyRecordFixture();
     terminal.incomplete = false;

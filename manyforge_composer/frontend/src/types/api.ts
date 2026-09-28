@@ -689,7 +689,7 @@ export interface ProgramRunStatus {
   capture: ProgramRunCapture;
   treeStatus: 'invalid' | 'running' | 'success' | 'failure';
   nodeStatusRevision: number;
-  nodeStatuses: Record<string, 'idle' | 'running' | 'success' | 'failure'>;
+  nodeStatuses: Record<string, 'idle' | 'running' | 'held' | 'success' | 'failure'>;
   activeOperationCount: number | null;
   reasonCode: string | null;
   message: string;

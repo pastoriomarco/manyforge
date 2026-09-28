@@ -2,12 +2,14 @@
 // viewport. Values that also exist in tokens.css are listed in
 // CSS_SHARED_TOKENS; tokens.test.ts keeps the two files equal.
 
-export type ProgramExecutionStatus = 'idle' | 'running' | 'success' | 'failure';
+/** ``held``: ticking, but its owner work waits for the operator's Run. */
+export type ProgramExecutionStatus = 'idle' | 'running' | 'held' | 'success' | 'failure';
 
 /** Execution status on Program canvas node borders and the edges into them. */
 export const STATUS_COLORS: Record<ProgramExecutionStatus, string> = {
   idle: '#677b87',
   running: '#e2b94e',
+  held: '#d45fc8',
   success: '#65c59b',
   failure: '#d86f66',
 };
@@ -86,6 +88,8 @@ export const VIEWPORT_COLORS = {
   frameTarget: '#43d7ec',
   frameTargetEmissive: '#0c5060',
   pointCloud: '#75d7ff',
+  /** Silhouette drawn by the viewer's optional object outline. */
+  outline: '#b8c7d4',
   pointCloudVertexTint: '#ffffff',
 } as const;
 
@@ -93,6 +97,7 @@ export const VIEWPORT_COLORS = {
 export const CSS_SHARED_TOKENS: Readonly<Record<string, string>> = {
   '--mf-status-idle': STATUS_COLORS.idle,
   '--mf-status-running': STATUS_COLORS.running,
+  '--mf-status-held': STATUS_COLORS.held,
   '--mf-status-success': STATUS_COLORS.success,
   '--mf-status-failure': STATUS_COLORS.failure,
   '--mf-availability-configuration-required': AVAILABILITY_COLORS.configuration_required,

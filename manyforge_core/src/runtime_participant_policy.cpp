@@ -178,15 +178,10 @@ Result<SpeedProfileDTO> apply_deployment_motion_speed_limit(
         "motion speed request or applied Deployment maximum is invalid",
         "deployment_motion_speed_invalid");
   }
-  if (requested.max_tcp_linear_speed_mps.has_value() &&
-      *requested.max_tcp_linear_speed_mps > deployment_maximum_tcp_linear_speed_mps) {
-    return invalid<SpeedProfileDTO>(
-        "requested TCP linear speed exceeds the applied Deployment maximum",
-        "deployment_motion_speed_exceeded");
-  }
   requested.max_tcp_linear_speed_mps =
-      requested.max_tcp_linear_speed_mps.value_or(
-          deployment_maximum_tcp_linear_speed_mps);
+      std::min(requested.max_tcp_linear_speed_mps.value_or(
+                   deployment_maximum_tcp_linear_speed_mps),
+               deployment_maximum_tcp_linear_speed_mps);
   return Result<SpeedProfileDTO>::Ok(std::move(requested));
 }
 

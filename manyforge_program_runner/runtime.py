@@ -1686,6 +1686,10 @@ class ProgramRuntime:
             intervention=intervention,
             policy={} if policy is None else policy.recovery_policy,
             selection_revision=selection_revision,
+            containment_pending=(
+                intervention.policy_parameter != "operator_stop_policy"
+                and self._owner.failure_pause_stop_pending(program_run_id)
+            ),
         )
 
     @staticmethod
@@ -3916,6 +3920,34 @@ class ProgramRuntime:
                         "runtime_controls": None,
                         "recovery_offer": None,
                     }
+                elif (
+                    intervention.policy_parameter != "operator_stop_policy"
+                    and request.action_id != "acknowledge_and_continue"
+                ):
+                    # Failure pause Retry: recover the interrupted tasks and
+                    # the failed step while all motion stays held, release all
+                    # Program motion, then let the tree tick again.
+                    effect_started = True
+                    snapshot = self._owner.retry_failure_pause(
+                        program_run_id,
+                        node_attempt_id=intervention.identity.node_attempt_id,
+                        action=(
+                            None
+                            if request.action_id == "retry_runtime_step"
+                            else request.action_id
+                        ),
+                        request_id=request.request_id,
+                        reason=request.reason,
+                    )
+                    owner_effect_accepted = True
+                    snapshot = self._host.resume_recovery(
+                        program_run_id,
+                        node_attempt_id=intervention.identity.node_attempt_id,
+                        action="retry",
+                    )
+                    controls.note_retry(intervention.identity.node_instance_id)
+                    owner_result = {"accepted": True, "action": request.action_id}
+                    cycle_resumed = True
                 elif request.action_id == "retry_runtime_step":
                     effect_started = True
                     snapshot = self._host.resume_recovery(
@@ -3923,8 +3955,6 @@ class ProgramRuntime:
                         node_attempt_id=intervention.identity.node_attempt_id,
                         action="retry",
                     )
-                    if intervention.policy_parameter != "operator_stop_policy":
-                        controls.note_retry(intervention.identity.node_instance_id)
                     cycle_resumed = True
                 elif (
                     intervention.policy_parameter == "operator_stop_policy"
@@ -3983,8 +4013,6 @@ class ProgramRuntime:
                             node_attempt_id=(intervention.identity.node_attempt_id),
                             action="retry",
                         )
-                        if intervention.policy_parameter != "operator_stop_policy":
-                            controls.note_retry(intervention.identity.node_instance_id)
                         cycle_resumed = True
                 controls.audit_value(
                     "cycle_recovery_action_applied",
@@ -4024,9 +4052,9 @@ class ProgramRuntime:
             except ProgramSchedulingError as error:
                 # resume_recovery checks capacity and owner state before its
                 # atomic transition, so its direct rejection is a no-effect.
-                # After an addressed owner action, however, that owner effect
-                # has already succeeded and the combined outcome is unknown.
-                if effect_started and request.action_id != "retry_runtime_step":
+                # After an accepted owner effect (recovery or Retry release),
+                # however, the combined outcome is unknown.
+                if owner_effect_accepted:
                     unresolved(error)
                 reject(ProgramRunnerError("program_run_scheduling_failed", str(error)))
             except ProgramRunOwnerOutcomeUnknownError as error:

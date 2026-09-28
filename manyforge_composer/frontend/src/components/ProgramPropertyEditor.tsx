@@ -350,13 +350,7 @@ export function ProgramPropertyEditor({
       && value > ceiling
       ? `${parameter.id}=${value} exceeds Program ${parameter.id}=${ceiling}.`
       : null;
-    const deploymentMessage = parameter.id === 'max_tcp_linear_speed_mps'
-      && selectedDeploymentSpeed !== null
-      && typeof value === 'number'
-      && value > selectedDeploymentSpeed.maximum
-      ? `TCP speed ${value} m/s exceeds Deployment target ${selectedDeploymentSpeed.target} maximum ${selectedDeploymentSpeed.maximum} m/s.`
-      : null;
-    const message = deploymentMessage ?? ceilingMessage
+    const message = ceilingMessage
       ?? firstCatalogParameterValidationMessage(parameter, value);
     if (message) {
       setErrors((current) => ({ ...current, [parameter.id]: message }));
@@ -548,6 +542,10 @@ export function ProgramPropertyEditor({
           );
           const fallbackValid = fallback !== undefined
             && firstCatalogParameterValidationMessage(parameter, fallback) === null;
+          const displayedSpeed = source === undefined ? literal
+            : source.kind === 'program_parameter'
+              ? programParameters.find((row) => row.parameter_id === source.reference)?.default
+              : undefined;
           const canSelectLiteral = !parameter.required || fallbackValid;
           const literalValidation = hasLiteral
             ? firstCatalogParameterValidationMessage(parameter, literal)
@@ -568,7 +566,7 @@ export function ProgramPropertyEditor({
               <div className="program-property-heading">
                 <label htmlFor={`property-${selected.instance_id}-${parameter.id}`}>
                   {parameter.id === 'max_tcp_linear_speed_mps'
-                    ? 'TCP speed (m/s)'
+                    ? 'TCP speed ceiling (m/s)'
                     : parameter.id}
                 </label>
                 <span>{parameter.required ? 'required' : 'optional'}</span>
@@ -576,8 +574,8 @@ export function ProgramPropertyEditor({
               {parameter.id === 'max_tcp_linear_speed_mps' && (
                 <p className="muted">
                   {selectedDeploymentSpeed === null
-                    ? 'Optional operation request; Apply validates it against the selected Deployment target.'
-                    : `Optional operation request for ${selectedDeploymentSpeed.target}; Deployment maximum ${selectedDeploymentSpeed.maximum} m/s.`}
+                    ? 'Optional speed ceiling; the backend uses the lower of this value and the applied Deployment target maximum.'
+                    : `Currently applied Deployment maximum for ${selectedDeploymentSpeed.target}: ${selectedDeploymentSpeed.maximum} m/s. ${typeof displayedSpeed === 'number' && Number.isFinite(displayedSpeed) && displayedSpeed > 0 ? `With ${source === undefined ? 'request' : 'parameter default'} ${displayedSpeed} m/s, the effective ceiling is ${Math.min(displayedSpeed, selectedDeploymentSpeed.maximum)} m/s. ` : 'The backend resolves the effective ceiling when the request is known. '}The authored value is unchanged.`}
                 </p>
               )}
               {(choices.length > 0 || source !== undefined) && (

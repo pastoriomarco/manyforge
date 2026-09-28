@@ -528,12 +528,16 @@ def test_held_task_observation_distinguishes_unstarted_from_settled_failure(unst
     adapter.observe_while_operator_stop_held()
     if unstarted:
         assert adapter.presented_status is py_trees.common.Status.INVALID
+        # Ticking but held until motion starts: presented as "held", not idle.
+        assert adapter.status is py_trees.common.Status.RUNNING
+        assert adapter.presented_held is True
         assert adapter.observe_control_state() == "inactive"
         list(adapter.tick())
         assert len(task.starts) == 1
         state.publish(OperatorMotionStopSnapshot(5))
         list(adapter.tick())
         assert len(task.starts) == 2  # Fresh attempt only after authoritative release.
+        assert adapter.presented_held is False
         assert task.starts[0][1] != task.starts[1][1]
     else:
         assert adapter.status is py_trees.common.Status.FAILURE
@@ -1175,3 +1179,22 @@ def test_closed_resolver_source_contains_no_dynamic_loader_surface() -> None:
     assert "entry_point" not in source
     assert "module_path" not in source
     assert "factory_path" not in source
+
+
+def test_node_status_presentation_distinguishes_held_from_idle() -> None:
+    from manyforge_behavior.program_runtime import _presented_node_status
+
+    class Leaf(py_trees.behaviour.Behaviour):
+        def __init__(self, status, held=False):
+            super().__init__("leaf")
+            self.status = status
+            self.presented_held = held
+
+        def update(self):
+            return self.status
+
+    running = py_trees.common.Status.RUNNING
+    assert _presented_node_status(Leaf(running, held=True)) == "held"
+    assert _presented_node_status(Leaf(running)) == "running"
+    assert _presented_node_status(Leaf(py_trees.common.Status.INVALID)) == "idle"
+    assert _presented_node_status(Leaf(py_trees.common.Status.SUCCESS)) == "success"

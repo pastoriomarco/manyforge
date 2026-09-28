@@ -11,6 +11,8 @@ interface PaneDividerProps {
   max: number;
   direction?: 1 | -1;
   axis?: 'x' | 'y';
+  /** Pointer travel multiplier; 2 keeps a centered pane centered. */
+  scale?: number;
   onChange: (value: number) => void;
   className?: string;
 }
@@ -27,6 +29,7 @@ export function PaneDivider({
   max,
   direction = 1,
   axis = 'x',
+  scale = 1,
   onChange,
   className = '',
 }: PaneDividerProps) {
@@ -45,7 +48,7 @@ export function PaneDivider({
     const active = pointer.current;
     if (active === null || active.id !== event.pointerId) return;
     onChange(clamp(
-      active.startValue + direction * (
+      active.startValue + direction * scale * (
         (axis === 'x' ? event.clientX : event.clientY) - active.start
       ),
       min,

@@ -875,6 +875,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const ProgramExecutionSelectionRequestDTO& request) const;
   [[nodiscard]] ProgramExecutionScopeStateDTO program_execution_scope_locked(
       const ProgramRunStopFence& fence) const;
+  // Whether a captured node can have physical effects. Unknown capture or
+  // index is treated as effectful, so containment is never skipped.
+  [[nodiscard]] bool program_node_effectful_locked(const ProgramRunId& program_run_id,
+                                                   std::size_t index) const;
   void reduce_program_selection_stop_locked(const StopCertificateDTO& certificate);
   std::vector<ReplayEntry> replay_ledger_;
   std::vector<ControlReplayEntry> control_replay_ledger_;

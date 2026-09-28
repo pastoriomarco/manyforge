@@ -65,6 +65,7 @@ import {
 import {
   quaternionFromRpyDegrees,
   robotControlCandidatePresentationAllowed,
+  robotControlHasActiveOperation,
   robotControlHasLocalDraft,
 } from '../state/robotControl';
 import type { StructuralResourceState } from '../state/structuralResource';
@@ -1718,6 +1719,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
             ? appliedObject.placement.pose_in_cell : null);
     })
   );
+  // A Draft/Applied choice only means something while the two differ and its
+  // toggle is visible. Once they match (a Load, Apply or Discard settled),
+  // return to automatic so a stale choice cannot keep a hidden Draft view.
+  useEffect(() => {
+    if (!draftSceneDifferent) setSceneSourceChoice('auto');
+  }, [draftSceneDifferent]);
   const programDraftPreview = !executionActive && sceneSourceIsDraft(
     sceneSourceChoice, ownerSceneKnown, draftIdentity !== null,
     draftSceneDifferent,
@@ -2189,6 +2196,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
         />
       )}
       robotControlBlocked={robotControl.state.phase === 'blocked'}
+      robotMotionActive={robotControlHasActiveOperation(robotControl.state)}
       objectControlSurface={objectControlSurface}
       inspectorTarget={inspectorTarget}
       inspectorMinimized={inspectorMinimized}

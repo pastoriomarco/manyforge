@@ -45,7 +45,7 @@ const UNSTYLED_CLASS_HOOKS = new Set([
   'program-side-rail-left',
   'program-topology-node-type',
   'program-tree-action-row-placement',
-  'program-tree-action-row-type-commands',
+  'program-tree-action-row-type',
   'runtime-detail-group',
   'scene-shape-fields',
   'transport-full-stop',

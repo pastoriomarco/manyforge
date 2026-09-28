@@ -100,7 +100,7 @@ export function DeploymentCompositionPanel({
   const [error, setError] = useState<string | null>(null);
   useOperationalErrorMirror({
     source: 'composer.manager_composition',
-    title: 'Manager preview or Apply failed',
+    title: 'Manager status could not be read',
     message: error,
     onDismiss: () => setError(null),
   });

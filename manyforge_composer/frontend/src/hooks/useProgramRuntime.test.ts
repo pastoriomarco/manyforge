@@ -11,7 +11,6 @@ import type {
 import type { ComposerHeadlessState } from '../types/headless';
 import {
   buildProgramResetRequest,
-  buildProgramStopRequest,
   buildProgramStartRequest,
   controlPendingAfterProjection,
   programPendingAfterProjection,
@@ -216,41 +215,6 @@ describe('Program command settlement', () => {
 
     expect(programPendingAfterProjection(
       'run', run, null, runningCycle,
-    )).toBeNull();
-  });
-
-  it('addresses Program Stop from the authoritative cycle while Start is pending', () => {
-    const { snapshot } = admissionFixtures();
-    const starting = {
-      ...snapshot,
-      programCycle: {
-        ...snapshot.programCycle,
-        state: 'starting' as const,
-        programRunId: 'program-cycle.7',
-        allowedCommands: [{
-          commandKind: 'program_stop',
-          semanticTarget: {},
-          allowed: true,
-          disabledReason: null,
-        }],
-      },
-    };
-    expect(buildProgramStopRequest(
-      starting, 'composer.epoch.1', 'request.stop.1',
-    )).toMatchObject({
-      program_run_id: 'program-cycle.7',
-      expected_owner_epoch: 'runner.epoch.1',
-    });
-    expect(buildProgramStopRequest(
-      {
-        ...starting,
-        programCycle: {
-          ...starting.programCycle,
-          allowedCommands: [],
-        },
-      },
-      'composer.epoch.1',
-      'request.stop.2',
     )).toBeNull();
   });
 

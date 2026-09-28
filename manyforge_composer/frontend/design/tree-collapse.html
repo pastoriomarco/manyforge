@@ -1,0 +1,408 @@
+<title>Collapsed Subtree Mock</title>
+<!-- Program tree collapsed-subtree proposal. Open directly in a browser
+     (file://). It loads the app's real stylesheet; the icons are the real
+     node icons. Lint, build, tests and packaging ignore this folder. -->
+<link rel="stylesheet" href="../src/styles/index.css">
+<style>
+  body { margin: 0; padding: 28px clamp(16px, 3vw, 40px) 48px; overflow: auto; }
+  .ck-wrap { max-width: 1240px; margin: 0 auto; display: grid; gap: 22px; }
+  .ck-wrap h1 { margin: 0; font-size: 1.3rem; }
+  .ck-wrap h2 { margin: 0; font-size: 0.95rem; }
+  .ck-lead { margin: 0; max-width: 84ch; color: var(--mf-text-neutral-68); font-size: 0.84rem; line-height: 1.5; }
+  .ck-block { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--mf-border-neutral-23); border-radius: var(--mf-radius-lg); background: var(--mf-bg-neutral-08); }
+  .ck-block > p, .ck-block li { margin: 0; max-width: 88ch; color: var(--mf-text-neutral-68); font-size: 0.8rem; line-height: 1.5; }
+  .ck-block ul { margin: 0; padding-left: 1.1rem; display: grid; gap: 4px; }
+  .ck-block strong { color: var(--mf-text-neutral-90); }
+  .ck-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 0.76rem; color: var(--mf-text-neutral-68); }
+  .ck-controls button { min-height: 1.9rem; padding: 0.25rem 0.6rem; font-size: 0.74rem; }
+  .ck-controls label { display: inline-flex; gap: 6px; align-items: center; }
+  .ck-controls input { width: auto; }
+  .ck-sep { width: 1px; height: 1.3rem; background: var(--mf-border-neutral-23); }
+
+  /* ---- Canvas ------------------------------------------------------- */
+  .ck-canvas { position: relative; overflow: auto; min-height: 420px; border: 1px solid var(--mf-border-neutral-19); border-radius: var(--mf-radius-md-sm);
+    background-color: var(--mf-bg-neutral-06-a52);
+    background-image: radial-gradient(circle, var(--mf-border-neutral-19) 1px, transparent 1px); background-size: 24px 24px; }
+  .ck-stage { position: relative; }
+  .ck-stage svg.ck-edges { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
+  .ck-edges path { fill: none; stroke-width: 2; transition: stroke 160ms; }
+  /* A wide invisible stroke makes an edge easy to right-click. */
+  .ck-edges path.ck-hit { stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: context-menu; }
+  .ck-edges path.ck-hit:hover + path, .ck-edges path.ck-edge-active { stroke-width: 3.5; }
+  .ck-toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); padding: 0.4rem 0.8rem; border: 1px solid var(--mf-border-neutral-32);
+    border-radius: var(--mf-radius-md); color: var(--mf-text-neutral-90); background: var(--mf-bg-neutral-08); font-size: 0.76rem; }
+  .ck-stage .bt-node { position: absolute; transition: top 200ms ease, left 200ms ease; }
+
+  /* The empty right band of a composite holds the collapse chevron. */
+  /* Quiet chevron: no border; only a faint background tells it is a button.
+     Hovering the node brightens it, hovering the chevron fills it. */
+  .ck-fold { position: absolute; top: 50%; left: 50%; display: grid; width: 1.35rem; height: 1.35rem; place-items: center; padding: 0;
+    transform: translate(-50%, -50%); border: 0; border-radius: var(--mf-radius-md-sm);
+    color: var(--mf-text-neutral-57); background: var(--mf-bg-neutral-15-a60); cursor: pointer; transition: opacity 120ms, background 120ms, color 120ms; }
+  .bt-node:hover .ck-fold { color: var(--mf-text-neutral-78); background: var(--mf-bg-neutral-15); }
+  .ck-fold:hover, .ck-fold:focus-visible { color: var(--mf-text-neutral-94b); background: var(--mf-bg-neutral-19); }
+  /* Hover-only: expanded composites show the chevron only on hover or focus.
+     A collapsed node keeps it, since it is the only way back. */
+  .chev-hover .bt-node:not(.ck-collapsed) .ck-fold { opacity: 0; }
+  .chev-hover .bt-node:not(.ck-collapsed):hover .ck-fold, .chev-hover .ck-fold:focus-visible { opacity: 1; }
+  .ck-fold svg { width: 0.8rem; height: 0.8rem; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .ck-hidden-count { position: absolute; right: 4px; bottom: 3px; color: var(--mf-text-neutral-57); font-size: 0.6rem; }
+
+  /* ---- Collapsed node ------------------------------------------------ */
+  /* Same width, border (its own status) and header as a node; the header is
+     the node's normal icon band, name and right band (expand chevron). */
+  .bt-node.ck-collapsed { display: block; height: auto; padding-bottom: 6px; }
+  /* Grow: a collapsed node widens to fit its deepest/longest row, from the
+     node width up to a cap; past the cap names end in an ellipsis. */
+  .width-grow .bt-node.ck-collapsed { width: max-content; min-width: var(--mf-node-width); max-width: var(--ck-max-width, 340px); }
+  .width-grow .ck-row span.ck-name { overflow: visible; }
+  .width-grow .bt-node.ck-collapsed.ck-capped .ck-row span.ck-name { overflow: hidden; }
+  .ck-collapsed > .ck-head { display: grid; grid-template-columns: var(--mf-node-band-width) minmax(0, 1fr) var(--mf-node-band-width); align-items: center; height: 3.1rem; }
+  .ck-collapsed > .ck-head > .bt-node-band { height: 100%; }
+  .ck-collapsed > .ck-head .bt-node-name { -webkit-line-clamp: 1; }
+  .ck-rows { display: grid; gap: 3px; margin: 0 6px; padding-top: 5px; border-top: 1px solid var(--mf-border-neutral-32); }
+  /* An item is a leaf row, or a composite box whose border also encloses its
+     children: nesting is drawn by the boxes, not by indent lines. */
+  .ck-item { --row-status: var(--mf-status-idle); position: relative; border-radius: 4px; }
+  .ck-row { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 6px;
+    height: 22px; padding: 0 6px; text-align: left; font-size: 0.72rem; cursor: pointer; }
+  .ck-group > .ck-row { height: 21px; }
+  .ck-group-body { display: grid; gap: 3px; padding: 0 4px 4px 12px; }
+  .ck-row .program-category-icon { width: 15px; height: 15px; --program-icon-size: 15px; }
+  .ck-row span.ck-name { overflow: hidden; color: var(--mf-text-neutral-90); text-overflow: ellipsis; white-space: nowrap; }
+  .ck-row .ck-kind { color: var(--mf-text-neutral-57); font-size: 0.6rem; }
+  .ck-item.selected { outline: 1.5px solid var(--mf-border-neutral-94); outline-offset: 1px; }
+  .ck-row:hover { filter: brightness(1.15); }
+
+  .ck-item.status-running { --row-status: var(--mf-status-running); }
+  .ck-item.status-success { --row-status: var(--mf-status-success); }
+  .ck-item.status-failure { --row-status: var(--mf-status-failure); }
+  /* Only a running leaf glows; a running box would light its whole group. */
+  .ck-leaf.status-running { --glow: 0 0 0.5rem var(--mf-shadow-warning-60-a28); }
+
+  /* Style A (Groot): category-colour border, status-tinted fill. */
+  .style-a .ck-item { border: 1px solid color-mix(in srgb, var(--mf-category-color) 80%, transparent);
+    background: color-mix(in srgb, var(--row-status) 30%, var(--mf-bg-neutral-15)); box-shadow: var(--glow, none); }
+  .style-a .ck-item.status-idle { background: var(--mf-bg-neutral-15); }
+  .style-a .ck-group { background: color-mix(in srgb, var(--row-status) 14%, var(--mf-bg-neutral-11)); }
+  .style-a .ck-group.status-idle { background: var(--mf-bg-neutral-11); }
+  /* Style B (node border): status-colour border like a node, neutral fill;
+     the category shows only through the icon. */
+  .style-b .ck-item { border: 1.5px solid var(--row-status); background: var(--mf-bg-neutral-15); box-shadow: var(--glow, none); }
+  .style-b .ck-group { background: var(--mf-bg-neutral-11); }
+  /* Style C (status bar): neutral border, a solid status bar on the left edge. */
+  .style-c .ck-item { border: 1px solid var(--mf-border-neutral-27); background: var(--mf-bg-neutral-15);
+    box-shadow: inset 4px 0 0 var(--row-status), var(--glow, 0 0 transparent); }
+  .style-c .ck-group { background: var(--mf-bg-neutral-11); }
+  /* Style D (border + bar): border and left bar both in the status colour. */
+  .style-d .ck-item { border: 1.5px solid var(--row-status); background: var(--mf-bg-neutral-15);
+    box-shadow: inset 4px 0 0 var(--row-status), var(--glow, 0 0 transparent); }
+  .style-d .ck-group { background: var(--mf-bg-neutral-11); }
+  .style-c .ck-row, .style-d .ck-row { padding-left: 9px; }
+
+  /* ---- Anatomy grid --------------------------------------------------- */
+  .ck-anatomy { display: flex; flex-wrap: wrap; gap: 26px; align-items: flex-start; }
+  .ck-anatomy figure { margin: 0; display: grid; gap: 8px; justify-items: start; }
+  .ck-anatomy figcaption { color: var(--mf-text-neutral-63); font-size: 0.72rem; max-width: 200px; line-height: 1.4; }
+  .ck-anatomy .bt-node { position: relative; }
+</style>
+
+<div class="ck-wrap">
+  <header style="display:grid;gap:8px">
+    <h1>Program tree — fully collapsed subtree</h1>
+    <p class="ck-lead">A composite node can be collapsed. Its whole subtree leaves the canvas and is listed inside the node instead; a nested composite is a box that encloses its own children, like Groot's nested collapsed view (the partial, direct-children view is not proposed). Every listed node keeps showing its live execution status. Press <strong>Play run</strong> and collapse <em>pick</em> or <em>place</em> while it runs.</p>
+  </header>
+
+  <section class="ck-block">
+    <h2>Canvas</h2>
+    <div class="ck-controls">
+      <button type="button" id="play">Play run</button>
+      <button type="button" id="step">Step</button>
+      <button type="button" id="reset">Reset</button>
+      <label><input type="checkbox" id="fail"> Fail at <code>check_grasped</code></label>
+      <span class="ck-sep"></span>
+      Row style
+      <label><input type="radio" name="style" value="a"> A · Groot</label>
+      <label><input type="radio" name="style" value="b"> B · node border</label>
+      <label><input type="radio" name="style" value="c"> C · status bar</label>
+      <label><input type="radio" name="style" value="d" checked> D · border + bar</label>
+      <span class="ck-sep"></span>
+      Width
+      <label><input type="radio" name="width" value="grow" checked> grow to fit</label>
+      <label><input type="radio" name="width" value="fixed"> fixed</label>
+      <span class="ck-sep"></span>
+      Chevron
+      <label><input type="radio" name="chev" value="quiet" checked> quiet</label>
+      <label><input type="radio" name="chev" value="hover"> on hover</label>
+      <span class="ck-sep"></span>
+      <button type="button" id="collapse-all">Collapse all</button>
+      <button type="button" id="expand-all">Expand all</button>
+    </div>
+    <div class="ck-canvas"><div class="ck-stage style-d width-grow" id="stage"><svg class="ck-edges" id="edges"></svg></div></div>
+  </section>
+
+  <section class="ck-block">
+    <h2>Anatomy and every status</h2>
+    <div class="ck-anatomy style-d width-grow" id="anatomy"></div>
+  </section>
+
+  <section class="ck-block">
+    <h2>Proposed rules</h2>
+    <ul>
+      <li><strong>Only composites collapse</strong> (nodes with children). The chevron sits in the node's empty right band, so the node keeps its size and layout when expanded. It is quiet (no border, faint background) and brightens when the node is hovered. Right-click adds <em>Collapse subtree</em> / <em>Expand subtree</em>; the canvas toolbar adds <em>Collapse all</em> / <em>Expand all</em>.</li>
+      <li><strong>Collapsed means fully collapsed:</strong> every descendant is listed, at any depth; a nested composite is a box around its own children. Collapsing a node inside an already collapsed one has nothing to show until expanded; expanding restores descendants' own collapsed state. <em>Collapse all</em> collapses every composite including the roots, so the whole Program becomes one box per root; expanding a root then shows its children still collapsed.</li>
+      <li><strong>Width:</strong> expanded nodes keep the fixed node width. A collapsed node grows to fit its deepest and longest row, from the node width up to a cap (340 px here); past the cap, names end in "…" with the full name in the tooltip. Later columns move right by the extra width.</li>
+      <li><strong>Status stays live:</strong> the collapsed node's border is its own status, as today; each row shows its node's status (running rows glow). A failure deep inside a collapsed subtree is visible without expanding.</li>
+      <li><strong>Right-click:</strong> on a node, the menu starts with <em>Collapse</em> (or <em>Expand</em> on a collapsed node; disabled on a leaf), <em>Collapse all</em> and <em>Expand all</em>, then the existing node commands. On a row inside a collapsed node, the first entry is <em>Show on canvas</em>, which expands its collapsed ancestors. On empty canvas: the existing <em>Paste here</em>, <em>Add node here</em>, <em>Auto-layout</em>, <em>Fit view</em>, then <em>Collapse all</em> and <em>Expand all</em>. On an edge: <em>Disconnect</em>, which detaches the child subtree as a separate root (the same operation as double-clicking the edge today). A node's own chevron opens that node's menu; over toolbar and panel buttons no canvas menu opens. In this mock, the existing commands only show a notice.</li>
+      <li><strong>Rows are the nodes:</strong> clicking a row selects that node and opens it in the Program inspector; an invalid or unavailable row shows the same kind symbol as the node would.</li>
+      <li><strong>View only:</strong> collapsing never edits the Program. Auto-layout treats a collapsed node as one tall node. Editing links into a hidden node needs it expanded (drops onto a collapsed node append as the last child, as now).</li>
+      <li><strong>Open choice:</strong> keep the collapsed set per browser (like edge style), or save it with the Program's viewer metadata so it follows the file.</li>
+    </ul>
+  </section>
+</div>
+
+<script>
+const ICONS = {"sequence": "<svg class=\"program-category-icon\" data-category-family=\"execution_control\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(-0.087 -0.348) scale(1.0435)\"><path d=\"M2 8h11\"></path><path d=\"M9 3.5 13.5 8 9 12.5\"></path></g></svg>", "fallback": "<svg class=\"program-category-icon\" data-category-family=\"execution_control\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(0.000 -0.150) scale(1.0000)\"><path d=\"M2 4.5h6\"></path><path d=\"M10 2.8l3.4 3.4M13.4 2.8 10 6.2\"></path><path d=\"M5 4.5V10a1.5 1.5 0 0 0 1.5 1.5H14\"></path><path d=\"M12 9.5l2 2-2 2\"></path></g></svg>", "parallel": "<svg class=\"program-category-icon\" data-category-family=\"execution_control\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(0.742 0.258) scale(0.9677)\"><path d=\"M2 4h11\"></path><path d=\"M10.8 1.8 13 4l-2.2 2.2\"></path><path d=\"M2 12h11\"></path><path d=\"M10.8 9.8 13 12l-2.2 2.2\"></path></g></svg>", "retry": "<svg class=\"program-category-icon\" data-category-family=\"execution_control\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(0.080 0.560) scale(0.9600)\"><path d=\"M2 2.5l3 3M5 2.5l-3 3\"></path><path d=\"M7.5 4H11a3.5 3.5 0 0 1 0 7H4\"></path><path d=\"M6 9l-2 2 2 2\"></path></g></svg>", "motion": "<svg class=\"program-category-icon\" data-category-family=\"motion\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(2.167 1.250) scale(0.8333)\"><circle class=\"solid\" cx=\"3\" cy=\"14\" r=\"1.3\"></circle><path d=\"M3 14h6.5a2.8 2.8 0 0 0 0-5.6h-3a2.8 2.8 0 0 1 0-5.6h5.4\"></path><path d=\"M10.2 0.9 12.3 2.8 10.2 4.7\"></path></g></svg>", "gripper": "<svg class=\"program-category-icon\" data-category-family=\"gripper\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(-0.276 0.138) scale(1.0345)\"><rect x=\"2.5\" y=\"1.8\" width=\"11\" height=\"3.6\" rx=\"1\"></rect><path d=\"M4.6 5.4v5.4l2.1 2.6\"></path><path d=\"M11.4 5.4v5.4l-2.1 2.6\"></path><path d=\"M4.6 8.2h1.4\"></path><path d=\"M11.4 8.2H10\"></path></g></svg>", "geometry": "<svg class=\"program-category-icon\" data-category-family=\"world\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(-0.727 -1.000) scale(1.0909)\"><path d=\"M2.5 13.5h11\"></path><path d=\"M2.5 13.5 10 3\"></path><path d=\"M8 13.5a5.5 5.5 0 0 0-2.3-4.48\"></path></g></svg>", "logic": "<svg class=\"program-category-icon\" data-category-family=\"logic\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(0.615 0.615) scale(0.9231)\"><rect x=\"1.5\" y=\"4.5\" width=\"13\" height=\"7\" rx=\"3.5\"></rect><circle class=\"solid\" cx=\"11\" cy=\"8\" r=\"2\"></circle></g></svg>"};
+const TREE = { id: 'pick_and_place', icon: 'sequence', kind: 'Sequence', children: [
+  { id: 'open_gripper_start', icon: 'gripper', kind: 'Command gripper' },
+  { id: 'pick', icon: 'sequence', kind: 'Sequence', children: [
+    { id: 'approach_pick', icon: 'motion', kind: 'Joint motion' },
+    { id: 'descend_pick', icon: 'motion', kind: 'Cartesian motion' },
+    { id: 'close_gripper', icon: 'gripper', kind: 'Command gripper' },
+    { id: 'check_grasped', icon: 'logic', kind: 'Check boolean' },
+    { id: 'lift_pick', icon: 'motion', kind: 'Cartesian motion' },
+  ]},
+  { id: 'place', icon: 'sequence', kind: 'Sequence', children: [
+    { id: 'approach_place', icon: 'motion', kind: 'Joint motion' },
+    { id: 'release', icon: 'retry', kind: 'Retry', children: [
+      { id: 'open_gripper_place', icon: 'gripper', kind: 'Command gripper' },
+      { id: 'check_released', icon: 'geometry', kind: 'Check pose distance' },
+      { id: 'recover_part_stuck_in_gripper', icon: 'fallback', kind: 'Fallback', children: [
+        { id: 'wiggle_and_reopen', icon: 'sequence', kind: 'Sequence', children: [
+          { id: 'wiggle_tool_along_approach_axis', icon: 'motion', kind: 'Cartesian motion' },
+          { id: 'open_gripper_second_attempt_wide', icon: 'gripper', kind: 'Command gripper' },
+        ]},
+      ]},
+    ]},
+    { id: 'retreat', icon: 'motion', kind: 'Cartesian motion' },
+  ]},
+  { id: 'return_home', icon: 'motion', kind: 'Joint motion' },
+]};
+const FAMILY = { sequence: 'execution_control', fallback: 'execution_control', parallel: 'execution_control', retry: 'execution_control', motion: 'motion', gripper: 'gripper', geometry: 'world', logic: 'logic' };
+/* Several roots can exist on the canvas: a disconnected subtree becomes one. */
+let ROOTS = [TREE];
+const byId = new Map(); const parentOf = new Map();
+function reindex() {
+  byId.clear(); parentOf.clear();
+  ROOTS.forEach((r) => (function index(n, p) { byId.set(n.id, n); if (p) parentOf.set(n.id, p.id); (n.children || []).forEach((c) => index(c, n)); })(r, null));
+}
+reindex();
+const leaves = []; (function walk(n) { if (!n.children) leaves.push(n.id); else n.children.forEach(walk); })(TREE);
+
+const collapsed = new Set(['place']);
+let status = {}; let tick = -1; let timer = null; let selected = null;
+
+function reset() { status = {}; byId.forEach((_, id) => { status[id] = 'idle'; }); tick = -1; stop(); }
+function stop() { if (timer) clearInterval(timer); timer = null; document.getElementById('play').textContent = 'Play run'; }
+/* Leaves run in order: running on one tick, then success (or failure). A
+   composite is running while any child runs, failure when one fails,
+   success when all succeed. */
+function step() {
+  if (tick >= 0 && tick < leaves.length) {
+    const id = leaves[tick];
+    const failing = id === 'check_grasped' && document.getElementById('fail').checked;
+    status[id] = failing ? 'failure' : 'success';
+    if (failing) { propagate(); tick = leaves.length; render(); stop(); return; }
+  }
+  tick += 1;
+  if (tick < leaves.length) status[leaves[tick]] = 'running'; else stop();
+  propagate(); render();
+}
+function propagate() {
+  (function agg(n) {
+    if (!n.children) return status[n.id];
+    const s = n.children.map(agg);
+    status[n.id] = s.includes('failure') ? 'failure' : s.includes('running') ? 'running'
+      : s.every((x) => x === 'success') ? 'success' : s.some((x) => x !== 'idle') ? 'running' : 'idle';
+    return status[n.id];
+  })(TREE);
+}
+
+const chevron = (down) => `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="${down ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'}"/></svg>`;
+function countDescendants(n) { return (n.children || []).reduce((a, c) => a + 1 + countDescendants(c), 0); }
+/* One collapsed-list item: a leaf row, or a composite box whose border
+   encloses its own children. */
+function itemHtml(c) {
+  const sel = selected === c.id ? ' selected' : '';
+  const row = `<div class="ck-row" data-select="${c.id}" title="${c.id} · ${c.kind} · ${status[c.id]}">
+      ${ICONS[c.icon]}<span class="ck-name">${c.id}</span>${c.children ? `<span class="ck-kind">${countDescendants(c)}</span>` : '<span></span>'}</div>`;
+  if (!c.children) return `<div class="ck-item ck-leaf status-${status[c.id]}${sel}" data-category-family="${FAMILY[c.icon]}">${row}</div>`;
+  return `<div class="ck-item ck-group status-${status[c.id]}${sel}" data-category-family="${FAMILY[c.icon]}">${row}
+      <div class="ck-group-body">${c.children.map(itemHtml).join('')}</div></div>`;
+}
+
+function nodeHtml(n) {
+  const fam = FAMILY[n.icon];
+  const s = status[n.id];
+  const sel = selected === n.id ? ' selected' : '';
+  if (collapsed.has(n.id) && n.children) {
+    const rows = (n.children || []).map(itemHtml).join('');
+    return `<div class="bt-node ck-collapsed status-${s}${sel}" data-id="${n.id}" data-category-family="${fam}" title="${n.id} (collapsed, ${countDescendants(n)} nodes)">
+      <div class="ck-head"><span class="bt-node-band">${ICONS[n.icon]}</span><strong class="bt-node-name">${n.id}</strong>
+      <span class="bt-node-band"><button type="button" class="ck-fold" data-fold="${n.id}" aria-label="Expand ${n.id}">${chevron(false)}</button></span></div>
+      <div class="ck-rows">${rows}</div></div>`;
+  }
+  return `<div class="bt-node status-${s}${sel}" data-id="${n.id}" data-category-family="${fam}" title="${n.id}" data-select="${n.id}">
+    <span class="bt-node-band">${ICONS[n.icon]}</span><strong class="bt-node-name">${n.id.replaceAll('_', '_<wbr>')}</strong>
+    <span class="bt-node-band">${n.children ? `<button type="button" class="ck-fold" data-fold="${n.id}" aria-label="Collapse ${n.id}">${chevron(true)}</button>` : ''}</span></div>`;
+}
+
+function visibleTree(n, out) { out.push(n); if (n.children && !collapsed.has(n.id)) n.children.forEach((c) => visibleTree(c, out)); return out; }
+
+function render() {
+  const stage = document.getElementById('stage');
+  const edges = document.getElementById('edges');
+  stage.querySelectorAll('.bt-node').forEach((e) => e.remove());
+  const nodes = ROOTS.flatMap((r) => visibleTree(r, []));
+  const els = new Map();
+  nodes.forEach((n) => { const t = document.createElement('template'); t.innerHTML = nodeHtml(n).trim(); const el = t.content.firstChild; stage.appendChild(el); els.set(n.id, el); });
+  // Left-to-right tidy layout from the measured sizes.
+  // Column x from the widest node at each depth, so a wider collapsed node
+  // pushes later columns right instead of overlapping them.
+  const gapX = 70, gapY = 16; let cursor = 20; const pos = new Map();
+  const depthOf = new Map(); ROOTS.forEach((r) => (function d(n, k) { depthOf.set(n.id, k); if (n.children && !collapsed.has(n.id)) n.children.forEach((c) => d(c, k + 1)); })(r, 0));
+  const colWidth = []; els.forEach((el, id) => {
+    const k = depthOf.get(id); if (k === undefined) return;
+    el.classList.toggle('ck-capped', el.scrollWidth > el.clientWidth + 1 || el.offsetWidth >= 340);
+    colWidth[k] = Math.max(colWidth[k] || 0, el.offsetWidth);
+  });
+  const colX = []; colWidth.reduce((x, w, k) => { colX[k] = x; return x + w + gapX; }, 20);
+  const place = (n, depth) => {
+    const el = els.get(n.id); const h = el.offsetHeight;
+    const kids = n.children && !collapsed.has(n.id) ? n.children : [];
+    const w = el.offsetWidth;
+    if (!kids.length) { pos.set(n.id, { x: colX[depth], y: cursor, h, w }); cursor += h + gapY; return; }
+    kids.forEach((c) => place(c, depth + 1));
+    const first = pos.get(kids[0].id), last = pos.get(kids[kids.length - 1].id);
+    const mid = (first.y + first.h / 2 + last.y + last.h / 2) / 2;
+    pos.set(n.id, { x: colX[depth], y: Math.max(0, mid - h / 2), h, w });
+  };
+  ROOTS.forEach((r) => { place(r, 0); cursor += 24; });
+  let maxX = 0, maxY = 0;
+  pos.forEach((p, id) => { const el = els.get(id); el.style.left = p.x + 'px'; el.style.top = p.y + 'px'; maxX = Math.max(maxX, p.x + p.w); maxY = Math.max(maxY, p.y + p.h); });
+  stage.style.width = (maxX + 40) + 'px'; stage.style.height = (maxY + 30) + 'px';
+  const col = { idle: 'var(--mf-status-idle)', running: 'var(--mf-status-running)', success: 'var(--mf-status-success)', failure: 'var(--mf-status-failure)' };
+  edges.innerHTML = nodes.filter((n) => parentOf.has(n.id)).map((n) => {
+    const p = pos.get(parentOf.get(n.id)), c = pos.get(n.id);
+    const x1 = p.x + p.w, y1 = p.y + (collapsed.has(parentOf.get(n.id)) ? 25 : p.h / 2), x2 = c.x, y2 = c.y + (collapsed.has(n.id) ? 25 : c.h / 2), mx = (x1 + x2) / 2;
+    const d = `M${x1} ${y1} C${mx} ${y1} ${mx} ${y2} ${x2} ${y2}`;
+    return `<path class="ck-hit" d="${d}" data-edge="${n.id}"/><path d="${d}" style="stroke:${col[status[n.id]]}"/>`;
+  }).join('');
+  renderAnatomy();
+}
+
+function renderAnatomy() {
+  const box = document.getElementById('anatomy');
+  const saved = { ...status }; const savedCollapsed = new Set(collapsed); const savedSel = selected;
+  const demo = [
+    ['idle', 'Idle: nothing has run.', {}],
+    ['running', 'Running: the node is running; its running descendants glow.', { approach_pick: 'success', descend_pick: 'success', close_gripper: 'running' }],
+    ['success', 'Success: every row green.', { approach_pick: 'success', descend_pick: 'success', close_gripper: 'success', check_grasped: 'success', lift_pick: 'success' }],
+    ['failure', 'Failure deep inside is visible without expanding.', { approach_pick: 'success', descend_pick: 'success', close_gripper: 'success', check_grasped: 'failure' }],
+  ];
+  collapsed.add('pick'); selected = null;
+  box.innerHTML = demo.map(([s, caption, rows]) => {
+    byId.forEach((_, id) => { status[id] = 'idle'; }); Object.assign(status, rows); status.pick = s;
+    return `<figure>${nodeHtml(byId.get('pick'))}<figcaption>${caption}</figcaption></figure>`;
+  }).join('');
+  status = saved; collapsed.clear(); savedCollapsed.forEach((id) => collapsed.add(id)); selected = savedSel;
+}
+
+document.addEventListener('click', (e) => {
+  const fold = e.target.closest('[data-fold]');
+  if (fold && fold.closest('#stage')) { const id = fold.dataset.fold; collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id); render(); return; }
+  const sel = e.target.closest('[data-select]');
+  if (sel && sel.closest('#stage')) { selected = sel.dataset.select; render(); }
+});
+document.getElementById('play').onclick = () => {
+  if (timer) { stop(); return; }
+  if (tick >= leaves.length) reset();
+  document.getElementById('play').textContent = 'Pause';
+  step(); timer = setInterval(step, 700);
+};
+document.getElementById('step').onclick = () => { stop(); if (tick >= leaves.length) reset(); step(); };
+document.getElementById('reset').onclick = () => { reset(); render(); };
+/* Every composite, roots included. Expanding a root afterwards shows its
+   children still collapsed, since each keeps its own state. */
+function collapseAll() { byId.forEach((n, id) => { if (n.children) collapsed.add(id); }); render(); }
+document.getElementById('collapse-all').onclick = collapseAll;
+document.getElementById('expand-all').onclick = () => { collapsed.clear(); render(); };
+document.querySelectorAll('input[name=width]').forEach((r) => r.onchange = () => {
+  ['stage', 'anatomy'].forEach((id) => document.getElementById(id).classList.toggle('width-grow', r.value === 'grow'));
+  render();
+});
+document.querySelectorAll('input[name=chev]').forEach((r) => r.onchange = () => {
+  document.getElementById('stage').classList.toggle('chev-hover', r.value === 'hover');
+});
+document.querySelectorAll('input[name=style]').forEach((r) => r.onchange = () => {
+  ['stage', 'anatomy'].forEach((id) => { const el = document.getElementById(id); el.classList.remove('style-a', 'style-b', 'style-c', 'style-d'); el.classList.add('style-' + r.value); });
+});
+/* ---- Right-click menu --------------------------------------------------
+   Node (or a row inside a collapsed node): the canvas's existing entries plus
+   Collapse/Expand and Collapse all/Expand all. Empty canvas: the existing
+   pane entries plus Collapse all/Expand all. Edge: Disconnect. Over a button
+   (chevron, toolbars) no canvas menu opens. */
+const EXISTING_NODE = [['Duplicate', 'Ctrl+D'], ['Copy', 'Ctrl+C'], ['Paste after', 'Ctrl+V'], ['Paste as child'], '-', ['Wrap in', null, true], ['Unwrap'], ['Change type', null, true], '-', ['Move earlier'], ['Move later'], ['Detach'], '-', ['Delete', 'Del']];
+const EXISTING_PANE = [['Paste here', 'Ctrl+V'], ['Add node here', null, true], '-', ['Auto-layout'], ['Fit view']];
+let menuEl = null;
+function closeMenu() { menuEl?.remove(); menuEl = null; document.querySelectorAll('.ck-edge-active').forEach((e) => e.classList.remove('ck-edge-active')); }
+function toast(text) { const t = document.createElement('div'); t.className = 'ck-toast'; t.textContent = text; document.body.appendChild(t); setTimeout(() => t.remove(), 1800); }
+function openMenu(x, y, heading, entries) {
+  closeMenu();
+  menuEl = document.createElement('div'); menuEl.className = 'context-menu'; menuEl.style.left = x + 'px'; menuEl.style.top = y + 'px';
+  const items = entries.map((e, i) => e === '-' ? '<li class="context-menu-separator" role="separator"></li>'
+    : `<li><button type="button" role="menuitem" class="context-menu-item${e.danger ? ' danger' : ''}${e.mock ? ' ck-mock' : ''}" data-i="${i}" ${e.disabled ? 'disabled' : ''} title="${e.title || ''}"><span>${e.label}</span>${e.shortcut ? `<kbd>${e.shortcut}</kbd>` : ''}${e.sub ? '<span class="context-menu-arrow" aria-hidden="true">▸</span>' : ''}</button></li>`).join('');
+  menuEl.innerHTML = `${heading ? `<strong class="context-menu-heading">${heading}</strong>` : ''}<div class="context-menu-list"><ul role="menu">${items}</ul></div>`;
+  document.body.appendChild(menuEl);
+  const r = menuEl.getBoundingClientRect();
+  if (r.right > innerWidth) menuEl.style.left = (x - r.width) + 'px';
+  if (r.bottom > innerHeight) menuEl.style.top = Math.max(4, y - r.height) + 'px';
+  menuEl.onclick = (ev) => { const b = ev.target.closest('[data-i]'); if (!b || b.disabled) return; const e = entries[+b.dataset.i]; closeMenu(); if (e.run) e.run(); else toast(`${e.label}: existing command (not part of this mock)`); };
+}
+const existing = (list) => list.map((e) => e === '-' ? '-' : { label: e[0], shortcut: e[1], sub: e[2], mock: true });
+function collapseEntries(id) {
+  const n = byId.get(id);
+  const insideCollapsed = (() => { for (let p = parentOf.get(id); p; p = parentOf.get(p)) if (collapsed.has(p)) return p; return null; })();
+  let own;
+  if (insideCollapsed) own = { label: `Show on canvas`, title: `Expand ${insideCollapsed} and every collapsed ancestor`, run: () => { for (let p = parentOf.get(id); p; p = parentOf.get(p)) collapsed.delete(p); render(); } };
+  else if (!n.children) own = { label: 'Collapse', disabled: true, title: 'Only nodes with children can collapse.' };
+  else if (collapsed.has(id)) own = { label: 'Expand', run: () => { collapsed.delete(id); render(); } };
+  else own = { label: 'Collapse', run: () => { collapsed.add(id); render(); } };
+  return [own, { label: 'Collapse all', run: collapseAll }, { label: 'Expand all', run: () => { collapsed.clear(); render(); } }];
+}
+document.querySelector('.ck-canvas').addEventListener('contextmenu', (ev) => {
+  // Buttons outside the nodes (toolbars) keep the browser menu; a button that
+  // belongs to a node, such as its chevron, opens that node's menu.
+  if (ev.target.closest('button') && !ev.target.closest('.bt-node')) return;
+  ev.preventDefault();
+  const edge = ev.target.closest('[data-edge]');
+  if (edge) {
+    const child = edge.dataset.edge, parent = parentOf.get(child);
+    edge.nextElementSibling.classList.add('ck-edge-active');
+    openMenu(ev.clientX, ev.clientY, `${parent} → ${child}`, [{ label: 'Disconnect', title: `Detach ${child} and its subtree from ${parent}; it stays on the canvas as a separate root.`, run: () => {
+      const p = byId.get(parent); p.children = p.children.filter((c) => c.id !== child); if (!p.children.length) delete p.children;
+      ROOTS.push(byId.get(child)); reindex(); render(); toast(`${child} disconnected from ${parent}`);
+    } }]);
+    return;
+  }
+  const row = ev.target.closest('.ck-row[data-select]');
+  const node = ev.target.closest('.bt-node');
+  const id = row ? row.dataset.select : node ? node.dataset.id : null;
+  if (id) { selected = id; render(); openMenu(ev.clientX, ev.clientY, id, [...collapseEntries(id), '-', ...existing(EXISTING_NODE)]); return; }
+  openMenu(ev.clientX, ev.clientY, null, [...existing(EXISTING_PANE), '-', { label: 'Collapse all', run: collapseAll }, { label: 'Expand all', run: () => { collapsed.clear(); render(); } }]);
+});
+document.addEventListener('pointerdown', (ev) => { if (menuEl && !menuEl.contains(ev.target)) closeMenu(); });
+document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closeMenu(); });
+
+reset(); status.pick = 'idle'; render();
+</script>

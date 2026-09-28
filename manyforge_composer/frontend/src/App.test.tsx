@@ -70,7 +70,7 @@ describe('Composer shell continuity', () => {
 
     expect(markup).not.toContain('aria-label="Collapse viewer and operations pane"');
     expect(markup).not.toContain('aria-label="Expand Operations pane"');
-    expect(markup).toContain('aria-label="Resize viewer and live controls pane"');
+    expect(markup).toContain('aria-label="Resize central inspector (viewer side) pane"');
     expect(markup).toContain('aria-label="Resize central inspector pane"');
     expect(markup).toContain('aria-label="Resize Program tools pane"');
     expect(markup).toContain('aria-label="Collapse node palette"');
@@ -91,7 +91,9 @@ describe('Composer shell continuity', () => {
     expect(css).toMatch(/\.program-inspector-scroll\s*\{[\s\S]*?overflow-y: auto;/);
     expect(css).toContain('.workbench-inspector');
     expect(css).toContain('.central-inspector-slot');
-    expect(source).toContain('Math.round(window.innerWidth * 0.45)');
+    // The inspector stays centered: editor and viewer share the rest equally.
+    expect(source).toContain('scale={2}');
+    expect(css).toMatch(/minmax\(0, var\(--inspector-width\)\)\s*0\.45rem\s*minmax\(0, 1fr\)/);
     expect(css).toMatch(/\.viewer-transport\s*\{[\s\S]*?display: grid;/);
     expect(css).toMatch(
       /\.viewer-transport\s*\{[\s\S]*?width: min\(58rem, calc\(100% - 2 \* 0\.65rem\)\);/,
@@ -153,7 +155,8 @@ describe('Composer shell continuity', () => {
       /const openRuntimeAttention[\s\S]*if \(globalPanel !== 'runtime'\)[\s\S]*setRuntimePanelExpanded\(false\)[\s\S]*setGlobalPanel\('runtime'\)/,
     );
     expect(appSource).not.toContain('panelClassName="runtime-observability-overlay"');
-    expect(controlsSource).toContain('<ArtifactBrowser lockedKind="program"');
+    expect(controlsSource).not.toContain('<ArtifactBrowser');
+    expect(appSource).toContain('<ScenarioDocumentCommands');
     expect(controlsSource).toContain('Its Deployment will not change.');
     expect(controlsSource).not.toContain('Update Draft');
   });

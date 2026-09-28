@@ -576,6 +576,15 @@ svg.viewer-camera-icon {
   pointer-events: auto;
 }
 
+/* Dialogs opened from the transport render inside it; they must not inherit
+   its single-line, non-selectable control text. */
+.viewer-transport .overlay-scrim {
+  white-space: normal;
+  pointer-events: auto;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 .transport-control-layout {
   display: contents;
 }
@@ -585,7 +594,9 @@ svg.viewer-camera-icon {
   color: var(--mf-text-danger-81);
 }
 
-.viewer-transport button {
+/* Transport-sized buttons, but not those of the dialogs it opens (Halt,
+   Reset, settings), which keep ordinary button sizes. */
+.viewer-transport button:not(.overlay-panel *) {
   height: var(--viewer-transport-control-height);
   min-height: var(--viewer-transport-control-height);
   padding: 0.5rem 0.9rem;
@@ -860,8 +871,9 @@ svg.viewer-camera-icon {
   bottom: calc(100% + 0.35rem);
   z-index: var(--mf-z-popover);
   display: grid;
-  min-width: 13rem;
-  max-width: min(20rem, 70vw);
+  width: max-content;
+  min-width: 15rem;
+  max-width: min(22rem, 80vw);
   gap: 0.25rem;
   padding: 0.5rem;
   border: 1px solid var(--mf-border-neutral-35);
@@ -889,12 +901,10 @@ svg.viewer-camera-icon {
 .transport-group-settings-menu label span {
   display: block;
   min-width: 0;
-  overflow: hidden;
   color: var(--mf-text-neutral-86);
   opacity: 1;
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
   visibility: visible;
-  white-space: nowrap;
 }
 
 .transport-group-settings-menu .transport-settings-option {

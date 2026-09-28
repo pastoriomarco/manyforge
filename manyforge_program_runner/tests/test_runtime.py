@@ -21,6 +21,7 @@ from manyforge_behavior.program_run_owner import (
     ProgramRunOwnerRecoveryIncompleteError,
     ProgramRunOwnerStaleRevisionError,
 )
+from manyforge_behavior.program_scheduling import ProgramSchedulingError
 from manyforge_headless_api.models import (
     CycleRecoveryActionRequest,
     ProgramFullStopResetRequest,
@@ -394,6 +395,9 @@ class _Owner:
             if not active_only or row.state in _ACTIVE_STATES
         )
         return rows[:limit], len(rows) > limit
+
+    def failure_pause_stop_pending(self, _program_run_id: str) -> bool:
+        return False
 
     def read(self, program_run_id: str) -> _Snapshot:
         self.reads += 1
@@ -5497,3 +5501,124 @@ def test_runtime_injects_and_closes_the_program_snapshot_source() -> None:
     runtime.shutdown()
     assert snapshot.closed == 1
     assert model.closed == 1
+
+
+@pytest.mark.parametrize(
+    ("action_id", "case"),
+    [
+        ("retry_runtime_step", "accepted"),
+        ("retry_motion_from_current_state", "accepted"),
+        ("retry_motion_from_current_state", "rejected"),
+        ("retry_motion_from_current_state", "incomplete"),
+        ("retry_motion_from_current_state", "unknown"),
+        ("retry_motion_from_current_state", "resolve_rejected"),
+    ],
+)
+def test_failure_retry_prepares_and_releases_through_owner_before_ticking(
+    monkeypatch, tmp_path, action_id, case
+):
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: object(),
+    )
+    _bypass_scene_preparation(monkeypatch)
+    runtime, journal, _admission = _reconcile_runtime(
+        tmp_path,
+        journal_owner_epoch="runner.1",
+        runtime_owner_epoch="runner.1",
+        inventory={},
+    )
+    owner = _Owner()
+    host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    runtime._owner, runtime._host = owner, host
+    runtime.start()
+    runtime.start_run(_start_request())
+    intervention = SimpleNamespace(
+        identity=SimpleNamespace(
+            program_run_id="program-cycle.1",
+            node_instance_id="move.1",
+            node_attempt_id="attempt.1",
+        ),
+        owner_task_id="operation.1",
+        policy_parameter="stop_policy",
+    )
+    resolved = False
+    owner.intervention = lambda _run: None if resolved else intervention
+    owner.operator_stop_scope = lambda _run: OperatorMotionStopSnapshot(
+        4, frozenset({"move.1", "grip.1"})
+    )
+    offer = {
+        "offer_id": _DIGEST_A,
+        "offer_revision": 1,
+        "actions": [{"action_id": action_id, "enabled": True}],
+    }
+    runtime._recovery_offer = lambda *_args, **_kwargs: deepcopy(offer)
+    calls: list[Any] = []
+
+    def retry(run_id, **kwargs):
+        calls.append(("retry_failure_pause", kwargs["action"]))
+        if case == "rejected":
+            raise ProgramRunOwnerError("a newer Stop holds the motion")
+        if case == "incomplete":
+            raise ProgramRunOwnerRecoveryIncompleteError("cleanup accepted")
+        if case == "unknown":
+            raise ProgramRunOwnerOutcomeUnknownError("release reply lost")
+        return owner.read(run_id)
+
+    def resume_recovery(run_id, **kwargs):
+        nonlocal resolved
+        calls.append(("resume_recovery", kwargs["action"]))
+        if case == "resolve_rejected":
+            raise ProgramSchedulingError("tick host is closed")
+        resolved = True
+        return owner.read(run_id)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("failure Retry must not use per-node owner recovery")
+
+    owner.retry_failure_pause = retry
+    owner.apply_owner_recovery = forbidden
+    host.resume_motion = forbidden
+    host.resume_recovery = resume_recovery
+    request = CycleRecoveryActionRequest.model_validate(
+        {
+            "request_id": "retry.1",
+            "request_owner_epoch": "client.1",
+            "source_label": "test",
+            "expected_owner_epoch": runtime.owner_epoch,
+            "offer_id": offer["offer_id"],
+            "offer_revision": offer["offer_revision"],
+            "action_id": action_id,
+        }
+    )
+    owner_action = None if action_id == "retry_runtime_step" else action_id
+    try:
+        if case == "accepted":
+            result = runtime.apply_recovery_action(request)
+            # Owner prepares and releases all motion first; only then does
+            # the tree tick again.
+            assert calls == [
+                ("retry_failure_pause", owner_action),
+                ("resume_recovery", "retry"),
+            ]
+            assert result["cycle_resumed"] is True
+            assert result["owner_result"] == {"accepted": True, "action": action_id}
+            assert runtime._controls("program-cycle.1").retry_count("move.1") == 1
+            return
+        with pytest.raises(ProgramRunnerError) as rejected:
+            runtime.apply_recovery_action(request)
+        if case in {"rejected", "incomplete"}:
+            # Nothing released: the tree stays paused, the cycle coherent.
+            assert calls == [("retry_failure_pause", owner_action)]
+            assert journal.read().state == "running"
+            assert not journal.read().reconciliation_required
+            assert rejected.value.code == (
+                "program_motion_resume_incomplete"
+                if case == "incomplete"
+                else "cycle_recovery_action_rejected"
+            )
+        else:
+            assert rejected.value.code == "program_cycle_reconciliation_required"
+            assert journal.read().reconciliation_required
+    finally:
+        runtime.shutdown()

@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-26 16:32:46 UTC
+  Last regenerated: 2026-09-28 05:46:36 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -127,7 +127,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/program/workspace` | composer-draft | Read Workspace |
 | `GET` | `/api/runtime` | headless-runtime-client | Runtime |
 | `GET` | `/api/scenario-documents` | composer-scenario-documents | List Documents |
-| `POST` | `/api/scenario-documents/convert-legacy` | composer-scenario-documents | Convert Legacy Document |
 | `POST` | `/api/scenario-documents/export` | composer-scenario-documents | Export Document |
 | `POST` | `/api/scenario-documents/load` | composer-scenario-documents | Load Document |
 | `POST` | `/api/scenario-documents/save` | composer-scenario-documents | Save Document |

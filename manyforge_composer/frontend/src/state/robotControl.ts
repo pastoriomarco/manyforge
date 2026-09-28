@@ -395,7 +395,6 @@ function motionSettingsAreValid(status: ExecutionOwnerStatus, settings: ManualMo
   return Object.values(positiveValues).every((value) => Number.isFinite(value) && value > 0)
     && Number.isFinite(cartesianMaxBlendDeviationRad) && cartesianMaxBlendDeviationRad >= 0
     && settings.velocityScale <= 1 && settings.accelerationScale <= 1
-    && settings.tcpLinearSpeedMps <= (descriptor.operationalLimit?.maximumTcpLinearSpeedMps ?? Infinity)
     && Object.entries(jointLimits).every(([name, limit]) => {
       const joint = descriptor.joints.find((entry) => entry.sourceJointName === name);
       if (joint === undefined) return false;

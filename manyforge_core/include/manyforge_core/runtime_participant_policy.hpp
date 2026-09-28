@@ -84,8 +84,8 @@ class RuntimeParticipantPolicySelection final {
     const RuntimeParticipantPolicySelection& selection, PerJointDynamicsLimitsDTO requested);
 
 /// Resolve one optional operation request against the exact applied
-/// Deployment maximum. Omission selects the Deployment value; an excessive
-/// request is rejected rather than silently clipped.
+/// Deployment maximum. Omission selects the Deployment value; otherwise select
+/// the minimum. The caller retains the original request for diagnostics.
 [[nodiscard]] Result<SpeedProfileDTO> apply_deployment_motion_speed_limit(
     double deployment_maximum_tcp_linear_speed_mps, SpeedProfileDTO requested);
 

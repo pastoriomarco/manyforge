@@ -1220,52 +1220,56 @@ def discover_scenario_artifacts(
         if path.is_symlink() or not path.is_dir() or not (path / SCENARIO_MANIFEST).is_file():
             continue
         try:
-            document, resolved, _, member_changed, source_diagnostics = _capture_project(
-                str(path), allowed_roots=allowed_roots
+            # Discovery is metadata-only. Load captures and validates the selected
+            # project's members and model sources before any runtime effects.
+            project = _existing_project(str(path), _roots(allowed_roots))
+            descriptor = os.open(
+                project, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
             )
+            try:
+                if Path(f"/proc/self/fd/{descriptor}").resolve(strict=True) != project:
+                    _fail("scenario_artifact_changed", "Scenario project changed", status_code=409)
+                raw = _read_regular_at(
+                    descriptor, SCENARIO_MANIFEST, source=str(project / SCENARIO_MANIFEST)
+                )
+            finally:
+                os.close(descriptor)
+            try:
+                document = _validate_project_manifest(
+                    load_strict_json_yaml_bytes(raw, source=str(project / SCENARIO_MANIFEST)),
+                    source=str(project / SCENARIO_MANIFEST),
+                )
+            except StrictArtifactError as error:
+                _fail("scenario_artifact_invalid", str(error))
             saved = document["saved_status"]
-            current_digest = scenario_content_digest(
-                document["program_draft"],
-                document["deployment_draft"],
-                document["program_role_assignment"],
-                document["typed_parameter_overrides"],
-            )
-            modified = member_changed or current_digest != saved["checked_content_digest"]
             version_changed = saved["manyforge_version"] != manyforge_version
             display_status = (
-                "source_changed"
-                if source_diagnostics
-                else "changed"
-                if modified
-                else "version_changed"
+                "version_changed"
                 if version_changed
                 else saved["last_known_status"]
             )
             rows.append(
                 {
                     "source_kind": "saved",
-                    "path": resolved,
+                    "path": str(project),
                     "scenario_id": document["scenario_id"],
                     "name": document["name"],
                     "description": document["description"],
                     "saved_manyforge_version": saved["manyforge_version"],
                     "display_status": display_status,
                     "status_detail": (
-                        "One or more referenced source files changed."
-                        if source_diagnostics
-                        else "Content changed since the recorded status."
-                        if modified
-                        else (
-                            "Saved by another ManyForge version."
+                        (
+                            "Saved by another ManyForge version. "
                             if version_changed
                             else (
-                                "Configuration was load-ready when last checked."
+                                "Previously recorded as load-ready. "
                                 if display_status == "ready"
-                                else "Configuration was incomplete when saved."
+                                else "Previously recorded as incomplete. "
                                 if display_status == "incomplete"
-                                else "Configuration has no recorded readiness result."
+                                else "No readiness check is recorded. "
                             )
                         )
+                        + "Current files and model sources are validated when you load this Scenario."
                     ),
                 }
             )

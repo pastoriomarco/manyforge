@@ -59,7 +59,7 @@ import type { ProgramWorkspaceActionName } from './state/programWorkspace';
 import {
   INSPECTOR_WIDTH_MIN,
   WORKBENCH_DIVIDER_WIDTH,
-  workbenchWidthLimits,
+  inspectorWidthMax as centeredInspectorWidthMax,
 } from './state/workbenchLayout';
 
 function isNotFound(error: unknown): boolean {
@@ -144,9 +144,6 @@ function clamp(value: number, min: number, max: number): number {
 
 export default function App() {
   const [activeWorkspace, setActiveWorkspace] = useState<'program' | 'scene' | 'deployment'>('program');
-  const [viewerWidth, setViewerWidth] = useState(() => (
-    typeof window === 'undefined' ? 640 : Math.round(window.innerWidth * 0.45)
-  ));
   const [inspectorWidth, setInspectorWidth] = useState(320);
   const [workbenchWidth, setWorkbenchWidth] = useState(() => (
     typeof window === 'undefined' ? 1440 : window.innerWidth
@@ -674,17 +671,12 @@ export default function App() {
     }
   }, [globalPanel, runtimeAttentionItems.length, runtimePanelAutomatic]);
   const runtimeView = headlessSnapshot?.componentOverview ?? null;
-  const {
-    viewerWidthMin,
-    viewerWidthMax,
-    inspectorWidthMax,
-  } = workbenchWidthLimits(workbenchWidth, inspectorWidth);
+  const inspectorWidthMax = centeredInspectorWidthMax(workbenchWidth);
   const programInspectorHeightMax = Math.max(
     INSPECTOR_SECTION_MIN_HEIGHT,
     inspectorHeight - INSPECTOR_SECTION_MIN_HEIGHT - WORKBENCH_DIVIDER_WIDTH,
   );
   const layoutStyle = {
-    '--viewer-width': `${viewerWidth}px`,
     '--inspector-width': `${inspectorWidth}px`,
     '--program-inspector-height': `${programInspectorHeight}px`,
   } as CSSProperties;
@@ -697,9 +689,6 @@ export default function App() {
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
-  useEffect(() => {
-    setViewerWidth((current) => clamp(current, viewerWidthMin, viewerWidthMax));
-  }, [viewerWidthMax, viewerWidthMin]);
   useEffect(() => {
     setInspectorWidth((current) => clamp(
       current,
@@ -1038,6 +1027,7 @@ export default function App() {
           min={INSPECTOR_WIDTH_MIN}
           max={inspectorWidthMax}
           direction={-1}
+          scale={2}
           onChange={setInspectorWidth}
         />
 
@@ -1079,12 +1069,12 @@ export default function App() {
         </aside>
 
         <PaneDivider
-          label="viewer and live controls"
-          value={viewerWidth}
-          min={viewerWidthMin}
-          max={viewerWidthMax}
-          direction={-1}
-          onChange={setViewerWidth}
+          label="central inspector (viewer side)"
+          value={inspectorWidth}
+          min={INSPECTOR_WIDTH_MIN}
+          max={inspectorWidthMax}
+          scale={2}
+          onChange={setInspectorWidth}
         />
 
         <aside className="workbench-commands" aria-label="3D viewer and live controls">

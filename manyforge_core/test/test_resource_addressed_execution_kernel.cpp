@@ -2908,16 +2908,13 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto before_run = kernel.execute(scoped_motion_operation("before.initial.run"));
   ASSERT_FALSE(before_run.ok());
   EXPECT_EQ(before_run.error().details.at("reason"), "program_node_stop_fence_active");
-  const auto wrong_resume = kernel.release_program_selection(
-      program_selection_request("resume.before.initial.run", "arm"),
-      initial.value().selection_revision);
-  ASSERT_FALSE(wrong_resume.ok());
-  EXPECT_EQ(wrong_resume.error().details.at("reason"), "program_selection_not_releasable");
   EXPECT_EQ(engine.prepare_motion_calls, 0);
   EXPECT_EQ(engine.execute_calls, 0);
 
-  const auto started = kernel.start_program_selection(
-      program_selection_request("initial.run.arm", "arm"), initial.value().selection_revision);
+  // Resume is the same release as Run: it also releases never-started work.
+  const auto started = kernel.release_program_selection(
+      program_selection_request("resume.as.initial.run", "arm"),
+      initial.value().selection_revision);
   ASSERT_TRUE(started.ok()) << started.error().message;
   EXPECT_TRUE(started.value().held_nodes.empty());
   const auto admitted = kernel.execute(scoped_motion_operation("after.initial.run"));
@@ -4521,6 +4518,43 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_TRUE(std::all_of(slots.begin(), slots.end(), [](const auto& slot) {
     return slot.state == ResourceSlotState::kDispatched;
   }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     MotionAdmissionCapsEachExactTargetAndPreservesRequestedCeilings) {
+  for (const bool coordinated : {false, true}) {
+    SCOPED_TRACE(coordinated);
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine first_engine, second_engine;
+    const auto first =
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    auto first_registration = registration(first, first_engine);
+    auto second_registration = registration(coordinated_occurrence(first, "2"), second_engine);
+    first_registration.deployment_maximum_tcp_linear_speed_mps = 0.15;
+    second_registration.deployment_maximum_tcp_linear_speed_mps = 0.25;
+    ResourceAddressedExecutionKernel kernel(
+        {first_registration, second_registration}, clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+    auto intent = coordinated ? coordinated_motion_operation("speed.coordinated")
+                              : motion_operation("speed.single");
+    for (auto& participant : intent.participants) {
+      std::get<MotionParticipantIntentDTO>(participant.payload)
+          .speed_profile.max_tcp_linear_speed_mps = 0.25;
+    }
+    const auto accepted = kernel.execute(intent);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(first_engine.last_prepared_request);
+    EXPECT_EQ(first_engine.last_prepared_request->execution_request.speed_profile
+                  .max_tcp_linear_speed_mps, 0.15);
+    if (coordinated) {
+      ASSERT_TRUE(second_engine.last_prepared_request);
+      EXPECT_EQ(second_engine.last_prepared_request->execution_request.speed_profile
+                    .max_tcp_linear_speed_mps, 0.25);
+    }
+    EXPECT_EQ(std::get<MotionParticipantIntentDTO>(intent.participants.front().payload)
+                  .speed_profile.max_tcp_linear_speed_mps, 0.25);
+  }
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -6598,8 +6632,168 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto released = kernel.release_program_run_stop_fence(
       ProgramRunId("run.1"), newest.value().stop_id, newest.value().stop_generation);
   ASSERT_TRUE(released.ok()) << released.error().message;
-  const auto admitted =
+  // Releasing the Stop resumes execution only: the never-started node is
+  // still Ready and needs the explicit initial Run.
+  const auto still_ready =
       kernel.execute(scoped_motion_operation("request.program-run.after-release"));
+  ASSERT_FALSE(still_ready.ok());
+  EXPECT_EQ(still_ready.error().details.at("reason"), "program_node_stop_fence_active");
+  start_program_motion(kernel);
+  const auto admitted =
+      kernel.execute(scoped_motion_operation("request.program-run.after-run"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ProgramHaltKeepsReadyWorkReadyAfterRelease) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+
+  // Execute, then Halt before Run.
+  const auto halted = kernel.stop(program_run_stop_request("request.halt.ready", "run.1"));
+  ASSERT_TRUE(halted.ok()) << halted.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(halted.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  const auto during = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(during.ok()) << during.error().message;
+  ASSERT_EQ(during.value().held_nodes.size(), 1U);
+  EXPECT_EQ(during.value().held_nodes.front().state, ProgramNodeHoldStateDTO::kReady);
+
+  // Neither Run nor Resume ends the Halt; only its release does.
+  const auto resume_while_halted = kernel.release_program_selection(
+      program_selection_request("resume.while.halted", "arm"), during.value().selection_revision);
+  ASSERT_FALSE(resume_while_halted.ok());
+  EXPECT_EQ(resume_while_halted.error().details.at("reason"), "program_selection_not_releasable");
+
+  ASSERT_TRUE(kernel
+                  .release_program_run_stop_fence(ProgramRunId("run.1"), halted.value().stop_id,
+                                                  halted.value().stop_generation)
+                  .ok());
+  const auto after = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(after.ok()) << after.error().message;
+  ASSERT_EQ(after.value().held_nodes.size(), 1U);
+  EXPECT_EQ(after.value().held_nodes.front().state, ProgramNodeHoldStateDTO::kReady);
+  const auto before_run = kernel.execute(scoped_motion_operation("halt.ready.before.run"));
+  ASSERT_FALSE(before_run.ok());
+  EXPECT_EQ(before_run.error().details.at("reason"), "program_node_stop_fence_active");
+  EXPECT_EQ(engine.execute_calls, 0);
+
+  start_program_motion(kernel);
+  const auto admitted = kernel.execute(scoped_motion_operation("halt.ready.after.run"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ProgramHaltStopsRunningWorkUntilResumeAfterRelease) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  // Execute and Run: the motion node is Running (between operations here).
+  start_program_motion(kernel);
+
+  const auto halted = kernel.stop(program_run_stop_request("request.halt.running", "run.1"));
+  ASSERT_TRUE(halted.ok()) << halted.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(halted.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  ASSERT_TRUE(kernel
+                  .release_program_run_stop_fence(ProgramRunId("run.1"), halted.value().stop_id,
+                                                  halted.value().stop_generation)
+                  .ok());
+
+  // Execute after Halt resumed execution, not motion: the node is Stopped.
+  const auto after = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(after.ok()) << after.error().message;
+  ASSERT_EQ(after.value().held_nodes.size(), 1U);
+  EXPECT_EQ(after.value().held_nodes.front().state, ProgramNodeHoldStateDTO::kHeld);
+  const auto before_resume = kernel.execute(scoped_motion_operation("halt.running.before.resume"));
+  ASSERT_FALSE(before_resume.ok());
+  EXPECT_EQ(before_resume.error().details.at("reason"), "program_node_stop_fence_active");
+
+  const auto resumed = kernel.release_program_selection(
+      program_selection_request("resume.after.halt", "arm"), after.value().selection_revision);
+  ASSERT_TRUE(resumed.ok()) << resumed.error().message;
+  EXPECT_TRUE(resumed.value().held_nodes.empty());
+  const auto admitted = kernel.execute(scoped_motion_operation("halt.running.after.resume"));
+  ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ProgramResumeReleasesMixedStoppedAndReadyWorkAtOnce) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  auto capture = program_execution_capture();
+  auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+  // Canonical order: move (0), place (1), timer (2).
+  table->nodes.insert(table->nodes.begin() + 1,
+                      {ProgramNodeInstanceId("place"),
+                       "kernel.operation",
+                       {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"),
+                         true}}});
+  table->named_selections = {{"arm", {0U}}, {"place", {1U}}, {"supervision", {2U}}};
+  capture.table = table;
+  const auto registered = kernel.register_program_run_capture(std::move(capture));
+  ASSERT_TRUE(registered.ok()) << registered.error().message;
+
+  // Run only "arm", then Halt and Execute: "move" is Stopped, "place" never
+  // started and stays Ready.
+  start_program_motion(kernel, "arm");
+  const auto halted = kernel.stop(program_run_stop_request("request.halt.mixed", "run.1"));
+  ASSERT_TRUE(halted.ok()) << halted.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(halted.value().stop_id);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded;
+  }));
+  ASSERT_TRUE(kernel
+                  .release_program_run_stop_fence(ProgramRunId("run.1"), halted.value().stop_id,
+                                                  halted.value().stop_generation)
+                  .ok());
+  const auto mixed = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(mixed.ok()) << mixed.error().message;
+  ASSERT_EQ(mixed.value().held_nodes.size(), 2U);
+  for (const auto& node : mixed.value().held_nodes) {
+    // Node 0 is "move", node 1 is "place".
+    EXPECT_EQ(node.state, node.node_index == 0U ? ProgramNodeHoldStateDTO::kHeld
+                                                : ProgramNodeHoldStateDTO::kReady);
+  }
+
+  // Run and Resume are one release: both kinds of work continue together.
+  const auto released = kernel.release_program_selection(
+      program_selection_request("resume.mixed", "all"), mixed.value().selection_revision);
+  ASSERT_TRUE(released.ok()) << released.error().message;
+  EXPECT_TRUE(released.value().held_nodes.empty());
+  const auto admitted = kernel.execute(scoped_motion_operation("mixed.after.resume"));
   ASSERT_TRUE(admitted.ok()) << admitted.error().message;
 }
 

@@ -12,6 +12,7 @@ import type { ExecutionObservationTransportStatus } from '../types/viewerObserva
 import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
 import { appliedExecutionSelectionRows } from '../state/programExecutionGroups';
 import { OverlayPanel } from './OverlayPanel';
+import { ProgramRunSetup } from './ProgramRunSetup';
 import {
   usePublishWorkbenchNotices,
   type WorkbenchNotice,
@@ -28,11 +29,13 @@ const TRANSPORT_PREFERENCES_KEY = 'manyforge.composer.transport_preferences.v1';
 interface TransportPreferences {
   controlWidthRem: number;
   confirmHalt: boolean;
+  confirmReset: boolean;
 }
 
 const DEFAULT_TRANSPORT_PREFERENCES: TransportPreferences = {
   controlWidthRem: 7,
   confirmHalt: true,
+  confirmReset: true,
 };
 
 function loadTransportPreferences(): TransportPreferences {
@@ -47,6 +50,8 @@ function loadTransportPreferences(): TransportPreferences {
         : DEFAULT_TRANSPORT_PREFERENCES.controlWidthRem,
       confirmHalt: typeof parsed.confirmHalt === 'boolean'
         ? parsed.confirmHalt : DEFAULT_TRANSPORT_PREFERENCES.confirmHalt,
+      confirmReset: typeof parsed.confirmReset === 'boolean'
+        ? parsed.confirmReset : DEFAULT_TRANSPORT_PREFERENCES.confirmReset,
     };
   } catch {
     return DEFAULT_TRANSPORT_PREFERENCES;
@@ -66,6 +71,33 @@ function stateLabel(state: string, motionStopSettled = false): string {
   if (state === 'stopped' || state === 'full_stopped') return 'Stopped';
   if (state === 'full_stopping') return 'Stopping';
   return state.replaceAll('_', ' ');
+}
+
+/** Retry variants the backend may offer for a node paused on failure; the
+ * Motion panel shows one Retry for whichever is enabled. */
+const RETRY_ACTION_IDS: readonly string[] = [
+  'retry_motion_from_current_state',
+  'retry_after_scene_repair',
+  'retry_runtime_step',
+];
+
+const MANUAL_RESULT_PENDING = 'Manual result: implementation pending (open point U10). Disabled in Composer until its safety rules are designed.';
+
+const MOTION_STATE_LABEL: Readonly<Record<string, string>> = {
+  running: 'Running',
+  ready: 'Waiting for Run',
+  held: 'Stopped',
+  stopping: 'Stopping',
+  faulted: 'Stop fault',
+  mixed: 'Mixed',
+};
+
+/** "2 running · 1 waiting" from the owner's per-node statuses. */
+function nodeActivitySummary(statuses: Record<string, string>): string {
+  const values = Object.values(statuses);
+  const running = values.filter((status) => status === 'running').length;
+  const waiting = values.filter((status) => status === 'held').length;
+  return `${running} node${running === 1 ? '' : 's'} running · ${waiting} waiting`;
 }
 
 function actionLabel(value: string): string {
@@ -110,13 +142,7 @@ export function ProgramRuntimePanel({
     state,
     cycleState,
     cycleFailure,
-    commandAllowed,
     refresh,
-    run,
-    resumeFullStop,
-    stop,
-    reset,
-    applyRecoveryAction,
     activateRuntimeOverride,
     clearRuntimeOverride,
     promoteRuntimeOverride,
@@ -125,34 +151,32 @@ export function ProgramRuntimePanel({
     writeRuntimeBlackboard,
     stageManualResult,
   } = controller;
-  const [confirmation, setConfirmation] = useState<string | null>(null);
   const [blackboardKey, setBlackboardKey] = useState('');
   const [blackboardValue, setBlackboardValue] = useState('');
   const [blackboardError, setBlackboardError] = useState<string | null>(null);
   const [manualOutput, setManualOutput] = useState('null');
   const [manualError, setManualError] = useState<string | null>(null);
-  const canStop = cycleState === 'starting'
-    || state.run?.state === 'running'
-    || state.run?.state === 'intervention_required';
-  // A selected Stop receipt must not block Stop for a different selection or
-  // the broader Full Stop. The owner, not pending click feedback, holds nodes.
-  const stopCommandPending = ['stop', 'full-stop', 'reset']
-    .includes(state.pending ?? '');
-  const fullStopped = state.run?.state === 'full_stopped';
-  const canRun = state.runnerAvailable
-    && state.applied !== null
-    && state.pending === null
-    && (
-      fullStopped
-        ? commandAllowed('program_resume_full_stop')
-        : cycleState === 'idle_after_reset'
-          && commandAllowed('program_run')
-    );
   const controls = state.controls?.runtimeControls ?? null;
   const recoveryOffer = state.controls?.recoveryOffer ?? null;
   const ordinaryMotionHeld = recoveryOffer?.recoveryClass === 'ordinary_operator_stop';
   const writableKeys = (state.applied?.program.blackboard?.keys ?? []).filter(
     (key) => key.access === 'write' || key.access === 'read_write',
+  );
+  // Live motion of the whole Program, from the owner's group projection
+  // (the Kernel's active-operation count is only set while a Stop settles).
+  const allMotion = state.controls?.executionSelections.groups
+    .find((group) => group.groupId === 'all') ?? null;
+  // Never turn a missing projection into "not moving".
+  const motionSummary = state.run === null
+    ? (state.runnerAvailable ? 'None' : 'Unknown')
+    : ['full_stopped', 'full_stopping'].includes(state.run.state)
+      ? 'Halted'
+      : allMotion === null
+        ? 'Unknown'
+        : MOTION_STATE_LABEL[allMotion.state] ?? 'Unknown';
+  const hasAdvanced = enabled && (
+    controls !== null
+    || (state.run !== null && writableKeys.length > 0)
   );
   const selectedBlackboardKey = writableKeys.find(
     (key) => key.key === blackboardKey,
@@ -162,7 +186,7 @@ export function ProgramRuntimePanel({
     <section className="panel program-runtime-panel" aria-labelledby="program-runtime-title">
       <header className="panel-header">
         <div>
-          <p className="eyebrow">Headless-owned execution</p>
+          <p className="eyebrow">Program execution</p>
           <h2 id="program-runtime-title">Program run</h2>
         </div>
         <button
@@ -244,12 +268,12 @@ export function ProgramRuntimePanel({
                 target="_blank"
                 rel="noreferrer"
               >
-                Inspect exact Applied Program and Binding JSON
+                View Applied Program and Binding (JSON)
               </a>
             )}
           </div>
           <div className="program-runtime-fact">
-            <span>Owner-issued run state</span>
+            <span>Run state</span>
             <strong>
               {state.run
                 ? stateLabel(
@@ -264,34 +288,28 @@ export function ProgramRuntimePanel({
               {state.run
                 ? `${shortIdentity(state.run.capture.programRunId)} · revision ${state.run.runRevision}`
                 : state.runnerAvailable
-                  ? 'No active or locally observed terminal run.'
+                  ? 'No run is active.'
                   : 'No current owner projection; execution state is unknown.'}
             </small>
           </div>
           <div className="program-runtime-fact">
-            <span>Captured run Program</span>
+            <span>Program in this run</span>
             <strong>{state.run?.capture.programId ?? 'none'}</strong>
             <small>
               {state.run
-                ? `${state.run.capture.scenarioId} · ${shortIdentity(state.run.capture.programRevision)} · immutable for this run`
-                : 'Execute captures the exact Applied selection once.'}
+                ? `${state.run.capture.scenarioId} · ${shortIdentity(state.run.capture.programRevision)} · fixed for this run`
+                : 'Execute captures the Applied Program for the run.'}
             </small>
           </div>
           <div className="program-runtime-fact">
-            <span>Active robot work</span>
-            <strong>
-              {state.run
-                ? state.run.activeOperationCount ?? 'unknown'
-                : state.runnerAvailable
-                  ? 0
-                  : 'unknown'}
-            </strong>
+            <span>Motion</span>
+            <strong>{motionSummary}</strong>
             <small>
               {state.run
-                ? `Tree ${state.run.treeStatus}; owner ${shortIdentity(state.run.ownerEpoch)}`
+                ? nodeActivitySummary(state.run.nodeStatuses)
                 : state.runnerAvailable
-                  ? 'Read from the independent Program runner.'
-                  : 'Runner loss never proves that dispatched robot work stopped.'}
+                  ? 'No run is active.'
+                  : 'Runner unavailable: this never proves that robot work stopped.'}
             </small>
           </div>
         </div>
@@ -326,48 +344,22 @@ export function ProgramRuntimePanel({
             {actionLabel(recoveryOffer.recoveryClass)} · node{' '}
             <code>{recoveryOffer.nodeInstanceId}</code>
           </p>
-          <div className="runtime-control-actions">
-            {recoveryOffer.actions.map((action) => {
-              const confirming = confirmation === action.actionId;
-              return (
-                <span key={action.actionId} className="runtime-control-action">
-                  <button
-                    type="button"
-                    disabled={
-                      !action.enabled
-                      || state.controlPending !== null
-                    }
-                    title={action.disabledReasonCode ?? undefined}
-                    onClick={() => {
-                      if (action.requiresConfirmation && !confirming) {
-                        setConfirmation(action.actionId);
-                        return;
-                      }
-                      setConfirmation(null);
-                      applyRecoveryAction(action.actionId);
-                    }}
-                  >
-                    {confirming ? 'Confirm ' : ''}{actionLabel(action.labelKey)}
-                  </button>
-                  {confirming && (
-                    <button type="button" onClick={() => setConfirmation(null)}>
-                      Cancel
-                    </button>
-                  )}
-                </span>
-              );
-            })}
-          </div>
+          <p className="hint">
+            Use Retry in the Motion panel to retry this node and resume the
+            Program&apos;s motion, or Reset to end the run.
+          </p>
+          {/* Kept visible but disabled: the backend path exists, but operator
+              use is pending design (open point U10). */}
           <details>
-            <summary
-              title={recoveryOffer.manualResult.disabledReasonCode ?? undefined}
-            >
-              Stage a manual result
+            <summary title={MANUAL_RESULT_PENDING}>
+              Stage a manual result (not available yet)
             </summary>
             <label className="runtime-control-field">
               <span>Output (JSON)</span>
               <textarea
                 rows={2}
+                disabled
+                title={MANUAL_RESULT_PENDING}
                 value={manualOutput}
                 onChange={(event) => {
                   setManualOutput(event.currentTarget.value);
@@ -381,13 +373,8 @@ export function ProgramRuntimePanel({
                 <button
                   key={outcome}
                   type="button"
-                  disabled={
-                    !recoveryOffer.manualResult.enabled
-                    || state.controlPending !== null
-                  }
-                  title={
-                    recoveryOffer.manualResult.disabledReasonCode ?? undefined
-                  }
+                  disabled
+                  title={MANUAL_RESULT_PENDING}
                   onClick={() => {
                     try {
                       const output = JSON.parse(manualOutput) as JsonValue;
@@ -406,6 +393,10 @@ export function ProgramRuntimePanel({
         </section>
       )}
 
+      {/* Rarely needed tools, kept out of the way; they exist only during a
+          run, so the section is shown only when it has content. */}
+      {hasAdvanced && <details className="runtime-advanced">
+        <summary>Advanced: runtime overrides, blackboard and audit</summary>
       {enabled && controls !== null && (
         <section className="runtime-control-section" aria-labelledby="runtime-overrides-title">
           <div className="runtime-control-heading">
@@ -555,62 +546,7 @@ export function ProgramRuntimePanel({
           </ol>
         </details>
       )}
-      {commandAllowed('program_reset') && (
-        <button
-          type="button"
-          disabled={
-            !enabled
-            || state.pending !== null
-            || state.controlPending !== null
-          }
-          onClick={() => { void reset(); }}
-        >
-          {cycleState === 'resetting' ? 'Resetting' : 'Reset Program cycle'}
-        </button>
-      )}
-
-      <div className="program-runtime-actions">
-        <button
-          type="button"
-          disabled={!enabled || !canRun}
-          onClick={() => {
-            if (fullStopped) {
-              void resumeFullStop();
-            } else {
-              void run();
-            }
-          }}
-        >
-          {cycleState === 'starting'
-            ? 'Executing'
-            : state.pending === 'run' || state.pending === 'resume-full-stop'
-            ? 'Sending Execute'
-            : fullStopped
-              ? 'Execute'
-              : 'Execute Applied Program'}
-        </button>
-        <button
-          type="button"
-          className="danger-button"
-          disabled={
-            !enabled
-            || !state.runnerAvailable
-            || !canStop
-            || stopCommandPending
-          }
-          onClick={() => { void stop(); }}
-        >
-          {state.run?.state === 'stopping'
-            ? 'Stopping'
-            : state.pending === 'stop'
-              ? 'Sending Stop'
-              : 'Program Stop'}
-        </button>
-      </div>
-      <p className="panel-intro">
-        Closing or reloading Composer stops observation only. It never sends
-        Stop implicitly and cannot change already-dispatched robot work.
-      </p>
+      </details>}
     </section>
   );
 }
@@ -835,11 +771,15 @@ export function ProgramTransportControls({
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [groupSettingsOpen, setGroupSettingsOpen] = useState(false);
   const [haltIntent, setHaltIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
+  // Reset during execution ends the run and restarts the tree, so it is
+  // confirmed like Halt: motion stops first, the question comes after.
+  const [resetIntent, setResetIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
   const [preferences, setPreferences] = useState<TransportPreferences>(loadTransportPreferences);
   const [selection, setSelection] = useState({ scopeKey: '', groupIds: ['all'] });
   const detailsButton = useRef<HTMLButtonElement>(null);
   const groupSettingsButton = useRef<HTMLButtonElement>(null);
   const haltButton = useRef<HTMLButtonElement>(null);
+  const resetButton = useRef<HTMLButtonElement>(null);
   const { state, cycleState } = program;
   const scopeKey = state.applied === null
     ? ''
@@ -864,9 +804,10 @@ export function ProgramTransportControls({
     : [];
   const groupIds = requestedGroupIds.length > 0 ? requestedGroupIds : defaultGroupIds;
   const visibleGroups = selections.filter((group) => groupIds.includes(group.groupId));
-  const hiddenGroupCount = hasMultipleScopes
-    ? Math.max(0, selections.length - visibleGroups.length)
-    : 0;
+  // Only named groups the operator chose to hide: "all" is hidden by default
+  // whenever named groups exist, and is not worth a badge.
+  const hiddenGroupCount = namedGroups
+    .filter((group) => !groupIds.includes(group.groupId)).length;
   const selectionGroupPending = (
     groupId: string,
     kind: 'start-motion' | 'motion-stop' | 'resume-motion',
@@ -911,13 +852,25 @@ export function ProgramTransportControls({
   const fullCellStop = robot.currentStatus?.cellStopAction
     ?? robot.state.status?.cellStopAction
     ?? null;
-  const fullStopReason = fullCellStop === null
-    ? 'The current execution owner status is unavailable.'
-    : fullCellStop.available
-      ? 'Stop all currently addressed motion in this cell using the exact owner-issued generation fence.'
-      : fullCellStop.unavailableReason
-        ?? 'The execution owner has not made Full Stop available.';
   const allMotionQuiesced = allGroup?.state === 'ready' || allGroup?.state === 'held';
+  // Paused on a failed node: Retry retries it and resumes the motion the
+  // failure pause stopped (backend), so it replaces Run/Resume meanwhile.
+  const failureOffer = state.controls?.recoveryOffer ?? null;
+  // A disabled Retry still replaces Run/Resume: the pause must not be
+  // bypassed, and its reason (e.g. containment not confirmed) is shown.
+  const retryActions = failureOffer?.actions.filter(
+    (action) => RETRY_ACTION_IDS.includes(action.actionId),
+  ) ?? [];
+  const retryAction = retryActions.find((action) => action.enabled)
+    ?? retryActions[0]
+    ?? null;
+  const retryPending = retryAction !== null
+    && state.controlPending === `recovery:${retryAction.actionId}`;
+  const canRetry = enabled
+    && retryAction !== null
+    && retryAction.enabled
+    && state.pending === null
+    && state.controlPending === null;
   const canProgramHalt = enabled
     && state.runnerAvailable
     && cycleState === 'running'
@@ -947,6 +900,42 @@ export function ProgramTransportControls({
     setHaltIntent(null);
     void program.fullStop();
   }, [allMotionQuiesced, haltIntent, program]);
+
+  // Ask only once every motion group has stopped (no groups: nothing moves).
+  // A completed Halt has already contained all motion; while it settles,
+  // wait for it rather than sending a motion Stop the owner would refuse.
+  const motionSettled = allGroup === undefined || allMotionQuiesced || programFullStopped;
+  useEffect(() => {
+    if (resetIntent === 'stopping' && motionSettled) setResetIntent('confirm');
+    if (resetIntent === 'automatic' && motionSettled) {
+      setResetIntent(null);
+      void program.reset();
+    }
+  }, [motionSettled, program, resetIntent]);
+
+  const executionActive = cycleState === 'running' || programMotionRunning;
+  // Name the Motion-panel button that continues the run, as it is labelled
+  // there: Run for a group not started yet, Resume for a stopped one.
+  const continueStates = new Set(selections.map((group) => group.state));
+  const continueLabel = continueStates.has('held') && continueStates.has('ready')
+    ? 'Run or Resume'
+    : continueStates.has('held') ? 'Resume' : 'Run';
+  const requestProgramReset = async () => {
+    if (!canReset) return;
+    if (!executionActive) {
+      void program.reset();
+      return;
+    }
+    if (!motionSettled) {
+      setResetIntent(preferences.confirmReset ? 'stopping' : 'automatic');
+      if (programFullStopping) return;
+      const accepted = await program.stopMotion(['all']);
+      if (!accepted) setResetIntent(null);
+      return;
+    }
+    if (preferences.confirmReset) setResetIntent('confirm');
+    else void program.reset();
+  };
 
   const requestProgramHalt = async () => {
     if (!canProgramHalt) return;
@@ -1054,8 +1043,10 @@ export function ProgramTransportControls({
           )}
           {visibleGroups.map((group) => {
             const stopPending = selectionGroupPending(group.groupId, 'motion-stop');
-            const startPending = selectionGroupPending(group.groupId, 'start-motion');
-            const resumePending = selectionGroupPending(group.groupId, 'resume-motion');
+            // Run and Resume are one command: release the group's never-started
+            // and stopped work. Only the label differs.
+            const releasePending = selectionGroupPending(group.groupId, 'start-motion')
+              || selectionGroupPending(group.groupId, 'resume-motion');
             const selectionTransitionPending = state.selectionPending.length > 0;
             const canGroupStop = enabled
               && state.runnerAvailable
@@ -1069,17 +1060,7 @@ export function ProgramTransportControls({
               && group.state !== 'ready'
               && group.state !== 'stopping'
               && program.commandAllowed('program_motion_stop');
-            const canGroupStart = enabled
-              && state.runnerAvailable
-              && cycleState === 'running'
-              && !manualResident
-              && programMotionRunning
-              && state.pending === null
-              && !selectionTransitionPending
-              && state.controlPending === null
-              && group.startAllowed
-              && program.commandAllowed('program_motion_start');
-            const canGroupResume = enabled
+            const canGroupRelease = enabled
               && state.runnerAvailable
               && cycleState === 'running'
               && !manualResident
@@ -1087,9 +1068,10 @@ export function ProgramTransportControls({
               && state.pending === null
               && !selectionTransitionPending
               && group.resumeAllowed
-              && !resumePending
+              && !releasePending
               && state.controlPending === null
               && program.commandAllowed('program_motion_resume');
+            const releaseLabel = group.state === 'ready' ? 'Run' : 'Resume';
             const scale = program.groupRuntimeScales[group.groupId];
             const scaleAvailable = enabled
               && blockedReason === null
@@ -1127,26 +1109,27 @@ export function ProgramTransportControls({
                 <button
                   type="button"
                   className="transport-group-resume"
-                  disabled={!canGroupStart && !canGroupResume}
-                  title={canGroupStart
-                    ? `Run initial motion in ${group.groupId}.`
-                    : canGroupResume
-                      ? `Resume ${group.groupId} from current observations.`
+                  disabled={retryAction !== null ? !canRetry : !canGroupRelease}
+                  title={retryAction !== null && failureOffer !== null
+                    ? retryAction.enabled
+                      ? `Retry ${failureOffer.nodeInstanceId} and let all the Program's motion continue.`
+                      : retryAction.disabledReasonCode === 'failure_pause_containment_unconfirmed'
+                        ? 'Retry waits until stopping the Program\'s other motion is confirmed.'
+                        : `Retry is unavailable: ${(retryAction.disabledReasonCode ?? 'not allowed').replaceAll('_', ' ')}.`
+                    : canGroupRelease
+                      ? `${releaseLabel} ${group.groupId}: its stopped and not-yet-started motion continues.`
                       : group.state === 'running'
                         ? `${group.groupId} motion is running.`
-                        : (group.state === 'ready'
-                          ? group.startUnavailableReason
-                          : group.resumeUnavailableReason)?.replaceAll('_', ' ')
-                            ?? 'Run is unavailable for this group.'}
+                        : group.resumeUnavailableReason?.replaceAll('_', ' ')
+                          ?? `${releaseLabel} is unavailable for this group.`}
                   onClick={() => {
-                    if (canGroupStart) void program.startMotion([group.groupId]);
-                    else if (canGroupResume) void program.resumeMotion([group.groupId]);
+                    if (retryAction !== null) {
+                      if (canRetry) program.applyRecoveryAction(retryAction.actionId);
+                    } else if (canGroupRelease) void program.resumeMotion([group.groupId]);
                   }}
-                >{startPending ? 'Starting'
-                    : resumePending ? 'Resuming'
-                      : group.state === 'ready' ? 'Run'
-                        : group.state === 'held' ? 'Resume'
-                          : group.state === 'running' ? 'Running' : 'Run'}</button>
+                >{retryAction !== null ? (retryPending ? 'Retrying' : 'Retry')
+                  : releasePending ? (group.state === 'ready' ? 'Starting' : 'Resuming')
+                    : group.state === 'running' ? 'Running' : releaseLabel}</button>
                 <button
                   type="button"
                   className="danger-button transport-group-stop"
@@ -1201,7 +1184,7 @@ export function ProgramTransportControls({
             className="transport-run transport-unique-control"
             disabled={!canRunOrResume}
             title={canResumeFullStop
-                ? 'Execute the preserved Program tree from fresh current-state resolution.'
+                ? 'Resume the halted Program tree. Motion stays stopped until Run or Resume in the Motion panel.'
                 : canRun
                   ? 'Execute the exact Applied Program without starting robot motion.'
                   : blockedReason ?? 'Execute requires an Applied Program and an idle, reset runner.'}
@@ -1227,16 +1210,20 @@ export function ProgramTransportControls({
             onClick={() => { void requestProgramHalt(); }}
           >{haltIntent !== null || programFullStopping ? 'Halting' : 'Halt'}</button>
           <button
+            ref={resetButton}
             type="button"
             className={canReset ? 'transport-reset transport-unique-control meaningful' : 'transport-reset transport-unique-control'}
-            disabled={!canReset}
+            disabled={!canReset || resetIntent !== null}
             title={canReset
               ? resetRequired ? 'Reset the completed Program cycle.'
-                : 'Reset the current Program cycle using its exact owner evidence.'
+                : executionActive
+                  ? 'Stop all Program motion, then confirm ending this run and resetting the Program.'
+                  : 'Reset the current Program cycle using its exact owner evidence.'
               : 'Reset is unavailable in the current backend control state.'}
-            onClick={() => { void program.reset(); }}
-          >{cycleState === 'resetting' || state.pending === 'reset'
-            || state.controlPending === 'recovery:reset_cycle' ? 'Resetting' : 'Reset'}</button>
+            onClick={() => { void requestProgramReset(); }}
+          >{resetIntent === 'stopping' || resetIntent === 'automatic' ? 'Stopping'
+            : cycleState === 'resetting' || state.pending === 'reset'
+              || state.controlPending === 'recovery:reset_cycle' ? 'Resetting' : 'Reset'}</button>
           <div className="transport-unique-icons">
             <button
               ref={detailsButton}
@@ -1325,7 +1312,18 @@ export function ProgramTransportControls({
                         confirmHalt: event.target.checked,
                       }))}
                     />
-                    <span>Confirm before halting Program execution</span>
+                    <span>Confirm before halting the Program</span>
+                  </label>
+                  <label className="transport-settings-option">
+                    <input
+                      type="checkbox"
+                      checked={preferences.confirmReset}
+                      onChange={(event) => setPreferences((current) => ({
+                        ...current,
+                        confirmReset: event.target.checked,
+                      }))}
+                    />
+                    <span>Confirm before resetting a running Program</span>
                   </label>
                 </div>
               )}
@@ -1343,147 +1341,171 @@ export function ProgramTransportControls({
         returnFocusRef={detailsButton}
       >
         <ProgramRuntimePanel enabled={enabled} controller={program} />
-        <p className="panel-intro transport-unavailable-reason">
-          Each displayed group has its own owner-scoped runtime velocity. A
-          slider keeps only the latest pending value, reconciles the owner&apos;s
-          applied value, and drops pending input when Stop begins. A disabled
-          slider means that the selected group has no qualified runtime-scale
-          target or is currently held for Stop/recovery.
-        </p>
-        <section className="runtime-detail-group" aria-label="Program Halt">
-          <h4>Program Halt</h4>
-          <p className="panel-intro transport-unavailable-reason">
-            Quiesce the current Program while retaining its captured run for a
-            later Execute or Reset. This is distinct from the cell-wide Full Stop.
-          </p>
-          <button
-            type="button"
-            className="runtime-detail-button danger-button"
-            disabled={!canProgramHalt || haltIntent !== null}
-            onClick={() => { void requestProgramHalt(); }}
-          >
-            {haltIntent !== null || state.pending === 'full-stop'
-              ? 'Halting Program' : 'Halt Program'}
-          </button>
-        </section>
-        <section className="runtime-detail-group" aria-label="Cell Full Stop">
-          <h4>Cell Full Stop</h4>
-          <p className="panel-intro transport-unavailable-reason">
-            Generation {fullCellStop?.expectedStopGeneration ?? '—'} · {fullStopReason}
-          </p>
-          {robot.fullStopError && (
-            <p className="panel-intro">
-              Cell Full Stop requires attention in Runtime/history.
+        {fullCellStop?.fault && fullCellStop.fault.state !== 'cleared' && (
+          <section className="runtime-detail-group" aria-labelledby="program-stop-fault-title">
+            <h4 id="program-stop-fault-title">Stop fault: motion is blocked</h4>
+            <p className="inline-message severity-error" role="alert">
+              A stop did not complete cleanly ({fullCellStop.fault.reasonCode.replaceAll('_', ' ')}).
+              {fullCellStop.fault.recoveryStatus === 'ready'
+                ? ' The cell can be recovered.'
+                : ' The cell stays blocked until the backend confirms it is safe.'}
             </p>
-          )}
-          <button
-            type="button"
-            className="runtime-detail-button danger-button"
-            disabled={
-              !enabled
-              || fullCellStop?.available !== true
-              || robot.fullStopPending
-            }
-            title={fullStopReason}
-            onClick={() => { void robot.fullStop(); }}
-          >
-            {robot.fullStopPending ? 'Sending Full Stop' : 'Cell Full Stop'}
-          </button>
-          {fullCellStop?.fault && fullCellStop.fault.state !== 'cleared' && (
-            <>
-              <p className="panel-intro transport-unavailable-reason">
-                Stop-fault recovery: {fullCellStop.fault.recoveryStatus.replaceAll('_', ' ')}.
-                {fullCellStop.fault.recoveryStatus !== 'ready'
-                  ? ' The cell remains motion-blocked until the backend confirms configuration and quiescence.'
-                  : ' The backend has confirmed the cell can be recovered.'}
-              </p>
-              {robot.stopFaultRecoveryError && (
-                <p className="panel-intro">
-                  {robot.stopFaultRecoveryError}
-                </p>
-              )}
+            {robot.stopFaultRecoveryError && (
+              <p className="inline-message severity-error">{robot.stopFaultRecoveryError}</p>
+            )}
+            <div className="runtime-detail-actions">
               <button
                 type="button"
                 className="runtime-detail-button"
-                disabled={
-                  !enabled
-                  || robot.stopFaultRecoveryPending
-                }
+                disabled={!enabled || robot.stopFaultRecoveryPending}
                 title={fullCellStop.fault.recoveryStatus === 'ready'
-                  ? 'Clear the cell stop-fault latch using the current backend recovery offer.'
-                  : 'Ask the backend to refresh the recovery assessment. It will clear the latch only when all safety predicates are ready.'}
+                  ? 'Clear the stop fault and allow motion again.'
+                  : 'Ask the backend to check again; it clears the fault only when every safety check passes.'}
                 onClick={() => { void robot.recoverStopFault(); }}
               >
                 {robot.stopFaultRecoveryPending
                   ? 'Checking recovery'
-                  : fullCellStop.fault.recoveryStatus === 'ready' ? 'Recover cell' : 'Retry recovery'}
+                  : fullCellStop.fault.recoveryStatus === 'ready' ? 'Recover cell' : 'Check again'}
               </button>
-            </>
-          )}
-          {fullCellStop?.latestTerminal && (
-            <p className="panel-intro">
-              Latest certificate {fullCellStop.latestTerminal.certificate.stopCertificateId}
-              {' · '}{fullCellStop.latestTerminal.result}
-              {fullCellStop.latestTerminal.escalated ? ' · escalated' : ''}
-              {fullCellStop.latestTerminal.hardStopFloorUsed
-                ? ' · hard-stop floor used'
-                : ''}
-              {fullCellStop.latestTerminal.executedStages.map((stage) => (
-                <span key={`${stage.operationId}:${stage.participantId}:${stage.stageIndex}`}>
-                  <br />{stage.participantId}: {stage.executedMode ?? stage.actionClass}
-                  {stage.substitutionReason
-                    ? ` (fallback: ${stage.substitutionReason})`
-                    : ''}
-                </span>
-              ))}
-            </p>
-          )}
-          {fullCellStop?.fault && (
-            <p className="inline-message severity-error" role="alert">
-              Stop fault {fullCellStop.fault.state}: {fullCellStop.fault.reasonCode}
-              {' · recovery '}{fullCellStop.fault.recoveryStatus}
-            </p>
-          )}
-          {onOpenRuntimeHistory && (
+            </div>
+          </section>
+        )}
+        <details className="runtime-detail-group runtime-detail-disclosure">
+          <summary>How execution and motion work</summary>
+          <dl className="runtime-stop-levels">
+            <div>
+              <dt>Execute</dt>
+              <dd>Starts the Program tree. Motion does not start: each motion group waits for Run.</dd>
+            </div>
+            <div>
+              <dt>Run / Resume</dt>
+              <dd>In the Motion panel: lets a group move. It is one command: the button says Run when nothing in the group has moved yet, Resume otherwise. Stopped work continues from where the robot is now.</dd>
+            </div>
+            <div>
+              <dt>Stop</dt>
+              <dd>Stops one group&apos;s motion. The tree keeps its place; Resume continues.</dd>
+            </div>
+            <div>
+              <dt>Retry</dt>
+              <dd>Shown instead of Run/Resume when the Program paused on a failed node: retries that node and lets all the Program&apos;s stopped and not-yet-started motion continue. To start over, use Reset.</dd>
+            </div>
+            <div>
+              <dt>Halt</dt>
+              <dd>Stops all Program motion and pauses the tree. Execute resumes the tree; motion stays stopped until Run or Resume.</dd>
+            </div>
+            <div>
+              <dt>Reset</dt>
+              <dd>Ends the run and returns Scene objects to the Program&apos;s initial Scene; the next Execute starts from the beginning.</dd>
+            </div>
+            <div>
+              <dt>Magenta node</dt>
+              <dd>The node is running but its work waits for Run, Resume or Retry.</dd>
+            </div>
+            <div>
+              <dt>Closing Composer</dt>
+              <dd>Closing or reloading Composer only stops watching: it never sends Stop and cannot change robot work already sent.</dd>
+            </div>
+            <div>
+              <dt>Failure pause</dt>
+              <dd>A node allowed to pause for the operator (its Recovery policy) failed: the tree waits and all Program motion is stopped until Retry or Reset.</dd>
+            </div>
+          </dl>
+        </details>
+        <details className="runtime-detail-group runtime-detail-disclosure">
+          <summary>Current setup</summary>
+          <ProgramRunSetup
+            applied={state.applied}
+            targets={robot.currentStatus?.directControlTargets ?? []}
+            groups={selections.map((group) => {
+              const scale = program.groupRuntimeScales[group.groupId];
+              const requested = scale?.draft ?? scale?.status?.requestedScale ?? null;
+              return {
+                groupId: group.groupId,
+                nodeCount: group.nodeCount,
+                state: group.state,
+                velocity: requested === null ? '—' : `${Math.round(requested * 100)}%`,
+              };
+            })}
+          />
+        </details>
+        {onOpenRuntimeHistory && (
+          <button
+            type="button"
+            className="runtime-detail-button"
+            onClick={() => {
+              setDetailsOpen(false);
+              onOpenRuntimeHistory();
+            }}
+          >
+            Open Runtime/history
+          </button>
+        )}
+      </OverlayPanel>
+      <OverlayPanel
+        open={resetIntent === 'confirm'}
+        title="Reset the running Program?"
+        titleId="program-reset-confirmation-title"
+        kind="dialog"
+        compact
+        onClose={() => setResetIntent(null)}
+        returnFocusRef={resetButton}
+      >
+        <div className="dialog-copy transport-confirmation">
+          <p>Motion is stopped. Reset also ends this run:</p>
+          <ul>
+            <li>its progress is discarded;</li>
+            <li>Scene objects return to the Program's initial Scene;</li>
+            <li>the next Execute starts the tree from the beginning.</li>
+          </ul>
+          <p>
+            {programFullStopped
+              ? 'Cancel keeps the run halted; Execute resumes it.'
+              : `Cancel keeps the run stopped; ${continueLabel} in the Motion panel continues it.`}
+          </p>
+          <div className="dialog-actions">
+            <button type="button" onClick={() => setResetIntent(null)}>Cancel</button>
             <button
               type="button"
-              className="runtime-detail-button"
+              className="danger-button"
+              disabled={!canReset || !motionSettled}
               onClick={() => {
-                setDetailsOpen(false);
-                onOpenRuntimeHistory();
+                setResetIntent(null);
+                void program.reset();
               }}
-            >
-              Open Runtime/history
-            </button>
-          )}
-        </section>
+            >Reset Program</button>
+          </div>
+        </div>
       </OverlayPanel>
       <OverlayPanel
         open={haltIntent === 'confirm'}
         title="Halt Program execution?"
         titleId="program-halt-confirmation-title"
         kind="dialog"
+        compact
         onClose={() => setHaltIntent(null)}
         returnFocusRef={haltButton}
       >
-        <p className="panel-intro">
-          Program motion has been stopped. Halting also pauses Program-tree
-          execution; choose Cancel if you intended to stop motion only.
-        </p>
-        {!allMotionQuiesced && (
-          <p className="panel-intro" role="status">Waiting for all motion groups to stop…</p>
-        )}
-        <div className="program-halt-confirmation-actions">
-          <button type="button" onClick={() => setHaltIntent(null)}>Cancel</button>
-          <button
-            type="button"
-            className="danger-button"
-            disabled={!allMotionQuiesced}
-            onClick={() => {
-              setHaltIntent(null);
-              void program.fullStop();
-            }}
-          >Halt Program</button>
+        <div className="dialog-copy transport-confirmation">
+          <p>
+            Motion is stopped. Halt also pauses the Program tree; Execute
+            resumes it later, with motion still stopped until Run or Resume.
+            Choose Cancel if you only meant to stop motion.
+          </p>
+          {!allMotionQuiesced && (
+            <p role="status">Waiting for all motion groups to stop…</p>
+          )}
+          <div className="dialog-actions">
+            <button type="button" onClick={() => setHaltIntent(null)}>Cancel</button>
+            <button
+              type="button"
+              className="danger-button"
+              disabled={!allMotionQuiesced}
+              onClick={() => {
+                setHaltIntent(null);
+                void program.fullStop();
+              }}
+            >Halt Program</button>
+          </div>
         </div>
       </OverlayPanel>
     </>

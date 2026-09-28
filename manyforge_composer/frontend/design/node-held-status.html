@@ -1,0 +1,124 @@
+<title>Held Status Mock</title>
+<!-- "Held until Run" node status options. Open directly in a browser
+     (file://). Uses the app's real stylesheet and node icons. Lint, build,
+     tests and packaging ignore this folder. -->
+<link rel="stylesheet" href="../src/styles/index.css">
+<style>
+  body { margin: 0; padding: 28px clamp(16px, 3vw, 40px) 48px; overflow: auto; }
+  .hs-wrap { max-width: 1420px; margin: 0 auto; display: grid; gap: 22px; }
+  .hs-wrap h1 { margin: 0; font-size: 1.3rem; }
+  .hs-wrap h2 { margin: 0; font-size: 0.95rem; }
+  .hs-lead { margin: 0; max-width: 90ch; color: var(--mf-text-neutral-68); font-size: 0.84rem; line-height: 1.5; }
+  .hs-block { display: grid; gap: 14px; padding: 16px; border: 1px solid var(--mf-border-neutral-23); border-radius: var(--mf-radius-lg); background: var(--mf-bg-neutral-08); }
+  .hs-block > p, .hs-block li { margin: 0; max-width: 90ch; color: var(--mf-text-neutral-68); font-size: 0.8rem; line-height: 1.5; }
+  .hs-block ul { margin: 0; padding-left: 1.1rem; display: grid; gap: 4px; }
+  .hs-block strong { color: var(--mf-text-neutral-90); }
+  .hs-head, .hs-row { display: grid; grid-template-columns: 12rem repeat(4, 200px) 240px; gap: 18px; align-items: center; }
+  .hs-head { color: var(--mf-text-neutral-57); font-size: 0.66rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  .hs-row { padding-top: 14px; border-top: 1px solid var(--mf-border-neutral-19); }
+  .hs-label { display: grid; gap: 4px; color: var(--mf-text-neutral-82); font-size: 0.8rem; }
+  .hs-label small { color: var(--mf-text-neutral-57); font-size: 0.7rem; line-height: 1.4; }
+  .hs-scroll { overflow-x: auto; scrollbar-color: var(--mf-border-neutral-32) transparent; }
+  .hs-row .bt-node { position: relative; }
+
+  /* Collapsed-list rows (style D), as in the tree editor. */
+  .hs-list { display: grid; gap: 3px; padding: 6px; border: 2px solid var(--mf-status-running); border-radius: var(--mf-radius-md); background: var(--mf-bg-neutral-23); }
+  .hs-item { --item-status: var(--mf-status-idle); position: relative; border: 1.5px solid var(--item-status); border-radius: 4px; background: var(--mf-bg-neutral-15); box-shadow: inset 4px 0 0 var(--item-status); }
+  .hs-item.status-running { --item-status: var(--mf-status-running); box-shadow: inset 4px 0 0 var(--item-status), 0 0 0.5rem var(--mf-shadow-warning-60-a28); }
+  .hs-item.status-success { --item-status: var(--mf-status-success); }
+  .hs-item > div { display: grid; grid-template-columns: 16px minmax(0,1fr) auto; align-items: center; gap: 6px; height: 22px; padding: 0 6px 0 9px; font-size: 0.72rem; color: var(--mf-text-neutral-90); }
+  .hs-item .program-category-icon { width: 15px; height: 15px; --program-icon-size: 15px; }
+  .hs-badge-slot { display: inline-flex; }
+
+  /* ---- Held treatments ------------------------------------------------ */
+  /* C · marching dashes: running-colour stripes travel round the border. */
+  .held-c { --ants: var(--mf-status-running); --ants-w: 2px; border-color: transparent !important; }
+  .held-c.hs-item { --ants-w: 1.5px; box-shadow: inset 4px 0 0 color-mix(in srgb, var(--mf-status-running) 55%, transparent); }
+  .held-c::after { content: ""; position: absolute; inset: calc(-1 * var(--ants-w)); border-radius: inherit; pointer-events: none;
+    background:
+      linear-gradient(90deg, var(--ants) 50%, transparent 0) repeat-x top left / 12px var(--ants-w),
+      linear-gradient(90deg, var(--ants) 50%, transparent 0) repeat-x bottom left / 12px var(--ants-w),
+      linear-gradient(0deg, var(--ants) 50%, transparent 0) repeat-y top left / var(--ants-w) 12px,
+      linear-gradient(0deg, var(--ants) 50%, transparent 0) repeat-y top right / var(--ants-w) 12px;
+    animation: hs-march 0.6s linear infinite; }
+  /* Top runs right, right runs down, bottom runs left, left runs up. */
+  @keyframes hs-march { to { background-position: 12px 0, -12px 100%, 0 -12px, 100% 12px; } }
+  /* E · running colour + pause badge: says "waiting" without motion. */
+  .held-e.bt-node { border-color: var(--mf-status-running); }
+  .held-e.hs-item { --item-status: var(--mf-status-running); }
+  /* The badge takes the held colour of its option (running yellow by default). */
+  .hs-pause { position: absolute; z-index: 3; display: grid; place-items: center; border-radius: 50%; color: var(--mf-bg-neutral-08); background: var(--held, var(--mf-status-running)); }
+  .bt-node > .hs-pause { top: -9px; right: -9px; width: 18px; height: 18px; box-shadow: 0 0 0 2px var(--mf-bg-neutral-08); }
+  .hs-item .hs-pause { position: static; width: 13px; height: 13px; }
+  .hs-pause svg { width: 60%; height: 60%; fill: currentColor; }
+  /* F · dashed + pause badge (B and E together). */
+  .held-f.bt-node { border-style: dashed; border-color: var(--mf-status-running); }
+  .held-f.hs-item { --item-status: var(--mf-status-running); border-style: dashed; box-shadow: none; }
+
+  /* G · thick magenta border. */
+  .held-g { --held: var(--held-magenta); }
+  .held-g.bt-node { border-width: 4px; border-color: var(--held); }
+  .held-g.hs-item { --item-status: var(--held); border-width: 3px; }
+  /* H · magenta, I · orange: a colour of their own. */
+  .held-h { --held: var(--held-magenta); }
+  .held-i { --held: var(--held-orange); }
+  .held-h.bt-node, .held-i.bt-node { border-color: var(--held); }
+  .held-h.hs-item, .held-i.hs-item { --item-status: var(--held); }
+
+  :root { --held-magenta: #d45fc8; --held-orange: #ec8a3a; }
+  @media (prefers-reduced-motion: reduce) { .held-c::after { animation: none !important; } }
+</style>
+
+<div class="hs-wrap">
+  <header style="display:grid;gap:8px">
+    <h1>"Held until Run": a node that is executing but waiting for motion</h1>
+    <p class="hs-lead">After Execute, a motion node's operation is submitted but held until the operator presses <strong>Run</strong>. Today it shows as idle, so nothing says it is the one waiting. Each row is one way to show that state, next to the existing idle, running and success looks, and as a row inside a collapsed node.</p>
+  </header>
+
+  <section class="hs-block">
+    <div class="hs-scroll"><div id="grid" style="display:grid;gap:0;min-width:1340px"></div></div>
+  </section>
+
+  <section class="hs-block">
+    <h2>Notes</h2>
+    <ul>
+      <li><strong>Data:</strong> the runner already knows it. A motion node whose operation is held before admission is presented as <code>INVALID</code>, which the status contract turns into <em>idle</em>. Showing it needs a fifth node status, <code>held</code>, from the runner (<code>program_runtime.node_statuses</code>) through its validator, the Composer parser and the node/row styles. The frontend cannot infer it: a held leaf and a later, not-yet-started sibling both look idle under a running parent.</li>
+      <li><strong>Colour:</strong> C, E and F reuse the running colour, since the node <em>is</em> part of the running execution, and change only the line or add a badge. G, H and I add a sixth status colour: magenta is used by no other status; orange sits between running yellow and failure red, so it needs a second look to tell apart at a glance.</li>
+      <li><strong>Motion:</strong> only C animates; it stops under the system's "reduce motion" setting. Running nodes do not animate today, so the waiting nodes would be the only moving thing on the canvas, which is where the operator should look next.</li>
+      <li><strong>Collapsed rows:</strong> the same treatment applies to the row's border and bar; the badge variants put the pause mark at the end of the row.</li>
+    </ul>
+  </section>
+</div>
+
+<script>
+const ICONS = {"sequence": "<svg class=\"program-category-icon\" data-category-family=\"execution_control\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(-0.087 -0.348) scale(1.0435)\"><path d=\"M2 8h11\"></path><path d=\"M9 3.5 13.5 8 9 12.5\"></path></g></svg>", "fallback": "<svg class=\"program-category-icon\" data-category-family=\"execution_control\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(0.000 -0.150) scale(1.0000)\"><path d=\"M2 4.5h6\"></path><path d=\"M10 2.8l3.4 3.4M13.4 2.8 10 6.2\"></path><path d=\"M5 4.5V10a1.5 1.5 0 0 0 1.5 1.5H14\"></path><path d=\"M12 9.5l2 2-2 2\"></path></g></svg>", "parallel": "<svg class=\"program-category-icon\" data-category-family=\"execution_control\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(0.742 0.258) scale(0.9677)\"><path d=\"M2 4h11\"></path><path d=\"M10.8 1.8 13 4l-2.2 2.2\"></path><path d=\"M2 12h11\"></path><path d=\"M10.8 9.8 13 12l-2.2 2.2\"></path></g></svg>", "retry": "<svg class=\"program-category-icon\" data-category-family=\"execution_control\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(0.080 0.560) scale(0.9600)\"><path d=\"M2 2.5l3 3M5 2.5l-3 3\"></path><path d=\"M7.5 4H11a3.5 3.5 0 0 1 0 7H4\"></path><path d=\"M6 9l-2 2 2 2\"></path></g></svg>", "motion": "<svg class=\"program-category-icon\" data-category-family=\"motion\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(2.167 1.250) scale(0.8333)\"><circle class=\"solid\" cx=\"3\" cy=\"14\" r=\"1.3\"></circle><path d=\"M3 14h6.5a2.8 2.8 0 0 0 0-5.6h-3a2.8 2.8 0 0 1 0-5.6h5.4\"></path><path d=\"M10.2 0.9 12.3 2.8 10.2 4.7\"></path></g></svg>", "gripper": "<svg class=\"program-category-icon\" data-category-family=\"gripper\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(-0.276 0.138) scale(1.0345)\"><rect x=\"2.5\" y=\"1.8\" width=\"11\" height=\"3.6\" rx=\"1\"></rect><path d=\"M4.6 5.4v5.4l2.1 2.6\"></path><path d=\"M11.4 5.4v5.4l-2.1 2.6\"></path><path d=\"M4.6 8.2h1.4\"></path><path d=\"M11.4 8.2H10\"></path></g></svg>", "geometry": "<svg class=\"program-category-icon\" data-category-family=\"world\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(-0.727 -1.000) scale(1.0909)\"><path d=\"M2.5 13.5h11\"></path><path d=\"M2.5 13.5 10 3\"></path><path d=\"M8 13.5a5.5 5.5 0 0 0-2.3-4.48\"></path></g></svg>", "logic": "<svg class=\"program-category-icon\" data-category-family=\"logic\" viewBox=\"0 0 16 16\" aria-hidden=\"true\" focusable=\"false\"><g transform=\"translate(0.615 0.615) scale(0.9231)\"><rect x=\"1.5\" y=\"4.5\" width=\"13\" height=\"7\" rx=\"3.5\"></rect><circle class=\"solid\" cx=\"11\" cy=\"8\" r=\"2\"></circle></g></svg>"};
+const PAUSE = '<span class="hs-pause" aria-hidden="true"><svg viewBox="0 0 10 10"><rect x="2" y="1.5" width="2.2" height="7" rx="0.6"/><rect x="5.8" y="1.5" width="2.2" height="7" rx="0.6"/></svg></span>';
+const OPTIONS = [
+  ['c', 'C · marching dashes', 'Running-colour dashes travel round the border. Draws the eye; static dashes with reduced motion.', false],
+  ['e', 'E · pause badge', 'Running colour plus a pause badge on the corner. Explicit, static.', true],
+  ['f', 'F · dashed + badge', 'Dashed running border plus the pause badge.', true],
+  ['g', 'G · thick magenta + badge', 'Magenta border twice as thick, plus a magenta pause badge. Static.', true],
+  ['h', 'H · magenta + badge', 'Magenta border, a colour no other status uses, plus a magenta pause badge. Static.', true],
+  ['i', 'I · orange', 'Orange border, between running yellow and failure red. Static.', false],
+];
+function node(id, icon, fam, cls, badge) {
+  return `<div class="bt-node ${cls}" data-category-family="${fam}"><span class="bt-node-band">${ICONS[icon]}</span><strong class="bt-node-name">${id.replaceAll('_', '_<wbr>')}</strong><span class="bt-node-band"></span>${badge ? PAUSE : ''}</div>`;
+}
+function row(id, icon, fam, cls, badge) {
+  return `<div class="hs-item ${cls}" data-category-family="${fam}"><div>${ICONS[icon]}<span>${id}</span>${badge ? PAUSE : '<span></span>'}</div></div>`;
+}
+const head = `<div class="hs-head"><span>Option</span><span>Idle</span><span>Held until Run</span><span>Running</span><span>Success</span><span>Collapsed rows</span></div>`;
+const rows = OPTIONS.map(([k, name, text, badge]) => `<div class="hs-row">
+  <div class="hs-label"><span>${name}</span><small>${text}</small></div>
+  ${node('lite6_joint_motion_2', 'motion', 'motion', 'status-idle')}
+  ${node('lite6_joint_motion', 'motion', 'motion', 'status-idle held-' + k, badge)}
+  ${node('open_gripper', 'gripper', 'gripper', 'status-running')}
+  ${node('check_grasped', 'logic', 'logic', 'status-success')}
+  <div class="hs-list">
+    ${row('open_gripper', 'gripper', 'gripper', 'status-success')}
+    ${row('lite6_joint_motion', 'motion', 'motion', 'held-' + k, badge)}
+    ${row('lite6_joint_motion_2', 'motion', 'motion', 'status-idle')}
+  </div>
+</div>`).join('');
+document.getElementById('grid').innerHTML = head + rows;
+</script>

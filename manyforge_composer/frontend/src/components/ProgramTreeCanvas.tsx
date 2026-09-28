@@ -67,6 +67,11 @@ import {
   readProgramPaletteDrag,
   type ProgramInsertionPlacement,
 } from '../utils/programCanvasInteraction';
+import {
+  collapsedProgramItems,
+  collapsibleProgramNodeIds,
+  hiddenProgramNodeIds,
+} from '../utils/programCollapse';
 import { BtNode, type BtNodePresentation } from './BtNode';
 import {
   CanvasContextMenu,
@@ -74,6 +79,7 @@ import {
   type CanvasMenuItem,
 } from './CanvasContextMenu';
 import { CanvasViewControls } from './CanvasViewControls';
+import { ProgramCanvasHelp } from './ProgramCanvasHelp';
 import {
   ProgramNoticeRail,
   type ProgramNotice,
@@ -105,6 +111,8 @@ interface ProgramCanvasMenu {
   /** Where the pointer was on the canvas, for "Paste here" and "Add node here". */
   flowPosition: XYPosition;
   instanceId: string | null;
+  /** Set when the menu was opened on a link. */
+  edge?: { source: string; target: string };
 }
 
 interface ProgramFlowNodeData extends Record<string, unknown> {
@@ -114,6 +122,8 @@ interface ProgramFlowNodeData extends Record<string, unknown> {
   onDelete: (event: KeyboardEvent<HTMLDivElement>, instanceId: string) => void;
   onNavigate: (instanceId: string, key: string) => void;
   registerElement: (instanceId: string, element: HTMLDivElement | null) => void;
+  onToggleCollapse: (instanceId: string) => void;
+  onItemContextMenu: (event: ReactMouseEvent, instanceId: string) => void;
 }
 
 interface ProgramFlowEdgeData extends Record<string, unknown> {
@@ -160,6 +170,8 @@ function ProgramFlowNode({ data, selected }: NodeProps<ProgramFlowNode>) {
       onDelete={data.onDelete}
       onNavigate={data.onNavigate}
       elementRef={elementRef}
+      onToggleCollapse={data.onToggleCollapse}
+      onItemContextMenu={data.onItemContextMenu}
     />
   );
 }
@@ -220,6 +232,8 @@ export function ProgramTreeCanvas({
   const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
   const [clipboard, setClipboard] = useState<ProgramTreeNode | null>(programClipboard);
   const [menu, setMenu] = useState<ProgramCanvasMenu | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const helpButton = useRef<HTMLButtonElement>(null);
   const closeMenu = useCallback(() => setMenu(null), []);
   const flowInstance = useRef<ReactFlowInstance<ProgramFlowNode, ProgramFlowEdge> | null>(null);
   const nodeElements = useRef<Record<string, HTMLDivElement | null>>({});
@@ -275,9 +289,45 @@ export function ProgramTreeCanvas({
       .map((row) => ({ source: row.parentId as string, target: row.node.instance_id })),
     [flat],
   );
+  // Collapsed subtrees are view state only: they never edit the Program.
+  const [collapsedIds, setCollapsedIds] = useState<ReadonlySet<string>>(() => new Set());
+  const collapsible = useMemo(() => collapsibleProgramNodeIds(roots), [roots]);
+  const collapsed = useMemo(
+    () => new Set([...collapsedIds].filter((id) => collapsible.has(id))),
+    [collapsedIds, collapsible],
+  );
+  const hidden = useMemo(() => hiddenProgramNodeIds(roots, collapsed), [collapsed, roots]);
+  const collapseActive = collapsed.size > 0;
+  const collapseActiveRef = useRef(collapseActive);
+  collapseActiveRef.current = collapseActive;
+  const toggleCollapse = useCallback((instanceId: string) => {
+    setCollapsedIds((current) => {
+      const next = new Set(current);
+      if (next.has(instanceId)) next.delete(instanceId);
+      else next.add(instanceId);
+      return next;
+    });
+  }, []);
+  // Collapse all and Expand all change the whole layout, so they refit the
+  // view once the new sizes are measured; a single collapse keeps the view.
+  const refitAfterLayout = useCallback(() => {
+    globalThis.setTimeout(() => {
+      flowInstance.current?.fitView({ padding: 0.2, duration: 180 });
+    }, 120);
+  }, []);
+  const collapseAll = useCallback(() => {
+    setCollapsedIds(new Set(collapsible));
+    refitAfterLayout();
+  }, [collapsible, refitAfterLayout]);
+  const expandAll = useCallback(() => {
+    setCollapsedIds(new Set());
+    refitAfterLayout();
+  }, [refitAfterLayout]);
   const layoutNodes = useCallback((
     layoutDirection: LayoutDirection,
     orderedIds: string[] = flat.map((row) => row.node.instance_id),
+    rows: FlatProgramNode[] = flat,
+    graphEdges: AuthoringGraphEdge[] = edges,
   ) => {
     // The view names the direction in which siblings are read. The layout
     // utility names the perpendicular graph-growth axis.
@@ -285,7 +335,7 @@ export function ProgramTreeCanvas({
       ? 'horizontal'
       : 'vertical';
     const orderById = new Map(orderedIds.map((id, order) => [id, order]));
-    const seeds: AuthoringGraphNode[] = flat.map((row, fallbackOrder) => {
+    const seeds: AuthoringGraphNode[] = rows.map((row, fallbackOrder) => {
       const id = row.node.instance_id;
       const dimensions = nodeMeasurements[id] ?? NODE_SIZE;
       const order = orderById.get(id) ?? fallbackOrder;
@@ -303,7 +353,7 @@ export function ProgramTreeCanvas({
     });
     const positioned = layoutAuthoringGraph(
       seeds,
-      edges,
+      graphEdges,
       graphDirection,
       graphDirection,
     );
@@ -324,6 +374,24 @@ export function ProgramTreeCanvas({
     () => layoutNodes(view.layoutDirection),
     [layoutNodes, view.layoutDirection],
   );
+  // While anything is collapsed the canvas shows an automatic layout of the
+  // visible nodes, sized by their measurements (a collapsed node is taller and
+  // may be wider). It is not saved; expanding everything restores the
+  // Program's own positions. Drags while collapsed move only this view.
+  const collapsedLayout = useMemo(() => {
+    if (!collapseActive) return null;
+    const visibleRows = flat.filter((row) => !hidden.has(row.node.instance_id));
+    return layoutNodes(
+      view.layoutDirection,
+      undefined,
+      visibleRows,
+      edges.filter((edge) => !hidden.has(edge.target)),
+    );
+  }, [collapseActive, edges, flat, hidden, layoutNodes, view.layoutDirection]);
+  const [collapsedDrag, setCollapsedDrag] = useState<Record<string, XYPosition>>({});
+  // A different collapsed set lays the view out again from scratch.
+  const collapsedKey = [...collapsed].sort().join('|');
+  useEffect(() => setCollapsedDrag({}), [collapsedKey]);
   const topologyKey = useMemo(
     () => flat.map((row) => [
       row.node.instance_id,
@@ -335,6 +403,9 @@ export function ProgramTreeCanvas({
   );
   const selectedRow = flat.find((row) => row.node.instance_id === selectedId) ?? null;
   const [topologyCatalogId, setTopologyCatalogId] = useState('');
+  // The chosen type belongs to the current selection; a new or cleared
+  // selection starts without one.
+  useEffect(() => setTopologyCatalogId(''), [selectedId]);
   const authoringDisabled = busy || environment?.portableAuthoringAvailable !== true;
 
   useEffect(() => {
@@ -403,8 +474,20 @@ export function ProgramTreeCanvas({
     nodeElements.current[next.node.instance_id]?.focus();
   }, [flat, onSelect]);
 
+  const describeCollapsedItem = useCallback((child: ProgramTreeNode) => ({
+    id: child.instance_id,
+    label: child.instance_id,
+    catalogId: child.node_id,
+    category: catalog.get(child.node_id)?.category ?? 'unknown',
+    status: nodeStatuses[child.instance_id] ?? 'idle',
+    invalid: invalidNodeIds.has(child.instance_id),
+    selected: selectedId === child.instance_id,
+  }), [catalog, invalidNodeIds, nodeStatuses, selectedId]);
+  const openItemMenu = useCallback((event: ReactMouseEvent, instanceId: string) => {
+    openMenuRef.current(event, instanceId);
+  }, []);
   const graphNodes = useMemo<ProgramFlowNode[]>(
-    () => laidOut.map((node) => {
+    () => (collapsedLayout ?? laidOut).filter((node) => !hidden.has(node.id)).map((node) => {
       const row = flatById.get(node.id);
       const entry = catalog.get(row?.node.node_id ?? '');
       const nodeAvailability = availability.get(row?.node.node_id ?? '');
@@ -423,7 +506,9 @@ export function ProgramTreeCanvas({
       return {
         id: node.id,
         type: 'programNode',
-        position: presentationPositions[node.id] ?? retainedPositions[node.id] ?? node.position,
+        position: collapsedLayout !== null
+          ? collapsedDrag[node.id] ?? node.position
+          : presentationPositions[node.id] ?? retainedPositions[node.id] ?? node.position,
         measured: nodeMeasurements[node.id],
         draggable: true,
         selectable: false,
@@ -447,18 +532,32 @@ export function ProgramTreeCanvas({
             executionDisposition,
             executionReason: nodeAvailability?.reasons[0]?.replaceAll('_', ' '),
             invalid: invalidNodeIds.has(node.id),
+            collapsible: collapsible.has(node.id),
+            collapsedItems: collapsed.has(node.id) && row !== undefined
+              ? collapsedProgramItems(row.node, describeCollapsedItem)
+              : null,
           },
           onSelect,
           onFocus: setFocusedNodeId,
           onDelete: onNodeDelete,
           onNavigate: onNodeNavigate,
           registerElement,
+          onToggleCollapse: toggleCollapse,
+          onItemContextMenu: openItemMenu,
         },
       };
     }),
     [
       availability,
       catalog,
+      collapsed,
+      collapsedDrag,
+      collapsedLayout,
+      collapsible,
+      describeCollapsedItem,
+      hidden,
+      openItemMenu,
+      toggleCollapse,
       flatById,
       laidOut,
       invalidNodeIds,
@@ -475,7 +574,7 @@ export function ProgramTreeCanvas({
     ],
   );
   const graphEdges = useMemo<ProgramFlowEdge[]>(
-    () => edges.map((edge) => ({
+    () => edges.filter((edge) => !hidden.has(edge.target)).map((edge) => ({
       id: `${edge.source}:${edge.target}`,
       source: edge.source,
       target: edge.target,
@@ -486,7 +585,7 @@ export function ProgramTreeCanvas({
         targetStatus: nodeStatuses[edge.target] ?? 'idle',
       },
     })),
-    [edges, nodeStatuses, view.edgeStyle, view.layoutDirection],
+    [edges, hidden, nodeStatuses, view.edgeStyle, view.layoutDirection],
   );
   const positions = useMemo(
     () => new Map(graphNodes.map((node) => [node.id, node.position])),
@@ -543,7 +642,8 @@ export function ProgramTreeCanvas({
       const pending = pendingPositionChanges.current;
       pendingPositionChanges.current = {};
       positionFrame.current = null;
-      setPresentationPositions((current) => ({ ...current, ...pending }));
+      if (collapseActiveRef.current) setCollapsedDrag((current) => ({ ...current, ...pending }));
+      else setPresentationPositions((current) => ({ ...current, ...pending }));
     };
     if (typeof globalThis.requestAnimationFrame !== 'function') {
       flushPositions();
@@ -554,7 +654,11 @@ export function ProgramTreeCanvas({
 
   const onNodeDragStop = useCallback<NodeMouseHandler<ProgramFlowNode>>((_, node) => {
     delete pendingPositionChanges.current[node.id];
-    setPresentationPositions((current) => ({ ...current, [node.id]: node.position }));
+    if (collapseActive) {
+      setCollapsedDrag((current) => ({ ...current, [node.id]: node.position }));
+    } else {
+      setPresentationPositions((current) => ({ ...current, [node.id]: node.position }));
+    }
     if (authoringDisabled) return;
     const row = flatById.get(node.id);
     const nextPositions = new Map(positions);
@@ -572,20 +676,22 @@ export function ProgramTreeCanvas({
         graphDirection,
       );
       if (index !== null && index !== row.index) {
+        // Positions of a collapsed view are not the Program's layout.
         const mutation = programMoveMutation(
           node.id,
           row.parentId,
           index,
-          Object.fromEntries(nextPositions),
+          collapseActive ? undefined : Object.fromEntries(nextPositions),
         );
         onMutate(mutation.mutation, mutation.args);
         return;
       }
     }
+    if (collapseActive) return;
     onMutate('tree_draft_update_positions', {
       positions: { [node.id]: { x: node.position.x, y: node.position.y } },
     });
-  }, [authoringDisabled, edges, flatById, graphDirection, graphNodes, onMutate, positions]);
+  }, [authoringDisabled, collapseActive, edges, flatById, graphDirection, graphNodes, onMutate, positions]);
 
   const onConnect = useCallback((connection: Connection) => {
     if (authoringDisabled) {
@@ -616,11 +722,12 @@ export function ProgramTreeCanvas({
       result.intent.instance_id,
       parentId,
       index,
-      Object.fromEntries(positions),
+      collapseActive ? undefined : Object.fromEntries(positions),
     );
     onMutate(mutation.mutation, mutation.args);
   }, [
     authoringDisabled,
+    collapseActive,
     edges,
     graphDirection,
     graphNodes,
@@ -630,16 +737,16 @@ export function ProgramTreeCanvas({
     showCanvasMessage,
   ]);
 
-  const detachEdge = useCallback((edge: ProgramFlowEdge) => {
+  const detachEdge = useCallback((edge: { target: string }) => {
     if (authoringDisabled) return;
     const mutation = programMoveMutation(
       edge.target,
       null,
       roots.length,
-      Object.fromEntries(positions),
+      collapseActive ? undefined : Object.fromEntries(positions),
     );
     onMutate(mutation.mutation, mutation.args);
-  }, [authoringDisabled, onMutate, positions, roots.length]);
+  }, [authoringDisabled, collapseActive, onMutate, positions, roots.length]);
 
   const onDragOver = useCallback((event: DragEvent) => {
     if (authoringDisabled) return;
@@ -963,6 +1070,8 @@ export function ProgramTreeCanvas({
       ...extra,
     });
     return [
+      ...collapseMenuEntries(row),
+      'separator',
       item('Duplicate', () => duplicateRow(row), !canInsertAfter(row), { shortcut: 'Ctrl+D' }),
       { label: 'Copy', onSelect: () => copyRow(row), shortcut: 'Ctrl+C' },
       item('Paste after', () => pasteAfter(row), clipboard === null || !canInsertAfter(row), { shortcut: 'Ctrl+V' }),
@@ -999,6 +1108,33 @@ export function ProgramTreeCanvas({
       item('Delete', () => deleteRow(row), false, { danger: true, shortcut: 'Del' }),
     ];
   };
+  /** Collapse entries of a node menu; on a node listed inside a collapsed
+   * one, the first entry brings it back onto the canvas instead. */
+  const collapseMenuEntries = (row: FlatProgramNode): CanvasMenuEntry[] => {
+    const id = row.node.instance_id;
+    const ancestors: string[] = [];
+    for (let parent = row.parentId; parent !== null; parent = flatById.get(parent)?.parentId ?? null) {
+      ancestors.push(parent);
+    }
+    const own: CanvasMenuItem = hidden.has(id)
+      ? {
+          label: 'Show on canvas',
+          title: 'Expand the collapsed nodes above this one.',
+          onSelect: () => setCollapsedIds((current) => new Set(
+            [...current].filter((candidate) => !ancestors.includes(candidate)),
+          )),
+        }
+      : !collapsible.has(id)
+        ? { label: 'Collapse', disabled: true, title: 'Only nodes with children can collapse.' }
+        : collapsed.has(id)
+          ? { label: 'Expand', onSelect: () => toggleCollapse(id) }
+          : { label: 'Collapse', onSelect: () => toggleCollapse(id) };
+    return [
+      own,
+      { label: 'Collapse all', onSelect: collapseAll, disabled: collapsible.size === 0 },
+      { label: 'Expand all', onSelect: expandAll, disabled: !collapseActive },
+    ];
+  };
   const paneMenuEntries = (position: XYPosition): CanvasMenuEntry[] => [
     {
       label: 'Paste here',
@@ -1019,6 +1155,17 @@ export function ProgramTreeCanvas({
     'separator',
     { label: 'Auto-layout', onSelect: autoLayout },
     { label: 'Fit view', onSelect: fitView },
+    'separator',
+    { label: 'Collapse all', onSelect: collapseAll, disabled: collapsible.size === 0 },
+    { label: 'Expand all', onSelect: expandAll, disabled: !collapseActive },
+  ];
+  const edgeMenuEntries = (edge: { source: string; target: string }): CanvasMenuEntry[] => [
+    {
+      label: 'Disconnect',
+      disabled: authoringDisabled,
+      title: `Detach ${edge.target} and its subtree from ${edge.source}; it stays on the canvas as a separate root.`,
+      onSelect: () => detachEdge(edge),
+    },
   ];
 
   const openMenu = (
@@ -1035,6 +1182,18 @@ export function ProgramTreeCanvas({
       setFocusedNodeId(instanceId);
     }
     setMenu({ x: event.clientX, y: event.clientY, flowPosition, instanceId });
+  };
+  const openMenuRef = useRef(openMenu);
+  openMenuRef.current = openMenu;
+  const openEdgeMenu = (event: ReactMouseEvent, edge: ProgramFlowEdge) => {
+    event.preventDefault();
+    setMenu({
+      x: event.clientX,
+      y: event.clientY,
+      flowPosition: { x: 0, y: 0 },
+      instanceId: null,
+      edge: { source: edge.source, target: edge.target },
+    });
   };
 
   const onCanvasShortcut = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -1084,10 +1243,13 @@ export function ProgramTreeCanvas({
       >
         <div className="program-canvas-topbar">
           <button
+            ref={helpButton}
             type="button"
             className="icon-button program-canvas-help"
-            aria-label="Program canvas keyboard help"
-            title="Focus a node, use arrow keys to navigate, Enter or Space to select, and Delete or Backspace to remove it. Double-click a link, or select it and press Delete, to detach it. Right-click a node or the canvas for more actions; Ctrl+D duplicates the selected node, Ctrl+C copies it and Ctrl+V pastes after it (or on the canvas when nothing is selected)."
+            aria-label="Tree editor help"
+            aria-haspopup="dialog"
+            title="Tree editor help: how to operate it, colours and collapsing"
+            onClick={() => setHelpOpen(true)}
           >
             ?
           </button>
@@ -1133,6 +1295,7 @@ export function ProgramTreeCanvas({
           }}
           onNodeContextMenu={(event, node) => openMenu(event, node.id)}
           onPaneContextMenu={(event) => openMenu(event, null)}
+          onEdgeContextMenu={openEdgeMenu}
           onMoveStart={closeMenu}
           onDragOver={onDragOver}
           onDrop={onDrop}
@@ -1158,7 +1321,17 @@ export function ProgramTreeCanvas({
           <Background color={CANVAS_COLORS.grid} gap={24} />
           <Controls showInteractive />
         </ReactFlow>
-        {menu !== null && (menu.instanceId === null || menuRow !== null) && (
+        {menu !== null && menu.edge !== undefined && (
+          <CanvasContextMenu
+            x={menu.x}
+            y={menu.y}
+            heading={`${menu.edge.source} → ${menu.edge.target}`}
+            label={`Actions for the link from ${menu.edge.source} to ${menu.edge.target}`}
+            entries={edgeMenuEntries(menu.edge)}
+            onClose={closeMenu}
+          />
+        )}
+        {menu !== null && menu.edge === undefined && (menu.instanceId === null || menuRow !== null) && (
           <CanvasContextMenu
             x={menu.x}
             y={menu.y}
@@ -1173,51 +1346,7 @@ export function ProgramTreeCanvas({
             className="program-tree-actions"
             aria-label={`Topology actions for ${selectedRow.node.instance_id}`}
           >
-            {topologyEntry !== undefined && (
-              <div className="program-tree-action-row program-tree-action-row-type-commands">
-                <button
-                  type="button"
-                  disabled={authoringDisabled || !childInsertionAvailable}
-                  title={childInsertionAvailable
-                    ? 'Insert the chosen type as the final child and open its Properties.'
-                    : 'The selected node cannot accept another child.'}
-                  onClick={() => { void insertTopologyNode('child'); }}
-                >
-                  Add child
-                </button>
-                <button
-                  type="button"
-                  disabled={authoringDisabled || !siblingInsertionAvailable}
-                  title={siblingInsertionAvailable
-                    ? 'Insert the chosen type immediately after the selected node.'
-                    : 'The selected node parent cannot accept another child.'}
-                  onClick={() => { void insertTopologyNode('after'); }}
-                >
-                  Add after
-                </button>
-                <button
-                  type="button"
-                  disabled={authoringDisabled || !wrapperAvailable}
-                  title={wrapperAvailable
-                    ? 'Wrap the selected subtree atomically with the chosen type.'
-                    : 'The chosen node type cannot wrap one child.'}
-                  onClick={() => { void wrapSelected(); }}
-                >
-                  Wrap
-                </button>
-                <button
-                  type="button"
-                  disabled={authoringDisabled || !kindReplacementAvailable}
-                  title={kindReplacementAvailable
-                    ? 'Change type while retaining every compatible authored parameter and all children.'
-                    : 'The chosen type is not compatible with the current children and authored parameters.'}
-                  onClick={() => { void changeSelectedKind(); }}
-                >
-                  Change type
-                </button>
-              </div>
-            )}
-            <div className="program-tree-action-row program-tree-action-row-placement">
+            <div className="program-tree-action-row program-tree-action-row-type">
               <label className="inline-select-label program-topology-node-type">
                 Node type
                 <select
@@ -1231,6 +1360,52 @@ export function ProgramTreeCanvas({
                   ))}
                 </select>
               </label>
+              {topologyEntry !== undefined && (
+                <>
+                  <button
+                    type="button"
+                    disabled={authoringDisabled || !childInsertionAvailable}
+                    title={childInsertionAvailable
+                      ? 'Insert the chosen type as the final child and open its Properties.'
+                      : 'The selected node cannot accept another child.'}
+                    onClick={() => { void insertTopologyNode('child'); }}
+                  >
+                    Add child
+                  </button>
+                  <button
+                    type="button"
+                    disabled={authoringDisabled || !siblingInsertionAvailable}
+                    title={siblingInsertionAvailable
+                      ? 'Insert the chosen type immediately after the selected node.'
+                      : 'The selected node parent cannot accept another child.'}
+                    onClick={() => { void insertTopologyNode('after'); }}
+                  >
+                    Add after
+                  </button>
+                  <button
+                    type="button"
+                    disabled={authoringDisabled || !wrapperAvailable}
+                    title={wrapperAvailable
+                      ? 'Wrap the selected subtree atomically with the chosen type.'
+                      : 'The chosen node type cannot wrap one child.'}
+                    onClick={() => { void wrapSelected(); }}
+                  >
+                    Wrap
+                  </button>
+                  <button
+                    type="button"
+                    disabled={authoringDisabled || !kindReplacementAvailable}
+                    title={kindReplacementAvailable
+                      ? 'Change type while retaining every compatible authored parameter and all children.'
+                      : 'The chosen type is not compatible with the current children and authored parameters.'}
+                    onClick={() => { void changeSelectedKind(); }}
+                  >
+                    Change type
+                  </button>
+                </>
+              )}
+            </div>
+            <div className="program-tree-action-row program-tree-action-row-placement">
               <button
                 type="button"
                 disabled={
@@ -1310,6 +1485,11 @@ export function ProgramTreeCanvas({
           </div>
         )}
       </div>
+      <ProgramCanvasHelp
+        open={helpOpen}
+        onClose={() => setHelpOpen(false)}
+        returnFocusRef={helpButton}
+      />
       <span className="sr-only" aria-live="polite">
         Canvas bounds {positions.size} nodes, {graphWidth} by {graphHeight} pixels.
       </span>

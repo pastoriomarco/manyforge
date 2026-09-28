@@ -1,27 +1,21 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  INSPECTOR_WIDTH_MAX,
   INSPECTOR_WIDTH_MIN,
-  workbenchWidthLimits,
+  inspectorWidthMax,
 } from './workbenchLayout';
 
-describe('workbench width limits', () => {
-  it('lets the viewer reach half of a 1440 px workbench at the default inspector width', () => {
-    const limits = workbenchWidthLimits(1440, 320);
-
-    expect(limits.viewerWidthMax).toBeGreaterThanOrEqual(720);
+describe('centered inspector width', () => {
+  it('reaches the maximum on a 1440 px workbench', () => {
+    expect(inspectorWidthMax(1440)).toBe(INSPECTOR_WIDTH_MAX);
   });
 
-  it('lets the viewer reach two thirds of a 1920 px workbench when the inspector is minimized', () => {
-    const limits = workbenchWidthLimits(1920, INSPECTOR_WIDTH_MIN);
-
-    expect(limits.viewerWidthMax).toBe(1280);
+  it('keeps both side panes usable on a narrow workbench', () => {
+    expect(inspectorWidthMax(1100)).toBe(1100 - 2 * 360 - 2 * 8);
   });
 
-  it('retains the established viewer and inspector minima', () => {
-    const limits = workbenchWidthLimits(1440, 320);
-
-    expect(limits.viewerWidthMin).toBe(420);
-    expect(limits.inspectorWidthMax).toBe(480);
+  it('never goes below the inspector minimum', () => {
+    expect(inspectorWidthMax(800)).toBe(INSPECTOR_WIDTH_MIN);
   });
 });

@@ -275,3 +275,15 @@ export function ProgramNodeName({ name }: { name: string }) {
     </>
   );
 }
+
+/** Pause mark of a node whose motion waits for Run (status ``held``). */
+export function ProgramHeldBadge() {
+  return (
+    <span className="bt-node-held-badge" aria-hidden="true">
+      <svg viewBox="0 0 10 10">
+        <rect x="2" y="1.5" width="2.2" height="7" rx="0.6" />
+        <rect x="5.8" y="1.5" width="2.2" height="7" rx="0.6" />
+      </svg>
+    </span>
+  );
+}

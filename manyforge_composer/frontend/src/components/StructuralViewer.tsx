@@ -33,6 +33,7 @@ import {
 } from '../api/snapshotObserverClient';
 import type { PointCloudFrame } from '../api/pointcloudObserverClient';
 import { usePointCloudFrame } from '../hooks/usePointCloudFrame';
+import { SceneOutline } from './SceneOutline';
 import { SnapshotResponder } from './SnapshotResponder';
 import {
   MAX_AUTHORITATIVE_INTERPOLATION_MS,
@@ -188,6 +189,9 @@ interface StructuralViewerProps {
   onAxesSizesCommit?: (frameSizeM: number, objectSizeM: number) => void;
   robotControlSurface?: ReactNode;
   robotControlBlocked?: boolean;
+  /** A manual robot move is active: the Robot panel stays open and visible
+   * so its Stop is at hand. */
+  robotMotionActive?: boolean;
   objectControlSurface?: ReactNode;
   transportControls?: ReactNode | ((openRobotControls: () => void) => ReactNode);
   runtimeOverlay?: ReactNode;
@@ -2410,10 +2414,26 @@ function ModelLoadedSignal({ generation, onLoaded }: {
   return null;
 }
 
+/** Viewer link name -> model instance. Keyed by content, so an equal but
+ * new frame list keeps the same map. */
+function useOutlineComponents(
+  frameAxes: NonNullable<StructuralViewerProps['frameAxes']>,
+): ReadonlyMap<string, string> {
+  const key = frameAxes.flatMap((row) => (
+    row.modelInstanceId === null ? [] : [`${row.linkName}\u0000${row.modelInstanceId}`]
+  )).join('\n');
+  return useMemo(() => new Map(key
+    .split('\n')
+    .filter((line) => line !== '')
+    .map((line) => line.split('\u0000') as [string, string])), [key]);
+}
+
 const ViewerCanvas = memo(function ViewerCanvas({
   manifest,
   collisionsVisible,
   wireframeVisible,
+  outlineVisible,
+  outlineComponents,
   retryGeneration,
   onModelLoaded,
   onAssetError,
@@ -2460,6 +2480,9 @@ const ViewerCanvas = memo(function ViewerCanvas({
   manifest: SceneUrdfManifest | null;
   collisionsVisible: boolean;
   wireframeVisible: boolean;
+  outlineVisible: boolean;
+  /** Viewer link name -> model instance, for one outline per component. */
+  outlineComponents: ReadonlyMap<string, string>;
   /** Incremented by Retry/Reload: remounts the model subtree to load again. */
   retryGeneration: number;
   onModelLoaded: (generation: number) => void;
@@ -2748,6 +2771,10 @@ const ViewerCanvas = memo(function ViewerCanvas({
         }}
         onPresentation={captureCameraPresentation}
       />
+      {outlineVisible && (
+        <SceneOutline multisample={renderer.antialias} componentByLink={outlineComponents} />
+      )}
+      {/* SceneOutline outlines this group's solid meshes by name. */}
       <group name="viewer-frame-content">
         {manifest !== null && (
           <AssetErrorBoundary
@@ -2925,6 +2952,7 @@ function StructuralViewerContent({
   onAxesSizesCommit,
   robotControlSurface,
   robotControlBlocked = false,
+  robotMotionActive = false,
   objectControlSurface,
   transportControls,
   runtimeOverlay,
@@ -2939,6 +2967,7 @@ function StructuralViewerContent({
     DEFAULT_WIREFRAME_VISIBLE,
   );
   const [pointCloudVisible, setPointCloudVisible] = useState(false);
+  const [outlineVisible, setOutlineVisible] = useState(false);
   const [sessionFrameAxes, setSessionFrameAxes] = useState<Set<string>>(
     () => new Set(frameAxes.filter((frame) => (
       frame.defaultVisible && frame.poseAvailable
@@ -3089,6 +3118,9 @@ function StructuralViewerContent({
     setFrameAxesSizeM(viewer?.frame_gizmo_size_m ?? 0.1);
     setObjectAxesSizeM(viewer?.object_axes_gizmo_size_m ?? 0.1);
   }, [viewer?.frame_gizmo_size_m, viewer?.object_axes_gizmo_size_m]);
+  // One outline per component: every robot link (not only those with axes
+  // shown) resolves to its model instance.
+  const outlineComponents = useOutlineComponents(frameAxes);
   const presentedFrameAxes = frameAxes
     .filter((frame) => sessionFrameAxes.has(frame.linkName))
     .sort((left, right) => left.sourceLinkName.localeCompare(right.sourceLinkName));
@@ -3116,7 +3148,16 @@ function StructuralViewerContent({
     onInspectorPanelChange?.(inspectorPanel);
   }, [inspectorPanel, onInspectorPanelChange]);
   useEffect(() => () => onInspectorPanelChange?.(null), [onInspectorPanelChange]);
+  // During a manual move the Robot panel is forced open, restored and cannot
+  // be closed or replaced until the move ends.
+  const robotPanelLocked = robotMotionActive && robotControlSurface !== undefined;
+  useEffect(() => {
+    if (!robotPanelLocked) return;
+    setInspectorPanel('robot');
+    if (inspectorMinimized) onInspectorMinimizedChange?.(false);
+  }, [inspectorMinimized, onInspectorMinimizedChange, robotPanelLocked]);
   const toggleInspectorPanel = useCallback((panel: Exclude<ViewerInspectorPanel, null>) => {
+    if (robotPanelLocked) return;
     if (inspectorPanel === panel) {
       if (inspectorMinimized) onInspectorMinimizedChange?.(false);
       else setInspectorPanel(null);
@@ -3124,7 +3165,8 @@ function StructuralViewerContent({
     }
     setInspectorPanel(panel);
     onInspectorMinimizedChange?.(false);
-  }, [inspectorMinimized, inspectorPanel, onInspectorMinimizedChange]);
+  }, [inspectorMinimized, inspectorPanel, onInspectorMinimizedChange, robotPanelLocked]);
+  const robotLockTitle = 'A robot move is active: Robot control stays open until it ends.';
 
   const visualCount = manifest.status === 'ready'
     ? manifest.data.links.reduce((total, link) => total + link.visuals.length, 0)
@@ -3396,23 +3438,29 @@ function StructuralViewerContent({
             <button
               type="button"
               aria-pressed={inspectorPanel === 'robot'}
-              disabled={robotControlSurface === undefined}
+              disabled={robotControlSurface === undefined || robotPanelLocked}
+              title={robotPanelLocked ? robotLockTitle : undefined}
               onClick={() => toggleInspectorPanel('robot')}
             >Robot</button>
             <button
               type="button"
               aria-pressed={inspectorPanel === 'object'}
+              disabled={robotPanelLocked}
+              title={robotPanelLocked ? robotLockTitle : undefined}
               onClick={() => toggleInspectorPanel('object')}
             >Object</button>
             <button
               type="button"
               aria-pressed={inspectorPanel === 'tools'}
+              disabled={robotPanelLocked}
               aria-label={auxiliaryViewerSourcesActive
                 ? 'Viewer tools; preview layer visible'
                 : 'Viewer tools'}
-              title={auxiliaryViewerSourcesActive
-                ? 'A Draft scene or target preview is visible. Open Tools for layer details.'
-                : 'Viewer tools'}
+              title={robotPanelLocked
+                ? robotLockTitle
+                : auxiliaryViewerSourcesActive
+                  ? 'A Draft scene or target preview is visible. Open Tools for layer details.'
+                  : 'Viewer tools'}
               onClick={() => toggleInspectorPanel('tools')}
             >Tools{auxiliaryViewerSourcesActive && (
               <span className="viewer-preview-dot" aria-hidden="true" />
@@ -3443,6 +3491,8 @@ function StructuralViewerContent({
               manifest={manifest.status === 'ready' ? manifest.data : null}
               collisionsVisible={collisionsVisible}
               wireframeVisible={wireframeVisible}
+              outlineVisible={outlineVisible}
+              outlineComponents={outlineComponents}
               retryGeneration={geometryRetryGeneration}
               onModelLoaded={reportModelLoaded}
               onAssetError={reportAssetError}
@@ -3637,13 +3687,15 @@ function StructuralViewerContent({
               >□</button>
               <button
                 type="button"
-                disabled={inspectorPanel === null}
+                disabled={inspectorPanel === null || robotPanelLocked}
+                title={robotPanelLocked ? robotLockTitle : undefined}
                 aria-label={inspectorMinimized ? 'Restore viewer inspector' : 'Minimize viewer inspector'}
                 onClick={() => onInspectorMinimizedChange?.(!inspectorMinimized)}
               >{inspectorMinimized ? '⌃' : '⌄'}</button>
               <button
                 type="button"
-                disabled={inspectorPanel === null}
+                disabled={inspectorPanel === null || robotPanelLocked}
+                title={robotPanelLocked ? robotLockTitle : undefined}
                 aria-label="Close viewer inspector"
                 onClick={() => setInspectorPanel(null)}
               >×</button>
@@ -3690,6 +3742,17 @@ function StructuralViewerContent({
                       onChange={(event) => setWireframeVisible(event.target.checked)}
                     />
                     <span>Wireframe overlays</span>
+                  </label>
+                  <label
+                    className="toggle-control"
+                    title="Outline robots and objects so dark ones stay visible. Adds rendering work; slower with software rendering."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={outlineVisible}
+                      onChange={(event) => setOutlineVisible(event.target.checked)}
+                    />
+                    <span>Object outline</span>
                   </label>
                   <label className="toggle-control">
                     <input

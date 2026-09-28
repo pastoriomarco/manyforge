@@ -495,17 +495,20 @@
 
 .workspace-switcher button {
   min-height: 1.9rem;
-  padding: 0.28rem 0.48rem;
-  border-color: transparent;
-  background: transparent;
+  padding: 0.28rem 0.62rem;
+  border-color: var(--mf-border-neutral-27);
+  color: var(--mf-text-neutral-63);
+  background: var(--mf-bg-neutral-11);
   font-size: var(--mf-font-size-068);
   white-space: nowrap;
 }
 
+/* Every section keeps its button shape; the selected one is lit and ringed. */
 .workspace-switcher button.active {
-  border-color: var(--mf-border-neutral-35);
+  border-color: var(--mf-border-accent-64);
   color: var(--mf-text-neutral-94b);
-  background: var(--mf-bg-neutral-15);
+  background: var(--mf-bg-neutral-19);
+  box-shadow: inset 0 0 0 1px var(--mf-shadow-accent-91-a42);
 }
 
 .workspace-switcher button.deployment-status-button {
@@ -515,39 +518,39 @@
   justify-content: center;
   padding-inline: 1.22rem;
   overflow: visible;
+  border-color: color-mix(in srgb, var(--deployment-tone-border, var(--mf-border-neutral-35)) 55%, var(--mf-border-neutral-27));
+  background: color-mix(in srgb, var(--deployment-tone-bg, var(--mf-bg-neutral-20)) 40%, var(--mf-bg-neutral-11));
 }
 
 .workspace-switcher .deployment-status-button.readiness-ready {
-  border-color: var(--mf-border-success-40);
-  background: var(--mf-bg-success-24);
+  --deployment-tone-border: var(--mf-border-success-40);
+  --deployment-tone-bg: var(--mf-bg-success-24);
 }
 
 .workspace-switcher .deployment-status-button.readiness-degraded {
-  border-color: var(--mf-border-warning-43);
-  background: var(--mf-bg-warning-27b);
+  --deployment-tone-border: var(--mf-border-warning-43);
+  --deployment-tone-bg: var(--mf-bg-warning-27b);
 }
 
 .workspace-switcher .deployment-status-button.readiness-fault {
-  border-color: var(--mf-border-danger-49);
-  background: var(--mf-bg-danger-30);
+  --deployment-tone-border: var(--mf-border-danger-49);
+  --deployment-tone-bg: var(--mf-bg-danger-30);
 }
 
 .workspace-switcher .deployment-status-button.readiness-offline {
-  border-color: var(--mf-border-danger-37);
-  background: var(--mf-bg-danger-21);
+  --deployment-tone-border: var(--mf-border-danger-37);
+  --deployment-tone-bg: var(--mf-bg-danger-21);
 }
 
 .workspace-switcher .deployment-status-button.readiness-waiting {
-  border-color: var(--mf-border-neutral-35);
-  background: var(--mf-bg-neutral-20);
+  --deployment-tone-border: var(--mf-border-neutral-35);
+  --deployment-tone-bg: var(--mf-bg-neutral-20);
 }
 
-.workspace-switcher .deployment-status-button.active {
-  box-shadow: inset 0 0 0 1px var(--mf-shadow-accent-91-a42);
-}
-
-.workspace-switcher .active {
-  border-color: var(--mf-border-neutral-37);
+.workspace-switcher button.deployment-status-button.active {
+  border-color: var(--mf-border-accent-64);
+  color: var(--mf-text-neutral-94b);
+  background: var(--deployment-tone-bg, var(--mf-bg-neutral-20));
 }
 
 .header-action-divider {
@@ -563,7 +566,7 @@
     0.45rem
     minmax(0, var(--inspector-width))
     0.45rem
-    minmax(0, var(--viewer-width));
+    minmax(0, 1fr);
   flex: 1 1 auto;
   min-height: 0;
   gap: 0;
@@ -733,7 +736,7 @@
       0.4rem
       minmax(0, var(--inspector-width))
       0.4rem
-      minmax(0, var(--viewer-width));
+      minmax(0, 1fr);
   }
 
 }

@@ -26,6 +26,12 @@
   grid-column: 1;
 }
 
+/* Without an action there is no second column, so loose text can never be
+   placed beside the title. */
+.notice:not(:has(> button)) {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .notice > button {
   grid-row: 1;
   grid-column: 2;

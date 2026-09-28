@@ -234,8 +234,7 @@ function ManualMotionSettingsControls({ controller, disabled }: {
   const commonFields: MotionSettingField[] = [
     { key: 'velocityScale', label: 'Vel. (%)', fullLabel: 'Velocity scale (%)', unit: '%', factor: 100, step: 5, max: 100 },
     { key: 'accelerationScale', label: 'Acc. (%)', fullLabel: 'Acceleration scale (%)', unit: '%', factor: 100, step: 5, max: 100 },
-    { key: 'tcpLinearSpeedMps', label: 'TCP Sp. (m/s)', fullLabel: 'TCP linear speed (m/s)', unit: 'm/s', factor: 1, step: 0.01,
-      max: descriptor.operationalLimit?.maximumTcpLinearSpeedMps },
+    { key: 'tcpLinearSpeedMps', label: 'TCP Sp. (m/s)', fullLabel: 'TCP speed ceiling (m/s); capped by the applied Deployment maximum', unit: 'm/s', factor: 1, step: 0.01 },
   ];
   const advancedFields: MotionSettingField[] = cartesian ? [
     { key: 'tcpAngularSpeedRadS', label: 'TCP Ang. (deg/s)', fullLabel: 'TCP angular speed (deg/s)', unit: 'deg/s', factor: RAD_TO_DEG, step: 5 },
@@ -262,6 +261,13 @@ function ManualMotionSettingsControls({ controller, disabled }: {
       <div className="robot-control-motion-settings-grid">
         {commonFields.map(settingControl)}
       </div>
+      {descriptor.operationalLimit !== null && (
+        <p className="muted">
+          Applied Deployment maximum: {descriptor.operationalLimit.maximumTcpLinearSpeedMps} m/s.
+          {' '}Effective TCP ceiling: {Math.min(settings.tcpLinearSpeedMps,
+            descriptor.operationalLimit.maximumTcpLinearSpeedMps)} m/s; the request is unchanged.
+        </p>
+      )}
       <details className="robot-control-joint-settings">
         <summary title="Cartesian path fidelity, smoothing and optional tighter per-joint limits.">Advanced</summary>
         {advancedFields.length > 0 && <div className="robot-control-advanced-settings-grid">
@@ -398,6 +404,11 @@ export function RobotControlPanelView({
     || pendingInputs.size > 0
   );
   const canStop = operationActive && state.operation !== null;
+  // While the robot moves, Stop has the keyboard focus (Enter/Space stops).
+  const stopButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (canStop) stopButton.current?.focus();
+  }, [canStop]);
   const recoveryRequired = manualOperationRequiresRecovery(state.operation);
   const resetOperationControl = (
     <button
@@ -1418,6 +1429,7 @@ export function RobotControlPanelView({
                 Revert
               </button>
               <button
+                ref={stopButton}
                 className="stop-button"
                 type="button"
                 disabled={!canStop}

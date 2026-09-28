@@ -471,6 +471,41 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.state.pendingAction).toBeNull();
   });
 
+  it('re-reads Applied once when an accepted activation settles without a new Draft', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    const snapshot = authoringSnapshot(workspace(1));
+    const rerender = await mountHarness(initial, snapshot, testPublication(workspace(1)));
+    const loading = {
+      ...workspace(1),
+      applied: { ...workspace(1).applied, available: false, matchesDraft: null },
+      hasUnappliedChanges: null,
+    };
+    await act(async () => initial.resolve(loading));
+    expect(latest?.state.workspace?.applied.available).toBe(false);
+    apiMock.programWorkspace.get.mockResolvedValueOnce(workspace(1));
+
+    // Same Draft publication; only the Manager's active bundle moved.
+    const settled = {
+      ...snapshot,
+      runtime: {
+        ...snapshot.runtime,
+        sections: {
+          ...snapshot.runtime.sections,
+          manager: {
+            ...snapshot.runtime.sections.manager,
+            payload: { active: { retained_bundle_id: 'bundle-2', graph_revision: 'graph-2' } },
+          },
+        },
+      },
+    };
+    await rerender(settled);
+    await rerender(settled);
+
+    expect(apiMock.programWorkspace.get).toHaveBeenCalledTimes(2);
+    expect(latest?.state.workspace?.applied.available).toBe(true);
+    expect(latest?.state.workspace?.applied.matchesDraft).toBe(true);
+  });
+
   it.each(['authoring_not_ready', 'stale_generation'])('does not retry or report a fault for %s', async (code) => {
     const initial = deferred<ProgramWorkspaceResponse>();
     await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));

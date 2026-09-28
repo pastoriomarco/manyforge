@@ -1165,9 +1165,11 @@ void AddExecutionScope(CanonicalValue::Object& row,
                     diagnostic.deployment_maximum_tcp_linear_speed_mps &&
                 (!diagnostic.requested_tcp_linear_speed_mps.has_value() ||
                  (std::isfinite(*diagnostic.requested_tcp_linear_speed_mps) &&
-                  *diagnostic.requested_tcp_linear_speed_mps > 0.0 &&
-                  *diagnostic.requested_tcp_linear_speed_mps <=
-                      diagnostic.deployment_maximum_tcp_linear_speed_mps)),
+                  *diagnostic.requested_tcp_linear_speed_mps > 0.0)) &&
+                diagnostic.admitted_tcp_linear_speed_mps ==
+                    std::min(diagnostic.requested_tcp_linear_speed_mps.value_or(
+                                 diagnostic.deployment_maximum_tcp_linear_speed_mps),
+                             diagnostic.deployment_maximum_tcp_linear_speed_mps),
             "operation_journal_record_invalid",
             "prepared-motion diagnostics contain invalid runtime-policy provenance");
 

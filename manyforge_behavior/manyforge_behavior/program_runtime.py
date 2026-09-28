@@ -254,6 +254,15 @@ def _program_node_ids(node: ProgramTreeNode) -> tuple[str, ...]:
     return tuple(sorted(result))
 
 
+def _presented_node_status(behaviour: py_trees.behaviour.Behaviour) -> str:
+    if getattr(behaviour, "presented_held", False):
+        return "held"
+    status = getattr(behaviour, "presented_status", behaviour.status)
+    if status is py_trees.common.Status.INVALID:
+        return "idle"
+    return status.name.lower()
+
+
 class ExecutableProgramRun:
     """Build and tick one exact Program without owning downstream semantics."""
 
@@ -456,19 +465,16 @@ class ExecutableProgramRun:
 
     @property
     def node_statuses(self) -> Mapping[str, str]:
-        """Return exact authored-node phases from the current tree tick."""
+        """Return exact authored-node phases from the current tree tick.
+
+        ``held`` is a ticking node whose owner work waits for motion to start
+        (held before admission); it would otherwise present as idle.
+        """
 
         with self._lock:
             return MappingProxyType(
                 {
-                    instance_id: (
-                        "idle"
-                        if getattr(behaviour, "presented_status", behaviour.status)
-                        is py_trees.common.Status.INVALID
-                        else getattr(
-                            behaviour, "presented_status", behaviour.status
-                        ).name.lower()
-                    )
+                    instance_id: _presented_node_status(behaviour)
                     for instance_id, behaviour in self._authored_nodes.items()
                 }
             )

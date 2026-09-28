@@ -37,6 +37,7 @@ import type {
 import type { ComposerHeadlessState } from '../types/headless';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
 import { browserStableIdentity } from './useHeadlessState';
+import { programRuntimeWakeKey } from './useProgramRuntime';
 
 function identity(prefix: string): string {
   const random = globalThis.crypto?.randomUUID?.()
@@ -123,6 +124,7 @@ export function useProgramWorkspace(
   const workspaceRead = useRef<Promise<ProgramWorkspaceResponse> | null>(null);
   const workspaceReadGeneration = useRef<number | null>(null);
   const projectionIdentityRead = useRef<string | null>(null);
+  const appliedIdentityRead = useRef<string | null>(null);
   const requestOwnerEpoch = useRef(browserStableIdentity(
     'manyforge.composer.request_owner_epoch',
     'composer-authoring-owner',
@@ -256,6 +258,27 @@ export function useProgramWorkspace(
         workspaceResult(workspace, null)),
     );
   }, [authoring.current, published, readWorkspace, run]);
+
+  // The Applied half of this projection changes without a new authoring
+  // publication when an accepted Load/Apply/Revert settles. Re-read once per
+  // Applied runtime identity, as the runtime projection does, and never over
+  // an in-flight operation, whose own result is still to be shown.
+  const appliedIdentity = programRuntimeWakeKey(snapshot);
+  const operationPending = state.status === 'loading'
+    || (state.status === 'ready' && state.pendingAction !== null);
+  useEffect(() => {
+    if (snapshot === null || state.workspace === null || operationPending) return;
+    if (appliedIdentityRead.current === appliedIdentity) return;
+    const initial = appliedIdentityRead.current === null;
+    appliedIdentityRead.current = appliedIdentity;
+    if (initial) return;
+    const requestGeneration = generation.current + 1;
+    void run(
+      'refresh',
+      () => readWorkspace(requestGeneration).then((workspace) =>
+        workspaceResult(workspace, null)),
+    );
+  }, [appliedIdentity, operationPending, readWorkspace, run, snapshot, state.workspace]);
 
   useEffect(() => {
     if (state.workspace === null || published === null) return;

@@ -43,8 +43,10 @@ export function sceneSourceIsDraft(
   draftDiffersFromApplied: boolean,
   emptyOwnerPreview: boolean,
 ): boolean {
+  // An explicit Draft choice applies only while Draft and Applied differ,
+  // which is also the only time its toggle is shown.
   return ownerSceneKnown && draftAvailable
-    && (choice === 'draft' || (choice === 'auto'
+    && ((choice === 'draft' && draftDiffersFromApplied) || (choice === 'auto'
       && (draftDiffersFromApplied || emptyOwnerPreview)));
 }
 

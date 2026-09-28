@@ -213,6 +213,19 @@ class OperatorMotionStopPolicy(py_trees.decorators.Decorator):
         # action as Running. The scope projection separately reports the hold.
         return getattr(self.decorated, "presented_status", self.decorated.status)
 
+    @property
+    def presented_held(self) -> bool:
+        """Waiting for Run/Resume: held here before the node started, or
+        held inside. A composite already running its children is not held;
+        its children say which ones wait."""
+        if getattr(self.decorated, "presented_held", False):
+            return True
+        return (
+            self.status is py_trees.common.Status.RUNNING
+            and self.decorated.status is py_trees.common.Status.INVALID
+            and self._stop_state.holds_subtree(self._node_instance_id)
+        )
+
     def tick(self) -> Iterator[py_trees.behaviour.Behaviour]:
         if not self._stop_state.holds_subtree(self._node_instance_id):
             yield from super().tick()

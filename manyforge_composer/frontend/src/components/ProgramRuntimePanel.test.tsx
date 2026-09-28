@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -115,7 +116,6 @@ function robotController(): RobotControlController {
     stopFaultRecoveryPending: false,
     stopFaultRecoveryError: null,
     resume: vi.fn(),
-    stop: vi.fn(),
     recoverStopFault: vi.fn(),
     setRuntimeScale: vi.fn(),
     commitRuntimeScale: vi.fn(),
@@ -278,7 +278,6 @@ function controller(
     resumeMotion: vi.fn(),
     fullStop: vi.fn(),
     resumeFullStop: vi.fn(),
-    stop: vi.fn(),
     reset: vi.fn(),
     applyRecoveryAction: vi.fn(),
     stageObservationOverride: vi.fn(),
@@ -296,52 +295,24 @@ function controller(
 }
 
 describe('Program runtime projection', () => {
-  it('shows exact owner status and retains one-click Stop for one active run', () => {
+  it('shows exact owner status without duplicating the standard commands', () => {
     const markup = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={controller()} />,
     );
 
-    expect(markup).toContain('Headless-owned execution');
+    expect(markup).toContain('Program execution');
     expect(markup).toContain('program-run.1');
     expect(markup).toContain('revision 4');
     expect(markup).toContain('next-pick');
     expect(markup).not.toContain('Selection for the next Run');
-    expect(markup).toContain('Captured run Program');
-    expect(markup).toContain('immutable for this run');
-    expect(markup).toContain('Program Stop');
-    expect(markup).not.toContain('Stop all');
-    expect(markup).toContain('never sends Stop implicitly');
-  });
-
-  it('enables Execute only after the terminal cycle has been reset to Idle', () => {
-    const active = renderToStaticMarkup(
-      <ProgramRuntimePanel enabled controller={controller()} />,
-    );
-    const terminal = renderToStaticMarkup(
-      <ProgramRuntimePanel enabled controller={controller('succeeded')} />,
-    );
-    const resetIdle = renderToStaticMarkup(
-      <ProgramRuntimePanel
-        enabled
-        controller={controller('succeeded', 'idle_after_reset')}
-      />,
-    );
-
-    expect(active).toMatch(/disabled=""[^>]*>Execute Applied Program/);
-    expect(terminal).toMatch(/disabled=""[^>]*>Execute Applied Program/);
-    expect(terminal).toContain('Reset Program cycle');
-    expect(resetIdle).not.toMatch(/disabled=""[^>]*>Execute Applied Program/);
-  });
-
-  it('offers the same Execute recovery from Program Halt in the detailed panel', () => {
-    const fullStopped = controller('full_stopped');
-    const markup = renderToStaticMarkup(
-      <ProgramRuntimePanel enabled controller={fullStopped} />,
-    );
-
-    expect(markup).toContain('>Execute</button>');
-    expect(markup).not.toMatch(/disabled=""[^>]*>Execute<\/button>/);
-    expect(markup).toContain('Reset Program cycle');
+    expect(markup).toContain('Program in this run');
+    expect(markup).toContain('fixed for this run');
+    // Execute, Halt and Reset live in the Program panel; Program Stop is gone.
+    expect(markup).not.toContain('Program Stop');
+    expect(markup).not.toContain('Execute Applied Program');
+    expect(markup).not.toContain('Reset Program cycle');
+    // Advanced tools exist only with run controls; no empty section otherwise.
+    expect(markup).not.toContain('Advanced: runtime overrides, blackboard and audit');
   });
 
   it('never turns an unavailable or unknown owner fact into idle or zero work', () => {
@@ -353,16 +324,16 @@ describe('Program runtime projection', () => {
     );
     expect(unavailableMarkup).toContain('unavailable');
     expect(unavailableMarkup).toContain('execution state is unknown');
-    expect(unavailableMarkup).toContain('Runner loss never proves');
+    expect(unavailableMarkup).toContain('this never proves that robot work stopped');
+    expect(unavailableMarkup).toContain('<span>Motion</span><strong>Unknown</strong>');
 
-    const unknownCount = controller();
-    if (unknownCount.state.run) {
-      unknownCount.state.run.activeOperationCount = null;
-    }
+    // A run without a motion projection is Unknown, never "not moving".
+    const unknownMotion = controller();
+    unknownMotion.state.controls = null;
     const unknownMarkup = renderToStaticMarkup(
-      <ProgramRuntimePanel enabled controller={unknownCount} />,
+      <ProgramRuntimePanel enabled controller={unknownMotion} />,
     );
-    expect(unknownMarkup).toContain('<strong>unknown</strong>');
+    expect(unknownMarkup).toContain('<span>Motion</span><strong>Unknown</strong>');
   });
 
   it('distinguishes ordinary Motion Stop from whole-Program Stop', () => {
@@ -408,6 +379,48 @@ describe('Program runtime projection', () => {
     expect(staleOfferMarkup).toContain('<strong>Stopped</strong>');
   });
 
+  it('shows Retry during a failure pause, disabled until containment is confirmed', () => {
+    const paused = controller('intervention_required');
+    const controls = ordinaryMotionStopControls();
+    const offer = controls.recoveryOffer!;
+    offer.recoveryClass = 'operation_failure' as typeof offer.recoveryClass;
+    offer.nodeInstanceId = 'move.1';
+    offer.actions = [{
+      actionId: 'retry_motion_from_current_state',
+      labelKey: 'recovery.retry_motion_from_current_state',
+      requiresConfirmation: false,
+      performsBackendReset: false,
+      enabled: false,
+      disabledReasonCode: 'failure_pause_containment_unconfirmed',
+    }];
+    paused.state.controls = controls;
+    const render = () => renderToStaticMarkup(
+      <ProgramTransportControls enabled program={paused} robot={robotController()} />,
+    );
+
+    // Resume must not bypass the pause while Retry is unavailable.
+    expect(render()).toMatch(
+      /class="transport-group-resume"[^>]*disabled=""[^>]*title="Retry waits until stopping the Program&#x27;s other motion is confirmed."[^>]*>Retry<\/button>/,
+    );
+    offer.actions[0].enabled = true;
+    offer.actions[0].disabledReasonCode = null;
+    expect(render()).toMatch(
+      /class="transport-group-resume"(?![^>]*disabled)[^>]*title="Retry move.1 and let all the Program&#x27;s motion continue."[^>]*>Retry<\/button>/,
+    );
+  });
+
+  it('labels a group with stopped and never-started work Resume', () => {
+    const mixed = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    controls.executionSelections.groups[0].state = 'mixed';
+    mixed.state.controls = controls;
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={mixed} robot={robotController()} />,
+    );
+    expect(markup).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
+  });
+
   it('offers Resume and Reset, but not another Stop, after ordinary Motion Stop', () => {
     const motionStopped = controller('intervention_required');
     motionStopped.state.controls = ordinaryMotionStopControls();
@@ -427,6 +440,34 @@ describe('Program runtime projection', () => {
     expect(markup).toMatch(/class="transport-reset transport-unique-control meaningful"(?![^>]*disabled)[^>]*>Reset<\/button>/);
   });
 
+  it('confirms Reset during execution only after all motion has stopped', () => {
+    const motionStopped = controller('intervention_required');
+    motionStopped.state.controls = ordinaryMotionStopControls();
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={motionStopped} robot={robotController()} />,
+    );
+    // While executing, Reset asks first instead of resetting at once.
+    expect(markup).toMatch(
+      /class="transport-reset[^"]*"[^>]*title="Stop all Program motion, then confirm ending this run and resetting the Program\."[^>]*>Reset<\/button>/,
+    );
+    const source = readFileSync(new URL('./ProgramRuntimePanel.tsx', import.meta.url), 'utf8');
+    const flow = source.slice(
+      source.indexOf('const requestProgramReset'),
+      source.indexOf('const requestProgramHalt'),
+    );
+    // Not executing: reset at once. Executing: stop motion, then ask.
+    expect(flow).toMatch(/if \(!executionActive\) \{\s*void program\.reset\(\);/);
+    expect(flow).toContain("setResetIntent(preferences.confirmReset ? 'stopping' : 'automatic');");
+    expect(flow).toContain("await program.stopMotion(['all'])");
+    // Halted: motion is already contained, so no refused motion Stop is sent.
+    expect(source).toContain('allGroup === undefined || allMotionQuiesced || programFullStopped');
+    expect(flow).toContain('if (programFullStopping) return;');
+    expect(source).toContain(
+      "if (resetIntent === 'stopping' && motionSettled) setResetIntent('confirm');",
+    );
+    expect(source).toContain('open={resetIntent === \'confirm\'}');
+  });
+
   it('projects Execute as active while initial motion is Ready for deliberate Run', () => {
     const executing = controller('running');
     const controls = ordinaryMotionStopControls();
@@ -436,8 +477,9 @@ describe('Program runtime projection', () => {
     group.stopAllowed = false;
     group.startAllowed = true;
     group.startUnavailableReason = null;
-    group.resumeAllowed = false;
-    group.resumeUnavailableReason = 'selection_not_stopped';
+    // Run and Resume are one command; the owner projects them equal.
+    group.resumeAllowed = true;
+    group.resumeUnavailableReason = null;
     executing.state.controls = controls;
     const selector = group.runtimeScaleSelector!;
     const status = runtimeScaleStatus(selector, 0.4);
@@ -735,7 +777,8 @@ describe('Program runtime projection', () => {
     expect(markup).toMatch(/aria-label="Open control settings(?:; [^"]+)?"/);
     expect(markup).toContain('class="transport-unique-icons"');
     expect(markup).toContain('robot_group controls');
-    expect(markup).toContain('transport-hidden-group-count');
+    // The default layout hides only "all", which is not counted.
+    expect(markup).not.toContain('transport-hidden-group-count');
 
     const css = readStyleSource();
     expect(css).toMatch(

@@ -930,20 +930,6 @@ select_disable_active_configurations(
         "motion target has no applied Deployment TCP linear-speed maximum",
         "deployment_motion_speed_missing", ErrorCode::kMissingReference);
   }
-  if (motion.speed_profile.max_tcp_linear_speed_mps.has_value() &&
-      *motion.speed_profile.max_tcp_linear_speed_mps >
-          *registration.deployment_maximum_tcp_linear_speed_mps) {
-    return Result<ExecuteRequestDTO>::Err(ErrorDTO{
-        std::string(to_string(ErrorCode::kExecutionRejected)),
-        "requested TCP linear speed exceeds the applied Deployment maximum",
-        {{"reason", "deployment_motion_speed_exceeded"},
-         {"controllable_component_id", binding.controllable_component_id.value()},
-         {"command_target_id", binding.command_target_id.value()},
-         {"requested_tcp_linear_speed_mps",
-          std::to_string(*motion.speed_profile.max_tcp_linear_speed_mps)},
-         {"deployment_maximum_tcp_linear_speed_mps",
-          std::to_string(*registration.deployment_maximum_tcp_linear_speed_mps)}}});
-  }
   auto effective_speed = apply_deployment_motion_speed_limit(
       *registration.deployment_maximum_tcp_linear_speed_mps,
       motion.speed_profile);
@@ -9155,8 +9141,10 @@ Result<void> ResourceAddressedExecutionKernel::validate_manual_program_handover_
     return reject<void>("Program hold changed or is not settled", "manual_handover_scope_stale");
   }
   for (const auto index : result.producer_node_indices) {
+    // Ready producers never started, so they are as quiet as Held ones.
     if (index >= fence->node_states.size() ||
-        fence->node_states[index] != ProgramNodeHoldStateDTO::kHeld) {
+        (fence->node_states[index] != ProgramNodeHoldStateDTO::kHeld &&
+         fence->node_states[index] != ProgramNodeHoldStateDTO::kReady)) {
       return reject<void>("a conflicting Program producer is running, stopping or faulted",
                           "manual_handover_producer_not_held");
     }
@@ -9312,11 +9300,9 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
             ProgramRunStopFence{capture.program_run_id, std::nullopt, StopGeneration(0U)});
         fence = std::prev(program_run_stop_fences_.end());
       }
-      if (fence->stop_id.has_value()) {
-        std::fill(node_states.begin(), node_states.end(),
-                  fence->releasable ? ProgramNodeHoldStateDTO::kHeld
-                                    : ProgramNodeHoldStateDTO::kStopping);
-      }
+      // A Stop that overtook registration keeps the initial Ready/Running
+      // states: nothing has started, and its stop identity already fences
+      // every admission until it is released.
       fence->node_states = std::move(node_states);
       program_cycle_claim_run_->motion_continuations = std::move(continuations);
       current = std::move(capture);
@@ -9586,9 +9572,9 @@ Result<void> ResourceAddressedExecutionKernel::release_program_run_stop_fence(
   if (fence->node_states.empty()) {
     program_run_stop_fences_.erase(fence);
   } else {
+    // Releasing the whole-run Stop resumes execution only. Motion holds are
+    // kept: Ready work still needs Run and contained work still needs Resume.
     fence->stop_id.reset();
-    std::fill(fence->node_states.begin(), fence->node_states.end(),
-              ProgramNodeHoldStateDTO::kRunning);
     ++fence->selection_revision;
   }
   return Result<void>::Ok();
@@ -9630,6 +9616,18 @@ ResourceAddressedExecutionKernel::resolve_program_selection_locked(
   for (std::size_t index = 0; index < selected.size(); ++index)
     if (selected[index]) indices.push_back(static_cast<std::uint32_t>(index));
   return Result<Indices>::Ok(std::move(indices));
+}
+
+bool ResourceAddressedExecutionKernel::program_node_effectful_locked(
+    const ProgramRunId& program_run_id, const std::size_t index) const {
+  if (!program_cycle_claim_run_.has_value() || !program_cycle_claim_run_->capture.has_value() ||
+      program_cycle_claim_run_->program_run_id != program_run_id ||
+      !program_cycle_claim_run_->capture->table ||
+      index >= program_cycle_claim_run_->capture->table->nodes.size())
+    return true;
+  const auto& effects = program_cycle_claim_run_->capture->table->nodes[index].target_effects;
+  return std::any_of(effects.begin(), effects.end(),
+                     [](const auto& effect) { return effect.effectful; });
 }
 
 ProgramExecutionScopeStateDTO ResourceAddressedExecutionKernel::program_execution_scope_locked(
@@ -10003,50 +10001,8 @@ void ResourceAddressedExecutionKernel::reduce_program_selection_stop_locked(
 Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::start_program_selection(
     const ProgramExecutionSelectionRequestDTO& request,
     const std::uint64_t expected_selection_revision) {
-  std::unique_lock admission_lock(*admission_mutex_, std::try_to_lock);
-  if (!admission_lock.owns_lock()) {
-    return reject<ProgramExecutionScopeStateDTO>("ordinary admission is still in flight",
-                                                 "program_run_admission_in_flight",
-                                                 ErrorCode::kInvalidStateTransition);
-  }
-  std::lock_guard state_lock(state_mutex_);
-  auto selection = resolve_program_selection_locked(request);
-  if (!selection.ok()) return Result<ProgramExecutionScopeStateDTO>::Err(selection.error());
-  auto fence =
-      std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-                   [&](const auto& row) { return row.program_run_id == request.program_run_id; });
-  if (fence == program_run_stop_fences_.end() ||
-      fence->selection_revision != expected_selection_revision ||
-      fence->selection_revision >= kMaximumKernelJsonInteger) {
-    return reject<ProgramExecutionScopeStateDTO>(
-        "Program selection changed after initial Run was prepared",
-        "program_selection_revision_stale", ErrorCode::kInvalidStateTransition);
-  }
-  if (motion_admission_closed_ || motion_admission_unreconciled_ ||
-      pending_program_run_admission_ == request.program_run_id || fence->stop_id.has_value()) {
-    return reject<ProgramExecutionScopeStateDTO>("Program admission or containment has not settled",
-                                                 "program_selection_not_releasable",
-                                                 ErrorCode::kInvalidStateTransition);
-  }
-  std::erase_if(selection.value(), [&](const auto index) {
-    return fence->node_states[index] == ProgramNodeHoldStateDTO::kRunning;
-  });
-  if (selection.value().empty()) {
-    return reject<ProgramExecutionScopeStateDTO>("Selected scope is not Ready",
-                                                 "program_selection_not_ready",
-                                                 ErrorCode::kInvalidStateTransition);
-  }
-  if (std::any_of(selection.value().begin(), selection.value().end(), [&](const auto index) {
-        return fence->node_states[index] != ProgramNodeHoldStateDTO::kReady;
-      })) {
-    return reject<ProgramExecutionScopeStateDTO>(
-        "Initial Run accepts only Ready Program nodes", "program_selection_not_ready",
-        ErrorCode::kInvalidStateTransition);
-  }
-  for (const auto index : selection.value())
-    fence->node_states[index] = ProgramNodeHoldStateDTO::kRunning;
-  ++fence->selection_revision;
-  return Result<ProgramExecutionScopeStateDTO>::Ok(program_execution_scope_locked(*fence));
+  // Run is the same release as Resume (see release_program_selection).
+  return release_program_selection(request, expected_selection_revision);
 }
 
 Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_program_selection(
@@ -10075,9 +10031,10 @@ Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_
         "Program selection changed after Resume was prepared", "program_selection_revision_stale",
         ErrorCode::kInvalidStateTransition);
   }
+  // A whole-run Stop (Program Halt) governs execution; only releasing it
+  // (Execute) ends it. Resume releases motion holds and never ends a Halt.
   if (motion_admission_closed_ || motion_admission_unreconciled_ ||
-      pending_program_run_admission_ == request.program_run_id ||
-      (fence->stop_id.has_value() && !fence->releasable)) {
+      pending_program_run_admission_ == request.program_run_id || fence->stop_id.has_value()) {
     return reject<ProgramExecutionScopeStateDTO>("Program admission or containment has not settled",
                                                  "program_selection_not_releasable",
                                                  ErrorCode::kInvalidStateTransition);
@@ -10094,10 +10051,13 @@ Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_
                                                  "program_selection_not_releasable",
                                                  ErrorCode::kInvalidStateTransition);
   }
+  // Run and Resume are one release: never-started (Ready) and stopped (Held)
+  // work are both released; Stopping or Faulted work is not.
   for (const auto index : selection.value()) {
-    if (fence->node_states[index] != ProgramNodeHoldStateDTO::kHeld) {
+    if (fence->node_states[index] != ProgramNodeHoldStateDTO::kHeld &&
+        fence->node_states[index] != ProgramNodeHoldStateDTO::kReady) {
       return reject<ProgramExecutionScopeStateDTO>(
-          "Resume accepts only settled ordinary-Stop holds",
+          "Run/Resume accepts only Ready work and settled ordinary-Stop holds",
           "program_selection_not_releasable", ErrorCode::kInvalidStateTransition);
     }
   }
@@ -10142,7 +10102,6 @@ Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_
   }
   // All selected eligibility was checked before any node is released. An
   // unrelated branch may keep executing; there is no per-group lock to clear.
-  fence->stop_id.reset();
   for (const auto index : selection.value())
     fence->node_states[index] = ProgramNodeHoldStateDTO::kRunning;
   ++fence->selection_revision;
@@ -11932,8 +11891,14 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         auto& fence = *installed;
         if (fence.selection_revision < kMaximumKernelJsonInteger) ++fence.selection_revision;
         fence.legacy_selection_revision = fence.selection_revision;
-        for (auto& state : fence.node_states) {
-          if (state != ProgramNodeHoldStateDTO::kFaulted)
+        // The whole-run Stop closes the run through its stop identity. Only
+        // effectful work that may be moving is contained here; Ready (never
+        // started), Held and non-effectful nodes keep their motion state, so
+        // releasing the Stop later does not grant motion.
+        for (std::size_t index = 0U; index < fence.node_states.size(); ++index) {
+          auto& state = fence.node_states[index];
+          if (state == ProgramNodeHoldStateDTO::kRunning &&
+              program_node_effectful_locked(fence.program_run_id, index))
             state = ProgramNodeHoldStateDTO::kStopping;
         }
       }
@@ -12918,9 +12883,12 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
           fence.stop_generation == certificate.stop_generation) {
         fence.releasable = program_run_fence_releasable;
         for (auto& state : fence.node_states) {
-          if (state != ProgramNodeHoldStateDTO::kFaulted)
-            state = program_run_fence_releasable ? ProgramNodeHoldStateDTO::kHeld
-                                                 : ProgramNodeHoldStateDTO::kFaulted;
+          if (!program_run_fence_releasable) {
+            if (state != ProgramNodeHoldStateDTO::kFaulted) state = ProgramNodeHoldStateDTO::kFaulted;
+          } else if (state == ProgramNodeHoldStateDTO::kStopping) {
+            // Contained work waits for Resume; every other state is kept.
+            state = ProgramNodeHoldStateDTO::kHeld;
+          }
         }
       }
     }

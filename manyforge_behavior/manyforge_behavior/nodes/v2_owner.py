@@ -61,9 +61,11 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         self._failure_message = ""
         self._operator_stop_state: OperatorMotionStopState | None = None
         self._held_before_admission: int | None = None
+        self._held_after_operator_stop = False
 
     def initialise(self) -> None:
         self._held_before_admission = None
+        self._held_after_operator_stop = False
         self._inputs = None
         self._owner_inputs = None
         self._identity = None
@@ -174,6 +176,18 @@ class _OwnerAdapter(py_trees.behaviour.Behaviour):
         return (py_trees.common.Status.INVALID if self._held_before_admission is not None
                 else self.status)
 
+    @property
+    def presented_held(self) -> bool:
+        """The node is ticking but its owner work waits for Run or Resume.
+
+        Either the owner refused to start it under a Stop (held before
+        admission), or an ordinary operator Stop interrupted it and it waits
+        for Resume. A Stop fault needing recovery is not presented as held.
+        """
+        return (self.status is py_trees.common.Status.RUNNING
+                and (self._held_before_admission is not None
+                     or self._held_after_operator_stop))
+
 
 class OwnerTaskAdapter(_OwnerAdapter):
     """Submit once, observe owner state, and acknowledge only exact success."""
@@ -221,6 +235,9 @@ class OwnerTaskAdapter(_OwnerAdapter):
             task.state is OwnerTaskState.INTERRUPTED
             and isinstance(assessment, Mapping)
             and assessment.get("recovery_class") in PROGRAM_MOTION_STOP_RECOVERY_CLASSES
+        )
+        self._held_after_operator_stop = (
+            operator_stop and assessment.get("recovery_class") == "ordinary_operator_stop"
         )
         if operator_stop and self._operator_stop_state is not None:
             if (
