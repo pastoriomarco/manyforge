@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 2.3.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:d2ca039d89bb8b6fecb6ca64a4fe52d02f444c0040f818112a4fddb4700985fa
+catalog_digest: sha256:8019b8fff49f4206672820029e059bfac0475ca3d77f50abaa5e9f3816027900
 schema_types:
   coordinate_position:
     type: object
@@ -798,11 +798,13 @@ entries:
     schema:
       type: string
       semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: tcp_frame_role
     required: true
     schema:
       type: string
       semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: goal
     required: true
     schema_ref: '#/schema_types/joint_target_list'
@@ -971,11 +973,13 @@ entries:
     schema:
       type: string
       semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: tcp_frame_role
     required: true
     schema:
       type: string
       semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: goal
     required: true
     schema_ref: '#/schema_types/motion_pose'
@@ -1159,11 +1163,13 @@ entries:
     schema:
       type: string
       semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: tcp_frame_role
     required: true
     schema:
       type: string
       semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: path
     required: true
     schema_ref: '#/schema_types/cartesian_path'
@@ -3169,11 +3175,13 @@ entries:
     schema:
       type: string
       semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: tcp_frame_role
     required: true
     schema:
       type: string
       semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: carrier_frame_role
     required: true
     schema:
@@ -3368,11 +3376,13 @@ entries:
     schema:
       type: string
       semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: tcp_frame_role
     required: true
     schema:
       type: string
       semantic_type: frame_role
+      semantic_scope_parameter: target_role
   - id: carrier_frame_role
     required: true
     schema:

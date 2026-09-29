@@ -73,6 +73,22 @@ esac
     (state / "installed-targets" / "reproducible-binary").write_text(
         "large cache", encoding="utf-8"
     )
+    for reproducible in ("raw-artifacts", "prepared-activations"):
+        (state / "artifacts" / reproducible).mkdir(parents=True)
+        (state / "artifacts" / reproducible / "large.blob").write_text(
+            "reproducible input", encoding="utf-8"
+        )
+    planning = state / "execution-run" / "manyforge-retained-planning-0123"
+    planning.mkdir(parents=True)
+    (planning / "robot.stl").write_text("mesh", encoding="utf-8")
+    (state / "execution-run" / "resolved-stop-base-plans").mkdir()
+    (state / "execution-run" / "resolved-stop-base-plans" / "plan.json").write_text(
+        "stop evidence", encoding="utf-8"
+    )
+    (state / "artifacts" / "programs").mkdir()
+    (state / "artifacts" / "programs" / "program.json").write_text(
+        "program evidence", encoding="utf-8"
+    )
 
     environment = {
         **os.environ,
@@ -119,6 +135,17 @@ def test_stop_with_evidence_preserves_quiescent_state_and_removes_container(
         encoding="utf-8"
     ) == "manager evidence"
     assert not (evidence_path / "manyforge-state/installed-targets").exists()
+    assert not (evidence_path / "manyforge-state/artifacts/raw-artifacts").exists()
+    assert not (
+        evidence_path / "manyforge-state/artifacts/prepared-activations"
+    ).exists()
+    assert (evidence_path / "manyforge-state/artifacts/programs/program.json").exists()
+    assert not (
+        evidence_path / "manyforge-state/execution-run/manyforge-retained-planning-0123"
+    ).exists()
+    assert (
+        evidence_path / "manyforge-state/execution-run/resolved-stop-base-plans/plan.json"
+    ).exists()
     assert (evidence_path / "docker.log").read_text(encoding="utf-8") == (
         "preserved log\n"
     )

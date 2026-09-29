@@ -454,6 +454,31 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('The literal is absent while this exact source is bound.');
   });
 
+  it('offers the current robot pose or joints for a move goal', () => {
+    const poseEntry: CatalogEntry = { ...timer, id: 'motion.move_to_pose', parameters: [
+      { id: 'target_role', required: true, schema: { type: 'string' },
+        schemaHash: 'sha256:role', hasDefault: false },
+      { id: 'goal', required: true, schema: { type: 'object', properties: {
+        position_m: { type: 'array' }, orientation: { type: 'object' } } },
+        schemaHash: 'sha256:goal', hasDefault: false },
+    ] };
+    const render = (parameters: ProgramTreeNode['parameters']) => renderToStaticMarkup(
+      <ProgramPropertyEditor
+        roots={[{ node_id: 'motion.move_to_pose', instance_id: 'move', children: [], parameters }]}
+        selectedId="move" catalogEntries={[poseEntry]}
+        program={authoringProgram([], [])}
+        busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
+      />,
+    );
+    const goal = { frame_ref: { kind: 'cell_frame' }, position_m: [0, 0, 0],
+      orientation: { xyzw: [0, 0, 0, 1] } };
+    const bound = render({ target_role: 'lite6_arm', target_mode: 'relative', goal });
+    expect(bound).toContain('Use current robot pose');
+    expect(bound).toContain('This switches the move to absolute.');
+    const unbound = render({ goal });
+    expect(unbound).toMatch(/disabled=""[^>]*title="Choose the target role first\."/);
+  });
+
   it('explains backend TCP capping without rewriting literals or parameter references', () => {
     const binding = parseProgramBindingTransport(nativeBindingFixture, 'binding');
     const target = binding.target_role_bindings.find((row) => row.target_role_id === 'arm')!;

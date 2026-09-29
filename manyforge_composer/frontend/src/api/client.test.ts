@@ -14,6 +14,12 @@ it('classifies only exact authoring admission refusals', () => {
     expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: { code } })))
       .toContain('Edit not applied');
   }
+  expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: { code: 'activation_preparation_failed' } })))
+    .toBe('Not applied: the candidate could not be prepared. Correct it and try again.');
+  expect(authoringRefusalMessage(new ApiError('refused', 409, { detail: {
+    code: 'activation_preparation_failed',
+    details: { preparer_detail: 'manyforge_prepare_activation: Program is missing compatibility' },
+  } }))).toBe('Not applied: the candidate could not be prepared (Program is missing compatibility). Correct it and try again.');
   expect(authoringRefusalMessage(new ApiError('fault', 409, { detail: { code: 'component_fault' } }))).toBeNull();
   expect(authoringRefusalMessage(new ApiError('failure', 500, { detail: { code: 'authoring_not_ready' } }))).toBeNull();
   expect(authoringRefusalMessage(new Error('authoring_not_ready'))).toBeNull();

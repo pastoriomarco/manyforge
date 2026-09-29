@@ -327,6 +327,33 @@ def test_missing_execution_owner_degrades_only_affected_scopes() -> None:
     assert components["execute_control"]["status"] == "offline"
 
 
+def test_no_selected_program_is_normal_not_a_fault() -> None:
+    facts = _facts()
+    facts["applied_program"] = None
+    facts["errors"] = {
+        "applied_program": {
+            "code": "program_not_selected",
+            "message": "No Program is selected",
+        }
+    }
+
+    overview = build_component_overview(**facts)
+    components = _by_id(overview)
+
+    assert overview["readiness"] == "ready"
+    assert components["applied_program"]["status"] == "healthy"
+    assert components["applied_program"]["reason_code"] == "program_not_selected"
+    assert components["applied_program"]["detail"] == (
+        "no Program is selected; Execute is unavailable"
+    )
+    assert components["execute_control"]["status"] == "healthy"
+
+    facts["errors"]["applied_program"]["code"] = "applied_program_invalid"
+    assert _by_id(build_component_overview(**facts))["applied_program"][
+        "status"
+    ] == "fault"
+
+
 def test_overview_revision_changes_only_with_semantic_content() -> None:
     facts = _facts()
     first = build_component_overview(**facts)

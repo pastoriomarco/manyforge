@@ -80,7 +80,11 @@ diagnostic state, use:
 
 The command copies nothing until Docker confirms that the container stopped.
 It then writes `.manyforge-dev/evidence/<UTC timestamp>.partial/`, containing the
-`manyforge-state/` tree except its reproducible `installed-targets/` directory,
+`manyforge-state/` tree except what is reproducible from the image and the
+Scenario: `installed-targets/`, `artifacts/raw-artifacts/` (model and mesh
+copies), `artifacts/prepared-activations/` (activation inputs embedding
+them) and `execution-run/manyforge-retained-planning-*` (unpacked planning
+robot packages); the Manager journal keeps their digests,
 plus `docker.log` and a bounded `docker-inspect.json` summary containing the
 image, mounts and exit state (not container environment variables). Once
 complete, it renames the bundle to `<UTC timestamp>/`, removes the container

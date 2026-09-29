@@ -1342,10 +1342,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     expected_revision=body.expected_draft_revision,
                 ),
             )
-            return {
-                **_workspace(state),
-                "authoringWorkspace": commit.snapshot.as_dict(),
-            }
+            # The Program workspace carries its own Draft-matched identity; the
+            # composite snapshot must not replace it (it breaks that contract).
+            return _workspace(state)
         except Exception as error:
             _raise_workspace_error(error)
 
@@ -1390,10 +1389,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     expected_revision=body.expected_draft_revision,
                 ),
             )
-            return {
-                **_workspace(state),
-                "authoringWorkspace": commit.snapshot.as_dict(),
-            }
+            # The Program workspace carries its own Draft-matched identity; the
+            # composite snapshot must not replace it (it breaks that contract).
+            return _workspace(state)
         except Exception as error:
             _raise_workspace_error(error)
 
@@ -1481,10 +1479,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     "currentWorkspace": error.detail.get("workspace"),
                 },
             ) from error
-        return {
-            **_workspace(state),
-            "authoringWorkspace": commit.snapshot.as_dict(),
-        }
+        # The Program workspace carries its own Draft-matched identity; the
+        # composite snapshot must not replace it (it breaks that contract).
+        return _workspace(state)
 
     @router.post("/api/program/save")
     def save_draft(body: SaveDraftRequest) -> dict[str, Any]:
@@ -1648,10 +1645,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     expected_revision=body.expected_draft_revision,
                 ),
             )
-            return {
-                **_workspace(state),
-                "authoringWorkspace": commit.snapshot.as_dict(),
-            }
+            # The Program workspace carries its own Draft-matched identity; the
+            # composite snapshot must not replace it (it breaks that contract).
+            return _workspace(state)
         except Exception as error:
             _raise_workspace_error(error)
 

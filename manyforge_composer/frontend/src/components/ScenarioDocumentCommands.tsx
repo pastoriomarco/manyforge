@@ -433,8 +433,8 @@ export function ScenarioDocumentCommands({
               )}
             </section>
             <p className="new-scenario-note">
-              The old Scenario&apos;s objects and attachments are cleared through the
-              Scene owner; an unsafe attachment removal is refused.
+              The old Scenario&apos;s objects are cleared from the Scene, including any
+              held by a gripper. Remove physically held parts yourself.
             </p>
             {newConfirmationStale && <p className="inline-message severity-warning" role="status">The workspace changed. Close and reopen New to review the current state.</p>}
             {(newError ?? blockReason) && <p className="inline-message severity-error" role="status">{newError ?? blockReason}</p>}

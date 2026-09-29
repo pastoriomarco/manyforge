@@ -455,15 +455,25 @@ export function ProgramWorkspace({
             <button type="button" onClick={refresh}>Retry workspace</button>
           </div>
         )}
-        {catalog.status !== 'ready' && (
+        {catalog.status === 'loading' && (
+          <div className="program-workspace-notice notice severity-info notice-floating" role="status">
+            Reading the node catalog…
+          </div>
+        )}
+        {(catalog.status === 'error' || catalog.status === 'absent') && (
           <div className="program-workspace-notice error-state notice severity-error notice-floating" role="alert">
-            <span><strong>Node catalog unavailable.</strong> {catalog.status === 'error' || catalog.status === 'absent' ? catalog.message : 'Loading…'}</span>
+            <span><strong>Node catalog unavailable.</strong> {catalog.message}</span>
             <button type="button" onClick={onRetryCatalog}>Retry catalog</button>
           </div>
         )}
-        {environment.status !== 'ready' && (
+        {environment.status === 'loading' && (
+          <div className="program-workspace-notice notice severity-info notice-floating" role="status">
+            Reading authoring availability…
+          </div>
+        )}
+        {(environment.status === 'error' || environment.status === 'absent') && (
           <div className="program-workspace-notice error-state notice severity-error notice-floating" role="alert">
-            <span><strong>Authoring availability unavailable.</strong> {environment.status === 'error' || environment.status === 'absent' ? environment.message : 'Loading…'}</span>
+            <span><strong>Authoring availability unavailable.</strong> {environment.message}</span>
             <button type="button" onClick={onRetryEnvironment}>Retry environment</button>
           </div>
         )}

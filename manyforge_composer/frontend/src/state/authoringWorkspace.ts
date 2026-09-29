@@ -1,6 +1,7 @@
 import type {
   AuthoringWorkspaceProjectFacts,
   AuthoringWorkspaceSnapshot,
+  CurrentScenarioResponse,
   DeploymentWorkspaceResponse,
   JsonValue,
   LocalWorkspaceFenceRequest,
@@ -23,6 +24,25 @@ import type { WorkbenchNotice } from './workbenchNotices';
 export interface PublishedAuthoringWorkspace {
   identity: AuthoringWorkspaceIdentity;
   snapshot: AuthoringWorkspaceSnapshot;
+}
+
+/**
+ * Why Program Apply has no current Scenario to apply to, or ``null``.
+ *
+ * A Scenario applied without a Program (Scenario New) reports exactly
+ * `program_not_selected`: it is not execution-ready, but it is a valid base
+ * for Applying a first Program.
+ */
+export function programApplyScenarioReason(
+  projection: CurrentScenarioResponse | null,
+): string | null {
+  if (projection === null) return 'Current Scenario is still being read from the backend.';
+  if (projection.currentScenario !== null) return null;
+  if (projection.unavailableReasons.length === 1
+    && projection.unavailableReasons[0] === 'program_not_selected') return null;
+  return projection.unavailableReasons.length > 0
+    ? projection.unavailableReasons.join(', ').replaceAll('_', ' ')
+    : 'No exact current Scenario exists.';
 }
 
 /** Document-specific prerequisites; admission remains the common owner gate. */
@@ -139,7 +159,12 @@ export function authoringUnavailableCause(
   return null;
 }
 
-/** Owner-reported faults remain errors independently of the authoring gate. */
+/**
+ * Owner-reported faults remain errors independently of the authoring gate.
+ * A fault that first appears during a known controlled transition is its
+ * expected, related gap (spec 450 §5.3); one present before it began, or one
+ * that outlasts it, stays an error.
+ */
 export function requiredComponentFaultNotices(snapshot: ComposerHeadlessState | null): WorkbenchNotice[] {
   return (snapshot?.componentOverview.components ?? [])
     .filter((component) => component.required && ['fault', 'offline'].includes(component.status))
@@ -149,6 +174,7 @@ export function requiredComponentFaultNotices(snapshot: ComposerHeadlessState | 
       domain: 'runtime',
       title: `${component.label} unavailable`,
       message: component.detail,
+      expectedDuringTransition: true,
     }));
 }
 

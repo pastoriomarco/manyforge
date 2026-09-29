@@ -340,6 +340,8 @@ def _error_status(code: str) -> int:
             "route_selection_component_not_ready",
             "program_applied_non_executable",
             "program_not_selected",
+            # Preparation runs before any claim or effect; it refuses the input.
+            "activation_preparation_failed",
             "prepared_activation_unverified",
             "authoring_not_ready",
             "program_run_draft_applied_mismatch",

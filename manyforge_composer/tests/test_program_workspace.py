@@ -599,6 +599,19 @@ def test_assistant_scene_proposal_honours_reviewed_filters_and_overrides(
     assert identity["arguments_digest"].startswith("sha256:")
 
 
+def _assert_program_workspace_contract(workspace: dict) -> None:
+    """The browser parses these replies as a Program workspace whose
+    ``authoringWorkspace`` is exactly its Draft-matched identity."""
+
+    identity = workspace["authoringWorkspace"]
+    assert set(identity) == {
+        "workspaceEpoch", "workspaceRevision", "programDraftId",
+        "programDraftRevision", "deploymentDraftId", "deploymentDraftRevision",
+    }
+    assert identity["programDraftId"] == workspace["draft"]["draftId"]
+    assert identity["programDraftRevision"] == workspace["draft"]["draftRevision"]
+
+
 def test_open_mutate_save_and_save_as_preserve_exact_workspace_facts(
     tmp_path: Path,
 ) -> None:
@@ -612,6 +625,7 @@ def test_open_mutate_save_and_save_as_preserve_exact_workspace_facts(
     )
     assert opened_response.status_code == 200
     opened = opened_response.json()
+    _assert_program_workspace_contract(opened)
     assert opened["draft"]["draftId"] != empty["draft"]["draftId"]
     assert opened["saved"]["path"] == str(source.resolve())
     assert opened["saved"]["matchesDraft"] is True
@@ -637,6 +651,7 @@ def test_open_mutate_save_and_save_as_preserve_exact_workspace_facts(
     saved_response = client.post("/api/program/save", json=_fence(mutated))
     assert saved_response.status_code == 200
     saved = saved_response.json()
+    _assert_program_workspace_contract(saved)
     assert saved["saved"]["matchesDraft"] is True
     assert Program(source, build_node_environment().catalog).to_dict()["tree"][
         "children"

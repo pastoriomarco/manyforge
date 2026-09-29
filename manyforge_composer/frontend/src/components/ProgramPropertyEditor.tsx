@@ -695,6 +695,38 @@ export function ProgramPropertyEditor({
                   />
                 </div>
               )}
+              {parameter.id === 'goal'
+                && (selected.node_id === 'motion.move_to_pose'
+                  || selected.node_id === 'motion.move_to_joint_target') && (() => {
+                const pose = selected.node_id === 'motion.move_to_pose';
+                const targetRole = selected.parameters.target_role;
+                const relative = pose && selected.parameters.target_mode === 'relative';
+                const unavailable = busy
+                  ? 'Editing is unavailable.'
+                  : typeof targetRole !== 'string'
+                    ? 'Choose the target role first.'
+                    : null;
+                return (
+                  <button
+                    type="button"
+                    className="text-button"
+                    disabled={unavailable !== null}
+                    title={unavailable ?? (
+                      `Write the ${pose ? 'current TCP pose' : 'current joint positions'} of `
+                      + `${String(targetRole)} into this goal`
+                      + (relative ? '. This switches the move to absolute.' : '.')
+                    )}
+                    onClick={() => {
+                      void onMutate('program_draft_store_observed_move', {
+                        instance_id: selected.instance_id,
+                        observed_kind: pose ? 'tcp_pose' : 'joint',
+                      });
+                    }}
+                  >
+                    {pose ? 'Use current robot pose' : 'Use current joints'}
+                  </button>
+                );
+              })()}
               {!source && (!parameter.required || parameter.hasDefault) && (
                 <button
                   type="button"

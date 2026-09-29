@@ -857,7 +857,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 "scenario_id": scenario_document_id,
                 "incomplete": False,
                 "workspace": workspace,
-                "authoringWorkspace": workspace["authoringWorkspace"],
+                # The exact composite post-image this Load/New committed, as
+                # every other authoring route returns it (not its identity).
+                "authoringWorkspace": committed_snapshot.as_dict(),
             }
         except Exception as error:
             if created_path is not None:

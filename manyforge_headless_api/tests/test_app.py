@@ -230,6 +230,8 @@ def _malform_binding_frame_with_valid_identity(value: dict[str, Any]) -> None:
 def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("invalid_request") == 400
     assert _error_status("full_stack_restart_required") == 409
+    # Preparation refuses the input before any claim or effect.
+    assert _error_status("activation_preparation_failed") == 409
     assert _error_status("manual_handover_required") == 409
     assert _error_status("deployment_candidate_cell_mismatch") == 409
     assert _error_status("manual_operation_scope_stale") == 409

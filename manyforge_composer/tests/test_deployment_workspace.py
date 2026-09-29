@@ -1106,6 +1106,15 @@ def test_pose_only_controllable_component_edit_remains_draftable(
     )
 
     assert changed.status_code == 200, changed.text
+    # The browser parses this reply as a Deployment workspace whose
+    # authoringWorkspace is exactly its Draft-matched identity.
+    identity = changed.json()["authoringWorkspace"]
+    assert set(identity) == {
+        "workspaceEpoch", "workspaceRevision", "programDraftId",
+        "programDraftRevision", "deploymentDraftId", "deploymentDraftRevision",
+    }
+    assert identity["deploymentDraftId"] == changed.json()["draft"]["id"]
+    assert identity["deploymentDraftRevision"] == changed.json()["draft"]["revision"]
     assert changed.json()["draft"]["document"]["graph"][
         "controllable_components"
     ][0]["root_pose_in_cell"] == pose

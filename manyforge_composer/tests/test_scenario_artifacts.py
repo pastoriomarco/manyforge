@@ -755,6 +755,13 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
     assert observed_generations == [(1, None), (1, None), (1, 2)]
     assert state.scenario_document_id == "cell_fixture"
     loaded = state.authoring_workspace.snapshot().as_dict()
+    # The reply carries the full committed snapshot the browser parser
+    # requires (the same shape as every other authoring route), not only its
+    # identity.
+    assert response.json()["authoringWorkspace"] == loaded
+    assert loaded["schemaVersion"] == (
+        "manyforge.composer_authoring_workspace_snapshot.v1"
+    )
     assert loaded["program"]["saved"]["matchesDraft"] is True
     assert loaded["program"]["saved"]["path"] == str(target / "program.yaml")
     assert loaded["deployment"]["differsFromSaved"] is False

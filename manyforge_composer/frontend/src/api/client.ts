@@ -329,6 +329,15 @@ export function authoringRefusalMessage(error: unknown): string | null {
   const code = apiErrorCode(error);
   if (code === 'authoring_not_ready') return 'Edit not applied: authoring is currently unavailable.';
   if (code === 'stale_generation') return 'Edit not applied: backend state changed. Review the current state before trying again.';
+  // Preparation runs before any claim or runtime effect, so it is a definite
+  // refusal of this input, never an unconfirmed submission.
+  if (code === 'activation_preparation_failed') {
+    const details = ((error.payload as { detail?: { details?: { preparer_detail?: unknown } } })
+      .detail?.details?.preparer_detail);
+    const cause = typeof details === 'string'
+      ? details.replace(/^manyforge_prepare_activation:\s*/, '').trim() : '';
+    return `Not applied: the candidate could not be prepared${cause ? ` (${cause})` : ''}. Correct it and try again.`;
+  }
   return null;
 }
 

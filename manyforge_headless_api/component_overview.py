@@ -406,7 +406,13 @@ def build_component_overview(
     applied_source = _mapping(applied_program.get("source"))
     applied_status = _HEALTHY
     applied_reason: str | None = None
-    if applied_error:
+    applied_detail: str | None = None
+    if applied_error.get("code") == "program_not_selected":
+        # An Applied `no_program` outcome is a normal state: Execute is
+        # unavailable, not an error (spec 450, Scenario New).
+        applied_reason = "program_not_selected"
+        applied_detail = "no Program is selected; Execute is unavailable"
+    elif applied_error:
         applied_status = _error_status(applied_error)
         applied_reason = _bounded_reason(
             applied_error.get("code"), "applied_program_unavailable"
@@ -430,7 +436,9 @@ def build_component_overview(
             "Applied Program and admission",
             applied_status,
             (
-                f"{applied_program.get('program_id')} · {applied_program.get('scenario_id')}"
+                applied_detail
+                if applied_detail is not None
+                else f"{applied_program.get('program_id')} · {applied_program.get('scenario_id')}"
                 if applied_status == _HEALTHY
                 else "no exact Applied Program matches the active composition"
             ),

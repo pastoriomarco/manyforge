@@ -1051,6 +1051,81 @@ TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
   EXPECT_EQ(reopened.VerifyIntegrity().terminal_outcome_count, 1);
 }
 
+// UA7W.5: a direct Manager claim settles only after a known refusal at the
+// accepted phase; any later or uncertain failure keeps it held until the
+// cold-restart recovery (UA7W.R).
+TEST(ManagerApplyJournal, SettlesADirectClaimOnlyForAKnownAcceptedPhaseRefusal) {
+  const auto settlement = [](const ManagerApplyPhase phase,
+                             const ManagerApplyEffectDisposition disposition,
+                             const bool record_terminal) {
+    TemporaryDirectory directory;
+    const auto path = directory.path() / "settlement.sqlite3";
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto intent = journal.EnsureIntent(Intent()).record;
+    ContentDigest evidence{std::string(kDigestOne)};
+    if (record_terminal) {
+      evidence = journal
+                     .EnsureTerminalOutcome({
+                         ApplyId("apply-1"),
+                         ApplyGeneration(1U),
+                         std::nullopt,
+                         std::nullopt,
+                         std::nullopt,
+                         std::nullopt,
+                         disposition == ManagerApplyEffectDisposition::kKnown
+                             ? ManagerApplyTerminalOutcomeState::kFailed
+                             : ManagerApplyTerminalOutcomeState::kUnknownEffect,
+                         ManagerApplyFailureEvidenceDTO{
+                             intent.intent_digest, phase, "refused",
+                             "refused by the test", disposition},
+                     })
+                     .record.terminal_outcome_digest;
+    }
+    const core::CellAdmissionClaimDTO claim{
+        {
+            core::CellAdmissionClaimKindDTO::kManagerApply,
+            core::CellAdmissionOwnerRoleDTO::kManager,
+            intent.intent.request_context.request_owner_epoch,
+            intent.intent.apply_id.value(),
+            intent.intent.request_context.request_id,
+            intent.intent_digest,
+            *intent.intent.expected_admission_generation,
+            {},
+            std::nullopt,
+            std::nullopt,
+        },
+        core::CellAdmissionClaimGeneration(3U),
+        *intent.intent.expected_admission_generation,
+        42,
+    };
+    const core::CellAdmissionClaimReleaseDTO release{
+        claim.intent.owner_role,
+        claim.intent.owner_epoch,
+        claim.intent.owner_transaction_id,
+        claim.intent.request_id,
+        claim.intent.request_payload_digest,
+        claim.acquired_admission_generation,
+        claim.claim_generation,
+        {core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
+         evidence},
+    };
+    return ValidateManagerApplyCellAdmissionSettlementReadOnly(
+               path, CellId("cell-1"), claim, release)
+        .ok();
+  };
+
+  EXPECT_TRUE(settlement(ManagerApplyPhase::kAccepted,
+                         ManagerApplyEffectDisposition::kKnown, true));
+  EXPECT_FALSE(settlement(ManagerApplyPhase::kFenceAcquired,
+                          ManagerApplyEffectDisposition::kKnown, true));
+  EXPECT_FALSE(settlement(ManagerApplyPhase::kFenceAccepted,
+                          ManagerApplyEffectDisposition::kKnown, true));
+  EXPECT_FALSE(settlement(ManagerApplyPhase::kAccepted,
+                          ManagerApplyEffectDisposition::kUnknown, true));
+  EXPECT_FALSE(settlement(ManagerApplyPhase::kAccepted,
+                          ManagerApplyEffectDisposition::kKnown, false));
+}
+
 TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
   TemporaryDirectory directory;
   SqliteManagerApplyJournal journal(directory.path() / "failure-binding.sqlite3",

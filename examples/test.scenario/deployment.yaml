@@ -1,8 +1,0 @@
-{
-  "api_version": "manyforge.deployment_intent.v2",
-  "deployment_artifact_id": "empty_scenario",
-  "name": "Empty Deployment",
-  "components": [],
-  "attachments": [],
-  "policies": {}
-}

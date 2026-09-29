@@ -60,9 +60,17 @@ stop_with_evidence() {
     return 69
   fi
 
+  # Skip what is reproducible from the image and the Scenario at this commit:
+  # installed binaries, content-addressed model/mesh copies, the prepared
+  # activation inputs that embed them and the native host's unpacked planning
+  # robot packages. The Manager journal keeps their exact digests, so the
+  # failed Apply stays identifiable.
   if ! docker cp "$container_name:/tmp/manyforge-state" - |
       tar --extract --no-same-owner --directory "$partial_path" \
-        --exclude='installed-targets'; then
+        --exclude='manyforge-state/installed-targets' \
+        --exclude='manyforge-state/artifacts/raw-artifacts' \
+        --exclude='manyforge-state/artifacts/prepared-activations' \
+        --exclude='manyforge-state/execution-run/manyforge-retained-planning-*'; then
     echo "Could not copy runtime evidence. Partial evidence: $partial_path" >&2
     echo "The stopped container was retained: $container_name" >&2
     return 69

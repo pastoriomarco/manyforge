@@ -203,7 +203,7 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).toContain('Its Deployment will not change.');
     expect(scenarioSource).toContain('loadScenarioDocument(');
     expect(scenarioSource).not.toContain('loadScenario(');
-    expect(source).toContain('currentScenarioProjection?.currentScenario');
+    expect(source).toContain('programApplyScenarioReason(runtime.state.currentScenario)');
     expect(source).not.toContain('applyDraft(selectedScenario');
     expect(source).not.toContain('Load and Apply Program');
     expect(scenarioSource).toContain('Load replaces the current Scenario and applies its Deployment, Scene and Program.');

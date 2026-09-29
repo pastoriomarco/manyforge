@@ -1647,6 +1647,7 @@ class NativeKernelProgramPort:
             "coordination_policy": coordination_policy,
         }
 
+    @staticmethod
     def _terminal_error(operation: Mapping[str, Any]) -> tuple[str, str]:
         participants = operation.get("participants")
         if isinstance(participants, list):

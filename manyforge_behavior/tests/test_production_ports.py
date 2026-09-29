@@ -16,6 +16,7 @@ from manyforge_behavior.assistant_program_port import (
     ProgramAssistantPort,
 )
 from manyforge_behavior.kernel_client import KernelClient
+from manyforge_behavior.orchestration_ports import OwnerTaskState
 from manyforge_behavior.nodes.stop_policy import (
     OperatorMotionStopPolicy,
     OperatorMotionStopSnapshot,
@@ -1092,6 +1093,27 @@ def test_operation_identity_change_remains_a_terminal_observation_error() -> Non
 
     with pytest.raises(ProductionPortError, match="changed identity"):
         port.operations.observe(started.task_id)
+
+
+@pytest.mark.parametrize("state", ["failed", "intervention_required"])
+def test_failed_native_operation_is_observed_as_a_failure_with_its_owner_reason(state) -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
+    operation = transport.operations[started.task_id]
+    operation.update({"state": state, "operation_revision": 3})
+    for participant in operation.get("participants", []):
+        participant["terminal_error"] = {
+            "code": "planning_failed", "message": "goal is unreachable",
+        }
+
+    snapshot = port.operations.observe(started.task_id)
+
+    assert snapshot.state is OwnerTaskState.FAILED
+    assert snapshot.reason_code == (
+        "planning_failed" if operation.get("participants") else "operation_failed"
+    )
 
 
 def test_native_context_cleanup_consumes_settled_tasks_but_refuses_active_work() -> None:

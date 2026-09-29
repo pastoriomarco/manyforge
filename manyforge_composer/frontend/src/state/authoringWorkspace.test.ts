@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   authoringUnavailableCause,
   authoringUnavailableReason,
+  programApplyScenarioReason,
   requiredComponentFaultNotices,
   authoringWorkspaceIdentity,
   programLocalFence,
@@ -216,6 +217,7 @@ describe('authoringWorkspace', () => {
     } as never;
     expect(requiredComponentFaultNotices(state)).toEqual([expect.objectContaining({
       severity: 'error', title: 'Arm unavailable', message: 'Owner reports a fault',
+      expectedDuringTransition: true,
     })]);
     state.authoringAdmission.authoringAllowed = true;
     expect(authoringUnavailableCause(installed, state)).toBeNull();
@@ -345,5 +347,22 @@ describe('authoringWorkspace', () => {
     // The compiled artifact identity and Manager truth stay with their owner.
     expect(mergedDeployment.draft.deploymentArtifactId).toBe('artifact.1');
     expect(mergedDeployment.managerApplied).toBe(deployment.managerApplied);
+  });
+
+  it('lets a first Program Apply to a Scenario applied without a Program', () => {
+    const projection = (currentScenario: object | null, unavailableReasons: string[]) => ({
+      schemaVersion: 'manyforge.current_scenario.v1' as const,
+      ready: currentScenario !== null,
+      currentScenario: currentScenario as never,
+      unavailableReasons,
+    });
+    expect(programApplyScenarioReason(null)).toMatch(/still being read/);
+    expect(programApplyScenarioReason(projection({ scenarioId: 'cell' }, []))).toBeNull();
+    expect(programApplyScenarioReason(projection(null, ['program_not_selected']))).toBeNull();
+    expect(programApplyScenarioReason(projection(null, ['program_not_applied'])))
+      .toBe('program not applied');
+    expect(programApplyScenarioReason(projection(null, ['program_not_selected', 'deployment_not_published'])))
+      .toBe('program not selected, deployment not published');
+    expect(programApplyScenarioReason(projection(null, []))).toBe('No exact current Scenario exists.');
   });
 });

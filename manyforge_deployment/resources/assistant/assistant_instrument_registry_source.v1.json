@@ -6507,6 +6507,7 @@
                       },
                       "base_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "cache_mode": {
@@ -6612,6 +6613,7 @@
                       },
                       "tcp_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "translation_tol_m": {
@@ -6757,6 +6759,7 @@
                       },
                       "base_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "cache_mode": {
@@ -6832,6 +6835,7 @@
                       },
                       "tcp_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "translation_tol_m": {
@@ -6983,6 +6987,7 @@
                       },
                       "base_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "cache_mode": {
@@ -7052,6 +7057,7 @@
                       },
                       "tcp_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "translation_tol_m": {
@@ -8783,6 +8789,7 @@
                       },
                       "base_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "cache_mode": {
@@ -8888,6 +8895,7 @@
                       },
                       "tcp_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "translation_tol_m": {
@@ -9053,6 +9061,7 @@
                       },
                       "base_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "cache_mode": {
@@ -9128,6 +9137,7 @@
                       },
                       "tcp_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "translation_tol_m": {
@@ -9328,6 +9338,7 @@
                       },
                       "base_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "cache_mode": {
@@ -9397,6 +9408,7 @@
                       },
                       "tcp_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "translation_tol_m": {
@@ -13028,6 +13040,7 @@
                       },
                       "base_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "cache_mode": {
@@ -13133,6 +13146,7 @@
                       },
                       "tcp_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "translation_tol_m": {
@@ -13298,6 +13312,7 @@
                       },
                       "base_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "cache_mode": {
@@ -13373,6 +13388,7 @@
                       },
                       "tcp_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "translation_tol_m": {
@@ -13573,6 +13589,7 @@
                       },
                       "base_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "cache_mode": {
@@ -13642,6 +13659,7 @@
                       },
                       "tcp_frame_role": {
                         "type": "string",
+                        "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
                       "translation_tol_m": {
@@ -18784,6 +18802,7 @@
                   },
                   "base_frame_role": {
                     "type": "string",
+                    "x-manyforge-semantic-scope-parameter": "target_role",
                     "x-manyforge-semantic-type": "frame_role"
                   },
                   "cache_mode": {
@@ -18889,6 +18908,7 @@
                   },
                   "tcp_frame_role": {
                     "type": "string",
+                    "x-manyforge-semantic-scope-parameter": "target_role",
                     "x-manyforge-semantic-type": "frame_role"
                   },
                   "translation_tol_m": {
@@ -19063,6 +19083,7 @@
                   },
                   "base_frame_role": {
                     "type": "string",
+                    "x-manyforge-semantic-scope-parameter": "target_role",
                     "x-manyforge-semantic-type": "frame_role"
                   },
                   "cache_mode": {
@@ -19138,6 +19159,7 @@
                   },
                   "tcp_frame_role": {
                     "type": "string",
+                    "x-manyforge-semantic-scope-parameter": "target_role",
                     "x-manyforge-semantic-type": "frame_role"
                   },
                   "translation_tol_m": {
@@ -19318,6 +19340,7 @@
                   },
                   "base_frame_role": {
                     "type": "string",
+                    "x-manyforge-semantic-scope-parameter": "target_role",
                     "x-manyforge-semantic-type": "frame_role"
                   },
                   "cache_mode": {
@@ -19387,6 +19410,7 @@
                   },
                   "tcp_frame_role": {
                     "type": "string",
+                    "x-manyforge-semantic-scope-parameter": "target_role",
                     "x-manyforge-semantic-type": "frame_role"
                   },
                   "translation_tol_m": {

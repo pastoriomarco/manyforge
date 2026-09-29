@@ -23,7 +23,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = "sha256:d2ca039d89bb8b6fecb6ca64a4fe52d02f444c0040f818112a4fddb4700985fa"
+EXPECTED_CATALOG_DIGEST = "sha256:8019b8fff49f4206672820029e059bfac0475ca3d77f50abaa5e9f3816027900"
 
 
 def _catalog_data() -> dict[str, object]:
@@ -407,6 +407,10 @@ def test_recomputed_catalog_rejects_source_joint_without_one_target_scope(
             parameter for parameter in move["parameters"] if parameter["id"] == "target_role"
         )
         target["schema"]["semantic_type"] = "component_role"
+        # Frame roles are scoped by target_role; unscope them so this
+        # mutation reaches the source_joint rule under test.
+        for parameter in move["parameters"]:
+            parameter.get("schema", {}).pop("semantic_scope_parameter", None)
 
     path = _write_recomputed(tmp_path, mutate)
     with pytest.raises(

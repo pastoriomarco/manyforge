@@ -497,10 +497,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     confirm_discard=body.confirm_discard,
                 ),
             )
-            return {
-                **_workspace(state),
-                "authoringWorkspace": commit.snapshot.as_dict(),
-            }
+            # The Deployment workspace carries its own Draft-matched identity;
+            # the composite snapshot must not replace it (it breaks that contract).
+            return _workspace(state)
         except Exception as error:
             _raise(error)
 
@@ -536,10 +535,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     expected_revision=body.expected_draft_revision,
                 ),
             )
-            return {
-                **_workspace(state),
-                "authoringWorkspace": commit.snapshot.as_dict(),
-            }
+            # The Deployment workspace carries its own Draft-matched identity;
+            # the composite snapshot must not replace it (it breaks that contract).
+            return _workspace(state)
         except Exception as error:
             _raise(error)
 
@@ -567,10 +565,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     expected_revision=body.expected_draft_revision,
                 ),
             )
-            return {
-                **_workspace(state),
-                "authoringWorkspace": commit.snapshot.as_dict(),
-            }
+            # The Deployment workspace carries its own Draft-matched identity;
+            # the composite snapshot must not replace it (it breaks that contract).
+            return _workspace(state)
         except Exception as error:
             _raise(error)
 
@@ -599,10 +596,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     expected_revision=body.expected_draft_revision,
                 ),
             )
-            return {
-                **_workspace(state),
-                "authoringWorkspace": commit.snapshot.as_dict(),
-            }
+            # The Deployment workspace carries its own Draft-matched identity;
+            # the composite snapshot must not replace it (it breaks that contract).
+            return _workspace(state)
         except Exception as error:
             _raise(error)
 
@@ -702,10 +698,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                         "currentWorkspace": error.detail.get("workspace"),
                     },
                 ) from error
-            return {
-                **_workspace(state),
-                "authoringWorkspace": commit.snapshot.as_dict(),
-            }
+            # The Deployment workspace carries its own Draft-matched identity;
+            # the composite snapshot must not replace it (it breaks that contract).
+            return _workspace(state)
         except Exception as error:
             _raise(error)
 
@@ -786,10 +781,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     expected_revision=body.expected_draft_revision,
                 ),
             )
-            return {
-                **_workspace(state),
-                "authoringWorkspace": commit.snapshot.as_dict(),
-            }
+            # The Deployment workspace carries its own Draft-matched identity;
+            # the composite snapshot must not replace it (it breaks that contract).
+            return _workspace(state)
         except Exception as error:
             _raise(error)
 

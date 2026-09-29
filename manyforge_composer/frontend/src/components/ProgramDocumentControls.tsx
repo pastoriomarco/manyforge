@@ -10,7 +10,7 @@ import {
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import { OverlayPanel } from './OverlayPanel';
-import { programActionUnavailableReason } from '../state/authoringWorkspace';
+import { programActionUnavailableReason, programApplyScenarioReason } from '../state/authoringWorkspace';
 
 type ProgramAction = 'apply' | 'revert' | 'discard';
 
@@ -59,20 +59,15 @@ export function ProgramDocumentControls({
     : busy
     ? 'Another Program operation is in progress.'
     : mutationUnavailableReason;
-  const currentScenarioProjection = runtime.state.currentScenario;
-  const currentScenario = currentScenarioProjection?.currentScenario ?? null;
-  const currentScenarioUnavailable = currentScenarioProjection === null
-    ? 'Current Scenario is still being read from the backend.'
-    : currentScenarioProjection.unavailableReasons.length > 0
-      ? currentScenarioProjection.unavailableReasons.join(', ').replaceAll('_', ' ')
-      : 'No exact current Scenario exists.';
+  const currentScenario = runtime.state.currentScenario?.currentScenario ?? null;
+  const currentScenarioUnavailable = programApplyScenarioReason(runtime.state.currentScenario);
   const affectedPolicyInstances = workspace?.applicability.affectedInstanceIds ?? [];
   const commonReason = busy ? 'Another Program operation is in progress.'
     : !mutationAvailable ? mutationUnavailableReason ?? 'Authoring is unavailable.' : null;
   const reasons = {
     apply: programActionUnavailableReason(workspace, 'apply', commonReason)
       ?? (localInvalidEdit ? authoringBlockReason : null)
-      ?? (currentScenario === null ? currentScenarioUnavailable : null),
+      ?? currentScenarioUnavailable,
     revert: programActionUnavailableReason(workspace, 'revert', commonReason),
     discard: programActionUnavailableReason(workspace, 'discard', commonReason),
   };
@@ -131,7 +126,7 @@ export function ProgramDocumentControls({
             className="primary-action"
             type="button"
             disabled={reasons.apply !== null}
-            title={currentScenario === null
+            title={currentScenarioUnavailable !== null
               ? `Load a Scenario before Program Apply. ${currentScenarioUnavailable}`
               : authoringBlockReason
                 ?? (!program
@@ -171,9 +166,11 @@ export function ProgramDocumentControls({
         )}
         {action === 'apply' && (
           <div className="dialog-copy compact-confirmation">
-            {currentScenario ? (
+            {currentScenarioUnavailable === null ? (
               <p>
-                Apply this Program Draft to <strong>{currentScenario.scenarioId}</strong>?
+                {currentScenario
+                  ? <>Apply this Program Draft to <strong>{currentScenario.scenarioId}</strong>?</>
+                  : 'Apply this Program Draft as the current Scenario’s first Program?'}
                 {' '}Its Deployment will not change.
               </p>
             ) : (
