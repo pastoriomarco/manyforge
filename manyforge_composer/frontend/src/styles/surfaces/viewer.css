@@ -1197,3 +1197,56 @@ svg.viewer-camera-icon {
   display: inline-flex;
   gap: 0.25rem;
 }
+
+/* Graphics settings: one column per renderer kind; the column this browser
+   uses is marked, the other is disabled. */
+.viewer-graphics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--mf-font-size-072);
+}
+
+.viewer-graphics-table th,
+.viewer-graphics-table td {
+  padding: 0.3rem 0.25rem;
+  text-align: left;
+}
+
+.viewer-graphics-table tbody tr + tr > * {
+  border-top: 1px solid var(--mf-border-neutral-19);
+}
+
+.viewer-graphics-table thead th {
+  color: var(--mf-text-neutral-63);
+  font-weight: 600;
+}
+
+.viewer-graphics-table thead th.current {
+  color: var(--mf-text-accent-79);
+}
+
+.viewer-graphics-table thead th small {
+  display: block;
+  color: var(--mf-text-neutral-55);
+  font-size: var(--mf-font-size-058);
+  font-weight: 400;
+}
+
+.viewer-graphics-table tbody th {
+  color: var(--mf-text-neutral-73);
+  font-weight: 400;
+  cursor: help;
+}
+
+.viewer-graphics-table select {
+  width: 100%;
+  min-width: 0;
+  min-height: 1.7rem;
+  padding: 0.1rem 0.35rem;
+  font-size: var(--mf-font-size-072);
+}
+
+.viewer-graphics-table select:disabled,
+.viewer-graphics-table input:disabled {
+  opacity: 0.45;
+}

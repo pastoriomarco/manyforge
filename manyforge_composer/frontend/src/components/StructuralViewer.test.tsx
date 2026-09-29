@@ -147,7 +147,7 @@ describe('viewer failure isolation', () => {
     // Display toggles are installation settings, not local component state.
     expect(source).toContain('objectOutline: outlineVisible,');
     expect(source).toContain("setViewerSetting('objectOutline', event.target.checked)");
-    expect(source).toContain('<SceneOutline multisample={renderer.antialias} componentByLink={outlineComponents} />');
+    expect(source).toContain('<SceneOutline multisample={graphicsProfile.outlineSmoothing} componentByLink={outlineComponents} />');
     // Viewer settings open from the viewer gear; there is no Tools button.
     expect(source).not.toContain("toggleInspectorPanel('tools')");
     expect(source).toContain("setInspectorPanel('tools');");

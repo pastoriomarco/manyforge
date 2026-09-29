@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { ManagerDeploymentImpact } from '../types/api';
-import { deploymentMatchesApplied, deploymentUnapplied } from '../state/documentStates';
+import { deploymentMatchesApplied, deploymentUnapplied, deploymentActionUnavailableReason } from '../state/documentStates';
 import { OverlayPanel } from './OverlayPanel';
 
 type Action = 'discard' | 'revert';
@@ -109,7 +109,13 @@ export function DeploymentDocumentControls({
     ? 'Another Deployment operation is in progress.'
     : controller.mutationUnavailableReason;
   const close = () => setAction(null);
+  const reasons = {
+    apply: deploymentActionUnavailableReason(workspace, 'apply', blockReason),
+    revert: deploymentActionUnavailableReason(workspace, 'revert', blockReason),
+    discard: deploymentActionUnavailableReason(workspace, 'discard', blockReason),
+  };
   const complete = async (request: () => Promise<unknown>) => {
+    if (action === null || reasons[action] !== null) return;
     // The confirmation is only the user's authorization boundary. Close it
     // as soon as the request is dispatched; busy/error state belongs to the
     // document controls and remains visible if the owner rejects the action.
@@ -133,7 +139,7 @@ export function DeploymentDocumentControls({
           )}
           <button
             type="button"
-            disabled={!controller.mutationAvailable || controller.busy || !hasUnappliedChanges}
+            disabled={reasons.discard !== null}
             title={blockReason ?? (hasUnappliedChanges
               ? 'Discard Draft changes and return to Manager Applied.'
               : 'Draft already matches Manager Applied.')}
@@ -141,30 +147,14 @@ export function DeploymentDocumentControls({
           >Discard</button>
           <button
             type="button"
-            disabled={
-              !controller.mutationAvailable
-              || controller.busy
-              || workspace?.savedScenarioCandidates.length === 0
-              || workspace?.saved.deploymentRevision
-                === workspace?.managerApplied.deploymentRevision
-            }
-            title={blockReason ?? (workspace?.savedScenarioCandidates.length === 0
-              ? 'No saved Deployment is available to revert to.'
-              : workspace?.saved.deploymentRevision
-                  === workspace?.managerApplied.deploymentRevision
-                ? 'Applied already matches Saved.'
-                : 'Replace Draft and Manager Applied with the Saved Deployment.')}
+            disabled={reasons.revert !== null}
+            title={reasons.revert ?? 'Replace Draft and Manager Applied with the Saved Deployment.'}
             onClick={() => setAction('revert')}
           >Revert</button>
           <button
             type="button"
             className="primary-action"
-            disabled={
-              !controller.mutationAvailable
-              || controller.busy
-              || !workspace?.draft.document
-              || draftMatchesManager
-            }
+            disabled={reasons.apply !== null}
             title={blockReason ?? (!workspace?.draft.document
               ? 'No Deployment Draft is loaded.'
               : draftMatchesManager
@@ -183,16 +173,17 @@ export function DeploymentDocumentControls({
           onClose={close}
           compact
         >
+          {reasons[action] !== null && <p role="status">{reasons[action]}</p>}
           {action === 'discard' && (
             <div className="dialog-copy compact-confirmation">
               <p>Discard the unsaved Deployment Draft changes?</p>
-              <button type="button" className="primary-action" onClick={() => { void complete(controller.discard); }}>Discard changes</button>
+              <button type="button" className="primary-action" disabled={reasons.discard !== null} onClick={() => { void complete(controller.discard); }}>Discard changes</button>
             </div>
           )}
           {action === 'revert' && (
             <div className="dialog-copy compact-confirmation">
               <p>Replace Draft and Manager Applied with the Saved Deployment?</p>
-              <button type="button" className="primary-action" onClick={() => { void complete(controller.revert); }}>Revert to saved</button>
+              <button type="button" className="primary-action" disabled={reasons.revert !== null} onClick={() => { void complete(controller.revert); }}>Revert to saved</button>
             </div>
           )}
         </OverlayPanel>
@@ -206,6 +197,7 @@ export function DeploymentDocumentControls({
           compact
         >
           <div className="dialog-copy compact-confirmation">
+            {reasons.apply !== null && <p role="status">{reasons.apply}</p>}
             <p>
               Applying this exact Deployment Draft will reconfigure active runtime
               components. Running operations remain protected by Manager admission.
@@ -223,7 +215,7 @@ export function DeploymentDocumentControls({
             <button
               type="button"
               className="primary-action"
-              disabled={!controller.mutationAvailable || controller.busy}
+              disabled={reasons.apply !== null}
               title={blockReason ?? 'Apply the validated Deployment to runtime.'}
               onClick={() => { void controller.confirmApply(); }}
             >{controller.applying ? 'Applying Deployment' : 'Confirm apply'}</button>

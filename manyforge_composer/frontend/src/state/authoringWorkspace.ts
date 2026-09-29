@@ -25,6 +25,29 @@ export interface PublishedAuthoringWorkspace {
   snapshot: AuthoringWorkspaceSnapshot;
 }
 
+/** Document-specific prerequisites; admission remains the common owner gate. */
+export function programActionUnavailableReason(
+  workspace: ProgramWorkspaceResponse | null,
+  action: 'apply' | 'revert' | 'discard',
+  commonReason: string | null,
+): string | null {
+  if (commonReason !== null) return commonReason;
+  if (workspace === null) return 'Program workspace is not loaded.';
+  if (action === 'discard') {
+    return !workspace.applied.available ? 'No Applied Program is available.'
+      : workspace.hasUnappliedChanges !== true ? 'Draft already matches Applied.' : null;
+  }
+  if (action === 'revert') {
+    return !workspace.saved.available ? 'No Saved Program is available.'
+      : workspace.saved.matchesDraft && workspace.applied.available
+        && workspace.saved.programRevision === workspace.applied.programRevision
+        ? 'Saved already matches Draft and Applied.' : null;
+  }
+  return !workspace.draft.program || !workspace.applicability.applyReady
+    ? 'Complete the Draft before Apply.'
+    : workspace.applied.matchesDraft === true ? 'Draft already matches Applied.' : null;
+}
+
 export function authoringWorkspaceIdentity(
   snapshot: AuthoringWorkspaceSnapshot,
 ): AuthoringWorkspaceIdentity {

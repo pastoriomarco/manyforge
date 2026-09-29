@@ -13,6 +13,7 @@ import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
   programLocalFence,
   publicationSupersedesProgram,
+  programActionUnavailableReason,
   scenarioLocalFence,
   withSharedProgramAuthoring,
 } from '../state/authoringWorkspace';
@@ -172,11 +173,15 @@ export function useProgramWorkspace(
     action: ProgramWorkspaceActionName,
     request: () => Promise<ProgramWorkspaceRunResult>,
   ): Promise<ProgramWorkspaceRunResult | null> => {
+    if ((action === 'apply' || action === 'revert' || action === 'discard')
+      && programActionUnavailableReason(state.workspace, action, mutationUnavailableReason) !== null) return null;
+    if (action !== 'refresh' && !authoring.beginMutation()) return null;
     const current = generation.current + 1;
     generation.current = current;
     dispatch({ type: 'request_started', generation: current, action });
     try {
       const result = await request();
+      if (action !== 'refresh') authoring.finishMutation(result.acceptedApply ?? null);
       if (mounted.current && result.acceptedApply) {
         setAcceptedApply(result.acceptedApply);
       }
@@ -191,6 +196,7 @@ export function useProgramWorkspace(
       }
       return result;
     } catch (error: unknown) {
+      if (action !== 'refresh') authoring.finishMutation(null, error);
       const refusal = action === 'refresh' ? null : authoringRefusalMessage(error);
       if (refusal !== null) {
         if (mounted.current) dispatch({ type: 'request_refused', generation: current, message: refusal });
@@ -224,7 +230,7 @@ export function useProgramWorkspace(
       }
       return null;
     }
-  }, [authoring]);
+  }, [authoring, state.workspace, mutationUnavailableReason, readWorkspace]);
 
   const refresh = useCallback(() => {
     const result = run(
@@ -257,7 +263,7 @@ export function useProgramWorkspace(
       () => readWorkspace(requestGeneration).then((workspace) =>
         workspaceResult(workspace, null)),
     );
-  }, [authoring.current, published, readWorkspace, run]);
+  }, [authoring, published, readWorkspace, run]);
 
   // The Applied half of this projection changes without a new authoring
   // publication when an accepted Load/Apply/Revert settles. Re-read once per

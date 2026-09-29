@@ -201,6 +201,27 @@ def test_routes_report_conflict_with_current_state_and_validate_input(tmp_path: 
         }},
     )
     assert out_of_range.status_code == 422
+    graphics = settings["viewerGraphics"]
+    assert graphics["gpu"] == {
+        "maxPixelRatio": 1.5, "antialias": True, "outlineSmoothing": True,
+        "poseRateHz": 30, "motionSmoothing": True, "cameraDamping": True,
+    }
+    assert graphics["software"]["maxPixelRatio"] == 1.0
+    assert graphics["software"]["poseRateHz"] == 10
+    for field, value in (
+        ("maxPixelRatio", 0.4), ("maxPixelRatio", 1.1), ("maxPixelRatio", 3.0),
+        ("poseRateHz", 4), ("poseRateHz", 61), ("poseRateHz", 30.5),
+        ("antialias", "yes"),
+    ):
+        rejected = client.put(
+            "/api/composer/settings",
+            json={"expectedRevision": 1, "settings": {
+                **settings, "viewerGraphics": {
+                    **graphics, "software": {**graphics["software"], field: value},
+                },
+            }},
+        )
+        assert rejected.status_code == 422, (field, value)
     for tools_width in (100, 400, 216.5, "216"):
         rejected = client.put(
             "/api/composer/settings",

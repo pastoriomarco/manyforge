@@ -18,6 +18,7 @@ import type {
 import type { ComposerHeadlessState } from '../types/headless';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
 import { browserStableIdentity } from './useHeadlessState';
+import { deploymentActionUnavailableReason } from '../state/documentStates';
 
 function requestId(): string {
   return `composer-deployment.${globalThis.crypto?.randomUUID?.()
@@ -140,15 +141,19 @@ export function useDeploymentWorkspace(
   const run = useCallback(async (
     operation: (requestFence: LocalWorkspaceFenceRequest) => Promise<DeploymentWorkspaceResponse>,
     message: string,
+    action?: 'discard',
   ) => {
+    if (action && deploymentActionUnavailableReason(workspace, action, mutationUnavailableReason) !== null) return null;
     const requestFence = fence();
     if (requestFence === null || snapshot === null || inFlight.current) return null;
+    if (!authoring.beginMutation()) return null;
     inFlight.current = true;
     setBusy(true);
     setError(null);
     setFeedback(null);
     try {
       const next = await operation(requestFence);
+      authoring.finishMutation();
       if (mounted.current) {
         // The HTTP post-image can arrive before the shared status stream.
         // Never submit the next edit with the just-consumed admission fence.
@@ -164,6 +169,7 @@ export function useDeploymentWorkspace(
       }
       return next;
     } catch (reason: unknown) {
+      authoring.finishMutation(null, reason);
       const message = errorMessage(reason, 'Deployment authoring request failed.');
       const refusal = authoringRefusalMessage(reason);
       if (refusal !== null) {
@@ -181,16 +187,19 @@ export function useDeploymentWorkspace(
       inFlight.current = false;
       if (mounted.current) setBusy(false);
     }
-  }, [fence, refresh, snapshot]);
+  }, [authoring, fence, refresh, snapshot, workspace, mutationUnavailableReason]);
 
   const runApply = useCallback(async (
     operation: (
       requestFence: LocalWorkspaceFenceRequest,
     ) => Promise<DeploymentCandidateOperationResponse>,
     message: string,
+    action: 'apply' | 'revert' = 'apply',
   ) => {
+    if (deploymentActionUnavailableReason(workspace, action, mutationUnavailableReason) !== null) return null;
     const requestFence = fence();
     if (requestFence === null || snapshot === null || inFlight.current) return null;
+    if (!authoring.beginMutation()) return null;
     inFlight.current = true;
     setBusy(true);
     setApplying(true);
@@ -198,6 +207,10 @@ export function useDeploymentWorkspace(
     setFeedback(null);
     try {
       const response = await operation(requestFence);
+      const accepted = response.result.status === 'accepted' ? response.result.managerApply : null;
+      authoring.finishMutation(accepted === null ? null : {
+        applyId: accepted.applyId, applyGeneration: accepted.applyGeneration,
+      });
       if (mounted.current) {
         setCompletedAdmission({
           receiverEpoch: snapshot.receiverEpoch,
@@ -226,6 +239,7 @@ export function useDeploymentWorkspace(
       }
       return response;
     } catch (reason: unknown) {
+      authoring.finishMutation(null, reason);
       const message = errorMessage(
         reason,
         'Deployment Apply request failed.',
@@ -251,7 +265,7 @@ export function useDeploymentWorkspace(
       if (mounted.current) setBusy(false);
       if (mounted.current) setApplying(false);
     }
-  }, [fence, refresh, snapshot]);
+  }, [authoring, fence, refresh, snapshot, workspace, mutationUnavailableReason]);
 
   const actions = useMemo(() => ({
     open: (path: string, confirmDiscard: boolean) => run(
@@ -302,12 +316,15 @@ export function useDeploymentWorkspace(
     discard: () => run(
       (requestFence) => api.deploymentWorkspace.discard(requestFence),
       'Deployment Draft changes discarded; Manager Applied was unchanged.',
+      'discard',
     ),
     revert: () => runApply(
       (requestFence) => api.deploymentWorkspace.revert(requestFence),
       'Saved Deployment was already current in Manager.',
+      'revert',
     ),
     applyDraft: () => {
+      if (!mutationAvailable || inFlight.current) return Promise.resolve(null);
       setPendingApplyConfirmation(null);
       return runApply(
         (requestFence) => api.deploymentWorkspace.applyDraft(requestFence),
@@ -315,6 +332,7 @@ export function useDeploymentWorkspace(
       );
     },
     confirmApply: () => {
+      if (!mutationAvailable || inFlight.current) return Promise.resolve(null);
       const token = pendingApplyConfirmation?.result.confirmationToken ?? null;
       const preparation = pendingApplyConfirmation?.result.preparation ?? null;
       if (token === null || preparation === null) return Promise.resolve(null);
@@ -331,7 +349,7 @@ export function useDeploymentWorkspace(
       );
     },
     cancelApplyConfirmation: () => setPendingApplyConfirmation(null),
-  }), [pendingApplyConfirmation, run, runApply]);
+  }), [mutationAvailable, pendingApplyConfirmation, run, runApply]);
 
   return {
     workspace,

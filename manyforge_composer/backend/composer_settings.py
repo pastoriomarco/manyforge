@@ -96,10 +96,56 @@ class MotionPanelSettings(BaseModel):
     )
 
 
+class ViewerGraphicsProfile(BaseModel):
+    """How the 3D viewer renders on one kind of browser renderer.
+
+    Presentation cost only: nothing here changes what the viewer shows as
+    truth. ``max_pixel_ratio`` caps the rendered resolution relative to CSS
+    pixels; ``pose_rate_hz`` is how often live robot poses are redrawn."""
+
+    model_config = _STRICT
+
+    max_pixel_ratio: float = Field(
+        ge=0.5, le=2.0, multiple_of=0.25, alias="maxPixelRatio",
+    )
+    antialias: bool
+    outline_smoothing: bool = Field(alias="outlineSmoothing")
+    pose_rate_hz: int = Field(ge=5, le=60, alias="poseRateHz")
+    motion_smoothing: bool = Field(alias="motionSmoothing")
+    camera_damping: bool = Field(alias="cameraDamping")
+
+
+def _gpu_graphics() -> ViewerGraphicsProfile:
+    return ViewerGraphicsProfile(
+        max_pixel_ratio=1.5, antialias=True, outline_smoothing=True,
+        pose_rate_hz=30, motion_smoothing=True, camera_damping=True,
+    )
+
+
+def _software_graphics() -> ViewerGraphicsProfile:
+    return ViewerGraphicsProfile(
+        max_pixel_ratio=1.0, antialias=False, outline_smoothing=False,
+        pose_rate_hz=10, motion_smoothing=False, camera_damping=True,
+    )
+
+
+class ViewerGraphicsSettings(BaseModel):
+    """One profile per renderer kind. Every browser uses the one matching how
+    it renders: the GPU, or software rendering (e.g. llvmpipe)."""
+
+    model_config = _STRICT
+
+    gpu: ViewerGraphicsProfile = Field(default_factory=_gpu_graphics)
+    software: ViewerGraphicsProfile = Field(default_factory=_software_graphics)
+
+
 class ComposerSettings(BaseModel):
     model_config = _STRICT
 
     viewer: ViewerSettings = Field(default_factory=ViewerSettings)
+    viewer_graphics: ViewerGraphicsSettings = Field(
+        default_factory=ViewerGraphicsSettings, alias="viewerGraphics",
+    )
     tree_editor: TreeEditorSettings = Field(
         default_factory=TreeEditorSettings, alias="treeEditor",
     )

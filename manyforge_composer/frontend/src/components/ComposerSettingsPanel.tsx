@@ -207,6 +207,7 @@ export const SETTINGS_INFO_MS = 6000;
 
 const SECTION_LABEL = {
   viewer: 'Display',
+  viewerGraphics: 'Graphics',
   treeEditor: 'Tree editor',
   motionPanel: 'Layout and confirmations',
 } as const;

@@ -88,6 +88,24 @@ export function deploymentMatchesApplied(workspace: DeploymentWorkspaceResponse 
   return workspace.runAdmission.ready;
 }
 
+export function deploymentActionUnavailableReason(
+  workspace: DeploymentWorkspaceResponse | null,
+  action: 'apply' | 'revert' | 'discard',
+  commonReason: string | null,
+): string | null {
+  if (commonReason !== null) return commonReason;
+  if (workspace === null) return 'Deployment workspace is not loaded.';
+  if (action === 'discard') return deploymentUnapplied(workspace)
+    ? null : 'Draft already matches Manager Applied.';
+  if (action === 'revert') return workspace.savedScenarioCandidates.length === 0
+    ? 'No saved Deployment is available.'
+    : !workspace.draft.differsFromSaved
+      && workspace.saved.deploymentRevision === workspace.managerApplied.deploymentRevision
+      ? 'Saved already matches Draft and Applied.' : null;
+  return !workspace.draft.document ? 'No Deployment Draft is loaded.'
+    : deploymentMatchesApplied(workspace) ? 'Draft already matches Manager Applied.' : null;
+}
+
 /** Something is applied and the Deployment Draft is not it. */
 export function deploymentUnapplied(workspace: DeploymentWorkspaceResponse | null): boolean {
   return workspace !== null

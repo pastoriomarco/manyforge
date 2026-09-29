@@ -94,24 +94,34 @@ function sameSettings(left: ComposerSettings, right: ComposerSettings): boolean 
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+type SettingsTree = { [key: string]: SettingsTree | boolean | number | string };
+
+function rebaseTree(base: SettingsTree, mine: SettingsTree, theirs: SettingsTree): SettingsTree {
+  const merged: SettingsTree = { ...theirs };
+  for (const [key, value] of Object.entries(mine)) {
+    const before = base[key];
+    const current = theirs[key];
+    merged[key] = typeof value === 'object' && typeof before === 'object' && typeof current === 'object'
+      ? rebaseTree(before, value, current)
+      : value !== before ? value : current;
+  }
+  return merged;
+}
+
 /**
- * The fields `mine` changed from `base`, applied on top of `theirs`. Settings
- * are sections of plain values, so a field is the unit of change.
+ * The values `mine` changed from `base`, applied on top of `theirs`. Settings
+ * are nested records of plain values, so a single value is the unit of change.
  */
 export function rebaseSettings(
   base: ComposerSettings,
   mine: ComposerSettings,
   theirs: ComposerSettings,
 ): ComposerSettings {
-  const merged = structuredClone(theirs) as unknown as Record<string, Record<string, unknown>>;
-  const baseSections = base as unknown as Record<string, Record<string, unknown>>;
-  const mySections = mine as unknown as Record<string, Record<string, unknown>>;
-  for (const [section, fields] of Object.entries(mySections)) {
-    for (const [field, value] of Object.entries(fields)) {
-      if (value !== baseSections[section][field]) merged[section][field] = value;
-    }
-  }
-  return merged as unknown as ComposerSettings;
+  return rebaseTree(
+    base as unknown as SettingsTree,
+    mine as unknown as SettingsTree,
+    theirs as unknown as SettingsTree,
+  ) as unknown as ComposerSettings;
 }
 
 function message(error: unknown): string {

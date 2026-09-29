@@ -474,6 +474,9 @@ export default function App() {
     ? activation.status
     : null;
   const activationUnobservable = activation.unavailable;
+  useEffect(() => {
+    authoringWorkspace.observeApply(activation.status);
+  }, [authoringWorkspace, activation.status]);
   // Only owner evidence scopes a transition: the observed activation's status
   // read as pending. An advertised, submitted or unobservable (lost) operation
   // is not evidence, so it never downgrades an error.

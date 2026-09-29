@@ -95,10 +95,10 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).toContain('Discard changes');
     expect(source).toContain('return to the Applied Program');
     expect(source).toContain(
-      'disabled={authoringBusy || workspace?.hasUnappliedChanges !== true}',
+      'disabled={reasons.discard !== null}',
     );
-    expect(source).toContain('disabled={authoringBusy || !hasAppliedUnsavedChanges}');
-    expect(source).toContain('workspace?.saved.available');
+    expect(source).toContain('disabled={reasons.revert !== null}');
+    expect(source).toContain('programActionUnavailableReason');
     expect(source).not.toContain('localStorage');
     expect(source).not.toContain('sendBeacon');
   });
@@ -239,7 +239,7 @@ describe('Program workspace lifecycle controls', () => {
     expect(workspaceSource).toContain('Authoring unavailable. ${mutationUnavailableReason}');
     expect(workspaceSource).toContain('dismissible: false');
     expect(workspaceSource).toContain('? mutationUnavailableReason');
-    expect(controlsSource).toContain('busy || !mutationAvailable');
+    expect(controlsSource).toContain('!mutationAvailable ? mutationUnavailableReason');
     expect(workspaceSource).not.toContain('affect only later runs');
   });
 });

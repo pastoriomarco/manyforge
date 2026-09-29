@@ -14,7 +14,8 @@ const apiMock = vi.hoisted(() => ({
   },
 }));
 
-vi.mock('../api/client', () => ({
+vi.mock('../api/client', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../api/client')>(),
   api: apiMock,
   isStaleWorkspaceError: (error: unknown) =>
     error !== null
@@ -23,6 +24,8 @@ vi.mock('../api/client', () => ({
 }));
 
 import { useAuthoringWorkspace } from './useAuthoringWorkspace';
+import { managerApplyRecord } from '../test/managerApplyRecord';
+import { ApiError } from '../api/client';
 import type { ControlTransportStatus } from './useHeadlessState';
 
 type FakeNode = {
@@ -128,7 +131,11 @@ function headlessSnapshot(
     schemaVersion: 'manyforge.composer_headless_state.v2',
     complete: true,
     executionControlStatus: null,
-    runtime: {} as ComposerHeadlessState['runtime'],
+    runtime: { sections: { manager: {
+      available: true, freshness: 'fresh', knownGaps: [], sourceOwnerId: 'manager',
+      sourceOwnerEpoch: 'manager.1', sourceGeneration: 1, receiverAgeNs: 0,
+      payload: { apply: { mutation_available: true, records: [], unavailable_reason_code: null } },
+    } } } as unknown as ComposerHeadlessState['runtime'],
     componentOverview: {
       schemaVersion: 'manyforge.component_overview.v2',
       overviewRevision: `sha256:${'a'.repeat(64)}`,
@@ -286,6 +293,90 @@ describe('useAuthoringWorkspace', () => {
     }
     expect(apiMock.authoringWorkspace.get).toHaveBeenCalledTimes(1);
     expect(latest?.published).toBe(installed);
+  });
+
+  it('blocks a second synchronous submission and hands an accepted Apply to matching owner evidence', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation()).toBe(false);
+      latest!.finishMutation({ applyId: 'apply-3', applyGeneration: 3 });
+    });
+    expect(latest!.unavailableReason).toContain('submitted operation');
+    await rerender(headlessSnapshot(1));
+    expect(latest!.unavailableReason).toContain('submitted operation');
+    const pending = headlessSnapshot(1);
+    pending.runtime.sections.manager.payload = { apply: {
+      records: [managerApplyRecord()], mutation_available: false, unavailable_reason_code: 'pending',
+    } };
+    await rerender(pending);
+    expect(latest!.unavailableReason).toContain('Manager operation');
+    const terminal = headlessSnapshot(1);
+    terminal.runtime.sections.manager.payload = { apply: {
+      records: [managerApplyRecord('terminal', 'succeeded')], mutation_available: true, unavailable_reason_code: null,
+    } };
+    terminal.authoringAdmission.authoringAllowed = false;
+    await rerender(terminal);
+    expect(latest!.unavailableReason).not.toBe(null);
+    terminal.authoringAdmission.authoringAllowed = true;
+    await rerender({ ...terminal });
+    expect(latest!.unavailableReason).toBe(null);
+  });
+
+  it('reconstructs the gate from pending owner records on initial load', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const pending = headlessSnapshot(1);
+    pending.runtime.sections.manager.payload = { apply: {
+      records: [managerApplyRecord()], mutation_available: false, unavailable_reason_code: 'pending',
+    } };
+    await mountHarness(pending);
+    await flush();
+    expect(latest!.beginMutation()).toBe(false);
+    expect(latest!.unavailableReason).toContain('Manager operation');
+  });
+
+  it('handles completion before the response, and exact terminal lookup after inventory eviction', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+    const terminal = headlessSnapshot(1);
+    terminal.runtime.sections.manager.payload = { apply: {
+      records: [managerApplyRecord('terminal', 'succeeded')], mutation_available: true, unavailable_reason_code: null,
+    } };
+    await rerender(terminal);
+    await act(async () => latest!.finishMutation({ applyId: 'apply-3', applyGeneration: 3 }));
+    expect(latest!.unavailableReason).toBe(null);
+    await rerender(headlessSnapshot(1));
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      latest!.finishMutation({ applyId: 'apply-4', applyGeneration: 4 });
+    });
+    const result = { applyId: 'apply-4', applyGeneration: 4, state: 'succeeded' } as import('../types/api').ManagerApplyStatus;
+    await act(async () => latest!.observeApply({ ...result, applyId: 'other' }));
+    expect(latest!.unavailableReason).not.toBe(null);
+    await act(async () => latest!.observeApply(result));
+    expect(latest!.unavailableReason).toBe(null);
+  });
+
+  it('keeps a lost response unknown, but releases a named pre-effect refusal', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      latest!.finishMutation(null, new ApiError('not ready', 409, { detail: { code: 'authoring_not_ready' } }));
+    });
+    expect(latest!.unavailableReason).toBe(null);
+    await act(async () => {
+      expect(latest!.beginMutation()).toBe(true);
+      latest!.finishMutation(null, new Error('reply lost'));
+    });
+    await rerender(headlessSnapshot(1));
+    expect(latest!.unavailableReason).toContain('unconfirmed');
+    expect(latest!.beginMutation()).toBe(false);
   });
 
   it('reads once after a real reconnect, even through delay, and retains identical objects', async () => {

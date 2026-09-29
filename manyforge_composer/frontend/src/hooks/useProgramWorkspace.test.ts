@@ -63,6 +63,9 @@ function testAuthoringController(
     reading: false,
     error: null,
     refresh: async () => undefined,
+    beginMutation: () => true,
+    finishMutation: () => undefined,
+    observeApply: () => undefined,
   };
 }
 

@@ -1,3 +1,4 @@
+import { DEFAULT_COMPOSER_SETTINGS } from '../state/composerSettings';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   VIEWER_QUALIFICATION_GLOBAL,
@@ -26,14 +27,17 @@ describe('viewer presentation and performance', () => {
   it('selects a bounded software or hardware presentation profile', () => {
     expect(isSoftwareRenderer('llvmpipe (LLVM 20.1.2)')).toBe(true);
     expect(isSoftwareRenderer('NVIDIA Tegra')).toBe(false);
-    expect(selectViewerPresentationProfile(true, 2)).toEqual({
+    // The defaults reproduce the former fixed software and GPU choices.
+    expect(selectViewerPresentationProfile(2, DEFAULT_COMPOSER_SETTINGS.viewerGraphics.software)).toEqual({
       effectiveDpr: 1,
       antialias: false,
     });
-    expect(selectViewerPresentationProfile(false, 2)).toEqual({
+    expect(selectViewerPresentationProfile(2, DEFAULT_COMPOSER_SETTINGS.viewerGraphics.gpu)).toEqual({
       effectiveDpr: 1.5,
       antialias: true,
     });
+    // The cap never raises the resolution above the screen's own.
+    expect(selectViewerPresentationProfile(1, { maxPixelRatio: 2, antialias: true }).effectiveDpr).toBe(1);
   });
 
   it('detects Firefox software rendering beneath a sanitized debug identity', () => {

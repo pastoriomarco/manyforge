@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api } from '../api/client';
+import { api, ApiError, apiErrorCode, authoringRefusalMessage, isStaleWorkspaceError } from '../api/client';
+import { parseManagerApplyAvailability } from '../api/parsers';
+import { sameManagerApply, type ManagerApplyIdentity } from '../state/managerApply';
 import { errorMessage } from '../state/structuralResource';
 import {
   authoringUnavailableReason,
@@ -9,7 +11,7 @@ import {
   publicationIsCurrent,
   type PublishedAuthoringWorkspace,
 } from '../state/authoringWorkspace';
-import type { AuthoringWorkspaceProjectFacts } from '../types/api';
+import type { AuthoringWorkspaceProjectFacts, ManagerApplyStatus } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import { sameAuthoringWorkspaceIdentity, type ControlTransportStatus } from './useHeadlessState';
 
@@ -42,6 +44,36 @@ export function useAuthoringWorkspace(
   const inFlight = useRef(new Map<string, Promise<void>>());
   const installedKey = useRef<string | null>(null);
   const reconnectPending = useRef(false);
+  const submission = useRef<null | 'sending' | 'unknown' | ManagerApplyIdentity>(null);
+  const [submissionState, setSubmissionState] = useState<typeof submission.current>(null);
+  const manager = snapshot?.runtime.sections?.manager;
+  const managerAdmission = useMemo(() => {
+    if (!manager?.available || manager.freshness !== 'fresh') {
+      return { records: [], reason: 'Current Manager status is unavailable.' };
+    }
+    try {
+      const apply = parseManagerApplyAvailability(manager.payload?.apply, 'manager.payload.apply');
+      return {
+        records: apply.records,
+        reason: !apply.mutationAvailable || apply.records.some((record) => record.incomplete)
+          ? 'A Manager operation is pending or authoring is unavailable.' : null,
+      };
+    } catch {
+      return { records: [], reason: 'Manager operation status is invalid.' };
+    }
+  }, [manager]);
+
+  useEffect(() => {
+    const pending = submission.current;
+    if (pending !== null && typeof pending === 'object'
+      && manager?.available && manager.freshness === 'fresh'
+      && managerAdmission.records.some((record) => sameManagerApply(record, pending))) {
+      // Matching owner evidence takes over. A detail-read failure cannot leave
+      // this browser holding a second, independent admission lock.
+      submission.current = null;
+      setSubmissionState(null);
+    }
+  }, [manager, managerAdmission, submissionState]);
 
   const observed = snapshot === null ? null : snapshot.authoringWorkspace;
   const observedKey = observed === null
@@ -133,7 +165,38 @@ export function useAuthoringWorkspace(
   }, [observedKey, refresh, transportStatus]);
 
   const current = publicationIsCurrent(published, snapshot);
-  const unavailableReason = authoringUnavailableReason(published, snapshot);
+  const ownerReason = transportStatus !== 'connected'
+    ? 'Current backend status is unavailable.'
+    : authoringUnavailableReason(published, snapshot) ?? managerAdmission.reason;
+  const unavailableReason = submissionState === null ? ownerReason
+    : submissionState === 'unknown' ? 'Submission outcome is unconfirmed; inspect backend status before further changes.'
+      : 'Waiting for the submitted operation to be observed by the backend.';
+  const beginMutation = useCallback(() => {
+    if (submission.current !== null || ownerReason !== null) return false;
+    submission.current = 'sending';
+    setSubmissionState('sending');
+    return true;
+  }, [ownerReason]);
+  const finishMutation = useCallback((accepted: ManagerApplyIdentity | null = null, failure?: unknown) => {
+    // Only a definite client refusal proves that the effect was not accepted.
+    // A transport/parse/server failure is not permission to replay a mutation.
+    submission.current = failure === undefined ? accepted
+      : authoringRefusalMessage(failure) !== null || isStaleWorkspaceError(failure)
+        || apiErrorCode(failure) === 'manager_apply_rejected'
+        || (failure instanceof ApiError && [400, 403, 404, 422].includes(failure.status))
+        ? null : 'unknown';
+    setSubmissionState(submission.current);
+  }, []);
+  const observeApply = useCallback((status: ManagerApplyStatus | null) => {
+    const pending = submission.current;
+    // Bounded stream inventories may age a completed record out. An exact
+    // terminal read plus current admission is also sufficient; absence isn't.
+    if (status !== null && status.state !== 'pending' && ownerReason === null
+      && pending !== null && typeof pending === 'object' && sameManagerApply(status, pending)) {
+      submission.current = null;
+      setSubmissionState(null);
+    }
+  }, [ownerReason]);
   const facts: AuthoringWorkspaceProjectFacts | null = projectFacts(published);
 
   return useMemo(() => ({
@@ -147,7 +210,10 @@ export function useAuthoringWorkspace(
     reading,
     error,
     refresh,
-  }), [current, error, facts, published, reading, refresh, unavailableReason]);
+    beginMutation,
+    finishMutation,
+    observeApply,
+  }), [current, error, facts, published, reading, refresh, unavailableReason, beginMutation, finishMutation, observeApply]);
 }
 
 export type AuthoringWorkspaceController = ReturnType<typeof useAuthoringWorkspace>;

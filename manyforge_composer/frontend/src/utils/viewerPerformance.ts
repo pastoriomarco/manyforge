@@ -1,3 +1,4 @@
+import type { ViewerGraphicsProfile } from '../state/composerSettings';
 import type { WebGLRenderer } from 'three';
 
 const MAX_RENDER_INTERVAL_SAMPLES = 512;
@@ -211,22 +212,17 @@ export function inspectViewerRenderer(
   };
 }
 
+/** The renderer settings for this browser, from its graphics profile. */
 export function selectViewerPresentationProfile(
-  software: boolean,
   devicePixelRatio: number,
+  graphics: Pick<ViewerGraphicsProfile, 'maxPixelRatio' | 'antialias'>,
 ): ViewerPresentationProfile {
   const finiteDpr = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0
     ? devicePixelRatio
     : 1;
-  if (software) {
-    return {
-      effectiveDpr: 1,
-      antialias: false,
-    };
-  }
   return {
-    effectiveDpr: Math.min(finiteDpr, 1.5),
-    antialias: true,
+    effectiveDpr: Math.min(finiteDpr, graphics.maxPixelRatio),
+    antialias: graphics.antialias,
   };
 }
 

@@ -37,8 +37,13 @@ import { SceneOutline } from './SceneOutline';
 import { PendingApplyNote, SettingsSubheading } from './SettingsScope';
 import { useComposerSettings } from '../hooks/useComposerSettings';
 import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
+import { ViewerGraphicsSettings } from './ViewerGraphicsSettings';
 import { onOpenSettingsRequest } from '../state/settingsNavigation';
-import { DEFAULT_COMPOSER_SETTINGS, type ComposerSettings } from '../state/composerSettings';
+import {
+  DEFAULT_COMPOSER_SETTINGS,
+  type ComposerSettings,
+  type ViewerRendererKind,
+} from '../state/composerSettings';
 import { SnapshotResponder } from './SnapshotResponder';
 import {
   MAX_AUTHORITATIVE_INTERPOLATION_MS,
@@ -102,7 +107,6 @@ import {
   stopViewerPerformanceMonitoring,
   reportViewerQualificationError,
   viewerQualificationOptedIn,
-  type ViewerPresentationProfile,
   type ViewerRendererInspection,
 } from '../utils/viewerPerformance';
 import { usePublishWorkbenchNotices } from '../state/workbenchNotices';
@@ -1007,7 +1011,8 @@ function MeasuredRuntimeModel({
   onSelect,
   onSelectSceneResource,
   onAssetError,
-  softwareRenderer,
+  poseRateHz,
+  motionSmoothing,
 }: {
   manifest: SceneUrdfManifest;
   presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>;
@@ -1031,7 +1036,10 @@ function MeasuredRuntimeModel({
     sceneResourceId: string,
   ) => void;
   onAssetError: (error: Error) => void;
-  softwareRenderer: boolean;
+  /** How often live robot poses are redrawn. */
+  poseRateHz: number;
+  /** Interpolate between pose updates. */
+  motionSmoothing: boolean;
 }) {
   const reported = useRef(false);
   const linkGroups = useMemo(() => new Map(
@@ -1063,10 +1071,8 @@ function MeasuredRuntimeModel({
         presentation={presentation}
         livePresentation={livePresentation}
         latestFrameAppliers={latestFrameAppliers}
-        interpolationDurationMs={softwareRenderer
-          ? 0
-          : MAX_AUTHORITATIVE_INTERPOLATION_MS}
-        minimumCreditIntervalMs={softwareRenderer ? 100 : 1_000 / 30}
+        interpolationDurationMs={motionSmoothing ? MAX_AUTHORITATIVE_INTERPOLATION_MS : 0}
+        minimumCreditIntervalMs={1_000 / poseRateHz}
       />
       {manifest.links.map((link) => {
         const transform = presentation.linkTransforms[link.name];
@@ -2488,11 +2494,17 @@ const ViewerCanvas = memo(function ViewerCanvas({
   onCommitSceneTransform,
   onSceneContext,
   cameraCommand,
+  graphics,
+  onRendererKind,
 }: {
   manifest: SceneUrdfManifest | null;
   collisionsVisible: boolean;
   wireframeVisible: boolean;
   outlineVisible: boolean;
+  /** Installation graphics profiles; this browser uses the one it renders with. */
+  graphics: ComposerSettings['viewerGraphics'];
+  /** Reports whether this browser renders with the GPU or in software. */
+  onRendererKind?: (kind: ViewerRendererKind) => void;
   /** Viewer link name -> model instance, for one outline per component. */
   outlineComponents: ReadonlyMap<string, string>;
   /** Incremented by Retry/Reload: remounts the model subtree to load again. */
@@ -2546,14 +2558,19 @@ const ViewerCanvas = memo(function ViewerCanvas({
   const devicePixelRatio = typeof window === 'undefined'
     ? 1
     : window.devicePixelRatio;
-  const [renderer, setRenderer] = useState<
-    ViewerRendererInspection & ViewerPresentationProfile
-  >(() => ({
+  const [inspection, setInspection] = useState<ViewerRendererInspection>({
     vendor: null,
     renderer: null,
     software: false,
-    ...selectViewerPresentationProfile(false, devicePixelRatio),
-  }));
+  });
+  const graphicsProfile = graphics[inspection.software ? 'software' : 'gpu'];
+  const renderer = useMemo(() => ({
+    ...inspection,
+    ...selectViewerPresentationProfile(devicePixelRatio, graphicsProfile),
+  }), [graphicsProfile, inspection]);
+  useEffect(() => {
+    if (inspection.renderer !== null) setViewerQualificationRenderer(renderer);
+  }, [inspection.renderer, renderer]);
   const retainedCameraPresentation = cameraPresentation.read();
   const observedSceneResourceIds = useMemo(
     () => new Set(
@@ -2707,7 +2724,8 @@ const ViewerCanvas = memo(function ViewerCanvas({
       onContextMenu={(event) => event.preventDefault()}
     >
     <Canvas
-      key={renderer.software ? 'software' : 'hardware'}
+      // Antialiasing is fixed when the WebGL context is created.
+      key={`${renderer.software ? 'software' : 'hardware'}:${renderer.antialias ? 'aa' : 'no-aa'}`}
       frameloop="demand"
       dpr={renderer.effectiveDpr}
       gl={{
@@ -2719,16 +2737,11 @@ const ViewerCanvas = memo(function ViewerCanvas({
         if (qualificationEnabled && materializationStartedAtMs.current === null) {
           materializationStartedAtMs.current = performance.now();
         }
-        const inspection = inspectViewerRenderer(gl);
-        const presentation = selectViewerPresentationProfile(
-          inspection.software,
-          devicePixelRatio,
-        );
-        setViewerQualificationRenderer({ ...inspection, ...presentation });
-        setRenderer((current) => {
-          const next = { ...inspection, ...presentation };
-          return JSON.stringify(current) === JSON.stringify(next) ? current : next;
-        });
+        const next = inspectViewerRenderer(gl);
+        setInspection((current) => (
+          JSON.stringify(current) === JSON.stringify(next) ? current : next
+        ));
+        onRendererKind?.(next.software ? 'software' : 'gpu');
       }}
       style={{ background: VIEWPORT_COLORS.background }}
     >
@@ -2767,7 +2780,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
       <OrbitControls
         makeDefault
         screenSpacePanning
-        enableDamping
+        enableDamping={graphicsProfile.cameraDamping}
         dampingFactor={0.1}
         target={selectedCamera.target}
       />
@@ -2784,7 +2797,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
         onPresentation={captureCameraPresentation}
       />
       {outlineVisible && (
-        <SceneOutline multisample={renderer.antialias} componentByLink={outlineComponents} />
+        <SceneOutline multisample={graphicsProfile.outlineSmoothing} componentByLink={outlineComponents} />
       )}
       {/* SceneOutline outlines this group's solid meshes by name. */}
       <group name="viewer-frame-content">
@@ -2830,7 +2843,8 @@ const ViewerCanvas = memo(function ViewerCanvas({
                     onSelect={selectStructure}
                     onSelectSceneResource={selectSceneResource}
                     onAssetError={onIsolatedAssetError}
-                    softwareRenderer={renderer.software}
+                    poseRateHz={graphicsProfile.poseRateHz}
+                    motionSmoothing={graphicsProfile.motionSmoothing}
                   />
                 )}
             </Suspense>
@@ -2979,6 +2993,7 @@ function StructuralViewerContent({
   // Display toggles are installation settings (UA7W.11): they say what to
   // show when the data exists, never that it exists.
   const composerSettings = useComposerSettings();
+  const [rendererKind, setRendererKind] = useState<ViewerRendererKind | null>(null);
   const {
     collisionGeometry: collisionsVisible,
     wireframeOverlays: wireframeVisible,
@@ -3509,6 +3524,8 @@ function StructuralViewerContent({
               wireframeVisible={wireframeVisible}
               outlineVisible={outlineVisible}
               outlineComponents={outlineComponents}
+              graphics={composerSettings.settings.viewerGraphics}
+              onRendererKind={setRendererKind}
               retryGeneration={geometryRetryGeneration}
               onModelLoaded={reportModelLoaded}
               onAssetError={reportAssetError}
@@ -3808,6 +3825,7 @@ function StructuralViewerContent({
                     <span>Comparison ghost</span>
                   </label>
                   </section>
+                  <ViewerGraphicsSettings rendererKind={rendererKind} />
                   <details className="dcard" open>
                     <summary>Frames and joints</summary>
                     <SettingsSubheading title="Size" scope="program" />

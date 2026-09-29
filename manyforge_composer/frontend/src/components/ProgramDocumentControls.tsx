@@ -10,6 +10,7 @@ import {
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import { OverlayPanel } from './OverlayPanel';
+import { programActionUnavailableReason } from '../state/authoringWorkspace';
 
 type ProgramAction = 'apply' | 'revert' | 'discard';
 
@@ -53,7 +54,6 @@ export function ProgramDocumentControls({
     ?? 'Complete the authoring Draft before Save or Apply.';
   const busy = state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
-  const authoringBusy = busy || !mutationAvailable || localInvalidEdit;
   const authoringBlockReason = localInvalidEdit
     ? 'Review or discard the invalid local field edit first.'
     : busy
@@ -67,9 +67,15 @@ export function ProgramDocumentControls({
       ? currentScenarioProjection.unavailableReasons.join(', ').replaceAll('_', ' ')
       : 'No exact current Scenario exists.';
   const affectedPolicyInstances = workspace?.applicability.affectedInstanceIds ?? [];
-  const hasAppliedUnsavedChanges = workspace?.saved.available === true
-    && workspace.applied.available
-    && workspace.saved.programRevision !== workspace.applied.programRevision;
+  const commonReason = busy ? 'Another Program operation is in progress.'
+    : !mutationAvailable ? mutationUnavailableReason ?? 'Authoring is unavailable.' : null;
+  const reasons = {
+    apply: programActionUnavailableReason(workspace, 'apply', commonReason)
+      ?? (localInvalidEdit ? authoringBlockReason : null)
+      ?? (currentScenario === null ? currentScenarioUnavailable : null),
+    revert: programActionUnavailableReason(workspace, 'revert', commonReason),
+    discard: programActionUnavailableReason(workspace, 'discard', commonReason),
+  };
   const affectedPolicyInstanceSummary = affectedPolicyInstances.length <= 12
     ? affectedPolicyInstances.join(', ')
     : `${affectedPolicyInstances.slice(0, 12).join(', ')}, and ${affectedPolicyInstances.length - 12} more`;
@@ -91,10 +97,12 @@ export function ProgramDocumentControls({
     next: ProgramAction,
     event: MouseEvent<HTMLButtonElement>,
   ) => {
+    if (reasons[next] !== null) return;
     returnFocus.current = event.currentTarget;
     setAction(next);
   };
   const complete = (operation: () => void) => {
+    if (action === null || reasons[action] !== null) return;
     operation();
     closeAction();
   };
@@ -117,18 +125,12 @@ export function ProgramDocumentControls({
               <span className="header-action-divider" aria-hidden="true" />
             </>
           )}
-          <button type="button" disabled={authoringBusy || workspace?.hasUnappliedChanges !== true} title={authoringBlockReason ?? (workspace?.hasUnappliedChanges !== true ? 'Draft already matches Applied.' : 'Discard Draft edits and return to Applied.')} onClick={(event) => beginAction('discard', event)}>Discard</button>
-          <button type="button" disabled={authoringBusy || !hasAppliedUnsavedChanges} title={authoringBlockReason ?? (!hasAppliedUnsavedChanges ? 'Applied already matches Saved.' : 'Restore Applied and Draft to Saved.')} onClick={(event) => beginAction('revert', event)}>Revert</button>
+          <button type="button" disabled={reasons.discard !== null} title={reasons.discard ?? 'Discard Draft edits and return to Applied.'} onClick={(event) => beginAction('discard', event)}>Discard</button>
+          <button type="button" disabled={reasons.revert !== null} title={reasons.revert ?? 'Restore Draft and Applied to Saved.'} onClick={(event) => beginAction('revert', event)}>Revert</button>
           <button
             className="primary-action"
             type="button"
-            disabled={
-              authoringBusy
-              || !program
-              || !workspace?.applicability.applyReady
-              || workspace?.applied.matchesDraft === true
-              || currentScenario === null
-            }
+            disabled={reasons.apply !== null}
             title={currentScenario === null
               ? `Load a Scenario before Program Apply. ${currentScenarioUnavailable}`
               : authoringBlockReason
@@ -164,6 +166,9 @@ export function ProgramDocumentControls({
         onClose={closeAction}
         returnFocusRef={returnFocus}
       >
+        {action !== null && reasons[action] !== null && (
+          <p role="status">{reasons[action]}</p>
+        )}
         {action === 'apply' && (
           <div className="dialog-copy compact-confirmation">
             {currentScenario ? (
@@ -188,13 +193,7 @@ export function ProgramDocumentControls({
             <button
               type="button"
               className="primary-action"
-              disabled={
-                authoringBusy
-                || currentScenario === null
-                || !program
-                || !workspace?.applicability.applyReady
-                || workspace?.applied.matchesDraft === true
-              }
+              disabled={reasons.apply !== null}
               onClick={() => complete(applyDraft)}
             >
               Apply Draft
@@ -205,7 +204,7 @@ export function ProgramDocumentControls({
         {action === 'discard' && (
           <div className="dialog-copy compact-confirmation">
             <p>The editor will return to the Applied Program. Your Saved Program will not change.</p>
-            <button type="button" className="primary-action" disabled={authoringBusy || workspace?.hasUnappliedChanges !== true} title={authoringBlockReason ?? undefined} onClick={() => complete(discard)}>
+            <button type="button" className="primary-action" disabled={reasons.discard !== null} title={reasons.discard ?? undefined} onClick={() => complete(discard)}>
               Discard changes
             </button>
           </div>
@@ -214,7 +213,7 @@ export function ProgramDocumentControls({
         {action === 'revert' && (
           <div className="dialog-copy compact-confirmation">
             <p>Replace the Applied Program and Draft with the Saved Program?</p>
-            <button type="button" className="primary-action" disabled={authoringBusy || !hasAppliedUnsavedChanges} title={authoringBlockReason ?? undefined} onClick={() => complete(revert)}>
+            <button type="button" className="primary-action" disabled={reasons.revert !== null} title={reasons.revert ?? undefined} onClick={() => complete(revert)}>
               Revert to saved
             </button>
           </div>

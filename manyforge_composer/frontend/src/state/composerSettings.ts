@@ -5,6 +5,20 @@ import type { EdgeStyle, LayoutDirection } from '../store/composerStore';
  * only: nothing here reaches the Program, the Deployment or execution.
  * Mirrors `manyforge_composer/backend/composer_settings.py`.
  */
+/** How the 3D viewer renders on one kind of browser renderer. */
+export interface ViewerGraphicsProfile {
+  /** Caps the rendered resolution relative to CSS pixels. */
+  maxPixelRatio: number;
+  antialias: boolean;
+  outlineSmoothing: boolean;
+  /** How often live robot poses are redrawn. */
+  poseRateHz: number;
+  motionSmoothing: boolean;
+  cameraDamping: boolean;
+}
+
+export type ViewerRendererKind = 'gpu' | 'software';
+
 export interface ComposerSettings {
   viewer: {
     wireframeOverlays: boolean;
@@ -12,6 +26,8 @@ export interface ComposerSettings {
     collisionGeometry: boolean;
     pointCloud: boolean;
   };
+  /** One profile per renderer kind; each browser uses the one it renders with. */
+  viewerGraphics: Record<ViewerRendererKind, ViewerGraphicsProfile>;
   /** `layoutDirection` is the direction the tree editor starts in; the
    * toolbar toggle changes it for the session only. `toolsWidthPx` is the
    * width the Program tools pane opens at; dragging its divider changes it
@@ -46,12 +62,33 @@ export const MOTION_CONTROL_WIDTH_REM = { min: 6, max: 11 } as const;
 /** Program tools pane (Nodes / Params) width limits, in CSS pixels. */
 export const PROGRAM_TOOLS_WIDTH_PX = { min: 160, max: 360 } as const;
 
+export const VIEWER_PIXEL_RATIO = { min: 0.5, max: 2, step: 0.25 } as const;
+export const VIEWER_POSE_RATE_HZ = { min: 5, max: 60 } as const;
+
 export const DEFAULT_COMPOSER_SETTINGS: ComposerSettings = {
   viewer: {
     wireframeOverlays: false,
     objectOutline: false,
     collisionGeometry: false,
     pointCloud: false,
+  },
+  viewerGraphics: {
+    gpu: {
+      maxPixelRatio: 1.5,
+      antialias: true,
+      outlineSmoothing: true,
+      poseRateHz: 30,
+      motionSmoothing: true,
+      cameraDamping: true,
+    },
+    software: {
+      maxPixelRatio: 1,
+      antialias: false,
+      outlineSmoothing: false,
+      poseRateHz: 10,
+      motionSmoothing: false,
+      cameraDamping: true,
+    },
   },
   treeEditor: {
     linkStyle: 'default',
@@ -95,9 +132,39 @@ function oneOf<T extends string>(value: unknown, options: readonly T[], path: st
   return value as T;
 }
 
+const GRAPHICS_KEYS = [
+  'maxPixelRatio', 'antialias', 'outlineSmoothing', 'poseRateHz', 'motionSmoothing', 'cameraDamping',
+] as const;
+
+function parseGraphicsProfile(raw: unknown, path: string): ViewerGraphicsProfile {
+  const profile = record(raw, path);
+  exactKeys(profile, GRAPHICS_KEYS, path);
+  const ratio = profile.maxPixelRatio;
+  if (typeof ratio !== 'number' || !Number.isFinite(ratio)
+    || ratio < VIEWER_PIXEL_RATIO.min || ratio > VIEWER_PIXEL_RATIO.max
+    || !Number.isInteger(ratio / VIEWER_PIXEL_RATIO.step)) {
+    throw new Error(`${path}.maxPixelRatio is out of range`);
+  }
+  const rate = profile.poseRateHz;
+  if (typeof rate !== 'number' || !Number.isInteger(rate)
+    || rate < VIEWER_POSE_RATE_HZ.min || rate > VIEWER_POSE_RATE_HZ.max) {
+    throw new Error(`${path}.poseRateHz is out of range`);
+  }
+  return {
+    maxPixelRatio: ratio,
+    antialias: bool(profile.antialias, `${path}.antialias`),
+    outlineSmoothing: bool(profile.outlineSmoothing, `${path}.outlineSmoothing`),
+    poseRateHz: rate,
+    motionSmoothing: bool(profile.motionSmoothing, `${path}.motionSmoothing`),
+    cameraDamping: bool(profile.cameraDamping, `${path}.cameraDamping`),
+  };
+}
+
 export function parseComposerSettings(raw: unknown, path = 'settings'): ComposerSettings {
   const root = record(raw, path);
-  exactKeys(root, ['viewer', 'treeEditor', 'motionPanel'], path);
+  exactKeys(root, ['viewer', 'viewerGraphics', 'treeEditor', 'motionPanel'], path);
+  const graphics = record(root.viewerGraphics, `${path}.viewerGraphics`);
+  exactKeys(graphics, ['gpu', 'software'], `${path}.viewerGraphics`);
   const viewer = record(root.viewer, `${path}.viewer`);
   exactKeys(viewer, ['wireframeOverlays', 'objectOutline', 'collisionGeometry', 'pointCloud'], `${path}.viewer`);
   const tree = record(root.treeEditor, `${path}.treeEditor`);
@@ -120,6 +187,10 @@ export function parseComposerSettings(raw: unknown, path = 'settings'): Composer
       objectOutline: bool(viewer.objectOutline, `${path}.viewer.objectOutline`),
       collisionGeometry: bool(viewer.collisionGeometry, `${path}.viewer.collisionGeometry`),
       pointCloud: bool(viewer.pointCloud, `${path}.viewer.pointCloud`),
+    },
+    viewerGraphics: {
+      gpu: parseGraphicsProfile(graphics.gpu, `${path}.viewerGraphics.gpu`),
+      software: parseGraphicsProfile(graphics.software, `${path}.viewerGraphics.software`),
     },
     treeEditor: {
       linkStyle: oneOf(tree.linkStyle, EDGE_STYLES, `${path}.treeEditor.linkStyle`),
