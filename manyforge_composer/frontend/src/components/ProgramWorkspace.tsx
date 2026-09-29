@@ -13,8 +13,11 @@ import type {
 } from '../types/api';
 import type { ManualControlMotionDescriptor } from '../types/robotControl';
 import {
+  deriveProgramMotionConfiguration,
   flattenProgramForest,
   programDiagnosticNodeId,
+  programMotionDefaultRoles,
+  type ProgramMotionDefaultRole,
 } from '../utils/programAuthoring';
 import { PaneDivider } from './PaneDivider';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
@@ -29,9 +32,15 @@ import {
   ProgramPropertyEditor,
 } from './ProgramPropertyEditor';
 import { ProgramTreeCanvas } from './ProgramTreeCanvas';
+import { ProgramSettingsEditor } from './ProgramSettingsEditor';
+import { TreeEditorPreferences } from './TreeEditorPreferences';
+import { onOpenSettingsRequest } from '../state/settingsNavigation';
+import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
+import { useComposerSettings } from '../hooks/useComposerSettings';
+import { PROGRAM_TOOLS_WIDTH_PX } from '../state/composerSettings';
 
-const PROGRAM_TOOL_MIN = 160;
-const PROGRAM_TOOL_MAX = 360;
+const PROGRAM_TOOL_MIN = PROGRAM_TOOLS_WIDTH_PX.min;
+const PROGRAM_TOOL_MAX = PROGRAM_TOOLS_WIDTH_PX.max;
 const PROGRAM_CANVAS_MIN = 216;
 const PROGRAM_DIVIDER_WIDTH = 7;
 export const PROGRAM_INFO_NOTICE_TIMEOUT_MS = 4_000;
@@ -64,7 +73,6 @@ interface ProgramWorkspaceProps {
   onRetryEnvironment: () => void;
   onInvalidEditChange?: (invalid: boolean) => void;
   onOpenScene?: () => void;
-  onOpenProgramSettings?: () => void;
   inspectorTarget?: HTMLElement | null;
   inspectorMinimized?: boolean;
   onInspectorMinimizedChange?: (minimized: boolean) => void;
@@ -79,6 +87,7 @@ interface ProgramWorkspaceProps {
     id: string;
     kind: 'component_role' | 'target_role';
   } | null;
+  onProgramRequirementCreated?: (kind: 'component_role' | 'target_role', id: string) => void;
 }
 
 export function ProgramWorkspace({
@@ -93,13 +102,13 @@ export function ProgramWorkspace({
   onRetryEnvironment,
   onInvalidEditChange,
   onOpenScene,
-  onOpenProgramSettings,
   inspectorTarget = null,
   inspectorMinimized = false,
   onInspectorMinimizedChange,
   onInspectorMaximize,
   onInspectorStateChange,
   programRequirementCreated = null,
+  onProgramRequirementCreated,
 }: ProgramWorkspaceProps) {
   const {
     state,
@@ -110,6 +119,18 @@ export function ProgramWorkspace({
     updateNodePolicies,
   } = controller;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  // Program settings show in the Program inspector, opened from the tree
+  // editor gear or the Composer settings; closing returns to the properties.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsInvalid, setSettingsInvalid] = useState(false);
+  useEffect(() => onOpenSettingsRequest('program', () => setSettingsOpen(true)), []);
+  // Selecting another node shows its properties (unless a setting is invalid).
+  const settingsSelection = useRef(selectedNodeId);
+  useEffect(() => {
+    if (settingsSelection.current === selectedNodeId) return;
+    settingsSelection.current = selectedNodeId;
+    if (selectedNodeId !== null && !settingsInvalid) setSettingsOpen(false);
+  }, [selectedNodeId, settingsInvalid]);
   const [paletteCollapsed, setPaletteCollapsed] = useState(false);
   const collapsePalette = useCallback(() => setPaletteCollapsed(true), []);
   const [toolView, setToolView] = useState<'nodes' | 'params'>('nodes');
@@ -127,7 +148,10 @@ export function ProgramWorkspace({
     applying: boolean;
   } | null>(null);
   const [invalidLocalEdit, setInvalidLocalEdit] = useState(false);
-  const [paletteWidth, setPaletteWidth] = useState(216);
+  // The pane opens at the installation default; dragging the divider
+  // changes only this session. Moving the settings slider previews it live.
+  const defaultToolsWidth = useComposerSettings().settings.treeEditor.toolsWidthPx;
+  const [paletteWidth, setPaletteWidth] = useState(defaultToolsWidth);
   const [authoringWidth, setAuthoringWidth] = useState(856);
   const [notices, setNotices] = useState<ProgramNotice[]>([]);
   const noticeSequence = useRef(0);
@@ -135,6 +159,7 @@ export function ProgramWorkspace({
   const noticeTimeouts = useRef(new Map<string, number>());
   const observedRequirementSequence = useRef(0);
   const authoringGrid = useRef<HTMLDivElement>(null);
+  const settingsPanel = useCardPanelLayout();
   const paletteCollapseButton = useRef<HTMLButtonElement>(null);
   const paletteRail = useRef<HTMLButtonElement>(null);
   const previousPaletteCollapsed = useRef(false);
@@ -199,7 +224,16 @@ export function ProgramWorkspace({
   );
   const busy = state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
-  const catalogEntries = catalog.status === 'ready' ? catalog.data.entries : [];
+  const catalogEntries = useMemo(
+    () => catalog.status === 'ready' ? catalog.data.entries : [],
+    [catalog],
+  );
+  const motionDefaults = useMemo(
+    () => authoring === null
+      ? new Map<string, ProgramMotionDefaultRole>()
+      : programMotionDefaultRoles(deriveProgramMotionConfiguration(authoring, catalogEntries)),
+    [authoring, catalogEntries],
+  );
   const catalogIdentity = useMemo(() => catalog.status === 'ready' ? {
     catalogId: catalog.data.catalogId,
     contentVersion: catalog.data.contentVersion,
@@ -340,9 +374,12 @@ export function ProgramWorkspace({
       authoringWidth - PROGRAM_CANVAS_MIN - PROGRAM_DIVIDER_WIDTH,
     ),
   );
+  // The requested width is kept as set; the pane shows it within the space
+  // the tree canvas leaves free.
   useEffect(() => {
-    setPaletteWidth((current) => clamp(current, PROGRAM_TOOL_MIN, paletteWidthMax));
-  }, [paletteWidthMax]);
+    setPaletteWidth(defaultToolsWidth);
+  }, [defaultToolsWidth]);
+  const shownPaletteWidth = clamp(paletteWidth, PROGRAM_TOOL_MIN, paletteWidthMax);
 
   // Workspace command results and failures belong to the workbench
   // notification rows. Authoring availability is a status of this editor, so
@@ -375,14 +412,15 @@ export function ProgramWorkspace({
     paletteCollapsed ? 'palette-collapsed' : '',
   ].filter(Boolean).join(' ');
   const gridStyle = {
-    '--program-tool-width': `${paletteWidth}px`,
+    '--program-tool-width': `${shownPaletteWidth}px`,
   } as CSSProperties;
   let inspectorTitle = '';
-  if (toolView === 'params') inspectorTitle = 'Declaration';
+  if (settingsOpen) inspectorTitle = 'Program settings';
+  else if (toolView === 'params') inspectorTitle = 'Declaration';
   else if (selectedNodeId !== null) inspectorTitle = 'Properties';
-  const inspectorActive = toolView === 'nodes'
+  const inspectorActive = settingsOpen || (toolView === 'nodes'
     ? selectedNodeId !== null
-    : declarationSelection !== null;
+    : declarationSelection !== null);
   const inspectorReadOnlyReason = authoringUnavailable
     ? 'Portable Program authoring is unavailable for the current environment.'
     : busy
@@ -466,7 +504,7 @@ export function ProgramWorkspace({
         ) : authoring ? (
           <section className="program-palette" aria-label="Program declaration navigation">
             <header className="program-subpanel-header">
-              <div className="program-tool-tabs" aria-label="Program tools">
+              <div className="program-tool-tabs dseg" aria-label="Program tools">
                 <button type="button" aria-pressed="false" onClick={() => changeToolView('nodes')}>Nodes</button>
                 <button type="button" className="active" aria-pressed="true">Params</button>
               </div>
@@ -487,12 +525,13 @@ export function ProgramWorkspace({
               keys={authoring.blackboard?.keys ?? []}
               selected={declarationSelection}
               onSelect={selectDeclaration}
+              motionDefaults={motionDefaults}
             />
           </section>
         ) : (
           <section className="program-palette" aria-label="Node palette">
             <header className="program-subpanel-header">
-              <div className="program-tool-tabs" aria-label="Program tools">
+              <div className="program-tool-tabs dseg" aria-label="Program tools">
                 <button type="button" className={toolView === 'nodes' ? 'active' : ''} aria-pressed={toolView === 'nodes'} onClick={() => changeToolView('nodes')}>Nodes</button>
                 <button type="button" className={toolView === 'params' ? 'active' : ''} aria-pressed={toolView === 'params'} onClick={() => changeToolView('params')}>Params</button>
               </div>
@@ -509,7 +548,7 @@ export function ProgramWorkspace({
           <PaneDivider
             label="Program tools"
             className="program-pane-divider"
-            value={paletteWidth}
+            value={shownPaletteWidth}
             min={PROGRAM_TOOL_MIN}
             max={paletteWidthMax}
             onChange={setPaletteWidth}
@@ -565,6 +604,17 @@ export function ProgramWorkspace({
                 </span>
               )}
               <div className="central-inspector-actions">
+                {settingsOpen && (
+                  <button
+                    type="button"
+                    aria-label="Close Program settings"
+                    title={settingsInvalid
+                      ? 'Fix or discard the invalid setting first.'
+                      : 'Close Program settings'}
+                    disabled={settingsInvalid}
+                    onClick={() => setSettingsOpen(false)}
+                  >×</button>
+                )}
                 <button
                   type="button"
                   aria-label="Maximize Program inspector"
@@ -590,7 +640,26 @@ export function ProgramWorkspace({
             )}
             {inspectorActive && !inspectorMinimized && (
               <div className="program-inspector-scroll central-inspector-scroll">
-              {!authoring ? (
+              {settingsOpen ? (
+                <div ref={settingsPanel} className="program-settings-inspector dpanel">
+                  {authoring ? (
+                    <ProgramSettingsEditor
+                      program={authoring}
+                      catalogEntries={catalogEntries}
+                      candidateRevision={workspace?.draft.programRevision ?? null}
+                      busy={authoringBusy}
+                      runtime={runtime}
+                      onMutate={mutate}
+                      onInvalidChange={setSettingsInvalid}
+                      onRoleCreated={onProgramRequirementCreated}
+                      diagnostics={workspace?.draft.diagnostics ?? []}
+                    />
+                  ) : (
+                    <p className="hint">No Program is loaded.</p>
+                  )}
+                  <TreeEditorPreferences />
+                </div>
+              ) : !authoring ? (
                 <div className="program-empty-guidance">
                   <strong>Select a node to inspect properties</strong>
                   <span>Properties and declarations appear after a Draft is open.</span>
@@ -625,7 +694,7 @@ export function ProgramWorkspace({
                         createdId: null,
                         applying: false,
                       });
-                      onOpenProgramSettings?.();
+                      setSettingsOpen(true);
                     } else {
                       setPendingReference({
                         ...source,
@@ -659,6 +728,7 @@ export function ProgramWorkspace({
                   namespaces={authoring.blackboard?.namespaces ?? []}
                   keys={authoring.blackboard?.keys ?? []}
                   catalogEntries={catalogEntries}
+                  motionDefaults={motionDefaults}
                   creationExpectedType={declarationPrefill?.expectedType ?? null}
                   creationExpectedAccess={declarationPrefill?.expectedAccess ?? null}
                   busy={authoringBusy}

@@ -234,12 +234,17 @@ export function ProgramContactPolicyEditor({
   };
 
   return (
-    <div className="scene-authoring-column contact-policy-editor">
-      <div className="scene-authoring-heading">
-        <div>
-          <p className="eyebrow">Program Draft</p>
-          <h3>Contact policies</h3>
-        </div>
+    <div className="scene-authoring-column dpanel" aria-label="Contact policies">
+      <ProgramSupportContactEditor
+        program={program}
+        draftRevision={draftRevision}
+        busy={busy}
+        busyReason={busyReason}
+        mutate={mutate}
+      />
+      <section className="dcard">
+      <header>
+        <span>Robot/object grasp policy</span>
         <button
           type="button"
           disabled={busy || options.length === 0 || keys.length === 0}
@@ -249,22 +254,12 @@ export function ProgramContactPolicyEditor({
             setDraft(empty);
           }}
         >New grasp policy</button>
-      </div>
-      <p className="muted">
-        Policies are authored in this Program Draft. Live contact evidence
-        remains read-only logical-scene and Kernel truth.
+      </header>
+      <p>
+        Allowed component-body contact with one runtime object. Policies are
+        authored in this Program Draft; live contact evidence remains read-only
+        logical-scene and Kernel truth.
       </p>
-      <ProgramSupportContactEditor
-        program={program}
-        draftRevision={draftRevision}
-        busy={busy}
-        busyReason={busyReason}
-        mutate={mutate}
-      />
-      <div className="contact-policy-subheading">
-        <strong>Robot/object grasp policy</strong>
-        <span>Allowed component-body contact with one runtime object.</span>
-      </div>
       <label>
         <span>Policy</span>
         <select
@@ -379,7 +374,7 @@ export function ProgramContactPolicyEditor({
               onBlur={() => existing && materialize(draft)}
             />
           </label>
-          <div className="scene-authoring-actions">
+          <div className="dactions">
             {!existing && (
               <button
                 type="button"
@@ -405,6 +400,7 @@ export function ProgramContactPolicyEditor({
           </div>
         </div>
       )}
+      </section>
     </div>
   );
 }

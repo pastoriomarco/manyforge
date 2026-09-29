@@ -1,3 +1,4 @@
+import { BreakableId } from './BreakableId';
 import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
@@ -465,15 +466,15 @@ export function ProgramSettingsEditor({
           ))}
         </div>
       )}
-      <section className={`program-settings-section${identityDiagnostic ? ' backend-invalid' : ''}`} title={identityDiagnostic?.message}>
-        <h3>Identity and profile</h3>
-        <dl className="program-settings-facts">
+      <section className={`dcard${identityDiagnostic ? ' backend-invalid' : ''}`} title={identityDiagnostic?.message}>
+        <h3>Identity</h3>
+        <dl>
           <div><dt>Program ID</dt><dd><code>{program.program_id}</code></dd></div>
           <div><dt>Profile</dt><dd><code>{program.program_profile}</code></dd></div>
           <div><dt>Catalog</dt><dd><code>{program.catalog.content_version}</code></dd></div>
         </dl>
         <label>
-          Program name
+          Name
           <input id="program-settings-name" value={name} disabled={busy} aria-invalid={error !== null && errorTarget === 'program-settings-name'} title={errorTarget === 'program-settings-name' ? error ?? undefined : undefined} onChange={(event) => setName(event.target.value)} />
         </label>
         <label>
@@ -482,7 +483,7 @@ export function ProgramSettingsEditor({
         </label>
       </section>
 
-      <section className="program-settings-section">
+      <section className="dcard">
         <h3>Execution timing</h3>
         <label>
           Control groups
@@ -497,8 +498,8 @@ export function ProgramSettingsEditor({
         </label>
       </section>
 
-      <section className="program-settings-section program-motion-defaults">
-        <h3>Program motion defaults</h3>
+      <section className="dcard program-motion-defaults">
+        <h3>Motion defaults</h3>
         <p>
           These are portable Program defaults. Velocity, acceleration and TCP
           speed remain ceilings; Cartesian nodes may override the inherited
@@ -515,21 +516,21 @@ export function ProgramSettingsEditor({
           </p>
         ) : (
           <>
-            <dl className="program-settings-facts program-motion-bindings">
+            <dl className="program-motion-bindings">
               {PROGRAM_MOTION_FIELDS.map((field) => (
                 <div key={field}>
-                  <dt>{field}</dt>
+                  <dt><BreakableId text={field} /></dt>
                   <dd>
-                    <code>{motionConfiguration.configuration.bindings[field]}</code>
+                    <code><BreakableId text={motionConfiguration.configuration.bindings[field]} /></code>
                     {' · '}{motionConfiguration.configuration.usageCounts[field]}
                     /{motionConfiguration.configuration.applicableCounts[field]} bound nodes
                   </dd>
                 </div>
               ))}
             </dl>
-            <div className="program-motion-default-grid">
+            <div className="drows">
               <label>
-                Global velocity scale
+                Velocity scale
                 <input
                   aria-label="Program global velocity scale"
                   type="number"
@@ -545,7 +546,7 @@ export function ProgramSettingsEditor({
                 />
               </label>
               <label>
-                Global acceleration scale
+                Acceleration scale
                 <input
                   aria-label="Program global acceleration scale"
                   type="number"
@@ -561,8 +562,8 @@ export function ProgramSettingsEditor({
                 />
               </label>
               <label>
-                Cartesian translation tolerance
-                <span className="program-motion-number">
+                Translation tolerance
+                <span className="dunit">
                   <input
                     aria-label="Program Cartesian translation tolerance"
                     type="number"
@@ -579,8 +580,8 @@ export function ProgramSettingsEditor({
                 </span>
               </label>
               <label>
-                Maximum Cartesian blend deviation
-                <span className="program-motion-number">
+                Max blend deviation
+                <span className="dunit">
                   <input
                     aria-label="Program maximum Cartesian blend deviation"
                     type="number"
@@ -597,7 +598,7 @@ export function ProgramSettingsEditor({
                 </span>
               </label>
             </div>
-            <div className="program-motion-actions">
+            <div className="dactions">
               <button type="button" disabled={busy || !motionDirty} onClick={submitMotion}>
                 Update motion defaults
               </button>
@@ -616,9 +617,9 @@ export function ProgramSettingsEditor({
         )}
       </section>
 
-      <section className={`program-settings-section${compatibilityDiagnostic ? ' backend-invalid' : ''}`} title={compatibilityDiagnostic?.message}>
+      <section className={`dcard${compatibilityDiagnostic ? ' backend-invalid' : ''}`} title={compatibilityDiagnostic?.message}>
         <h3>Portable compatibility</h3>
-        <fieldset className="program-settings-lanes">
+        <fieldset className="dchecks">
           <legend>Supported lanes</legend>
           {LANES.map((lane) => (
             <label key={lane}>
@@ -638,7 +639,7 @@ export function ProgramSettingsEditor({
           ))}
         </fieldset>
         <label>
-          Assistant disposition
+          Assistant
           <select
             value={compatibility.assistant}
             disabled={busy}
@@ -654,7 +655,7 @@ export function ProgramSettingsEditor({
           </select>
         </label>
         <label>
-          Portable semantic requirements
+          Requirements
           <input
             id="program-settings-requires"
             value={compatibility.requires}
@@ -669,7 +670,7 @@ export function ProgramSettingsEditor({
           />
         </label>
         <label>
-          Discovery tags
+          Tags
           <input
             id="program-settings-tags"
             value={compatibility.tags}
@@ -685,10 +686,10 @@ export function ProgramSettingsEditor({
         </label>
       </section>
 
-      <section className="program-settings-section program-binding-projection">
-        <h3>Current owner-issued Binding</h3>
+      <section className="dcard">
+        <h3>Current Binding</h3>
         {exactBinding ? (
-          <dl className="program-settings-facts">
+          <dl>
             <div><dt>Scenario</dt><dd><code>{currentScenario?.scenarioId}</code></dd></div>
             <div><dt>Binding</dt><dd><code>{exactBinding.program_binding_id}</code></dd></div>
             <div><dt>Component roles</dt><dd>{exactBinding.component_role_bindings.length}</dd></div>
@@ -702,13 +703,13 @@ export function ProgramSettingsEditor({
         )}
       </section>
 
-      <section className="program-settings-section program-role-requirements">
-        <h3>Portable component and target roles</h3>
+      <section className="dcard">
+        <h3>Component and target roles</h3>
         <p>
           Node selectors use these logical requirements. Deployment Binding chooses
           implementations later; this Program does not name live components.
         </p>
-        <dl className="program-settings-facts">
+        <dl>
           {Object.keys(program.component_roles).map((role) => (
             <div key={`component:${role}`}><dt>Component role</dt><dd><code>{role}</code></dd></div>
           ))}
@@ -716,27 +717,31 @@ export function ProgramSettingsEditor({
             <div key={`target:${role}`}><dt>Target role</dt><dd><code>{role}</code></dd></div>
           ))}
         </dl>
-        <details>
+        <details className="dcard">
           <summary>Create component role</summary>
-          <div className="program-role-create-form">
+          <div className="drows">
             <label>Role ID<input id="program-component-role-id" value={componentRoleId} disabled={busy} onChange={(event) => setComponentRoleId(event.target.value)} /></label>
-            <label>Required component type tags<input value={componentTypeTags} disabled={busy} placeholder="articulated-arm, gripper" onChange={(event) => setComponentTypeTags(event.target.value)} /></label>
-            <label>Required model roles<input value={componentModelRoles} disabled={busy} placeholder="arm_model" onChange={(event) => setComponentModelRoles(event.target.value)} /></label>
-            <label>Required attachment interfaces<input value={componentAttachments} disabled={busy} onChange={(event) => setComponentAttachments(event.target.value)} /></label>
-            <button type="button" disabled={busy || !componentRoleId.trim()} onClick={addComponentRole}>Create component role</button>
+            <label>Type tags<input value={componentTypeTags} disabled={busy} placeholder="articulated-arm, gripper" onChange={(event) => setComponentTypeTags(event.target.value)} /></label>
+            <label>Model roles<input value={componentModelRoles} disabled={busy} placeholder="arm_model" onChange={(event) => setComponentModelRoles(event.target.value)} /></label>
+            <label>Attachments<input value={componentAttachments} disabled={busy} onChange={(event) => setComponentAttachments(event.target.value)} /></label>
+            <div className="dactions">
+              <button type="button" disabled={busy || !componentRoleId.trim()} onClick={addComponentRole}>Create component role</button>
+            </div>
           </div>
         </details>
-        <details>
+        <details className="dcard">
           <summary>Create target role</summary>
-          <div className="program-role-create-form">
+          <div className="drows">
             <label>Role ID<input id="program-target-role-id" value={targetRoleId} disabled={busy} onChange={(event) => setTargetRoleId(event.target.value)} /></label>
             <label>Component role<select value={targetComponentRole} disabled={busy} onChange={(event) => setTargetComponentRole(event.target.value)}><option value="" disabled>Select component role</option>{Object.keys(program.component_roles).map((role) => <option key={role}>{role}</option>)}</select></label>
-            <label>Required capabilities<input value={targetCapabilities} disabled={busy} placeholder="planning.motion.pose_goal" onChange={(event) => setTargetCapabilities(event.target.value)} /></label>
+            <label>Capabilities<input value={targetCapabilities} disabled={busy} placeholder="planning.motion.pose_goal" onChange={(event) => setTargetCapabilities(event.target.value)} /></label>
             <label>Frame roles<input value={targetFrameRoles} disabled={busy} placeholder="base, tcp" onChange={(event) => setTargetFrameRoles(event.target.value)} /></label>
             <label>Resource roles<input value={targetResourceRoles} disabled={busy} onChange={(event) => setTargetResourceRoles(event.target.value)} /></label>
-            <label>Collision-body roles<input value={targetCollisionRoles} disabled={busy} onChange={(event) => setTargetCollisionRoles(event.target.value)} /></label>
+            <label>Collision roles<input value={targetCollisionRoles} disabled={busy} onChange={(event) => setTargetCollisionRoles(event.target.value)} /></label>
             <label>Model roles<input value={targetModelRoles} disabled={busy} onChange={(event) => setTargetModelRoles(event.target.value)} /></label>
-            <button type="button" disabled={busy || !targetRoleId.trim()} onClick={addTargetRole}>Create target role</button>
+            <div className="dactions">
+              <button type="button" disabled={busy || !targetRoleId.trim()} onClick={addTargetRole}>Create target role</button>
+            </div>
           </div>
         </details>
       </section>

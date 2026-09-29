@@ -221,7 +221,7 @@ export function ProgramSupportContactEditor({
   };
 
   return (
-    <details className="contact-policy-section" open>
+    <details className="dcard" open>
       <summary>Object support contacts</summary>
       <p className="muted">
         Declare which Program scene object supports another and what geometric
@@ -258,7 +258,7 @@ export function ProgramSupportContactEditor({
               })}
             </select>
           </label>
-          <div className="program-template-grid">
+          <div className="program-template-grid dgrid">
             <label>
               <span>Supported object</span>
               <select
@@ -336,7 +336,7 @@ export function ProgramSupportContactEditor({
                 onCommit={() => selected !== null && replace(draft)}
               />
             )}
-            <div className="program-template-grid">
+            <div className="program-template-grid dgrid">
               <SupportNumber
                 label="Release tolerance (m)"
                 value={draft.releaseToleranceM}
@@ -402,7 +402,7 @@ export function ProgramSupportContactEditor({
               />
             </div>
           )}
-          <div className="scene-authoring-actions">
+          <div className="dactions">
             {selected === null ? (
               <button
                 type="button"

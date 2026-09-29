@@ -1973,10 +1973,17 @@ def _validate_viewer(value: Any, *, path: str) -> None:
                 "resource_role_visibility",
                 "scene_resource_axes_visibility",
                 "object_axes_gizmo_size_m",
+                "hidden_execution_groups",
             }
         ),
         path=path,
     )
+    if "hidden_execution_groups" in row:
+        # Motion panel presentation only; names are checked against the
+        # declared execution groups once those are parsed.
+        _canonical_identifier_list(
+            row["hidden_execution_groups"], path=f"{path}.hidden_execution_groups",
+        )
     for field_name in (
         "frame_role_visibility",
         "resource_role_visibility",
@@ -3918,6 +3925,15 @@ def _validate_program_document(
             "is unavailable in the previous Program contract",
         )
     _validate_execution_group_policies(tree, execution_group_policies)
+    viewer = root.get("viewer")
+    if isinstance(viewer, dict) and "hidden_execution_groups" in viewer:
+        declared_groups = set(execution_group_policies) | {"all"}
+        for name in viewer["hidden_execution_groups"]:
+            if name not in declared_groups:
+                _program_error(
+                    f"{source}.viewer.hidden_execution_groups.{name}",
+                    "does not name a declared execution group",
+                )
     normalized_root = deepcopy(root)
     normalized_root["tree"] = tree.to_dict()
     if execution_group_policies:

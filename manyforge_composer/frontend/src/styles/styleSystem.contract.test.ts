@@ -61,7 +61,6 @@ const REPEATED_PRELUDES = new Set([
   'surfaces/document-controls.css|.confirmation-check',
   'surfaces/program-canvas.css|.program-palette, .program-tree-surface',
   'surfaces/program-canvas.css|.program-canvas-toolbar',
-  'surfaces/program-canvas.css|.program-canvas-help',
   'surfaces/shell.css|.app-shell',
   'surfaces/shell.css|.workbench',
   'surfaces/shell.css|.workbench-pane > .panel, .workbench-workspace .panel',

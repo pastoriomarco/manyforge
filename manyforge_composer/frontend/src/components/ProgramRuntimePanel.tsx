@@ -10,8 +10,11 @@ import type {
 } from '../types/api';
 import type { ExecutionObservationTransportStatus } from '../types/viewerObservation';
 import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
-import { appliedExecutionSelectionRows } from '../state/programExecutionGroups';
+import { appliedExecutionSelectionRows, shownExecutionGroupIds } from '../state/programExecutionGroups';
+import { useComposerSettings } from '../hooks/useComposerSettings';
+import { MOTION_CONTROL_WIDTH_REM, type ComposerSettings } from '../state/composerSettings';
 import { OverlayPanel } from './OverlayPanel';
+import { PendingApplyNote, SettingsSubheading } from './SettingsScope';
 import { ProgramRunSetup } from './ProgramRunSetup';
 import {
   usePublishWorkbenchNotices,
@@ -22,40 +25,6 @@ import {
 interface ProgramRuntimePanelProps {
   enabled: boolean;
   controller: ProgramRuntimeController;
-}
-
-const TRANSPORT_PREFERENCES_KEY = 'manyforge.composer.transport_preferences.v1';
-
-interface TransportPreferences {
-  controlWidthRem: number;
-  confirmHalt: boolean;
-  confirmReset: boolean;
-}
-
-const DEFAULT_TRANSPORT_PREFERENCES: TransportPreferences = {
-  controlWidthRem: 7,
-  confirmHalt: true,
-  confirmReset: true,
-};
-
-function loadTransportPreferences(): TransportPreferences {
-  try {
-    const raw = globalThis.localStorage?.getItem(TRANSPORT_PREFERENCES_KEY);
-    if (raw === null || raw === undefined) return DEFAULT_TRANSPORT_PREFERENCES;
-    const parsed = JSON.parse(raw) as Partial<TransportPreferences>;
-    return {
-      controlWidthRem: typeof parsed.controlWidthRem === 'number'
-        && Number.isFinite(parsed.controlWidthRem)
-        ? Math.min(11, Math.max(6, parsed.controlWidthRem))
-        : DEFAULT_TRANSPORT_PREFERENCES.controlWidthRem,
-      confirmHalt: typeof parsed.confirmHalt === 'boolean'
-        ? parsed.confirmHalt : DEFAULT_TRANSPORT_PREFERENCES.confirmHalt,
-      confirmReset: typeof parsed.confirmReset === 'boolean'
-        ? parsed.confirmReset : DEFAULT_TRANSPORT_PREFERENCES.confirmReset,
-    };
-  } catch {
-    return DEFAULT_TRANSPORT_PREFERENCES;
-  }
 }
 
 function shortIdentity(value: string | null): string {
@@ -753,37 +722,13 @@ export function deriveTransportGuidance({
   return notices;
 }
 
-export function ProgramTransportControls({
-  enabled,
-  program,
-  robot,
-  observationTransport,
-  onOpenRuntimeHistory,
-  onOpenRobotControls,
-}: {
-  enabled: boolean;
-  program: ProgramRuntimeController;
-  robot: RobotControlController;
-  observationTransport?: ExecutionObservationTransportStatus;
-  onOpenRuntimeHistory?: () => void;
-  onOpenRobotControls?: () => void;
-}) {
-  const [detailsOpen, setDetailsOpen] = useState(false);
-  const [groupSettingsOpen, setGroupSettingsOpen] = useState(false);
-  const [haltIntent, setHaltIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
-  // Reset during execution ends the run and restarts the tree, so it is
-  // confirmed like Halt: motion stops first, the question comes after.
-  const [resetIntent, setResetIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
-  const [preferences, setPreferences] = useState<TransportPreferences>(loadTransportPreferences);
-  const [selection, setSelection] = useState({ scopeKey: '', groupIds: ['all'] });
-  const detailsButton = useRef<HTMLButtonElement>(null);
-  const groupSettingsButton = useRef<HTMLButtonElement>(null);
-  const haltButton = useRef<HTMLButtonElement>(null);
-  const resetButton = useRef<HTMLButtonElement>(null);
-  const { state, cycleState } = program;
-  const scopeKey = state.applied === null
-    ? ''
-    : `${state.applied.programId}:${state.applied.programRevision}:${state.applied.recordDigest}`;
+/**
+ * Execution groups of the Applied Program and which of them the Motion panel
+ * shows: the Applied Program's viewer choice, so hiding a group takes effect
+ * with Apply like any other Program change.
+ */
+function useTransportGroups(program: ProgramRuntimeController) {
+  const { state } = program;
   const appliedSelections = useMemo(
     () => appliedExecutionSelectionRows(state.applied),
     [state.applied],
@@ -792,22 +737,154 @@ export function ProgramTransportControls({
   const selections = projectedSelections !== undefined && projectedSelections.length > 0
     ? projectedSelections
     : appliedSelections;
-  const availableGroupIds = selections.map((group) => group.groupId);
   const allGroup = selections.find((group) => group.groupId === 'all');
   const namedGroups = selections.filter((group) => group.groupId !== 'all');
-  const hasMultipleScopes = selections.length > 1;
-  const defaultGroupIds = namedGroups.length > 0
-    ? namedGroups.map((group) => group.groupId)
-    : allGroup === undefined ? [] : ['all'];
-  const requestedGroupIds = selection.scopeKey === scopeKey
-    ? selection.groupIds.filter((groupId) => availableGroupIds.includes(groupId))
-    : [];
-  const groupIds = requestedGroupIds.length > 0 ? requestedGroupIds : defaultGroupIds;
+  const groupIds = shownExecutionGroupIds(
+    selections.map((group) => group.groupId),
+    state.applied?.program.viewer?.hidden_execution_groups,
+  );
   const visibleGroups = selections.filter((group) => groupIds.includes(group.groupId));
-  // Only named groups the operator chose to hide: "all" is hidden by default
-  // whenever named groups exist, and is not worth a badge.
+  // Only named groups the Program hides: "all" is hidden by default whenever
+  // named groups exist, and is not worth a badge.
   const hiddenGroupCount = namedGroups
     .filter((group) => !groupIds.includes(group.groupId)).length;
+  return { selections, allGroup, visibleGroups, hiddenGroupCount };
+}
+
+/** The Draft Program's choice of shown execution groups (a Program setting). */
+export interface DraftGroupVisibility {
+  /** The Draft's groups, including "all". */
+  groupIds: string[];
+  hidden: string[] | undefined;
+  /** The Draft's choice differs from the Applied Program's. */
+  pendingApply: boolean;
+  /** Undefined while the Draft cannot be edited. */
+  onChange?: (hidden: string[]) => void;
+}
+
+/**
+ * Motion panel settings, shown in the 3D viewer's settings panel. Displayed
+ * groups are a Program setting (they take effect with Apply); layout and
+ * confirmations are installation settings. Halt and Stop are never hidden or
+ * confirmed away.
+ */
+export function MotionControlSettings({ groups }: { groups: DraftGroupVisibility | null }) {
+  const composerSettings = useComposerSettings();
+  const preferences = composerSettings.settings.motionPanel;
+  const setPreferences = (change: Partial<ComposerSettings['motionPanel']>) => composerSettings.update(
+    (current) => ({ ...current, motionPanel: { ...current.motionPanel, ...change } }),
+  );
+  const shown = groups === null ? [] : shownExecutionGroupIds(groups.groupIds, groups.hidden);
+  const toggle = (groupId: string, visible: boolean) => {
+    if (groups?.onChange === undefined) return;
+    const next = visible
+      ? shown.filter((id) => id !== groupId).concat(groupId)
+      : shown.filter((id) => id !== groupId);
+    // At least one group stays shown.
+    if (next.length === 0) return;
+    groups.onChange(groups.groupIds.filter((id) => !next.includes(id)));
+  };
+  return (
+    <div className="drows">
+      {groups !== null && groups.groupIds.length > 1 && (
+        <fieldset
+          aria-label="Displayed groups"
+          disabled={groups.onChange === undefined}
+        >
+          <SettingsSubheading title="Displayed groups" scope="program" />
+          {groups.groupIds.map((groupId) => (
+            <label className="toggle-control" key={groupId}>
+              <input
+                type="checkbox"
+                checked={shown.includes(groupId)}
+                disabled={shown.length === 1 && shown.includes(groupId)}
+                onChange={(event) => toggle(groupId, event.target.checked)}
+              />
+              <span title={groupId}>{groupId === 'all' ? 'All groups' : groupId}</span>
+            </label>
+          ))}
+          {groups.pendingApply && <PendingApplyNote />}
+          {groups.onChange === undefined && (
+            <span className="hint">The Program Draft cannot be edited right now.</span>
+          )}
+        </fieldset>
+      )}
+      <fieldset aria-label="Layout and confirmations">
+        <SettingsSubheading
+          title="Layout and confirmations"
+          scope="installation"
+          onRestoreDefaults={() => composerSettings.restoreSection('motionPanel')}
+        />
+        <label>
+          <span>Control width</span>
+          <span className="dunit">
+            <input
+              type="range"
+              min={MOTION_CONTROL_WIDTH_REM.min}
+              max={MOTION_CONTROL_WIDTH_REM.max}
+              step="0.25"
+              value={preferences.controlWidthRem}
+              onChange={(event) => setPreferences({ controlWidthRem: Number(event.target.value) })}
+            />
+            <output>{preferences.controlWidthRem.toFixed(2).replace(/\.00$/, '')} rem</output>
+          </span>
+        </label>
+        <label className="toggle-control">
+          <input
+            type="checkbox"
+            checked={preferences.confirmHalt}
+            onChange={(event) => setPreferences({ confirmHalt: event.target.checked })}
+          />
+          <span>Confirm before halting the Program</span>
+        </label>
+        <label className="toggle-control">
+          <input
+            type="checkbox"
+            checked={preferences.confirmReset}
+            onChange={(event) => setPreferences({ confirmReset: event.target.checked })}
+          />
+          <span>Confirm before resetting a running Program</span>
+        </label>
+      </fieldset>
+    </div>
+  );
+}
+
+export function ProgramTransportControls({
+  enabled,
+  program,
+  robot,
+  observationTransport,
+  onOpenRuntimeHistory,
+  onOpenRobotControls,
+  onOpenViewerSettings,
+  viewerPreviewActive = false,
+}: {
+  enabled: boolean;
+  program: ProgramRuntimeController;
+  robot: RobotControlController;
+  observationTransport?: ExecutionObservationTransportStatus;
+  onOpenRuntimeHistory?: () => void;
+  onOpenRobotControls?: () => void;
+  /** The gear opens the 3D viewer settings (which include these controls). */
+  onOpenViewerSettings?: () => void;
+  /** A Draft scene or target preview is visible in the viewer. */
+  viewerPreviewActive?: boolean;
+}) {
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [haltIntent, setHaltIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
+  // Reset during execution ends the run and restarts the tree, so it is
+  // confirmed like Halt: motion stops first, the question comes after.
+  const [resetIntent, setResetIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
+  // Installation settings (UA7W.11); they never add a confirmation to Stop.
+  const preferences = useComposerSettings().settings.motionPanel;
+  const detailsButton = useRef<HTMLButtonElement>(null);
+  const haltButton = useRef<HTMLButtonElement>(null);
+  const resetButton = useRef<HTMLButtonElement>(null);
+  const { state, cycleState } = program;
+  const {
+    selections, allGroup, visibleGroups, hiddenGroupCount,
+  } = useTransportGroups(program);
   const selectionGroupPending = (
     groupId: string,
     kind: 'start-motion' | 'motion-stop' | 'resume-motion',
@@ -883,17 +960,6 @@ export function ProgramTransportControls({
     && state.controlPending === null
     && !programFullStopping
     && program.commandAllowed('program_full_stop');
-
-  useEffect(() => {
-    try {
-      globalThis.localStorage?.setItem(
-        TRANSPORT_PREFERENCES_KEY,
-        JSON.stringify(preferences),
-      );
-    } catch {
-      // A blocked preference store must never disable execution controls.
-    }
-  }, [preferences]);
 
   useEffect(() => {
     if (haltIntent !== 'automatic' || !allMotionQuiesced) return;
@@ -1187,7 +1253,9 @@ export function ProgramTransportControls({
                 ? 'Resume the halted Program tree. Motion stays stopped until Run or Resume in the Motion panel.'
                 : canRun
                   ? 'Execute the exact Applied Program without starting robot motion.'
-                  : blockedReason ?? 'Execute requires an Applied Program and an idle, reset runner.'}
+                  : (cycleState === 'idle_after_reset' ? program.startBlockedReason : null)
+                    ?? blockedReason
+                    ?? 'Execute requires an Applied Program and an idle, reset runner.'}
             onClick={() => {
               if (canResumeFullStop) void program.resumeFullStop();
               else void program.run();
@@ -1234,100 +1302,29 @@ export function ProgramTransportControls({
               title={blockedReason ?? 'Program and cell run information'}
               onClick={() => setDetailsOpen(true)}
             >i</button>
-            <div
-              className="transport-group-settings"
-              onBlur={(event) => {
-                if (!event.currentTarget.contains(event.relatedTarget)) setGroupSettingsOpen(false);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === 'Escape') {
-                  setGroupSettingsOpen(false);
-                  event.stopPropagation();
-                }
-              }}
+            <button
+              type="button"
+              className="icon-button transport-unique-icon transport-settings-button"
+              aria-label={hiddenGroupCount > 0
+                ? `Open viewer settings; ${hiddenGroupCount} command groups hidden`
+                : 'Open viewer settings'}
+              title={viewerPreviewActive
+                ? 'A Draft scene or target preview is visible. Open the viewer settings for layer details.'
+                : '3D viewer settings'}
+              disabled={onOpenViewerSettings === undefined}
+              onClick={onOpenViewerSettings}
             >
-              <button
-                ref={groupSettingsButton}
-                type="button"
-                className="icon-button transport-unique-icon transport-settings-button"
-                aria-label={hiddenGroupCount > 0
-                  ? `Open control settings; ${hiddenGroupCount} command groups hidden`
-                  : 'Open control settings'}
-                aria-haspopup="dialog"
-                aria-expanded={groupSettingsOpen}
-                title="Control layout and Program Halt settings."
-                onClick={() => setGroupSettingsOpen((open) => !open)}
-              >
-                <span className="transport-settings-glyph" aria-hidden="true">⚙</span>
-                {hiddenGroupCount > 0 && (
-                  <span
-                    className="transport-hidden-group-count"
-                    aria-hidden="true"
-                  >{hiddenGroupCount}</span>
-                )}
-              </button>
-              {groupSettingsOpen && (
-                <div className="transport-group-settings-menu" role="dialog" aria-label="Control settings">
-                  {hasMultipleScopes && <>
-                    <strong>Displayed groups</strong>
-                    {selections.map((group) => (
-                      <label className="transport-settings-option" key={group.groupId}>
-                        <input
-                          type="checkbox"
-                          checked={groupIds.includes(group.groupId)}
-                          onChange={(event) => {
-                            const nextGroupIds = event.target.checked
-                              ? [...new Set([...groupIds, group.groupId])]
-                              : groupIds.filter((id) => id !== group.groupId);
-                            if (nextGroupIds.length === 0) return;
-                            setSelection({ scopeKey, groupIds: nextGroupIds });
-                          }}
-                        />
-                        <span title={group.groupId}>{group.groupId === 'all' ? 'All groups' : group.groupId}</span>
-                      </label>
-                    ))}
-                  </>}
-                  <strong>Layout</strong>
-                  <label className="transport-settings-range">
-                    <span>Control width</span>
-                    <input
-                      type="range"
-                      min="6"
-                      max="11"
-                      step="0.25"
-                      value={preferences.controlWidthRem}
-                      onChange={(event) => setPreferences((current) => ({
-                        ...current,
-                        controlWidthRem: Number(event.target.value),
-                      }))}
-                    />
-                    <output>{preferences.controlWidthRem.toFixed(2).replace(/\.00$/, '')} rem</output>
-                  </label>
-                  <label className="transport-settings-option">
-                    <input
-                      type="checkbox"
-                      checked={preferences.confirmHalt}
-                      onChange={(event) => setPreferences((current) => ({
-                        ...current,
-                        confirmHalt: event.target.checked,
-                      }))}
-                    />
-                    <span>Confirm before halting the Program</span>
-                  </label>
-                  <label className="transport-settings-option">
-                    <input
-                      type="checkbox"
-                      checked={preferences.confirmReset}
-                      onChange={(event) => setPreferences((current) => ({
-                        ...current,
-                        confirmReset: event.target.checked,
-                      }))}
-                    />
-                    <span>Confirm before resetting a running Program</span>
-                  </label>
-                </div>
+              <span className="transport-settings-glyph" aria-hidden="true">⚙</span>
+              {hiddenGroupCount > 0 && (
+                <span
+                  className="transport-hidden-group-count"
+                  aria-hidden="true"
+                >{hiddenGroupCount}</span>
               )}
-            </div>
+              {viewerPreviewActive && hiddenGroupCount === 0 && (
+                <span className="viewer-preview-dot" aria-hidden="true" />
+              )}
+            </button>
           </div>
           </section>
         </div>
@@ -1410,6 +1407,96 @@ export function ProgramTransportControls({
               <dd>A node allowed to pause for the operator (its Recovery policy) failed: the tree waits and all Program motion is stopped until Retry or Reset.</dd>
             </div>
           </dl>
+        </details>
+        <details className="runtime-detail-group runtime-detail-disclosure">
+          <summary>3D viewer legend</summary>
+          <dl className="runtime-stop-levels">
+            <div>
+              <dt>Purple object</dt>
+              <dd>A Scene object as the owner currently has it.</dd>
+            </div>
+            <div>
+              <dt>Light blue object</dt>
+              <dd>The selected object.</dd>
+            </div>
+            <div>
+              <dt>Green object</dt>
+              <dd>An object attached to a robot or gripper.</dd>
+            </div>
+            <div>
+              <dt>Amber, see-through</dt>
+              <dd>The Program Draft&apos;s Scene: a preview, not the current Scene.</dd>
+            </div>
+            <div>
+              <dt>Robot ghost</dt>
+              <dd>A manual-move target preview: cyan when validated, amber while pending, red when rejected. It never moves the robot; only Approve does.</dd>
+            </div>
+            <div>
+              <dt>Orange wireframe</dt>
+              <dd>Collision geometry, when shown.</dd>
+            </div>
+            <div>
+              <dt>Light edges</dt>
+              <dd>Object outline, when shown: one edge per robot, gripper or object.</dd>
+            </div>
+            <div>
+              <dt>Settings</dt>
+              <dd>The gear next to this button opens the viewer settings: what is shown, frames and axes, and these control panels.</dd>
+            </div>
+          </dl>
+        </details>
+        <details className="runtime-detail-group runtime-detail-disclosure">
+          <summary>Status colours</summary>
+          <div className="status-legend">
+            <h4>Deployment button: runtime health</h4>
+            <dl className="status-legend-rows">
+              {([
+                ['ready', 'Green', 'every component is ready.'],
+                ['degraded', 'Amber', 'degraded: some components need attention.'],
+                ['fault', 'Red', 'a component is faulted.'],
+                ['offline', 'Dark red', 'offline: no component status.'],
+                ['waiting', 'Grey', 'waiting for the first status.'],
+              ] as const).map(([readiness, colour, text]) => (
+                <div key={readiness}>
+                  <dt><span className={`status-legend-button readiness-${readiness}`}>Deployment</span></dt>
+                  <dd><strong>{colour}</strong>: {text}</dd>
+                </div>
+              ))}
+            </dl>
+            <h4>Dot on the Deployment button</h4>
+            <dl className="status-legend-rows">
+              <div>
+                <dt><span className="status-legend-dot"><span className="deployment-status-indicator" /></span></dt>
+                <dd><strong>Green</strong>: the live status feed is connected.</dd>
+              </div>
+              <div>
+                <dt><span className="status-legend-dot offline"><span className="deployment-status-indicator" /></span></dt>
+                <dd><strong>Grey</strong>: live status unavailable; what you see may be stale.</dd>
+              </div>
+              <div>
+                <dt><span className="status-legend-dot"><span className="deployment-status-indicator has-attention">2</span></span></dt>
+                <dd><strong>Number</strong>: alarms or errors to review in Runtime / history.</dd>
+              </div>
+            </dl>
+            <h4>D / S / A beside the workspace buttons</h4>
+            <dl className="status-legend-rows">
+              <div>
+                <dt>
+                  <span className="status-legend-letters">
+                    <span className="document-state document-state-letter state-draft">D</span>
+                    <span className="document-state document-state-letter state-saved">S</span>
+                    <span className="document-state document-state-letter state-different">A</span>
+                  </span>
+                </dt>
+                <dd>
+                  <strong>Draft, Saved, Applied</strong> of the Program (left, Scene edits
+                  included) and of the Deployment (right). They appear only while
+                  something differs. Green matches, amber differs: Save, or Apply
+                  (Execute waits until Apply or Discard). Hover a letter for details.
+                </dd>
+              </div>
+            </dl>
+          </div>
         </details>
         <details className="runtime-detail-group runtime-detail-disclosure">
           <summary>Current setup</summary>

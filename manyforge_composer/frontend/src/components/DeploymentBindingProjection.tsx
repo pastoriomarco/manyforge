@@ -11,10 +11,10 @@ export function DeploymentBindingProjection({
 }) {
   const { binding, scenarioCandidates } = workspace;
   return (
-    <details className="deployment-binding-projection">
+    <details className="dcard">
       <summary>
-        Program Binding
-        <span>{binding === null ? 'no exact match' : `${binding.component_role_bindings.length} component roles`}</span>
+        <span>Program Binding</span>
+        <span className="dcard-meta">{binding === null ? 'no exact match' : `${binding.component_role_bindings.length} component roles`}</span>
       </summary>
       <div className="deployment-binding-body">
         {binding === null ? (

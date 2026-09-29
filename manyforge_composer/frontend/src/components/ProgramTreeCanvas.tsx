@@ -28,10 +28,10 @@ import {
 import '@xyflow/react/dist/style.css';
 
 import {
-  useComposerViewState,
   type LayoutDirection,
   type NodePresentationStatus,
 } from '../store/composerStore';
+import { requestOpenSettings } from '../state/settingsNavigation';
 import type {
   CatalogEntry,
   JsonValue,
@@ -79,6 +79,7 @@ import {
   type CanvasMenuItem,
 } from './CanvasContextMenu';
 import { CanvasViewControls } from './CanvasViewControls';
+import { useComposerSettings } from '../hooks/useComposerSettings';
 import { ProgramCanvasHelp } from './ProgramCanvasHelp';
 import {
   ProgramNoticeRail,
@@ -222,7 +223,15 @@ export function ProgramTreeCanvas({
   onDismissNotice = () => undefined,
   onDismissAllNotices = () => undefined,
 }: ProgramTreeCanvasProps) {
-  const [view, dispatchView] = useComposerViewState();
+  const composerSettings = useComposerSettings();
+  const edgeStyle = composerSettings.settings.treeEditor.linkStyle;
+  // The start direction is an installation setting. The toolbar toggle
+  // changes it for this session only (and re-lays out the tree, which is a
+  // Program edit).
+  const [sessionLayoutDirection, setSessionLayoutDirection] = useState<LayoutDirection | null>(null);
+  const view = {
+    layoutDirection: sessionLayoutDirection ?? composerSettings.settings.treeEditor.layoutDirection,
+  };
   const [presentationPositions, setPresentationPositions] = useState<
     Record<string, XYPosition>
   >({});
@@ -580,12 +589,12 @@ export function ProgramTreeCanvas({
       target: edge.target,
       type: 'statusEdge',
       data: {
-        edgeStyle: view.edgeStyle,
+        edgeStyle,
         layoutDirection: view.layoutDirection,
         targetStatus: nodeStatuses[edge.target] ?? 'idle',
       },
     })),
-    [edges, hidden, nodeStatuses, view.edgeStyle, view.layoutDirection],
+    [edgeStyle, edges, hidden, nodeStatuses, view.layoutDirection],
   );
   const positions = useMemo(
     () => new Map(graphNodes.map((node) => [node.id, node.position])),
@@ -806,12 +815,12 @@ export function ProgramTreeCanvas({
   }, [applyLayout, laidOut]);
   const changeLayoutDirection = useCallback((layoutDirection: LayoutDirection) => {
     if (layoutDirection === view.layoutDirection) return;
-    dispatchView({ type: 'set_layout_direction', layoutDirection });
+    setSessionLayoutDirection(layoutDirection);
     applyLayout(
       layoutNodes(layoutDirection),
       `${layoutDirection === 'vertical' ? 'Vertical' : 'Horizontal'} layout applied.`,
     );
-  }, [applyLayout, dispatchView, layoutNodes, view.layoutDirection]);
+  }, [applyLayout, layoutNodes, view.layoutDirection]);
 
   const parentOptions = selectedRow === null
     ? []
@@ -1242,17 +1251,6 @@ export function ProgramTreeCanvas({
         }}
       >
         <div className="program-canvas-topbar">
-          <button
-            ref={helpButton}
-            type="button"
-            className="icon-button program-canvas-help"
-            aria-label="Tree editor help"
-            aria-haspopup="dialog"
-            title="Tree editor help: how to operate it, colours and collapsing"
-            onClick={() => setHelpOpen(true)}
-          >
-            ?
-          </button>
           <ProgramNoticeRail
             notices={notices}
             onDismiss={onDismissNotice}
@@ -1260,12 +1258,12 @@ export function ProgramTreeCanvas({
           />
           <div className="program-canvas-toolbar">
             <CanvasViewControls
-              edgeStyle={view.edgeStyle}
+              edgeStyle={edgeStyle}
               layoutDirection={view.layoutDirection}
-              onEdgeStyleChange={(edgeStyle) => dispatchView({
-                type: 'set_edge_style',
-                edgeStyle,
-              })}
+              onEdgeStyleChange={(linkStyle) => composerSettings.update((current) => ({
+                ...current,
+                treeEditor: { ...current.treeEditor, linkStyle },
+              }))}
               onLayoutDirectionChange={changeLayoutDirection}
               onAutoLayout={autoLayout}
               onFitView={fitView}
@@ -1321,6 +1319,26 @@ export function ProgramTreeCanvas({
           <Background color={CANVAS_COLORS.grid} gap={24} />
           <Controls showInteractive />
         </ReactFlow>
+        {/* Same pattern as the 3D viewer: information and settings. */}
+        <div className="surface-corner-actions program-canvas-corner-actions">
+          <button
+            ref={helpButton}
+            type="button"
+            className="icon-button"
+            aria-label="Tree editor information"
+            aria-haspopup="dialog"
+            title="How to use the tree editor, colours and collapsing"
+            onClick={() => setHelpOpen(true)}
+          >i</button>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Program settings"
+            aria-haspopup="dialog"
+            title="Program settings, including how the tree editor draws it"
+            onClick={() => requestOpenSettings('program')}
+          ><span className="transport-settings-glyph" aria-hidden="true">⚙</span></button>
+        </div>
         {menu !== null && menu.edge !== undefined && (
           <CanvasContextMenu
             x={menu.x}

@@ -9,29 +9,16 @@ import {
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
-import type { CatalogEntry } from '../types/api';
 import { OverlayPanel } from './OverlayPanel';
-import { ProgramSettingsEditor } from './ProgramSettingsEditor';
 
 type ProgramAction = 'apply' | 'revert' | 'discard';
 
 interface ProgramDocumentControlsProps {
   controller: ProgramWorkspaceController;
   runtime: ProgramRuntimeController;
-  catalogEntries?: CatalogEntry[];
   localInvalidEdit?: boolean;
-  settingsRequest?: number;
   /** The workspace-independent Scenario New/Save/Save as/Load commands. */
   scenarioCommands?: ReactNode;
-  onProgramRequirementCreated?: (
-    kind: 'component_role' | 'target_role',
-    id: string,
-  ) => void;
-}
-
-function shortRevision(revision: string | null): string {
-  if (!revision) return 'none';
-  return revision.length > 18 ? `${revision.slice(0, 14)}…` : revision;
 }
 
 function actionTitle(action: ProgramAction): string {
@@ -45,11 +32,8 @@ function actionTitle(action: ProgramAction): string {
 export function ProgramDocumentControls({
   controller,
   runtime,
-  catalogEntries = [],
   localInvalidEdit = false,
-  settingsRequest = 0,
   scenarioCommands,
-  onProgramRequirementCreated,
 }: ProgramDocumentControlsProps) {
   const {
     state,
@@ -61,11 +45,7 @@ export function ProgramDocumentControls({
     scenarioSourceDiagnostics = [],
   } = controller;
   const [action, setAction] = useState<ProgramAction | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsInvalid, setSettingsInvalid] = useState(false);
   const returnFocus = useRef<HTMLElement | null>(null);
-  const settingsButton = useRef<HTMLButtonElement>(null);
-  const observedSettingsRequest = useRef(settingsRequest);
   const workspace = state.workspace;
   const program = workspace?.draft.program ?? null;
   const authoring = workspace?.draft.authoring ?? null;
@@ -95,12 +75,6 @@ export function ProgramDocumentControls({
     : `${affectedPolicyInstances.slice(0, 12).join(', ')}, and ${affectedPolicyInstances.length - 12} more`;
 
   useEffect(() => {
-    if (settingsRequest === observedSettingsRequest.current) return;
-    observedSettingsRequest.current = settingsRequest;
-    if (authoring !== null) setSettingsOpen(true);
-  }, [authoring, settingsRequest]);
-
-  useEffect(() => {
     if (!workspace?.hasUnsavedChanges && !workspace?.hasUnappliedChanges) return undefined;
     const protectDirtyDraft = (event: BeforeUnloadEvent) => {
       event.preventDefault();
@@ -126,15 +100,6 @@ export function ProgramDocumentControls({
   };
 
   const programName = authoring?.name ?? 'No Program';
-  const draftState = authoring !== null && program === null
-    ? 'incomplete'
-    : workspace?.hasUnsavedChanges ? 'modified' : 'draft';
-  const savedState = workspace?.saved.available
-    ? workspace.saved.matchesDraft ? 'saved' : 'different'
-    : 'unsaved';
-  const appliedState = workspace?.applied.available
-    ? workspace.applied.matchesDraft ? 'applied' : 'different'
-    : 'unavailable';
 
   return (
     <>
@@ -143,40 +108,6 @@ export function ProgramDocumentControls({
           <strong title={workspace?.saved.path ?? authoring?.description ?? programName}>
             {programName}
           </strong>
-          <span className="document-identity-divider" aria-hidden="true" />
-          <span
-            className={`document-state state-${draftState}`}
-            title={program === null && authoring !== null
-              ? `${workspace?.draft.diagnostics.length ?? 0} issue(s) · ${incompleteReason}`
-              : `Draft ${shortRevision(workspace?.draft.programRevision ?? null)} · ID ${workspace?.draft.draftId ?? 'unavailable'} · edit ${workspace?.draft.draftRevision ?? 0}`}
-          >
-            {draftState}
-          </span>
-          <span
-            className={`document-state state-${savedState}`}
-            title={workspace?.saved.path ?? 'No Saved Program path'}
-          >
-            {savedState}
-          </span>
-          <span
-            className={`document-state state-${appliedState}`}
-            title={workspace?.applied.unavailableReason?.message ?? `Applied ${shortRevision(workspace?.applied.programRevision ?? null)}`}
-          >
-            {appliedState}
-          </span>
-          <span className="document-identity-divider document-settings-divider" aria-hidden="true" />
-          <button
-            ref={settingsButton}
-            type="button"
-            className="icon-button program-settings-button"
-            aria-label="Program-wide settings"
-            title="Program-wide settings"
-            disabled={authoring === null}
-            onClick={() => setSettingsOpen(true)}
-          >
-            ⚙
-          </button>
-          <span className="document-identity-divider document-settings-divider" aria-hidden="true" />
         </div>
 
         <div className="document-actions">
@@ -224,31 +155,6 @@ export function ProgramDocumentControls({
           <span>Apply will capture and validate the current source contents.</span>
         </div>
       )}
-
-      <OverlayPanel
-        open={settingsOpen}
-        title="Program settings"
-        titleId="program-settings-title"
-        kind="info"
-        onClose={() => {
-          if (!settingsInvalid) setSettingsOpen(false);
-        }}
-        returnFocusRef={settingsButton}
-      >
-        {authoring && (
-          <ProgramSettingsEditor
-            program={authoring}
-            catalogEntries={catalogEntries}
-            candidateRevision={workspace?.draft.programRevision ?? null}
-            busy={authoringBusy}
-            runtime={runtime}
-            onMutate={controller.mutate}
-            onInvalidChange={setSettingsInvalid}
-            onRoleCreated={onProgramRequirementCreated}
-            diagnostics={workspace?.draft.diagnostics ?? []}
-          />
-        )}
-      </OverlayPanel>
 
       <OverlayPanel
         open={action !== null}

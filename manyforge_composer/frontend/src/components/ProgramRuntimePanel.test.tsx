@@ -12,6 +12,7 @@ import type {
 import { statusFixture } from '../testFixtures/robotControl';
 import {
   deriveTransportGuidance,
+  MotionControlSettings,
   ProgramRuntimePanel,
   ProgramTransportControls,
 } from './ProgramRuntimePanel';
@@ -155,6 +156,7 @@ function controller(
 ): ProgramRuntimeController {
   return {
     commandAllowed: vi.fn(() => true),
+    startBlockedReason: null,
     state: {
       currentScenario: null,
       applied: {
@@ -377,6 +379,52 @@ describe('Program runtime projection', () => {
       <ProgramRuntimePanel enabled controller={executionStoppedWithStaleOffer} />,
     );
     expect(staleOfferMarkup).toContain('<strong>Stopped</strong>');
+  });
+
+  it('edits displayed groups in the Draft and applies them to the Motion panel after Apply', () => {
+    const changes: string[][] = [];
+    const settings = renderToStaticMarkup(
+      <MotionControlSettings groups={{
+        groupIds: ['all', 'robot_a', 'robot_b'],
+        hidden: undefined,
+        pendingApply: true,
+        onChange: (hidden) => changes.push(hidden),
+      }} />,
+    );
+    expect(settings).toMatch(/<span>Displayed groups<\/span><span class="settings-scope" data-scope="program"[^>]*>Program<\/span>/);
+    expect(settings).toContain('Changed in the Draft, not applied yet.');
+    expect(settings).toMatch(/<span>Layout and confirmations<\/span><span class="settings-scope" data-scope="installation"[^>]*>Installation<\/span>/);
+    expect(settings).toContain('Confirm before halting the Program');
+    // Default: named groups shown, "all" not.
+    expect(settings).toMatch(/<input type="checkbox"\/><span title="all">All groups/);
+
+    const readOnly = renderToStaticMarkup(
+      <MotionControlSettings groups={{
+        groupIds: ['all', 'robot_a'], hidden: ['robot_a'], pendingApply: false,
+      }} />,
+    );
+    expect(readOnly).toContain('The Program Draft cannot be edited right now.');
+    expect(readOnly).toMatch(/<fieldset aria-label="Displayed groups" disabled="">/);
+
+    // The Applied Program's choice drives the Motion panel.
+    const running = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    const group = controls.executionSelections.groups[0];
+    controls.executionSelections.groups = [
+      group,
+      { ...group, groupId: 'robot_a' },
+      { ...group, groupId: 'robot_b' },
+    ];
+    running.state.controls = controls;
+    running.state.applied!.program.viewer = { hidden_execution_groups: ['all', 'robot_b'] };
+    const transport = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={running} robot={robotController()} />,
+    );
+    expect(transport).toContain('robot_a controls');
+    expect(transport).not.toContain('robot_b controls');
+    expect(transport).toMatch(/aria-label="Open viewer settings; 1 command groups hidden"/);
+    expect(changes).toEqual([]);
   });
 
   it('shows Retry during a failure pause, disabled until containment is confirmed', () => {
@@ -774,7 +822,8 @@ describe('Program runtime projection', () => {
     );
 
     expect(markup).toContain('aria-label="Program run information"');
-    expect(markup).toMatch(/aria-label="Open control settings(?:; [^"]+)?"/);
+    // The gear opens the 3D viewer settings, which hold these controls.
+    expect(markup).toMatch(/aria-label="Open viewer settings(?:; [^"]+)?"/);
     expect(markup).toContain('class="transport-unique-icons"');
     expect(markup).toContain('robot_group controls');
     // The default layout hides only "all", which is not counted.
@@ -785,16 +834,13 @@ describe('Program runtime projection', () => {
       /\.transport-unique-icons \{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/s,
     );
     expect(css).toMatch(
-      /\.transport-group-settings > button \{[^}]*width: 100%;[^}]*height: 100%;/s,
+      /\.transport-unique-icons > \.transport-settings-button \{[^}]*position: relative;/s,
     );
     expect(css).toMatch(
       /\.transport-group-scale \{[^}]*font-size: 0\.84rem;/s,
     );
     expect(css).toMatch(
       /\.transport-settings-glyph \{[^}]*font-size: 1\.3rem;/s,
-    );
-    expect(css).toMatch(
-      /\.transport-group-settings-menu \.transport-settings-option \{[^}]*grid-template-columns: 1rem minmax\(0, 1fr\);[^}]*opacity: 1;/s,
     );
     expect(css).toMatch(
       /\.viewer-transport \.transport-run:hover:not\(:disabled\),[\s\S]*\.transport-group-resume:hover:not\(:disabled\)/,

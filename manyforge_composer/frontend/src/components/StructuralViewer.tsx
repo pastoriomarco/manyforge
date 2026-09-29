@@ -34,6 +34,11 @@ import {
 import type { PointCloudFrame } from '../api/pointcloudObserverClient';
 import { usePointCloudFrame } from '../hooks/usePointCloudFrame';
 import { SceneOutline } from './SceneOutline';
+import { PendingApplyNote, SettingsSubheading } from './SettingsScope';
+import { useComposerSettings } from '../hooks/useComposerSettings';
+import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
+import { onOpenSettingsRequest } from '../state/settingsNavigation';
+import { DEFAULT_COMPOSER_SETTINGS, type ComposerSettings } from '../state/composerSettings';
 import { SnapshotResponder } from './SnapshotResponder';
 import {
   MAX_AUTHORITATIVE_INTERPOLATION_MS,
@@ -193,7 +198,14 @@ interface StructuralViewerProps {
    * so its Stop is at hand. */
   robotMotionActive?: boolean;
   objectControlSurface?: ReactNode;
-  transportControls?: ReactNode | ((openRobotControls: () => void) => ReactNode);
+  transportControls?: ReactNode | ((
+    openRobotControls: () => void,
+    viewerSettings: { open: () => void; previewLayerActive: boolean },
+  ) => ReactNode);
+  /** Motion panel settings shown in the viewer settings panel. */
+  controlPanelSettings?: ReactNode;
+  /** Program viewer settings whose Draft value is not applied yet. */
+  programViewerPendingApply?: { frameAxes: boolean; objectAxes: boolean };
   runtimeOverlay?: ReactNode;
   inspectorTarget?: HTMLElement | null;
   inspectorMinimized?: boolean;
@@ -221,7 +233,7 @@ interface ViewerFailureBoundaryState {
   failed: boolean;
 }
 
-export const DEFAULT_WIREFRAME_VISIBLE = false;
+export const DEFAULT_WIREFRAME_VISIBLE = DEFAULT_COMPOSER_SETTINGS.viewer.wireframeOverlays;
 export const DEFAULT_COMPARISON_GHOST_VISIBLE = false;
 
 export type SceneObjectAppearance =
@@ -2955,6 +2967,8 @@ function StructuralViewerContent({
   robotMotionActive = false,
   objectControlSurface,
   transportControls,
+  controlPanelSettings,
+  programViewerPendingApply,
   runtimeOverlay,
   inspectorTarget = null,
   inspectorMinimized = false,
@@ -2962,12 +2976,22 @@ function StructuralViewerContent({
   onInspectorMaximize,
   onInspectorPanelChange,
 }: StructuralViewerProps) {
-  const [collisionsVisible, setCollisionsVisible] = useState(false);
-  const [wireframeVisible, setWireframeVisible] = useState(
-    DEFAULT_WIREFRAME_VISIBLE,
+  // Display toggles are installation settings (UA7W.11): they say what to
+  // show when the data exists, never that it exists.
+  const composerSettings = useComposerSettings();
+  const {
+    collisionGeometry: collisionsVisible,
+    wireframeOverlays: wireframeVisible,
+    pointCloud: pointCloudVisible,
+    objectOutline: outlineVisible,
+  } = composerSettings.settings.viewer;
+  const updateComposerSettings = composerSettings.update;
+  const setViewerSetting = useCallback(
+    (key: keyof ComposerSettings['viewer'], value: boolean) => updateComposerSettings(
+      (current) => ({ ...current, viewer: { ...current.viewer, [key]: value } }),
+    ),
+    [updateComposerSettings],
   );
-  const [pointCloudVisible, setPointCloudVisible] = useState(false);
-  const [outlineVisible, setOutlineVisible] = useState(false);
   const [sessionFrameAxes, setSessionFrameAxes] = useState<Set<string>>(
     () => new Set(frameAxes.filter((frame) => (
       frame.defaultVisible && frame.poseAvailable
@@ -3015,6 +3039,7 @@ function StructuralViewerContent({
     () => new Set(),
   );
   const [inspectorPanel, setInspectorPanel] = useState<ViewerInspectorPanel>(null);
+  const viewerSettingsPanel = useCardPanelLayout();
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const contextAvailability = contextMenu === null
     ? null
@@ -3167,6 +3192,13 @@ function StructuralViewerContent({
     onInspectorMinimizedChange?.(false);
   }, [inspectorMinimized, inspectorPanel, onInspectorMinimizedChange, robotPanelLocked]);
   const robotLockTitle = 'A robot move is active: Robot control stays open until it ends.';
+  const openViewerSettings = useCallback(() => {
+    // A manual move keeps Robot control open (its Stop at hand).
+    if (robotPanelLocked) return;
+    setInspectorPanel('tools');
+    onInspectorMinimizedChange?.(false);
+  }, [onInspectorMinimizedChange, robotPanelLocked]);
+  useEffect(() => onOpenSettingsRequest('viewer', openViewerSettings), [openViewerSettings]);
 
   const visualCount = manifest.status === 'ready'
     ? manifest.data.links.reduce((total, link) => total + link.visuals.length, 0)
@@ -3449,22 +3481,6 @@ function StructuralViewerContent({
               title={robotPanelLocked ? robotLockTitle : undefined}
               onClick={() => toggleInspectorPanel('object')}
             >Object</button>
-            <button
-              type="button"
-              aria-pressed={inspectorPanel === 'tools'}
-              disabled={robotPanelLocked}
-              aria-label={auxiliaryViewerSourcesActive
-                ? 'Viewer tools; preview layer visible'
-                : 'Viewer tools'}
-              title={robotPanelLocked
-                ? robotLockTitle
-                : auxiliaryViewerSourcesActive
-                  ? 'A Draft scene or target preview is visible. Open Tools for layer details.'
-                  : 'Viewer tools'}
-              onClick={() => toggleInspectorPanel('tools')}
-            >Tools{auxiliaryViewerSourcesActive && (
-              <span className="viewer-preview-dot" aria-hidden="true" />
-            )}</button>
           </div>
         </div>
       </header>
@@ -3648,6 +3664,9 @@ function StructuralViewerContent({
         {typeof transportControls === 'function' ? transportControls(() => {
           setInspectorPanel('robot');
           onInspectorMinimizedChange?.(false);
+        }, {
+          open: openViewerSettings,
+          previewLayerActive: auxiliaryViewerSourcesActive,
         }) : transportControls}
       </div>
 
@@ -3660,12 +3679,12 @@ function StructuralViewerContent({
         >
           <header className="central-inspector-header">
             <strong>{inspectorPanel === 'tools'
-              ? 'Viewer tools'
+              ? 'Viewer settings'
               : inspectorPanel === 'robot'
                 ? 'Robot control'
                 : inspectorPanel === 'object'
                   ? 'Selected object'
-                  : 'Viewer tools'}</strong>
+                  : 'Viewer settings'}</strong>
             {inspectorPanel === 'robot' && robotControlBlocked && (
               <span className="central-inspector-warning" title="The current manual target has no executable preview. Check the Robot panel; this is not a Program fault.">Check preview</span>
             )}
@@ -3710,7 +3729,7 @@ function StructuralViewerContent({
                   <p className="panel-state">Robot control is unavailable.</p>
                 )
               ) : inspectorPanel === 'tools' ? (
-                <div className="viewer-options-body">
+                <div ref={viewerSettingsPanel} className="viewer-options-body dpanel">
                   {auxiliaryViewerSourcesActive && (
                     <div className="viewer-active-sources" aria-label="Visible non-primary sources">
                       <strong>Visible non-primary sources</strong>
@@ -3734,12 +3753,18 @@ function StructuralViewerContent({
                       )}
                     </div>
                   )}
+                  <section className="dcard">
+                  <SettingsSubheading
+                    title="Display"
+                    scope="installation"
+                    onRestoreDefaults={() => composerSettings.restoreSection('viewer')}
+                  />
                   <label className="toggle-control">
                     <input
                       type="checkbox"
                       aria-label="Wireframe overlays"
                       checked={wireframeVisible}
-                      onChange={(event) => setWireframeVisible(event.target.checked)}
+                      onChange={(event) => setViewerSetting('wireframeOverlays', event.target.checked)}
                     />
                     <span>Wireframe overlays</span>
                   </label>
@@ -3750,7 +3775,7 @@ function StructuralViewerContent({
                     <input
                       type="checkbox"
                       checked={outlineVisible}
-                      onChange={(event) => setOutlineVisible(event.target.checked)}
+                      onChange={(event) => setViewerSetting('objectOutline', event.target.checked)}
                     />
                     <span>Object outline</span>
                   </label>
@@ -3758,7 +3783,7 @@ function StructuralViewerContent({
                     <input
                       type="checkbox"
                       checked={collisionsVisible}
-                      onChange={(event) => setCollisionsVisible(event.target.checked)}
+                      onChange={(event) => setViewerSetting('collisionGeometry', event.target.checked)}
                       disabled={manifest.status !== 'ready'}
                     />
                     <span>Collision geometry</span>
@@ -3767,7 +3792,7 @@ function StructuralViewerContent({
                     <input
                       type="checkbox"
                       checked={pointCloudVisible}
-                      onChange={(event) => setPointCloudVisible(event.target.checked)}
+                      onChange={(event) => setViewerSetting('pointCloud', event.target.checked)}
                       disabled={pointCloudCellId === undefined}
                     />
                     <span>Point cloud</span>
@@ -3782,9 +3807,43 @@ function StructuralViewerContent({
                     />
                     <span>Comparison ghost</span>
                   </label>
-                  <details className="viewer-axes-section" open>
+                  </section>
+                  <details className="dcard" open>
                     <summary>Frames and joints</summary>
-                    <div className="viewer-axes-actions">
+                    <SettingsSubheading title="Size" scope="program" />
+                    <label>
+                      <span>Axis length</span>
+                      <span className="dunit">
+                        <input
+                          type="range"
+                          min={0.02}
+                          max={1}
+                          step={0.01}
+                          value={frameAxesSizeM}
+                          onChange={(event) => setFrameAxesSizeM(event.currentTarget.valueAsNumber)}
+                          onPointerUp={(event) => onAxesSizesCommit?.(
+                            event.currentTarget.valueAsNumber,
+                            objectAxesSizeM,
+                          )}
+                          onKeyUp={(event) => onAxesSizesCommit?.(
+                            event.currentTarget.valueAsNumber,
+                            objectAxesSizeM,
+                          )}
+                        />
+                        <output>{frameAxesSizeM.toFixed(2)} m</output>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const reset = viewer?.frame_gizmo_size_m ?? 0.1;
+                            setFrameAxesSizeM(reset);
+                            onAxesSizesCommit?.(reset, objectAxesSizeM);
+                          }}
+                        >Reset</button>
+                        </span>
+                    </label>
+                    {programViewerPendingApply?.frameAxes === true && <PendingApplyNote />}
+                    <SettingsSubheading title="Shown" scope="session" />
+                    <div className="dactions">
                       <button
                         type="button"
                         onClick={() => setSessionFrameAxes(new Set(
@@ -3805,34 +3864,6 @@ function StructuralViewerContent({
                         ))}
                       >Reset visibility</button>
                     </div>
-                    <label className="viewer-axes-size">
-                      <span>Axes size</span>
-                      <input
-                        type="range"
-                        min={0.02}
-                        max={1}
-                        step={0.01}
-                        value={frameAxesSizeM}
-                        onChange={(event) => setFrameAxesSizeM(event.currentTarget.valueAsNumber)}
-                        onPointerUp={(event) => onAxesSizesCommit?.(
-                          event.currentTarget.valueAsNumber,
-                          objectAxesSizeM,
-                        )}
-                        onKeyUp={(event) => onAxesSizesCommit?.(
-                          event.currentTarget.valueAsNumber,
-                          objectAxesSizeM,
-                        )}
-                      />
-                      <output>{frameAxesSizeM.toFixed(2)} m</output>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const reset = viewer?.frame_gizmo_size_m ?? 0.1;
-                          setFrameAxesSizeM(reset);
-                          onAxesSizesCommit?.(reset, objectAxesSizeM);
-                        }}
-                      >Reset size</button>
-                    </label>
                     <div className="viewer-axes-list">
                       {modelAxisRows.map((row) => (
                         <label
@@ -3868,9 +3899,42 @@ function StructuralViewerContent({
                       ))}
                     </div>
                   </details>
-                  <details className="viewer-axes-section" open>
+                  <details className="dcard" open>
                     <summary>Object axes</summary>
-                    <div className="viewer-axes-actions">
+                    <SettingsSubheading title="Size" scope="program" />
+                    <label>
+                      <span>Axis length</span>
+                      <span className="dunit">
+                        <input
+                          type="range"
+                          min={0.02}
+                          max={1}
+                          step={0.01}
+                          value={objectAxesSizeM}
+                          onChange={(event) => setObjectAxesSizeM(event.currentTarget.valueAsNumber)}
+                          onPointerUp={(event) => onAxesSizesCommit?.(
+                            frameAxesSizeM,
+                            event.currentTarget.valueAsNumber,
+                          )}
+                          onKeyUp={(event) => onAxesSizesCommit?.(
+                            frameAxesSizeM,
+                            event.currentTarget.valueAsNumber,
+                          )}
+                        />
+                        <output>{objectAxesSizeM.toFixed(2)} m</output>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const reset = viewer?.object_axes_gizmo_size_m ?? 0.1;
+                            setObjectAxesSizeM(reset);
+                            onAxesSizesCommit?.(frameAxesSizeM, reset);
+                          }}
+                        >Reset</button>
+                        </span>
+                    </label>
+                    {programViewerPendingApply?.objectAxes === true && <PendingApplyNote />}
+                    <SettingsSubheading title="Shown" />
+                    <div className="dactions">
                       <button
                         type="button"
                         onClick={() => onObjectAxesVisibleIdsChange?.(
@@ -3891,73 +3955,59 @@ function StructuralViewerContent({
                         )}
                       >Reset visibility</button>
                     </div>
-                    <label className="viewer-axes-size">
-                      <span>Axes size</span>
-                      <input
-                        type="range"
-                        min={0.02}
-                        max={1}
-                        step={0.01}
-                        value={objectAxesSizeM}
-                        onChange={(event) => setObjectAxesSizeM(event.currentTarget.valueAsNumber)}
-                        onPointerUp={(event) => onAxesSizesCommit?.(
-                          frameAxesSizeM,
-                          event.currentTarget.valueAsNumber,
-                        )}
-                        onKeyUp={(event) => onAxesSizesCommit?.(
-                          frameAxesSizeM,
-                          event.currentTarget.valueAsNumber,
-                        )}
-                      />
-                      <output>{objectAxesSizeM.toFixed(2)} m</output>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const reset = viewer?.object_axes_gizmo_size_m ?? 0.1;
-                          setObjectAxesSizeM(reset);
-                          onAxesSizesCommit?.(frameAxesSizeM, reset);
-                        }}
-                      >Reset size</button>
-                    </label>
-                    <div className="viewer-axes-list">
-                      {presentedObjectAxesRows.map((row) => (
-                        <label
-                          key={row.sceneResourceId}
-                          className={row.poseAvailable ? undefined : 'unavailable'}
-                          title={row.poseAvailable
-                            ? row.persistent
-                              ? 'Stored in the Program Draft.'
-                              : 'Session presentation only.'
-                            : 'The object is hidden, so its axes have no visible pose.'}
-                        >
-                          <input
-                            type="checkbox"
-                            disabled={!row.poseAvailable}
-                            checked={objectAxesVisible.has(row.sceneResourceId)}
-                            onChange={(event) => {
-                              const next = new Set(objectAxesVisible);
-                              if (event.target.checked) next.add(row.sceneResourceId);
-                              else next.delete(row.sceneResourceId);
-                              onObjectAxesVisibleIdsChange?.([...next].sort());
-                            }}
-                          />
-                          <span>
-                            <strong>{row.sceneResourceId}</strong>
-                            <small>{[
-                              row.attached ? 'Attached' : null,
-                              row.persistent
-                                ? 'Program Draft setting'
-                                : `${row.sourceLabel} session setting`,
-                            ].filter(Boolean).join(' · ')}</small>
-                          </span>
-                        </label>
-                      ))}
-                      {presentedObjectAxesRows.length === 0 && (
-                        <span className="muted">No current objects</span>
-                      )}
-                    </div>
+                    {([
+                      ['Program objects', 'program', presentedObjectAxesRows.filter((row) => row.persistent)],
+                      ['Other objects', 'session', presentedObjectAxesRows.filter((row) => !row.persistent)],
+                    ] as const).map(([title, scope, rows]) => rows.length > 0 && (
+                      <div className="viewer-axes-group" key={title}>
+                        <SettingsSubheading title={title} scope={scope} minor />
+                        <div className="viewer-axes-list">
+                          {rows.map((row) => (
+                            <label
+                              key={row.sceneResourceId}
+                              className={row.poseAvailable ? undefined : 'unavailable'}
+                              title={row.poseAvailable
+                                ? row.persistent
+                                  ? 'Stored in the Program Draft.'
+                                  : 'Session presentation only.'
+                                : 'The object is hidden, so its axes have no visible pose.'}
+                            >
+                              <input
+                                type="checkbox"
+                                disabled={!row.poseAvailable}
+                                checked={objectAxesVisible.has(row.sceneResourceId)}
+                                onChange={(event) => {
+                                  const next = new Set(objectAxesVisible);
+                                  if (event.target.checked) next.add(row.sceneResourceId);
+                                  else next.delete(row.sceneResourceId);
+                                  onObjectAxesVisibleIdsChange?.([...next].sort());
+                                }}
+                              />
+                              <span>
+                                <strong>{row.sceneResourceId}</strong>
+                                <small>{[
+                                  row.attached ? 'Attached' : null,
+                                  row.persistent ? null : row.sourceLabel,
+                                ].filter(Boolean).join(' · ')}</small>
+                              </span>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    {presentedObjectAxesRows.length === 0 && (
+                      <span className="muted">No current objects</span>
+                    )}
                   </details>
-                  <div className="viewer-options-actions">
+                  {controlPanelSettings !== undefined && (
+                    <details className="dcard" open>
+                      <summary>Control panels</summary>
+                      {controlPanelSettings}
+                    </details>
+                  )}
+                  <section className="dcard">
+                  <h4>Layers and model</h4>
+                  <div className="dactions">
                     <button
                       type="button"
                       className="quiet-button"
@@ -3976,22 +4026,25 @@ function StructuralViewerContent({
                     >{pointCloud.frame.pointCount} points</span>
                   )}
                   {manifest.status === 'ready' && (
-                    <details className="viewer-model-facts">
+                    <details className="dcard">
                       <summary>Model and source facts</summary>
-                      <span>Cell <code>{manifest.data.cell_id}</code></span>
-                      <span>{manifest.data.links.length} links · {manifest.data.joints.length} joints</span>
-                      <span>{sceneObjects.length} {programDraftPreview ? 'Draft-preview' : 'owner-scene'} objects</span>
-                      <span>Root <code>{manifest.data.projection.root_frame}</code></span>
-                      <span>Model <code>{manifest.data.model_key}</code></span>
-                      <span>Bundle <code>{manifest.data.retained_bundle_id}</code></span>
-                      <span>Retained model <strong>neutral coordinates</strong></span>
-                      <span>Owner observation <strong>{runtimePresentation === undefined
-                        ? 'unavailable'
-                        : `${runtimePresentation.status.freshGood} fresh / ${runtimePresentation.status.total} sources`}</strong></span>
-                      <span>Scene overlay <strong>owner-issued</strong></span>
-                      <span>Operational validity <strong>not asserted</strong></span>
+                      <dl>
+                        <div><dt>Cell</dt><dd><code>{manifest.data.cell_id}</code></dd></div>
+                        <div><dt>Model size</dt><dd>{manifest.data.links.length} links · {manifest.data.joints.length} joints</dd></div>
+                        <div><dt>Objects</dt><dd>{sceneObjects.length} {programDraftPreview ? 'Draft-preview' : 'owner-scene'}</dd></div>
+                        <div><dt>Root</dt><dd><code>{manifest.data.projection.root_frame}</code></dd></div>
+                        <div><dt>Model</dt><dd><code>{manifest.data.model_key}</code></dd></div>
+                        <div><dt>Bundle</dt><dd><code>{manifest.data.retained_bundle_id}</code></dd></div>
+                        <div><dt>Retained model</dt><dd>neutral coordinates</dd></div>
+                        <div><dt>Owner observation</dt><dd>{runtimePresentation === undefined
+                          ? 'unavailable'
+                          : `${runtimePresentation.status.freshGood} fresh / ${runtimePresentation.status.total} sources`}</dd></div>
+                        <div><dt>Scene overlay</dt><dd>owner-issued</dd></div>
+                        <div><dt>Operational validity</dt><dd>not asserted</dd></div>
+                      </dl>
                     </details>
                   )}
+                  </section>
                 </div>
               ) : objectControlSurface !== undefined ? (
                 <>
@@ -4024,19 +4077,17 @@ function StructuralViewerContent({
                   {objectControlSurface}
                 </>
               ) : selectedObject !== null ? (
-          <div className="viewer-object-quick-panel">
+          <div className="viewer-object-quick-panel dpanel">
             <div className="robot-control-step-controls" aria-label="Object control increments"><GizmoSteps gizmo={gizmo} /></div>
+            <section className="dcard">
+            <h4>Object</h4>
             <dl>
-              <dt>Scene resource</dt>
-              <dd><code>{selectedObject.scene_resource_id}</code></dd>
-              <dt>Placement</dt>
-              <dd>{selectedObject.placement.kind.replaceAll('_', ' ')}</dd>
-              <dt>Geometry</dt>
-              <dd>{selectedObject.collision_shapes.length} collision shape(s)</dd>
-              <dt>Source</dt>
-              <dd>{programDraftPreview ? 'Program Draft preview' : 'owner-issued scene'}</dd>
+              <div><dt>Scene resource</dt><dd><code>{selectedObject.scene_resource_id}</code></dd></div>
+              <div><dt>Placement</dt><dd>{selectedObject.placement.kind.replaceAll('_', ' ')}</dd></div>
+              <div><dt>Geometry</dt><dd>{selectedObject.collision_shapes.length} collision shape(s)</dd></div>
+              <div><dt>Source</dt><dd>{programDraftPreview ? 'Program Draft preview' : 'owner-issued scene'}</dd></div>
             </dl>
-            <div className="button-row">
+            <div className="dactions">
               <button
                 type="button"
                 onClick={() => issueCameraCommand('frame_selection')}
@@ -4086,18 +4137,22 @@ function StructuralViewerContent({
                 onClick={() => { void onRemoveSceneResource?.(selectedObject.scene_resource_id); }}
               >Remove</button>
             </div>
+            </section>
           </div>
               ) : selectedStructureName !== null ? (
-          <div className="viewer-object-quick-panel">
+          <div className="viewer-object-quick-panel dpanel">
+            <section className="dcard">
+            <h4>Robot link</h4>
             <dl>
-              <dt>Robot link</dt>
-              <dd><code>{selectedStructureName}</code></dd>
-              <dt>Source</dt>
-              <dd>retained structure</dd>
+              <div><dt>Link</dt><dd><code>{selectedStructureName}</code></dd></div>
+              <div><dt>Source</dt><dd>retained structure</dd></div>
             </dl>
-            <button type="button" onClick={() => issueCameraCommand('frame_selection')}>
-              Frame link
-            </button>
+            <div className="dactions">
+              <button type="button" onClick={() => issueCameraCommand('frame_selection')}>
+                Frame link
+              </button>
+            </div>
+            </section>
           </div>
               ) : (
           <p className="panel-state">

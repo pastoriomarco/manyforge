@@ -38,7 +38,7 @@ export function ProgramNoticeRail({
   }, [expandable]);
   const restoreFocus = () => window.requestAnimationFrame(() => {
     const target = document.querySelector<HTMLElement>(
-      '.program-notice-rail button, .program-canvas-help',
+      '.program-notice-rail button, .program-canvas-corner-actions button',
     );
     target?.focus();
   });

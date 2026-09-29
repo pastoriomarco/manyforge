@@ -119,7 +119,6 @@ describe('DeploymentDocumentEditor', () => {
     expect(appliedMarkup).toMatch(
       /<button[^>]*disabled=""[^>]*title="Draft already matches Manager Applied\."[^>]*>Discard<\/button>/,
     );
-    expect(appliedMarkup).toMatch(/state-applied">applied<\/span>/);
     expect(appliedMarkup).toMatch(
       /<button[^>]*disabled=""[^>]*title="Draft already matches Manager Applied\."[^>]*>Apply<\/button>/,
     );

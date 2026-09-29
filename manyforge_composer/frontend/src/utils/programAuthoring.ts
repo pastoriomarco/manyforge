@@ -89,7 +89,7 @@ export type ProgramSemanticCreateTarget =
  * `cycle_speed` as long as motion-node velocity_scale fields bind to it.
  */
 export function deriveProgramMotionConfiguration(
-  program: ProgramAuthoringDocument,
+  program: Pick<ProgramAuthoringDocument, 'parameters' | 'forest'>,
   entries: CatalogEntry[],
 ): ProgramMotionConfigurationResult {
   if (entries.length === 0) {
@@ -190,6 +190,47 @@ export function deriveProgramMotionConfiguration(
     available: true,
     configuration: { bindings, values, usageCounts, applicableCounts },
   };
+}
+
+/** Program motion defaults that also seed manual Cartesian moves. */
+export const PROGRAM_MANUAL_CARTESIAN_FIELDS: readonly ProgramMotionField[] = [
+  'translation_tol_m',
+  'max_blend_deviation_rad',
+];
+
+/** What makes one Program parameter a Program motion default. */
+export interface ProgramMotionDefaultRole {
+  field: ProgramMotionField;
+  /** Motion-node fields bound to it, out of all that accept this field. */
+  bound: number;
+  applicable: number;
+  /** Velocity and acceleration: node values may not exceed it. */
+  ceiling: boolean;
+  /** Also the default for manual Cartesian moves. */
+  manualDefault: boolean;
+}
+
+/**
+ * Program parameters acting as Program motion defaults, by parameter ID,
+ * from the same resolver as the Motion defaults settings and the manual
+ * Cartesian defaults. Empty when that resolver cannot identify them.
+ */
+export function programMotionDefaultRoles(
+  result: ProgramMotionConfigurationResult,
+): Map<string, ProgramMotionDefaultRole> {
+  const roles = new Map<string, ProgramMotionDefaultRole>();
+  if (!result.available) return roles;
+  const { bindings, usageCounts, applicableCounts } = result.configuration;
+  for (const field of PROGRAM_MOTION_FIELDS) {
+    roles.set(bindings[field], {
+      field,
+      bound: usageCounts[field],
+      applicable: applicableCounts[field],
+      ceiling: (PROGRAM_MOTION_CEILING_FIELDS as readonly string[]).includes(field),
+      manualDefault: PROGRAM_MANUAL_CARTESIAN_FIELDS.includes(field),
+    });
+  }
+  return roles;
 }
 
 function jsonRecord(value: JsonValue | undefined): Record<string, JsonValue> | null {

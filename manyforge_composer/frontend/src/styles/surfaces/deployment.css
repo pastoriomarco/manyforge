@@ -72,34 +72,9 @@
   padding: 0.7rem;
 }
 
-.deployment-binding-projection {
-  margin: 0.7rem 0.7rem 0;
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-md-sm);
-  background: var(--mf-bg-neutral-08);
-}
-
-.deployment-binding-projection > summary {
-  display: flex;
-  justify-content: space-between;
-  gap: 0.6rem;
-  padding: 0.48rem 0.62rem;
-  color: var(--mf-text-neutral-80);
-  font-size: var(--mf-font-size-072);
-  font-weight: var(--mf-font-weight-semibold);
-  cursor: pointer;
-}
-
-.deployment-binding-projection > summary span {
-  color: var(--mf-text-neutral-55);
-  font-weight: var(--mf-font-weight-regular);
-}
-
 .deployment-binding-body {
   display: grid;
   gap: 0.7rem;
-  padding: 0.6rem;
-  border-top: 1px solid var(--mf-border-neutral-23);
 }
 
 .deployment-binding-identities,
@@ -182,8 +157,7 @@
 }
 
 .deployment-object > summary,
-.deployment-collection > summary,
-.deployment-manager-boundary > summary {
+.deployment-collection > summary {
   padding: 0.48rem 0.62rem;
   color: var(--mf-text-neutral-80);
   font-size: var(--mf-font-size-072);
@@ -257,39 +231,14 @@
   font-size: var(--mf-font-size-065);
 }
 
-.deployment-manager-boundary {
-  margin: 0.7rem;
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-md-sm);
-}
-
 .deployment-focused-editor {
   display: grid;
   gap: 0.5rem;
-  padding: 0.7rem;
-}
-
-.deployment-focused-section,
-.deployment-advanced-document {
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-md-sm);
-  background: var(--mf-bg-neutral-08);
-}
-
-.deployment-focused-section > summary,
-.deployment-advanced-document > summary {
-  padding: 0.52rem 0.62rem;
-  color: var(--mf-text-neutral-80);
-  font-size: var(--mf-font-size-072);
-  font-weight: var(--mf-font-weight-semibold);
-  cursor: pointer;
 }
 
 .deployment-focused-body {
   display: grid;
   gap: 0.65rem;
-  padding: 0.62rem;
-  border-top: 1px solid var(--mf-border-neutral-23);
 }
 
 .deployment-resolved-grid {
@@ -552,15 +501,6 @@
   padding: 0.25rem 0.4rem;
 }
 
-.deployment-advanced-document {
-  margin: 0 0.7rem 0.7rem;
-}
-
-.deployment-advanced-document > .field-help {
-  margin: 0;
-  padding: 0 0.62rem 0.5rem;
-}
-
 @media (max-width: 70rem) {
   .deployment-field {
     grid-template-columns: 1fr;
@@ -615,24 +555,14 @@
   margin: 0;
 }
 
-.component-overview {
-  border: 1px solid var(--mf-border-neutral-27);
-  border-radius: var(--mf-radius-lg);
-  background: var(--mf-bg-neutral-08);
-}
-
-.component-overview > summary {
-  padding: 0.62rem 0.75rem;
-  color: var(--mf-text-neutral-90);
-  cursor: pointer;
-  font-weight: var(--mf-font-weight-bold);
-}
-
 .component-overview-body {
   display: grid;
   gap: 0.7rem;
-  padding: 0.15rem 0.75rem 0.75rem;
-  border-top: 1px solid var(--mf-border-neutral-23);
+}
+
+/* The body's gap spaces the chip groups; no extra margin. */
+.component-overview-body > .dchips {
+  margin: 0;
 }
 
 .component-overview .runtime-components {

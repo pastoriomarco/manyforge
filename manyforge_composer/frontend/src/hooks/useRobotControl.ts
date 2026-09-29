@@ -416,10 +416,13 @@ export function useRobotControl(
     });
   }, [cartesianDefaults, enabled, headlessSnapshot?.executionControlStatus]);
 
+  // Re-sent when an operation ends, so a default that changed during it
+  // still reaches the manual settings before the next move.
+  const operationActive = robotControlHasActiveOperation(state);
   useEffect(() => {
-    if (cartesianDefaults === null) return;
+    if (cartesianDefaults === null || operationActive) return;
     dispatch({ type: 'program_cartesian_defaults_changed', defaults: cartesianDefaults });
-  }, [cartesianDefaults]);
+  }, [cartesianDefaults, operationActive]);
 
   useEffect(() => {
     const previewStatus = previewStatusRef.current;

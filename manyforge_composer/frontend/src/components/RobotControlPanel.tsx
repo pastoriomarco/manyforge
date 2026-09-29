@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from 'react';
 
 import { useRobotControl } from '../hooks/useRobotControl';
+import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
@@ -254,7 +255,7 @@ function ManualMotionSettingsControls({ controller, disabled }: {
     </label>
   );
   return (
-    <section className="robot-control-motion-settings" aria-label="Manual speed and acceleration">
+    <section className="robot-control-motion-settings dcard" aria-label="Manual speed and acceleration">
       <h4 title="These defaults apply to every preview and approval without needing an edit. Percentages independently scale the planned velocity and acceleration within Deployment/model ceilings. The live Velocity bar is separate. TCP angular speed and acceleration limits are supported only in Cartesian mode.">
         Speed &amp; acceleration <span className="inspector-info-button" aria-hidden="true">i</span>
       </h4>
@@ -324,6 +325,7 @@ export function RobotControlPanelView({
   controlBasePoseInCell?: PoseTuple | null;
 }) {
   const localGizmo = useGizmoSettings();
+  const cardLayout = useCardPanelLayout();
   const gizmo = sharedGizmo ?? localGizmo;
   const { angularStepDeg, linearStepM, space: tcpTransformSpace } = gizmo.settings;
   const tcpTransformMode = gizmo.settings.mode === 'scale' ? 'translate' : gizmo.settings.mode;
@@ -694,6 +696,7 @@ export function RobotControlPanelView({
   return (
     <RobotInputContext.Provider value={inputContext}>
     <section
+      ref={cardLayout}
       className="panel robot-control-panel"
       aria-label="Robot Control"
       data-testid="robot-control-panel"
@@ -813,7 +816,7 @@ export function RobotControlPanelView({
               )}
             </div>
           )}
-          <nav className="robot-control-modes" aria-label="Manual control mode">
+          <nav className="robot-control-modes dseg" aria-label="Manual control mode">
             {MODE_LABELS.map(([mode, label]) => (
               <button
                 key={mode}
@@ -914,7 +917,8 @@ export function RobotControlPanelView({
             >
               {state.mode !== 'gripper' && motion !== null && <ManualMotionSettingsControls controller={controller} disabled={authoringBlocked} />}
               {state.mode === 'joint' && motion !== null && observedMotion !== null && (
-                <div className="robot-control-joints">
+                <section className="dcard" aria-label="Joint targets">
+                  <h4>Joints</h4>
                   {motion.targetDescriptor.joints.map((joint, index) => {
                     const live = observedMotion.positionsRad[index] ?? 0;
                     const draft = state.draftPositionsRad[index] ?? live;
@@ -969,7 +973,7 @@ export function RobotControlPanelView({
                       </label>
                     );
                   })}
-                </div>
+                </section>
               )}
 
               {(state.mode === 'pose_goal'

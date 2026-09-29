@@ -1,5 +1,3 @@
-import { useReducer } from 'react';
-
 export type NodePresentationStatus = 'idle' | 'running' | 'held' | 'success' | 'failure';
 export type EdgeStyle =
   | 'smoothstep'
@@ -9,33 +7,11 @@ export type EdgeStyle =
   | 'step';
 export type LayoutDirection = 'vertical' | 'horizontal';
 
-export interface ComposerViewState {
-  edgeStyle: EdgeStyle;
-  layoutDirection: LayoutDirection;
-}
-
-export type ComposerViewAction =
-  | { type: 'set_edge_style'; edgeStyle: EdgeStyle }
-  | { type: 'set_layout_direction'; layoutDirection: LayoutDirection };
-
-export const INITIAL_COMPOSER_VIEW_STATE: ComposerViewState = {
-  edgeStyle: 'default',
-  layoutDirection: 'vertical',
-};
-
-/** Pure presentation state; it has no cycle subscription or runtime authority. */
-export function composerViewReducer(
-  state: ComposerViewState,
-  action: ComposerViewAction,
-): ComposerViewState {
-  switch (action.type) {
-    case 'set_edge_style':
-      return { ...state, edgeStyle: action.edgeStyle };
-    case 'set_layout_direction':
-      return { ...state, layoutDirection: action.layoutDirection };
-  }
-}
-
-export function useComposerViewState() {
-  return useReducer(composerViewReducer, INITIAL_COMPOSER_VIEW_STATE);
-}
+/** Link styles, as named in the tree editor toolbar and settings. */
+export const EDGE_STYLE_OPTIONS: { value: EdgeStyle; label: string }[] = [
+  { value: 'smoothstep', label: 'Orthogonal' },
+  { value: 'simplebezier', label: 'Smooth' },
+  { value: 'default', label: 'Bezier' },
+  { value: 'straight', label: 'Straight' },
+  { value: 'step', label: 'Step' },
+];

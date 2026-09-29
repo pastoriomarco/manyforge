@@ -24,7 +24,8 @@ describe('UI4 application and viewport composition', () => {
     expect(app).not.toContain('<details className="workbench-disclosure"');
     expect(viewer).toContain('>Robot</button>');
     expect(viewer).toContain('>Object</button>');
-    expect(viewer).toContain("toggleInspectorPanel('tools')");
+    expect(viewer).not.toContain("toggleInspectorPanel('tools')");
+    expect(viewer).toContain('controlPanelSettings?: ReactNode;');
     expect(viewer).toContain('createPortal(');
     expect(viewer).toContain('Maximize viewer inspector');
     expect(viewer).not.toContain('<OverlayPanel');
@@ -55,7 +56,8 @@ describe('UI4 application and viewport composition', () => {
     expect(styles).toMatch(/\.robot-control-preview-notice \{[^}]*position: absolute;/);
     expect(styles).toMatch(/\.robot-control-footer \{\s*flex: 0 0 auto;/);
     expect(styles).toMatch(/\.robot-control-actions \{[\s\S]*?justify-content: center;/);
-    expect(styles).toMatch(/\.viewer-inspector-section \.robot-control-modes \{[\s\S]*?justify-content: center;/);
+    // Modes are a segmented choice that fills its rows (3 + 2 when narrow).
+    expect(styles).toMatch(/\.robot-control-modes \{[^}]*margin: 0\.45rem 0\.55rem;/);
     expect(styles).toMatch(/\.central-inspector-actions \.inspector-info-button \{[\s\S]*?border-color: transparent;/);
     expect(styles).toMatch(/\.robot-control-phase \{[\s\S]*?justify-content: center;[\s\S]*?text-align: center;/);
     expect(styles).toContain('--inspector-control-height: 1.9rem;');
@@ -65,7 +67,7 @@ describe('UI4 application and viewport composition', () => {
     // Inspector warnings use the shared warning notice (UI6-I-VC VC4).
     expect(styles).toContain('.notice.severity-warning');
     // Notifications sit below the floating viewer controls with their insets.
-    expect(styles).toMatch(/\.workbench-notification-stack \{[\s\S]*?top: calc\(1\.9rem \+ 2 \* 0\.65rem\);[\s\S]*?left: 0\.65rem;/);
+    expect(styles).toMatch(/\.workbench-notification-stack \{[\s\S]*?top: calc\(1\.9rem \+ 2 \* 0\.45rem\);[\s\S]*?left: 0\.45rem;/);
     expect(styles).toMatch(/\.workbench-notification-stack > \.runtime-observability-surface \{[^}]*position: static;/);
     expect(styles).not.toContain('.viewer-slot > .runtime-observability-surface');
   });
@@ -79,7 +81,34 @@ describe('UI4 application and viewport composition', () => {
     expect(transport).toContain('program.stopMotion([group.groupId])');
     expect(transport).toContain('transport-group-column');
     expect(transport).toContain('transport-unique-column');
-    expect(transport).toContain('transport-group-settings');
+    expect(transport).toContain('export function MotionControlSettings(');
+    expect(transport).toContain('onClick={onOpenViewerSettings}');
+    // Tree editor: information and settings at the bottom right, like the
+    // viewer; the top-left "?" is gone.
+    const tree = source('./ProgramTreeCanvas.tsx');
+    expect(tree).toContain('aria-label="Tree editor information"');
+    // Its gear opens the Program settings, which include the tree editor's
+    // own preferences; there is no separate Program gear in the top bar.
+    expect(tree).toContain('aria-label="Program settings"');
+    expect(tree).toContain("onClick={() => requestOpenSettings('program')}");
+    const documentControls = source('./ProgramDocumentControls.tsx');
+    expect(documentControls).not.toContain('Program-wide settings');
+    expect(documentControls).not.toContain('ProgramSettingsEditor');
+    // They open in the Program inspector, not in a pop-up.
+    const programWorkspace = source('./ProgramWorkspace.tsx');
+    expect(programWorkspace).toContain("onOpenSettingsRequest('program', () => setSettingsOpen(true))");
+    expect(programWorkspace).toContain("if (settingsOpen) inspectorTitle = 'Program settings';");
+    expect(programWorkspace).toContain('<TreeEditorPreferences />');
+    expect(tree).not.toContain('program-canvas-help"');
+    // The start direction is an installation setting; the toolbar toggle
+    // is a session-only re-layout.
+    expect(source('./TreeEditorPreferences.tsx'))
+      .toContain("onRestoreDefaults={() => composerSettings.restoreSection('treeEditor')}");
+    expect(tree).toContain('sessionLayoutDirection ?? composerSettings.settings.treeEditor.layoutDirection');
+    // No Composer settings gear for now; settings problems are notices.
+    const app = source('../App.tsx');
+    expect(app).not.toContain('<ComposerSettingsLauncher');
+    expect(app).toContain('useComposerSettingsNotices();');
     expect(transport).toContain("'Halting' : 'Halt'");
     expect(transport).toContain('program.fullStop()');
     expect(transport).toContain('program.resumeFullStop()');

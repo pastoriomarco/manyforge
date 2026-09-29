@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-28 05:46:36 UTC
+  Last regenerated: 2026-09-28 19:12:31 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -33,6 +33,13 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/cclc/routes/requests` | headless-runtime-client | Cclc Route Submit |
 | `GET` | `/api/cclc/routes/transactions/{transaction_id}` | headless-runtime-client | Cclc Route Status |
 | `GET` | `/api/component-overview` | headless-runtime-client | Component Overview |
+| `GET` | `/api/composer/settings` | composer-settings | Read Settings |
+| `PUT` | `/api/composer/settings` | composer-settings | Replace Settings |
+| `DELETE` | `/api/composer/settings/profiles/{name}` | composer-settings | Delete Profile |
+| `POST` | `/api/composer/settings/profiles/{name}` | composer-settings | Save Profile |
+| `POST` | `/api/composer/settings/profiles/{name}/load` | composer-settings | Load Profile |
+| `POST` | `/api/composer/settings/reset-damaged` | composer-settings | Reset Damaged |
+| `POST` | `/api/composer/settings/restore-defaults` | composer-settings | Restore Defaults |
 | `POST` | `/api/control/commands` | headless-runtime-client | Submit Control Command |
 | `GET` | `/api/control/state` | headless-runtime-client | Control Projection |
 | `POST` | `/api/cycle/recovery-actions` | headless-runtime-client | Cycle Recovery Action |

@@ -72,6 +72,10 @@ case "$command" in
     image_key=${image_id#sha256:}
     cache_root="$cache_base/images/$image_key"
     mkdir -p "$cache_root/build" "$cache_root/node_modules"
+    # Installation Composer settings survive stop/start. Only this folder is
+    # persistent; all other runtime state still resets with the container.
+    composer_state="$cache_base/state/composer"
+    mkdir -p "$composer_state"
     serve_args=(serve)
     if [[ -n "$project" ]]; then
       serve_args+=(--project "$project")
@@ -83,8 +87,10 @@ case "$command" in
       --log-opt max-size=50m \
       --log-opt max-file=3 \
       -e MANYFORGE_DEV_BUILD_JOBS="${MANYFORGE_DEV_BUILD_JOBS:-}" \
+      -e MANYFORGE_STATE_DIR=/var/lib/manyforge \
       -v "$repo_root:/workspace" \
       -v "$cache_root:/runner" \
+      -v "$composer_state:/var/lib/manyforge/composer" \
       -v "$cache_root/node_modules:/workspace/manyforge_composer/frontend/node_modules" \
       -w /workspace \
       "$image_id" \

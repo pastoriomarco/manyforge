@@ -1371,10 +1371,17 @@ function parseProgramViewerMetadata(
       'resource_role_visibility',
       'scene_resource_axes_visibility',
       'object_axes_gizmo_size_m',
+      'hidden_execution_groups',
     ],
     path,
   );
   const viewer: ProgramViewerMetadata = {};
+  if (record.hidden_execution_groups !== undefined) {
+    viewer.hidden_execution_groups = canonicalStringArrayAt(
+      record.hidden_execution_groups,
+      `${path}.hidden_execution_groups`,
+    );
+  }
   if (record.frame_role_visibility !== undefined) {
     viewer.frame_role_visibility = booleanRecordAt(
       record.frame_role_visibility,

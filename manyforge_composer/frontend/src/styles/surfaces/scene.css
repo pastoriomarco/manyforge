@@ -17,25 +17,8 @@
 }
 
 .scene-workspace-tabs {
-  display: flex;
+  flex: 1 1 auto;
   min-width: 0;
-  gap: 0.12rem;
-  overflow-x: auto;
-}
-
-.scene-workspace-tabs button {
-  flex: 0 0 auto;
-  padding: 0.34rem 0.48rem;
-  border-color: transparent;
-  color: var(--mf-text-neutral-63);
-  background: transparent;
-  font-size: var(--mf-font-size-068);
-}
-
-.scene-workspace-tabs button.active {
-  border-color: var(--mf-border-neutral-35);
-  color: var(--mf-text-accent-93);
-  background: var(--mf-bg-neutral-17);
 }
 
 .scene-selection-lock {
@@ -46,9 +29,6 @@
 }
 
 .scene-hierarchy {
-  display: grid;
-  gap: 0.55rem;
-  padding: 0.75rem;
   border-bottom: 1px solid var(--mf-border-neutral-23);
 }
 
@@ -57,35 +37,26 @@
   font-size: var(--mf-font-size-072);
 }
 
-.scene-hierarchy details {
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-md);
-  background: var(--mf-bg-neutral-08);
-}
-
-.scene-hierarchy summary {
-  padding: 0.5rem 0.65rem;
-  color: var(--mf-text-neutral-80);
-  cursor: pointer;
-  font-size: var(--mf-font-size-076);
-  font-weight: var(--mf-font-weight-semibold);
-}
-
-.scene-hierarchy-items {
+/* The list is the whole card body; its rows carry their own padding. */
+.scene-hierarchy .dcard > .scene-hierarchy-items {
   display: grid;
   max-height: 13rem;
+  margin: 0;
+  padding: 0;
   overflow: auto;
-  border-top: 1px solid var(--mf-border-neutral-23);
 }
 
 .scene-hierarchy-item {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
-  border-bottom: 1px solid var(--mf-border-neutral-19);
 }
 
-.scene-hierarchy-item > label {
+.scene-hierarchy-item + .scene-hierarchy-item {
+  border-top: 1px solid var(--mf-border-neutral-19);
+}
+
+.scene-hierarchy .dcard .scene-hierarchy-item > label {
   display: grid;
   justify-items: center;
   gap: 0.1rem;
@@ -131,13 +102,10 @@
   font-size: var(--mf-font-size-068);
 }
 
+/* Inside the Selected object "Attach" card. */
 .scene-attach-controls {
   display: grid;
   gap: 0.5rem;
-  padding: 0.65rem;
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-md);
-  background: var(--mf-bg-neutral-08);
 }
 
 .scene-mesh-browser {
@@ -203,55 +171,6 @@
   color: var(--mf-text-danger-82);
 }
 
-.scene-attach-controls label {
-  display: grid;
-  gap: 0.3rem;
-}
-
-.scene-object-metadata {
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-md);
-  background: var(--mf-bg-neutral-08);
-}
-
-.scene-object-metadata summary {
-  padding: 0.5rem 0.65rem;
-  color: var(--mf-text-neutral-80);
-  cursor: pointer;
-  font-size: var(--mf-font-size-072);
-}
-
-.scene-object-metadata dl {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 0.25rem 0.65rem;
-  margin: 0;
-  padding: 0 0.65rem 0.65rem;
-  font-size: var(--mf-font-size-068);
-}
-
-.scene-object-metadata dt {
-  color: var(--mf-text-neutral-55);
-}
-
-.scene-object-metadata dd {
-  min-width: 0;
-  margin: 0;
-  color: var(--mf-text-neutral-82);
-  overflow-wrap: anywhere;
-}
-
-.scene-object-metadata pre {
-  max-height: 10rem;
-  margin: 0;
-  padding: 0.65rem;
-  overflow: auto;
-  border-top: 1px solid var(--mf-border-neutral-23);
-  color: var(--mf-text-neutral-69);
-  font-size: var(--mf-font-size-065);
-  white-space: pre-wrap;
-}
-
 .scene-authoring-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -268,6 +187,27 @@
   background: var(--mf-bg-neutral-08);
 }
 
+/* Scene tabs laid out as card panels. */
+.scene-authoring-column.dpanel,
+.source-occurrence-panel.dpanel {
+  gap: 0.5rem;
+  padding: 0.5rem;
+  border-top: 0;
+  background: var(--mf-bg-neutral-03-a67);
+}
+
+.source-occurrence-panel .runtime-source-list {
+  gap: 0;
+}
+
+/* Runtime sources are rows of their card, not tiles. */
+.source-occurrence-panel .dcard > .runtime-source-row {
+  padding: 0.4rem 0;
+  border-width: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
 .scene-authoring-grid > .scene-authoring-column:first-child {
   border-right: 1px solid var(--mf-border-neutral-19);
 }
@@ -278,9 +218,7 @@
 }
 
 .scene-authoring-heading,
-.scene-authoring-actions,
-.source-occurrence-facts,
-.scene-owner-identity {
+.scene-authoring-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -336,52 +274,8 @@
   border-top: 1px solid var(--mf-border-neutral-19);
 }
 
-.source-occurrence-facts,
-.scene-owner-identity {
-  color: var(--mf-text-neutral-63);
-  font-size: var(--mf-font-size-072);
-}
-
-.source-occurrence-facts span,
-.scene-owner-identity span {
-  padding: 0.3rem 0.45rem;
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-md-sm);
-  background: var(--mf-bg-neutral-08);
-}
-
-.source-name-details {
-  grid-column: 1 / -1;
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-lg);
-  padding: 0.55rem 0.7rem;
-}
-
 .source-occurrence-panel > .scene-contract-note {
   grid-column: 1 / -1;
-}
-
-.source-name-details summary {
-  cursor: pointer;
-  color: var(--mf-text-neutral-90);
-  font-weight: var(--mf-font-weight-semibold);
-}
-
-.source-name-details dl {
-  display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
-  gap: 0.35rem 0.65rem;
-  margin: 0.65rem 0 0;
-}
-
-.source-name-details dt {
-  color: var(--mf-text-neutral-63);
-}
-
-.source-name-details dd {
-  margin: 0;
-  min-width: 0;
-  overflow-wrap: anywhere;
 }
 
 .scene-commit-success {
@@ -390,7 +284,6 @@
   line-height: 1.5;
   color: var(--mf-text-success-76);
 }
-
 
 .scene-authoring-actions button {
   padding: 0.5rem 0.7rem;
@@ -401,7 +294,28 @@
     grid-template-columns: 1fr;
   }
 
-  .scene-authoring-grid > .scene-authoring-column:first-child {
+  /* Scene tabs laid out as card panels. */
+.scene-authoring-column.dpanel,
+.source-occurrence-panel.dpanel {
+  gap: 0.5rem;
+  padding: 0.5rem;
+  border-top: 0;
+  background: var(--mf-bg-neutral-03-a67);
+}
+
+.source-occurrence-panel .runtime-source-list {
+  gap: 0;
+}
+
+/* Runtime sources are rows of their card, not tiles. */
+.source-occurrence-panel .dcard > .runtime-source-row {
+  padding: 0.4rem 0;
+  border-width: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.scene-authoring-grid > .scene-authoring-column:first-child {
     border-right: 0;
     border-bottom: 1px solid var(--mf-border-neutral-19);
   }

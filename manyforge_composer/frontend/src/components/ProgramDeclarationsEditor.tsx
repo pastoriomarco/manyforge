@@ -1,3 +1,6 @@
+import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
+import { BreakableId } from './BreakableId';
+import { SettingsSubheading } from './SettingsScope';
 import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from 'react';
 
 import type {
@@ -17,7 +20,9 @@ import {
   collectProgramParameterUsages,
   flattenProgramForest,
   resolveProgramParameterLiteralValue,
+  type ProgramMotionDefaultRole,
 } from '../utils/programAuthoring';
+import { requestOpenSettings } from '../state/settingsNavigation';
 import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
 import type { ProgramDeclarationSelection } from './ProgramDeclarationsNavigator';
 import { buildProgramParameterMutation } from './ProgramPropertyEditor';
@@ -58,6 +63,8 @@ interface ProgramDeclarationsEditorProps {
   onCreated?: (selection: ProgramDeclarationSelection) => void;
   onInvalidEditChange?: (invalid: boolean) => void;
   diagnostics?: ProgramAuthoringDiagnostic[];
+  /** Parameters acting as Program motion defaults, by parameter ID. */
+  motionDefaults?: ReadonlyMap<string, ProgramMotionDefaultRole>;
 }
 
 function parseJson(text: string, label: string): JsonValue {
@@ -112,7 +119,9 @@ export function ProgramDeclarationsEditor({
   onCreated,
   onInvalidEditChange,
   diagnostics = [],
+  motionDefaults = new Map(),
 }: ProgramDeclarationsEditorProps) {
+  const cardLayout = useCardPanelLayout();
   const parameterUsages = useMemo(() => collectProgramParameterUsages(roots), [roots]);
   const blackboardUsages = useMemo(() => collectBlackboardUsages(roots), [roots]);
   const [parameterId, setParameterId] = useState('');
@@ -147,6 +156,9 @@ export function ProgramDeclarationsEditor({
   const selectedParameter = selection?.kind === 'parameter'
     ? parameters.find((row) => row.parameter_id === selection.id) ?? null
     : null;
+  const selectedMotionDefault = selectedParameter === null
+    ? null
+    : motionDefaults.get(selectedParameter.parameter_id) ?? null;
   const selectedNamespace = selection?.kind === 'namespace'
     ? namespaces.find((row) => row.namespace_id === selection.id) ?? null
     : null;
@@ -546,7 +558,8 @@ export function ProgramDeclarationsEditor({
 
   return (
     <section
-      className="program-declarations"
+      ref={cardLayout}
+      className="program-declarations dpanel"
       aria-label={embedded ? 'Program declarations' : undefined}
       aria-labelledby={embedded ? undefined : 'program-declarations-title'}
     >
@@ -587,8 +600,32 @@ export function ProgramDeclarationsEditor({
         </div>
       )}
       <div className={`program-declaration-columns${showNavigation ? '' : ' contextual'}`}>
-        {(showNavigation || selection?.kind === 'parameter') && <section>
+        {(showNavigation || selection?.kind === 'parameter') && <section className="dcard">
           <h4>Program parameters</h4>
+          {!showNavigation && selectedMotionDefault !== null && (
+            <div className="program-motion-default-role">
+              <SettingsSubheading title="Program motion default" />
+              <p>
+                The default <code>{selectedMotionDefault.field}</code> for every motion node:{' '}
+                {selectedMotionDefault.bound} of {selectedMotionDefault.applicable} nodes that
+                accept it are bound to it, and new ones bind automatically.
+                {selectedMotionDefault.ceiling && ' A node may set a lower value, never a higher one.'}
+                {selectedMotionDefault.applicable === 0
+                  && ' No node in this Program accepts it yet, so it changes no Program move.'}
+              </p>
+              {selectedMotionDefault.manualDefault && (
+                <p>
+                  Also the default for manual Cartesian moves once applied; a stricter
+                  unapplied value applies to them at once.
+                </p>
+              )}
+              <div className="dactions">
+                <button type="button" onClick={() => requestOpenSettings('program')}>
+                  Motion defaults
+                </button>
+              </div>
+            </div>
+          )}
           {showNavigation && <ul className="program-declaration-list">
             {parameters.map((parameter) => {
               const usages = parameterUsages[parameter.parameter_id] ?? [];
@@ -616,7 +653,7 @@ export function ProgramDeclarationsEditor({
               );
             })}
           </ul>}
-          <div className={`program-declaration-form${error && selection?.kind === 'parameter' ? ' has-invalid-edit' : ''}${selectedDiagnostics.length > 0 && selection?.kind === 'parameter' ? ' has-backend-diagnostic' : ''}`} onKeyDown={(event) => guardCommitKey(event, parameterIssue())} onBlur={() => {
+          <div className={`program-declaration-form drows${error && selection?.kind === 'parameter' ? ' has-invalid-edit' : ''}${selectedDiagnostics.length > 0 && selection?.kind === 'parameter' ? ' has-backend-diagnostic' : ''}`} onKeyDown={(event) => guardCommitKey(event, parameterIssue())} onBlur={() => {
             if (selectedParameter && !busy) saveParameter(false);
           }}>
             <label>Parameter ID<input id="program-parameter-id" value={parameterId} aria-invalid={errorTarget === 'program-parameter-id'} title={errorTarget === 'program-parameter-id' ? error ?? undefined : undefined} onChange={(event) => setParameterId(event.target.value)} /></label>
@@ -660,7 +697,7 @@ export function ProgramDeclarationsEditor({
                   <legend>Numeric constraints</legend>
                   <label>
                     Minimum
-                    <span>
+                    <span className="dunit">
                       <select
                         aria-label="Minimum bound kind"
                         value={minimumConstraint}
@@ -693,7 +730,7 @@ export function ProgramDeclarationsEditor({
                   </label>
                   <label>
                     Maximum
-                    <span>
+                    <span className="dunit">
                       <select
                         aria-label="Maximum bound kind"
                         value={maximumConstraint}
@@ -775,13 +812,13 @@ export function ProgramDeclarationsEditor({
           </div>
           {!showNavigation && selectedParameter && (
             <div className="program-declaration-usage">
-              <h4>Bindings</h4>
+              <SettingsSubheading title="Program-node bindings" />
               {(parameterUsages[selectedParameter.parameter_id] ?? []).length === 0
                 ? <p>This parameter is not used by a tree node.</p>
                 : (parameterUsages[selectedParameter.parameter_id] ?? []).map((usage) => (
                   <div key={`${usage.nodeId}:${usage.fieldName}`}>
                     <button type="button" onClick={() => onSelectNode?.(usage.nodeId)}>
-                      {usage.nodeLabel}.{usage.fieldName}
+                      <BreakableId text={`${usage.nodeLabel}.${usage.fieldName}`} />
                     </button>
                     <button type="button" disabled={busy} onClick={() => unbindUsage(usage.nodeId, usage.fieldName)}>
                       Use literal
@@ -790,11 +827,11 @@ export function ProgramDeclarationsEditor({
                 ))}
               {bindingCandidates.length > 0 && (
                 <>
-                  <h4>Compatible fields</h4>
+                  <SettingsSubheading title="Compatible fields" />
                   {bindingCandidates.map((candidate) => (
                     <div key={`${candidate.nodeId}:${candidate.fieldName}`}>
                       <button type="button" onClick={() => onSelectNode?.(candidate.nodeId)}>
-                        {candidate.nodeLabel}.{candidate.fieldName}
+                        <BreakableId text={`${candidate.nodeLabel}.${candidate.fieldName}`} />
                       </button>
                       <button type="button" disabled={busy} onClick={() => bindParameter(candidate.nodeId, candidate.fieldName)}>
                         Bind
@@ -807,7 +844,7 @@ export function ProgramDeclarationsEditor({
           )}
         </section>}
 
-        {(showNavigation || selection?.kind === 'namespace' || selection?.kind === 'key') && <section>
+        {(showNavigation || selection?.kind === 'namespace' || selection?.kind === 'key') && <section className="dcard">
           {(showNavigation || selection?.kind === 'namespace') && <>
           <h4>Blackboard namespace</h4>
           {showNavigation && <ul className="program-declaration-list compact">
@@ -832,7 +869,7 @@ export function ProgramDeclarationsEditor({
               );
             })}
           </ul>}
-          <div className={`program-declaration-form compact${error && selection?.kind === 'namespace' ? ' has-invalid-edit' : ''}${selectedDiagnostics.length > 0 && selection?.kind === 'namespace' ? ' has-backend-diagnostic' : ''}`} onKeyDown={(event) => guardCommitKey(event, namespaceIssue())} onBlur={() => {
+          <div className={`program-declaration-form drows compact${error && selection?.kind === 'namespace' ? ' has-invalid-edit' : ''}${selectedDiagnostics.length > 0 && selection?.kind === 'namespace' ? ' has-backend-diagnostic' : ''}`} onKeyDown={(event) => guardCommitKey(event, namespaceIssue())} onBlur={() => {
             if (selectedNamespace && !busy) saveNamespace(false);
           }}>
             <label>Namespace ID<input id="program-namespace-id" value={namespaceId} aria-invalid={errorTarget === 'program-namespace-id'} title={errorTarget === 'program-namespace-id' ? error ?? undefined : undefined} onChange={(event) => setNamespaceId(event.target.value)} /></label>
@@ -885,7 +922,7 @@ export function ProgramDeclarationsEditor({
               );
             })}
           </ul>}
-          <div className={`program-declaration-form${error && selection?.kind === 'key' ? ' has-invalid-edit' : ''}${selectedDiagnostics.length > 0 && selection?.kind === 'key' ? ' has-backend-diagnostic' : ''}`} onKeyDown={(event) => guardCommitKey(event, keyIssue())} onBlur={() => {
+          <div className={`program-declaration-form drows${error && selection?.kind === 'key' ? ' has-invalid-edit' : ''}${selectedDiagnostics.length > 0 && selection?.kind === 'key' ? ' has-backend-diagnostic' : ''}`} onKeyDown={(event) => guardCommitKey(event, keyIssue())} onBlur={() => {
             if (selectedKey && !busy) saveKey(false);
           }}>
             <label>Fully-qualified key<input id="program-key-name" value={keyName} aria-invalid={errorTarget === 'program-key-name'} title={errorTarget === 'program-key-name' ? error ?? undefined : undefined} onChange={(event) => setKeyName(event.target.value)} placeholder="namespace.key" /></label>
@@ -930,13 +967,13 @@ export function ProgramDeclarationsEditor({
           </div>
           {!showNavigation && selectedKey && (
             <div className="program-declaration-usage">
-              <h4>Bindings</h4>
+              <SettingsSubheading title="Bindings" />
               {(blackboardUsages[selectedKey.key] ?? []).length === 0
                 ? <p>This key is not used by a tree node.</p>
                 : (blackboardUsages[selectedKey.key] ?? []).map((usage) => (
                   <div key={`${usage.nodeId}:${usage.fieldName}:${usage.field ?? ''}`}>
                     <button type="button" onClick={() => onSelectNode?.(usage.nodeId)}>
-                      {usage.nodeLabel}.{usage.fieldName}
+                      <BreakableId text={`${usage.nodeLabel}.${usage.fieldName}`} />
                     </button>
                     <button type="button" disabled={busy} onClick={() => unbindUsage(usage.nodeId, usage.fieldName)}>
                       Use literal

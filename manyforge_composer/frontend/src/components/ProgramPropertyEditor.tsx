@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
+import { BreakableId } from './BreakableId';
 
 import type {
   BlackboardKeyDeclaration,
@@ -216,6 +218,7 @@ export function ProgramPropertyEditor({
     : null;
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [discardEpoch, setDiscardEpoch] = useState(0);
+  const cardLayout = useCardPanelLayout();
   const selected = useMemo(
     () => flattenProgramForest(roots).find(
       ({ node }) => node.instance_id === selectedId,
@@ -414,7 +417,8 @@ export function ProgramPropertyEditor({
 
   return (
     <section
-      className="program-properties"
+      ref={cardLayout}
+      className="program-properties dpanel"
       aria-label={embedded ? `Properties for ${selected.instance_id}` : undefined}
       aria-labelledby={embedded ? undefined : 'program-properties-title'}
     >
@@ -469,10 +473,10 @@ export function ProgramPropertyEditor({
           )}
         </div>
       )}
-      <div className="program-property-list">
-        <div className="program-node-identity">
-          <label className="program-node-name-row">
-            <span>Node name</span>
+      <section className="dcard" aria-label="Node">
+          <h4>Node</h4>
+          <label>
+            <span>Name</span>
             <DraftTextInput
               id="program-node-name"
               value={selected.instance_id}
@@ -499,10 +503,11 @@ export function ProgramPropertyEditor({
               onCommit={renameNode}
             />
           </label>
-          <span><small>Catalog name</small><strong>{entry.name}</strong></span>
-          <span><small>Catalog ID</small><code>{selected.node_id}</code></span>
-          <span><small>Type and profile</small><span>{entry.kind} · {entry.category} · {entry.minProgramProfile ?? 'portable'}</span></span>
-        </div>
+          <dl>
+            <div><dt>Catalog name</dt><dd>{entry.name}</dd></div>
+            <div><dt>Catalog ID</dt><dd><code>{selected.node_id}</code></dd></div>
+            <div><dt>Type and profile</dt><dd>{entry.kind} · {entry.category} · {entry.minProgramProfile ?? 'portable'}</dd></div>
+          </dl>
         {entry.requiredCapabilities.length > 0 && (
           <details className="program-node-capabilities">
             <summary>{entry.requiredCapabilities.length} required capability binding(s)</summary>
@@ -513,6 +518,9 @@ export function ProgramPropertyEditor({
             ))}
           </details>
         )}
+      </section>
+      <section className="dcard" aria-label="Parameters">
+        <h4>Parameters</h4>
         {entry.parameters.length === 0 && (
           <p className="muted">This node has no authored parameters.</p>
         )}
@@ -606,7 +614,15 @@ export function ProgramPropertyEditor({
               )}
               {source ? (
                 <div className="program-source-summary">
-                  <code>{source.kind}:{source.reference}{source.field ? `.${source.field}` : ''}</code>
+                  <dl>
+                    <div>
+                      <dt>Bound to</dt>
+                      <dd title={source.kind}>
+                        <code><BreakableId text={`${source.reference}${source.field ? `.${source.field}` : ''}`} /></code>
+                        {' '}<small>{source.kind.replaceAll('_', ' ')}</small>
+                      </dd>
+                    </div>
+                  </dl>
                   <span>The literal is absent while this exact source is bound.</span>
                   {!canSelectLiteral && (
                     <span>A required parameter cannot become literal until a schema-valid fallback exists.</span>
@@ -695,7 +711,7 @@ export function ProgramPropertyEditor({
             </div>
           );
         })}
-      </div>
+      </section>
       <ProgramPolicyEditor
         key={`${selected.instance_id}:${discardEpoch}`}
         node={selected}

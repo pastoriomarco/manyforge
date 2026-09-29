@@ -166,7 +166,7 @@ export function DeploymentCompositionPanel({
       }. Controls remain disabled.`
   );
   return (
-    <section className="panel deployment-composition-panel" aria-labelledby="deployment-composition-title">
+    <section className="panel deployment-composition-panel dpanel" aria-labelledby="deployment-composition-title">
       <header className="panel-header">
         <div>
           <p className="eyebrow">Separate addressed artifact</p>
@@ -236,7 +236,7 @@ export function DeploymentCompositionPanel({
             motionDescriptors={motionDescriptors}
             gripperDescriptors={gripperDescriptors}
           />
-          <details className="deployment-advanced-document">
+          <details className="dcard">
             <summary>Advanced compiled Deployment artifact</summary>
             <p className="field-help">
               Generated identities and compiler-expanded policy rows are read-only here.
@@ -246,7 +246,7 @@ export function DeploymentCompositionPanel({
         </>
       )}
 
-      <details className="deployment-manager-boundary">
+      <details className="dcard">
         <summary>Manager Applied state and lifecycle</summary>
 
       {!enabled && (

@@ -6,6 +6,8 @@ export interface ViewerPresentationDraft {
   sceneResourceAxesVisibility: Record<string, boolean>;
   frameGizmoSizeM: number;
   objectAxesGizmoSizeM: number;
+  /** Execution groups the Motion panel hides; null keeps the default. */
+  hiddenExecutionGroups: string[] | null;
 }
 
 export type ViewerPresentationDraftAction =
@@ -21,6 +23,7 @@ export const DEFAULT_VIEWER_PRESENTATION_DRAFT: ViewerPresentationDraft = {
   sceneResourceAxesVisibility: {},
   frameGizmoSizeM: 0.1,
   objectAxesGizmoSizeM: 0.1,
+  hiddenExecutionGroups: null,
 };
 
 /**
@@ -69,6 +72,9 @@ export function viewerPresentationDraftFromProgram(
     },
     frameGizmoSizeM: viewer?.frame_gizmo_size_m ?? 0.1,
     objectAxesGizmoSizeM: viewer?.object_axes_gizmo_size_m ?? 0.1,
+    hiddenExecutionGroups: viewer?.hidden_execution_groups === undefined
+      ? null
+      : [...viewer.hidden_execution_groups],
   };
 }
 
@@ -83,6 +89,9 @@ export function programViewerMetadata(
       draft.sceneResourceAxesVisibility,
     ),
     object_axes_gizmo_size_m: draft.objectAxesGizmoSizeM,
+    ...(draft.hiddenExecutionGroups === null ? {} : {
+      hidden_execution_groups: [...new Set(draft.hiddenExecutionGroups)].sort(),
+    }),
   };
 }
 

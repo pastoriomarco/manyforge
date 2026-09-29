@@ -400,3 +400,23 @@ def test_offline_migration_cli_never_overwrites_and_cleans_temporary_files(
     )
     assert not (tmp_path / "bad").exists()
     assert not list(tmp_path.glob(".program-migration-*"))
+
+
+def test_viewer_hidden_execution_groups_name_declared_groups_only(
+    catalog: NodeCatalog,
+) -> None:
+    """Motion panel presentation: a canonical list of declared groups or all."""
+    source = document(leaf("arm_a", ["robot_a"]), leaf("arm_b", ["robot_b"]))
+    source["viewer"] = {"hidden_execution_groups": ["all", "robot_b"]}
+    program = Program.from_dict(identified(source), catalog)
+    assert program.to_dict()["viewer"]["hidden_execution_groups"] == ["all", "robot_b"]
+
+    for hidden, message in (
+        (["robot_c"], "does not name a declared execution group"),
+        (["robot_b", "robot_a"], "canonical-sorted"),
+        (["robot_a", "robot_a"], "duplicate-free"),
+    ):
+        invalid = deepcopy(source)
+        invalid["viewer"] = {"hidden_execution_groups": hidden}
+        with pytest.raises(ProgramValidationError, match=message):
+            Program.from_dict(identified(invalid), catalog)

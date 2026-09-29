@@ -20,7 +20,7 @@
   right: 0;
   left: 0;
   min-height: 0;
-  padding: var(--mf-viewer-overlay-inset);
+  padding: var(--mf-surface-overlay-inset);
   border-bottom: 0;
   background: none;
   pointer-events: none;
@@ -84,51 +84,6 @@
   box-shadow: 0 0.8rem 2rem var(--mf-shadow-neutral-00-a35);
 }
 
-.viewer-options-actions {
-  display: flex;
-  gap: 0.4rem;
-}
-
-.viewer-axes-section {
-  border-top: 1px solid var(--mf-border-neutral-23);
-  padding-top: 0.45rem;
-}
-
-.viewer-axes-section > summary {
-  color: var(--mf-text-neutral-82);
-  cursor: pointer;
-  font-size: var(--mf-font-size-076);
-  font-weight: var(--mf-font-weight-bold);
-}
-
-.viewer-axes-actions {
-  display: flex;
-  gap: 0.35rem;
-  margin: 0.45rem 0;
-}
-
-.viewer-axes-actions button {
-  min-height: 1.8rem;
-  padding: 0.22rem 0.5rem;
-  font-size: var(--mf-font-size-068);
-}
-
-.viewer-axes-size {
-  display: grid;
-  grid-template-columns: auto minmax(5rem, 1fr) auto;
-  align-items: center;
-  gap: 0.45rem;
-  color: var(--mf-text-neutral-73);
-  font-size: var(--mf-font-size-068);
-}
-
-.viewer-axes-size output {
-  min-width: 3.3rem;
-  color: var(--mf-text-neutral-81);
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-}
-
 .viewer-axes-list {
   display: grid;
   max-height: 11rem;
@@ -167,33 +122,6 @@
 .viewer-axes-list small {
   color: var(--mf-text-neutral-55);
   font-size: var(--mf-font-size-062);
-}
-
-.viewer-model-facts {
-  min-width: 0;
-  border-top: 1px solid var(--mf-border-neutral-23);
-  padding-top: 0.45rem;
-}
-
-.viewer-model-facts summary {
-  color: var(--mf-text-neutral-68);
-  cursor: pointer;
-  font-size: var(--mf-font-size-068);
-}
-
-.viewer-model-facts span {
-  display: block;
-  overflow: hidden;
-  margin-top: 0.35rem;
-  color: var(--mf-text-neutral-55);
-  font-size: var(--mf-font-size-065);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.viewer-model-facts code,
-.viewer-model-facts strong {
-  color: var(--mf-text-neutral-77);
 }
 
 .viewer-controls {
@@ -340,8 +268,8 @@ svg.viewer-camera-icon {
 
 .viewer-target-status {
   position: absolute;
-  top: calc(var(--mf-toolbar-control-height) + 2 * var(--mf-viewer-overlay-inset));
-  left: 0.65rem;
+  top: calc(var(--mf-toolbar-control-height) + 2 * var(--mf-surface-overlay-inset));
+  left: var(--mf-surface-overlay-inset);
   z-index: var(--mf-z-controls);
   display: flex;
   max-width: min(27rem, calc(100% - 1.3rem));
@@ -547,15 +475,16 @@ svg.viewer-camera-icon {
   position: absolute;
   z-index: var(--mf-z-dropdown-2);
   right: 50%;
-  bottom: var(--mf-viewer-overlay-inset);
+  bottom: var(--mf-surface-overlay-inset);
   display: grid;
-  width: min(58rem, calc(100% - 2 * var(--mf-viewer-overlay-inset)));
-  max-width: calc(100% - 2 * var(--mf-viewer-overlay-inset));
+  width: min(58rem, calc(100% - 2 * var(--mf-surface-overlay-inset)));
+  max-width: calc(100% - 2 * var(--mf-surface-overlay-inset));
   grid-template-columns:
     var(--viewer-transport-motion-panel-width)
     minmax(0, 1fr)
     var(--viewer-transport-column-width);
-  grid-template-rows: auto auto;
+  /* One row: an empty second row would still add its gap under the panels. */
+  grid-template-rows: auto;
   align-items: end;
   column-gap: 1.25rem;
   row-gap: 0.35rem;
@@ -846,18 +775,6 @@ svg.viewer-camera-icon {
   padding: 0;
 }
 
-.transport-group-settings {
-  position: relative;
-  width: 100%;
-  min-width: 0;
-}
-
-.transport-group-settings > button {
-  position: relative;
-  width: 100%;
-  height: 100%;
-}
-
 .transport-settings-glyph {
   display: inline-block;
   font-size: var(--mf-font-size-130);
@@ -865,75 +782,93 @@ svg.viewer-camera-icon {
   transform: translateY(-0.02rem);
 }
 
-.transport-group-settings-menu {
+.transport-unique-icons > .transport-settings-button {
+  position: relative;
+}
+
+.transport-settings-button > .viewer-preview-dot {
   position: absolute;
-  right: 0;
-  bottom: calc(100% + 0.35rem);
-  z-index: var(--mf-z-popover);
+  top: 0.3rem;
+  right: 0.3rem;
+  margin: 0;
+}
+
+/* Information and settings buttons at a surface's bottom right. */
+.surface-corner-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.surface-corner-actions > .icon-button {
   display: grid;
-  width: max-content;
-  min-width: 15rem;
-  max-width: min(22rem, 80vw);
-  gap: 0.25rem;
-  padding: 0.5rem;
+  width: 2.2rem;
+  height: 2.2rem;
+  place-items: center;
+  padding: 0;
   border: 1px solid var(--mf-border-neutral-35);
   border-radius: var(--mf-radius-md);
+  color: var(--mf-text-neutral-82);
   background: var(--mf-bg-neutral-08-a98);
-  box-shadow: 0 0.55rem 1.5rem var(--mf-shadow-neutral-00-a40);
-  white-space: normal;
+  font-weight: 600;
 }
 
-.transport-group-settings-menu strong {
-  color: var(--mf-text-neutral-86);
-  font-size: var(--mf-font-size-072);
+.settings-scope {
+  display: inline-block;
+  flex: 0 0 auto;
+  padding: 0.05rem 0.4rem;
+  border: 1px solid var(--mf-border-neutral-32);
+  border-radius: var(--mf-radius-pill);
+  color: var(--mf-text-neutral-68);
+  font-size: var(--mf-font-size-058);
+  font-weight: 400;
+  line-height: 1.35;
+  text-transform: none;
+  white-space: nowrap;
+  cursor: help;
 }
 
-.transport-group-settings-menu label {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 0.4rem;
-  padding: 0.25rem;
-  color: var(--mf-text-neutral-73);
-  font-size: var(--mf-font-size-072);
-}
-
-.transport-group-settings-menu label span {
+.settings-pending-apply {
   display: block;
-  min-width: 0;
-  color: var(--mf-text-neutral-86);
-  opacity: 1;
-  overflow-wrap: anywhere;
-  visibility: visible;
+  margin: 0.2rem 0;
+  color: var(--mf-text-warning-92);
+  font-size: var(--mf-font-size-062);
 }
 
-.transport-group-settings-menu .transport-settings-option {
-  display: grid;
-  grid-template-columns: 1rem minmax(0, 1fr);
-  color: var(--mf-text-neutral-86);
-  opacity: 1;
-}
-
-.transport-settings-range {
-  display: grid !important;
-  grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-areas:
-    "label output"
-    "slider slider";
-}
-
-.transport-settings-range span {
-  grid-area: label;
-}
-
-.transport-settings-range input {
-  grid-area: slider;
-  width: 100%;
-}
-
-.transport-settings-range output {
-  grid-area: output;
+/* A heading inside a settings section; its scope tag (and, for
+   installation settings, its Defaults action) sit at the right. */
+.settings-subheading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin: 0.6rem 0 0.3rem;
   color: var(--mf-text-neutral-80);
+  font-size: var(--mf-font-size-072);
+  font-weight: 600;
+}
+
+.viewer-axes-group {
+  display: grid;
+}
+
+.settings-subheading > span:first-child {
+  margin-right: auto;
+}
+
+.settings-restore-defaults {
+  min-height: 1.4rem;
+  padding: 0.05rem 0.5rem;
+  font-size: var(--mf-font-size-065);
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.settings-subheading.minor {
+  margin: 0.45rem 0 0.2rem;
+  color: var(--mf-text-neutral-68);
+  font-size: var(--mf-font-size-068);
+  font-weight: 400;
 }
 
 .viewer-transport .transport-run:hover:not(:disabled),
@@ -952,32 +887,6 @@ svg.viewer-camera-icon {
   background: var(--mf-bg-warning-22);
 }
 
-.transport-group-settings-menu input {
-  flex: 0 0 auto;
-}
-
-.viewer-object-quick-panel,
-.viewer-object-quick-panel dl {
-  display: grid;
-  min-width: 0;
-  gap: 0.55rem;
-}
-
-.viewer-object-quick-panel dl {
-  grid-template-columns: 7rem minmax(0, 1fr);
-  margin: 0;
-}
-
-.viewer-object-quick-panel dt {
-  color: var(--mf-text-neutral-57);
-}
-
-.viewer-object-quick-panel dd {
-  min-width: 0;
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
 .viewer-options-body {
   display: grid;
   gap: 0.65rem;
@@ -991,11 +900,6 @@ svg.viewer-camera-icon {
   overflow: hidden;
 }
 
-.viewer-inspector-section .viewer-options-body,
-.viewer-inspector-section .viewer-object-quick-panel {
-  padding: 0.65rem;
-}
-
 .viewer-object-global-actions {
   display: flex;
   gap: 0.35rem;
@@ -1005,10 +909,6 @@ svg.viewer-camera-icon {
 
 .viewer-object-global-actions button {
   flex: 1 1 auto;
-}
-
-.viewer-object-owner-editor {
-  padding: 0.55rem;
 }
 
 .viewer-inspector-section .robot-control-panel {
@@ -1029,14 +929,8 @@ svg.viewer-camera-icon {
 }
 
 .viewer-inspector-section .viewer-options-body,
-.viewer-inspector-section .viewer-object-quick-panel,
-.viewer-inspector-section .viewer-object-quick-panel dl {
+.viewer-inspector-section .viewer-object-quick-panel {
   gap: var(--inspector-section-gap);
-}
-
-.viewer-inspector-section .robot-control-modes {
-  justify-content: center;
-  padding: 0.45rem 0.55rem;
 }
 
 .viewer-inspector-section .robot-control-target-selectors {
@@ -1137,16 +1031,6 @@ svg.viewer-camera-icon {
   min-width: 0;
 }
 
-.viewer-inspector-section .robot-control-motion-settings h4 {
-  margin: 0 0 0.5rem;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  font-size: var(--mf-font-size-100);
-  font-weight: var(--mf-font-weight-semibold);
-  color: var(--mf-text-neutral-90);
-}
-
 .viewer-inspector-section .robot-control-actions {
   display: grid;
   width: 100%;
@@ -1194,8 +1078,8 @@ svg.viewer-camera-icon {
   }
 
   .viewer-transport {
-    right: 0.4rem;
-    left: 0.4rem;
+    right: var(--mf-surface-overlay-inset);
+    left: var(--mf-surface-overlay-inset);
     width: auto;
     max-width: none;
     grid-template-columns: minmax(0, 1fr);
@@ -1229,4 +1113,87 @@ svg.viewer-camera-icon {
     min-width: 0;
   }
 
+}
+
+/* Status colours legend in the viewer's information panel. Samples reuse
+   the header's classes so they always look the same. */
+.status-legend {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.status-legend h4 {
+  margin: 0.3rem 0 0;
+  color: var(--mf-text-neutral-86);
+  font-size: var(--mf-font-size-076);
+}
+
+.status-legend-rows {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+}
+
+.status-legend-rows > div {
+  display: grid;
+  grid-template-columns: 7.5rem minmax(0, 1fr);
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.status-legend-rows dt {
+  display: flex;
+  align-items: center;
+}
+
+.status-legend-rows dd {
+  margin: 0;
+  color: var(--mf-text-neutral-73);
+  font-size: var(--mf-font-size-072);
+  line-height: 1.4;
+}
+
+.status-legend-button {
+  display: inline-flex;
+  align-items: center;
+  height: 1.6rem;
+  padding: 0 0.6rem;
+  border: 1px solid color-mix(in srgb, var(--deployment-tone-border) 55%, var(--mf-border-neutral-27));
+  border-radius: var(--mf-radius-md);
+  color: var(--mf-text-neutral-82);
+  background: color-mix(in srgb, var(--deployment-tone-bg) 40%, var(--mf-bg-neutral-11));
+  font-size: var(--mf-font-size-068);
+}
+
+.status-legend-button.readiness-ready { --deployment-tone-border: var(--mf-border-success-40); --deployment-tone-bg: var(--mf-bg-success-24); }
+.status-legend-button.readiness-degraded { --deployment-tone-border: var(--mf-border-warning-43); --deployment-tone-bg: var(--mf-bg-warning-27b); }
+.status-legend-button.readiness-fault { --deployment-tone-border: var(--mf-border-danger-49); --deployment-tone-bg: var(--mf-bg-danger-30); }
+.status-legend-button.readiness-offline { --deployment-tone-border: var(--mf-border-danger-37); --deployment-tone-bg: var(--mf-bg-danger-21); }
+.status-legend-button.readiness-waiting { --deployment-tone-border: var(--mf-border-neutral-35); --deployment-tone-bg: var(--mf-bg-neutral-20); }
+
+.status-legend-dot {
+  position: relative;
+  display: inline-block;
+  width: 1rem;
+  height: 1rem;
+}
+
+.status-legend-dot > .deployment-status-indicator {
+  right: auto;
+  left: 0;
+}
+
+.status-legend-dot > .deployment-status-indicator.has-attention {
+  color: var(--mf-text-neutral-96);
+  background: var(--mf-bg-danger-37);
+}
+
+.status-legend-dot.offline > .deployment-status-indicator {
+  border-color: var(--mf-border-neutral-53);
+  background: var(--mf-bg-neutral-54);
+}
+
+.status-legend-letters {
+  display: inline-flex;
+  gap: 0.25rem;
 }

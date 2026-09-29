@@ -312,9 +312,11 @@ export function buildProgramStartRequest(
   workspace: ProgramWorkspaceResponse | null,
   requestOwnerEpoch: string,
   requestId: string,
+  /** The Deployment Draft is not the applied one: Execute waits, as for the Program. */
+  deploymentPending = false,
 ): Record<string, JsonValue> | null {
   if (
-    applied === null || !runnerAvailable || pending !== null
+    applied === null || !runnerAvailable || pending !== null || deploymentPending
     || snapshot === null || !snapshot.authoringAdmission.authoringAllowed
     || snapshot.programCycle.state !== 'idle_after_reset'
     || workspace === null
@@ -482,6 +484,7 @@ export function useProgramRuntime(
   snapshot: ComposerHeadlessState | null = null,
   workspace: ProgramWorkspaceResponse | null = null,
   controlSource: HeadlessStateSource | null = null,
+  deploymentPending = false,
 ) {
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
   const mounted = useRef(true);
@@ -861,7 +864,7 @@ export function useProgramRuntime(
     const requestId = identity('program-run-start');
     const request = buildProgramStartRequest(
       state.applied, state.runnerAvailable, state.pending, snapshot, workspace,
-      callerEpoch.current, requestId,
+      callerEpoch.current, requestId, deploymentPending,
     );
     if (request === null) return;
     if (controlSource === null) return;
@@ -876,7 +879,7 @@ export function useProgramRuntime(
       );
     }
   }, [
-    beginProgramCommand, controlSource,
+    beginProgramCommand, controlSource, deploymentPending,
     recordCommandFailure, snapshot,
     state.applied, state.pending, state.runnerAvailable, workspace,
   ]);
@@ -1637,18 +1640,30 @@ export function useProgramRuntime(
   const commandAllowed = useCallback((commandKind: string): boolean => (
     (commandKind !== 'program_run' || buildProgramStartRequest(
       state.applied, state.runnerAvailable, state.pending, snapshot, workspace,
-      callerEpoch.current, 'availability-check',
+      callerEpoch.current, 'availability-check', deploymentPending,
     ) !== null)
     && (snapshot?.programCycle.allowedCommands.some(
       (command) => command.commandKind === commandKind && command.allowed,
     ) ?? false)
-  ), [snapshot, state.applied, state.pending, state.runnerAvailable, workspace]);
+  ), [deploymentPending, snapshot, state.applied, state.pending, state.runnerAvailable, workspace]);
+  // Execute runs only what is applied: say which Draft still has changes.
+  const programPending = state.applied !== null && workspace !== null
+    && workspace.draft.programLoaded
+    && workspace.draft.programRevision !== state.applied.programRevision;
+  const pendingDocuments = [
+    ...(programPending ? ['Program (Scene edits included)'] : []),
+    ...(deploymentPending ? ['Deployment'] : []),
+  ];
+  const startBlockedReason = pendingDocuments.length === 0
+    ? null
+    : `Apply or Discard first: unapplied changes in ${pendingDocuments.join(' and ')}. Execute runs only what is applied.`;
 
   return useMemo(() => ({
     state,
     cycleState,
     cycleFailure,
     commandAllowed,
+    startBlockedReason,
     active,
     refresh,
     dismissError,
@@ -1684,6 +1699,7 @@ export function useProgramRuntime(
     cycleFailure,
     cycleState,
     commandAllowed,
+    startBlockedReason,
     refresh,
     reset,
     run,

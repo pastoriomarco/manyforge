@@ -353,5 +353,7 @@
   /* Floating canvas toolbars (tree editor, 3D viewer top): the same height
      as the application header buttons. */
   --mf-toolbar-control-height: 1.9rem;
-  --mf-viewer-overlay-inset: 0.65rem;
+  /* Distance of commands overlaid on a surface (tree editor, 3D viewer)
+     from its edges: one value so every surface looks the same. */
+  --mf-surface-overlay-inset: 0.45rem;
 }

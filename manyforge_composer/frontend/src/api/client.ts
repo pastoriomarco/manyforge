@@ -40,6 +40,11 @@ import {
   parseSourceModelProjection,
 } from './parsers';
 import {
+  parseComposerSettingsSnapshot,
+  type ComposerSettings,
+  type ComposerSettingsSnapshot,
+} from '../state/composerSettings';
+import {
   parseAssistantModeIndex,
   parseAssistantProviderStatus,
 } from './assistantParsers';
@@ -404,10 +409,55 @@ async function requestJson<T>(
   }
 }
 
+const COMPOSER_SETTINGS_PATH = '/api/composer/settings';
+
+function composerSettingsRevision(expectedRevision: number): RequestInit {
+  return { method: 'POST', body: JSON.stringify({ expectedRevision }) };
+}
+
+/** The current settings a revision conflict (HTTP 409) carries, if any. */
+export function composerSettingsConflict(error: unknown): ComposerSettingsSnapshot | null {
+  if (!(error instanceof ApiError) || error.status !== 409) return null;
+  if (apiErrorCode(error) !== 'composer_settings_revision_stale') return null;
+  const detail = (error.payload as { detail?: { current?: unknown } }).detail;
+  try {
+    return parseComposerSettingsSnapshot(detail?.current);
+  } catch {
+    return null;
+  }
+}
+
 export const api = {
   health: {
     get: (signal?: AbortSignal): Promise<HealthResponse> =>
       requestJson('/api/health', parseHealthResponse, signal),
+  },
+  /** Installation Composer settings; Composer HTTP only, revision-checked. */
+  composerSettings: {
+    read: (signal?: AbortSignal): Promise<ComposerSettingsSnapshot> =>
+      requestJson(COMPOSER_SETTINGS_PATH, parseComposerSettingsSnapshot, signal),
+    replace: (expectedRevision: number, settings: ComposerSettings): Promise<ComposerSettingsSnapshot> =>
+      requestJson(COMPOSER_SETTINGS_PATH, parseComposerSettingsSnapshot, undefined, {
+        method: 'PUT',
+        body: JSON.stringify({ expectedRevision, settings }),
+      }),
+    restoreDefaults: (expectedRevision: number): Promise<ComposerSettingsSnapshot> =>
+      requestJson(`${COMPOSER_SETTINGS_PATH}/restore-defaults`, parseComposerSettingsSnapshot,
+        undefined, composerSettingsRevision(expectedRevision)),
+    resetDamaged: (expectedRevision: number): Promise<ComposerSettingsSnapshot> =>
+      requestJson(`${COMPOSER_SETTINGS_PATH}/reset-damaged`, parseComposerSettingsSnapshot,
+        undefined, composerSettingsRevision(expectedRevision)),
+    saveProfile: (expectedRevision: number, name: string): Promise<ComposerSettingsSnapshot> =>
+      requestJson(`${COMPOSER_SETTINGS_PATH}/profiles/${encodeURIComponent(name)}`,
+        parseComposerSettingsSnapshot, undefined, composerSettingsRevision(expectedRevision)),
+    loadProfile: (expectedRevision: number, name: string): Promise<ComposerSettingsSnapshot> =>
+      requestJson(`${COMPOSER_SETTINGS_PATH}/profiles/${encodeURIComponent(name)}/load`,
+        parseComposerSettingsSnapshot, undefined, composerSettingsRevision(expectedRevision)),
+    deleteProfile: (expectedRevision: number, name: string): Promise<ComposerSettingsSnapshot> =>
+      requestJson(
+        `${COMPOSER_SETTINGS_PATH}/profiles/${encodeURIComponent(name)}?expectedRevision=${expectedRevision}`,
+        parseComposerSettingsSnapshot, undefined, { method: 'DELETE' },
+      ),
   },
   catalog: {
     list: (signal?: AbortSignal): Promise<CatalogResponse> =>

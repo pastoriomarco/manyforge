@@ -96,7 +96,7 @@ describe('Composer shell continuity', () => {
     expect(css).toMatch(/minmax\(0, var\(--inspector-width\)\)\s*0\.45rem\s*minmax\(0, 1fr\)/);
     expect(css).toMatch(/\.viewer-transport\s*\{[\s\S]*?display: grid;/);
     expect(css).toMatch(
-      /\.viewer-transport\s*\{[\s\S]*?width: min\(58rem, calc\(100% - 2 \* 0\.65rem\)\);/,
+      /\.viewer-transport\s*\{[\s\S]*?width: min\(58rem, calc\(100% - 2 \* 0\.45rem\)\);/,
     );
     expect(css).toMatch(/\.transport-control-layout\s*\{[\s\S]*?justify-content: space-between;/);
     expect(css).toContain('--inspector-control-height: 1.9rem');

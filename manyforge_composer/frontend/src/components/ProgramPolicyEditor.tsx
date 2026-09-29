@@ -275,7 +275,8 @@ export function ProgramPolicyEditor({
     errors[field] ? errorId(field) : undefined;
 
   return (
-    <section className="program-policy-editor" aria-labelledby={fieldId(id, 'title')}>
+    <section className="program-policy-editor dcard" aria-labelledby={fieldId(id, 'title')}>
+      <h4 id={fieldId(id, 'title')}>Node policy</h4>
       <form
         className="program-policy-form"
         onBlur={commit}
@@ -284,12 +285,6 @@ export function ProgramPolicyEditor({
           commit();
         }}
       >
-        <div className="program-policy-heading">
-          <div>
-            <p className="eyebrow">Authored policy</p>
-            <h4 id={fieldId(id, 'title')}>Node policy</h4>
-          </div>
-        </div>
         <p className="program-policy-note hint">
           Effective canonical defaults are shown when fields are omitted. Defaults
           are saved by omission. These values are authored for future Run behavior;

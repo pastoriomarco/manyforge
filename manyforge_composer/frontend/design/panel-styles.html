@@ -1,0 +1,505 @@
+<meta charset="utf-8">
+<title>Panel Styles Mock</title>
+<!-- Readability proposals for Composer's side panels. Open via the dev server
+     (/design/panel-styles.html) or file://. The app's colour tokens come from
+     its real stylesheet; panel content is reproduced from the live panels.
+     Lint, build, tests and packaging ignore this folder. -->
+<link rel="stylesheet" href="../src/styles/index.css">
+<style>
+  body { margin: 0; padding: 28px clamp(16px, 3vw, 40px) 64px; overflow: auto; }
+  .ps-wrap { max-width: 1660px; margin: 0 auto; display: grid; gap: 22px; }
+  .ps-wrap h1 { margin: 0; font-size: 1.3rem; }
+  .ps-lead { margin: 0; max-width: 96ch; color: var(--mf-text-neutral-68); font-size: 0.84rem; line-height: 1.55; }
+  .ps-rules { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+  .ps-rule { padding: 12px 14px; border: 1px solid var(--mf-border-neutral-23); border-radius: 10px; background: var(--mf-bg-neutral-08); }
+  .ps-rule h3 { margin: 0 0 6px; font-size: 0.86rem; color: var(--mf-text-neutral-94); }
+  .ps-rule ul { margin: 0; padding-left: 1.05rem; display: grid; gap: 3px; color: var(--mf-text-neutral-68); font-size: 0.76rem; line-height: 1.45; }
+  .ps-bar { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 0; background: var(--mf-bg-neutral-06, #081018); }
+  .ps-bar span { color: var(--mf-text-neutral-57); font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; margin-right: 6px; }
+  .ps-bar button { min-height: 2rem; padding: 0 0.9rem; }
+  .ps-bar button[aria-pressed="true"] { border-color: var(--mf-border-accent-64); color: var(--mf-text-neutral-96); background: var(--mf-bg-neutral-19); }
+  .ps-section-title { margin: 14px 0 0; font-size: 0.95rem; color: var(--mf-text-neutral-90); }
+  .ps-row { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start; }
+  .ps-col { display: grid; gap: 6px; }
+  .ps-col > .ps-cap { color: var(--mf-text-neutral-57); font-size: 0.68rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+
+  /* ================================================================
+     Shared panel frame: the inspector title bar stays as today.
+     ================================================================ */
+  .pn { --w: 380px; width: var(--w); max-width: 100%; display: flex; flex-direction: column; border: 1px solid var(--mf-border-neutral-27); border-radius: 8px; background: var(--mf-bg-neutral-06, #0a141c); color: var(--mf-text-neutral-86); overflow: hidden; }
+  .pn-bar { display: flex; align-items: center; gap: 8px; min-height: 2.4rem; padding: 0 10px 0 12px; border-bottom: 1px solid var(--mf-border-neutral-23); background: var(--mf-bg-neutral-11); }
+  .pn-bar strong { flex: 1; font-size: 0.86rem; color: var(--mf-text-neutral-94); }
+  .pn-bar i { display: grid; place-items: center; width: 1.6rem; height: 1.6rem; border: 1px solid var(--mf-border-neutral-32); border-radius: 6px; font-style: normal; font-size: 0.7rem; color: var(--mf-text-neutral-73); }
+  .pn-body { display: flex; flex-direction: column; }
+
+  /* Controls: one height everywhere (1.9rem), one text size. */
+  .pn .ctl { display: flex; align-items: center; min-height: 1.9rem; padding: 0 0.6rem; border: 1px solid var(--mf-border-neutral-32); border-radius: 6px; background: var(--mf-bg-neutral-08); color: var(--mf-text-neutral-90); font-size: 0.8rem; min-width: 0; }
+  .pn .ctl.select::after { content: "⌄"; margin-left: auto; padding-left: 0.5rem; color: var(--mf-text-neutral-63); }
+  .pn .ctl.area { align-items: flex-start; padding: 0.4rem 0.6rem; min-height: 3.6rem; font-size: 0.78rem; line-height: 1.4; }
+  .pn .btn { display: inline-flex; align-items: center; justify-content: center; min-height: 1.9rem; padding: 0 0.7rem; border: 1px solid var(--mf-border-neutral-35); border-radius: 6px; background: var(--mf-bg-neutral-11); color: var(--mf-text-neutral-86); font-size: 0.78rem; white-space: nowrap; }
+  .pn .btn.primary { border-color: var(--mf-border-success-40); background: var(--mf-bg-success-24); color: var(--mf-text-neutral-96); }
+  .pn .btn.danger { border-color: var(--mf-border-danger-49); color: var(--mf-text-danger-80, #f3a19b); }
+  .pn .btn.muted { opacity: 0.5; }
+  .pn .btn.link { border-color: transparent; background: none; color: var(--mf-text-accent-72, #7fd3e6); padding: 0 0.3rem; min-height: 1.4rem; }
+  .pn .chk { width: 0.95rem; height: 0.95rem; flex: 0 0 auto; border: 1.5px solid var(--mf-border-neutral-43); border-radius: 3px; }
+  .pn .chk.on { border-color: var(--mf-border-accent-64); background: var(--mf-bg-accent-45, #3aa6c0); box-shadow: inset 0 0 0 2px var(--mf-bg-neutral-08); }
+  .pn .slider { position: relative; flex: 1; height: 4px; border-radius: 2px; background: var(--mf-bg-neutral-27, #2b3b47); }
+  .pn .slider b { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 2px; background: var(--mf-bg-accent-45, #3aa6c0); }
+  .pn .slider b::after { content: ""; position: absolute; right: -7px; top: -5px; width: 14px; height: 14px; border-radius: 50%; background: var(--mf-text-neutral-86); }
+  .pn .tag { flex: 0 0 auto; padding: 0.05rem 0.4rem; border: 1px solid var(--mf-border-neutral-32); border-radius: 999px; color: var(--mf-text-neutral-68); font-size: 0.62rem; font-weight: 400; letter-spacing: 0; text-transform: none; }
+  .pn .mono { font-family: var(--mf-font-mono, ui-monospace, monospace); font-size: 0.74rem; color: var(--mf-text-accent-72, #8fd6e8); }
+  .pn .muted { color: var(--mf-text-neutral-57); }
+  .pn .dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--mf-status-success, #52c79a); flex: 0 0 auto; }
+
+  /* Item layouts (the same markup in every style). */
+  .it-facts { display: grid; }
+  .it-fact { display: grid; grid-template-columns: 9rem minmax(0,1fr); gap: 10px; align-items: baseline; font-size: 0.78rem; }
+  .it-fact > span:first-child { color: var(--mf-text-neutral-63); }
+  .it-field { display: grid; gap: 4px; }
+  .it-field > label { font-size: 0.72rem; color: var(--mf-text-neutral-63); }
+  .it-fields { display: grid; grid-template-columns: repeat(var(--n, 2), minmax(0,1fr)); gap: 8px; }
+  .it-toggles { display: grid; }
+  .it-toggle { display: flex; align-items: center; gap: 10px; font-size: 0.8rem; }
+  .it-slider { display: flex; align-items: center; gap: 12px; font-size: 0.78rem; }
+  .it-slider > span:first-child { flex: 0 0 5.5rem; color: var(--mf-text-neutral-68); }
+  .it-slider output { flex: 0 0 3.2rem; text-align: right; color: var(--mf-text-neutral-86); }
+  /* Buttons share their row: they grow to fill it and wrap when they do
+     not fit, so every button row ends at the section's edge. */
+  .it-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+  .it-buttons > .btn { flex: 1 1 auto; }
+  .it-note { margin: 0; color: var(--mf-text-neutral-63); font-size: 0.74rem; line-height: 1.5; }
+  .it-note.warn { color: var(--mf-text-warning-67); }
+  .it-list { display: grid; }
+  .it-li { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 8px; }
+  .it-li b { display: block; font-size: 0.8rem; font-weight: 600; color: var(--mf-text-neutral-90); }
+  .it-li small { display: block; font-size: 0.68rem; color: var(--mf-text-neutral-57); }
+  .it-li .meta { font-size: 0.72rem; color: var(--mf-text-neutral-63); }
+  /* Segmented choice: one row while every option fits; otherwise it wraps,
+     and every row stretches its options to the full width. */
+  .it-seg { display: flex; flex-wrap: wrap; gap: 4px; padding: 3px; border: 1px solid var(--mf-border-neutral-27); border-radius: 8px; background: var(--mf-bg-neutral-08); }
+  .it-seg span { flex: 1 1 var(--seg-basis, auto); display: grid; place-items: center; min-height: 1.75rem; padding: 0 0.45rem; border-radius: 5px; font-size: 0.78rem; color: var(--mf-text-neutral-73); white-space: nowrap; }
+  /* Every option has a faint outline; the selected one is clearly marked
+     by the accent border, a lighter fill and bright text. */
+  .it-seg span { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--mf-border-neutral-35) 55%, transparent); }
+  .it-seg span.on { background: var(--mf-bg-neutral-19); color: var(--mf-text-neutral-96); font-weight: 600; box-shadow: inset 0 0 0 1px var(--mf-border-accent-64); }
+  .it-status { display: grid; }
+  .it-st { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 10px; }
+  .it-st b { display: block; font-size: 0.82rem; color: var(--mf-text-neutral-90); }
+  .it-st small { display: block; font-size: 0.7rem; color: var(--mf-text-neutral-57); }
+  .it-st em { font-style: normal; font-size: 0.72rem; color: var(--mf-text-success-67); }
+  .it-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  /* As many chips per row as fit; each row stretches them to its width. */
+  .it-chips span { flex: 1 1 auto; text-align: center; padding: 0.12rem 0.5rem; border: 1px solid var(--mf-border-neutral-30); border-radius: 999px; font-size: 0.68rem; color: var(--mf-text-neutral-73); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .it-checkrows { display: grid; }
+  .it-cr { display: grid; grid-template-columns: minmax(0,1fr) auto auto; align-items: center; gap: 18px; }
+  .it-cr b { display: block; font-size: 0.8rem; color: var(--mf-text-neutral-90); }
+  .it-cr small { display: block; font-size: 0.68rem; color: var(--mf-text-neutral-57); }
+  .it-cr label { display: grid; justify-items: center; gap: 2px; font-size: 0.64rem; color: var(--mf-text-neutral-57); }
+  .it-joint { display: grid; grid-template-columns: minmax(0,1fr) 5.2rem 1.8rem; grid-template-areas: "head head head" "slider num unit"; gap: 4px 10px; align-items: center; }
+  .it-joint .jt-head { grid-area: head; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .it-joint b { font-size: 0.8rem; color: var(--mf-text-neutral-90); }
+  .it-joint small { font-size: 0.66rem; color: var(--mf-text-neutral-57); white-space: nowrap; }
+  .it-joint .slider { grid-area: slider; }
+  .it-joint .ctl { grid-area: num; }
+  .it-joint i { grid-area: unit; font-style: normal; font-size: 0.72rem; color: var(--mf-text-neutral-57); }
+  .it-table { width: 100%; border-collapse: collapse; font-size: 0.76rem; }
+  .it-table th { text-align: left; font-weight: 600; font-size: 0.66rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--mf-text-neutral-63); padding: 6px 8px; }
+  .it-table td { padding: 6px 8px; color: var(--mf-text-neutral-82); }
+  .it-tiles { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 8px; }
+  .it-tile { display: grid; gap: 2px; padding: 6px 8px; border: 1px solid var(--mf-border-neutral-27); border-radius: 6px; }
+  .it-tile small { font-size: 0.66rem; color: var(--mf-text-neutral-57); }
+  .it-tile b { font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .it-tabs { display: flex; flex-wrap: wrap; gap: 2px; }
+  .it-tabs span { padding: 0.35rem 0.65rem; border-radius: 6px; font-size: 0.78rem; color: var(--mf-text-neutral-68); }
+  .it-tabs span.on { color: var(--mf-text-neutral-96); background: var(--mf-bg-neutral-15); box-shadow: inset 0 -2px 0 var(--mf-border-accent-64); }
+  .it-head { display: grid; gap: 4px; }
+  .it-head small { font-size: 0.66rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--mf-text-accent-72, #7fd3e6); }
+  .it-head b { font-size: 1rem; color: var(--mf-text-neutral-96); }
+  .it-empty { font-size: 0.74rem; color: var(--mf-text-neutral-57); font-style: italic; }
+  .pn .sec-collapsed .sec-body { display: none; }
+
+  /* ================================================================
+     Style A · Headed sections: every section starts with a tinted
+     header strip (small caps title, tag/action on the right). The
+     strips are the only separators; content sits on the panel ground.
+     ================================================================ */
+  .st-a .sec-head { display: flex; align-items: center; gap: 8px; min-height: 1.9rem; padding: 0 12px; background: var(--mf-bg-neutral-11); border-top: 1px solid var(--mf-border-neutral-23); border-bottom: 1px solid var(--mf-border-neutral-19); }
+  .st-a .sec:first-child .sec-head { border-top: 0; }
+  .st-a .sec-head h4 { flex: 1; margin: 0; font-size: 0.68rem; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase; color: var(--mf-text-neutral-80); }
+  .st-a .sec-head .chev { font-size: 0.7rem; color: var(--mf-text-neutral-57); }
+  .st-a .sec-body { display: grid; gap: 10px; padding: 12px; }
+  .st-a .sub { margin: 4px 0 -2px; font-size: 0.74rem; font-weight: 600; color: var(--mf-text-neutral-80); display: flex; justify-content: space-between; align-items: center; }
+  .st-a .it-facts, .st-a .it-toggles, .st-a .it-list, .st-a .it-status, .st-a .it-checkrows { gap: 7px; }
+  .st-a .it-toggles { gap: 9px; }
+  .st-a .it-li, .st-a .it-st, .st-a .it-cr { padding: 4px 0; }
+  .st-a .it-table tr + tr td { border-top: 1px solid var(--mf-border-neutral-19); }
+
+  /* ================================================================
+     Style B · Cards: every section is a card on a slightly darker
+     ground; title in normal case inside the card, no inner hairlines.
+     ================================================================ */
+  .st-b .pn-body { gap: 10px; padding: 10px; background: color-mix(in srgb, var(--mf-bg-neutral-06, #0a141c) 70%, #000); }
+  .st-b .sec { border: 1px solid var(--mf-border-neutral-23); border-radius: 8px; background: var(--mf-bg-neutral-08); }
+  .st-b .sec-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px 0; }
+  .st-b .sec-head h4 { flex: 1; margin: 0; font-size: 0.84rem; font-weight: 600; color: var(--mf-text-neutral-94); }
+  .st-b .sec-head .chev { font-size: 0.75rem; color: var(--mf-text-neutral-57); }
+  .st-b .sec-collapsed .sec-head { padding-bottom: 10px; }
+  .st-b .sec-body { display: grid; gap: 10px; padding: 10px 12px 12px; }
+  .st-b .sub { margin: 2px 0 -3px; font-size: 0.7rem; color: var(--mf-text-neutral-63); display: flex; justify-content: space-between; align-items: center; }
+  .st-b .it-facts, .st-b .it-toggles, .st-b .it-list, .st-b .it-status, .st-b .it-checkrows { gap: 8px; }
+  .st-b .it-li, .st-b .it-st, .st-b .it-cr { padding: 6px 8px; border-radius: 6px; background: var(--mf-bg-neutral-11); }
+  .st-b .it-table td { background: var(--mf-bg-neutral-11); }
+  .st-b .it-table tr td:first-child { border-radius: 5px 0 0 5px; } .st-b .it-table tr td:last-child { border-radius: 0 5px 5px 0; }
+  .st-b .it-table { border-spacing: 0 3px; border-collapse: separate; }
+
+  /* ================================================================
+     Style C · Property grid: collapsible groups with a chevron; inside,
+     label | value rows on hairlines, like an IDE inspector. Dense and
+     aligned: every label column has the same width.
+     ================================================================ */
+  .st-c .sec + .sec { border-top: 1px solid var(--mf-border-neutral-23); }
+  .st-c .sec-head { display: flex; align-items: center; gap: 8px; min-height: 2rem; padding: 0 12px; }
+  .st-c .sec-head .chev { width: 0.8rem; font-size: 0.72rem; color: var(--mf-text-neutral-63); }
+  .st-c .sec-head h4 { flex: 1; margin: 0; font-size: 0.8rem; font-weight: 700; color: var(--mf-text-neutral-94); }
+  .st-c .sec-body { display: grid; padding: 0 12px 10px 32px; }
+  .st-c .sec-body > * { padding: 6px 0; border-top: 1px solid var(--mf-border-neutral-19); }
+  .st-c .sec-body > *:first-child { border-top: 0; }
+  .st-c .it-facts { gap: 6px; }
+  .st-c .it-field { grid-template-columns: minmax(0,1fr) minmax(0,2fr); align-items: center; gap: 10px; }
+  .st-c .it-fact { grid-template-columns: minmax(0,1fr) minmax(0,2fr); }
+  .st-c .it-field:not(:has(label)) { grid-template-columns: minmax(0,1fr); }
+  /* Labels take a third and may wrap to two lines; fields take two thirds. */
+  .st-c .it-field > label, .st-d .it-field > label,
+  .st-c .it-fact > span:first-child, .st-d .it-fact > span:first-child {
+    line-height: 1.3; padding-bottom: 1px; overflow-wrap: break-word;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  /* Read-only values end where editable fields end: at the right edge. */
+  .st-c .it-fact > span:last-child, .st-d .it-fact > span:last-child { justify-self: end; text-align: right; }
+  /* A read-only label may use all the room left of its value. */
+  .pn.st-c .it-fact, .pn.st-d .it-fact { grid-template-columns: minmax(0,1fr) auto; }
+  /* One setting per row: side-by-side fields stack in the grid. */
+  .st-c .it-fields { grid-template-columns: minmax(0,1fr); gap: 6px; }
+  .st-c .it-field.area { align-items: start; }
+  .st-c .it-toggles { gap: 6px; }
+  .st-c .it-list, .st-c .it-status, .st-c .it-checkrows { gap: 0; }
+  .st-c .it-li, .st-c .it-st, .st-c .it-cr { padding: 5px 0; }
+  .st-c .it-li + .it-li, .st-c .it-st + .it-st, .st-c .it-cr + .it-cr { border-top: 1px dashed var(--mf-border-neutral-19); }
+  .st-c .sub { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--mf-text-neutral-63); display: flex; justify-content: space-between; align-items: center; }
+  .st-c .it-table tr + tr td { border-top: 1px solid var(--mf-border-neutral-19); }
+
+  /* ================================================================
+     Style D · Cards + property grid: sections are cards (B) for clear
+     separation; inside, collapsible label | value rows on hairlines (C).
+     ================================================================ */
+  .st-d .pn-body { gap: 8px; padding: 8px; background: color-mix(in srgb, var(--mf-bg-neutral-06, #0a141c) 70%, #000); }
+  .st-d .sec { border: 1px solid var(--mf-border-neutral-23); border-radius: 8px; background: var(--mf-bg-neutral-08); overflow: hidden; }
+  .st-d .sec-head { display: flex; align-items: center; gap: 8px; min-height: 2.1rem; padding: 0 10px; background: var(--mf-bg-neutral-11); border-bottom: 1px solid var(--mf-border-neutral-19); }
+  .st-d .sec-collapsed .sec-head { border-bottom: 0; }
+  .st-d .sec-head .chev { width: 0.8rem; font-size: 0.72rem; color: var(--mf-text-neutral-63); }
+  .st-d .sec-head h4 { flex: 1; margin: 0; font-size: 0.8rem; font-weight: 700; color: var(--mf-text-neutral-94); }
+  .st-d .sec-body { display: grid; padding: 2px 10px 8px; }
+  .st-d .sec-body > * { padding: 6px 0; border-top: 1px solid var(--mf-border-neutral-19); }
+  .st-d .sec-body > *:first-child { border-top: 0; }
+  .st-d .it-facts { gap: 6px; }
+  .st-d .it-field { grid-template-columns: minmax(0,1fr) minmax(0,2fr); align-items: center; gap: 10px; }
+  .st-d .it-field.area { align-items: start; }
+  .st-d .it-field:not(:has(label)) { grid-template-columns: minmax(0,1fr); }
+  .st-d .it-fields { grid-template-columns: minmax(0,1fr); gap: 6px; }
+  .st-d .it-fact { grid-template-columns: minmax(0,1fr) minmax(0,2fr); }
+  .st-d .it-toggles { gap: 6px; }
+  .st-d .it-list, .st-d .it-status, .st-d .it-checkrows { gap: 0; }
+  .st-d .it-li, .st-d .it-st, .st-d .it-cr { padding: 5px 0; }
+  .st-d .it-li + .it-li, .st-d .it-st + .it-st, .st-d .it-cr + .it-cr { border-top: 1px dashed var(--mf-border-neutral-19); }
+  .st-d .sub { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--mf-text-neutral-63); display: flex; justify-content: space-between; align-items: center; }
+  .st-d .it-table tr + tr td { border-top: 1px solid var(--mf-border-neutral-19); }
+  /* D: a field sits beside its label (two thirds) while its value fits
+     there. Multi-line fields, and values that do not fit, take their own
+     row under the label, as in B. Decided by field kind and loaded value,
+     never while typing, so the layout does not jump. */
+  .st-d .it-field:not(.stacked) .ctl:not(.area) { white-space: nowrap; overflow: hidden; }
+  .pn.st-d .it-field.stacked { grid-template-columns: minmax(0,1fr); gap: 4px; }
+  /* A single-line field stays one line on its own row, as a real input. */
+  .pn.st-d .it-field.stacked .ctl:not(.area) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; line-height: 1.9rem; }
+  .pn.st-d .it-field.area { grid-template-columns: minmax(0,1fr); gap: 4px; }
+</style>
+
+<div class="ps-wrap">
+  <header style="display:grid; gap:8px;">
+    <h1>Panel styles: readability proposals</h1>
+    <p class="ps-lead">
+      The side panels are reproduced from the live app (Program settings, Parameters,
+      Viewer settings, Robot control, Selected object, Scene hierarchy, Deployment). Each is
+      rendered in three coherent styles close to today's colours. Content is unchanged; only
+      hierarchy, spacing, separators and type change. Pick one style, or mix a rule from
+      another.
+    </p>
+  </header>
+
+  <div class="ps-rules">
+    <div class="ps-rule">
+      <h3>Rules shared by all three</h3>
+      <ul>
+        <li><b>Three text levels only:</b> section title, label (muted), value.</li>
+        <li><b>One separator kind per style</b>, used everywhere; no stray hairlines.</li>
+        <li><b>One control height</b> (1.9rem) and text size for inputs, selects and buttons.</li>
+        <li><b>Labels above fields</b> (A, B) or in a left column (C, D): one third for the label, two thirds for the field. Long labels are shortened where the section gives the context, and wrap to two lines otherwise.</li>
+        <li><b>Actions at the end</b> of their section, primary first; destructive last. Buttons share their row and fill it, wrapping when they do not fit.</li>
+        <li><b>Scope tags</b> (Installation, Program, Session) on section or sub-headings only.</li>
+      </ul>
+    </div>
+    <div class="ps-rule">
+      <h3>A · Headed sections</h3>
+      <ul>
+        <li>Tinted header strip per section with a small-caps title.</li>
+        <li>The strips are the only separators; content sits on the panel ground.</li>
+        <li>Closest to today's look; clearest "where does this section start".</li>
+      </ul>
+    </div>
+    <div class="ps-rule">
+      <h3>B · Cards</h3>
+      <ul>
+        <li>Each section is a card; list rows are small filled tiles.</li>
+        <li>Most separation and whitespace; slightly less content per screen.</li>
+      </ul>
+    </div>
+    <div class="ps-rule">
+      <h3>D · Cards + property grid</h3>
+      <ul>
+        <li>Sections are cards with a tinted title bar; inside, label | value rows on hairlines.</li>
+        <li>C's density and alignment with B's separation between sections.</li>
+      </ul>
+    </div>
+    <div class="ps-rule">
+      <h3>C · Property grid</h3>
+      <ul>
+        <li>Collapsible groups (chevron), label | value rows on hairlines.</li>
+        <li>Densest and most aligned; best for long settings and inspectors.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="ps-bar" role="toolbar" aria-label="Style">
+    <span>Show</span>
+    <button type="button" data-view="compare" aria-pressed="true">Compare all</button>
+    <button type="button" data-view="a">Only A</button>
+    <button type="button" data-view="b">Only B</button>
+    <button type="button" data-view="c">Only C</button>
+    <button type="button" data-view="d">Only D</button>
+  </div>
+
+  <div id="ps-root"></div>
+</div>
+
+<script>
+/* ---------------- Panel content (from the live panels) ---------------- */
+const PANELS = [
+  { id: 'program-settings', title: 'Program settings', icons: ['×','□','⌄'], width: 380, sections: [
+    { title: 'Identity and profile', items: [
+      { t: 'facts', rows: [['Program ID','ur5e_lite6_wall_grouped',1],['Profile','composable-cell-v1',1],['Catalog','2.3.0',1]] },
+      { t: 'field', label: 'Program name', value: 'ur5e_lite6_wall_grouped' },
+      { t: 'field', label: 'Description', value: 'Two independent joint trajectories in the UR5e + Lite6 wall cell, in one shared control group without synchronized timing.', kind: 'area' },
+    ]},
+    { title: 'Execution timing', items: [ { t: 'field', label: 'Control groups', value: 'robot_group' } ]},
+    { title: 'Motion defaults', items: [
+      { t: 'note', text: 'Portable defaults. Velocity, acceleration and TCP speed are ceilings; Cartesian nodes may override tolerance and blend. The live Velocity control scales moves without changing these values.' },
+      { t: 'sub', text: 'Bound to nodes' },
+      { t: 'facts', rows: [['velocity_scale','4 of 4'],['acceleration_scale','4 of 4'],['translation_tol_m','4 of 4'],['max_blend_deviation_rad','0 of 0']] },
+      { t: 'fields', n: 2, fields: [['Velocity scale','0.35'],['Acceleration scale','0.5']] },
+    ]},
+    { title: 'Tree editor', tag: 'Installation', items: [
+      { t: 'fields', n: 2, fields: [['Link style','Bezier','select'],['Start in layout','Vertical','select']] },
+    ]},
+  ]},
+  { id: 'params', title: 'Nodes · Params', icons: ['‹'], width: 280, sections: [
+    { title: 'Parameters', action: 'New', items: [ { t: 'list', rows: [
+      ['acceleration_scale','float64','4'],['max_blend_deviation_rad','float64','0'],['max_tcp_linear_speed_mps','float64','4'],['translation_tol_m','float64','4'],['velocity_scale','float64','4']] } ]},
+    { title: 'Namespaces', action: 'New', items: [ { t: 'empty', text: 'No namespaces' } ]},
+    { title: 'Blackboard keys', action: 'New', items: [ { t: 'empty', text: 'No keys' } ]},
+  ]},
+  { id: 'viewer-settings', title: 'Viewer settings', icons: ['□','⌄','×'], width: 380, sections: [
+    { title: 'Display', tag: 'Installation', items: [ { t: 'toggles', items: [['Wireframe overlays',0],['Object outline',1],['Collision geometry',0],['Point cloud',0],['Comparison ghost',0,1]] } ]},
+    { title: 'Frames and joints', items: [
+      { t: 'sub', text: 'Size', tag: 'Program' },
+      { t: 'slider', label: 'Axes size', value: '0.10 m', pct: 8, reset: 1 },
+      { t: 'sub', text: 'Shown', tag: 'Session' },
+      { t: 'buttons', items: ['Show all','Hide all','Reset visibility'] },
+      { t: 'toggles', items: [['Cell frame · link frame',0],['link1 · joint1',0],['link2 · joint2',0],['link3 · joint3',0]] },
+    ]},
+    { title: 'Control panels', items: [
+      { t: 'sub', text: 'Displayed groups', tag: 'Program' },
+      { t: 'toggles', items: [['All groups',0],['robot_group',1]] },
+      { t: 'sub', text: 'Layout and confirmations', tag: 'Installation' },
+      { t: 'slider', label: 'Control width', value: '7 rem', pct: 20 },
+      { t: 'toggles', items: [['Confirm before halting the Program',1],['Confirm before resetting a running Program',1]] },
+    ]},
+    { title: 'Layers and model', collapsed: 1, items: [] },
+  ]},
+  { id: 'robot-control', title: 'Robot control', icons: ['i','□','⌄','×'], width: 400, sections: [
+    { title: 'Target and mode', items: [
+      { t: 'field', label: 'Robot', value: 'lite6_robot · arm', kind: 'select' },
+      { t: 'seg', n: 5, items: ['Joint','Pose plan','Cartesian','Move To','Gripper'], on: 0 },
+      { t: 'fields', n: 2, fields: [['Step','5 deg','select']] },
+    ]},
+    { title: 'Speed and acceleration', items: [
+      { t: 'fields', n: 3, fields: [['Velocity (%)','100'],['Acceleration (%)','100'],['TCP speed (m/s)','0.1']] },
+      { t: 'note', text: 'Deployment maximum 0.15 m/s · effective TCP ceiling 0.1 m/s.' },
+    ]},
+    { title: 'Joints', items: [
+      { t: 'joint', name: 'joint1', range: '−178.2° … 178.2° · 122.6°/s', value: '0', pct: 50 },
+      { t: 'joint', name: 'joint2', range: '−150.0° … 150.0° · 122.6°/s', value: '0', pct: 50 },
+      { t: 'joint', name: 'joint3', range: '−3.5° … 178.2° · 122.6°/s', value: '89.95', pct: 51 },
+    ]},
+    { title: 'Apply observed state to a stored move', collapsed: 1, items: [] },
+    { title: 'Preview', items: [ { t: 'note', text: 'No preview yet: edit a joint or target.' } ]},
+    { title: 'Operation', items: [ { t: 'buttons', items: ['Approve','Revert','Stop operation'], styles: ['primary muted','muted','danger muted'] } ]},
+  ]},
+  { id: 'robot-control-narrow', title: 'Robot control (narrow column)', icons: ['i','□','⌄','×'], width: 300, sections: [
+    { title: 'Target and mode', items: [
+      { t: 'field', label: 'Robot', value: 'lite6_robot · arm', kind: 'select' },
+      { t: 'seg', n: 5, items: ['Joint','Pose plan','Cartesian','Move To','Gripper'], on: 0 },
+      { t: 'fields', n: 2, fields: [['Step','5 deg','select']] },
+    ]},
+    { title: 'Operation', items: [ { t: 'buttons', items: ['Approve','Revert','Stop operation'], styles: ['primary muted','muted','danger muted'] } ]},
+  ]},
+  { id: 'selected-object', title: 'Selected object', icons: ['□','⌄','×'], width: 400, sections: [
+    { title: 'Object', items: [
+      { t: 'field', label: 'Scene object', value: 'Select a current scene object', kind: 'select' },
+      { t: 'field', label: 'Source', value: '/workspace/examples/ur5e_lite6_wall_grouped.scenario/scene/separation_wall.stl' },
+      { t: 'note', text: 'Select an owner-issued scene object.', warn: 1 },
+    ]},
+    { title: 'Move', items: [
+      { t: 'fields', n: 2, fields: [['Step (distance)','0.01 m','select'],['Step (angle)','5 deg','select']] },
+      { t: 'buttons', items: ['Frame selection'], styles: ['muted'] },
+    ]},
+    { title: 'Owner and runtime source facts', collapsed: 1, items: [] },
+    { title: 'Active collision policy', collapsed: 1, items: [] },
+    { title: 'Edit', items: [
+      { t: 'buttons', items: ['Commit object edit','Discard local edit'], styles: ['primary muted','muted'] },
+      { t: 'buttons', items: ['Stage Draft pose','Save observed object to Program'], styles: ['muted','muted'] },
+      { t: 'buttons', items: ['Duplicate','Detach at current pose','Remove'], styles: ['muted','muted','danger muted'] },
+    ]},
+  ]},
+  { id: 'scene', title: 'Scene', icons: [], width: 700, wide: 1, sections: [
+    { title: null, items: [ { t: 'tabs', items: ['Hierarchy','Program scene','Contact policies','Current scene','Sources','Viewer'], on: 0 },
+      { t: 'field', label: '', value: 'Find link, frame, or object' } ]},
+    { title: 'Owner scene objects', meta: '2 objects · 0 attached', items: [ { t: 'checkrows', rows: [['ground','cell_fixed',1,0],['separation_wall','cell_fixed',1,0]] } ]},
+    { title: 'Program Draft initial scene', collapsed: 1, items: [] },
+    { title: 'Retained robot links and frames', collapsed: 1, items: [] },
+  ]},
+  { id: 'deployment', title: 'Deployment workspace', icons: [], width: 760, wide: 1, sections: [
+    { title: null, items: [
+      { t: 'head', eyebrow: 'Separate addressed artifact', text: 'Deployment workspace', action: 'Refresh current state' },
+      { t: 'note', text: 'Edit and save a compiler-validated Deployment Draft independently from Program and Manager Applied state. The header Apply validates and activates this Draft.' },
+    ]},
+    { title: 'Component overview', items: [
+      { t: 'status', rows: [['Headless owner connected','Observe, plan and execute scopes are current for the active composition.','connected']] },
+      { t: 'chips', items: ['manyforge.native_execution_runtime','owner-issued scoped facts','0 acknowledgement required','0 active acknowledged','Scenario ur5e_lite6_wall_grouped','Deployment sha256:bc048d50…','Program sha256:025cfeb3…'] },
+      { t: 'status', rows: [['Observe / Render','Prerequisites are current · required','healthy'],['Plan / Preview','Prerequisites are current · required','healthy'],['Execute / Control','Prerequisites are current · required','healthy'],['Manager','Active graph and runtime units converged · generation 2','healthy'],['robot_cell.native_execution','Runtime contract present and converged · generation 1','healthy']] },
+      { t: 'buttons', items: ['Runtime details and history'] },
+    ]},
+    { title: 'Program binding', meta: 'no exact match', collapsed: 1, items: [] },
+    { title: 'Robot model and target limits', items: [
+      { t: 'field', label: 'Target', value: 'lite6_robot / arm', kind: 'select' },
+      { t: 'tiles', items: [['Robot source','lite6_lite_gripper'],['Model','lite6_robot.model'],['Model revision','sha256:3bc16935…'],['Planning groups','lite6']] },
+      { t: 'table', head: ['Joint','Position','Velocity','Acceleration'], rows: [['joint1','−3.11 … 3.11 rad','2.14 rad/s','10 rad/s²'],['joint2','−2.61 … 2.61 rad','2.14 rad/s','10 rad/s²'],['joint3','−0.06 … 5.23 rad','2.14 rad/s','10 rad/s²']] },
+    ]},
+  ]},
+];
+
+/* ---------------- Renderer (same markup for every style) ---------------- */
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const tag = (t) => t ? `<span class="tag">${esc(t)}</span>` : '';
+/* Labels: identifiers may break after an underscore, never mid-word. */
+const lbl = (s) => esc(s).replace(/_/g, '_<wbr>');
+function ctl(value, kind) {
+  if (kind === 'area') return `<div class="ctl area">${esc(value)}</div>`;
+  return `<div class="ctl${kind === 'select' ? ' select' : ''}">${esc(value)}</div>`;
+}
+function item(it) {
+  switch (it.t) {
+    case 'facts': return `<div class="it-facts">${it.rows.map(([k,v,m]) => `<div class="it-fact"><span>${lbl(k)}</span><span class="${m ? 'mono' : ''}">${esc(v)}</span></div>`).join('')}</div>`;
+    case 'field': return `<div class="it-field${it.kind === 'area' ? ' area' : ''}">${it.label ? `<label>${lbl(it.label)}</label>` : ''}${ctl(it.value, it.kind)}</div>`;
+    case 'fields': return `<div class="it-fields" style="--n:${it.n}">${it.fields.map(([l,v,k]) => `<div class="it-field"><label>${lbl(l)}</label>${ctl(v,k)}</div>`).join('')}</div>`;
+    case 'toggles': return `<div class="it-toggles">${it.items.map(([l,on,dis]) => `<div class="it-toggle"${dis ? ' style="opacity:.45"' : ''}><span class="chk${on ? ' on' : ''}"></span><span>${esc(l)}</span></div>`).join('')}</div>`;
+    case 'slider': return `<div class="it-slider"><span>${esc(it.label)}</span><span class="slider"><b style="width:${it.pct}%"></b></span><output>${esc(it.value)}</output>${it.reset ? '<span class="btn">Reset</span>' : ''}</div>`;
+    case 'buttons': return `<div class="it-buttons">${it.items.map((b,i) => `<span class="btn ${(it.styles && it.styles[i]) || ''}">${esc(b)}</span>`).join('')}</div>`;
+    case 'note': return `<p class="it-note${it.warn ? ' warn' : ''}">${esc(it.text)}</p>`;
+    case 'sub': return `<div class="sub"><span>${esc(it.text)}</span>${tag(it.tag)}</div>`;
+    case 'list': return `<div class="it-list">${it.rows.map(([n,s,m]) => `<div class="it-li"><span><b>${esc(n)}</b><small>${esc(s)}</small></span><span class="meta">${esc(m)}</span></div>`).join('')}</div>`;
+    case 'empty': return `<div class="it-empty">${esc(it.text)}</div>`;
+    case 'seg': return `<div class="it-seg" style="--n:${it.n}">${it.items.map((x,i) => `<span class="${i === it.on ? 'on' : ''}">${esc(x)}</span>`).join('')}</div>`;
+    case 'status': return `<div class="it-status">${it.rows.map(([n,s,st]) => `<div class="it-st"><span class="dot"></span><span><b>${esc(n)}</b><small>${esc(s)}</small></span><em>${esc(st)}</em></div>`).join('')}</div>`;
+    case 'chips': return `<div class="it-chips">${it.items.map((c) => `<span>${esc(c)}</span>`).join('')}</div>`;
+    case 'checkrows': return `<div class="it-checkrows">${it.rows.map(([n,s,v,a]) => `<div class="it-cr"><span><b>${esc(n)}</b><small>${esc(s)}</small></span><label><span class="chk${v ? ' on' : ''}"></span>Visible</label><label><span class="chk${a ? ' on' : ''}"></span>Axes</label></div>`).join('')}</div>`;
+    case 'joint': return `<div class="it-joint"><span class="jt-head"><b>${esc(it.name)}</b><small>${esc(it.range)}</small></span><span class="slider"><b style="width:${it.pct}%"></b></span><div class="ctl">${esc(it.value)}</div><i>deg</i></div>`;
+    case 'table': return `<table class="it-table"><thead><tr>${it.head.map((h) => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${it.rows.map((r) => `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+    case 'tiles': return `<div class="it-tiles">${it.items.map(([k,v]) => `<div class="it-tile"><small>${esc(k)}</small><b>${esc(v)}</b></div>`).join('')}</div>`;
+    // Tabs are a choice like any other: the same segmented control.
+    case 'tabs': return `<div class="it-seg">${it.items.map((x,i) => `<span class="${i === it.on ? 'on' : ''}">${esc(x)}</span>`).join('')}</div>`;
+    case 'head': return `<div style="display:flex; justify-content:space-between; align-items:center; gap:12px;"><div class="it-head"><small>${esc(it.eyebrow)}</small><b>${esc(it.text)}</b></div><span class="btn">${esc(it.action)}</span></div>`;
+    default: return '';
+  }
+}
+function section(sec) {
+  const head = sec.title === null ? '' : `<div class="sec-head">${sec.items.length === 0 || sec.collapsed !== undefined ? `<span class="chev">${sec.collapsed ? '▸' : '▾'}</span>` : '<span class="chev">▾</span>'}<h4>${esc(sec.title)}</h4>${sec.meta ? `<span class="muted" style="font-size:.7rem">${esc(sec.meta)}</span>` : ''}${tag(sec.tag)}${sec.action ? `<span class="btn link">${esc(sec.action)}</span>` : ''}</div>`;
+  return `<section class="sec${sec.collapsed ? ' sec-collapsed' : ''}">${head}<div class="sec-body">${sec.items.map(item).join('')}</div></section>`;
+}
+function panel(p, style) {
+  const bar = p.icons.length ? `<div class="pn-bar"><strong>${esc(p.title)}</strong>${p.icons.map((i) => `<i>${esc(i)}</i>`).join('')}</div>` : `<div class="pn-bar"><strong>${esc(p.title)}</strong></div>`;
+  return `<div class="pn st-${style}" style="--w:${p.width}px">${bar}<div class="pn-body">${p.sections.map(section).join('')}</div></div>`;
+}
+const NAMES = { a: 'A · Headed sections', b: 'B · Cards', c: 'C · Property grid', d: 'D · Cards + property grid' };
+function render(view) {
+  const styles = view === 'compare' ? ['a','b','c','d'] : [view];
+  const root = document.getElementById('ps-root');
+  root.innerHTML = PANELS.map((p) => `
+    <h2 class="ps-section-title">${esc(p.title)}</h2>
+    <div class="ps-row">${styles.map((st) => `<div class="ps-col"><span class="ps-cap">${NAMES[st]}</span>${panel(p, st)}</div>`).join('')}</div>`).join('');
+}
+document.querySelectorAll('.ps-bar button').forEach((b) => b.addEventListener('click', () => {
+  document.querySelectorAll('.ps-bar button').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+  render(b.dataset.view);
+}));
+/* Segmented choices: one row when all options fit, otherwise the fewest
+   rows with the options spread evenly (3 + 2, never 4 + 1). */
+function balanceSegments() {
+  document.querySelectorAll('.it-seg').forEach((seg) => {
+    const options = [...seg.children];
+    seg.style.removeProperty('--seg-basis');
+    options.forEach((o) => { o.style.flexGrow = '0'; });
+    const gap = 4;
+    const inner = seg.clientWidth - 6;
+    const widths = options.map((o) => o.getBoundingClientRect().width);
+    options.forEach((o) => { o.style.removeProperty('flex-grow'); });
+    // One row: natural widths, stretched to fill the row.
+    const total = widths.reduce((sum, w) => sum + w, 0) + gap * (widths.length - 1);
+    if (total <= inner) return;
+    // Otherwise balanced rows of equal width, sized for the widest option.
+    // Allowed splits for five: 3 + 2, 2 + 2 + 1, one per row. A split that
+    // leaves one option alone after a row of three or more (4 + 1) is
+    // skipped, even when it would fit.
+    const widest = Math.max(...widths);
+    const n = options.length;
+    const fitsRow = (count) => widest * count + gap * (count - 1) <= inner;
+    let perRow = 1;
+    for (let count = n - 1; count >= 1; count -= 1) {
+      const lastRow = n % count;
+      if (lastRow !== 0 && lastRow < count - 1) continue;
+      if (fitsRow(count)) { perRow = count; break; }
+    }
+    seg.style.setProperty('--seg-basis', `calc((100% - ${gap * (perRow - 1)}px) / ${perRow})`);
+  });
+}
+/* D: give a single-line field its own row when its value does not fit. */
+function stackOverflowingFields() {
+  document.querySelectorAll('.st-d .it-field:not(.area)').forEach((field) => {
+    field.classList.remove('stacked');
+    const control = field.querySelector('.ctl');
+    if (control && control.scrollWidth > control.clientWidth + 1) field.classList.add('stacked');
+  });
+}
+const baseRender = render;
+render = (view) => { baseRender(view); stackOverflowingFields(); balanceSegments(); };
+render('compare');
+</script>

@@ -208,10 +208,12 @@ export const ProgramNodePalette = memo(function ProgramNodePalette({
     <section className="program-palette" aria-labelledby="program-palette-title">
       <header className="program-subpanel-header">
         <div className="program-subpanel-title">
-          <div id="program-palette-title" className="program-tool-tabs" aria-label="Program tools">
+          <div id="program-palette-title" className="program-tool-tabs dseg" aria-label="Program tools">
             <button type="button" className="active" aria-pressed="true">Nodes</button>
             <button type="button" aria-pressed="false" onClick={() => onViewChange?.('params')}>Params</button>
           </div>
+        </div>
+        <div className="program-subpanel-actions">
           <button
             ref={infoButton}
             type="button"
@@ -222,19 +224,19 @@ export const ProgramNodePalette = memo(function ProgramNodePalette({
           >
             i
           </button>
+          {onCollapse && (
+            <button
+              ref={collapseButtonRef}
+              type="button"
+              className="icon-button"
+              aria-label="Collapse node palette"
+              title="Collapse node palette"
+              onClick={onCollapse}
+            >
+              ‹
+            </button>
+          )}
         </div>
-        {onCollapse && (
-          <button
-            ref={collapseButtonRef}
-            type="button"
-            className="icon-button"
-            aria-label="Collapse node palette"
-            title="Collapse node palette"
-            onClick={onCollapse}
-          >
-            ‹
-          </button>
-        )}
       </header>
       <OverlayPanel
         open={infoOpen}

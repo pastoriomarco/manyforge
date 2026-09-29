@@ -758,6 +758,8 @@ class Workbench:
         print("starting Composer backend", flush=True)
         # Composer owns only process-lifetime Draft state. Runtime transitions
         # are durable Manager operations and need no Composer state root.
+        # Installation presentation settings are the one exception: they
+        # persist under the inherited MANYFORGE_STATE_DIR (composer/).
         composer_command = self._composer_command(base_url)
         composer = subprocess.Popen(
             composer_command,

@@ -26,7 +26,8 @@ export type NoticeDomain =
   | 'viewer'
   | 'activation'
   | 'recovery'
-  | 'program_authoring';
+  | 'program_authoring'
+  | 'settings';
 
 /**
  * Bounded browser-only viewer conditions that Headless cannot observe.

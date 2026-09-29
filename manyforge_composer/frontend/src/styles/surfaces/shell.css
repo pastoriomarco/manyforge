@@ -486,11 +486,43 @@
   z-index: var(--mf-z-controls);
   left: 50%;
   transform: translateX(-50%);
-  gap: 0.15rem;
-  padding: 0.15rem;
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-md);
-  background: var(--mf-bg-neutral-08);
+  gap: 0.3rem;
+}
+
+/* Draft / Saved / Applied letters of the Program (left) and Deployment
+   (right). They hang off the switcher so it stays centred. */
+.document-state-letters {
+  position: absolute;
+  top: 50%;
+  display: inline-flex;
+  gap: 0.25rem;
+  transform: translateY(-50%);
+}
+
+.document-state-letters.left {
+  right: calc(100% + 0.6rem);
+}
+
+/* Clears the Deployment health dot that overhangs its button. */
+.document-state-letters.right {
+  left: calc(100% + 1rem);
+}
+
+.document-state-letter {
+  display: inline-grid;
+  width: 1.35rem;
+  height: 1.35rem;
+  place-items: center;
+  padding: 0;
+  font-weight: var(--mf-font-weight-bold);
+  letter-spacing: 0;
+  cursor: help;
+}
+
+/* A Draft without unsaved edits is fine too: green like Saved and Applied. */
+.document-state-letter.state-draft {
+  border-color: var(--mf-border-success-35);
+  color: var(--mf-text-success-67);
 }
 
 .workspace-switcher button {
@@ -775,12 +807,12 @@
 .workbench-notification-stack {
   position: absolute;
   z-index: var(--mf-z-popover);
-  top: calc(var(--mf-toolbar-control-height) + 2 * var(--mf-viewer-overlay-inset));
-  right: var(--mf-viewer-overlay-inset);
-  left: var(--mf-viewer-overlay-inset);
+  top: calc(var(--mf-toolbar-control-height) + 2 * var(--mf-surface-overlay-inset));
+  right: var(--mf-surface-overlay-inset);
+  left: var(--mf-surface-overlay-inset);
   display: flex;
   max-height: calc(
-    100% - var(--mf-toolbar-control-height) - 2 * var(--mf-viewer-overlay-inset) - 4.95rem
+    100% - var(--mf-toolbar-control-height) - 2 * var(--mf-surface-overlay-inset) - 4.95rem
   );
   flex-direction: column;
   gap: 0.35rem;
@@ -905,6 +937,78 @@
   color: var(--mf-text-warning-92);
   background: var(--mf-bg-warning-29);
   font-size: var(--mf-font-size-058);
+}
+
+.global-surface-launchers > .global-settings-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+
+/* Composer settings panel (UA7W.11). */
+.composer-settings {
+  display: grid;
+  width: min(30rem, 86vw);
+  gap: 0.85rem;
+  font-size: var(--mf-font-size-080);
+}
+
+/* Compact controls, like the other inspector and settings panels. */
+.composer-settings :is(input, select, button) {
+  min-height: 1.9rem;
+  padding: 0.25rem 0.6rem;
+  font-size: var(--mf-font-size-080);
+}
+
+.composer-settings p {
+  margin: 0;
+}
+
+.composer-settings section > button {
+  justify-self: start;
+}
+
+.composer-settings section {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.composer-settings h4 {
+  margin: 0;
+  color: var(--mf-text-neutral-86);
+  font-size: var(--mf-font-size-084);
+}
+
+.composer-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.composer-settings-profiles {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  gap: 0.3rem;
+  list-style: none;
+}
+
+.composer-settings-profiles > li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.composer-settings-profiles > li > span {
+  overflow-wrap: anywhere;
+}
+
+.composer-settings-save-as {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.4rem;
 }
 
 .overlay-panel .robot-control-panel,

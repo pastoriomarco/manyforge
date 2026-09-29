@@ -12,6 +12,7 @@ import {
   selectedStatusForState,
   type ManualMotionSettings,
   type RobotControlState,
+  stricterCartesianDefaults,
 } from './robotControl';
 
 import { statusFixture, receiptFixture, readyState, executingState, gripperReceiptFixture } from '../testFixtures/robotControl';
@@ -378,6 +379,41 @@ describe('addressed Robot Control state', () => {
     });
     expect(state.motionSettings.cartesianTranslationToleranceM).toBe(0.001);
     expect(state.motionSettings.cartesianMaxBlendDeviationRad).toBe(0);
+  });
+
+  it('takes the Applied Cartesian defaults; an unapplied Draft only tightens them', () => {
+    const applied = { translationToleranceM: 0.005, maxBlendDeviationRad: 0.01 };
+    expect(stricterCartesianDefaults(applied, null)).toEqual(applied);
+    // A looser Draft waits for Apply; a stricter one applies at once.
+    expect(stricterCartesianDefaults(applied, { translationToleranceM: 0.02, maxBlendDeviationRad: 0.005 }))
+      .toEqual({ translationToleranceM: 0.005, maxBlendDeviationRad: 0.005 });
+    // Without an Applied Program the manual defaults stand in for it.
+    expect(stricterCartesianDefaults(null, { translationToleranceM: 0.5, maxBlendDeviationRad: 0.5 }))
+      .toEqual({ translationToleranceM: 0.005, maxBlendDeviationRad: 0.01 });
+  });
+
+  it('keeps manual Cartesian values until the Program default itself changes', () => {
+    const status = statusFixture();
+    const defaults = { translationToleranceM: 0.005, maxBlendDeviationRad: 0.01 };
+    let state = robotControlReducer(initialRobotControlState, {
+      type: 'status_resolved', status, cartesianDefaults: defaults,
+    });
+    // Defaults, not limits: any valid manual value is kept...
+    state = robotControlReducer(state, {
+      type: 'edit_motion_settings',
+      update: { cartesianTranslationToleranceM: 0.02, cartesianMaxBlendDeviationRad: 0.001 },
+    });
+    // ...including when the same defaults are sent again (after a manual move).
+    state = robotControlReducer(state, { type: 'program_cartesian_defaults_changed', defaults });
+    expect(state.motionSettings.cartesianTranslationToleranceM).toBe(0.02);
+    expect(state.motionSettings.cartesianMaxBlendDeviationRad).toBe(0.001);
+    // A changed Program default (Apply, or a stricter Draft) replaces them.
+    state = robotControlReducer(state, {
+      type: 'program_cartesian_defaults_changed',
+      defaults: { translationToleranceM: 0.004, maxBlendDeviationRad: 0.01 },
+    });
+    expect(state.motionSettings.cartesianTranslationToleranceM).toBe(0.004);
+    expect(state.motionSettings.cartesianMaxBlendDeviationRad).toBe(0.001);
   });
 
   it('does not plan when only settings change at idle, and resets settings with the target owner', () => {

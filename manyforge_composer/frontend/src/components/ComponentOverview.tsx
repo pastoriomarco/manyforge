@@ -41,7 +41,7 @@ export function ComponentOverview({
     surface.current.querySelector<HTMLElement>('summary')?.focus();
   }, [request]);
   return (
-    <details ref={surface} className="component-overview">
+    <details ref={surface} className="component-overview dcard">
       <summary tabIndex={-1}>Component overview</summary>
       <div className="component-overview-body">
         <header className="runtime-status-summary">
@@ -60,7 +60,7 @@ export function ComponentOverview({
         ) : (
           <>
             <p className="runtime-status-message">{status.userMessage}</p>
-            <div className="runtime-status-facts">
+            <div className="runtime-status-facts dchips">
               <span>{status.profileLabel}</span>
               <span>{status.authorityLabel}</span>
               <span>{unacknowledgedAlarms} acknowledgement required</span>
@@ -68,7 +68,7 @@ export function ComponentOverview({
               {clientErrorCount > 0 && <span>{clientErrorCount} Composer message</span>}
               {contextFacts.map((fact) => <span key={fact}>{fact}</span>)}
             </div>
-            <div className="runtime-capabilities" aria-label="Functional scopes">
+            <div className="runtime-capabilities dchips" aria-label="Functional scopes">
               {status.capabilities.map((capability) => (
                 <span key={capability}>{capability}</span>
               ))}
@@ -96,7 +96,7 @@ export function ComponentOverview({
             </div>
           </>
         )}
-        <div className="runtime-status-actions">
+        <div className="runtime-status-actions dactions">
           {(!backendConnected || error !== null) && (
             <button
               type="button"

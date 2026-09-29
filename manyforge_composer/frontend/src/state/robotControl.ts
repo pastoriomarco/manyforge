@@ -79,6 +79,37 @@ export interface ManualCartesianDefaults {
   maxBlendDeviationRad: number;
 }
 
+/**
+ * The Program's Cartesian defaults for manual moves. Program values reach
+ * motion through Apply, so the Applied Program supplies them; an unapplied
+ * Draft change takes effect at once only where it is stricter (smaller
+ * tolerance, less blending). Without an Applied Program the manual defaults
+ * stand in for it.
+ */
+export function stricterCartesianDefaults(
+  applied: ManualCartesianDefaults | null,
+  draft: ManualCartesianDefaults | null,
+): ManualCartesianDefaults {
+  const base = applied ?? {
+    translationToleranceM: DEFAULT_MANUAL_MOTION_SETTINGS.cartesianTranslationToleranceM,
+    maxBlendDeviationRad: DEFAULT_MANUAL_MOTION_SETTINGS.cartesianMaxBlendDeviationRad,
+  };
+  if (draft === null) return base;
+  return {
+    translationToleranceM: Math.min(base.translationToleranceM, draft.translationToleranceM),
+    maxBlendDeviationRad: Math.min(base.maxBlendDeviationRad, draft.maxBlendDeviationRad),
+  };
+}
+
+/**
+ * Tolerance and blend are defaults, not limits: the operator may set any
+ * valid value for a manual move. When the Program default itself changes
+ * (Apply, or a stricter unapplied Draft), the manual value takes it.
+ */
+function followCartesianDefault(current: number, previous: number | null, next: number): number {
+  return previous === next ? current : next;
+}
+
 const DEFAULT_MANUAL_MOTION_SETTINGS: ManualMotionSettings = {
   velocityScale: 1,
   accelerationScale: 1,
@@ -107,6 +138,8 @@ export interface RobotControlState {
   draftPose: Pose3Value;
   draftGripperPosition: number | null;
   motionSettings: ManualMotionSettings;
+  /** The Program Cartesian defaults the manual settings last followed. */
+  cartesianDefaults: ManualCartesianDefaults | null;
   generation: number;
   intent: DirectControlOperationIntent | null;
   preview: DirectControlPreviewReceipt | null;
@@ -175,6 +208,7 @@ export const initialRobotControlState: RobotControlState = {
   draftPose: IDENTITY_POSE,
   draftGripperPosition: null,
   motionSettings: DEFAULT_MANUAL_MOTION_SETTINGS,
+  cartesianDefaults: null,
   generation: 0,
   intent: null,
   preview: null,
@@ -674,6 +708,7 @@ function resolveStatus(
       ...initialRobotControlState,
       mode: state.mode,
       motionSettings: initialMotionSettings(selectedStatus, cartesianDefaults),
+      cartesianDefaults,
       status,
       ...selectedStateFields(selection),
       phase: resolvedPhase,
@@ -697,6 +732,7 @@ function resolveStatus(
       motionSettings: state.status === null
         ? initialMotionSettings(selectedStatus, cartesianDefaults)
         : state.motionSettings,
+      cartesianDefaults: state.status === null ? cartesianDefaults : state.cartesianDefaults,
       intent: null,
       preview: null,
       ghost: null,
@@ -863,16 +899,31 @@ export function robotControlReducer(
     case 'status_refreshed':
       return resolveStatus(state, action.status, false, action.cartesianDefaults);
     case 'program_cartesian_defaults_changed': {
+      // Re-sent when an operation ends, so a change during one still applies.
       if (state.status === null || robotControlHasActiveOperation(state)) return state;
+      const previous = state.cartesianDefaults;
       const motionSettings = {
         ...state.motionSettings,
-        cartesianTranslationToleranceM: action.defaults.translationToleranceM,
-        cartesianMaxBlendDeviationRad: action.defaults.maxBlendDeviationRad,
+        cartesianTranslationToleranceM: followCartesianDefault(
+          state.motionSettings.cartesianTranslationToleranceM,
+          previous?.translationToleranceM ?? null,
+          action.defaults.translationToleranceM,
+        ),
+        cartesianMaxBlendDeviationRad: followCartesianDefault(
+          state.motionSettings.cartesianMaxBlendDeviationRad,
+          previous?.maxBlendDeviationRad ?? null,
+          action.defaults.maxBlendDeviationRad,
+        ),
       };
+      const unchanged = motionSettings.cartesianTranslationToleranceM
+          === state.motionSettings.cartesianTranslationToleranceM
+        && motionSettings.cartesianMaxBlendDeviationRad
+          === state.motionSettings.cartesianMaxBlendDeviationRad;
+      if (unchanged) return { ...state, cartesianDefaults: action.defaults };
       if (!motionSettingsAreValid(selectedStatusForState(state)!, motionSettings)) return state;
       return robotControlHasLocalDraft(state)
-        ? invalidateDraft(state, { motionSettings })
-        : { ...state, motionSettings };
+        ? invalidateDraft(state, { motionSettings, cartesianDefaults: action.defaults })
+        : { ...state, motionSettings, cartesianDefaults: action.defaults };
     }
     case 'select_robot': {
       if (state.status === null) return state;

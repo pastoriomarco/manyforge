@@ -1,5 +1,4 @@
 import {
-  Fragment,
   lazy,
   memo,
   Suspense,
@@ -22,9 +21,15 @@ import {
 } from '../hooks/useHeadlessState';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
+import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
+import { SettingsSubheading } from './SettingsScope';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
-import { ProgramTransportControls } from './ProgramRuntimePanel';
+import {
+  MotionControlSettings,
+  ProgramTransportControls,
+  type DraftGroupVisibility,
+} from './ProgramRuntimePanel';
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { RobotControlPanelView } from './RobotControlPanel';
 import { useGizmoSettings } from './common/GizmoControls';
@@ -398,16 +403,7 @@ function SceneHierarchy({
     || value.toLocaleLowerCase().includes(normalized);
   const selectedKey = sceneSelectionKey(selection);
   return (
-    <div className="scene-hierarchy" data-testid="scene-hierarchy">
-      <div className="scene-authoring-heading">
-        <div>
-          <p className="eyebrow">Current structure + authoring sources</p>
-          <h3>Scene hierarchy</h3>
-        </div>
-        <span className="scene-hierarchy-count">
-          {objects.length} objects · {attachments.length} Attached
-        </span>
-      </div>
+    <div className="scene-hierarchy dpanel" data-testid="scene-hierarchy" aria-label="Scene hierarchy">
       <input
         type="search"
         value={query}
@@ -415,8 +411,11 @@ function SceneHierarchy({
         aria-label="Find scene hierarchy item"
         onChange={(event) => setQuery(event.target.value)}
       />
-      <details open>
-        <summary>Owner scene objects</summary>
+      <details className="dcard" open>
+        <summary>
+          <span>Owner scene objects</span>
+          <span className="dcard-meta">{objects.length} objects · {attachments.length} Attached</span>
+        </summary>
         <div className="scene-hierarchy-items">
           {objects.filter((object) => matches(object.scene_resource_id)).map((object) => {
             const attachment = attachments.find(
@@ -472,7 +471,7 @@ function SceneHierarchy({
           {objects.length === 0 && <span className="muted">No owner-issued objects</span>}
         </div>
       </details>
-      <details>
+      <details className="dcard">
         <summary>Program Draft initial scene</summary>
         <div className="scene-hierarchy-items">
           {programResources.filter((resource) => matches(resource.scene_resource_id)).map((resource) => (
@@ -530,7 +529,7 @@ function SceneHierarchy({
           {programResources.length === 0 && <span className="muted">No Draft scene resources</span>}
         </div>
       </details>
-      <details>
+      <details className="dcard">
         <summary>Retained robot links and frames</summary>
         <div className="scene-hierarchy-items scene-hierarchy-static">
           {(manifest?.links ?? []).filter((link) => matches(link.name)).map((link) => (
@@ -789,7 +788,7 @@ function SceneShapeFields({
         </select>
       </label>
       {shape.type === 'box' && (
-        <div className="scene-pose-grid">
+        <div className="scene-pose-grid dgrid">
           {(['Width', 'Depth', 'Height'] as const).map((label, index) => (
             <label key={label}>
               <span>{label} (m)</span>
@@ -827,7 +826,7 @@ function SceneShapeFields({
         </label>
       )}
       {shape.type === 'cylinder' && (
-        <div className="scene-pose-grid">
+        <div className="scene-pose-grid dgrid">
           {(['Radius', 'Height'] as const).map((label) => (
             <label key={label}>
               <span>{label} (m)</span>
@@ -886,7 +885,7 @@ function SceneShapeFields({
               }}
             />
           )}
-          <div className="scene-pose-grid">
+          <div className="scene-pose-grid dgrid">
             {(['Scale X', 'Scale Y', 'Scale Z'] as const).map((label, index) => (
               <label key={label}>
                 <span>{label}</span>
@@ -1027,7 +1026,7 @@ function ProgramSceneEditor({
 
   return (
     <div
-      className="scene-authoring-column"
+      className="scene-authoring-column dpanel"
       data-testid="program-scene-editor"
       data-invalid={stagedError !== null}
       onBlurCapture={(event) => {
@@ -1040,11 +1039,9 @@ function ProgramSceneEditor({
         }
       }}
     >
-      <div className="scene-authoring-heading">
-        <div>
-          <p className="eyebrow">Program Draft</p>
-          <h3>Initial scene</h3>
-        </div>
+      <section className="dcard">
+      <header>
+        <span>Initial scene</span>
         <button
           type="button"
           disabled={busy}
@@ -1056,10 +1053,14 @@ function ProgramSceneEditor({
         >
           Add box
         </button>
-      </div>
-      <p className="muted">
+      </header>
+      <p>
         These resources belong to the editable Program. They are not the current runtime scene.
+        Save persists this Draft. Runtime Apply, Revert-to-Saved, and
+        Discard-to-Applied remain unavailable at their named scene-workflow gate.
       </p>
+      <label>
+      <span>Resource</span>
       <select
         aria-label="Program scene resource"
         value={selected?.scene_resource_id ?? ''}
@@ -1075,8 +1076,12 @@ function ProgramSceneEditor({
           </option>
         ))}
       </select>
+      </label>
+      </section>
       {staged !== null && (
         <>
+          <section className="dcard">
+          <h4>Shape and pose</h4>
           <SceneShapeFields
             shape={staged.shape}
             disabled={busy}
@@ -1125,7 +1130,7 @@ function ProgramSceneEditor({
               ))}
             </select>
           </label>
-          <div className="scene-pose-grid">
+          <div className="scene-pose-grid dgrid">
             {(['X', 'Y', 'Z'] as const).map((axis, index) => (
               <label key={axis}>
                 <span>{axis} (m)</span>
@@ -1141,7 +1146,7 @@ function ProgramSceneEditor({
             ))}
           </div>
           {'xyzw' in staged.pose.orientation ? (
-            <div className="scene-pose-grid scene-quaternion-grid">
+            <div className="scene-pose-grid scene-quaternion-grid dgrid">
               {(['Qx', 'Qy', 'Qz', 'Qw'] as const).map((axis, index) => (
                 <label key={axis}>
                   <span>{axis}</span>
@@ -1159,7 +1164,7 @@ function ProgramSceneEditor({
               ))}
             </div>
           ) : (
-            <div className="scene-pose-grid">
+            <div className="scene-pose-grid dgrid">
               {(['Roll', 'Pitch', 'Yaw'] as const).map((axis, index) => (
                 <label key={axis}>
                   <span>{axis} (deg)</span>
@@ -1184,23 +1189,23 @@ function ProgramSceneEditor({
           {stagedError !== null && (
             <p className="scene-commit-error inline-message severity-error" role="alert">{stagedError}</p>
           )}
-          <details className="scene-object-metadata">
+          </section>
+          <details className="dcard">
             <summary>Roles and collision metadata</summary>
             <dl>
-              <dt>Resource roles</dt>
-              <dd>{staged.resource_roles?.join(', ') || 'none'}</dd>
-              <dt>Collision policies</dt>
-              <dd>{staged.collision_policy_ids?.join(', ') || 'none'}</dd>
-              <dt>Support contacts</dt>
-              <dd>{Array.isArray(staged.metadata?.support_contacts)
+              <div><dt>Resource roles</dt><dd>{staged.resource_roles?.join(', ') || 'none'}</dd></div>
+              <div><dt>Collision policies</dt><dd>{staged.collision_policy_ids?.join(', ') || 'none'}</dd></div>
+              <div><dt>Support contacts</dt><dd>{Array.isArray(staged.metadata?.support_contacts)
                 ? staged.metadata.support_contacts.length
-                : 0}</dd>
+                : 0}</dd></div>
             </dl>
             {staged.metadata !== undefined && (
-              <pre>{JSON.stringify(staged.metadata, null, 2)}</pre>
+              <pre className="dcode">{JSON.stringify(staged.metadata, null, 2)}</pre>
             )}
           </details>
-          <div className="scene-authoring-actions">
+          <section className="dcard">
+          <h4>Edit</h4>
+          <div className="dactions">
             <button
               type="button"
               disabled={busy}
@@ -1223,12 +1228,9 @@ function ProgramSceneEditor({
               Remove from Draft
             </button>
           </div>
+          </section>
         </>
       )}
-      <p className="scene-contract-note hint">
-        Save persists this Draft. Runtime Apply, Revert-to-Saved, and
-        Discard-to-Applied remain unavailable at their named scene-workflow gate.
-      </p>
     </div>
   );
 }
@@ -1273,7 +1275,7 @@ function ViewerMetadataEditor({
   const resourceRoles = programRoleIds(program, 'required_resource_roles');
   return (
     <div
-      className="scene-authoring-column"
+      className="scene-authoring-column dpanel"
       data-testid="viewer-metadata-editor"
       onBlurCapture={(event) => {
         if (['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target.tagName)) commitViewerDraft();
@@ -1285,12 +1287,8 @@ function ViewerMetadataEditor({
         }
       }}
     >
-      <div className="scene-authoring-heading">
-        <div>
-          <p className="eyebrow">Same Program Draft</p>
-          <h3>Viewer metadata</h3>
-        </div>
-      </div>
+      <section className="dcard">
+      <SettingsSubheading title="Shown roles" scope="program" />
       <div className="viewer-role-controls">
         {frameRoles.map((role) => (
           <label key={`frame:${role}`}>
@@ -1325,7 +1323,9 @@ function ViewerMetadataEditor({
           </label>
         ))}
       </div>
-      <div className="scene-pose-grid">
+      </section>
+      <section className="dcard">
+      <SettingsSubheading title="Axes size" scope="program" />
         <label>
           <span>Frame axes (m)</span>
           <input
@@ -1358,8 +1358,8 @@ function ViewerMetadataEditor({
             })}
           />
         </label>
-      </div>
       {dirty && <p className="scene-contract-note hint">Valid edits commit on blur, Tab, or Enter.</p>}
+      </section>
     </div>
   );
 }
@@ -1386,11 +1386,11 @@ function SourceOccurrencePanel({
     return `${shown.join(', ') || 'none'}${suffix}`;
   };
   return (
-    <div className="source-occurrence-panel">
-      <div>
-        <p className="eyebrow">Verified source-local model facts</p>
-        <h3>Model occurrence</h3>
-      </div>
+    <div className="source-occurrence-panel dpanel">
+      <section className="dcard">
+      <h4>Model occurrence</h4>
+      <label>
+      <span>Occurrence</span>
       <select
         aria-label="Source model occurrence"
         value={selectedId ?? ''}
@@ -1404,48 +1404,46 @@ function SourceOccurrencePanel({
           </option>
         ))}
       </select>
+      </label>
       {occurrence !== null && (
-        <>
-          <div className="source-occurrence-facts">
-            <span>component <code>{occurrence.component_id ?? 'passive'}</code></span>
-            <span>source model <code>{occurrence.source_model_name}</code></span>
-            <span>source robot <code>{occurrence.source_robot_name}</code></span>
-            <span>{occurrence.coordinates.length} source coordinates</span>
-            <span>{occurrence.srdf_groups.length} SRDF groups</span>
-          </div>
-          <details className="source-name-details">
-            <summary>Source-local URDF/SRDF names</summary>
-            <dl>
-              <dt>Links</dt>
-              <dd><code>{boundedNames(
-                occurrence.links.map((link) => link.source_link_name),
-              )}</code></dd>
-              <dt>Joints</dt>
-              <dd><code>{boundedNames(
-                occurrence.coordinates.map((coordinate) => coordinate.source_joint_name),
-              )}</code></dd>
-              <dt>SRDF groups</dt>
-              <dd><code>{boundedNames(
-                occurrence.srdf_groups.map((group) => group.source_group_name),
-              )}</code></dd>
-              <dt>End effectors</dt>
-              <dd><code>{boundedNames(
-                occurrence.srdf_end_effectors.map(
-                  (endEffector) => endEffector.source_end_effector_name,
-                ),
-              )}</code></dd>
-            </dl>
-          </details>
-        </>
+        <dl>
+          <div><dt>Component</dt><dd><code>{occurrence.component_id ?? 'passive'}</code></dd></div>
+          <div><dt>Source model</dt><dd><code>{occurrence.source_model_name}</code></dd></div>
+          <div><dt>Source robot</dt><dd><code>{occurrence.source_robot_name}</code></dd></div>
+          <div><dt>Source coordinates</dt><dd>{occurrence.coordinates.length}</dd></div>
+          <div><dt>SRDF groups</dt><dd>{occurrence.srdf_groups.length}</dd></div>
+        </dl>
       )}
-      <div className="runtime-source-list">
-        <div className="scene-authoring-heading">
-          <div>
-            <p className="eyebrow">Owner-issued observation facts</p>
-            <h3>Runtime pose sources</h3>
-          </div>
-          <span className="scene-hierarchy-count">{runtimeSources.length}</span>
-        </div>
+      <p>
+        Names remain the original URDF/SRDF names for this occurrence. The authored-neutral mesh below is not claimed as an active multi-instance pose.
+      </p>
+      </section>
+      {occurrence !== null && (
+        <details className="dcard">
+          <summary>Source-local URDF/SRDF names</summary>
+          <dl>
+            <div><dt>Links</dt><dd><code>{boundedNames(
+              occurrence.links.map((link) => link.source_link_name),
+            )}</code></dd></div>
+            <div><dt>Joints</dt><dd><code>{boundedNames(
+              occurrence.coordinates.map((coordinate) => coordinate.source_joint_name),
+            )}</code></dd></div>
+            <div><dt>SRDF groups</dt><dd><code>{boundedNames(
+              occurrence.srdf_groups.map((group) => group.source_group_name),
+            )}</code></dd></div>
+            <div><dt>End effectors</dt><dd><code>{boundedNames(
+              occurrence.srdf_end_effectors.map(
+                (endEffector) => endEffector.source_end_effector_name,
+              ),
+            )}</code></dd></div>
+          </dl>
+        </details>
+      )}
+      <section className="dcard runtime-source-list">
+        <header>
+          <span>Runtime pose sources</span>
+          <span className="dcard-meta">{runtimeSources.length}</span>
+        </header>
         {runtimeSources.slice(0, 128).map((source) => (
           <div
             className="runtime-source-row"
@@ -1483,31 +1481,21 @@ function SourceOccurrencePanel({
             advertises no mutation action.
           </span>
         )}
-        {runtime !== null && (
-          <details className="source-name-details">
-            <summary>Runtime source diagnostics</summary>
-            <dl>
-              <dt>State</dt>
-              <dd><code>{runtime.state.state}</code></dd>
-              <dt>Reason</dt>
-              <dd>{runtime.state.reason || 'none'}</dd>
-              <dt>Deferred</dt>
-              <dd>{runtime.state.deferred ? 'yes' : 'no'}</dd>
-              <dt>Error</dt>
-              <dd>{runtime.state.error ?? 'none'}</dd>
-              {Object.entries(runtime.state.counters).slice(0, 64).map(([name, value]) => (
-                <Fragment key={name}>
-                  <dt>{name}</dt>
-                  <dd>{value}</dd>
-                </Fragment>
-              ))}
-            </dl>
-          </details>
-        )}
-      </div>
-      <p className="scene-contract-note hint">
-        Names remain the original URDF/SRDF names for this occurrence. The authored-neutral mesh below is not claimed as an active multi-instance pose.
-      </p>
+      </section>
+      {runtime !== null && (
+        <details className="dcard">
+          <summary>Runtime source diagnostics</summary>
+          <dl>
+            <div><dt>State</dt><dd><code>{runtime.state.state}</code></dd></div>
+            <div><dt>Reason</dt><dd>{runtime.state.reason || 'none'}</dd></div>
+            <div><dt>Deferred</dt><dd>{runtime.state.deferred ? 'yes' : 'no'}</dd></div>
+            <div><dt>Error</dt><dd>{runtime.state.error ?? 'none'}</dd></div>
+            {Object.entries(runtime.state.counters).slice(0, 64).map(([name, value]) => (
+              <div key={name}><dt>{name}</dt><dd>{value}</dd></div>
+            ))}
+          </dl>
+        </details>
+      )}
     </div>
   );
 }
@@ -2102,6 +2090,39 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   useLayoutEffect(() => {
     source.markViewerPresented(headlessState.snapshot);
   }, [headlessState.snapshot, source]);
+  // Shown execution groups are a Program setting: the checkboxes edit the
+  // Draft, and the Motion panel follows the Applied Program after Apply.
+  const draftProgram = programController.state.workspace?.draft.authoring ?? null;
+  const appliedHidden = programRuntime.state.applied?.program.viewer?.hidden_execution_groups;
+  const appliedViewer = programRuntime.state.applied?.program.viewer;
+  const differs = (read: (viewer: ProgramViewerMetadata | undefined) => unknown) => (
+    draftProgram !== null
+    && programRuntime.state.applied !== null
+    && JSON.stringify(read(draftProgram.viewer) ?? null) !== JSON.stringify(read(appliedViewer) ?? null)
+  );
+  const programViewerPendingApply = {
+    frameAxes: differs((viewer) => viewer?.frame_gizmo_size_m),
+    objectAxes: differs((viewer) => viewer?.object_axes_gizmo_size_m)
+      || differs((viewer) => viewer?.scene_resource_axes_visibility),
+  };
+  const draftGroupVisibility: DraftGroupVisibility | null = draftProgram === null ? null : {
+    groupIds: ['all', ...Object.keys(draftProgram.execution_groups ?? {}).sort()],
+    hidden: draftProgram.viewer?.hidden_execution_groups,
+    pendingApply: JSON.stringify(draftProgram.viewer?.hidden_execution_groups ?? null)
+      !== JSON.stringify(appliedHidden ?? null),
+    onChange: programController.mutationAvailable
+      ? (hidden) => {
+          const presentation = viewerPresentationDraftFromProgram(draftProgram.viewer);
+          void programController.mutate('viewer_draft_replace', {
+            viewer: programViewerMetadata({
+              ...presentation,
+              hiddenExecutionGroups: hidden,
+            }) as unknown as JsonValue,
+          });
+        }
+      : undefined,
+  };
+
   return (
     <Suspense fallback={(
       <section className="panel viewer-panel">
@@ -2203,7 +2224,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       onInspectorMinimizedChange={onInspectorMinimizedChange}
       onInspectorMaximize={onInspectorMaximize}
       onInspectorPanelChange={onInspectorPanelChange}
-      transportControls={(openRobotControls) => (
+      transportControls={(openRobotControls, viewerSettings) => (
         <ProgramTransportControls
           enabled={runtimeEnabled}
           program={programRuntime}
@@ -2211,8 +2232,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           observationTransport={observationTransport}
           onOpenRobotControls={openRobotControls}
           onOpenRuntimeHistory={onOpenRuntimeHistory}
+          onOpenViewerSettings={viewerSettings.open}
+          viewerPreviewActive={viewerSettings.previewLayerActive}
         />
       )}
+      controlPanelSettings={<MotionControlSettings groups={draftGroupVisibility} />}
+      programViewerPendingApply={programViewerPendingApply}
       runtimeOverlay={runtimeOverlay}
     />
     </Suspense>
@@ -2288,6 +2313,8 @@ export function SceneAuthoringWorkspace({
   const [selectedOccurrenceId, setSelectedOccurrenceId] = useState<string | null>(null);
   const [activeSceneTool, setActiveSceneTool] = useState<SceneWorkspaceTool>('hierarchy');
   const [selection, setSelection] = useState<SceneSelection>(null);
+  const ownerObjectPanel = useCardPanelLayout();
+  const sceneTabs = useCardPanelLayout();
   const [livePose, setLivePose] = useState<LogicalScenePose | null>(null);
   const [liveShape, setLiveShape] = useState<ProgramSceneResource['shape'] | null>(null);
   const [selectionLocked, setSelectionLocked] = useState(false);
@@ -2760,7 +2787,7 @@ export function SceneAuthoringWorkspace({
   };
 
   const ownerObjectControlSurface = objects.length === 0 ? undefined : (
-    <div className="scene-authoring-column current-scene-editor viewer-object-owner-editor">
+    <div ref={ownerObjectPanel} className="viewer-object-owner-editor dpanel">
       {!factsResult.available && (
         <div className="panel-state error-state" role="alert">
           <strong>Current scene is unavailable</strong>
@@ -2769,24 +2796,10 @@ export function SceneAuthoringWorkspace({
       )}
       {facts !== null && (
         <>
-          <details className="scene-object-metadata">
-            <summary>Owner and runtime source facts</summary>
-            <dl>
-              <dt>Scene source</dt>
-              <dd><code>{facts.sourceOwnerEpoch}</code> / {facts.sourceGeneration}</dd>
-              <dt>Runtime source</dt>
-              <dd><code>{facts.runtimeSourceOwnerEpoch}</code> / {facts.runtimeSourceGeneration}</dd>
-              <dt>Scene revision</dt>
-              <dd><code>{facts.logicalScene.snapshot?.revision.revision_id}</code></dd>
-              <dt>Observations</dt>
-              <dd>{runtimeStatus.freshGood} fresh / {runtimeStatus.total} total</dd>
-            </dl>
-          </details>
-          {runtimeStatus.warnings.map((warning) => (
-            <p className="scene-contract-note inline-message severity-warning" key={warning} role="status">
-              Measured overlay: {warning}
-            </p>
-          ))}
+          <section className="dcard">
+          <h4>Object</h4>
+          <label>
+          <span>Scene object</span>
           <select
             aria-label="Current scene object"
             value={selectedOwnerObjectId ?? ''}
@@ -2802,9 +2815,22 @@ export function SceneAuthoringWorkspace({
               </option>
             ))}
           </select>
+          </label>
+          {runtimeStatus.warnings.map((warning) => (
+            <p className="scene-contract-note inline-message severity-warning" key={warning} role="status">
+              Measured overlay: {warning}
+            </p>
+          ))}
+          {(editReason ?? selectedMutationAvailability?.transformReason ?? null) !== null && (
+            <p className="scene-contract-note inline-message severity-warning">
+              {editReason ?? selectedMutationAvailability?.transformReason}
+            </p>
+          )}
+          </section>
           {selectedObject !== null && livePose !== null && (
-            <>
-              <div className="scene-pose-grid">
+            <section className="dcard">
+              <h4>Pose and shape</h4>
+              <div className="scene-pose-grid dgrid">
                 {(['x', 'y', 'z'] as const).map((field) => (
                   <label key={field}>
                     <span>{field.toUpperCase()} (m)</span>
@@ -2821,7 +2847,7 @@ export function SceneAuthoringWorkspace({
                   </label>
                 ))}
               </div>
-              <div className="scene-pose-grid scene-quaternion-grid">
+              <div className="scene-pose-grid scene-quaternion-grid dgrid">
                 {['Qx', 'Qy', 'Qz', 'Qw'].map((label, index) => (
                   <label key={label}>
                     <span>{label}</span>
@@ -2852,45 +2878,47 @@ export function SceneAuthoringWorkspace({
                   onChange={setLiveShape}
                 />
               )}
-            </>
-          )}
-          {(editReason ?? selectedMutationAvailability?.transformReason ?? null) !== null && (
-            <p className="scene-contract-note inline-message severity-warning">
-              {editReason ?? selectedMutationAvailability?.transformReason}
-            </p>
-          )}
-          {selectedObject !== null && liveShape === null && (
-            <p className="scene-contract-note hint">
-              Shape editing is available only for an object with exactly one canonical shape;
-              pose editing remains independent.
-            </p>
+              {liveShape === null && (
+                <p className="scene-contract-note hint">
+                  Shape editing is available only for an object with exactly one canonical shape;
+                  pose editing remains independent.
+                </p>
+              )}
+            </section>
           )}
           {selectedObject !== null && (
-            <details className="scene-object-metadata">
+            <details className="dcard">
               <summary>Ownership, contacts, and collision metadata</summary>
               <dl>
-                <dt>Placement</dt>
-                <dd>{selectedObject.placement.kind.replaceAll('_', ' ')}</dd>
-                <dt>Ownership</dt>
-                <dd>{selectedObject.provider_evidence === null
+                <div><dt>Placement</dt><dd>{selectedObject.placement.kind.replaceAll('_', ' ')}</dd></div>
+                <div><dt>Ownership</dt><dd>{selectedObject.provider_evidence === null
                   ? 'Logical-scene owner'
-                  : 'External provider'}</dd>
-                <dt>Shapes</dt>
-                <dd>{selectedObject.collision_shapes.map((shape) => shape.type).join(', ') || 'none'}</dd>
-                <dt>Support contacts</dt>
-                <dd>{selectedObject.support_contacts.length}</dd>
+                  : 'External provider'}</dd></div>
+                <div><dt>Shapes</dt><dd>{selectedObject.collision_shapes.map((shape) => shape.type).join(', ') || 'none'}</dd></div>
+                <div><dt>Support contacts</dt><dd>{selectedObject.support_contacts.length}</dd></div>
               </dl>
             </details>
           )}
-          <details className="scene-object-metadata">
+          <details className="dcard">
+            <summary>Owner and runtime source facts</summary>
+            <dl>
+              <div><dt>Scene source</dt><dd><code>{facts.sourceOwnerEpoch}</code> / {facts.sourceGeneration}</dd></div>
+              <div><dt>Runtime source</dt><dd><code>{facts.runtimeSourceOwnerEpoch}</code> / {facts.runtimeSourceGeneration}</dd></div>
+              <div><dt>Scene revision</dt><dd><code>{facts.logicalScene.snapshot?.revision.revision_id}</code></dd></div>
+              <div><dt>Observations</dt><dd>{runtimeStatus.freshGood} fresh / {runtimeStatus.total} total</dd></div>
+            </dl>
+          </details>
+          <details className="dcard">
             <summary>Active collision policy</summary>
-            <pre>{JSON.stringify(
+            <pre className="dcode">{JSON.stringify(
               facts.logicalScene.snapshot?.configured_collision_policy ?? {},
               null,
               2,
             )}</pre>
           </details>
           {selectedObject?.placement.kind === 'cell_fixed' && (
+            <section className="dcard">
+            <h4>Attach</h4>
             <AttachObjectControls
               object={selectedObject}
               sourceModel={sourceValue}
@@ -2900,8 +2928,11 @@ export function SceneAuthoringWorkspace({
                 || commitState.kind === 'busy'}
               onAttach={attachObject}
             />
+            </section>
           )}
-          <div className="scene-authoring-actions">
+          <section className="dcard">
+          <h4>Edit</h4>
+          <div className="dactions">
             <button
               type="button"
               disabled={selectedObject === null || livePose === null || editReason !== null
@@ -2922,6 +2953,8 @@ export function SceneAuthoringWorkspace({
                   : editableProgramShapeFromObject(selectedObject));
               }}
             >Discard local edit</button>
+          </div>
+          <div className="dactions">
             <button
               type="button"
               disabled={draftPoseForLive === null || editReason !== null || commitState.kind === 'busy'}
@@ -2946,6 +2979,8 @@ export function SceneAuthoringWorkspace({
                 });
               }}
             >Save observed object to Program</button>
+          </div>
+          <div className="dactions">
             <button
               type="button"
               disabled={selectedOwnerObjectId === null
@@ -2984,6 +3019,7 @@ export function SceneAuthoringWorkspace({
               role={commitState.kind === 'error' ? 'alert' : 'status'}
             >{commitState.message}</p>
           )}
+          </section>
         </>
       )}
     </div>
@@ -3092,7 +3128,7 @@ export function SceneAuthoringWorkspace({
       <section className="panel scene-authoring-workspace" aria-labelledby="scene-authoring-title">
         <header className="panel-header scene-workspace-header">
           <strong id="scene-authoring-title">Scene</strong>
-          <nav className="scene-workspace-tabs" aria-label="Scene tools">
+          <nav ref={sceneTabs} className="scene-workspace-tabs dseg" aria-label="Scene tools">
             {([
               ['hierarchy', 'Hierarchy'],
               ['program', 'Program scene'],

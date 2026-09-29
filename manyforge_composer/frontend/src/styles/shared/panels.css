@@ -59,3 +59,382 @@
     flex-direction: column;
   }
 }
+
+/* ------------------------------------------------------------------
+   Card panels (design D, design/panel-styles.html): sections are cards
+   with a title bar; inside, label | value rows on hairlines.
+
+   .dpanel     the panel body: a darker ground with spaced cards.
+   .dcard      a section or <details>; its first h3/h4/summary/header is
+               the title bar. Direct children are rows, split by hairlines.
+   label       with a text field: label one third, field two thirds; the
+               field takes its own row (.stacked) when its value does not
+               fit, or is multi-line.
+   dl          read-only rows: label left, value at the right edge.
+   .dactions   buttons share the row and fill it, wrapping as needed.
+   .dseg       segmented choice: one row, or balanced rows (3 + 2, never
+               4 + 1); see useBalancedRows.
+   .dchips     status chips: as many per row as fit, stretched.
+   .drows      a group of rows inside one card row (same hairlines).
+   .dunit      a field with its unit after it.
+   .dchecks    a fieldset of checkboxes: legend, then the boxes in a row.
+   .dcard-meta a count or state at the right of a card's title bar.
+   .dgrid      compact fields side by side (x, y, z): labels above.
+   .dcode      preformatted data inside a card.
+   ------------------------------------------------------------------ */
+
+.dpanel {
+  display: grid;
+  grid-auto-rows: max-content;
+  align-content: start;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  background: var(--mf-bg-neutral-03-a67);
+}
+
+.dcard {
+  display: grid;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--mf-border-neutral-23);
+  border-radius: var(--mf-radius-lg);
+  background: var(--mf-bg-neutral-08);
+  font-size: var(--mf-font-size-080);
+}
+
+/* A plain collapsible inside a card: a quiet disclosure row. */
+.dcard details:not(.dcard) > summary {
+  color: var(--mf-text-neutral-73);
+  cursor: pointer;
+  font-size: var(--mf-font-size-072);
+}
+
+.dcard > :is(h3, h4, summary, header, .settings-subheading):first-child {
+  display: flex;
+  min-height: 2.1rem;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0 0.65rem;
+  border-bottom: 1px solid var(--mf-border-neutral-19);
+  color: var(--mf-text-neutral-94b);
+  background: var(--mf-bg-neutral-11);
+  font-size: var(--mf-font-size-080);
+  font-weight: var(--mf-font-weight-bold);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* A count or state at the right of a title bar. */
+.dcard-meta {
+  margin-left: auto;
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-068);
+  font-weight: 400;
+}
+
+/* An action at the right of a title bar. */
+.dcard > header:first-child > button:last-child {
+  min-height: 1.5rem;
+  margin-left: auto;
+  padding: 0.1rem 0.55rem;
+  font-size: var(--mf-font-size-068);
+  font-weight: 400;
+}
+
+/* A closed <details> card is just its title bar. */
+details.dcard:not([open]) > summary:first-child {
+  border-bottom: 0;
+}
+
+.dcard > summary:first-child {
+  cursor: pointer;
+  list-style: none;
+}
+
+.dcard > summary:first-child::-webkit-details-marker {
+  display: none;
+}
+
+.dcard > summary:first-child::before {
+  content: '▸';
+  width: 0.8rem;
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-072);
+}
+
+details.dcard[open] > summary:first-child::before {
+  content: '▾';
+}
+
+.dcard > :not(:first-child) {
+  min-width: 0;
+  margin: 0 0.65rem;
+  padding: 0.4rem 0;
+}
+
+.dcard > :not(:first-child) + :not(:first-child),
+.drows > * + * {
+  border-top: 1px solid var(--mf-border-neutral-19);
+}
+
+.drows {
+  display: grid;
+  min-width: 0;
+}
+
+.dcard > .drows:not(:first-child) {
+  padding: 0;
+}
+
+.drows > * {
+  min-width: 0;
+  padding: 0.4rem 0;
+}
+
+/* A card inside a card (a collapsible group of fields). */
+.dcard > .dcard:not(:first-child) {
+  margin: 0.4rem 0.65rem;
+  padding: 0;
+  border-top: 1px solid var(--mf-border-neutral-23);
+}
+
+.dcard.backend-invalid {
+  border-color: var(--mf-border-danger-62);
+}
+
+/* A scope heading used as the title bar: the tag at the right. */
+.dcard > .settings-subheading:first-child {
+  justify-content: space-between;
+}
+
+.dcard > :last-child:not(:first-child) {
+  margin-bottom: 0.25rem;
+}
+
+.dcard p {
+  margin: 0;
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-072);
+  line-height: 1.5;
+}
+
+/* Field rows: the label's text takes a third, the field two thirds. */
+/* :where keeps this rule's weight low, so .stacked and textarea rows win. */
+.dcard label:has(> :where(input:not([type='checkbox'], [type='radio'], [type='range']), select, textarea, .dunit)) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  align-items: center;
+  gap: 0.6rem;
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-072);
+  line-height: 1.3;
+  overflow-wrap: break-word;
+}
+
+.dcard label > :is(input:not([type='checkbox'], [type='radio']), select, textarea) {
+  min-width: 0;
+  width: 100%;
+  font-size: var(--mf-font-size-080);
+}
+
+.dunit {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.dunit > :is(input, select) {
+  width: auto;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.dunit > output {
+  flex: 0 0 auto;
+  min-width: 3.2rem;
+  color: var(--mf-text-neutral-81);
+  font-size: var(--mf-font-size-072);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.dunit > button {
+  flex: 0 0 auto;
+  min-height: 1.7rem;
+  padding: 0.15rem 0.5rem;
+  font-size: var(--mf-font-size-072);
+}
+
+.dunit > span {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-072);
+}
+
+/* A heading inside a card: small capitals, its scope tag at the right. */
+.dcard .settings-subheading {
+  margin-block: 0;
+  color: var(--mf-text-neutral-68);
+  font-size: var(--mf-font-size-065);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.dcard .settings-subheading.minor {
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.dcard fieldset:not(.dchecks) {
+  display: grid;
+  min-width: 0;
+  gap: 0.35rem;
+  border: 0;
+}
+
+/* Multi-line fields, and values that do not fit, take their own row. */
+.dcard label:has(> textarea),
+.dcard label.stacked {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.25rem;
+}
+
+/* Compact fields side by side keep their label above. */
+.dgrid {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.dcard .dgrid label:has(> :is(input, select, textarea)) {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.2rem;
+}
+
+.dcode {
+  max-height: 10rem;
+  margin: 0;
+  overflow: auto;
+  color: var(--mf-text-neutral-69);
+  font-size: var(--mf-font-size-065);
+  white-space: pre-wrap;
+}
+
+/* Checkbox rows. */
+.dcard label:has(> input[type='checkbox']) {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--mf-text-neutral-86);
+  font-size: var(--mf-font-size-080);
+}
+
+.dchecks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1rem;
+  margin: 0;
+  border: 0;
+}
+
+.dchecks > legend {
+  float: left;
+  width: 100%;
+  padding: 0 0 0.2rem;
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-072);
+}
+
+/* Read-only rows: label on the left, value at the right edge. */
+.dcard dl {
+  display: grid;
+  gap: 0.3rem;
+  margin: 0;
+}
+
+/* The label keeps its width (up to half the row); a long value wraps
+   beside it, right-aligned, at spaces first. */
+.dcard dl > div {
+  display: grid;
+  grid-template-columns: fit-content(50%) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 0.75rem;
+  font-size: var(--mf-font-size-076);
+}
+
+.dcard dt {
+  color: var(--mf-text-neutral-63);
+  overflow-wrap: break-word;
+}
+
+.dcard dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--mf-text-neutral-86);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.dcard dd code {
+  color: var(--mf-text-accent-79);
+  font-family: var(--mf-font-mono);
+  font-size: var(--mf-font-size-072);
+}
+
+/* Buttons share their row and fill it. */
+.dactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.dactions > button {
+  flex: 1 1 auto;
+  min-height: 1.9rem;
+  font-size: var(--mf-font-size-076);
+}
+
+/* Segmented choice: faint outline on every option, clear selected one. */
+.dseg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--mf-border-neutral-27);
+  border-radius: var(--mf-radius-lg);
+  background: var(--mf-bg-neutral-08);
+}
+
+.dseg > button {
+  flex: 1 1 var(--dseg-basis, auto);
+  min-height: 1.75rem;
+  padding: 0 0.45rem;
+  border: 1px solid var(--mf-border-neutral-27);
+  border-radius: var(--mf-radius-md-sm);
+  color: var(--mf-text-neutral-73);
+  background: transparent;
+  font-size: var(--mf-font-size-076);
+  white-space: nowrap;
+}
+
+/* Same weight as the others, so an option never changes width. */
+.dseg > button:is(.active, [aria-pressed='true'], [aria-selected='true']) {
+  border-color: var(--mf-border-accent-64);
+  color: var(--mf-text-neutral-96);
+  background: var(--mf-bg-neutral-19);
+  box-shadow: inset 0 0 0 1px var(--mf-border-accent-64);
+}
+
+/* Status chips: as many per row as fit, stretched to the row. */
+.dchips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.dchips > * {
+  flex: 1 1 auto;
+  text-align: center;
+}

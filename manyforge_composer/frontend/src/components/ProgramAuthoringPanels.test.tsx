@@ -450,7 +450,7 @@ describe('Program authoring panels', () => {
     );
 
     expect(markup).toContain('aria-pressed="true"');
-    expect(markup).toContain('program_parameter:wait_time');
+    expect(markup).toContain('<dd title="program_parameter"><code>wait_<wbr/>time</code> <small>program parameter</small></dd>');
     expect(markup).toContain('The literal is absent while this exact source is bound.');
   });
 
@@ -501,7 +501,7 @@ describe('Program authoring panels', () => {
       expect(markup).toContain(referenced ? 'parameter default' : 'With request');
       expect(markup).not.toContain('exceeds Deployment');
       expect(JSON.stringify(node)).toBe(before);
-      if (referenced) expect(markup).toContain('program_parameter:speed');
+      if (referenced) expect(markup).toContain('<dd title="program_parameter"><code>speed</code>');
     }
   });
 
@@ -824,6 +824,7 @@ describe('Program authoring panels', () => {
       cycleFailure: null,
       active: false,
       commandAllowed: vi.fn(() => false),
+      startBlockedReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
@@ -1011,6 +1012,7 @@ describe('Program authoring panels', () => {
       cycleFailure: null,
       active: false,
       commandAllowed: vi.fn(() => false),
+      startBlockedReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),

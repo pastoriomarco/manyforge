@@ -891,7 +891,7 @@ function ModelAndTargetSection({
   )) ?? [];
   const editingDisabled = !controller.mutationAvailable || controller.busy;
   return (
-    <details className="deployment-focused-section" open>
+    <details className="dcard" open>
       <summary>Robot model and target limits</summary>
       <div className="deployment-focused-body">
         {limits.length > 1 && target && <label className="deployment-focused-field">
@@ -1002,7 +1002,7 @@ function NativeRuntimeSection({
 }) {
   const disabled = !controller.mutationAvailable || controller.busy;
   return (
-    <details className="deployment-focused-section">
+    <details className="dcard">
       <summary>Native runtime configuration</summary>
       <div className="deployment-focused-body">
         {runtimes.length === 0 && <p className="muted">No native runtime configuration is declared.</p>}
@@ -1087,7 +1087,7 @@ function ControlledStopSection({
   const [selectedId, setSelectedId] = useState('');
   const target = targets.find((row) => row.key === selectedId) ?? targets[0];
   return (
-    <details className="deployment-focused-section">
+    <details className="dcard">
       <summary>Stop settings</summary>
       <div className="deployment-focused-body">
         {target ? <>
@@ -1385,7 +1385,7 @@ function GripperSection({
     setError(result === null ? 'The Deployment owner rejected this gripper configuration.' : null);
   };
   return (
-    <details className="deployment-focused-section">
+    <details className="dcard">
       <summary>Current gripper configuration</summary>
       <div className="deployment-focused-body">
         {descriptor === null ? <p className="muted">No current addressed gripper descriptor is available.</p> : (

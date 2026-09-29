@@ -694,7 +694,7 @@ function JointTargetListEditor({
               {unavailableCurrent && <span>not commandable by this target</span>}
             </label>
             <label className="program-joint-target-position">
-              <span>Position (rad)</span>
+              <span className="sr-only">Position (rad)</span>
               <JointTargetPositionInput
                 jointName={row.jointName}
                 value={row.selected ? row.positionText : ''}

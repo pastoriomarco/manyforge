@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { ManagerDeploymentImpact } from '../types/api';
+import { deploymentMatchesApplied, deploymentUnapplied } from '../state/documentStates';
 import { OverlayPanel } from './OverlayPanel';
 
 type Action = 'discard' | 'revert';
@@ -96,18 +97,11 @@ export function DeploymentDocumentControls({
   // Manager Applied is the publication identity.  Runtime convergence is a
   // separate readiness concern and must not make the document controls
   // oscillate while an accepted Apply is still settling.
-  const draftMatchesManager = workspace !== null
-    && workspace.draft.document !== null
-    && workspace.draft.deploymentRevision !== null
-    && workspace.draft.deploymentRevision
-      === workspace.managerApplied.deploymentRevision;
+  const draftMatchesManager = deploymentMatchesApplied(workspace);
   // Discard is a local Draft-to-Applied operation.  A Draft can remain
   // different from its saved baseline after Apply (which is what makes
   // Revert useful), but there is then nothing left for Discard to do.
-  const hasUnappliedChanges = workspace !== null
-    && workspace.draft.document !== null
-    && workspace.managerApplied.deploymentRevision !== null
-    && !draftMatchesManager;
+  const hasUnappliedChanges = deploymentUnapplied(workspace);
   const pendingConfirmation = controller.pendingApplyConfirmation;
   // Why authoring is blocked comes first, so every disabled control explains
   // itself the same way the Program controls do.
@@ -129,17 +123,6 @@ export function DeploymentDocumentControls({
           <strong title={workspace?.saved.path ?? workspace?.draft.deploymentRevision ?? undefined}>
             {workspace?.draft.deploymentArtifactId ?? 'No Deployment'}
           </strong>
-          <span className="document-identity-divider" aria-hidden="true" />
-          <span className={`document-state state-${workspace?.draft.differsFromSaved ? 'modified' : 'draft'}`}>
-            {workspace?.draft.differsFromSaved ? 'modified' : 'draft'}
-          </span>
-          <span className={`document-state state-${workspace?.draft.differsFromSaved ? 'different' : 'saved'}`}>
-            {workspace?.draft.differsFromSaved ? 'different' : 'saved'}
-          </span>
-          <span className={`document-state state-${draftMatchesManager ? 'applied' : 'different'}`}>
-            {draftMatchesManager ? 'applied' : 'different'}
-          </span>
-          <span className="document-identity-divider document-settings-divider" aria-hidden="true" />
         </div>
         <div className="document-actions">
           {scenarioCommands && (

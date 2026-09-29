@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
+from pathlib import Path
 import sys
 from typing import Any, Final, Sequence
 
 import uvicorn
 
 from manyforge_composer.backend.app import create_app
+from manyforge_composer.backend.composer_settings import ComposerSettingsStore
 from manyforge_composer.backend.logging_config import setup_logging
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import (
@@ -92,6 +95,13 @@ def main() -> None:
     )
     parser.add_argument("--assistant-request-timeout-s", type=float, default=10.0)
     parser.add_argument(
+        "--settings-dir",
+        help=(
+            "folder for installation Composer settings; defaults to"
+            " $MANYFORGE_STATE_DIR/composer (unset: defaults, not saved)"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -129,11 +139,18 @@ def main() -> None:
             headless_client=headless_client,
             assistant_client=assistant_client,
         )
+        state_dir = os.environ.get("MANYFORGE_STATE_DIR", "").strip()
+        settings_dir = (
+            Path(args.settings_dir) if args.settings_dir
+            else Path(state_dir) / "composer" if state_dir
+            else None
+        )
         app = create_app(
             state,
             static_dir=args.static_dir,
             security=security,
             enable_mcp=args.mcp_http,
+            settings_store=ComposerSettingsStore(settings_dir),
         )
         if args.startup_scenario_document is not None:
             if headless_client is None:

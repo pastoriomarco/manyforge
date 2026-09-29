@@ -469,6 +469,22 @@ describe('Program command settlement', () => {
 });
 
 describe('Program runtime authority requests', () => {
+  it('waits for an unapplied Deployment Draft exactly like a Program Draft', () => {
+    const { applied, workspace, snapshot } = admissionFixtures();
+    expect(buildProgramStartRequest(
+      applied, true, null, snapshot, workspace, 'owner', 'start', false,
+    )).not.toBeNull();
+    expect(buildProgramStartRequest(
+      applied, true, null, snapshot, workspace, 'owner', 'start', true,
+    )).toBeNull();
+    const programChanged = {
+      ...workspace, draft: { ...workspace.draft, programRevision: digest('d') },
+    } as typeof workspace;
+    expect(buildProgramStartRequest(
+      applied, true, null, snapshot, programChanged, 'owner', 'start', false,
+    )).toBeNull();
+  });
+
   it('starts only from one complete Idle snapshot and carries exact fences', () => {
     const { applied, workspace, snapshot } = admissionFixtures();
     expect(buildProgramStartRequest(

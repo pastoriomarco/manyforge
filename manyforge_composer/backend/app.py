@@ -27,12 +27,14 @@ from manyforge_headless_api.execution_control import (
     ExecutionControlClient,
 )
 
+from .composer_settings import ComposerSettingsStore
 from .log_throttle import ThrottledLog
 from .models import UnavailableDetail, UnavailableResponse
 from .routes_assistant import create_assistant_router
 from .routes_assistant_draft import create_assistant_draft_router
 from .routes_authoring_workspace import create_authoring_workspace_router
 from .routes_catalog import create_catalog_router
+from .routes_composer_settings import create_composer_settings_router
 from .routes_draft import create_draft_router
 from .routes_deployment_draft import create_deployment_draft_router
 from .routes_filesystem import create_filesystem_router
@@ -186,6 +188,7 @@ def create_app(
     security: SecurityConfig | None = None,
     *,
     enable_mcp: bool = False,
+    settings_store: ComposerSettingsStore | None = None,
 ) -> FastAPI:
     """Create structural, Draft/Saved authoring, and thin headless routes.
 
@@ -460,6 +463,15 @@ def create_app(
         create_catalog_router(state),
         prefix="/api/catalog",
         tags=["catalog"],
+    )
+    # Installation presentation settings: Composer-owned, never execution.
+    app.include_router(
+        create_composer_settings_router(
+            settings_store if settings_store is not None
+            else ComposerSettingsStore(None)
+        ),
+        prefix="/api/composer/settings",
+        tags=["composer-settings"],
     )
     app.include_router(
         create_nodes_router(state),

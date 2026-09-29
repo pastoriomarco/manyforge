@@ -123,8 +123,11 @@ describe('viewer failure isolation', () => {
     expect(source).toContain("(object) => !observedSceneResourceIds.has(object.scene_resource_id)");
     expect(source).toContain('<ObservedLogicalSceneObjects');
     expect(source).toContain('viewer-source-swatch candidate');
-    expect(source).toContain('className="viewer-preview-dot" aria-hidden="true"');
-    expect(source).toContain('A Draft scene or target preview is visible. Open Tools for layer details.');
+    // The preview-layer dot moved from the Tools button to the viewer gear.
+    const transport = readFileSync(new URL('./ProgramRuntimePanel.tsx', import.meta.url), 'utf8');
+    expect(transport).toContain('<span className="viewer-preview-dot" aria-hidden="true" />');
+    expect(transport).toContain('A Draft scene or target preview is visible. Open the viewer settings for layer details.');
+    expect(source).toContain('previewLayerActive: auxiliaryViewerSourcesActive,');
     expect(source).not.toContain('viewer-source-active');
     expect(source).not.toContain('Measured state');
     expect(source).not.toContain('Non-live viewer overlays');
@@ -141,13 +144,27 @@ describe('viewer failure isolation', () => {
     expect(source.match(/type="checkbox"/g)).toHaveLength(7);
     // Optional silhouette, off by default; it outlines the framed content.
     expect(source).toContain('<span>Object outline</span>');
-    expect(source).toContain('const [outlineVisible, setOutlineVisible] = useState(false);');
+    // Display toggles are installation settings, not local component state.
+    expect(source).toContain('objectOutline: outlineVisible,');
+    expect(source).toContain("setViewerSetting('objectOutline', event.target.checked)");
     expect(source).toContain('<SceneOutline multisample={renderer.antialias} componentByLink={outlineComponents} />');
-    expect(source).toContain("toggleInspectorPanel('tools')");
+    // Viewer settings open from the viewer gear; there is no Tools button.
+    expect(source).not.toContain("toggleInspectorPanel('tools')");
+    expect(source).toContain("setInspectorPanel('tools');");
+    // One scope vocabulary: a tag on the heading or row it applies to.
+    expect(source).toContain('title="Display"');
+    expect(source).toContain("onRestoreDefaults={() => composerSettings.restoreSection('viewer')}");
+    // Tags only on headings; each heading has one scope.
+    expect(source).toContain('<SettingsSubheading title="Size" scope="program" />');
+    expect(source).toContain('<SettingsSubheading title="Shown" scope="session" />');
+    expect(source).toContain("['Program objects', 'program', presentedObjectAxesRows.filter((row) => row.persistent)],");
+    expect(source).toContain("['Other objects', 'session', presentedObjectAxesRows.filter((row) => !row.persistent)],");
+    expect(source).not.toContain('Program Draft setting');
+    expect(source).toContain('<summary>Control panels</summary>');
     expect(source).toContain('Comparison ghost');
     expect(source).toContain('disabled={!comparisonGhostAvailable}');
     expect(source).toContain('Model and source facts');
-    expect(source).toContain('manifest.data.links.length} links · {manifest.data.joints.length} joints');
+    expect(source).toContain('{manifest.data.links.length} links · {manifest.data.joints.length} joints');
     expect(source).not.toContain('className="viewer-legend"');
   });
 
@@ -176,7 +193,7 @@ describe('viewer failure isolation', () => {
     expect(source.includes('else if (!generalTransformEnabled) return;')).toBe(true);
     expect(css).toMatch(/\.viewer-header-controls\s*\{[^}]*flex:\s*1 1 auto/s);
     expect(css).toMatch(/\.viewer-surface-launchers\s*\{[^}]*margin-left:\s*auto/s);
-    expect(source.slice(launchers, stage).match(/aria-pressed=\{inspectorPanel ===/g)).toHaveLength(3);
+    expect(source.slice(launchers, stage).match(/aria-pressed=\{inspectorPanel ===/g)).toHaveLength(2);
     expect(css).toMatch(
       /\.viewer-surface-launchers > button\[aria-pressed='true'\]\s*\{[^}]*border-color:\s*#68cadd;[^}]*background:\s*#17404c;/s,
     );
@@ -520,10 +537,10 @@ describe('viewer failure isolation', () => {
     expect(css).not.toContain('.viewer-notice-stack');
     expect(css).not.toContain('.viewer-model-state');
     const layout = css.match(/\.workbench-notification-stack\s*\{([^}]+)\}/)?.[1];
-    // Below the floating controls (1.9rem toolbar + 2 × 0.65rem inset), same side insets.
-    expect(layout).toContain('top: calc(1.9rem + 2 * 0.65rem)');
-    expect(layout).toContain('left: 0.65rem');
-    expect(layout).toContain('right: 0.65rem');
+    // Below the floating controls (1.9rem toolbar + 2 × 0.45rem inset), same side insets.
+    expect(layout).toContain('top: calc(1.9rem + 2 * 0.45rem)');
+    expect(layout).toContain('left: 0.45rem');
+    expect(layout).toContain('right: 0.45rem');
     expect(layout).toContain('pointer-events: none');
   });
 

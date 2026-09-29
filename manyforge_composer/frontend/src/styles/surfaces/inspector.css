@@ -210,32 +210,8 @@
   font-size: var(--mf-font-size-072);
 }
 
-.central-inspector-section .program-property-list {
-  padding: var(--inspector-content-padding);
-}
-
-.central-inspector-section .program-node-identity {
-  gap: var(--inspector-section-gap);
-  margin-bottom: 0.5rem;
-  padding-bottom: 0.45rem;
-}
-
-.central-inspector-section .program-node-name-row,
-.central-inspector-section .program-node-identity > span {
-  gap: 0.12rem;
-}
-
-.central-inspector-section .program-node-identity small {
-  font-size: var(--mf-font-size-056);
-}
-
-.central-inspector-section .program-node-identity :is(strong, code) {
-  font-size: var(--mf-font-size-076);
-}
-
 .central-inspector-section .program-node-capabilities {
-  margin: -0.15rem 0 0.35rem;
-  font-size: var(--mf-font-size-058);
+  font-size: var(--mf-font-size-065);
 }
 
 .central-inspector-section .program-property {
@@ -296,9 +272,6 @@
 }
 
 .central-inspector-section :is(
-  .program-policy-editor,
-  .program-policy-fieldset,
-  .program-policy-actions,
   .program-vector-editor,
   .program-waypoint,
   .program-schema-list,

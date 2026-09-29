@@ -1,12 +1,4 @@
-import type { EdgeStyle, LayoutDirection } from '../store/composerStore';
-
-const EDGE_STYLE_OPTIONS: { value: EdgeStyle; label: string }[] = [
-  { value: 'smoothstep', label: 'Orthogonal' },
-  { value: 'simplebezier', label: 'Smooth' },
-  { value: 'default', label: 'Bezier' },
-  { value: 'straight', label: 'Straight' },
-  { value: 'step', label: 'Step' },
-];
+import { EDGE_STYLE_OPTIONS, type EdgeStyle, type LayoutDirection } from '../store/composerStore';
 
 interface CanvasViewControlsProps {
   edgeStyle: EdgeStyle;

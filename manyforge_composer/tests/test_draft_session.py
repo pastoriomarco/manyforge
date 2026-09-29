@@ -11,6 +11,7 @@ import pytest
 from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
+from manyforge_composer.backend.authoring_forest import empty_authoring
 from manyforge_composer.backend.draft_session import (
     ComposerDraftSession,
     DraftSessionError,
@@ -941,6 +942,28 @@ def test_revert_failure_stale_fences_and_exhaustion_are_atomic() -> None:
             action()
         assert exhausted.value.code == "composer_draft_revision_exhausted"
     assert effects == ["read", "read"]
+
+
+def test_new_program_motion_defaults_equal_every_catalog_motion_default() -> None:
+    """New Programs declare the four Program motion defaults. Their values are
+    the catalog's, so declaring them changes no motion node's behaviour."""
+
+    catalog = build_node_environment().catalog
+    seeded = {
+        row["parameter_id"]: row["default"]
+        for row in empty_authoring(catalog)["parameters"]
+    }
+    assert set(seeded) == {
+        "velocity_scale", "acceleration_scale",
+        "translation_tol_m", "max_blend_deviation_rad",
+    }
+    compared = 0
+    for entry in catalog.entries:
+        for parameter in entry.parameters:
+            if parameter.id in seeded and parameter.has_default:
+                assert parameter.default == seeded[parameter.id], (entry.id, parameter.id)
+                compared += 1
+    assert compared > 0
 
 
 def test_new_draft_is_fresh_empty_authoring_and_clears_saved_identity() -> None:

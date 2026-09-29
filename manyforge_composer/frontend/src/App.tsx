@@ -39,12 +39,20 @@ import {
 } from './state/nodeEnvironmentRefresh';
 import { useStructuralResource } from './state/structuralResource';
 import { deriveProgramMotionConfiguration } from './utils/programAuthoring';
+import { stricterCartesianDefaults } from './state/robotControl';
 import {
   useOperationalErrorMirror,
   useOperationalErrors,
 } from './state/operationalErrors';
 import { authoringUnavailableCause, requiredComponentFaultNotices } from './state/authoringWorkspace';
 import { sameManagerApply, type ManagerApplyIdentity } from './state/managerApply';
+import {
+  deploymentDocumentStates,
+  deploymentUnapplied,
+  programDocumentStates,
+} from './state/documentStates';
+import { DocumentStateLetters } from './components/DocumentStateLetters';
+import { useComposerSettingsNotices } from './components/ComposerSettingsPanel';
 import {
   activeViewerIncidentKinds,
   classifyWorkbenchNotices,
@@ -172,7 +180,6 @@ export default function App() {
   const [runtimeAttentionRequest, setRuntimeAttentionRequest] = useState<string | null>(null);
   const [runtimePanelAutomatic, setRuntimePanelAutomatic] = useState(false);
   const [programInvalidEdit, setProgramInvalidEdit] = useState(false);
-  const [programSettingsRequest, setProgramSettingsRequest] = useState(0);
   const [componentOverviewRequest, setComponentOverviewRequest] = useState(0);
   const [programRequirementCreated, setProgramRequirementCreated] = useState<{
     sequence: number;
@@ -288,25 +295,42 @@ export default function App() {
     retryManifest,
     retrySourceModel,
   ]);
+  // Composer settings problems appear as workbench notices.
+  useComposerSettingsNotices();
   const programController = useProgramWorkspace(
     headlessSnapshot,
     authoringWorkspace,
   );
+  // Draft / Saved / Applied of both documents, shown in every workspace.
+  const programStates = programDocumentStates(programController.state.workspace);
+  const deploymentStates = deploymentDocumentStates(deploymentController.workspace);
   const programRuntime = useProgramRuntime(
     headlessEnabled,
     headlessSnapshot,
     programController.state.workspace,
     headlessStateSource,
+    deploymentUnapplied(deploymentController.workspace),
   );
+  // Manual Cartesian defaults: the Applied Program's, tightened at once by an
+  // unapplied Draft that is stricter (a looser Draft waits for Apply).
+  const appliedProgram = programRuntime.state.applied;
   const programCartesianDefaults = useMemo(() => {
+    if (catalog.status !== 'ready') return null;
+    const defaults = (program: Parameters<typeof deriveProgramMotionConfiguration>[0]) => {
+      const configuration = deriveProgramMotionConfiguration(program, catalog.data.entries);
+      return configuration.available ? {
+        translationToleranceM: configuration.configuration.values.translation_tol_m,
+        maxBlendDeviationRad: configuration.configuration.values.max_blend_deviation_rad,
+      } : null;
+    };
     const authoring = programController.state.workspace?.draft.authoring ?? null;
-    if (authoring === null || catalog.status !== 'ready') return null;
-    const configuration = deriveProgramMotionConfiguration(authoring, catalog.data.entries);
-    return configuration.available ? {
-      translationToleranceM: configuration.configuration.values.translation_tol_m,
-      maxBlendDeviationRad: configuration.configuration.values.max_blend_deviation_rad,
-    } : null;
-  }, [catalog, programController.state.workspace?.draft.authoring]);
+    return stricterCartesianDefaults(
+      appliedProgram === null
+        ? null
+        : defaults({ parameters: appliedProgram.program.parameters, forest: [appliedProgram.program.tree] }),
+      authoring === null ? null : defaults(authoring),
+    );
+  }, [appliedProgram, catalog, programController.state.workspace?.draft.authoring]);
   const robotControl = useRobotControl(
     headlessEnabled,
     programRuntime.cycleState !== null
@@ -827,6 +851,7 @@ export default function App() {
           <strong>ManyForge</strong>
         </div>
         <nav className="workspace-switcher" aria-label="Workbench sections">
+          <DocumentStateLetters states={programStates} owner="Program" side="left" />
           <button
             type="button"
             data-workspace="program"
@@ -888,6 +913,7 @@ export default function App() {
                 : ''}
             </span>
           </button>
+          <DocumentStateLetters states={deploymentStates} owner="Deployment" side="right" />
         </nav>
         {activeWorkspace === 'deployment' ? (
           <DeploymentDocumentControls
@@ -899,14 +925,7 @@ export default function App() {
             controller={programController}
             scenarioCommands={scenarioCommands}
             runtime={programRuntime}
-            catalogEntries={catalog.status === 'ready' ? catalog.data.entries : []}
             localInvalidEdit={programInvalidEdit}
-            settingsRequest={programSettingsRequest}
-            onProgramRequirementCreated={(kind, id) => setProgramRequirementCreated((current) => ({
-              sequence: (current?.sequence ?? 0) + 1,
-              kind,
-              id,
-            }))}
           />
         )}
         <div className="global-surface-launchers" aria-label="Application tools">
@@ -962,13 +981,17 @@ export default function App() {
               onRetryEnvironment={retryNodeEnvironment}
               onInvalidEditChange={setProgramInvalidEdit}
               onOpenScene={() => setActiveWorkspace('scene')}
-              onOpenProgramSettings={() => setProgramSettingsRequest((current) => current + 1)}
               inspectorTarget={programInspectorTarget}
               inspectorMinimized={programInspectorMinimized}
               onInspectorMinimizedChange={setProgramInspectorMinimized}
               onInspectorMaximize={maximizeProgramInspector}
               onInspectorStateChange={handleProgramInspectorState}
               programRequirementCreated={programRequirementCreated}
+              onProgramRequirementCreated={(kind, id) => setProgramRequirementCreated((current) => ({
+                sequence: (current?.sequence ?? 0) + 1,
+                kind,
+                id,
+              }))}
             />
           ) : activeWorkspace === 'scene' ? (
             <div

@@ -81,6 +81,16 @@ the workbench is running is refused; stop it before switching. A failed new
 start removes only the container it created. `stop` removes runtime state while
 retaining build, npm, and repository-bootstrap caches under `.manyforge-dev/`.
 
+Composer settings (viewer display toggles, tree editor link style and start
+direction, Motion panel layout and confirmations, and profiles; the gear at
+the top right) are installation-specific and survive stop/start. They are kept in
+`.manyforge-dev/state/composer/settings.json`, mounted into the workbench as
+`/var/lib/manyforge/composer` (`MANYFORGE_STATE_DIR=/var/lib/manyforge`). Only
+that folder persists; all other runtime state still resets with the container.
+An unreadable settings file is never overwritten silently: Composer uses the
+defaults, keeps settings read-only and offers a reset that keeps the file as a
+`settings.json.bak-<time>` backup.
+
 The current fixed ports are frontend `3000`, Headless API `9010`, Program
 runner `9011`, and internal Composer API `9020`. If one is occupied, startup
 fails with a direct diagnostic rather than taking over the process.

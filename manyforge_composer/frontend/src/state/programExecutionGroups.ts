@@ -105,3 +105,19 @@ export function appliedExecutionSelectionRows(
       } satisfies ProgramExecutionSelectionRow;
     });
 }
+
+/**
+ * Groups the Motion panel shows. Without a Program choice, named groups are
+ * shown and "all" only when there are none. A choice hides the groups it
+ * names; at least one group always stays shown (Halt is shown regardless).
+ */
+export function shownExecutionGroupIds(
+  groupIds: readonly string[],
+  hidden: readonly string[] | undefined,
+): string[] {
+  const named = groupIds.filter((groupId) => groupId !== 'all');
+  const fallback = named.length > 0 ? named : groupIds.filter((groupId) => groupId === 'all');
+  if (hidden === undefined) return fallback;
+  const shown = groupIds.filter((groupId) => !hidden.includes(groupId));
+  return shown.length > 0 ? shown : fallback;
+}

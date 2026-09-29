@@ -496,6 +496,8 @@
 }
 
 .program-tree-react-flow .react-flow__controls {
+  /* Same inset as every other command on a surface. */
+  margin: var(--mf-surface-overlay-inset);
   border: 1px solid var(--mf-border-neutral-32);
   box-shadow: 0 0.7rem 1.5rem var(--mf-shadow-neutral-00-a22);
 }
@@ -780,24 +782,14 @@
   gap: 0.25rem;
   position: absolute;
   z-index: var(--mf-z-sticky);
-  top: 0.45rem;
-  right: 0.45rem;
-}
-
-.program-canvas-help {
-  position: absolute;
-  z-index: var(--mf-z-sticky);
-  top: 0.45rem;
-  left: 0.45rem;
-  border-color: var(--mf-border-neutral-32);
-  color: var(--mf-text-neutral-68);
-  background: var(--mf-bg-neutral-07-a88);
+  top: var(--mf-surface-overlay-inset);
+  right: var(--mf-surface-overlay-inset);
 }
 
 .program-canvas-message {
   position: absolute;
   z-index: var(--mf-z-sticky);
-  bottom: 0.45rem;
+  bottom: var(--mf-surface-overlay-inset);
   left: 50%;
   max-width: min(34rem, calc(100% - 8rem));
   transform: translateX(-50%);
@@ -886,12 +878,12 @@
 .program-canvas-topbar {
   position: absolute;
   z-index: var(--mf-z-sticky);
-  top: 0.45rem;
-  right: 0.45rem;
+  top: var(--mf-surface-overlay-inset);
+  right: var(--mf-surface-overlay-inset);
   bottom: 3.55rem;
-  left: 0.45rem;
+  left: var(--mf-surface-overlay-inset);
   display: grid;
-  grid-template-columns: var(--program-canvas-control-height) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: start;
   gap: 0.4rem;
   pointer-events: none;
@@ -901,19 +893,20 @@
   pointer-events: auto;
 }
 
-.program-canvas-toolbar,
-.program-canvas-help {
+.program-canvas-toolbar {
   position: static;
 }
 
 .program-canvas-toolbar {
-  grid-column: 3;
+  grid-column: 2;
 }
 
-.program-canvas-help {
-  grid-column: 1;
-  width: var(--program-canvas-control-height);
-  height: var(--program-canvas-control-height);
+/* Information and settings, bottom right, as in the 3D viewer. */
+.program-canvas-corner-actions {
+  position: absolute;
+  z-index: var(--mf-z-sticky);
+  right: var(--mf-surface-overlay-inset);
+  bottom: var(--mf-surface-overlay-inset);
 }
 
 .program-canvas-toolbar .canvas-view-controls {
@@ -947,7 +940,7 @@
 }
 
 .program-notice-rail {
-  grid-column: 2;
+  grid-column: 1;
   min-width: 0;
   max-height: 100%;
   overflow: hidden;
@@ -1020,8 +1013,8 @@
 .program-tree-react-flow .program-tree-actions {
   position: absolute;
   z-index: var(--mf-z-sticky);
-  right: 0.45rem;
-  bottom: 0.45rem;
+  right: var(--mf-surface-overlay-inset);
+  bottom: var(--mf-surface-overlay-inset);
   width: max-content;
   max-width: calc(100% - var(--program-canvas-control-height) - 1.9rem);
   border: 1px solid var(--mf-border-neutral-32);

@@ -9,6 +9,7 @@ import type {
 import {
   collectBlackboardUsages,
   collectProgramParameterUsages,
+  type ProgramMotionDefaultRole,
 } from '../utils/programAuthoring';
 
 export type ProgramDeclarationSelection =
@@ -23,6 +24,8 @@ interface ProgramDeclarationsNavigatorProps {
   keys: BlackboardKeyDeclaration[];
   selected: ProgramDeclarationSelection | null;
   onSelect: (selection: ProgramDeclarationSelection) => void;
+  /** Parameters acting as Program motion defaults, by parameter ID. */
+  motionDefaults?: ReadonlyMap<string, ProgramMotionDefaultRole>;
 }
 
 function selectedClass(
@@ -41,19 +44,20 @@ export function ProgramDeclarationsNavigator({
   keys,
   selected,
   onSelect,
+  motionDefaults = new Map(),
 }: ProgramDeclarationsNavigatorProps) {
   const parameterUsages = useMemo(() => collectProgramParameterUsages(roots), [roots]);
   const blackboardUsages = useMemo(() => collectBlackboardUsages(roots), [roots]);
 
   return (
-    <nav className="program-declaration-navigator" aria-label="Program declarations">
-      <section>
-        <div className="program-declaration-heading">
+    <nav className="program-declaration-navigator dpanel" aria-label="Program declarations">
+      <section className="dcard">
+        <header>
           <h4>Parameters</h4>
           <button type="button" onClick={() => onSelect({ kind: 'parameter', id: '' })}>
             New
           </button>
-        </div>
+        </header>
         {parameters.length === 0 && <p>No parameters</p>}
         {parameters.map((parameter) => (
           <button
@@ -62,18 +66,31 @@ export function ProgramDeclarationsNavigator({
             className={selectedClass(selected, 'parameter', parameter.parameter_id)}
             onClick={() => onSelect({ kind: 'parameter', id: parameter.parameter_id })}
           >
-            <span><strong>{parameter.parameter_id}</strong><small>{parameter.type}</small></span>
-            <small>{parameterUsages[parameter.parameter_id]?.length ?? 0}</small>
+            <span>
+              <strong>{parameter.parameter_id}</strong>
+              <small>
+                {parameter.type}
+                {motionDefaults.has(parameter.parameter_id) && ' · motion default'}
+              </small>
+            </span>
+            {motionDefaults.has(parameter.parameter_id) ? (
+              <small title="Motion nodes bound to it, out of those that accept this field">
+                {motionDefaults.get(parameter.parameter_id)!.bound}
+                /{motionDefaults.get(parameter.parameter_id)!.applicable}
+              </small>
+            ) : (
+              <small>{parameterUsages[parameter.parameter_id]?.length ?? 0}</small>
+            )}
           </button>
         ))}
       </section>
-      <section>
-        <div className="program-declaration-heading">
+      <section className="dcard">
+        <header>
           <h4>Namespaces</h4>
           <button type="button" onClick={() => onSelect({ kind: 'namespace', id: '' })}>
             New
           </button>
-        </div>
+        </header>
         {namespaces.length === 0 && <p>No namespaces</p>}
         {namespaces.map((namespace) => (
           <button
@@ -87,13 +104,13 @@ export function ProgramDeclarationsNavigator({
           </button>
         ))}
       </section>
-      <section>
-        <div className="program-declaration-heading">
+      <section className="dcard">
+        <header>
           <h4>Blackboard keys</h4>
           <button type="button" onClick={() => onSelect({ kind: 'key', id: '' })}>
             New
           </button>
-        </div>
+        </header>
         {keys.length === 0 && <p>No keys</p>}
         {keys.map((key) => (
           <button

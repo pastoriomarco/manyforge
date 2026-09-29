@@ -184,6 +184,8 @@ export interface ProgramViewerMetadata {
   resource_role_visibility?: Record<string, boolean>;
   scene_resource_axes_visibility?: Record<string, boolean>;
   object_axes_gizmo_size_m?: number;
+  /** Execution groups the Motion panel does not show (absent: default). */
+  hidden_execution_groups?: string[];
 }
 
 export interface ProgramValueSource {

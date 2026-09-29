@@ -71,3 +71,22 @@ describe('viewer presentation draft reducer', () => {
     });
   });
 });
+
+describe('Program viewer settings round trip', () => {
+  it('keeps the hidden execution groups when other viewer settings change', () => {
+    const draft = viewerPresentationDraftFromProgram({
+      frame_gizmo_size_m: 0.1,
+      hidden_execution_groups: ['all', 'robot_b'],
+    });
+    expect(programViewerMetadata({ ...draft, frameGizmoSizeM: 0.2 })).toMatchObject({
+      frame_gizmo_size_m: 0.2,
+      hidden_execution_groups: ['all', 'robot_b'],
+    });
+    // No choice stays no choice (the default rule), not an empty list.
+    expect(programViewerMetadata(viewerPresentationDraftFromProgram({})))
+      .not.toHaveProperty('hidden_execution_groups');
+    // Written canonical: sorted and unique, as the Program requires.
+    expect(programViewerMetadata({ ...draft, hiddenExecutionGroups: ['robot_b', 'all', 'robot_b'] })
+      .hidden_execution_groups).toEqual(['all', 'robot_b']);
+  });
+});
