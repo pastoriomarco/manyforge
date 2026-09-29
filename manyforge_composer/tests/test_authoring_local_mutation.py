@@ -734,6 +734,51 @@ def test_external_submission_contains_unclassified_owner_response(tmp_path) -> N
     assert headless.settlements == []
 
 
+@pytest.mark.parametrize("operation_kind", ["apply_program", "revert_program", "discard_draft"])
+def test_accepted_apply_keeps_overlapping_authoring_at_the_owner_boundary(
+    tmp_path, operation_kind
+) -> None:
+    workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+
+    def accept(_claim):
+        # Manager adopts the parent claim before acknowledging acceptance.
+        # Composer must neither release it nor invent an independent lock.
+        headless.allowed = False
+        headless.acquire_error = HeadlessClientError(
+            "authoring_not_ready", "Manager owns the admission claim", status_code=409
+        )
+        return {"status": "accepted", "apply_id": "apply.1", "apply_generation": 1}
+
+    coordinator.execute_external_submission(
+        _envelope(), operation_kind="apply_program", draft_id=program.draft_id,
+        draft_revision=program.revision, payload={},
+        validate_under_claim=lambda _claim: None, submit=accept,
+    )
+    assert coordinator.local_claim_pending is False
+    before = workspace.identity()
+    with pytest.raises(HTTPException) as raised:
+        if operation_kind == "discard_draft":
+            coordinator.execute_local_mutation(
+                replace(_envelope(), request_id="overlapping-discard"),
+                operation_kind=operation_kind, draft_id=program.draft_id,
+                draft_revision=program.revision, payload={}, workspace=workspace,
+                install=lambda: pytest.fail("Discard must not install while Apply owns admission"),
+            )
+        else:
+            coordinator.execute_external_submission(
+                replace(_envelope(), request_id="overlapping-activation"),
+                operation_kind=operation_kind, draft_id=program.draft_id,
+                draft_revision=program.revision, payload={},
+                validate_under_claim=lambda _claim: pytest.fail("Refused before validation"),
+                submit=lambda _claim: pytest.fail("Must not submit another activation"),
+            )
+    assert raised.value.detail["code"] == "authoring_not_ready"
+    assert workspace.identity() == before
+    assert len(headless.claims) == 1
+    assert headless.settlements == []
+    assert coordinator.mutation_ready is True
+
+
 def test_authoritative_acquire_rejection_does_not_contain(tmp_path) -> None:
     _workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
     headless.acquire_error = HeadlessClientError(

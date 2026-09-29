@@ -56,12 +56,8 @@
   text-align: left;
 }
 
-.catalog-entry-list button:hover,
 .catalog-entry-list button.selected {
   background: var(--mf-bg-neutral-15);
-}
-
-.catalog-entry-list button.selected {
   box-shadow: inset 0.2rem 0 var(--mf-shadow-accent-58);
 }
 
@@ -153,7 +149,6 @@
   text-align: left;
 }
 
-.artifact-list button:hover,
 .artifact-list button.selected {
   background: var(--mf-bg-neutral-15);
 }

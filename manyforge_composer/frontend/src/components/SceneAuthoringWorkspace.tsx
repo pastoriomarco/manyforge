@@ -427,8 +427,8 @@ function SceneHierarchy({
                   type="button"
                   disabled={selectionLocked && selectedKey !== `owner_object:${object.scene_resource_id}`}
                   className={selectedKey === `owner_object:${object.scene_resource_id}`
-                    ? 'selected'
-                    : undefined}
+                    ? 'dpick selected'
+                    : 'dpick'}
                   onClick={() => onSelect({
                     kind: 'owner_object',
                     id: object.scene_resource_id,
@@ -480,8 +480,8 @@ function SceneHierarchy({
                 type="button"
                 disabled={selectionLocked && selectedKey !== `program_resource:${resource.scene_resource_id}`}
                 className={selectedKey === `program_resource:${resource.scene_resource_id}`
-                  ? 'selected'
-                  : undefined}
+                  ? 'dpick selected'
+                  : 'dpick'}
                 onClick={() => onSelect({
                   kind: 'program_resource',
                   id: resource.scene_resource_id,
@@ -537,7 +537,7 @@ function SceneHierarchy({
               type="button"
               key={link.name}
               disabled={selectionLocked && selectedKey !== `structure:link:${link.name}`}
-              className={selectedKey === `structure:link:${link.name}` ? 'selected' : undefined}
+              className={selectedKey === `structure:link:${link.name}` ? 'dpick selected' : 'dpick'}
               onClick={() => onSelect({
                 kind: 'structure',
                 id: `link:${link.name}`,
@@ -558,7 +558,7 @@ function SceneHierarchy({
               key={frame.key}
               disabled={frame.linkName === null
                 || (selectionLocked && selectedKey !== `structure:frame:${frame.key}`)}
-              className={selectedKey === `structure:frame:${frame.key}` ? 'selected' : undefined}
+              className={selectedKey === `structure:frame:${frame.key}` ? 'dpick selected' : 'dpick'}
               title={frame.linkName === null
                 ? 'This frame has no retained source link to select in the viewport.'
                 : `Select frame on ${frame.linkName}`}

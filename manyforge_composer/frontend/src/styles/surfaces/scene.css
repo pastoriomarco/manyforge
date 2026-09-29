@@ -83,7 +83,6 @@
   opacity: 0.55;
 }
 
-.scene-hierarchy-items button:hover,
 .scene-hierarchy-items button.selected {
   background: var(--mf-bg-neutral-15);
 }

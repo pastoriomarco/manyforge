@@ -81,6 +81,9 @@
    .dcard-meta a count or state at the right of a card's title bar.
    .dgrid      compact fields side by side (x, y, z): labels above.
    .dcode      preformatted data inside a card.
+   .dpick      a clickable list row: a faint tint on hover or keyboard focus,
+               the selected tint when .selected / .active, a little lighter
+               when both.
    ------------------------------------------------------------------ */
 
 .dpanel {
@@ -437,4 +440,24 @@ details.dcard[open] > summary:first-child::before {
 .dchips > * {
   flex: 1 1 auto;
   text-align: center;
+}
+
+/* Clickable list rows. The hover tint is lighter than the selected one, so
+   pointing at a row never looks like selecting it. */
+.dpick {
+  background: transparent;
+  transition: background-color 120ms ease;
+}
+
+.dpick:is(:hover, :focus-visible):not(:disabled) {
+  border-color: transparent;
+  background: var(--mf-bg-neutral-12);
+}
+
+.dpick:is(.selected, .active) {
+  background: var(--mf-bg-neutral-15);
+}
+
+.dpick:is(.selected, .active):is(:hover, :focus-visible):not(:disabled) {
+  background: var(--mf-bg-neutral-17);
 }

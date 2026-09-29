@@ -1835,7 +1835,7 @@ function parseManagerActiveProjection(
   };
 }
 
-function parseManagerApplyAvailability(
+export function parseManagerApplyAvailability(
   value: unknown,
   path: string,
 ): ManagerApplyAvailability {

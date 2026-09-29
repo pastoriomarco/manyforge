@@ -63,7 +63,7 @@ export function ProgramDeclarationsNavigator({
           <button
             key={parameter.parameter_id}
             type="button"
-            className={selectedClass(selected, 'parameter', parameter.parameter_id)}
+            className={`dpick${selectedClass(selected, 'parameter', parameter.parameter_id)}`}
             onClick={() => onSelect({ kind: 'parameter', id: parameter.parameter_id })}
           >
             <span>
@@ -96,7 +96,7 @@ export function ProgramDeclarationsNavigator({
           <button
             key={namespace.namespace_id}
             type="button"
-            className={selectedClass(selected, 'namespace', namespace.namespace_id)}
+            className={`dpick${selectedClass(selected, 'namespace', namespace.namespace_id)}`}
             onClick={() => onSelect({ kind: 'namespace', id: namespace.namespace_id })}
           >
             <span><strong>{namespace.namespace_id}</strong><small>namespace</small></span>
@@ -116,7 +116,7 @@ export function ProgramDeclarationsNavigator({
           <button
             key={key.key}
             type="button"
-            className={selectedClass(selected, 'key', key.key)}
+            className={`dpick${selectedClass(selected, 'key', key.key)}`}
             onClick={() => onSelect({ kind: 'key', id: key.key })}
           >
             <span><strong>{key.key}</strong><small>{key.type}</small></span>

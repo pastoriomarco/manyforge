@@ -188,7 +188,7 @@ export function CatalogPanel({ catalog, onRetry }: CatalogPanelProps) {
                     key={entry.id}
                     type="button"
                     role="listitem"
-                    className={selected?.id === entry.id ? 'selected' : ''}
+                    className={`dpick${selected?.id === entry.id ? ' selected' : ''}`}
                     onClick={() => setSelectedId(entry.id)}
                   >
                     <span>{entry.name}</span>

@@ -374,6 +374,88 @@
   margin: 0.5rem 0 0;
 }
 
+/* One target's limits: a sub-card of label | field rows (a third for the
+   label, two thirds for the field), help under its field, hairlines only
+   between groups. */
+.deployment-target-limit {
+  display: grid;
+  gap: 0;
+  padding: 0 0.65rem 0.2rem;
+  border-radius: var(--mf-radius-md);
+  background: var(--mf-bg-neutral-08);
+}
+
+.deployment-target-limit > header {
+  margin: 0 -0.65rem;
+  padding: 0.45rem 0.65rem;
+  border-bottom: 1px solid var(--mf-border-neutral-19);
+  background: var(--mf-bg-neutral-11);
+}
+
+.deployment-target-limit .deployment-focused-field {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  gap: 0.6rem;
+  padding: 0.45rem 0;
+  font-size: var(--mf-font-size-072);
+}
+
+.deployment-target-limit .deployment-focused-form-grid {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
+.deployment-target-limit .deployment-focused-form-grid > * + * {
+  border-top: 1px solid var(--mf-border-neutral-19);
+}
+
+.deployment-target-limit :is(.field-help, .deployment-applied-comparison, .muted) {
+  margin: 0 0 0.45rem;
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-068);
+  line-height: 1.45;
+}
+
+.deployment-target-limit .deployment-joint-caps {
+  margin: 0;
+  border-top: 1px solid var(--mf-border-neutral-19);
+}
+
+.deployment-target-limit .deployment-joint-caps details {
+  border-top: 1px solid var(--mf-border-neutral-19);
+}
+
+/* Per-joint rows: plain rows under hairlines, not boxed tiles. */
+.deployment-target-limit .deployment-joint-cap-list {
+  gap: 0;
+  margin: 0;
+}
+
+.deployment-target-limit .deployment-joint-cap {
+  gap: 0.1rem;
+  padding: 0.4rem 0;
+  border: 0;
+  border-top: 1px solid var(--mf-border-neutral-19);
+  border-radius: 0;
+  background: transparent;
+}
+
+.deployment-target-limit .deployment-joint-cap .deployment-focused-field {
+  padding: 0.15rem 0;
+}
+
+.deployment-target-limit .deployment-joint-cap > small,
+.deployment-target-limit .deployment-joint-effective {
+  color: var(--mf-text-neutral-55);
+  font-size: var(--mf-font-size-062);
+}
+
+.deployment-target-limit :is(.deployment-joint-caps > summary, .deployment-joint-caps details > summary) {
+  padding: 0.5rem 0;
+  color: var(--mf-text-neutral-80);
+  font-size: var(--mf-font-size-072);
+  cursor: pointer;
+}
+
 .deployment-target-limit > header,
 .deployment-runtime-unit > header {
   display: flex;

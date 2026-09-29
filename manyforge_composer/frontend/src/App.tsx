@@ -466,7 +466,8 @@ export default function App() {
   ), [maintenance, trackedApply]);
   const activation = useManagerApplyStatus(
     observedApply,
-    headlessSnapshot?.snapshotSequence ?? null,
+    headlessSnapshot?.runtime.sections.manager ?? null,
+    headlessState.transportStatus,
   );
   const activationStatus = activation.status !== null
     && sameManagerApply(activation.status, observedApply)
@@ -1005,6 +1006,7 @@ export default function App() {
                 controller={deploymentController}
                 enabled={headlessEnabled}
                 snapshot={headlessSnapshot}
+                transportStatus={headlessState.transportStatus}
                 sourceModel={sourceModel}
                 motionDescriptors={robotControl.motionTargets.map(
                   (target) => target.targetDescriptor,

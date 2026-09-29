@@ -44,7 +44,7 @@ export function NodePaletteItem({
   const titleId = `node-info-${entry.id.replaceAll(/[^A-Za-z0-9_-]/g, '-')}`;
 
   return (
-    <div className="node-palette-row">
+    <div className="node-palette-row dpick">
       <button
         type="button"
         draggable={!disabled && allowDrag}

@@ -1236,18 +1236,12 @@
   margin: 0 0.3rem;
   padding: 0.3rem 0.35rem;
   border: 0;
-  border-radius: 0;
+  border-radius: var(--mf-radius-sm);
   text-align: left;
-  background: transparent;
 }
 
 .program-declaration-navigator .dcard > button:not(:first-child) + button {
   border-top: 1px solid var(--mf-border-neutral-19);
-}
-
-.program-declaration-navigator .dcard > button.active {
-  border-radius: var(--mf-radius-sm);
-  background: var(--mf-bg-neutral-15);
 }
 
 .program-declaration-navigator .dcard > header > h4 {

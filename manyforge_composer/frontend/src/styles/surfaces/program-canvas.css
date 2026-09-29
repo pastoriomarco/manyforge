@@ -705,10 +705,6 @@
   border-radius: var(--mf-radius-md-sm);
 }
 
-.node-palette-row:hover {
-  background: var(--mf-bg-neutral-15);
-}
-
 .node-palette-item {
   display: flex;
   width: 100%;

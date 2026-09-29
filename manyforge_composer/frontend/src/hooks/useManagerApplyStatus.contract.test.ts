@@ -10,7 +10,8 @@ describe('useManagerApplyStatus observation contract', () => {
     );
 
     expect(source.match(/api\.manager\.applyStatus\(/g)).toHaveLength(1);
-    expect(source).toContain('snapshotSequence');
+    expect(source).toContain('parseManagerApplyAvailability');
+    expect(source).not.toContain('snapshotSequence');
     expect(source).toContain('controller.abort()');
     expect(source).not.toContain('setInterval');
     expect(source).not.toContain('setTimeout');

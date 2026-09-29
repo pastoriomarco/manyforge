@@ -188,7 +188,7 @@ export function ArtifactBrowser({
               key={entry.path}
               type="button"
               role="listitem"
-              className={selected?.path === entry.path ? 'selected' : ''}
+              className={`dpick${selected?.path === entry.path ? ' selected' : ''}`}
               onClick={() => chooseEntry(entry)}
             >
               <span className="entry-kind" aria-hidden="true">

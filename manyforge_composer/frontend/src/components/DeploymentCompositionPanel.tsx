@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import { useManagerApplyStatus } from '../hooks/useManagerApplyStatus';
+import type { ControlTransportStatus } from '../hooks/useHeadlessState';
 import type {
   ManagerDiffProjection,
   ManagerGraphProjection,
@@ -45,6 +46,7 @@ interface DeploymentCompositionPanelProps {
   controller: DeploymentWorkspaceController;
   enabled: boolean;
   snapshot: ComposerHeadlessState | null;
+  transportStatus: ControlTransportStatus;
   componentOverview: ComponentOverviewInput;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   motionDescriptors: ManualControlMotionDescriptor[];
@@ -88,6 +90,7 @@ export function DeploymentCompositionPanel({
   controller: deploymentController,
   enabled,
   snapshot,
+  transportStatus,
   componentOverview,
   sourceModel,
   motionDescriptors,
@@ -110,7 +113,8 @@ export function DeploymentCompositionPanel({
     : selectManagerApplyInventoryIdentity(readModel.status.status.apply.records);
   const inventoryStatus = useManagerApplyStatus(
     maintenance === null ? inventoryApply : null,
-    snapshot?.snapshotSequence ?? null,
+    snapshot?.runtime.sections.manager ?? null,
+    transportStatus,
   );
   const maintenanceStatus = maintenance === null ? inventoryStatus : advertisedStatus;
   const [reloadToken, setReloadToken] = useState(0);
