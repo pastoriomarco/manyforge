@@ -12,6 +12,7 @@ import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type {
   ScenarioDocumentEntry,
   ScenarioDocumentIndexResponse,
+  ManagerActiveProjection,
 } from '../types/api';
 import { OverlayPanel } from './OverlayPanel';
 
@@ -38,12 +39,14 @@ function ScenarioIconButton({
   disabled,
   onClick,
   children,
+  text,
 }: {
   label: string;
   reason?: string | null;
   disabled: boolean;
   onClick: (event: MouseEvent<HTMLButtonElement>) => void;
   children: ReactNode;
+  text?: string;
 }) {
   return (
     <button
@@ -55,6 +58,7 @@ function ScenarioIconButton({
       onClick={onClick}
     >
       <svg viewBox="0 0 16 16" aria-hidden="true">{children}</svg>
+      {text}
     </button>
   );
 }
@@ -74,7 +78,7 @@ export function ScenarioDocumentCommands({
     state,
     mutationAvailable,
     mutationUnavailableReason,
-    newDraft,
+    newScenarioDocument,
     saveScenarioDocument,
     loadScenarioDocument,
     exportScenarioDocument,
@@ -94,10 +98,21 @@ export function ScenarioDocumentCommands({
   const [scenarioId, setScenarioId] = useState('scenario');
   const [scenarioName, setScenarioName] = useState('Scenario');
   const [scenarioDescription, setScenarioDescription] = useState('');
+  const [deploymentChoice, setDeploymentChoice] = useState<'keep_applied' | 'empty'>('keep_applied');
+  const [newApplied, setNewApplied] = useState<ManagerActiveProjection | null>(null);
+  const [newError, setNewError] = useState<string | null>(null);
+  const [newWorkspaceKey, setNewWorkspaceKey] = useState<string | null>(null);
   const [exportDestinationPath, setExportDestinationPath] = useState('');
   const scenarioDirectoryRef = useRef('');
   const returnFocus = useRef<HTMLElement | null>(null);
   const workspace = state.workspace;
+  const workspaceKey = workspace === null ? null : JSON.stringify(workspace.authoringWorkspace);
+  const newConfirmationStale = action === 'new' && newWorkspaceKey !== workspaceKey;
+  const managedComponents = newApplied?.cellGraph.controllable_components;
+  const managedComponentNames = Array.isArray(managedComponents)
+    ? managedComponents.flatMap((row) => row !== null && typeof row === 'object'
+      && !Array.isArray(row) && typeof row.controllable_component_id === 'string'
+      ? [row.controllable_component_id] : []) : [];
   const authoring = workspace?.draft.authoring ?? null;
   const busy = state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
@@ -160,6 +175,22 @@ export function ScenarioDocumentCommands({
     }
   }, [action, refreshScenarioIndex]);
 
+  useEffect(() => {
+    if (action !== 'new') return;
+    const abort = new AbortController();
+    setNewApplied(null);
+    setNewError(null);
+    void api.manager.status(abort.signal).then((value) => {
+      if (abort.signal.aborted) return;
+      if (!value.source.available || value.source.freshness !== 'fresh' || !value.status.managerReady) {
+        setNewError('Current Applied Deployment cannot be verified.');
+      } else setNewApplied(value.status.active);
+    }, (error: unknown) => {
+      if (!abort.signal.aborted) setNewError(error instanceof Error ? error.message : 'Applied Deployment is unavailable.');
+    });
+    return () => abort.abort();
+  }, [action]);
+
   const closeAction = useCallback(() => {
     setAction(null);
     setConfirmDiscard(false);
@@ -172,6 +203,12 @@ export function ScenarioDocumentCommands({
     returnFocus.current = event.currentTarget;
     setConfirmDiscard(false);
     setConfirmOverwrite(false);
+    if (next === 'new') {
+      setNewWorkspaceKey(workspaceKey);
+      setScenarioName('');
+      setSavePath('');
+      setDeploymentChoice('keep_applied');
+    }
     if (next === 'save_as') {
       const id = scenarioDocument.id ?? authoring?.program_id ?? 'scenario';
       setSaveAsMode('project');
@@ -198,6 +235,7 @@ export function ScenarioDocumentCommands({
       <div className="scenario-commands" role="group" aria-label="Scenario">
         <ScenarioIconButton
           label="New Scenario"
+          text="New"
           reason={blockReason}
           disabled={blocked}
           onClick={(event) => beginAction('new', event)}
@@ -252,15 +290,39 @@ export function ScenarioDocumentCommands({
       >
         {action === 'new' && (
           <div className="dialog-copy compact-confirmation">
-            <p>Start an empty Program Draft. The Deployment and the running configuration do not change until you Apply.</p>
-            {replaceNeedsConfirmation && (
-              <label className="confirmation-check">
-                <input type="checkbox" checked={confirmDiscard} onChange={(event) => setConfirmDiscard(event.target.checked)} />
-                Discard the current unsaved or unapplied Draft changes
-              </label>
-            )}
-            <button type="button" className="primary-action" disabled={blocked || (replaceNeedsConfirmation && !confirmDiscard)} onClick={() => complete(() => newDraft(confirmDiscard))}>
-              Create New Draft
+            <p>Close the current Scenario and create a saved Scenario with an empty Program and Scene. Saved source files are not changed.</p>
+            {replaceNeedsConfirmation && <p className="inline-message severity-warning">Current unsaved and unapplied Draft changes will be discarded.</p>}
+            <label className="document-save-as-path">Scenario name
+              <input value={scenarioName} onChange={(event) => setScenarioName(event.target.value)} />
+            </label>
+            <label className="document-save-as-path">New project folder
+              <input value={savePath} onChange={(event) => setSavePath(event.target.value)} />
+            </label>
+            <label className="document-save-as-path">Deployment
+              <select value={deploymentChoice} onChange={(event) => setDeploymentChoice(event.target.value as 'keep_applied' | 'empty')}>
+                <option value="keep_applied">Keep Applied Deployment</option>
+                <option value="empty">Empty Deployment</option>
+              </select>
+            </label>
+            <p>{deploymentChoice === 'keep_applied'
+              ? 'Keep the currently Applied components, not edited Deployment Draft changes.'
+              : 'Stop and unload all managed controllable components. This does not power off hardware.'}</p>
+            {newApplied !== null && <p>Components to {deploymentChoice === 'keep_applied' ? 'keep' : 'unload'}: {managedComponentNames.join(', ') || 'none'}.</p>}
+            <p>Clear the old Scenario’s objects and attachments through the Scene owner. Unsafe attachment removal is refused.</p>
+            {newConfirmationStale && <p role="status">The workspace changed. Close and reopen New to review the current state.</p>}
+            {(newError ?? blockReason) && <p role="status">{newError ?? blockReason}</p>}
+            <button type="button" className="primary-action"
+              disabled={blocked || newConfirmationStale || newApplied === null || !scenarioName.trim() || !savePath.trim()}
+              onClick={() => {
+                if (blocked || newConfirmationStale || newApplied === null) return;
+                complete(() => newScenarioDocument({
+                  path: savePath.trim(), name: scenarioName.trim(), deploymentChoice,
+                  expectedRetainedBundleId: newApplied.retainedBundleId,
+                  expectedGraphRevision: newApplied.graphRevision,
+                  confirmDiscard: true,
+                }));
+              }}>
+              {deploymentChoice === 'keep_applied' ? 'Create and activate' : 'Create and unload components'}
             </button>
           </div>
         )}

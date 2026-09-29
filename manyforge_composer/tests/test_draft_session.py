@@ -11,7 +11,7 @@ import pytest
 from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
-from manyforge_composer.backend.authoring_forest import empty_authoring
+from manyforge_composer.backend.authoring_forest import empty_authoring, derive_candidate
 from manyforge_composer.backend.draft_session import (
     ComposerDraftSession,
     DraftSessionError,
@@ -28,6 +28,32 @@ _PICK_PROGRAM_PATH = (
 _LITE6_PROGRAM_PATH = (
     _REPOSITORY_ROOT / "examples" / "lite6_lite_gripper_pick_and_place.program.yaml"
 )
+
+
+def test_saved_empty_authoring_has_independent_saved_and_applied_baselines(tmp_path: Path) -> None:
+    catalog = build_node_environment().catalog
+    session = ComposerDraftSession()
+    empty = empty_authoring(catalog)
+    saved = session.retained_state()
+    saved.update(authoring=empty, program=None, diagnostics=derive_candidate(empty, catalog)[1], draft_revision=1,
+                 saved_path=str(tmp_path / "program.yaml"), saved_program_revision=None,
+                 saved_document=deepcopy(empty))
+    session.install_prepared_replacement(session.prepare_load_replacement(saved, catalog))
+    workspace = session.workspace_snapshot(applied_authoring=empty)
+    assert workspace["saved"]["available"] and workspace["saved"]["matchesDraft"]
+    assert workspace["applied"]["available"] and workspace["applied"]["matchesDraft"]
+    assert not workspace["hasUnsavedChanges"] and not workspace["hasUnappliedChanges"]
+    assert not workspace["draft"]["candidateAvailable"]
+    edited = session.retained_state()
+    edited["authoring"]["name"] = "Edited, not saved"
+    edited["draft_revision"] += 1
+    session.install_prepared_replacement(session.prepare_load_replacement(edited, catalog))
+    workspace = session.workspace_snapshot(applied_authoring=empty)
+    assert workspace["hasUnsavedChanges"] and workspace["hasUnappliedChanges"]
+    session.install_prepared_replacement(session.prepare_discard_replacement(empty, catalog))
+    workspace = session.workspace_snapshot(applied_authoring=empty)
+    assert not workspace["hasUnsavedChanges"] and not workspace["hasUnappliedChanges"]
+    assert workspace["saved"]["path"] == str(tmp_path / "program.yaml")
 
 
 def _program(*, metadata: dict | None = None) -> Program:

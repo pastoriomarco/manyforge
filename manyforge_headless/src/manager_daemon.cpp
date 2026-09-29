@@ -647,8 +647,9 @@ RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
 component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
     const CanonicalValue &value) {
   RequireExactObjectSize(value, 15U, "Apply prepared activation");
-  Require(RequiredString(value, "schema_version") ==
-              "manyforge.prepared_activation_input.v3",
+  const auto schema = RequiredString(value, "schema_version");
+  Require(schema == "manyforge.prepared_activation_input.v3" ||
+              schema == deployment::kPreparedActivationInputSchemaVersion,
           "Apply prepared activation schema is unsupported");
   const auto captured_input_digest =
       RequiredString(value, "captured_input_digest");
@@ -667,7 +668,18 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
   const auto &program_outcome = RequiredMember(value, "program_outcome");
   std::optional<core::ProgramBindingId> program_binding_id;
   const auto outcome_kind = RequiredString(program_outcome, "kind");
-  if (outcome_kind == "bound") {
+  const bool no_program = outcome_kind == "no_program";
+  if (no_program) {
+    Require(schema == deployment::kPreparedActivationInputSchemaVersion,
+            "no_program requires prepared activation v4");
+    RequireExactObjectSize(program_outcome, 1U, "Apply Program outcome");
+    Require(RequiredMember(value, "program_id").is_null() &&
+                RequiredMember(value, "program_revision").is_null() &&
+                RequiredString(value, "assistant_mode") == "optional" &&
+                RequiredMember(value, "typed_parameter_overrides").is_object() &&
+                RequiredMember(value, "typed_parameter_overrides").as_object().empty(),
+            "no_program must have no Program identities or overrides");
+  } else if (outcome_kind == "bound") {
     RequireExactObjectSize(program_outcome, 2U, "Apply Program outcome");
     const auto binding_id = RequiredString(program_outcome, "program_binding_id");
     Require(core::IsExactLowercaseSha256Digest(binding_id),
@@ -697,7 +709,7 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
             "Apply Program outcome differs from its prepared activation");
   }
   for (const auto field : {"source_document_digest", "retained_bundle_id",
-                           "graph_revision", "program_revision",
+                           "graph_revision",
                            "node_environment_digest"}) {
     Require(core::IsExactLowercaseSha256Digest(RequiredString(value, field)),
             "Apply prepared activation digest is not canonical");
@@ -710,7 +722,11 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
           "Apply prepared activation typed_parameter_overrides must be an "
           "object");
   static_cast<void>(RequiredString(value, "scenario_id"));
-  static_cast<void>(RequiredString(value, "program_id"));
+  if (!no_program) {
+    static_cast<void>(RequiredString(value, "program_id"));
+    Require(core::IsExactLowercaseSha256Digest(RequiredString(value, "program_revision")),
+            "Apply Program revision is not canonical");
+  }
   return {
       core::ContentDigest(captured_input_digest),
       core::DeploymentArtifactId(
@@ -2013,15 +2029,19 @@ CanonicalValue DeploymentApplyImpact(
       {"detached_components", CanonicalValue(std::move(detached))},
       {"program",
        CanonicalValue(CanonicalValue::Object{
-           {"executable", CanonicalValue(!outcome.has_value())},
+           {"executable", CanonicalValue(prepared->program_binding_id().has_value())},
            {"non_executable",
             outcome.has_value()
                 ? content_identity::parse_canonical_json(
                       deployment::EncodeProgramNonExecutableOutcome(*outcome))
                 : CanonicalValue(nullptr)},
-           {"program_id", CanonicalValue(prepared->program_id().value())},
+           {"program_id", prepared->program_id().has_value()
+                              ? CanonicalValue(prepared->program_id()->value())
+                              : CanonicalValue(nullptr)},
            {"program_revision",
-            CanonicalValue(prepared->program_revision().value())},
+            prepared->program_revision().has_value()
+                ? CanonicalValue(prepared->program_revision()->value())
+                : CanonicalValue(nullptr)},
        })},
       {"shared_scene_projection_changed",
        CanonicalValue(delta.shared_scene_projection_changed)},
@@ -2330,6 +2350,15 @@ public:
           "Apply initial Scene prepared identity differs from candidate");
     }
     const auto &maps = bundle.value().compiled_products.symbol_role_maps;
+    if (outcome != nullptr && RequiredString(*outcome, "kind") == "no_program") {
+      if (!activation_root_.has_value() ||
+          !PreparedActivationIsStoredExactly(*activation_root_, activation)) {
+        throw std::invalid_argument("Apply empty Scene requires exact no_program evidence");
+      }
+      // Empty initial intents still go through the normal Scene staging and
+      // attachment disposition path; they are not a direct Scene mutation.
+      return {};
+    }
     const bool empty_non_executable_candidate =
         !activation.program_binding_id.has_value() && maps.empty() &&
         bundle.value().cell_graph.controllable_components.empty();

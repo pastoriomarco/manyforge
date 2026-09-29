@@ -797,6 +797,61 @@ TEST(HeadlessApiCore,
   }
 }
 
+TEST(HeadlessApiCore, NoProgramIsPublishedNormallyButHasNoExecutableSelection) {
+  TemporaryDirectory directory;
+  PublishHealthySources(directory, "open");
+  auto payload = ManagerPayload();
+  auto active = Member(payload, "active");
+  active = WithField(active, "publication", CanonicalValue(CanonicalValue::Object{
+      {"transaction", CanonicalValue(CanonicalValue::Object{
+          {"kind", CanonicalValue("named_apply")},
+          {"apply_id", CanonicalValue("apply.new")},
+          {"apply_generation", CanonicalValue(1.0)},
+      })},
+  }));
+  const CanonicalValue prepared(CanonicalValue::Object{
+      {"schema_version", CanonicalValue("manyforge.prepared_activation_input.v4")},
+      {"prepared_activation_id", CanonicalValue(Digest('a'))},
+      {"retained_bundle_id", Member(active, "retained_bundle_id")},
+      {"graph_revision", Member(active, "graph_revision")},
+      {"scenario_id", CanonicalValue("new_scenario")},
+      {"source_document_digest", CanonicalValue(Digest('b'))},
+      {"deployment_artifact_id", CanonicalValue("new_deployment")},
+      {"deployment_revision", CanonicalValue(Digest('c'))},
+      {"program_id", CanonicalValue(nullptr)},
+      {"program_revision", CanonicalValue(nullptr)},
+      {"program_outcome", CanonicalValue(CanonicalValue::Object{
+          {"kind", CanonicalValue("no_program")},
+      })},
+  });
+  payload = WithField(payload, "active", active);
+  payload = WithField(payload, "apply", CanonicalValue(CanonicalValue::Object{
+      {"records", CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+          {"apply_id", CanonicalValue("apply.new")},
+          {"apply_generation", CanonicalValue(1.0)},
+          {"terminal_state", CanonicalValue("succeeded")},
+          {"incomplete", CanonicalValue(false)},
+          {"intent_digest", CanonicalValue(Digest('d'))},
+          {"prepared_activation", prepared},
+      })})},
+  }));
+  AtomicSourceSnapshotChannel manager(directory.publications(), "manager-source.json");
+  static_cast<void>(manager.Publish("component_manager", "component-manager." + std::string(kCellId),
+                                    "manager.epoch.1", 2, payload));
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const auto status = core.AppliedProgramStatus();
+  EXPECT_TRUE(Member(status, "program_id").is_null());
+  EXPECT_TRUE(Member(status, "program_binding_id").is_null());
+  EXPECT_TRUE(Member(status, "non_executable").is_null());
+  EXPECT_FALSE(std::get<bool>(Member(status, "executable").storage()));
+  try {
+    static_cast<void>(core.AppliedProgramSelection());
+    FAIL() << "no_program returned an executable selection";
+  } catch (const OperatorAlarmError &error) {
+    EXPECT_EQ(error.code(), "program_not_selected");
+  }
+}
+
 TEST(HeadlessApiCore,
      IdleOperationSnapshotReconcilesOnlyImplementedAlarmDomains) {
   TemporaryDirectory directory;

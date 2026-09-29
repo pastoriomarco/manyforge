@@ -915,6 +915,53 @@ TEST(ProgramBindingCompilerTest,
                manyforge::deployment::PreparedActivationInputError);
 }
 
+TEST(ProgramBindingCompilerTest, NoProgramReadbackProvesAbsenceWithoutInventingABinding) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path());
+  const auto bound = prepare(root.path(), context, kLite6ArmTargetId);
+  auto payload = *bound.normalized_root().find_object_member("activation_payload");
+  payload = with_member(payload, "program", CanonicalValue(nullptr));
+  payload = with_member(payload, "program_binding", CanonicalValue(nullptr));
+  payload = with_member(payload, "program_role_assignment", CanonicalValue(CanonicalValue::Object{
+      {"component_roles", CanonicalValue(CanonicalValue::Array{})},
+      {"target_roles", CanonicalValue(CanonicalValue::Array{})},
+  }));
+  auto value = with_member(bound.normalized_root(), "activation_payload", payload);
+  value = with_member(value, "program_id", CanonicalValue(nullptr));
+  value = with_member(value, "program_revision", CanonicalValue(nullptr));
+  value = with_member(value, "program_outcome", CanonicalValue(CanonicalValue::Object{
+      {"kind", CanonicalValue("no_program")},
+  }));
+  const auto prepared = manyforge::deployment::parse_prepared_activation_input(reidentify(value));
+  EXPECT_EQ(prepared.closure().program, nullptr);
+  EXPECT_EQ(prepared.closure().program_binding, nullptr);
+  EXPECT_FALSE(prepared.program_id().has_value());
+  EXPECT_FALSE(prepared.program_revision().has_value());
+  EXPECT_FALSE(prepared.program_outcome().has_value());
+  EXPECT_NO_THROW(manyforge::deployment::verify_prepared_program_outcome(prepared));
+  const manyforge::deployment::FilesystemPreparedActivationRepository repository(root.path());
+  ASSERT_TRUE(repository.put_if_absent(prepared));
+  EXPECT_NE(repository.get_verified(prepared.prepared_activation_id()), nullptr);
+
+  // Rehash every forgery: rejection must follow semantic inconsistency,
+  // not merely a stale envelope digest.
+  for (const auto field : {"program", "program_binding", "program_role_assignment"}) {
+    const auto forged_payload = with_member(payload, field,
+        *bound.normalized_root().find_object_member("activation_payload")->find_object_member(field));
+    EXPECT_THROW(static_cast<void>(manyforge::deployment::parse_prepared_activation_input(
+        reidentify(with_member(value, "activation_payload", forged_payload)))),
+        manyforge::deployment::PreparedActivationInputError);
+  }
+  for (const auto field : {"program_id", "program_revision"}) {
+    EXPECT_THROW(static_cast<void>(manyforge::deployment::parse_prepared_activation_input(
+        reidentify(with_member(value, field, *bound.normalized_root().find_object_member(field))))),
+        manyforge::deployment::PreparedActivationInputError);
+  }
+  EXPECT_THROW(static_cast<void>(manyforge::deployment::parse_prepared_activation_input(
+      reidentify(with_member(value, "schema_version", CanonicalValue("manyforge.prepared_activation_input.v3"))))),
+      manyforge::deployment::PreparedActivationInputError);
+}
+
 TEST(ProgramBindingCompilerTest,
      ReadbackRejectsANonExecutableOutcomeForgedOverABindableProgram) {
   ScopedTrustedRoot root;

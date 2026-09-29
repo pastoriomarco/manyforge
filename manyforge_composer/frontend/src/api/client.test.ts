@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiError,
   authoringRefusalMessage,
+  failedAuthoringRequest,
   HISTORIAN_PAGE_LIMIT,
   api,
   historianListPath,
@@ -38,6 +39,42 @@ it('reads the shared authoring workspace through its single endpoint', async () 
   );
   expect(fetchMock).toHaveBeenCalledTimes(1);
   expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/authoring/workspace');
+});
+
+it('retains the exact sent authoring envelope after a lost reply without retrying', async () => {
+  const lost = new Error('reply lost');
+  const fetcher = vi.fn().mockRejectedValue(lost);
+  vi.stubGlobal('fetch', fetcher);
+  const fence = localFence();
+  await expect(api.programWorkspace.discard(fence)).rejects.toBe(lost);
+  expect(failedAuthoringRequest(lost)).toEqual({
+    requestOwnerEpoch: fence.requestOwnerEpoch, requestId: fence.requestId,
+    expectedAdmissionGeneration: fence.expectedAdmissionGeneration,
+    path: '/api/program/discard',
+  });
+  expect(fetcher).toHaveBeenCalledTimes(1);
+});
+
+it('reads only exact submission evidence and rejects mismatched or malformed records', async () => {
+  const identity = { requestOwnerEpoch: 'browser.1', requestId: 'request.1', expectedAdmissionGeneration: 7 };
+  const record = {
+    schema_version: 'manyforge.authoring_submission_outcome.v1',
+    request_owner_epoch: 'browser.1', request_id: 'request.1', expected_admission_generation: 7,
+    owner_epoch: 'composer.1', outcome: { kind: 'settled', operation_kind: 'save', apply: null },
+  };
+  const fetcher = vi.fn().mockResolvedValue(response(record));
+  vi.stubGlobal('fetch', fetcher);
+  await expect(api.authoringWorkspace.submissionOutcome(identity)).resolves.toEqual({ kind: 'settled', apply: null });
+  expect(fetcher.mock.calls[0][1].method).toBe('GET');
+  for (const patch of [{ request_id: 'other' }, { expected_admission_generation: 8 },
+    { outcome: { kind: 'settled', operation_kind: 'save', apply: {} } },
+    { outcome: { kind: 'manager_accepted', operation_kind: 'apply', apply: null } },
+    { unexpected: true }]) {
+    fetcher.mockResolvedValue(response({ ...record, ...patch }));
+    await expect(api.authoringWorkspace.submissionOutcome(identity)).rejects.toThrow();
+  }
+  fetcher.mockResolvedValue(response({ ...record, outcome: null }));
+  await expect(api.authoringWorkspace.submissionOutcome(identity)).resolves.toBeNull();
 });
 
 it('downloads filtered diagnostics directly without fetching or parsing into UI state', () => {

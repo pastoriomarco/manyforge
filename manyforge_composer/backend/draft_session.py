@@ -911,6 +911,12 @@ class ComposerDraftSession:
         saved_path = state["saved_path"]
         saved_revision = state["saved_program_revision"]
         saved_document = state["saved_document"]
+        saved_empty_authoring = (
+            isinstance(saved_document, dict)
+            and saved_document.get("forest") == []
+            and not saved_document.get("scene")
+            and saved_revision is None
+        )
         if (
             state["schema_version"] != _RETAINED_STATE_API_VERSION
             or type(draft_id) is not str
@@ -920,8 +926,8 @@ class ComposerDraftSession:
             or (authoring is None) != (revision == 0)
             or type(diagnostics) is not list
             or (saved_path is None)
-            != (saved_revision is None or saved_document is None)
-            or (saved_revision is None) != (saved_document is None)
+            != (saved_document is None)
+            or (not saved_empty_authoring and (saved_revision is None) != (saved_document is None))
         ):
             _error(
                 "composer_retained_draft_invalid",
@@ -959,18 +965,23 @@ class ComposerDraftSession:
         resolved_saved_path: str | None = None
         if saved_document is not None:
             try:
-                saved = Program.from_dict(
-                    deepcopy(saved_document),
-                    catalog,
-                    path="<composer-retained-saved-program>",
-                )
-            except ProgramValidationError as error:
+                if saved_empty_authoring:
+                    saved, _ = derive_candidate(deepcopy(saved_document), catalog)
+                    if saved is not None:
+                        raise ValueError("empty authoring produced a Program")
+                else:
+                    saved = Program.from_dict(
+                        deepcopy(saved_document),
+                        catalog,
+                        path="<composer-retained-saved-program>",
+                    )
+            except (ProgramValidationError, AuthoringForestError, ValueError) as error:
                 _error(
                     "composer_retained_draft_invalid",
                     f"retained Saved Program is invalid: {error}",
                     status_code=503,
                 )
-            if saved.program_revision != saved_revision or type(saved_path) is not str:
+            if (saved is not None and saved.program_revision != saved_revision) or type(saved_path) is not str:
                 _error(
                     "composer_retained_draft_invalid",
                     "retained Saved Program identity is inconsistent",
@@ -1005,6 +1016,7 @@ class ComposerDraftSession:
         *,
         applied_program_revision: str | None = None,
         applied_unavailable_reason: dict[str, Any] | None = None,
+        applied_authoring: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Project Draft/Saved plus one externally owned Applied identity."""
 
@@ -1012,6 +1024,7 @@ class ComposerDraftSession:
             return self._workspace_snapshot_locked(
                 applied_program_revision=applied_program_revision,
                 applied_unavailable_reason=applied_unavailable_reason,
+                applied_authoring=applied_authoring,
             )
 
     def validate(self, catalog: NodeCatalog) -> dict[str, Any]:
@@ -1066,6 +1079,8 @@ class ComposerDraftSession:
         }
 
     def _matches_saved_locked(self) -> bool:
+        if self._saved_path is not None and self._saved_program_revision is None:
+            return self._authoring == self._saved_document
         return (
             self._authoring is not None
             and self._program is not None
@@ -1078,6 +1093,7 @@ class ComposerDraftSession:
         *,
         applied_program_revision: str | None = None,
         applied_unavailable_reason: dict[str, Any] | None = None,
+        applied_authoring: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         program = self._program
         matches_saved = self._matches_saved_locked()
@@ -1099,12 +1115,14 @@ class ComposerDraftSession:
                 },
             }
         )
-        applied_available = applied_program_revision is not None
+        applied_available = applied_program_revision is not None or applied_authoring is not None
         matches_applied = (
             program is not None
             and applied_program_revision is not None
             and program.program_revision == applied_program_revision
         )
+        if applied_authoring is not None:
+            matches_applied = self._authoring == applied_authoring
         unavailable_reason = applied_unavailable_reason or {
             "code": "program_apply_unavailable",
             "message": (
@@ -1128,7 +1146,7 @@ class ComposerDraftSession:
             },
             "applicability": applicability,
             "saved": {
-                "available": self._saved_program_revision is not None,
+                "available": self._saved_path is not None,
                 "matchesDraft": matches_saved,
                 "path": self._saved_path,
                 "programRevision": self._saved_program_revision,
@@ -1358,15 +1376,23 @@ class ComposerDraftSession:
         )
 
     def prepare_discard_replacement(
-        self, applied: Program
+        self, applied: Program | dict[str, Any], catalog: NodeCatalog | None = None
     ) -> PreparedProgramReplacement:
         """Prepare one Discard-to-Applied replacement that preserves Saved."""
 
+        if isinstance(applied, dict):
+            if catalog is None or applied.get("forest") != [] or applied.get("scene"):
+                raise ValueError("Discard without a Program requires verified empty authoring")
+            program, diagnostics = derive_candidate(deepcopy(applied), catalog)
+            authoring = deepcopy(applied)
+        else:
+            program, diagnostics = applied, []
+            authoring = from_program(applied)
         return PreparedProgramReplacement(
             kind="discard",
-            authoring=from_program(applied),
-            program=applied,
-            diagnostics=(),
+            authoring=authoring,
+            program=program,
+            diagnostics=tuple(diagnostics),
             successor_draft_id=None,
             successor_revision=None,
             saved_path=None,

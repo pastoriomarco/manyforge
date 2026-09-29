@@ -150,6 +150,27 @@ def _planning_pose(z_m: float = 0.0) -> dict[str, object]:
     }
 
 
+def test_no_program_activation_requires_exact_absence() -> None:
+    value = {
+        **_prepared_activation(),
+        "schema_version": "manyforge.prepared_activation_input.v4",
+        "program_id": None,
+        "program_revision": None,
+        "program_outcome": {"kind": "no_program"},
+    }
+    assert ManagerApplyPreparedActivation.model_validate(value).program_id is None
+    for field, inconsistent in (
+        ("schema_version", "manyforge.prepared_activation_input.v3"),
+        ("program_id", "old.program"),
+        ("program_revision", "sha256:" + "4" * 64),
+        ("program_outcome", {"kind": "no_program", "program_binding_id": "sha256:" + "9" * 64}),
+        ("typed_parameter_overrides", {"speed": 0.1}),
+        ("assistant_mode", "required"),
+    ):
+        with pytest.raises(ValidationError):
+            ManagerApplyPreparedActivation.model_validate({**value, field: inconsistent})
+
+
 def _planning_motion(
     move_id: str,
     motion: dict[str, object],

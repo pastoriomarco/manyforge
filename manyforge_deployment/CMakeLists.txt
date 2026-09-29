@@ -1636,6 +1636,10 @@ if(BUILD_TESTING)
     PrepareActivationSingleDocument
     "examples/lite6_pick_and_place.scenario")
   manyforge_add_prepare_activation_test(
+    PrepareActivationNoProgram
+    "examples/lite6_pick_and_place.scenario"
+    --no-program)
+  manyforge_add_prepare_activation_test(
     PrepareActivationRuntimeIdentity
     "examples/lite6_pick_and_place.scenario"
     --runtime-identity)

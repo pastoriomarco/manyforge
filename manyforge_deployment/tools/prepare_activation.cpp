@@ -144,7 +144,7 @@ void materialize_activation(
     deployment::FilesystemRetainedBundleRepository store(activation_root);
     static_cast<void>(store.put_if_absent(closure.retained_bundle));
   }
-  {
+  if (closure.program != nullptr) {
     deployment::FilesystemProgramRepository store(activation_root);
     static_cast<void>(
         store.put_if_absent(closure.program, *closure.retained_bundle));
@@ -330,7 +330,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   static_cast<void>(object(deployment_value, "deployment"));
   static_cast<void>(object(model_source_closure, "model_source_closure"));
   static_cast<void>(object(prepared_model_closure, "prepared_model_closure"));
-  static_cast<void>(object(program_value, "program"));
+  if (!program_value.is_null()) static_cast<void>(object(program_value, "program"));
   static_cast<void>(object(overrides, "typed_parameter_overrides"));
   const deployment::CanonicalValue captured(deployment::CanonicalValue::Object{
       {"deployment", deployment_value},
@@ -370,32 +370,35 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   const auto materialized = deployment::detail::materialize_prepared_activation(
       options.capability_root, std::move(prepared_models),
       deployment_intent, runtime_cell_id, component_profiles, options.publish_canonical_empty);
-  const auto program = deployment::verify_program_binding_contract(
-      deployment::canonical_json(program_value), *materialized.bundle);
-  const auto mode = assistant_mode(program_value);
-  deployment::verify_scenario_program_admission(
-      program->normalized_program_root(), materialized.bundle->value(),
-      materialized.deployment_compatibility, mode, overrides);
+  std::shared_ptr<const deployment::ProgramBindingContract> program;
+  const auto mode = program_value.is_null()
+                        ? deployment::ScenarioAssistantMode::kOptional
+                        : assistant_mode(program_value);
   const PreparedCatalogSource catalog_store(materialized.catalog_artifacts);
   // Bind the preserved authored Program to this candidate. A Program whose
   // roles no longer resolve is prepared as explicitly non-executable (H1a);
   // malformed input or unexpected failures still abort here.
-  auto outcome = deployment::compile_program_binding_outcome(
-      *program, deployment::parse_program_role_assignment(assignment_value), *materialized.bundle,
-      materialized.model_map, catalog_store);
-  const auto &binding = outcome.binding;
-  const auto reverified_program = deployment::verify_program_binding_contract(
-      program->canonical_program_bytes(), *materialized.bundle);
-  if (reverified_program == nullptr ||
-      reverified_program->value().program_id != program->value().program_id ||
-      reverified_program->value().program_revision !=
-          program->value().program_revision) {
-    throw std::logic_error(
-        "prepared Program failed independent in-memory reload");
+  deployment::ProgramBindingOutcome outcome;
+  if (!program_value.is_null()) {
+    program = deployment::verify_program_binding_contract(
+        deployment::canonical_json(program_value), *materialized.bundle);
+    deployment::verify_scenario_program_admission(
+        program->normalized_program_root(), materialized.bundle->value(),
+        materialized.deployment_compatibility, mode, overrides);
+    outcome = deployment::compile_program_binding_outcome(
+        *program, deployment::parse_program_role_assignment(assignment_value),
+        *materialized.bundle, materialized.model_map, catalog_store);
   }
+  const auto &binding = outcome.binding;
+  // The complete assembled input is independently verified below, including
+  // strict absence of identities, assignments and overrides for no_program.
   deployment::CanonicalValue program_outcome(nullptr);
   deployment::CanonicalValue program_binding_payload(nullptr);
-  if (binding != nullptr) {
+  if (program == nullptr) {
+    program_outcome = deployment::CanonicalValue(deployment::CanonicalValue::Object{
+        {"kind", deployment::CanonicalValue("no_program")},
+    });
+  } else if (binding != nullptr) {
     if (!materialized.model_map.has_value()) {
       throw std::logic_error(
           "prepared Program binding has no retained model map");
@@ -437,7 +440,8 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
        deployment::CanonicalValue(deployment::CanonicalValue::Object{
            {"catalog_artifacts",
             artifact_payload(materialized.catalog_artifacts)},
-           {"program", program->normalized_program_root()},
+           {"program", program != nullptr ? program->normalized_program_root()
+                                          : deployment::CanonicalValue(nullptr)},
            {"program_binding", std::move(program_binding_payload)},
            {"program_role_assignment", assignment_value},
            {"raw_artifacts", artifact_payload(materialized.raw_artifacts)},
@@ -458,16 +462,18 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
            materialized.bundle->value()
                .catalogs.node_environment.environment_digest.value())},
       {"program_id",
-       deployment::CanonicalValue(program->value().program_id.value())},
+       program != nullptr ? deployment::CanonicalValue(program->value().program_id.value())
+                          : deployment::CanonicalValue(nullptr)},
       {"program_outcome", std::move(program_outcome)},
       {"program_revision",
-       deployment::CanonicalValue(program->value().program_revision.value())},
+       program != nullptr ? deployment::CanonicalValue(program->value().program_revision.value())
+                          : deployment::CanonicalValue(nullptr)},
       {"retained_bundle_id",
        deployment::CanonicalValue(
            materialized.bundle->retained_bundle_id().value())},
       {"scenario_id", deployment::CanonicalValue(scenario_id)},
       {"schema_version",
-       deployment::CanonicalValue("manyforge.prepared_activation_input.v3")},
+       deployment::CanonicalValue(std::string(deployment::kPreparedActivationInputSchemaVersion))},
       {"source_document_digest", deployment::CanonicalValue(source_digest)},
       {"typed_parameter_overrides", overrides},
   };

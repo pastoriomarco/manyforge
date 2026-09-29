@@ -345,8 +345,8 @@ def capture_deployment_model_sources(
     """Capture each component's exact model-source closure once."""
 
     components = deployment.get("components")
-    if not isinstance(components, list) or not components:
-        raise ModelSourceCaptureError("Deployment has no model components")
+    if not isinstance(components, list):
+        raise ModelSourceCaptureError("Deployment model components must be a list")
     captured: list[dict[str, Any]] = []
     total_bytes = 0
     total_resources = 0

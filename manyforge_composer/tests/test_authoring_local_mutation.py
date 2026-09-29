@@ -11,9 +11,11 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 from manyforge_headless_api.client import HeadlessClientError
 
 from manyforge_composer.backend.authoring_admission import (
@@ -26,6 +28,7 @@ from manyforge_composer.backend.authoring_workspace import (
     AuthoringWorkspaceIdentity,
     scenario_project_facts,
 )
+from manyforge_composer.backend.routes_authoring_workspace import create_authoring_workspace_router
 
 
 class _ProgramSession:
@@ -289,6 +292,34 @@ def test_validated_no_op_does_not_advance_or_wake(tmp_path) -> None:
     assert commit.admission_generation == 8
     assert workspace.revision == 1
 
+    # A settled no-op is provable even though the revision did not advance.
+    assert coordinator.submission_outcome(_envelope())["outcome"] == {
+        "kind": "settled", "operation_kind": "mutate_draft", "apply": None,
+    }
+
+
+def test_submission_readback_is_exact_read_only_and_bounded(tmp_path) -> None:
+    workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+    _run_local(coordinator, workspace, program, headless)
+    events = list(headless.events)
+    assert coordinator.submission_outcome(_envelope())["outcome"]["kind"] == "settled"
+    for changed in [replace(_envelope(), request_id="other"),
+                    replace(_envelope(), request_owner_epoch="other"), _envelope(8)]:
+        assert coordinator.submission_outcome(changed)["outcome"] is None
+    assert AuthoringAdmissionCoordinator(headless).submission_outcome(_envelope())["outcome"] is None
+    assert headless.events == events
+    app = FastAPI()
+    app.include_router(create_authoring_workspace_router(SimpleNamespace(authoring_admission=coordinator)))
+    response = TestClient(app).get('/api/authoring/submission-outcome', params={
+        'request_owner_epoch': 'browser.1', 'request_id': 'request.1', 'expected_admission_generation': 7,
+    })
+    assert response.status_code == 200
+    assert response.json() == coordinator.submission_outcome(_envelope())
+    assert headless.events == events
+    for index in range(128):
+        coordinator._record_outcome(replace(_envelope(), request_id=str(index)), "mutate_draft")
+    assert coordinator.submission_outcome(_envelope())["outcome"] is None
+
 
 @pytest.mark.parametrize("session", ["project", "whole-workspace"])
 def test_under_claim_project_preparation_runs_between_acquire_and_commit(tmp_path, session) -> None:
@@ -431,6 +462,7 @@ def test_uncertain_settlement_contains_authoring_without_rollback(
 
     assert raised.value.status_code == 503
     assert raised.value.detail["code"] == "composer_authoring_release_uncertain"
+    assert coordinator.submission_outcome(_envelope())["outcome"] is None
     # The committed in-memory edit is retained, not rolled back, and no wake
     # was published because the claim settlement is unresolved.
     assert workspace.revision == 2
@@ -709,6 +741,10 @@ def test_external_submission_transfers_claim_after_manager_acceptance(tmp_path) 
     )
 
     assert result["state"] == "pending"
+    assert coordinator.submission_outcome(_envelope())["outcome"] == {
+        "kind": "manager_accepted", "operation_kind": "apply_program",
+        "apply": {"apply_id": "apply.1", "apply_generation": 1},
+    }
     assert len(submitted) == 1
     assert headless.settlements == []
     assert coordinator.local_claim_pending is False
@@ -729,6 +765,7 @@ def test_external_submission_contains_unclassified_owner_response(tmp_path) -> N
         )
 
     assert raised.value.detail["code"] == "manager_apply_acceptance_invalid"
+    assert coordinator.submission_outcome(_envelope())["outcome"] is None
     assert coordinator.mutation_ready is False
     assert coordinator.local_claim_pending is True
     assert headless.settlements == []

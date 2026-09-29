@@ -877,6 +877,7 @@ class HeadlessService:
             if error.code in {
                 "program_applied_selection_not_found",
                 "program_applied_non_executable",
+                "program_not_selected",
             }:
                 return projection
             raise
@@ -1174,11 +1175,24 @@ class HeadlessService:
         }
         if (
             set(projection) != expected_fields
-            or projection.get("schema_version") != "manyforge.applied_program_status.v1"
+            or projection.get("schema_version") != "manyforge.applied_program_status.v2"
             or type(executable) is not bool
             or (projection.get("program_binding_id") is None) is executable
-            or (projection.get("non_executable") is None) is not executable
-            or (projection.get("program") is None) is not executable
+            or (
+                projection.get("program_id") is None
+                and (
+                    executable or projection.get("program_revision") is not None
+                    or projection.get("non_executable") is not None
+                    or projection.get("program") is not None
+                )
+            )
+            or (
+                projection.get("program_id") is not None
+                and (
+                    (projection.get("non_executable") is None) is not executable
+                    or (projection.get("program") is None) is not executable
+                )
+            )
             or not _bounded_text(
                 projection.get("deployment_artifact_id"), maximum_bytes=256
             )

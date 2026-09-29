@@ -373,8 +373,21 @@ def _applied_context(
     )
 
 
+def _applied_empty_authoring(state: ComposerState) -> tuple[dict[str, Any], tuple[str, str, str]] | None:
+    publication = state.published_scenario().get("published_scenario")
+    if not isinstance(publication, dict) or publication.get("program_outcome") != {"kind": "no_program"}:
+        return None
+    captured = state.applied_activation_for_publication(publication)
+    authoring = captured.get("program_authoring") if captured is not None else None
+    if not isinstance(authoring, dict) or authoring.get("forest") != [] or authoring.get("scene"):
+        return None
+    derive_candidate(authoring, _active_catalog(state))
+    return deepcopy(authoring), (publication["scenario_id"], publication["source_document_digest"], publication["retained_bundle_id"])
+
+
 def _workspace(state: ComposerState) -> dict[str, Any]:
     context, reason = _applied_context(state)
+    empty = _applied_empty_authoring(state) if reason is not None and reason["code"] == "program_not_selected" else None
     for _attempt in range(3):
         identity = state.authoring_workspace.identity()
         workspace = state.draft_session.workspace_snapshot(
@@ -382,6 +395,7 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
                 context.program_revision if context is not None else None
             ),
             applied_unavailable_reason=reason,
+            applied_authoring=empty[0] if empty is not None else None,
         )
         if state.authoring_workspace.identity() == identity:
             workspace["authoringWorkspace"] = identity.as_dict()
@@ -1047,7 +1061,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
     router = APIRouter()
 
     def prepare_program_activation(
-        body: _DraftFence, program_document: dict[str, Any]
+        body: _DraftFence, program_document: dict[str, Any] | None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Prepare one complete immutable activation for a Program change."""
 
@@ -1091,6 +1105,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 status_code=409,
             )
         overrides = deepcopy(context["typed_parameter_overrides"])
+        if program_document is None:
+            assignment = {"component_roles": [], "target_roles": []}
+            overrides = {}
         captured_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
@@ -1555,8 +1572,12 @@ def create_draft_router(state: ComposerState) -> APIRouter:
     @router.post("/api/program/discard")
     def discard_draft(body: DiscardDraftRequest) -> dict[str, Any]:
         try:
-            def read_applied() -> tuple[Program, tuple[str, str, str]]:
+            def read_applied() -> tuple[Program | dict[str, Any], tuple[str, str, str]]:
                 context, reason = _applied_context(state)
+                if reason is not None and reason["code"] == "program_not_selected":
+                    empty = _applied_empty_authoring(state)
+                    if empty is not None:
+                        return empty
                 if reason is not None or context is None:
                     raise DraftSessionError(
                         (
@@ -1604,7 +1625,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
 
             applied_program, applied_identity = read_applied()
             prepared = state.draft_session.prepare_discard_replacement(
-                applied_program
+                applied_program, _active_catalog(state)
             )
 
             def validate_applied_under_claim() -> None:
@@ -1645,20 +1666,22 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     "Composer has no retained Saved Program",
                     status_code=404,
                 )
-            saved_program = Program.from_dict(
-                saved_document,
-                _active_catalog(state),
-                path="<composer-program-revert-saved>",
-            )
+            saved_empty = saved_document.get("forest") == [] and not saved_document.get("scene")
+            saved_program = None if saved_empty else Program.from_dict(
+                saved_document, _active_catalog(state), path="<composer-program-revert-saved>")
             intent, prepared = prepare_program_activation(
-                body, saved_program.to_dict()
+                body, saved_program.to_dict() if saved_program is not None else None
             )
+            if saved_program is None:
+                intent["program_authoring"] = deepcopy(saved_document)
             replacement_state = deepcopy(retained)
-            if replacement_state.get("program") != saved_document:
+            restored_program = saved_program.to_dict() if saved_program is not None else None
+            restored_authoring = from_program(saved_program) if saved_program is not None else deepcopy(saved_document)
+            if replacement_state.get("authoring") != restored_authoring:
                 replacement_state["draft_revision"] += 1
-            replacement_state["program"] = deepcopy(saved_document)
-            replacement_state["authoring"] = from_program(saved_program)
-            replacement_state["diagnostics"] = []
+            replacement_state["program"] = restored_program
+            replacement_state["authoring"] = restored_authoring
+            replacement_state["diagnostics"] = derive_candidate(restored_authoring, _active_catalog(state))[1]
             replacement = state.draft_session.prepare_load_replacement(
                 replacement_state, _active_catalog(state)
             )

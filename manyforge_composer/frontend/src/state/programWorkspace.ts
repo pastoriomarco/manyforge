@@ -5,7 +5,6 @@ import type {
 
 export type ProgramWorkspaceActionName =
   | 'refresh'
-  | 'new'
   | 'mutate'
   | 'open_draft'
   | 'apply'
@@ -13,6 +12,7 @@ export type ProgramWorkspaceActionName =
   | 'revert'
   | 'load'
   | 'load_scenario_document'
+  | 'new_scenario_document'
   | 'export_scenario_document'
   | 'save'
   | 'save_as'

@@ -1229,7 +1229,7 @@ describe('Applied Program status parser', () => {
     record_digest: digest,
     retained_bundle_id: digest,
     scenario_id: 'scenario-a',
-    schema_version: 'manyforge.applied_program_status.v1',
+    schema_version: 'manyforge.applied_program_status.v2',
     source_document_digest: digest,
   };
 
@@ -1237,6 +1237,23 @@ describe('Applied Program status parser', () => {
     const parsed = parseAppliedProgramStatus(executable);
     expect(parsed.executable).toBe(true);
     expect(parsed.unresolvedReferences).toEqual([]);
+  });
+
+  it('distinguishes no Program from broken references and rejects mixed identities', () => {
+    const absent = {
+      ...executable,
+      executable: false,
+      program_id: null,
+      program_revision: null,
+      program_binding_id: null,
+      message: 'No Program is selected',
+    };
+    expect(parseAppliedProgramStatus(absent)).toMatchObject({
+      executable: false, programId: null, programRevision: null, unresolvedReferences: [],
+    });
+    expect(() => parseAppliedProgramStatus({ ...absent, program_binding_id: digest })).toThrow();
+    expect(() => parseAppliedProgramStatus({ ...absent, program_revision: digest })).toThrow();
+    expect(() => parseAppliedProgramStatus({ ...absent, schema_version: 'manyforge.applied_program_status.v1' })).toThrow();
   });
 
   it('names the references of a preserved non-executable Program', () => {

@@ -516,6 +516,28 @@ CanonicalValue compile_activation_deployment(
   const auto &runtime_ref = catalog.require(
       core::CatalogRecordKind::kRuntimeProfile,
       "manyforge.native_execution_runtime");
+  std::vector<QualifiedRuntimeProfile> selected_profiles;
+  for (const auto &profile : runtime_profiles) {
+    if (profile.value().runtime_profile_id.value() ==
+        native_execution_runtime_contract::kRuntimeProfileId) {
+      selected_profiles.push_back(profile);
+    }
+  }
+  if (selected_profiles.size() != 1U) fail("native runtime profile selection is not exact");
+  if (intent.components.empty()) {
+    if (!object(intent.policies, "policies").empty() || intent.assistant_profile_id.has_value()) {
+      fail("empty Deployment has no component policies or assistant profile");
+    }
+    auto authored = native_execution_runtime_contract::empty_host_deployment(
+        runtime_cell_id, catalog_value(runtime_ref), intent.deployment_artifact_id, intent.name).as_object();
+    authored.emplace_back("compatibility", CanonicalValue(Object{
+        {"lane", CanonicalValue("manyforge-only")},
+        {"provides", CanonicalValue(Array{})},
+        {"tags", CanonicalValue(Array{})},
+    }));
+    return compute_deployment_artifact_revision(
+        parse_strict_json_model_yaml(canonical_json(CanonicalValue(std::move(authored)))), selected_profiles).normalized_authored_root();
+  }
   const std::string runtime_id(
       native_execution_runtime_contract::kCellHostRuntimeUnitId);
   std::vector<ComponentProjection> projections;
@@ -606,14 +628,6 @@ CanonicalValue compile_activation_deployment(
       {"control_bindings", CanonicalValue(std::move(bindings))},
       {"component_attachments", CanonicalValue(Array{})},
   });
-  std::vector<QualifiedRuntimeProfile> selected_profiles;
-  for (const auto &profile : runtime_profiles) {
-    if (profile.value().runtime_profile_id.value() ==
-        "manyforge.native_execution_runtime") {
-      selected_profiles.push_back(profile);
-    }
-  }
-  if (selected_profiles.size() != 1U) fail("native runtime profile selection is not exact");
   const auto graph_parsed = parse_strict_json_model_yaml(canonical_json(graph));
   const auto typed = decode_cell_graph_candidate(graph_parsed);
   const auto intrinsic = validate_intrinsic_cell_graph_candidate(typed);

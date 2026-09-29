@@ -420,7 +420,6 @@ CanonicalEmptyRetainedBundleAdmission generate_native_empty_package(
     const std::filesystem::path &output_root, const core::CellId &cell_id,
     std::string_view runtime_profile_bytes) {
   using Object = CanonicalValue::Object;
-  using Array = CanonicalValue::Array;
   // Validate before creating any artifact repositories or admission locator.
   const auto &cell_text = cell_id.value();
   if (cell_text.empty() || cell_text.size() > 128U ||
@@ -467,42 +466,11 @@ CanonicalEmptyRetainedBundleAdmission generate_native_empty_package(
   });
   // These are workbench infrastructure settings, not controller defaults.
   // An incompatible infrastructure change remains a pre-effect Apply refusal.
-  const CanonicalValue configuration(Object{
-      {"mode", CanonicalValue("simulated")},
-      {"planner_rng_seed", CanonicalValue(12345.0)},
-      {"execution_tick_hz", CanonicalValue(100.0)},
-      {"collision_monitor_period_ms", CanonicalValue(50.0)},
-      {"initial_joint_positions_rad", CanonicalValue(Array{})},
-      {"motion_target_limits", CanonicalValue(Array{})},
-      {"direct_control_joint_limits", CanonicalValue(Array{})},
-      {"gripper_target_configurations", CanonicalValue(Array{})},
-  });
-  const CanonicalValue runtime(Object{
-      {"runtime_unit_id", CanonicalValue(std::string(native_execution_runtime_contract::kCellHostRuntimeUnitId))},
-      {"runtime_profile_id", CanonicalValue(reference.record_id.value())},
-      {"runtime_profile_revision", CanonicalValue(reference.record_revision.value())},
-      {"dependency_runtime_unit_ids", CanonicalValue(Array{})},
-      {"configuration", configuration},
-  });
   const auto deployment = compute_deployment_artifact_revision(
-      parse_strict_json_model_yaml(canonical_json(CanonicalValue(Object{
-          {"api_version", CanonicalValue("manyforge.deployment.v1")},
-          {"deployment_artifact_id", CanonicalValue("native_workbench_bootstrap")},
-          {"deployment_revision", CanonicalValue(std::string(kPlaceholderDigest))},
-          {"cell_id", CanonicalValue(cell_id.value())},
-          {"name", CanonicalValue("Native workbench infrastructure")},
-          {"catalogs", CanonicalValue(Object{{"records", CanonicalValue(Array{catalog_reference})}})},
-          {"graph", CanonicalValue(Object{
-              {"runtime_units", CanonicalValue(Array{runtime})},
-              {"model_instances", CanonicalValue(Array{})},
-              {"controllable_components", CanonicalValue(Array{})},
-              {"control_domains", CanonicalValue(Array{})},
-              {"control_bindings", CanonicalValue(Array{})},
-              {"component_attachments", CanonicalValue(Array{})},
-          })},
-          {"desired_control_configurations", CanonicalValue(Array{})},
-          {"capability_provider_bindings", CanonicalValue(Array{})},
-      }))), profiles);
+      parse_strict_json_model_yaml(canonical_json(
+          native_execution_runtime_contract::empty_host_deployment(
+              cell_id, catalog_reference, "native_workbench_bootstrap",
+              "Native workbench infrastructure"))), profiles);
   const auto qualified = compile_fixed_deployment(deployment, profiles);
   FilesystemBuildManifestRepository manifests(root);
   FilesystemRawArtifactStore artifacts(root);

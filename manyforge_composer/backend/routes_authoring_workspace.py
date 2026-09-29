@@ -16,14 +16,30 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from .authoring_workspace import AuthoringWorkspaceError
+from .authoring_admission import AuthoringMutationEnvelope
 from .state import ComposerState
 
 
 def create_authoring_workspace_router(state: ComposerState) -> APIRouter:
     router = APIRouter()
+
+    @router.get("/api/authoring/submission-outcome")
+    def read_submission_outcome(
+        request_owner_epoch: str = Query(min_length=1, max_length=256),
+        request_id: str = Query(min_length=1, max_length=256),
+        expected_admission_generation: int = Query(ge=1, le=9_007_199_254_740_991),
+    ) -> dict[str, Any]:
+        """Read exact confirmed evidence; never retry, settle or release a claim."""
+        if state.authoring_admission is None:
+            raise HTTPException(status_code=503, detail={
+                "code": "authoring_owner_unavailable", "message": "Authoring owner is unavailable",
+            })
+        return state.authoring_admission.submission_outcome(AuthoringMutationEnvelope(
+            expected_admission_generation, request_owner_epoch, request_id,
+        ))
 
     @router.get("/api/authoring/workspace")
     def read_authoring_workspace() -> dict[str, Any]:

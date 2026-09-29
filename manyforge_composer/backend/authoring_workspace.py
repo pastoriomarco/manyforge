@@ -876,8 +876,11 @@ class AuthoringWorkspace:
                 "program": program_document,
                 "diagnostics": program_state["diagnostics"],
                 "saved": {
-                    "available": saved_program_revision is not None,
+                    "available": program_state["saved_path"] is not None,
                     "matchesDraft": (
+                        program_state["saved_path"] is not None
+                        and program_state["authoring"] == program_state["saved_document"]
+                        if saved_program_revision is None else
                         program_state["authoring"] is not None
                         and isinstance(program_document, dict)
                         and saved_program_revision is not None

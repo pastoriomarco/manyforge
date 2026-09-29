@@ -269,7 +269,7 @@ class ActivationPreparer:
         captured_input_digest: str,
         deployment: Mapping[str, Any],
         model_source_closure: Mapping[str, Any],
-        program: Mapping[str, Any],
+        program: Mapping[str, Any] | None,
         program_role_assignment: Mapping[str, Any],
         typed_parameter_overrides: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -294,7 +294,7 @@ class ActivationPreparer:
                 "deployment": dict(deployment),
                 "model_source_closure": dict(model_source_closure),
                 "prepared_model_closure": prepared_model_closure,
-                "program": dict(program),
+                "program": dict(program) if program is not None else None,
                 "program_role_assignment": dict(program_role_assignment),
                 "typed_parameter_overrides": dict(typed_parameter_overrides),
             }
@@ -378,7 +378,7 @@ class ActivationPreparer:
                 not isinstance(value, dict)
                 or set(value) != _EXPECTED_RESULT_FIELDS
                 or value.get("schema_version")
-                != "manyforge.prepared_activation_input.v3"
+                != "manyforge.prepared_activation_input.v4"
                 or value.get("source_document_digest") != source_document_digest
                 or value.get("captured_input_digest") != captured_input_digest
                 or value.get("typed_parameter_overrides")

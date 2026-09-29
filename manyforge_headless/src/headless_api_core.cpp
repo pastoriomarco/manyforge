@@ -734,6 +734,15 @@ struct AppliedProgramOutcome final {
 AppliedProgramOutcome ReadAppliedProgramOutcome(const CanonicalValue &prepared) {
   const auto &outcome = RequiredMember(prepared, "program_outcome");
   const auto kind = RequiredString(outcome, "kind");
+  if (kind == "no_program") {
+    Require(RequiredString(prepared, "schema_version") ==
+                "manyforge.prepared_activation_input.v4" &&
+                outcome.is_object() && outcome.as_object().size() == 1U &&
+                RequiredMember(prepared, "program_id").is_null() &&
+                RequiredMember(prepared, "program_revision").is_null(),
+            "program_applied_selection_invalid", "inconsistent no_program outcome");
+    return {};
+  }
   if (kind == "bound") {
     return {core::ProgramBindingId(
                 RequiredString(outcome, "program_binding_id")),
@@ -798,6 +807,9 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
   if (outcome.non_executable.has_value()) {
     CoreFail("program_applied_non_executable",
              NonExecutableMessage(*outcome.non_executable));
+  }
+  if (!outcome.program_binding_id.has_value()) {
+    CoreFail("program_not_selected", "No Program is selected; create a Program and Apply it before Execute.");
   }
   const auto active_bundle_id = RequiredString(active, "retained_bundle_id");
   const auto active_graph_revision = RequiredString(active, "graph_revision");
@@ -952,7 +964,9 @@ CanonicalValue HeadlessApiCore::AppliedProgramStatus() {
       {"graph_revision", RequiredMember(prepared, "graph_revision")},
       {"message", outcome.non_executable.has_value()
                       ? CanonicalValue(NonExecutableMessage(*outcome.non_executable))
-                      : CanonicalValue(nullptr)},
+                      : (!outcome.program_binding_id.has_value()
+                             ? CanonicalValue("No Program is selected")
+                             : CanonicalValue(nullptr))},
       {"non_executable", std::move(non_executable)},
       {"program", std::move(program)},
       {"program_binding_id",

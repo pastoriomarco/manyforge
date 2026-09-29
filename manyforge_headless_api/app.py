@@ -339,6 +339,7 @@ def _error_status(code: str) -> int:
             "program_required_component_not_active",
             "route_selection_component_not_ready",
             "program_applied_non_executable",
+            "program_not_selected",
             "prepared_activation_unverified",
             "authoring_not_ready",
             "program_run_draft_applied_mismatch",

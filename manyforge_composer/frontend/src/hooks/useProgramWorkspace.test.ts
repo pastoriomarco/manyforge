@@ -18,6 +18,7 @@ const apiMock = vi.hoisted(() => ({
   scenarioDocuments: {
     save: vi.fn(),
     load: vi.fn(),
+    new: vi.fn(),
   },
 }));
 
@@ -66,6 +67,10 @@ function testAuthoringController(
     beginMutation: () => true,
     finishMutation: () => undefined,
     observeApply: () => undefined,
+    submissionUnconfirmed: false,
+    rechecking: false,
+    recheckMessage: null,
+    recheckSubmission: async () => undefined,
   };
 }
 
@@ -568,6 +573,27 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     }));
     expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
     expect(latest?.state.pendingAction).toBeNull();
+  });
+
+  it('New uses the shared fence and follows the exact accepted Apply without a second command', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
+    await act(async () => initial.resolve(workspace(1)));
+    apiMock.scenarioDocuments.new.mockResolvedValue({
+      status: 'accepted', workspace: workspace(1),
+      activation: { status: 'accepted', apply_id: 'apply.new', apply_generation: 9 },
+    });
+    const input = {
+      name: 'New cell', path: '/workspace/new', deploymentChoice: 'keep_applied' as const,
+      expectedRetainedBundleId: 'bundle', expectedGraphRevision: 'graph', confirmDiscard: true,
+    };
+    await act(async () => { latest?.newScenarioDocument(input); });
+    expect(apiMock.scenarioDocuments.new).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ draftId: 'draft-1', deploymentDraftId: 'deployment-draft-1' }), input,
+    );
+    expect(latest?.acceptedApply).toEqual({ applyId: 'apply.new', applyGeneration: 9 });
+    expect(latest?.state.message).toContain('No Program or motion starts automatically');
+    expect(apiMock.scenarioDocuments.load).not.toHaveBeenCalled();
   });
 
   it('fences Scenario Save and Load with both current authored documents', async () => {

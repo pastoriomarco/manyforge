@@ -389,6 +389,15 @@ export interface ScenarioDocumentSaveResponse {
   workspace: ProgramWorkspaceResponse;
 }
 
+export interface NewScenarioDocumentInput {
+  path: string;
+  name: string;
+  deploymentChoice: 'keep_applied' | 'empty';
+  expectedRetainedBundleId: string;
+  expectedGraphRevision: string;
+  confirmDiscard: boolean;
+}
+
 export type ScenarioDocumentActivation =
   | (Record<string, JsonValue> & {
       status: 'accepted';
@@ -534,7 +543,7 @@ export interface DeploymentWorkspaceResponse {
 }
 
 export interface PreparedActivationInput {
-  schemaVersion: 'manyforge.prepared_activation_input.v3';
+  schemaVersion: 'manyforge.prepared_activation_input.v3' | 'manyforge.prepared_activation_input.v4';
   preparedActivationId: string;
   scenarioId: string;
   sourceDocumentDigest: string;
@@ -543,9 +552,9 @@ export interface PreparedActivationInput {
   deploymentRevision: string;
   retainedBundleId: string;
   graphRevision: string;
-  programId: string;
-  programRevision: string;
-  /** Null exactly when the preserved Program is non-executable in this
+  programId: string | null;
+  programRevision: string | null;
+  /** Null when no Program is selected or the preserved Program is non-executable in this
    * candidate; the named references are in the preview impact (H1a). */
   programBindingId: string | null;
   nodeEnvironmentDigest: string;
@@ -1450,8 +1459,8 @@ export interface AppliedProgramStatus {
   deploymentArtifactId: string;
   deploymentRevision: string;
   executable: boolean;
-  programId: string;
-  programRevision: string;
+  programId: string | null;
+  programRevision: string | null;
   scenarioId: string;
   message: string | null;
   unresolvedReferences: ProgramUnresolvedReference[];
@@ -1470,8 +1479,8 @@ export interface ManagerDeploymentImpact {
   componentDeltaDigest: string;
   program: {
     executable: boolean;
-    programId: string;
-    programRevision: string;
+    programId: string | null;
+    programRevision: string | null;
     unresolvedReferences: ProgramUnresolvedReference[];
     affectedNodes: string[];
     affectedExecutionGroups: string[];

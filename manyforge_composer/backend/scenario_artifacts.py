@@ -792,16 +792,16 @@ def _writable_project(raw_path: str, roots: list[str]) -> tuple[Path, Path]:
     return parent / target.name, parent
 
 
-def save_scenario_artifact(
+def prepare_scenario_artifact(
     document: dict[str, Any],
     raw_path: str,
     *,
     allowed_roots: list[str],
-    overwrite: bool,
     source_project_path: str | None = None,
-) -> str:
+) -> tuple[dict[str, Any], Path, dict[str, bytes], bytes]:
+    """Resolve and encode one project without writing it (Save and New)."""
     roots = _roots(allowed_roots)
-    target, parent = _writable_project(raw_path, roots)
+    target, _parent = _writable_project(raw_path, roots)
     prepared_document = deepcopy(document)
     if source_project_path is not None:
         source_project = _existing_project(source_project_path, roots)
@@ -824,6 +824,33 @@ def save_scenario_artifact(
     member_bytes, manifest_raw = _project_payload(
         prepared_document, source_snapshot=source_snapshot
     )
+    return prepared_document, target, member_bytes, manifest_raw
+
+
+def prepared_scenario_source_digest(member_bytes: dict[str, bytes], manifest_raw: bytes) -> str:
+    """The same exact file identity used when reopening a saved project."""
+    return raw_sha256_digest(canonical_json_bytes({
+        "manifest": raw_sha256_digest(manifest_raw),
+        "members": {name: raw_sha256_digest(raw) for name, raw in member_bytes.items()},
+    }))
+
+
+def save_scenario_artifact(
+    document: dict[str, Any],
+    raw_path: str,
+    *,
+    allowed_roots: list[str],
+    overwrite: bool,
+    source_project_path: str | None = None,
+    expected_source_digest: str | None = None,
+) -> str:
+    roots = _roots(allowed_roots)
+    _prepared_document, target, member_bytes, manifest_raw = prepare_scenario_artifact(
+        document, raw_path, allowed_roots=roots, source_project_path=source_project_path
+    )
+    if expected_source_digest is not None and prepared_scenario_source_digest(member_bytes, manifest_raw) != expected_source_digest:
+        _fail("scenario_artifact_changed", "Scenario sources changed before creation", status_code=409)
+    parent = target.parent
     parent_fd = -1
     project_fd = -1
     try:

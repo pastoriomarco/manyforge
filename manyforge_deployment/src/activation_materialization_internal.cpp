@@ -890,7 +890,8 @@ materialize_scenarios(const std::filesystem::path &root,
               value.value().stop_evidence_policy_revision.value()};
         });
 
-    if (model_assets.empty() || component_types.empty() ||
+    if ((model_assets.empty() != verified.graph().graph().model_instances.empty()) ||
+        (component_types.empty() != verified.graph().graph().controllable_components.empty()) ||
         profiles.size() != 1U) {
       throw std::logic_error(
           "scenario cannot select its exact structural/runtime closure");
@@ -1572,9 +1573,11 @@ qualify_catalog(const std::filesystem::path &root,
                 const std::vector<FamilySource> &families,
                 std::vector<deployment::detail::ActivationPreparedModel>
                     prepared_models = {}) {
-  if (!families.empty() == !prepared_models.empty()) {
+  // A runtime-only Deployment has no model inputs. Component/model cardinality
+  // is checked by the authored compiler; the two input forms cannot be mixed.
+  if (!families.empty() && !prepared_models.empty()) {
     throw std::invalid_argument(
-        "catalog qualification requires exactly one model input form");
+        "catalog qualification cannot mix model input forms");
   }
   const auto catalog_root =
       root / "manyforge_deployment/resources/maintained/catalog";
@@ -1949,7 +1952,6 @@ qualify_catalog(const std::filesystem::path &root,
       result.stop_policies.size() + result.model_assets.size();
   if (result.records.size() != expected_record_count ||
       result.model_assets.size() != result.structural_preparations.size() ||
-      result.model_assets.empty() ||
       result.runtime_profiles.size() != 2U ||
       result.runtime_policies.size() != kScenarios.size() + 1U) {
     throw std::logic_error("maintained exact catalog closure is incomplete");

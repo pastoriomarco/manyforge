@@ -761,6 +761,123 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
     assert loaded["deployment"]["savedPath"] == str(target / "deployment.yaml")
 
 
+@pytest.mark.parametrize("choice", ["empty", "keep_applied"])
+@pytest.mark.parametrize("failure", [None, "prepare", "save", "submit", "stale", "unexpected_impact"])
+def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None, choice: str
+) -> None:
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    admission = _PassThroughAdmission()
+    state.authoring_admission = admission  # type: ignore[assignment]
+    state.headless_client = type("Manager", (), {"manager_status": lambda _self: {}})()  # type: ignore[assignment]
+    monkeypatch.setattr(state, "_manager_current", lambda _status: ("bundle", "graph", "epoch"))
+    monkeypatch.setattr(routes_scenario_documents, "program_workspace",
+                        lambda _state: {"authoringWorkspace": {"workspaceEpoch": "test"}})
+    target = tmp_path / "new-project"
+    old_project = tmp_path / "old-project"
+    (tmp_path / "model.urdf").write_text('<robot name="fixture"><link name="base"/></robot>')
+    save_scenario_artifact(_document(), str(old_project), allowed_roots=[str(tmp_path)], overwrite=False)
+    original_files = {path.name: path.read_bytes() for path in old_project.iterdir() if path.is_file()}
+    source_closure = routes_scenario_documents.capture_deployment_model_sources(
+        _deployment_intent(), project_root=old_project)
+    monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": {"active": True}})
+    monkeypatch.setattr(state, "applied_activation_for_publication", lambda _publication: {
+        "deployment": _deployment_intent(), "project_path": str(old_project),
+        "model_source_closure": source_closure,
+    })
+    before = state.authoring_workspace.snapshot()
+    calls: list[str] = []
+
+    def prepare_or_apply(intent, claim, *, apply, prepared=None, prepare_only=False):
+        assert intent["program"] is None
+        assert intent["program_authoring"]["forest"] == []
+        assert not intent["program_authoring"].get("scene")
+        if choice == "empty":
+            assert intent["deployment"]["components"] == []
+        else:
+            assert intent["deployment"]["name"] == "Fixture deployment"
+            assert len(intent["deployment"]["components"]) == 1
+        assert intent["program_role_assignment"] == {"component_roles": [], "target_roles": []}
+        assert intent["typed_parameter_overrides"] == {}
+        if prepare_only:
+            assert not target.exists()
+            calls.append("prepare")
+            if failure == "prepare":
+                raise HeadlessClientError("activation_preparation_failed", "invalid candidate", status_code=409)
+            return {"confirmation_required": False, "prepared_activation": {},
+                    "candidate_preview": {"impact": {"components": [{
+                        "controllable_component_id": "fixture_robot",
+                        "disposition": "replace" if failure == "unexpected_impact" else
+                            "retain" if choice == "keep_applied" else "remove",
+                    }]}}}
+        calls.append("submit")
+        saved, _path, digest = capture_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
+        assert digest == intent["source_document_digest"]
+        assert saved["program_draft"] == intent["program_authoring"]
+        assert saved["name"] == "New cell"
+        if failure == "submit":
+            raise HeadlessClientError("manager_unavailable", "reply lost", status_code=503)
+        return {"status": "accepted", "apply_id": "new-apply"}
+
+    monkeypatch.setattr(state, "execute_authored_deployment_candidate", prepare_or_apply)
+    if failure == "save":
+        def refuse_save(*_args, **_kwargs):
+            raise ScenarioArtifactError("scenario_save_failed", "disk unavailable", status_code=503)
+        monkeypatch.setattr(routes_scenario_documents, "save_scenario_artifact", refuse_save)
+    response = _scenario_client(state).post("/api/scenario-documents/new", json={
+        **_fence(state), "path": str(target), "name": "New cell", "deploymentChoice": choice,
+        "confirmDiscard": True, "expectedRetainedBundleId": "other" if failure == "stale" else "bundle",
+        "expectedGraphRevision": "graph",
+    })
+    assert {path.name: path.read_bytes() for path in old_project.iterdir() if path.is_file()} == original_files
+    if failure in {"prepare", "save", "stale", "unexpected_impact"}:
+        assert response.status_code in {409, 503}, response.text
+        assert not target.exists()
+        assert state.authoring_workspace.snapshot() == before
+        assert "submit" not in calls
+    elif failure == "submit":
+        assert response.status_code == 503, response.text
+        assert response.json()["detail"]["code"] == "scenario_created_not_activated"
+        assert response.json()["detail"]["path"] == str(target)
+        assert target.is_dir()
+        assert calls == ["prepare", "submit"]  # no retry or rollback
+    else:
+        assert response.status_code == 200, response.text
+        assert response.json()["activation"] == {"status": "accepted", "apply_id": "new-apply"}
+        assert admission.events == ["validate", "commit", "submit", "wake"]
+        assert state.draft_session.workspace_snapshot()["saved"]["matchesDraft"] is True
+        assert state.draft_session.workspace_snapshot()["saved"]["available"] is True
+        saved = state.authoring_workspace.snapshot().as_dict()["program"]["saved"]
+        assert saved["available"] and saved["matchesDraft"] and saved["programRevision"] is None
+        # Save As of an empty editable Program must move its Saved baseline too.
+        copy_path = tmp_path / "new-copy"
+        result = _scenario_client(state).post("/api/scenario-documents/save", json={
+            **_fence(state), "path": str(copy_path), "scenarioId": state.scenario_document_id,
+            "name": "New cell", "description": "", "confirmOverwrite": False,
+        })
+        assert result.status_code == 200, result.text
+        saved = state.authoring_workspace.snapshot().as_dict()["program"]["saved"]
+        assert saved["available"] and saved["matchesDraft"]
+        assert saved["path"] == str(copy_path / "program.yaml")
+
+
+def test_new_keep_refuses_missing_applied_source_instead_of_using_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": None})
+    before = state.authoring_workspace.snapshot()
+    response = _scenario_client(state).post("/api/scenario-documents/new", json={
+        **_fence(state), "path": str(tmp_path / "new"), "name": "New",
+        "deploymentChoice": "keep_applied", "confirmDiscard": True,
+        "expectedRetainedBundleId": "bundle", "expectedGraphRevision": "graph",
+    })
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "scenario_applied_source_unavailable"
+    assert state.authoring_workspace.snapshot() == before
+    assert not (tmp_path / "new").exists()
+
+
 def test_capture_reads_one_source_identity(tmp_path: Path) -> None:
     target = tmp_path / "captured"
     original = build_scenario_document(

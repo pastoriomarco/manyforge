@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, ApiError, apiErrorCode, authoringRefusalMessage, isStaleWorkspaceError } from '../api/client';
+import { api, ApiError, apiErrorCode, authoringRefusalMessage, failedAuthoringRequest, isStaleWorkspaceError, type AuthoringRequestIdentity } from '../api/client';
 import { parseManagerApplyAvailability } from '../api/parsers';
 import { sameManagerApply, type ManagerApplyIdentity } from '../state/managerApply';
 import { errorMessage } from '../state/structuralResource';
@@ -46,6 +46,10 @@ export function useAuthoringWorkspace(
   const reconnectPending = useRef(false);
   const submission = useRef<null | 'sending' | 'unknown' | ManagerApplyIdentity>(null);
   const [submissionState, setSubmissionState] = useState<typeof submission.current>(null);
+  const unknownRequest = useRef<AuthoringRequestIdentity | null>(null);
+  const recheckingRef = useRef(false);
+  const [rechecking, setRechecking] = useState(false);
+  const [recheckMessage, setRecheckMessage] = useState<string | null>(null);
   const manager = snapshot?.runtime.sections?.manager;
   const managerAdmission = useMemo(() => {
     if (!manager?.available || manager.freshness !== 'fresh') {
@@ -174,6 +178,8 @@ export function useAuthoringWorkspace(
   const beginMutation = useCallback(() => {
     if (submission.current !== null || ownerReason !== null) return false;
     submission.current = 'sending';
+    unknownRequest.current = null;
+    setRecheckMessage(null);
     setSubmissionState('sending');
     return true;
   }, [ownerReason]);
@@ -185,8 +191,48 @@ export function useAuthoringWorkspace(
         || apiErrorCode(failure) === 'manager_apply_rejected'
         || (failure instanceof ApiError && [400, 403, 404, 422].includes(failure.status))
         ? null : 'unknown';
+    unknownRequest.current = submission.current === 'unknown' ? failedAuthoringRequest(failure) : null;
+    if (unknownRequest.current !== null) {
+      setRecheckMessage(`Request ${unknownRequest.current.requestId}${unknownRequest.current.path ? ` (${unknownRequest.current.path})` : ''}: outcome unconfirmed.`);
+    }
     setSubmissionState(submission.current);
   }, []);
+  const recheckSubmission = useCallback(async () => {
+    if (submission.current !== 'unknown' || recheckingRef.current) return;
+    const request = unknownRequest.current;
+    if (request === null) {
+      setRecheckMessage('The failed request has no verifiable identity. Its outcome remains unknown.');
+      return;
+    }
+    recheckingRef.current = true;
+    setRechecking(true);
+    try {
+      const outcome = await api.authoringWorkspace.submissionOutcome(request);
+      if (!mounted.current || submission.current !== 'unknown' || unknownRequest.current !== request) return;
+      if (outcome === null) {
+        setRecheckMessage('No confirmed outcome is available for this exact request. It may still be processing, or its evidence is unavailable. Nothing was retried.');
+        return;
+      }
+      // Successful readback settles only this browser's uncertainty. Current
+      // workspace, Manager and Kernel admission still govern all new actions.
+      const status = outcome.apply === null ? null : await api.manager.applyStatus(
+        outcome.apply.applyId, outcome.apply.applyGeneration,
+      );
+      if (!mounted.current || submission.current !== 'unknown' || unknownRequest.current !== request) return;
+      submission.current = status?.state === 'pending' ? outcome.apply : null;
+      unknownRequest.current = null;
+      setSubmissionState(submission.current);
+      setRecheckMessage(outcome.apply === null
+        ? `Request ${request.requestId}: the authoring change is confirmed settled.`
+        : `Request ${request.requestId}: Apply ${outcome.apply.applyId} (${outcome.apply.applyGeneration}) is ${status!.state}. Backend admission still applies.`);
+      await refresh();
+    } catch (error) {
+      if (mounted.current) setRecheckMessage(errorMessage(error, 'Submission status could not be verified.'));
+    } finally {
+      recheckingRef.current = false;
+      if (mounted.current) setRechecking(false);
+    }
+  }, [refresh]);
   const observeApply = useCallback((status: ManagerApplyStatus | null) => {
     const pending = submission.current;
     // Bounded stream inventories may age a completed record out. An exact
@@ -213,7 +259,11 @@ export function useAuthoringWorkspace(
     beginMutation,
     finishMutation,
     observeApply,
-  }), [current, error, facts, published, reading, refresh, unavailableReason, beginMutation, finishMutation, observeApply]);
+    submissionUnconfirmed: submissionState === 'unknown',
+    rechecking,
+    recheckMessage,
+    recheckSubmission,
+  }), [current, error, facts, published, reading, refresh, unavailableReason, beginMutation, finishMutation, observeApply, submissionState, rechecking, recheckMessage, recheckSubmission]);
 }
 
 export type AuthoringWorkspaceController = ReturnType<typeof useAuthoringWorkspace>;

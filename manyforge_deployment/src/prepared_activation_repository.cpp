@@ -293,6 +293,9 @@ void verify_prepared_program_outcome(const PreparedActivationInput &prepared) {
 ProgramBindingOutcome
 recompile_prepared_program_outcome(const PreparedActivationInput &prepared) {
   const auto &closure = prepared.closure();
+  // The structural verifier proved exact absence of artifacts, identities,
+  // assignments and overrides. There is no Program to compile or Scene to project.
+  if (closure.program == nullptr) return {};
   const PreparedPayloadCatalogSource catalog(closure.catalog_artifacts);
   ProgramBindingOutcome recompiled;
   try {

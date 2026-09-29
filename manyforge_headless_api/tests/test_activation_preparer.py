@@ -88,7 +88,7 @@ def _preparer(tmp_path: Path) -> ActivationPreparer:
 
 def _result() -> dict[str, object]:
     identity: dict[str, object] = {
-        "schema_version": "manyforge.prepared_activation_input.v3",
+        "schema_version": "manyforge.prepared_activation_input.v4",
         "source_document_digest": _DIGEST,
         "scenario_id": "scenario_a",
         "captured_input_digest": _DIGEST,

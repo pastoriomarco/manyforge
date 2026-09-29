@@ -24,6 +24,7 @@ import {
 } from '../state/programWorkspace';
 import type {
   DraftMutationResponse,
+  NewScenarioDocumentInput,
   JsonValue,
   LocalWorkspaceFenceRequest,
   ProgramNodeModificationPolicy,
@@ -378,21 +379,6 @@ export function useProgramWorkspace(
     );
   }, [localFence, run]);
 
-  const newDraft = useCallback((confirmDiscard: boolean) => {
-    const requestFence = localFence();
-    if (!requestFence) return;
-    void run(
-      'new',
-      () => api.programWorkspace.newDraft(
-        requestFence,
-        confirmDiscard,
-      ).then((next) => workspaceResult(
-        next,
-        'New unsaved Program Draft created; Saved, disk, and runtime were not changed.',
-      )),
-    );
-  }, [localFence, run]);
-
   const save = useCallback(() => {
     const requestFence = localFence();
     if (!requestFence) return;
@@ -488,6 +474,24 @@ export function useProgramWorkspace(
     });
   }, [requireWorkspace, run, scenarioFence]);
 
+  const newScenarioDocument = useCallback((input: NewScenarioDocumentInput) => {
+    void run('new_scenario_document', async () => {
+      const requestFence = scenarioFence();
+      if (requestFence === null) throw new Error('New Scenario is not admitted.');
+      const response = await api.scenarioDocuments.new(requestFence, input);
+      return {
+        workspace: response.workspace,
+        message: response.status === 'accepted'
+          ? `New Scenario saved; activation accepted (${response.activation.apply_id}). No Program or motion starts automatically.`
+          : 'New Scenario saved and activated. Create a Program to enable Execute.',
+        transitionStatus: response.status,
+        acceptedApply: response.status === 'accepted'
+          ? acceptedApplyIdentity(response.activation.apply_id, response.activation.apply_generation)
+          : null,
+      };
+    });
+  }, [run, scenarioFence]);
+
   const loadScenarioDocument = useCallback((
     path: string,
     confirmDiscard: boolean,
@@ -547,7 +551,7 @@ export function useProgramWorkspace(
     admissionObserved,
     refresh,
     mutate,
-    newDraft,
+    newScenarioDocument,
     openDraft,
     save,
     saveAs,
@@ -579,7 +583,7 @@ export function useProgramWorkspace(
     mutate,
     mutationAvailable,
     mutationUnavailableReason,
-    newDraft,
+    newScenarioDocument,
     openDraft,
     project,
     refresh,

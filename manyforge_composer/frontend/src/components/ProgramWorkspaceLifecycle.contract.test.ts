@@ -90,7 +90,9 @@ describe('Program workspace lifecycle controls', () => {
     );
 
     expect(scenarioSource).toContain('New Scenario');
-    expect(scenarioSource).toContain('newDraft(confirmDiscard)');
+    expect(scenarioSource).toContain('newScenarioDocument({');
+    expect(scenarioSource).toContain('Keep Applied Deployment');
+    expect(scenarioSource).toContain('Create and unload components');
     expect(source).toContain('Revert to saved');
     expect(source).toContain('Discard changes');
     expect(source).toContain('return to the Applied Program');
@@ -110,7 +112,7 @@ describe('Program workspace lifecycle controls', () => {
     );
 
     expect(source).toContain("'discard'");
-    expect(source).toContain("'new'");
+    expect(source).toContain("'new_scenario_document'");
     expect(source).toContain("'revert'");
     expect(source).toContain('api.programWorkspace.discard(requestFence)');
     expect(source).toContain('api.programWorkspace.revert(requestFence)');

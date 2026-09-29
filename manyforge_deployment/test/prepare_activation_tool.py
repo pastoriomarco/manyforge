@@ -33,6 +33,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--intent-rejections", action="store_true")
     parser.add_argument("--source-closure-rejections", action="store_true")
     parser.add_argument("--runtime-identity", action="store_true")
+    parser.add_argument("--no-program", action="store_true")
     return parser.parse_args()
 
 
@@ -311,8 +312,8 @@ def _run(
         raise AssertionError("preparer changed the source-document identity")
     if value["captured_input_digest"] != request["captured_input_digest"]:
         raise AssertionError("preparer changed the captured-input identity")
-    if value.get("schema_version") != "manyforge.prepared_activation_input.v3":
-        raise AssertionError("preparer did not return the direct v3 handoff")
+    if value.get("schema_version") != "manyforge.prepared_activation_input.v4":
+        raise AssertionError("preparer did not return the direct v4 handoff")
     program_outcome = value.get("program_outcome")
     if (
         not isinstance(program_outcome, dict)
@@ -347,6 +348,15 @@ def _run(
     if not payload["raw_artifacts"] or not payload["catalog_artifacts"]:
         raise AssertionError("preparer omitted its exact artifact closure")
     bundle = payload["retained_bundle"]
+    if expected_program_outcome_kind == "no_program":
+        assert program_outcome == {"kind": "no_program"}
+        assert value["program_id"] is None and value["program_revision"] is None
+        assert payload["program"] is None and payload["program_binding"] is None
+        if not request["deployment"]["components"]:
+            assert not bundle["cell_graph"]["controllable_components"]
+            assert not bundle["cell_graph"]["model_instances"]
+            assert _native_host_identity(value)
+            return value
     if bundle["cell_graph"]["cell_id"] != request["runtime_cell_id"]:
         raise AssertionError("candidate did not use the configured runtime identity")
     policies = bundle["retained_policy_records"]
@@ -439,6 +449,22 @@ def main() -> int:
     scenario_path, document, request = _scenario_request(workspace, args.scenario)
     with tempfile.TemporaryDirectory(prefix="manyforge-prepare-test-") as raw:
         temporary = Path(raw)
+        if args.no_program:
+            request["program"] = None
+            request["program_role_assignment"] = {
+                "component_roles": [], "target_roles": []
+            }
+            request["typed_parameter_overrides"] = {}
+            _rehash_request(request)
+            _run(args, request, temporary / "keep", expected_program_outcome_kind="no_program")
+            request["deployment"]["components"] = []
+            request["deployment"]["attachments"] = []
+            request["deployment"]["policies"] = {}
+            request["model_source_closure"]["components"] = []
+            request["prepared_model_closure"]["components"] = []
+            _rehash_request(request)
+            _run(args, request, temporary / "empty", expected_program_outcome_kind="no_program")
+            return 0
         if args.intent_rejections:
             unsupported_version = copy.deepcopy(request)
             unsupported_version["deployment"]["api_version"] = (

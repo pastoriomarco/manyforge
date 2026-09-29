@@ -1,4 +1,5 @@
 import {
+  parseAuthoringSubmissionOutcome,
   parseAuthoringWorkspaceSnapshot,
   parseCatalogResponse,
   parseAppliedProgramSelection,
@@ -57,6 +58,7 @@ import {
 } from './cclcParsers';
 import type {
   ArtifactKind,
+  NewScenarioDocumentInput,
   AppliedProgramSelection,
   AppliedProgramStatus,
   AuthoringWorkspaceSnapshot,
@@ -363,7 +365,47 @@ export function isStaleWorkspaceError(error: unknown): boolean {
   return typeof code === 'string' && STALE_WORKSPACE_CODES.has(code);
 }
 
+export type AuthoringRequestIdentity = {
+  requestOwnerEpoch: string;
+  requestId: string;
+  expectedAdmissionGeneration: number;
+  path?: string;
+};
+
+const failedAuthoringRequests = new WeakMap<object, AuthoringRequestIdentity>();
+
+export function failedAuthoringRequest(error: unknown): AuthoringRequestIdentity | null {
+  return error !== null && typeof error === 'object'
+    ? failedAuthoringRequests.get(error) ?? null : null;
+}
+
 async function requestJson<T>(
+  path: string,
+  parser: (value: unknown) => T,
+  signal?: AbortSignal,
+  init: RequestInit = {},
+): Promise<T> {
+  try {
+    return await requestJsonResponse(path, parser, signal, init);
+  } catch (error) {
+    // Preserve the original error/classification, including parse failures.
+    // The exact sent envelope is only readback evidence, never a replay request.
+    if (error !== null && typeof error === 'object' && typeof init.body === 'string') {
+      const body = JSON.parse(init.body) as Partial<AuthoringRequestIdentity>;
+      if (typeof body.requestOwnerEpoch === 'string' && typeof body.requestId === 'string'
+        && Number.isSafeInteger(body.expectedAdmissionGeneration) && body.expectedAdmissionGeneration! > 0) {
+        failedAuthoringRequests.set(error, {
+          requestOwnerEpoch: body.requestOwnerEpoch, requestId: body.requestId,
+          expectedAdmissionGeneration: body.expectedAdmissionGeneration!,
+          path,
+        });
+      }
+    }
+    throw error;
+  }
+}
+
+async function requestJsonResponse<T>(
   path: string,
   parser: (value: unknown) => T,
   signal?: AbortSignal,
@@ -575,6 +617,14 @@ export const api = {
     ),
   },
   authoringWorkspace: {
+    submissionOutcome: (request: AuthoringRequestIdentity) => requestJson(
+      `/api/authoring/submission-outcome?${new URLSearchParams({
+        request_owner_epoch: request.requestOwnerEpoch,
+        request_id: request.requestId,
+        expected_admission_generation: String(request.expectedAdmissionGeneration),
+      })}`,
+      (value) => parseAuthoringSubmissionOutcome(value, request),
+    ),
     /**
      * Read the one atomic composite authoring snapshot.
      *
@@ -713,6 +763,14 @@ export const api = {
     ),
   },
   scenarioDocuments: {
+    new: (
+      fence: ScenarioDocumentFenceRequest,
+      input: NewScenarioDocumentInput,
+      signal?: AbortSignal,
+    ): Promise<ScenarioDocumentLoadResponse> => requestJson(
+      '/api/scenario-documents/new', parseScenarioDocumentLoadResponse, signal,
+      { method: 'POST', body: JSON.stringify({ ...fence, ...input }) },
+    ),
     list: (
       directory?: string,
       signal?: AbortSignal,

@@ -125,7 +125,7 @@ _APPLIED_PROGRAM_STATUS_FIELDS = frozenset(
     }
 )
 _ProgramOutcomeIdentity = tuple[str, str]
-_DeploymentPublicationIdentity = tuple[str, str, str, str, _ProgramOutcomeIdentity]
+_DeploymentPublicationIdentity = tuple[str, str, str, str | None, _ProgramOutcomeIdentity]
 
 
 def _is_sha256_identity(value: object) -> bool:
@@ -519,6 +519,11 @@ class ComposerState:
         if not isinstance(outcome, dict):
             raise ValueError("publication has no typed Program outcome")
         kind = outcome.get("kind")
+        if kind == "no_program":
+            if (set(outcome) != {"kind"} or publication.get("program_id") is not None
+                    or publication.get("program_revision") is not None):
+                raise ValueError("no_program must not carry Program identity")
+            return ("no_program", "")
         if kind == "bound":
             if set(outcome) != {"kind", "program_binding_id"}:
                 raise ValueError("bound Program outcome has unexpected fields")
@@ -601,9 +606,10 @@ class ComposerState:
             "program_revision",
         )
         identity_values = tuple(publication.get(name) for name in identity_fields)
-        if any(not isinstance(value, str) or not value for value in identity_values):
+        required_values = identity_values[:3] if outcome_identity[0] == "no_program" else identity_values
+        if any(not isinstance(value, str) or not value for value in required_values):
             raise ValueError("publication lacks a complete activation identity")
-        if any(not _is_sha256_identity(value) for value in identity_values):
+        if any(not _is_sha256_identity(value) for value in required_values):
             raise ValueError("publication has an invalid activation digest")
         return (*identity_values, outcome_identity)
 
@@ -613,14 +619,21 @@ class ComposerState:
     ) -> dict[str, Any]:
         if (
             set(status) != _APPLIED_PROGRAM_STATUS_FIELDS
-            or status.get("schema_version") != "manyforge.applied_program_status.v1"
+            or status.get("schema_version") != "manyforge.applied_program_status.v2"
             or type(status.get("executable")) is not bool
         ):
             raise ValueError("Applied Program status has an unsupported shape")
         executable = status["executable"]
         binding_id = status.get("program_binding_id")
         non_executable = status.get("non_executable")
-        if executable:
+        no_program = status.get("program_id") is None
+        if no_program:
+            if (executable or binding_id is not None or non_executable is not None
+                    or status.get("program") is not None
+                    or status.get("program_revision") is not None):
+                raise ValueError("no_program Applied status is contradictory")
+            outcome: dict[str, Any] = {"kind": "no_program"}
+        elif executable:
             if (
                 not _is_sha256_identity(binding_id)
                 or non_executable is not None
@@ -628,7 +641,7 @@ class ComposerState:
                 or status.get("message") is not None
             ):
                 raise ValueError("executable Applied Program status is contradictory")
-            outcome: dict[str, Any] = {
+            outcome = {
                 "kind": "bound",
                 "program_binding_id": binding_id,
             }
@@ -656,12 +669,14 @@ class ComposerState:
             )
         }
         if (
-            any(not isinstance(value, str) or not value for value in projection.values())
+            any(not isinstance(value, str) or not value
+                for name, value in projection.items()
+                if not (no_program and name in {"program_id", "program_revision"}))
             or not _is_sha256_identity(projection["source_document_digest"])
             or not _is_sha256_identity(projection["deployment_revision"])
             or not _is_sha256_identity(projection["retained_bundle_id"])
             or not _is_sha256_identity(projection["graph_revision"])
-            or not _is_sha256_identity(projection["program_revision"])
+            or (not no_program and not _is_sha256_identity(projection["program_revision"]))
             or not _is_sha256_identity(status.get("record_digest"))
         ):
             raise ValueError("Applied Program status lacks activation identity fields")
@@ -715,6 +730,7 @@ class ComposerState:
         identity = self._deployment_publication_identity(prepared_activation)
         context = {
             "deployment": deepcopy(deployment),
+            "program_authoring": deepcopy(intent.get("program_authoring")),
             "model_source_closure": deepcopy(intent["model_source_closure"]),
             "program_role_assignment": deepcopy(intent["program_role_assignment"]),
             "typed_parameter_overrides": deepcopy(intent["typed_parameter_overrides"]),
@@ -997,7 +1013,7 @@ class ComposerState:
         except HeadlessClientError as error:
             if error.code == "program_applied_selection_not_found":
                 return None
-            if error.code == "program_applied_non_executable":
+            if error.code in {"program_applied_non_executable", "program_not_selected"}:
                 # H1a: the Applied Program is preserved but has no executable
                 # selection; its named status is read separately.
                 return None
@@ -1030,7 +1046,7 @@ class ComposerState:
             current is not None
             and current["program_outcome"].get("kind") != "bound"
         ):
-            reasons.append("program_not_executable")
+            reasons.append("program_not_selected" if current["program_outcome"].get("kind") == "no_program" else "program_not_executable")
         if current is not None and not self._manager_matches_scenario(
             self.headless_client.manager_status(),
             self.headless_client.manager_diff(),

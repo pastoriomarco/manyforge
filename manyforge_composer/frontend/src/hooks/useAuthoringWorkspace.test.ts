@@ -11,12 +11,16 @@ import type { ComposerHeadlessState } from '../types/headless';
 const apiMock = vi.hoisted(() => ({
   authoringWorkspace: {
     get: vi.fn(),
+    submissionOutcome: vi.fn(),
   },
+  manager: { applyStatus: vi.fn() },
+  failedIdentity: vi.fn(),
 }));
 
 vi.mock('../api/client', async (importOriginal) => ({
   ...await importOriginal<typeof import('../api/client')>(),
   api: apiMock,
+  failedAuthoringRequest: apiMock.failedIdentity,
   isStaleWorkspaceError: (error: unknown) =>
     error !== null
     && typeof error === 'object'
@@ -270,6 +274,9 @@ async function flush(): Promise<void> {
 
 describe('useAuthoringWorkspace', () => {
   beforeEach(() => {
+    apiMock.failedIdentity.mockReset().mockReturnValue(null);
+    apiMock.authoringWorkspace.submissionOutcome.mockReset();
+    apiMock.manager.applyStatus.mockReset();
     apiMock.authoringWorkspace.get.mockReset();
   });
 
@@ -377,6 +384,52 @@ describe('useAuthoringWorkspace', () => {
     await rerender(headlessSnapshot(1));
     expect(latest!.unavailableReason).toContain('unconfirmed');
     expect(latest!.beginMutation()).toBe(false);
+  });
+
+  it('rechecks exact local settlement, not an unrelated revision or idle status', async () => {
+    const identity = { requestOwnerEpoch: 'browser.1', requestId: 'edit.1', expectedAdmissionGeneration: 7 };
+    apiMock.failedIdentity.mockReturnValue(identity);
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => {
+      latest!.beginMutation(); latest!.finishMutation(null, new Error('reply lost'));
+    });
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(2, 4, 4, '/workspace/cell'));
+    await rerender(headlessSnapshot(2, 4, 4));
+    await flush();
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    apiMock.authoringWorkspace.submissionOutcome.mockResolvedValue(null);
+    await act(async () => { await latest!.recheckSubmission(); });
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    expect(apiMock.authoringWorkspace.submissionOutcome).toHaveBeenCalledWith(identity);
+    apiMock.authoringWorkspace.submissionOutcome.mockResolvedValue({ kind: 'settled', apply: null });
+    await act(async () => { await latest!.recheckSubmission(); });
+    expect(latest!.submissionUnconfirmed).toBe(false);
+    expect(latest!.unavailableReason).toBe(null);
+  });
+
+  it('looks up a recovered Manager identity and preserves terminal unknown-effect admission', async () => {
+    apiMock.failedIdentity.mockReturnValue({ requestOwnerEpoch: 'browser.1', requestId: 'apply.1', expectedAdmissionGeneration: 7 });
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => { latest!.beginMutation(); latest!.finishMutation(null, new Error('lost')); });
+    const terminal = headlessSnapshot(1);
+    terminal.runtime.sections.manager.payload = { apply: {
+      records: [managerApplyRecord('terminal', 'unknown_effect')], mutation_available: false, unavailable_reason_code: 'unknown_effect',
+    } };
+    await rerender(terminal);
+    apiMock.authoringWorkspace.submissionOutcome.mockResolvedValue({ kind: 'manager_accepted', apply: { applyId: 'apply-3', applyGeneration: 3 } });
+    apiMock.manager.applyStatus.mockRejectedValueOnce(new Error('status unavailable'));
+    await act(async () => { await latest!.recheckSubmission(); });
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    apiMock.manager.applyStatus.mockResolvedValue({ applyId: 'apply-3', applyGeneration: 3, state: 'unknown_effect' });
+    await act(async () => { await latest!.recheckSubmission(); });
+    expect(apiMock.manager.applyStatus).toHaveBeenCalledWith('apply-3', 3);
+    expect(latest!.submissionUnconfirmed).toBe(false);
+    expect(latest!.beginMutation()).toBe(false);
+    expect(latest!.unavailableReason).toContain('Manager operation');
   });
 
   it('reads once after a real reconnect, even through delay, and retains identical objects', async () => {

@@ -1,4 +1,31 @@
 import { parseNanoseconds, type Nanoseconds } from '../types/nanoseconds';
+
+export function parseAuthoringSubmissionOutcome(value: unknown, request: {
+  requestOwnerEpoch: string; requestId: string; expectedAdmissionGeneration: number;
+}): { kind: 'settled' | 'manager_accepted'; apply: { applyId: string; applyGeneration: number } | null } | null {
+  const path = 'authoringSubmissionOutcome';
+  const row = objectAt(value, path);
+  exactKeysAt(row, ['schema_version', 'request_owner_epoch', 'request_id', 'expected_admission_generation', 'owner_epoch', 'outcome'], path);
+  if (row.schema_version !== 'manyforge.authoring_submission_outcome.v1'
+    || row.request_owner_epoch !== request.requestOwnerEpoch || row.request_id !== request.requestId
+    || row.expected_admission_generation !== request.expectedAdmissionGeneration) {
+    throw new Error('Authoring submission identity mismatch');
+  }
+  if (!stringAt(row.owner_epoch, `${path}.owner_epoch`)) fail(path, 'a nonempty owner epoch');
+  if (row.outcome === null) return null;
+  const result = objectAt(row.outcome, `${path}.outcome`);
+  exactKeysAt(result, ['kind', 'operation_kind', 'apply'], `${path}.outcome`);
+  if (!stringAt(result.operation_kind, `${path}.outcome.operation_kind`)) fail(path, 'a nonempty operation kind');
+  if (result.kind === 'settled' && result.apply === null) return { kind: 'settled', apply: null };
+  if (result.kind !== 'manager_accepted') throw new Error('Invalid authoring submission outcome');
+  const apply = objectAt(result.apply, `${path}.outcome.apply`);
+  exactKeysAt(apply, ['apply_id', 'apply_generation'], `${path}.outcome.apply`);
+  if (!stringAt(apply.apply_id, `${path}.outcome.apply.apply_id`)) fail(path, 'a nonempty Apply identity');
+  return { kind: 'manager_accepted', apply: {
+    applyId: stringAt(apply.apply_id, `${path}.outcome.apply.apply_id`),
+    applyGeneration: positiveIntegerAt(apply.apply_generation, `${path}.outcome.apply.apply_generation`),
+  } };
+}
 import type {
   AuthoringWorkspaceProgramSaved,
   AuthoringWorkspaceProjectFacts,
@@ -2360,12 +2387,17 @@ export function parseAppliedProgramStatus(value: unknown): AppliedProgramStatus 
     'retained_bundle_id', 'scenario_id', 'schema_version',
     'source_document_digest',
   ], path);
-  if (stringAt(record.schema_version, `${path}.schema_version`)
-    !== 'manyforge.applied_program_status.v1') {
-    return fail(`${path}.schema_version`, 'manyforge.applied_program_status.v1');
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.applied_program_status.v1'
+    && schemaVersion !== 'manyforge.applied_program_status.v2') {
+    return fail(`${path}.schema_version`, 'manyforge.applied_program_status.v1 or v2');
   }
   const executable = booleanAt(record.executable, `${path}.executable`);
-  if (executable !== (record.non_executable === null)
+  const noProgram = record.program_id === null;
+  if ((noProgram && (schemaVersion !== 'manyforge.applied_program_status.v2'
+      || executable || record.non_executable !== null
+      || record.program_revision !== null || record.program !== null))
+    || (!noProgram && executable !== (record.non_executable === null))
     || executable !== (record.program_binding_id !== null)) {
     return fail(path, 'a binding exactly when executable, named references otherwise');
   }
@@ -2385,8 +2417,8 @@ export function parseAppliedProgramStatus(value: unknown): AppliedProgramStatus 
       `${path}.deployment_revision`,
     ),
     executable,
-    programId: stringAt(record.program_id, `${path}.program_id`),
-    programRevision: digestAt(record.program_revision, `${path}.program_revision`),
+    programId: noProgram ? null : stringAt(record.program_id, `${path}.program_id`),
+    programRevision: noProgram ? null : digestAt(record.program_revision, `${path}.program_revision`),
     scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
     message: nullableStringAt(record.message, `${path}.message`),
     ...references,
@@ -2443,7 +2475,9 @@ function parseManagerDeploymentImpact(
   let unresolvedReferences: ProgramUnresolvedReference[] = [];
   let affectedNodes: string[] = [];
   let affectedExecutionGroups: string[] = [];
-  if (executable !== (program.non_executable === null)) {
+  const noProgram = program.program_id === null;
+  if ((noProgram && (executable || program.non_executable !== null || program.program_revision !== null))
+    || (!noProgram && executable !== (program.non_executable === null))) {
     return fail(`${path}.program.non_executable`, 'present exactly for a non-executable Program');
   }
   if (program.non_executable !== null) {
@@ -2466,8 +2500,8 @@ function parseManagerDeploymentImpact(
     componentDeltaDigest: digestAt(record.component_delta_digest, `${path}.component_delta_digest`),
     program: {
       executable,
-      programId: stringAt(program.program_id, `${path}.program.program_id`),
-      programRevision: digestAt(program.program_revision, `${path}.program.program_revision`),
+      programId: noProgram ? null : stringAt(program.program_id, `${path}.program.program_id`),
+      programRevision: noProgram ? null : digestAt(program.program_revision, `${path}.program.program_revision`),
       unresolvedReferences,
       affectedNodes,
       affectedExecutionGroups,
@@ -2845,15 +2879,15 @@ function parseProgramSavedProjection(
     `${path}.programRevision`,
   );
   const matchesDraft = booleanAt(saved.matchesDraft, `${path}.matchesDraft`);
-  if (available !== (savedPath !== null && savedRevision !== null)) {
+  if (available !== (savedPath !== null) || (!available && savedRevision !== null)) {
     return fail(path, 'internally consistent Saved identity');
   }
   if (
-    matchesDraft !== (
+    (savedRevision !== null && matchesDraft !== (
       draft.programRevision !== null
       && savedRevision !== null
       && draft.programRevision === savedRevision
-    )
+    )) || (savedRevision === null && matchesDraft && (!available || draft.candidateAvailable))
   ) {
     return fail(path, 'a truthful Draft/Saved comparison');
   }
@@ -3047,7 +3081,8 @@ export function parseProgramWorkspaceResponse(value: unknown): ProgramWorkspaceR
     'programWorkspace.applied.programRevision',
   );
   if (
-    (appliedAvailable && (appliedMatchesDraft === null || appliedRevision === null))
+    (appliedAvailable && appliedMatchesDraft === null)
+    || (appliedAvailable && appliedRevision === null && appliedMatchesDraft && draft.candidateAvailable)
     || (!appliedAvailable && (appliedMatchesDraft !== null || appliedRevision !== null))
   ) {
     return fail('programWorkspace.applied', 'internally consistent Applied identity');
@@ -3727,17 +3762,27 @@ function parsePreparedActivationInput(
     'program_id', 'program_revision', 'program_outcome',
     'node_environment_digest', 'assistant_mode', 'typed_parameter_overrides',
   ], path);
-  if (stringAt(record.schema_version, `${path}.schema_version`)
-    !== 'manyforge.prepared_activation_input.v3') {
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.prepared_activation_input.v3'
+    && schemaVersion !== 'manyforge.prepared_activation_input.v4') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.prepared_activation_input.v3',
+      'manyforge.prepared_activation_input.v3 or v4',
     );
   }
   const outcome = objectAt(record.program_outcome, `${path}.program_outcome`);
   const outcomeKind = stringAt(outcome.kind, `${path}.program_outcome.kind`);
   let programBindingId: string | null;
-  if (outcomeKind === 'bound') {
+  if (outcomeKind === 'no_program') {
+    exactKeysAt(outcome, ['kind'], `${path}.program_outcome`);
+    if (schemaVersion !== 'manyforge.prepared_activation_input.v4'
+      || record.program_id !== null || record.program_revision !== null
+      || record.assistant_mode !== 'optional'
+      || Object.keys(objectAt(record.typed_parameter_overrides, `${path}.typed_parameter_overrides`)).length !== 0) {
+      return fail(path, 'no_program v4 with no Program identities or overrides');
+    }
+    programBindingId = null;
+  } else if (outcomeKind === 'bound') {
     exactKeysAt(outcome, ['kind', 'program_binding_id'], `${path}.program_outcome`);
     programBindingId = digestAt(
       outcome.program_binding_id,
@@ -3748,10 +3793,10 @@ function parsePreparedActivationInput(
     objectAt(outcome.outcome, `${path}.program_outcome.outcome`);
     programBindingId = null;
   } else {
-    return fail(`${path}.program_outcome.kind`, 'bound or non_executable');
+    return fail(`${path}.program_outcome.kind`, 'bound, non_executable, or no_program');
   }
   return {
-    schemaVersion: 'manyforge.prepared_activation_input.v3',
+    schemaVersion,
     preparedActivationId: digestAt(record.prepared_activation_id,
       `${path}.prepared_activation_id`),
     scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
@@ -3772,8 +3817,8 @@ function parsePreparedActivationInput(
       `${path}.retained_bundle_id`,
     ),
     graphRevision: digestAt(record.graph_revision, `${path}.graph_revision`),
-    programId: stringAt(record.program_id, `${path}.program_id`),
-    programRevision: digestAt(
+    programId: outcomeKind === 'no_program' ? null : stringAt(record.program_id, `${path}.program_id`),
+    programRevision: outcomeKind === 'no_program' ? null : digestAt(
       record.program_revision,
       `${path}.program_revision`,
     ),

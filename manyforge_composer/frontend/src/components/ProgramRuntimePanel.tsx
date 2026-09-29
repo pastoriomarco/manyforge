@@ -180,7 +180,12 @@ export function ProgramRuntimePanel({
         </div>
       )}
 
-      {enabled && state.nonExecutable !== null && (
+      {enabled && state.nonExecutable !== null && state.nonExecutable.programId === null && (
+        <div className="panel-state" role="status">
+          No Program is applied. Add steps and Apply to enable Execute. Manual control remains independent.
+        </div>
+      )}
+      {enabled && state.nonExecutable !== null && state.nonExecutable.programId !== null && (
         <div className="program-feedback" role="alert" aria-label="Applied Program not executable">
           <p>
             Applied Program <strong>{state.nonExecutable.programId}</strong> is not
@@ -228,7 +233,7 @@ export function ProgramRuntimePanel({
               {state.applied
                 ? `${state.applied.scenarioId} · ${shortIdentity(state.applied.programRevision)}`
                 : state.nonExecutable !== null
-                  ? `${state.nonExecutable.scenarioId} · not executable in this Deployment`
+                  ? `${state.nonExecutable.scenarioId} · ${state.nonExecutable.programId === null ? 'no Program' : 'not executable in this Deployment'}`
                   : 'Apply a validated Draft before Execute.'}
             </small>
             {state.applied && (

@@ -454,7 +454,7 @@ class ActivationPreparationRequest(StrictRequest):
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     deployment: dict[str, Any]
     model_source_closure: dict[str, Any]
-    program: dict[str, Any]
+    program: dict[str, Any] | None
     program_role_assignment: dict[str, Any]
     typed_parameter_overrides: dict[str, Any]
     expected_admission_generation: Annotated[
@@ -473,13 +473,18 @@ class ActivationPreparationRequest(StrictRequest):
         if (
             not self.deployment
             or not self.model_source_closure
-            or not self.program
+            or (self.program is not None and not self.program)
             or not self.program_role_assignment
         ):
             raise ValueError(
-                "deployment, model_source_closure, program, and "
-                "program_role_assignment must be non-empty objects"
+                "deployment, model_source_closure, and program_role_assignment "
+                "must be non-empty objects; program must be null or a non-empty object"
             )
+        if self.program is None and (
+            self.program_role_assignment != {"component_roles": [], "target_roles": []}
+            or self.typed_parameter_overrides
+        ):
+            raise ValueError("no Program requires empty role assignment and overrides")
         return self
 
 
@@ -495,17 +500,18 @@ class ManagerApplyPreparedActivation(StrictRequest):
     """
 
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    schema_version: Literal["manyforge.prepared_activation_input.v3"]
+    schema_version: Literal["manyforge.prepared_activation_input.v3", "manyforge.prepared_activation_input.v4"]
     scenario_id: str
     source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     retained_bundle_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     graph_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    program_id: str
-    program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    program_id: str | None
+    program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)] | None
     # Exactly one typed outcome (H1a): {"kind": "bound", "program_binding_id"}
-    # or {"kind": "non_executable", "outcome"}; the Manager verifies it.
+    # or {"kind": "non_executable", "outcome"}, or v4 {"kind": "no_program"}.
+    # The Manager verifies it against the immutable stored activation.
     program_outcome: dict[str, Any]
     node_environment_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     assistant_mode: Literal["required", "optional", "forbidden"]
@@ -516,7 +522,10 @@ class ManagerApplyPreparedActivation(StrictRequest):
     @classmethod
     def validate_program_outcome(cls, value: dict[str, Any]) -> dict[str, Any]:
         kind = value.get("kind")
-        if kind == "bound":
+        if kind == "no_program":
+            if set(value) != {"kind"}:
+                raise ValueError("no_program must not carry Program facts")
+        elif kind == "bound":
             binding_id = value.get("program_binding_id")
             if set(value) != {"kind", "program_binding_id"} or not (
                 isinstance(binding_id, str) and _SHA256_RE.fullmatch(binding_id)
@@ -540,12 +549,29 @@ class ManagerApplyPreparedActivation(StrictRequest):
 
     @field_validator("deployment_artifact_id", "scenario_id", "program_id")
     @classmethod
-    def validate_identity(cls, value: str, info) -> str:
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return value
         return _bounded_nfc(
             value,
             label=info.field_name,
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
+
+    @model_validator(mode="after")
+    def require_program_identity(self) -> "ManagerApplyPreparedActivation":
+        if self.program_outcome["kind"] == "no_program":
+            if (
+                self.schema_version != "manyforge.prepared_activation_input.v4"
+                or self.program_id is not None
+                or self.program_revision is not None
+                or self.assistant_mode != "optional"
+                or self.typed_parameter_overrides
+            ):
+                raise ValueError("no_program requires v4 with no Program identity or overrides")
+        elif self.program_id is None or self.program_revision is None:
+            raise ValueError("selected Program requires its identity and revision")
+        return self
 
 
 class ManagerApplyRequest(CallerAttributionRequest):

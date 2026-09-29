@@ -18,7 +18,7 @@
 namespace manyforge::deployment {
 
 inline constexpr std::string_view kPreparedActivationInputSchemaVersion =
-    "manyforge.prepared_activation_input.v3";
+    "manyforge.prepared_activation_input.v4";
 
 class PreparedActivationInputError final : public std::invalid_argument {
 public:
@@ -34,11 +34,10 @@ struct PreparedActivationArtifact final {
 struct VerifiedPreparedActivationClosure final {
   std::shared_ptr<const RetainedBundle> retained_bundle;
   /// A candidate with no retained model products has no symbol-role map.
-  /// This is permitted only for a non-executable Program whose authored
-  /// references are all unresolved against that empty candidate.
+  /// The candidate may have no selected Program, or a non-executable Program.
   std::optional<VerifiedRetainedModelMap> retained_model_map;
   std::shared_ptr<const ProgramBindingContract> program;
-  /// Null exactly when the Program outcome is non-executable.
+  /// Null for no Program or a non-executable Program.
   std::shared_ptr<const ProgramBinding> program_binding;
   std::vector<PreparedActivationArtifact> raw_artifacts;
   std::vector<PreparedActivationArtifact> catalog_artifacts;
@@ -79,14 +78,14 @@ public:
   [[nodiscard]] const core::GraphRevision &graph_revision() const noexcept {
     return graph_revision_;
   }
-  [[nodiscard]] const core::ProgramId &program_id() const noexcept {
+  [[nodiscard]] const std::optional<core::ProgramId> &program_id() const noexcept {
     return program_id_;
   }
-  [[nodiscard]] const core::ProgramRevision &program_revision() const noexcept {
+  [[nodiscard]] const std::optional<core::ProgramRevision> &program_revision() const noexcept {
     return program_revision_;
   }
   /// The candidate binding identity; absent exactly when
-  /// `program_outcome()` names a non-executable Program (H1a).
+  /// a non-executable Program or no Program is selected.
   [[nodiscard]] const std::optional<core::ProgramBindingId> &
   program_binding_id() const noexcept {
     return program_binding_id_;
@@ -130,8 +129,8 @@ private:
       core::DeploymentArtifactId deployment_artifact_id,
       core::DeploymentRevision deployment_revision,
       core::RetainedBundleId retained_bundle_id,
-      core::GraphRevision graph_revision, core::ProgramId program_id,
-      core::ProgramRevision program_revision,
+      core::GraphRevision graph_revision, std::optional<core::ProgramId> program_id,
+      std::optional<core::ProgramRevision> program_revision,
       std::optional<core::ProgramBindingId> program_binding_id,
       std::optional<ProgramNonExecutableOutcomeDTO> program_outcome,
       core::ProgramRoleAssignmentDTO program_role_assignment,
@@ -147,8 +146,8 @@ private:
   core::DeploymentRevision deployment_revision_;
   core::RetainedBundleId retained_bundle_id_;
   core::GraphRevision graph_revision_;
-  core::ProgramId program_id_;
-  core::ProgramRevision program_revision_;
+  std::optional<core::ProgramId> program_id_;
+  std::optional<core::ProgramRevision> program_revision_;
   std::optional<core::ProgramBindingId> program_binding_id_;
   std::optional<ProgramNonExecutableOutcomeDTO> program_outcome_;
   core::ProgramRoleAssignmentDTO program_role_assignment_;

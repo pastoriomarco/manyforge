@@ -323,8 +323,8 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
         result["description"] = intent["description"]
 
     components = intent["components"]
-    if type(components) is not list or not 1 <= len(components) <= _MAX_COMPONENTS:
-        _fail(f"{source}: components must be a bounded non-empty list")
+    if type(components) is not list or len(components) > _MAX_COMPONENTS:
+        _fail(f"{source}: components must be a bounded list")
     normalized_components: list[dict[str, Any]] = []
     component_ids: set[str] = set()
     for index, raw_component in enumerate(components):

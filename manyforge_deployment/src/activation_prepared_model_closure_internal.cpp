@@ -115,7 +115,7 @@ parse_activation_prepared_model_closure(const CanonicalValue &value) {
   }
   const auto &components = array(member(value, "components", "root"),
                                  "components");
-  if (components.empty() || components.size() > kMaximumComponents) {
+  if (components.size() > kMaximumComponents) {
     fail("has an invalid component count");
   }
   std::vector<PreparedComponentModelSource> result;

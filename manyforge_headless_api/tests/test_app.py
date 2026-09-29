@@ -320,7 +320,7 @@ def _applied_program_status_projection() -> dict[str, Any]:
         "record_digest": "sha256:" + "5" * 64,
         "retained_bundle_id": "sha256:" + "8" * 64,
         "scenario_id": "cell-pick",
-        "schema_version": "manyforge.applied_program_status.v1",
+        "schema_version": "manyforge.applied_program_status.v2",
         "source_document_digest": "sha256:" + "6" * 64,
     }
 
@@ -335,6 +335,21 @@ def test_applied_program_status_preserves_deployment_identity() -> None:
 
     assert response.status_code == 200
     assert response.json() == status
+
+
+def test_applied_status_accepts_explicit_no_program_and_rejects_mixed_identity() -> None:
+    core = FakeCore()
+    status = _applied_program_status_projection()
+    status.update(executable=False, program_id=None, program_revision=None,
+                  program_binding_id=None, program=None, non_executable=None,
+                  message="No Program is selected")
+    core.applied_program_status_projection = status
+    client = TestClient(create_app(service=_service(core, FakeManager())))
+    assert client.get("/api/program/applied/status").json() == status
+    status["program_binding_id"] = "sha256:" + "a" * 64
+    response = client.get("/api/program/applied/status")
+    assert response.status_code != 200
+    assert response.json()["detail"]["code"] == "program_applied_selection_invalid"
 
 
 @pytest.mark.parametrize(

@@ -164,18 +164,18 @@ describe('Program workspace request fencing', () => {
     }, {
       type: 'request_started',
       generation: 10,
-      action: 'new',
+      action: 'new_scenario_document',
     });
     const created = workspace('fresh-new-draft', 1);
     const succeeded = programWorkspaceReducer(started, {
       type: 'request_succeeded',
       generation: 10,
       workspace: created,
-      message: 'New unsaved Program Draft created.',
+      message: 'New Scenario saved; activation accepted.',
       transitionStatus: null,
     });
 
-    expect(started.pendingAction).toBe('new');
+    expect(started.pendingAction).toBe('new_scenario_document');
     expect(succeeded.workspace).toBe(created);
     expect(succeeded.pendingAction).toBeNull();
   });

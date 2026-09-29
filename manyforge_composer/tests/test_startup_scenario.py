@@ -127,7 +127,7 @@ def _non_executable_status(
         "record_digest": "sha256:" + "b" * 64,
         "retained_bundle_id": selection["retained_bundle_id"],
         "scenario_id": selection["scenario_id"],
-        "schema_version": "manyforge.applied_program_status.v1",
+        "schema_version": "manyforge.applied_program_status.v2",
         "source_document_digest": selection["source_document_digest"],
     }
 
@@ -200,7 +200,7 @@ class _Headless:
             "record_digest": applied["source"]["record_digest"],
             "retained_bundle_id": applied["retained_bundle_id"],
             "scenario_id": applied["scenario_id"],
-            "schema_version": "manyforge.applied_program_status.v1",
+            "schema_version": "manyforge.applied_program_status.v2",
             "source_document_digest": applied["source_document_digest"],
         }
 
@@ -453,6 +453,26 @@ def test_published_scenario_does_not_wait_for_runtime_convergence() -> None:
     assert state.current_scenario()["unavailable_reasons"] == [
         "deployment_not_active_and_converged"
     ]
+
+
+def test_no_program_publication_promotes_capture_without_becoming_executable() -> None:
+    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
+    selection = _selection(program.to_dict())
+    headless = _Headless(selection)
+    headless.applied_status = _non_executable_status(selection)
+    headless.applied_status.update(
+        program_id=None, program_revision=None, program=None, non_executable=None,
+        message="No Program is selected",
+    )
+    headless.manager_target = True
+    state = _state(headless, _Coordinator(), program=None)
+    selection.update(program_id=None, program_revision=None)
+    state._retain_submitted_deployment(_captured_activation(state, selection, {"kind": "no_program"}))
+    published = state.published_scenario()
+    assert published["ready"] is True
+    assert published["published_scenario"]["program_outcome"] == {"kind": "no_program"}
+    assert state.applied_activation_for_publication(published["published_scenario"]) is not None
+    assert state.current_scenario()["unavailable_reasons"] == ["program_not_selected"]
 
 
 def test_non_executable_publication_promotes_exact_capture_but_is_not_runnable() -> None:

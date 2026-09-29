@@ -559,7 +559,9 @@ export function useProgramRuntime(
       let nonExecutable: AppliedProgramStatus | null = null;
       if (appliedResult.status === 'fulfilled') {
         applied = appliedResult.value;
-      } else if (apiErrorCode(appliedResult.reason) === 'program_applied_non_executable') {
+      } else if (['program_applied_non_executable', 'program_not_selected'].includes(
+        apiErrorCode(appliedResult.reason) ?? '',
+      )) {
         // Not an observation fault: read the named outcome for the operator.
         try {
           const status = await api.programs.appliedStatus();

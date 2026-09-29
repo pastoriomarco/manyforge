@@ -78,7 +78,7 @@ const INSPECTOR_SECTION_MIN_HEIGHT = 140;
 const BRIEF_NOTICE_MS = 8_000;
 
 const PROGRAM_ACTION_LABELS: Partial<Record<ProgramWorkspaceActionName, string>> = {
-  new: 'Creating a new Program Draft',
+  new_scenario_document: 'Creating and activating Scenario',
   open_draft: 'Opening Program as Draft',
   apply: 'Submitting Program Apply',
   discard: 'Discarding Program changes',
@@ -850,6 +850,15 @@ export default function App() {
   return (
     <main className="app-shell">
       <header className="app-header">
+        {(authoringWorkspace.submissionUnconfirmed || authoringWorkspace.recheckMessage !== null) && (
+          <div role="status" title={authoringWorkspace.recheckMessage ?? undefined}>
+            <span>{authoringWorkspace.submissionUnconfirmed ? 'Submission unconfirmed' : 'Submission verified'}</span>
+            {authoringWorkspace.submissionUnconfirmed && <button type="button" disabled={authoringWorkspace.rechecking}
+              onClick={() => { void authoringWorkspace.recheckSubmission(); }}>
+              {authoringWorkspace.rechecking ? 'Checking…' : 'Recheck status'}
+            </button>}
+          </div>
+        )}
         <div className="app-identity" aria-label="ManyForge Composer">
           <span className="brand-mark" aria-hidden="true">MF</span>
           <strong>ManyForge</strong>

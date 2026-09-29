@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-09-28 19:12:31 UTC
+  Last regenerated: 2026-09-29 12:12:44 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -22,6 +22,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/assistant/bridge/tools/{tool_id}` | assistant-draft-callback | Invoke Draft Tool |
 | `GET` | `/api/assistant/modes` | headless-runtime-client | Assistant Modes |
 | `GET` | `/api/assistant/modes/{mode_id}` | headless-runtime-client | Assistant Mode |
+| `GET` | `/api/authoring/submission-outcome` | composer-authoring-workspace | Read Submission Outcome |
 | `GET` | `/api/authoring/workspace` | composer-authoring-workspace | Read Authoring Workspace |
 | `GET` | `/api/catalog` | catalog | Get Catalog |
 | `GET` | `/api/catalog/{entry_id}` | catalog | Get Catalog Entry |
@@ -136,6 +137,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/scenario-documents` | composer-scenario-documents | List Documents |
 | `POST` | `/api/scenario-documents/export` | composer-scenario-documents | Export Document |
 | `POST` | `/api/scenario-documents/load` | composer-scenario-documents | Load Document |
+| `POST` | `/api/scenario-documents/new` | composer-scenario-documents | New Document |
 | `POST` | `/api/scenario-documents/save` | composer-scenario-documents | Save Document |
 | `GET` | `/api/scenarios/current` | headless-runtime-client | Current Scenario |
 | `GET` | `/api/scene` | headless-runtime-client | Scene |

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import OrderedDict
+from copy import deepcopy
 import hashlib
 import threading
 from typing import TYPE_CHECKING, Any, Callable, Mapping
@@ -104,6 +106,36 @@ class AuthoringAdmissionCoordinator:
         self._local_claim_lock = threading.Lock()
         self._local_mutation_lock = threading.Lock()
         self._pending_local_claim: _PendingLocalClaim | None = None
+        # Bounded readback of already-confirmed outcomes, not a replay ledger.
+        # Missing/evicted/restarted evidence is unknown, never proven no-effect.
+        self._outcome_lock = threading.Lock()
+        self._outcomes: OrderedDict[AuthoringMutationEnvelope, dict[str, Any]] = OrderedDict()
+
+    def submission_outcome(self, envelope: AuthoringMutationEnvelope) -> dict[str, Any]:
+        with self._outcome_lock:
+            outcome = deepcopy(self._outcomes.get(envelope))
+        return {
+            "schema_version": "manyforge.authoring_submission_outcome.v1",
+            "request_owner_epoch": envelope.request_owner_epoch,
+            "request_id": envelope.request_id,
+            "expected_admission_generation": envelope.expected_admission_generation,
+            "owner_epoch": self.owner_epoch,
+            "outcome": outcome,
+        }
+
+    def _record_outcome(
+        self, envelope: AuthoringMutationEnvelope, operation_kind: str,
+        apply_identity: dict[str, Any] | None = None,
+    ) -> None:
+        with self._outcome_lock:
+            self._outcomes[envelope] = {
+                "operation_kind": operation_kind,
+                "kind": "manager_accepted" if apply_identity is not None else "settled",
+                "apply": apply_identity,
+            }
+            self._outcomes.move_to_end(envelope)
+            while len(self._outcomes) > 128:
+                self._outcomes.popitem(last=False)
 
     @property
     def mutation_ready(self) -> bool:
@@ -295,7 +327,7 @@ class AuthoringAdmissionCoordinator:
         elif not callable(install):
             raise TypeError("local mutation install must be callable")
         with self._local_mutation_lock:
-            return self._execute_local_mutation_locked(
+            result = self._execute_local_mutation_locked(
                 envelope,
                 operation_kind=operation_kind,
                 draft_id=draft_id,
@@ -309,6 +341,8 @@ class AuthoringAdmissionCoordinator:
                 project=project,
                 prepare_project_under_claim=prepare_project_under_claim,
             )
+            self._record_outcome(envelope, operation_kind)
+            return result
 
     def submit_execution_start(self, callback: Callable[[], Any]) -> Any:
         """Serialize an execution start with Composer's local Draft commits.
@@ -399,6 +433,11 @@ class AuthoringAdmissionCoordinator:
                 )
             if after_release is not None:
                 after_release()
+            self._record_outcome(
+                envelope, operation_kind,
+                {"apply_id": result["apply_id"], "apply_generation": result["apply_generation"]}
+                if result.get("status") == "accepted" else None,
+            )
             return result
 
     def _forget_transferred_local_claim(self, claim: Mapping[str, Any]) -> None:

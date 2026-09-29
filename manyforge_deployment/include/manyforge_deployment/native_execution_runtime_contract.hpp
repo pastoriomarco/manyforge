@@ -33,6 +33,12 @@ inline constexpr std::string_view kRuntimeRoleId = "native_execution";
 /// The CellId scopes this infrastructure role; controller membership does not.
 inline constexpr std::string_view kCellHostRuntimeUnitId =
     "robot_cell.native_execution";
+/// Build-owned infrastructure configuration, with no controller-specific rows.
+/// Shared by startup bootstrap and an authored empty Deployment.
+[[nodiscard]] CanonicalValue empty_host_configuration();
+[[nodiscard]] CanonicalValue empty_host_deployment(
+    const core::CellId &cell_id, const CanonicalValue &runtime_profile_reference,
+    std::string_view deployment_id, std::string_view name);
 inline constexpr std::string_view kStatusEndpointRoleId =
     "native_execution_status";
 inline constexpr std::string_view kProjectionEndpointRoleId =

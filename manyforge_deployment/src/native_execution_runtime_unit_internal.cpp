@@ -1059,6 +1059,56 @@ decode_native_execution_runtime_configuration(
 
 namespace manyforge::deployment::native_execution_runtime_contract {
 
+CanonicalValue empty_host_configuration() {
+  return CanonicalValue(CanonicalValue::Object{
+      {"mode", CanonicalValue("simulated")},
+      {"planner_rng_seed", CanonicalValue(12345.0)},
+      {"execution_tick_hz", CanonicalValue(100.0)},
+      {"collision_monitor_period_ms", CanonicalValue(50.0)},
+      {"initial_joint_positions_rad", CanonicalValue(CanonicalValue::Array{})},
+      {"motion_target_limits", CanonicalValue(CanonicalValue::Array{})},
+      {"direct_control_joint_limits", CanonicalValue(CanonicalValue::Array{})},
+      {"gripper_target_configurations", CanonicalValue(CanonicalValue::Array{})},
+  });
+}
+
+CanonicalValue empty_host_deployment(
+    const core::CellId &cell_id, const CanonicalValue &runtime_profile_reference,
+    std::string_view deployment_id, std::string_view name) {
+  using Object = CanonicalValue::Object;
+  using Array = CanonicalValue::Array;
+  const auto *profile = runtime_profile_reference.find_object_member("record_id");
+  const auto *revision = runtime_profile_reference.find_object_member("record_revision");
+  if (profile == nullptr || revision == nullptr || !profile->is_string() ||
+      profile->as_string() != kRuntimeProfileId || !revision->is_string()) {
+    throw RetainedBundleError("empty native Deployment requires its qualified runtime profile");
+  }
+  return CanonicalValue(Object{
+      {"api_version", CanonicalValue("manyforge.deployment.v1")},
+      {"deployment_artifact_id", CanonicalValue(std::string(deployment_id))},
+      {"deployment_revision", CanonicalValue("sha256:" + std::string(64U, '0'))},
+      {"cell_id", CanonicalValue(cell_id.value())},
+      {"name", CanonicalValue(std::string(name))},
+      {"catalogs", CanonicalValue(Object{{"records", CanonicalValue(Array{runtime_profile_reference})}})},
+      {"graph", CanonicalValue(Object{
+          {"runtime_units", CanonicalValue(Array{CanonicalValue(Object{
+              {"runtime_unit_id", CanonicalValue(std::string(kCellHostRuntimeUnitId))},
+              {"runtime_profile_id", *profile},
+              {"runtime_profile_revision", *revision},
+              {"dependency_runtime_unit_ids", CanonicalValue(Array{})},
+              {"configuration", empty_host_configuration()},
+          })})},
+          {"model_instances", CanonicalValue(Array{})},
+          {"controllable_components", CanonicalValue(Array{})},
+          {"control_domains", CanonicalValue(Array{})},
+          {"control_bindings", CanonicalValue(Array{})},
+          {"component_attachments", CanonicalValue(Array{})},
+      })},
+      {"desired_control_configurations", CanonicalValue(Array{})},
+      {"capability_provider_bindings", CanonicalValue(Array{})},
+  });
+}
+
 Configuration
 require_configuration(const RetainedBundle &retained_bundle,
                       const core::RuntimeUnitId &runtime_unit_id) {

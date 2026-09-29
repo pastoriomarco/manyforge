@@ -5,14 +5,17 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.routing import APIRoute
 from manyforge_behavior.program import Program
 from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha256_digest
-from manyforge_behavior.model_source_capture import capture_deployment_model_sources
+from manyforge_behavior.model_source_capture import (
+    ModelSourceCaptureError,
+    capture_deployment_model_sources,
+)
 from manyforge_headless_api.client import HeadlessClientError
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,6 +23,7 @@ from .authoring_admission import AuthoringMutationEnvelope, headless_client_http
 from .authoring_forest import (
     AuthoringForestError,
     derive_candidate,
+    empty_authoring,
     validate_invariants,
 )
 from .authoring_identity import canonical_digest
@@ -45,6 +49,8 @@ from .scenario_artifacts import (
     discover_scenario_artifacts,
     export_scenario_artifact,
     normalize_scenario_save_path,
+    prepare_scenario_artifact,
+    prepared_scenario_source_digest,
     save_scenario_artifact,
 )
 from .state import ComposerState
@@ -110,6 +116,13 @@ class LoadScenarioDocumentRequest(_ScenarioFence):
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
 
 
+class NewScenarioDocumentRequest(LoadScenarioDocumentRequest):
+    name: str = Field(min_length=1, max_length=256)
+    deployment_choice: Literal["keep_applied", "empty"] = Field(alias="deploymentChoice")
+    expected_retained_bundle_id: str = Field(alias="expectedRetainedBundleId", min_length=1)
+    expected_graph_revision: str = Field(alias="expectedGraphRevision", min_length=1)
+
+
 class ExportScenarioDocumentRequest(_ScenarioFence):
     destination_path: str = Field(
         alias="destinationPath", min_length=1, max_length=4096
@@ -117,6 +130,10 @@ class ExportScenarioDocumentRequest(_ScenarioFence):
 
 
 def _raise(error: Exception) -> NoReturn:
+    if isinstance(error, ModelSourceCaptureError):
+        raise HTTPException(status_code=409, detail={
+            "code": "scenario_model_source_unavailable", "message": str(error),
+        }) from error
     if isinstance(error, HeadlessClientError):
         raise headless_client_http_exception(error) from error
     if isinstance(error, ScenarioArtifactError):
@@ -360,6 +377,15 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 )
                 if captured_workspace["program"]["candidateAvailable"] else None
             )
+            empty_program_save = None
+            if (isinstance(authoring, dict) and authoring.get("forest") == []
+                    and not authoring.get("scene")):
+                retained = state.draft_session.retained_state()
+                retained.update(
+                    saved_path=str(Path(target) / SCENARIO_PROJECT_MEMBERS["program_draft"]),
+                    saved_program_revision=None, saved_document=deepcopy(authoring),
+                )
+                empty_program_save = state.draft_session.prepare_load_replacement(retained, state.node_catalog)
             deployment_save = (
                 state.deployment_draft_session.prepare_save(
                     draft_id=body.deployment_draft_id,
@@ -378,6 +404,8 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         saved_path=str(Path(saved_path) / SCENARIO_PROJECT_MEMBERS["program_draft"]),
                     ) if program_save is not None else False
                 )
+                if empty_program_save is not None:
+                    program_changed = state.draft_session.install_prepared_replacement(empty_program_save)
                 deployment_changed = (
                     state.deployment_draft_session.install_prepared_save(
                         deployment_save,
@@ -461,22 +489,72 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/scenario-documents/load")
     def load_document(body: LoadScenarioDocumentRequest) -> dict[str, Any]:
+        return activate_document(body)
+
+    @router.post("/api/scenario-documents/new")
+    def new_document(body: NewScenarioDocumentRequest) -> dict[str, Any]:
+        return activate_document(body)
+
+    def activate_document(body: LoadScenarioDocumentRequest) -> dict[str, Any]:
         committed_path: str | None = None
+        created_path: str | None = None
         committed_snapshot = None
         activation: dict[str, Any] | None = None
+        creating = isinstance(body, NewScenarioDocumentRequest)
         try:
             _require_fence(state, body)
             captured_workspace = state.authoring_workspace.snapshot()
             _require_captured_workspace_fence(body, captured_workspace.identity)
             authoring_catalog = state.node_catalog
-            (
-                scenario_document,
-                source_path,
-                source_digest,
-                source_diagnostics,
-            ) = capture_scenario_artifact_with_diagnostics(
-                body.path, allowed_roots=state.allowed_fs_roots
-            )
+            if creating:
+                if not body.confirm_discard:
+                    raise ScenarioArtifactError("scenario_discard_confirmation_required",
+                        "New closes the current Scenario and clears its Scene; confirmation is required", status_code=409)
+                if not body.name.strip():
+                    raise ScenarioArtifactError("scenario_name_invalid", "Scenario name must not be blank")
+                context = None
+                if body.deployment_choice == "keep_applied":
+                    publication = state.published_scenario().get("published_scenario")
+                    context = (state.applied_activation_for_publication(publication)
+                               if isinstance(publication, dict) else None)
+                    if context is None or not isinstance(context.get("project_path"), str):
+                        raise ScenarioArtifactError("scenario_applied_source_unavailable",
+                            "The exact Applied Deployment source is unavailable; New cannot substitute its Draft", status_code=409)
+                    deployment = deepcopy(context["deployment"])
+                else:
+                    deployment = {
+                        "api_version": "manyforge.deployment_intent.v2",
+                        "deployment_artifact_id": "empty_scenario",
+                        "name": "Empty Deployment",
+                        "components": [], "attachments": [], "policies": {},
+                    }
+                authoring = empty_authoring(authoring_catalog)
+                authoring["name"] = body.name.strip()
+                scenario_document = build_scenario_document(
+                    scenario_id="scenario-" + uuid.uuid4().hex,
+                    name=body.name.strip(), description="", program_draft=authoring,
+                    deployment_draft=deployment,
+                    program_role_assignment={"component_roles": [], "target_roles": []},
+                    typed_parameter_overrides={}, manyforge_version=_version(),
+                    last_known_status="incomplete",
+                )
+                scenario_document, target, members, manifest = prepare_scenario_artifact(
+                    scenario_document, body.path, allowed_roots=state.allowed_fs_roots,
+                    source_project_path=context["project_path"] if context is not None else None,
+                )
+                if target.exists() or target.is_symlink():
+                    raise ScenarioArtifactError("scenario_destination_exists", "New requires a new project folder", status_code=409)
+                source_path = str(target)
+                source_digest = prepared_scenario_source_digest(members, manifest)
+                source_diagnostics = []
+                if context is not None and capture_deployment_model_sources(
+                    scenario_document["deployment_draft"], project_root=target
+                ) != context["model_source_closure"]:
+                    raise ScenarioArtifactError("scenario_applied_source_changed",
+                        "Applied Deployment sources changed; New cannot silently apply them", status_code=409)
+            else:
+                (scenario_document, source_path, source_digest, source_diagnostics) = capture_scenario_artifact_with_diagnostics(
+                    body.path, allowed_roots=state.allowed_fs_roots)
             scenario_document_id = scenario_document["scenario_id"]
             authoring = scenario_document["program_draft"]
             deployment = deepcopy(scenario_document["deployment_draft"])
@@ -496,12 +574,13 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             post_state = _workspace_post_state(
                 state, authoring, program, diagnostics, deployment
             )
+            no_program = authoring is not None and authoring.get("forest") == [] and not authoring.get("scene")
             incomplete = (
-                program is None
+                (program is None and not no_program)
                 or deployment is None
                 or scenario_document["program_role_assignment"] is None
             )
-            if incomplete or program is None or not isinstance(deployment, dict):
+            if incomplete or not isinstance(deployment, dict):
                 raise ScenarioArtifactError(
                     "scenario_activation_incomplete",
                     "only a complete v2 Scenario document can be loaded",
@@ -511,8 +590,8 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             # of whether the subsequent Apply succeeds.
             post_state["program"].update(
                 saved_path=str(Path(source_path) / SCENARIO_PROJECT_MEMBERS["program_draft"]),
-                saved_program_revision=program.program_revision,
-                saved_document=program.to_dict(),
+                saved_program_revision=program.program_revision if program is not None else None,
+                saved_document=program.to_dict() if program is not None else deepcopy(authoring),
             )
             post_state["deployment"].update(
                 saved_path=str(Path(source_path) / SCENARIO_PROJECT_MEMBERS["deployment_draft"]),
@@ -536,7 +615,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "source_document_digest": source_digest,
                         "deployment": deployment,
                         "model_source_closure": source_closure,
-                        "program": program.to_dict(),
+                        "program": program.to_dict() if program is not None else None,
                         "program_role_assignment": assignment,
                         "typed_parameter_overrides": overrides,
                     }
@@ -545,13 +624,17 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             bundle, graph, _epoch = state._manager_current(
                 state.headless_client.manager_status()
             )
+            if creating and (body.expected_retained_bundle_id != bundle or body.expected_graph_revision != graph):
+                raise ScenarioArtifactError("scenario_activation_preview_changed",
+                    "Applied Deployment changed since New was opened; review the choice again", status_code=409)
             activation_intent: dict[str, Any] = {
                 "scenario_id": scenario_document["scenario_id"],
                 "source_document_digest": source_digest,
                 "captured_input_digest": captured_digest,
                 "deployment": deepcopy(deployment),
                 "model_source_closure": source_closure,
-                "program": program.to_dict(),
+                "program": program.to_dict() if program is not None else None,
+                "program_authoring": deepcopy(authoring),
                 "program_role_assignment": assignment,
                 "typed_parameter_overrides": overrides,
                 "expected_manager_current": {
@@ -575,6 +658,22 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             activation_preview = state.execute_authored_deployment_candidate(
                 activation_intent, None, apply=True, prepare_only=True
             )
+            if creating:
+                # The dialog authorizes exactly keep-all or remove-all for the
+                # captured Applied Deployment, never a hidden replacement/add.
+                preview = activation_preview.get("candidate_preview")
+                impact = preview.get("impact") if isinstance(preview, dict) else None
+                changes = impact.get("components") if isinstance(impact, dict) else None
+                expected = "retain" if body.deployment_choice == "keep_applied" else "remove"
+                if not isinstance(changes, list) or any(
+                    not isinstance(change, dict) or change.get("disposition") != expected
+                    for change in changes
+                ):
+                    raise ScenarioArtifactError(
+                        "scenario_new_impact_changed",
+                        "New would change components beyond the confirmed Deployment choice",
+                        status_code=409,
+                    )
             if activation_preview.get("confirmation_required") is True:
                 token = activation_preview.get("confirmation_token")
                 if not isinstance(token, str) or not token:
@@ -690,7 +789,12 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 activation_prepared = activation_preview
 
             def commit_load() -> None:
-                nonlocal committed_path, committed_snapshot
+                nonlocal committed_path, committed_snapshot, created_path
+                if creating:
+                    created_path = save_scenario_artifact(
+                        scenario_document, source_path, allowed_roots=state.allowed_fs_roots,
+                        overwrite=False, expected_source_digest=source_digest,
+                    )
                 committed_snapshot = state.authoring_workspace.replace(
                     expected_identity=captured_workspace.identity,
                     install=install_load,
@@ -722,7 +826,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
             activation = coordinator.execute_external_submission(
                 body.admission_envelope(),
-                operation_kind="load_scenario_document",
+                operation_kind="new_scenario_document" if creating else "load_scenario_document",
                 draft_id=body.draft_id,
                 draft_revision=body.expected_draft_revision,
                 payload={
@@ -751,6 +855,15 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 "authoringWorkspace": workspace["authoringWorkspace"],
             }
         except Exception as error:
+            if created_path is not None:
+                raise HTTPException(status_code=503, detail={
+                    "code": "scenario_created_not_activated",
+                    "message": "The new Scenario was saved, but activation was not confirmed. No automatic retry was made.",
+                    "path": created_path,
+                    "cause": error.detail if isinstance(error, HTTPException) else str(error),
+                    "activation": activation,
+                    "workspace": state.authoring_workspace.identity().as_dict(),
+                }) from error
             if committed_path is not None and committed_snapshot is not None:
                 # The local workspace was committed before Manager submission.
                 # Preserve that observable partial result; never report Load as
