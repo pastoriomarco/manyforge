@@ -122,7 +122,9 @@
   align-items: center;
 }
 
-.document-actions button {
+/* Toolbar buttons only: dialogs opened from the toolbar render inside it
+   and keep the ordinary button look. */
+.document-actions button:not(.overlay-panel *) {
   min-height: 1.9rem;
   padding: 0.28rem 0.48rem;
   border-color: transparent;
@@ -401,7 +403,7 @@
 }
 
 @media (max-width: 90rem) {
-  .document-actions button {
+  .document-actions button:not(.overlay-panel *) {
     padding-inline: 0.34rem;
   }
 
@@ -436,4 +438,142 @@
 
 .deployment-apply-impact ul {
   padding-left: 1.1rem;
+}
+
+/* New Scenario dialog: cards for the Scenario and its Deployment, required
+   marks, a hint or error under each field, and the actions at the end. */
+.overlay-panel:has(.new-scenario-dialog) {
+  width: min(34rem, calc(100vw - 2rem));
+}
+
+.new-scenario-dialog {
+  margin: -0.25rem;
+  border-radius: var(--mf-radius-md);
+}
+
+.new-scenario-intro,
+.new-scenario-note {
+  margin: 0;
+  color: var(--mf-text-neutral-73);
+  font-size: var(--mf-font-size-076);
+  line-height: 1.5;
+}
+
+.new-scenario-note {
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-072);
+}
+
+.required-mark {
+  color: var(--mf-text-danger-75);
+  font-weight: var(--mf-font-weight-bold);
+}
+
+.field-hint,
+.field-error {
+  font-size: var(--mf-font-size-068);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.field-hint {
+  color: var(--mf-text-neutral-63);
+}
+
+.field-error {
+  color: var(--mf-text-danger-77);
+}
+
+.field-hint code {
+  color: var(--mf-text-neutral-86);
+}
+
+.new-scenario-location {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-072);
+}
+
+.new-scenario-location > span {
+  grid-column: 1 / -1;
+}
+
+.new-scenario-location > code {
+  min-width: 0;
+  color: var(--mf-text-neutral-86);
+  overflow-wrap: anywhere;
+}
+
+.new-scenario-location > button {
+  min-height: 1.8rem;
+  padding: 0.15rem 0.7rem;
+  font-size: var(--mf-font-size-072);
+}
+
+.new-scenario-actions {
+  justify-content: flex-end;
+}
+
+.new-scenario-actions > button {
+  flex: 0 1 auto;
+}
+
+/* Folder picker: folders only, inside the backend-approved roots. */
+.folder-picker {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.5rem;
+  border: 1px solid var(--mf-border-neutral-23);
+  border-radius: var(--mf-radius-md);
+  background: var(--mf-bg-neutral-03-a67);
+}
+
+.folder-picker-bar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.folder-picker-bar > button,
+.folder-picker-roots > button {
+  min-height: 1.7rem;
+  padding: 0.1rem 0.55rem;
+  font-size: var(--mf-font-size-068);
+}
+
+.folder-picker-bar > code {
+  min-width: 0;
+  color: var(--mf-text-neutral-86);
+  font-size: var(--mf-font-size-068);
+  overflow-wrap: anywhere;
+}
+
+.folder-picker-roots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.folder-picker-list {
+  display: grid;
+  max-height: 12rem;
+  overflow-y: auto;
+}
+
+.folder-picker-list > button {
+  min-height: 1.8rem;
+  padding: 0.2rem 0.4rem;
+  border: 0;
+  border-radius: var(--mf-radius-sm);
+  font-size: var(--mf-font-size-072);
+  text-align: left;
+}
+
+.folder-picker-list > p {
+  margin: 0;
+  font-size: var(--mf-font-size-072);
 }

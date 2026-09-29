@@ -432,6 +432,35 @@ describe('useAuthoringWorkspace', () => {
     expect(latest!.unavailableReason).toContain('Manager operation');
   });
 
+  it('correlates a lost reply to its Apply by exact request id, never by the latest record', async () => {
+    apiMock.failedIdentity.mockReturnValue({ requestOwnerEpoch: 'browser.1', requestId: 'composer-document.1', expectedAdmissionGeneration: 7 });
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => { latest!.beginMutation(); latest!.finishMutation(null, new Error('lost')); });
+    const unrelated = managerApplyRecord('terminal', 'unknown_effect');
+    unrelated.request = { ...unrelated.request, correlation_id: 'composer-document.other' as never };
+    const other = headlessSnapshot(1);
+    other.runtime.sections.manager.payload = { apply: {
+      records: [unrelated], mutation_available: false, unavailable_reason_code: 'unknown_effect',
+    } };
+    await rerender(other);
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    expect(latest!.correlatedApply).toBe(null);
+    const own = managerApplyRecord('terminal', 'unknown_effect');
+    own.apply_id = 'apply-7';
+    own.request = { ...own.request, correlation_id: 'composer-document.1' as never };
+    const matched = headlessSnapshot(1);
+    matched.runtime.sections.manager.payload = { apply: {
+      records: [unrelated, own], mutation_available: false, unavailable_reason_code: 'unknown_effect',
+    } };
+    await rerender(matched);
+    expect(latest!.correlatedApply).toEqual({ applyId: 'apply-7', applyGeneration: 3 });
+    expect(latest!.submissionUnconfirmed).toBe(false);
+    expect(latest!.beginMutation()).toBe(false);
+    expect(latest!.unavailableReason).toContain('Manager operation');
+  });
+
   it('reads once after a real reconnect, even through delay, and retains identical objects', async () => {
     apiMock.authoringWorkspace.get.mockImplementation(async () => snapshotFixture(1, 3, 4, '/workspace/cell'));
     const rerender = await mountHarness(headlessSnapshot(1));

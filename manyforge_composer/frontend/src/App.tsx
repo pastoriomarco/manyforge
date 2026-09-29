@@ -448,9 +448,10 @@ export default function App() {
   ]);
 
   // Activity follows the exact accepted Manager operation: the advertised
-  // maintenance operation (also after a browser reload) or the identity this
-  // browser's accepted Load/Apply/Revert returned. A different or older
-  // operation's status never clears it.
+  // maintenance operation (also after a browser reload), the identity this
+  // browser's accepted Load/Apply/Revert returned, or the Apply recorded for
+  // a lost reply's exact request id. A different or older operation's status
+  // never clears it.
   const [trackedApply, setTrackedApply] = useState<ManagerApplyIdentity | null>(null);
   useEffect(() => {
     if (programController.acceptedApply !== null) setTrackedApply(programController.acceptedApply);
@@ -458,6 +459,9 @@ export default function App() {
   useEffect(() => {
     if (deploymentController.acceptedApply !== null) setTrackedApply(deploymentController.acceptedApply);
   }, [deploymentController.acceptedApply]);
+  useEffect(() => {
+    if (authoringWorkspace.correlatedApply !== null) setTrackedApply(authoringWorkspace.correlatedApply);
+  }, [authoringWorkspace.correlatedApply]);
   const maintenance = headlessSnapshot?.componentOverview.maintenanceOperation ?? null;
   const observedApply = useMemo<ManagerApplyIdentity | null>(() => (
     maintenance !== null
@@ -477,6 +481,11 @@ export default function App() {
   useEffect(() => {
     authoringWorkspace.observeApply(activation.status);
   }, [authoringWorkspace, activation.status]);
+  const savedScenarioPath = headlessState.transportStatus === 'connected'
+    && authoringWorkspace.current
+    ? authoringWorkspace.project?.documentPath ?? null
+    : null;
+  const authoringAdmissionOpen = headlessSnapshot?.authoringAdmission.authoringAllowed ?? null;
   // Only owner evidence scopes a transition: the observed activation's status
   // read as pending. An advertised, submitted or unobservable (lost) operation
   // is not evidence, so it never downgrades an error.
@@ -489,7 +498,13 @@ export default function App() {
     if (observedApply === null) return [];
     const id = `activation.${observedApply.applyId}:${observedApply.applyGeneration}`;
     if (activationStatus?.state === 'failed' || activationStatus?.state === 'unknown_effect') {
-      return [activationFailureNotice(id, observedApply.applyId, activationStatus)];
+      return [activationFailureNotice(
+        id,
+        observedApply.applyId,
+        { state: activationStatus.state, failure: activationStatus.failure },
+        savedScenarioPath,
+        authoringAdmissionOpen,
+      )];
     }
     if (activationStatus?.state === 'succeeded') return [];
     if (activationUnobservable) {
@@ -510,7 +525,7 @@ export default function App() {
       message: `Manager phase: ${String(phase).replaceAll('_', ' ')} (${observedApply.applyId}). Motion does not start automatically.`,
       busy: true,
     }];
-  }, [activationStatus, activationUnobservable, maintenance, observedApply]);
+  }, [activationStatus, activationUnobservable, authoringAdmissionOpen, maintenance, observedApply, savedScenarioPath]);
   const activationCompleted = useBriefNotice(
     observedApply !== null && activationStatus?.state === 'succeeded'
       ? {

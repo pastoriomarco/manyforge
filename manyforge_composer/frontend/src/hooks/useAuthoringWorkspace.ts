@@ -50,6 +50,7 @@ export function useAuthoringWorkspace(
   const recheckingRef = useRef(false);
   const [rechecking, setRechecking] = useState(false);
   const [recheckMessage, setRecheckMessage] = useState<string | null>(null);
+  const [correlatedApply, setCorrelatedApply] = useState<ManagerApplyIdentity | null>(null);
   const manager = snapshot?.runtime.sections?.manager;
   const managerAdmission = useMemo(() => {
     if (!manager?.available || manager.freshness !== 'fresh') {
@@ -78,6 +79,24 @@ export function useAuthoringWorkspace(
       setSubmissionState(null);
     }
   }, [manager, managerAdmission, submissionState]);
+
+  useEffect(() => {
+    // A lost reply is not a lost operation. Every Manager-submitting route
+    // records this browser's own request id as the Apply's correlation id, so
+    // the exact record (never merely the latest one) identifies its Apply.
+    const request = unknownRequest.current;
+    if (submission.current !== 'unknown' || request === null) return;
+    const record = managerAdmission.records.find(
+      (candidate) => candidate.request.correlationId === request.requestId,
+    );
+    if (record === undefined) return;
+    const identity = { applyId: record.applyId, applyGeneration: record.applyGeneration };
+    submission.current = identity;
+    unknownRequest.current = null;
+    setSubmissionState(identity);
+    setCorrelatedApply(identity);
+    setRecheckMessage(`Request ${request.requestId}: Manager recorded Apply ${identity.applyId} (${identity.applyGeneration}).`);
+  }, [managerAdmission, submissionState]);
 
   const observed = snapshot === null ? null : snapshot.authoringWorkspace;
   const observedKey = observed === null
@@ -260,10 +279,12 @@ export function useAuthoringWorkspace(
     finishMutation,
     observeApply,
     submissionUnconfirmed: submissionState === 'unknown',
+    /** The Manager Apply found for a lost reply by its exact request id. */
+    correlatedApply,
     rechecking,
     recheckMessage,
     recheckSubmission,
-  }), [current, error, facts, published, reading, refresh, unavailableReason, beginMutation, finishMutation, observeApply, submissionState, rechecking, recheckMessage, recheckSubmission]);
+  }), [current, error, facts, published, reading, refresh, unavailableReason, beginMutation, finishMutation, observeApply, submissionState, correlatedApply, rechecking, recheckMessage, recheckSubmission]);
 }
 
 export type AuthoringWorkspaceController = ReturnType<typeof useAuthoringWorkspace>;

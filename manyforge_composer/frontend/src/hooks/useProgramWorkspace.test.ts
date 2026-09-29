@@ -68,6 +68,7 @@ function testAuthoringController(
     finishMutation: () => undefined,
     observeApply: () => undefined,
     submissionUnconfirmed: false,
+    correlatedApply: null,
     rechecking: false,
     recheckMessage: null,
     recheckSubmission: async () => undefined,

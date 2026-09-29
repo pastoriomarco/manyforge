@@ -71,6 +71,26 @@ Inspect the exact owner-issued active tuple or stop all workbench processes:
 ./scripts/compose-dev.sh stop
 ```
 
+Plain `stop` discards runtime state. To stop the workbench and preserve its
+diagnostic state, use:
+
+```bash
+./scripts/compose-dev.sh stop --keep-evidence
+```
+
+The command copies nothing until Docker confirms that the container stopped.
+It then writes `.manyforge-dev/evidence/<UTC timestamp>.partial/`, containing the
+`manyforge-state/` tree except its reproducible `installed-targets/` directory,
+plus `docker.log` and a bounded `docker-inspect.json` summary containing the
+image, mounts and exit state (not container environment variables). Once
+complete, it renames the bundle to `<UTC timestamp>/`, removes the container
+and prints that path. Evidence is not deleted automatically. If collection or
+finalization fails, the command exits non-zero, keeps the stopped container and
+may leave the partial directory.
+If only container removal fails, the completed bundle and stopped container are
+both retained. When set, `MANYFORGE_DEV_CACHE_BASE` places the bundle under its
+own `evidence/` directory instead.
+
 Each resolved immutable workbench image gets a separate cache under
 `.manyforge-dev/images/`; rebuilding the mutable image tag therefore cannot
 reuse native readers or npm dependencies from an incompatible runtime. Override
@@ -129,10 +149,55 @@ docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' manyforge-develo
 ```
 
 Use the selected `MANYFORGE_DEV_CONTAINER_NAME` if overridden. Child-process
-output is inherited by the container log. Capture logs/status before `stop`,
-which removes the container and runtime state; persist wanted artifacts first.
+output is inherited by the container log. Capture logs/status before plain
+`stop`, which removes the container and runtime state; persist wanted artifacts
+first, or use `stop --keep-evidence` for the diagnostic bundle described above.
 On a failed new start, the launcher prints the last logs before removing the
 container it created, so retain the startup terminal output too.
+
+### Terminal Apply recovery (simulated workbench only)
+
+Use this procedure only when Composer reports that a terminal Apply left the
+runtime locked: an `unknown_effect` outcome, or a `failed` outcome other than
+the exact pair `effect_disposition=known` and `failure_phase=accepted`. That
+exact pair is a clean pre-effect refusal; correct its named cause and do not
+restart the workbench merely because the Apply failed. The terminal record is
+not admission readback: retry only when the current owner reports admission
+open. If it remains closed or unavailable, inspect Runtime/history for the
+current holder rather than assuming either successful settlement or a
+catastrophic lock.
+
+For a locked outcome, do not retry it or resume execution. From the repository
+root, either close the failed runtime:
+
+```bash
+./scripts/compose-dev.sh stop --keep-evidence
+```
+
+Or preserve it and cold-reload the current Saved Scenario in a fresh container:
+
+```bash
+./scripts/compose-dev.sh stop --keep-evidence && \
+  ./scripts/compose-dev.sh start --project 'path/to/saved.scenario'
+```
+
+The project argument must be a safely shell-quoted Scenario project directory
+relative to the repository root; it must contain `scenario.yaml`. A Saved
+Scenario outside the repository, or a Saved single-file `.scenario.yaml`/
+`.scenario.yml` artifact, cannot be reloaded by this workbench command. Use
+Close to preserve the evidence, then reopen such a Scenario through a
+supported workflow. The page disconnects while the container is replaced and
+may need a refresh; unsaved Draft changes are lost. Startup validates the
+Saved Scenario, so invalid content leaves the runtime closed. A successful
+reload does not start a Program or authorize motion automatically.
+
+Ordinary Scenario Load remains a Manager Apply and does not restart the
+workbench. These commands are a development-workbench fallback for a runtime
+that deliberately retained its restrictions; the future installed GUI
+affordance belongs to the installed lifecycle supervisor, not this script.
+
+This procedure is only for the simulated development workbench. It is not a
+containment or recovery procedure for physical equipment.
 
 | Symptom | Action |
 | --- | --- |

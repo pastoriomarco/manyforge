@@ -116,8 +116,13 @@ class LoadScenarioDocumentRequest(_ScenarioFence):
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
 
 
+# A new Scenario's name is one word, also used as its project folder name:
+# letters, digits, "_" and "-", starting with a letter or digit.
+NEW_SCENARIO_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]*$"
+
+
 class NewScenarioDocumentRequest(LoadScenarioDocumentRequest):
-    name: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=256, pattern=NEW_SCENARIO_NAME_PATTERN)
     deployment_choice: Literal["keep_applied", "empty"] = Field(alias="deploymentChoice")
     expected_retained_bundle_id: str = Field(alias="expectedRetainedBundleId", min_length=1)
     expected_graph_revision: str = Field(alias="expectedGraphRevision", min_length=1)

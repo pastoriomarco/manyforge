@@ -2567,7 +2567,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
   const renderer = useMemo(() => ({
     ...inspection,
     ...selectViewerPresentationProfile(devicePixelRatio, graphicsProfile),
-  }), [graphicsProfile, inspection]);
+  }), [devicePixelRatio, graphicsProfile, inspection]);
   useEffect(() => {
     if (inspection.renderer !== null) setViewerQualificationRenderer(renderer);
   }, [inspection.renderer, renderer]);

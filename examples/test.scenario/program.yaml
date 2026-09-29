@@ -1,0 +1,61 @@
+{
+  "schema_version": "manyforge.composer_authoring_forest.v1",
+  "api_version": "manyforge.program.v2",
+  "program_id": "program-2af87dd994414ea697ee90b3057c83f6",
+  "program_profile": "composable-cell-v1",
+  "name": "test",
+  "catalog": {
+    "api_version": "manyforge.node_catalog.v2",
+    "content_version": "2.3.0"
+  },
+  "component_roles": {
+    "component": {}
+  },
+  "target_roles": {},
+  "parameters": [
+    {
+      "parameter_id": "acceleration_scale",
+      "type": "float64",
+      "default": 1.0,
+      "constraints": {
+        "min_exclusive": 0.0,
+        "max_inclusive": 1.0
+      },
+      "runtime_mutability": "before_run",
+      "description": "Default acceleration scale for motion nodes."
+    },
+    {
+      "parameter_id": "max_blend_deviation_rad",
+      "type": "float64",
+      "default": 0.01,
+      "constraints": {
+        "min_inclusive": 0.0
+      },
+      "runtime_mutability": "before_run",
+      "description": "Default maximum Cartesian blend deviation."
+    },
+    {
+      "parameter_id": "translation_tol_m",
+      "type": "float64",
+      "default": 0.005,
+      "constraints": {
+        "min_exclusive": 0.0
+      },
+      "runtime_mutability": "before_run",
+      "description": "Default Cartesian translation tolerance for motion nodes."
+    },
+    {
+      "parameter_id": "velocity_scale",
+      "type": "float64",
+      "default": 1.0,
+      "constraints": {
+        "min_exclusive": 0.0,
+        "max_inclusive": 1.0
+      },
+      "runtime_mutability": "before_run",
+      "description": "Default velocity scale for motion nodes."
+    }
+  ],
+  "forest": [],
+  "positions": {}
+}

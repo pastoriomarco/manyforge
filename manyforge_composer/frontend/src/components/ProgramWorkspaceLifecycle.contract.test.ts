@@ -91,7 +91,7 @@ describe('Program workspace lifecycle controls', () => {
 
     expect(scenarioSource).toContain('New Scenario');
     expect(scenarioSource).toContain('newScenarioDocument({');
-    expect(scenarioSource).toContain('Keep Applied Deployment');
+    expect(scenarioSource).toContain('Keep the Applied components');
     expect(scenarioSource).toContain('Create and unload components');
     expect(source).toContain('Revert to saved');
     expect(source).toContain('Discard changes');

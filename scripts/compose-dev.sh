@@ -28,7 +28,74 @@ cleanup_failed_start() {
 trap cleanup_failed_start EXIT
 
 usage() {
-  echo "Usage: $0 start [--project <scenario-project-folder>] | status | stop" >&2
+  echo "Usage: $0 start [--project <scenario-project-folder>] | status | stop [--keep-evidence]" >&2
+}
+
+stop_with_evidence() {
+  if ! docker stop --time 15 "$container_name" >/dev/null; then
+    echo "Failed to stop the development workbench; no evidence was copied." >&2
+    return 69
+  fi
+
+  local running
+  if ! running=$(docker inspect -f '{{.State.Running}}' "$container_name"); then
+    echo "Could not verify that the development workbench stopped; no evidence was copied." >&2
+    return 69
+  fi
+  if [[ "$running" != false ]]; then
+    echo "Development workbench is still running; no evidence was copied." >&2
+    return 69
+  fi
+
+  local timestamp evidence_root evidence_path partial_path
+  timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+  evidence_root="$cache_base/evidence"
+  evidence_path="$evidence_root/$timestamp"
+  partial_path="$evidence_path.partial"
+  if ! mkdir -p "$evidence_root" ||
+      [[ -e "$evidence_path" || -e "$partial_path" ]] ||
+      ! mkdir "$partial_path"; then
+    echo "Could not create partial evidence folder: $partial_path" >&2
+    echo "The stopped container was retained: $container_name" >&2
+    return 69
+  fi
+
+  if ! docker cp "$container_name:/tmp/manyforge-state" - |
+      tar --extract --no-same-owner --directory "$partial_path" \
+        --exclude='installed-targets'; then
+    echo "Could not copy runtime evidence. Partial evidence: $partial_path" >&2
+    echo "The stopped container was retained: $container_name" >&2
+    return 69
+  fi
+  if ! docker logs "$container_name" >"$partial_path/docker.log" 2>&1; then
+    echo "Could not copy container logs. Partial evidence: $partial_path" >&2
+    echo "The stopped container was retained: $container_name" >&2
+    return 69
+  fi
+  local inspect_format
+  inspect_format='{"image":{{json .Image}},"mounts":{{json .Mounts}},'
+  inspect_format+='"state":{"status":{{json .State.Status}},'
+  inspect_format+='"running":{{json .State.Running}},'
+  inspect_format+='"exit_code":{{json .State.ExitCode}},'
+  inspect_format+='"finished_at":{{json .State.FinishedAt}}}}'
+  if ! docker inspect --format "$inspect_format" "$container_name" \
+      >"$partial_path/docker-inspect.json"; then
+    echo "Could not inspect the stopped container. Partial evidence: $partial_path" >&2
+    echo "The stopped container was retained: $container_name" >&2
+    return 69
+  fi
+  if ! mv --no-clobber --no-target-directory "$partial_path" "$evidence_path" ||
+      [[ -e "$partial_path" ]]; then
+    echo "Could not finalize evidence folder. Partial evidence: $partial_path" >&2
+    echo "The stopped container was retained: $container_name" >&2
+    return 69
+  fi
+  if ! docker rm "$container_name" >/dev/null; then
+    echo "Evidence was preserved at $evidence_path, but the stopped container could not be removed." >&2
+    return 69
+  fi
+
+  echo "Evidence preserved at $evidence_path"
 }
 
 command=${1:-}
@@ -131,7 +198,21 @@ case "$command" in
     docker exec "$container_name" python3 scripts/dev-workbench.py status
     ;;
   stop)
+    keep_evidence=false
+    if [[ ${1:-} == --keep-evidence ]]; then
+      keep_evidence=true
+      shift
+    fi
     (($# == 0)) || { usage; exit 64; }
+    if [[ "$keep_evidence" == true ]]; then
+      docker inspect "$container_name" >/dev/null 2>&1 || {
+        echo "Cannot preserve evidence: development workbench container does not exist." >&2
+        exit 69
+      }
+      stop_with_evidence
+      echo "Development workbench is stopped. Build and npm caches were retained."
+      exit 0
+    fi
     if docker inspect "$container_name" >/dev/null 2>&1; then
       docker stop --time 15 "$container_name" >/dev/null || true
       docker rm "$container_name" >/dev/null || true

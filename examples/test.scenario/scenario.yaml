@@ -1,0 +1,26 @@
+{
+  "api_version": "manyforge.scenario.project.v1",
+  "scenario_id": "scenario-fc2fb11107224968a313842fc50c61b8",
+  "name": "test",
+  "description": "",
+  "content": {
+    "deployment_present": true,
+    "program_present": true,
+    "assignment_present": true
+  },
+  "members": {
+    "assignment.yaml": "sha256:64aa514af212149a52874df49f129f07e863c8f6c42764c532a923fe80d61ba7",
+    "deployment.yaml": "sha256:3a3d32079cf26d146ee9bda01372a17b4351b88e978c9197393adfa850607f0a",
+    "overrides.yaml": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+    "program.yaml": "sha256:e03ac2cc82aed55ad772480932488186be41afd1ea1d0841a69d6e7a357b564d"
+  },
+  "source_snapshot": {
+    "schema_version": "manyforge.scenario.source_snapshot.v1",
+    "entries": []
+  },
+  "saved_status": {
+    "manyforge_version": "0.1.0",
+    "last_known_status": "incomplete",
+    "checked_content_digest": "sha256:857ce278f05ef453fe837f72b475d51637325f761533be37d908fc27c723f240"
+  }
+}

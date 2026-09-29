@@ -814,7 +814,7 @@ def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
         saved, _path, digest = capture_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
         assert digest == intent["source_document_digest"]
         assert saved["program_draft"] == intent["program_authoring"]
-        assert saved["name"] == "New cell"
+        assert saved["name"] == "new_cell"
         if failure == "submit":
             raise HeadlessClientError("manager_unavailable", "reply lost", status_code=503)
         return {"status": "accepted", "apply_id": "new-apply"}
@@ -825,7 +825,7 @@ def test_new_empty_scenario_saves_before_activation_and_preserves_failure(
             raise ScenarioArtifactError("scenario_save_failed", "disk unavailable", status_code=503)
         monkeypatch.setattr(routes_scenario_documents, "save_scenario_artifact", refuse_save)
     response = _scenario_client(state).post("/api/scenario-documents/new", json={
-        **_fence(state), "path": str(target), "name": "New cell", "deploymentChoice": choice,
+        **_fence(state), "path": str(target), "name": "new_cell", "deploymentChoice": choice,
         "confirmDiscard": True, "expectedRetainedBundleId": "other" if failure == "stale" else "bundle",
         "expectedGraphRevision": "graph",
     })
@@ -874,6 +874,23 @@ def test_new_keep_refuses_missing_applied_source_instead_of_using_draft(
     })
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "scenario_applied_source_unavailable"
+    assert state.authoring_workspace.snapshot() == before
+    assert not (tmp_path / "new").exists()
+
+
+@pytest.mark.parametrize("name", [
+    "New cell", "new\tcell", " new_cell", "new_cell ", "-leading", "_leading",
+    "dotted.name", "slash/name", "",
+])
+def test_new_scenario_name_is_one_word(tmp_path: Path, name: str) -> None:
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    before = state.authoring_workspace.snapshot()
+    response = _scenario_client(state).post("/api/scenario-documents/new", json={
+        **_fence(state), "path": str(tmp_path / "new"), "name": name,
+        "deploymentChoice": "empty", "confirmDiscard": True,
+        "expectedRetainedBundleId": "bundle", "expectedGraphRevision": "graph",
+    })
+    assert response.status_code == 422, response.text
     assert state.authoring_workspace.snapshot() == before
     assert not (tmp_path / "new").exists()
 

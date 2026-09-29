@@ -21,6 +21,15 @@ hardening done before the first tag was granted.
 
 ### Added
 
+- **Contained-Apply workbench evidence preservation**: after an unknown-effect
+  or later-phase Apply failure retains runtime restrictions, the simulated
+  development workbench can stop with `--keep-evidence`, retain its quiescent
+  runtime state and container diagnostics, and then cold-start the Saved
+  Scenario project without carrying locks or execution into the replacement.
+  A known pre-effect refusal remains an ordinary correctable refusal.
+  When a New/Load/Apply reply is lost, Composer finds its Apply by the exact
+  browser request id, so the failure notice still appears. New with Empty
+  Deployment from a populated cell is a documented known limitation.
 - **Structured backend fault taxonomy (arm + gripper)**: ros2_control backend
   faults carry a stable `reason_code` (e.g. `tracking_error_exceeded`,
   `gripper_goal_rejected`) with measurements through the execution digest
