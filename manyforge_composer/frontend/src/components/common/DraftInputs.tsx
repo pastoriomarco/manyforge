@@ -64,7 +64,12 @@ export function DraftTextInput({
 
   const currentValue = useRef(normalizedValue);
   currentValue.current = normalizedValue;
+  const appliedReset = useRef<{ key: typeof resetKey } | null>(null);
   useEffect(() => {
+    // StrictMode can replay effects when a keyed row moves. Only a new reset
+    // key discards text; an effect replay is not another operator discard.
+    if (appliedReset.current?.key === resetKey && appliedReset.current !== null) return;
+    appliedReset.current = { key: resetKey };
     userEdited.current = false;
     setDraft(currentValue.current);
     setInvalidMessage(null);

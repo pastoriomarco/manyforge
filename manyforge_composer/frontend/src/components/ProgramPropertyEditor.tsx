@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
 import { BreakableId } from './BreakableId';
 
@@ -216,7 +216,19 @@ export function ProgramPropertyEditor({
   const motionBindings = motionConfiguration.available
     ? motionConfiguration.configuration.bindings
     : null;
-  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [errors, setErrors] = useState<Record<string, { local?: string; commit?: string }>>({});
+  const setFieldError = useCallback((field: string, message: string | null, source: 'local' | 'commit' = 'local') => {
+    setErrors((current) => {
+      if ((current[field]?.[source] ?? null) === message) return current;
+      const nextField = { ...current[field] };
+      if (message === null) delete nextField[source];
+      else nextField[source] = message;
+      const next = { ...current };
+      if (Object.keys(nextField).length === 0) delete next[field];
+      else next[field] = nextField;
+      return next;
+    });
+  }, []);
   const [discardEpoch, setDiscardEpoch] = useState(0);
   const cardLayout = useCardPanelLayout();
   const selected = useMemo(
@@ -276,10 +288,11 @@ export function ProgramPropertyEditor({
     setErrors({});
     setDiscardEpoch((current) => current + 1);
   }, [selectedId]);
-  useEffect(() => {
-    onInvalidEditChange?.(Object.keys(errors).length > 0);
-    return () => onInvalidEditChange?.(false);
-  }, [errors, onInvalidEditChange]);
+  const hasInvalidEdit = Object.keys(errors).length > 0;
+  const invalidEditCallback = useRef(onInvalidEditChange);
+  useEffect(() => { invalidEditCallback.current = onInvalidEditChange; }, [onInvalidEditChange]);
+  useEffect(() => { invalidEditCallback.current?.(hasInvalidEdit); }, [hasInvalidEdit]);
+  useEffect(() => () => invalidEditCallback.current?.(false), []);
 
   if (!selected || !entry) {
     return (
@@ -320,14 +333,10 @@ export function ProgramPropertyEditor({
         ? 'Node name must be at most 128 bytes.'
         : duplicate ? 'Another node already uses this name.' : null;
     if (message) {
-      setErrors((current) => ({ ...current, _identity: message }));
+      setFieldError('_identity', message);
       return;
     }
-    setErrors((current) => {
-      const next = { ...current };
-      delete next._identity;
-      return next;
-    });
+    setFieldError('_identity', null);
     if (normalized === selected.instance_id) return;
     void Promise.resolve(onMutate('tree_draft_rename_node', {
       instance_id: selected.instance_id,
@@ -356,14 +365,11 @@ export function ProgramPropertyEditor({
     const message = ceilingMessage
       ?? firstCatalogParameterValidationMessage(parameter, value);
     if (message) {
-      setErrors((current) => ({ ...current, [parameter.id]: message }));
+      setFieldError(parameter.id, message, 'commit');
       return;
     }
-    setErrors((current) => {
-      const next = { ...current };
-      delete next[parameter.id];
-      return next;
-    });
+    // A schema-valid sibling commit does not settle another child's local text.
+    setFieldError(parameter.id, null, 'commit');
     applyTransition(parameter.id, { kind: 'literal', value });
   };
 
@@ -398,7 +404,7 @@ export function ProgramPropertyEditor({
         ? parameter.required ? `${parameter.id} has no valid literal fallback` : null
         : firstCatalogParameterValidationMessage(parameter, fallback);
       if (fallbackMessage) {
-        setErrors((current) => ({ ...current, [parameter.id]: fallbackMessage }));
+        setFieldError(parameter.id, fallbackMessage, 'commit');
         return;
       }
       applyTransition(
@@ -408,11 +414,7 @@ export function ProgramPropertyEditor({
           : { kind: 'literal', value: fallback },
       );
     }
-    setErrors((current) => {
-      const next = { ...current };
-      delete next[parameter.id];
-      return next;
-    });
+    setFieldError(parameter.id, null, 'commit');
   };
 
   return (
@@ -494,12 +496,7 @@ export function ProgramPropertyEditor({
                     && node.instance_id !== selected.instance_id,
                 ) ? 'Another node already uses this name.' : null;
               }}
-              onInvalidChange={(message) => setErrors((current) => {
-                const next = { ...current };
-                if (message) next._identity = message;
-                else delete next._identity;
-                return next;
-              })}
+              onInvalidChange={(message) => setFieldError('_identity', message)}
               onCommit={renameNode}
             />
           </label>
@@ -650,22 +647,13 @@ export function ProgramPropertyEditor({
                         return error instanceof Error ? error.message : 'Value must be strict JSON.';
                       }
                     }}
-                    onInvalidChange={(message) => setErrors((current) => {
-                      const next = { ...current };
-                      if (message) next[parameter.id] = message;
-                      else delete next[parameter.id];
-                      return next;
-                    })}
+                    onInvalidChange={(message) => setFieldError(parameter.id, message)}
                     onCommit={(text) => {
                       try {
                         commitLiteral(parameter, JSON.parse(text) as JsonValue);
                       } catch (error) {
-                        setErrors((current) => ({
-                          ...current,
-                          [parameter.id]: error instanceof Error
-                            ? error.message
-                            : 'Value must be strict JSON.',
-                        }));
+                        setFieldError(parameter.id, error instanceof Error
+                          ? error.message : 'Value must be strict JSON.', 'commit');
                       }
                     }}
                   />
@@ -686,12 +674,7 @@ export function ProgramPropertyEditor({
                     }}
                     path={parameter.id}
                     onCommit={(value) => commitLiteral(parameter, value)}
-                    onInvalidChange={(message) => setErrors((current) => {
-                      const next = { ...current };
-                      if (message) next[parameter.id] = message;
-                      else delete next[parameter.id];
-                      return next;
-                    })}
+                    onInvalidChange={(message) => setFieldError(parameter.id, message)}
                   />
                 </div>
               )}
@@ -750,12 +733,7 @@ export function ProgramPropertyEditor({
         inheritedGroups={inheritedGroups}
         busy={busy}
         onUpdate={onUpdateNodePolicies}
-        onInvalidChange={(message) => setErrors((current) => {
-          const next = { ...current };
-          if (message) next._policy = message;
-          else delete next._policy;
-          return next;
-        })}
+        onInvalidChange={(message) => setFieldError('_policy', message)}
       />
     </section>
   );

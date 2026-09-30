@@ -159,6 +159,12 @@ hardening done before the first tag was granted.
 
 ### Changed
 
+- Program property editors settle after validation changes instead of repeatedly
+  rendering on callback changes. Unfinished sibling edits stay visible and block
+  Apply across row reorder, map-key rename and equal owner readback; explicit
+  Discard still clears them. Missing-value defaults and effect replay no longer
+  reset staged input.
+
 - **Real-robot candidate and observed-state authority**: approved Robot Control
   candidates now carry the same TCP and per-joint dynamics caps through
   preview, approval recheck, and execution. ROS-backed physical execution

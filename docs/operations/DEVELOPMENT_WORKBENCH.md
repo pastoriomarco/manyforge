@@ -45,31 +45,63 @@ from compiled Deployment artifacts or rename existing runtime journals.
 
 ## Start, inspect, and stop
 
-Start an empty authoring workbench:
+### Everyday workflow
 
-```bash
-./scripts/compose-dev.sh start
-```
+Run every command from the repository root.
 
-Or select one repository project folder:
+1. **Start** the workbench with one repository Scenario project folder, or
+   with no project for an empty authoring workspace:
 
-```bash
-./scripts/compose-dev.sh start --project examples/lite6_pick_and_place.scenario
-```
+   ```bash
+   ./scripts/compose-dev.sh start --project examples/ur5e_lite6_wall_grouped.scenario
+   ./scripts/compose-dev.sh start
+   ```
 
-Open `http://localhost:3000`. Frontend source edits update through HMR. Backend
+   The project must be a folder containing `scenario.yaml` inside the
+   repository's `examples/` folder, the only root startup accepts. Keep the terminal output: if a start fails,
+   the launcher removes the container it created, and the output is then the
+   only record of the cause (`… start --project X 2>&1 | tee start.log`).
+   A cached start takes about half a minute; the first start, or one after
+   native source changes, compiles and takes much longer.
+2. **Check readiness.** A successful start prints the owner-issued current
+   Scenario with `"ready": true` and `"unavailable_reasons": []`, then the
+   frontend URL. Check the reported Scenario and its readiness, not just
+   whether the page loads. Repeat the check at any time with:
+
+   ```bash
+   ./scripts/compose-dev.sh status
+   ```
+
+3. **Open** `http://localhost:3000`. After any start or restart, refresh a tab
+   that was already open; it does not reconnect to a new stack by itself.
+4. **Stop** when finished, or before switching to another Scenario project
+   (selecting a different project while running is refused):
+
+   ```bash
+   ./scripts/compose-dev.sh stop
+   ```
+
+**After a host reboot** the workbench does not start by itself. Its container
+is left `Exited`; run the start command again, which removes the stale
+container on its own. A reboot is a clean restart: runtime state lived in the
+container and is gone, unsaved Program and Deployment Drafts are lost, the
+selected saved Scenario is loaded again, and Composer settings are kept.
+
+During every start the log shows two error-looking lines before the native
+execution host is up. They are expected and stop once the start reports ready:
+
+- `Execution event pump unavailable: … execution-command.sock … No such file or directory`
+- `Execution event pump unavailable: … live logical-scene projection is unavailable`
+
+### Reference
+
+Frontend source edits update through HMR. Backend
 startup incrementally builds the current `manyforge_manager_daemon`,
 `manyforge_headless_py`, `manyforge_native_execution_host`,
 `manyforge_roboplan_candidate_worker` and Deployment authoring compiler targets
 with their dependencies. It deliberately runs no tests, sanitizers, qualification
-matrices, package materializers, or proof generators.
-
-Inspect the exact owner-issued active tuple or stop all workbench processes:
-
-```bash
-./scripts/compose-dev.sh status
-./scripts/compose-dev.sh stop
-```
+matrices, package materializers, or proof generators. `status` reports the exact
+owner-issued active tuple.
 
 Plain `stop` discards runtime state. To stop the workbench and preserve its
 diagnostic state, use:
@@ -210,6 +242,11 @@ containment or recovery procedure for physical equipment.
 | Port occupied | Identify the listener on 3000/9010/9011/9020; do not kill an unrelated process. |
 | Different or unhealthy workbench already running | Read status/logs first. Stop only with authorization before switching scenarios; do not spawn another stack to hide the failure. |
 | Slow first start | Inspect build output. Lower `MANYFORGE_DEV_BUILD_JOBS` if compilation exhausts memory; avoid repeated startup attempts. |
+| `status` says stopped after a failed start | The launcher removed the container it created, with its logs. Read the start output you kept (`tee`), or start again with its output captured. |
+| `Scenario project is outside allowed roots` (exit 69) | Pass a project folder inside `examples/`, the only root startup accepts; a scratch folder such as `.manyforge-dev/` is refused. |
+| Start refuses with `… assistant instrument source is invalid or stale` or `… node environment manifest is stale` | A generated source is out of date after a catalog or covered source change. Regenerate with the owner tools, in order: `manyforge_behavior/scripts/generate_effective_node_catalog.py` (an intentional catalog change also updates the pinned digest in `manyforge_behavior/manyforge_behavior/catalog.py`), `manyforge_behavior/scripts/generate_node_environment_manifest.py`, then `manyforge_deployment/tools/generate_assistant_instrument_registry.py`. Run them in the workbench image; each has `--check`. |
+| Error-looking `Execution event pump unavailable` lines during start | Expected before the native host is up; see the everyday workflow. Investigate only if they continue after the start reports ready. |
+| Page stale or disconnected after a restart | Refresh the tab. |
 | Stale viewer or failed command | Inspect Runtime/history and owner status. Do not infer rejection from a lost response or resend motion/Apply automatically. |
 
 For API clients, use the public generated

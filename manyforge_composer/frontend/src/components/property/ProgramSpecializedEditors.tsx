@@ -21,9 +21,15 @@ const SpecializedInvalidContext = createContext<SpecializedInvalidReporter>(() =
 function useSpecializedInvalidReporter() {
   const report = useContext(SpecializedInvalidContext);
   const token = useRef(Symbol('specialized-field'));
-  useEffect(() => () => report(token.current, null), [report]);
-  return useCallback((message: string | null) => {
-    report(token.current, message);
+  const message = useRef<string | null>(null);
+  useEffect(() => {
+    const fieldToken = token.current;
+    report(fieldToken, message.current);
+    return () => report(fieldToken, null);
+  }, [report]);
+  return useCallback((next: string | null) => {
+    message.current = next;
+    report(token.current, next);
   }, [report]);
 }
 
@@ -221,7 +227,10 @@ function FrameReferenceEditor({
     Object.fromEntries(Object.entries(value).filter((row): row is [string, string] =>
       typeof row[1] === 'string')),
   );
+  const resetValue = useRef<JsonObject | undefined>(undefined);
   useEffect(() => {
+    if (resetValue.current === value) return;
+    resetValue.current = value;
     setDraft(Object.fromEntries(Object.entries(value).filter((row): row is [string, string] =>
       typeof row[1] === 'string')));
     reportInvalid(null);
@@ -417,7 +426,10 @@ function MotionReferenceEditor({
   const currentType = typeof value.type === 'string' ? value.type : '';
   const [draftType, setDraftType] = useState(currentType);
   const [draftField, setDraftField] = useState('');
+  const resetValue = useRef<JsonObject | undefined>(undefined);
   useEffect(() => {
+    if (resetValue.current === value) return;
+    resetValue.current = value;
     setDraftType(currentType);
     const field = MOTION_REFERENCE_FIELDS[currentType];
     setDraftField(field && typeof value[field] === 'string' ? value[field] as string : '');
@@ -634,7 +646,13 @@ function JointTargetListEditor({
   const inventoryAvailable = sourceJointInventory?.unavailableReason === null;
   const [rows, setRows] = useState<JointTargetEditorRow[]>(() =>
     jointTargetEditorRows(availableJointNames, value));
+  const resetSource = useRef<{ value: JsonValue[]; joints: string[] } | null>(null);
   useEffect(() => {
+    const previous = resetSource.current;
+    if (previous?.value === value
+      && previous.joints.length === availableJointNames.length
+      && previous.joints.every((name, index) => name === availableJointNames[index])) return;
+    resetSource.current = { value, joints: availableJointNames };
     setRows(jointTargetEditorRows(availableJointNames, value));
     reportInvalid(null);
   }, [availableJointNames, reportInvalid, value]);
@@ -884,6 +902,7 @@ export function ProgramSpecializedEditor({
   const [invalid, setInvalid] = useState<Map<symbol, string>>(() => new Map());
   const reportInvalid = useCallback<SpecializedInvalidReporter>((token, message) => {
     setInvalid((current) => {
+      if ((current.get(token) ?? null) === message) return current;
       const next = new Map(current);
       if (message === null) next.delete(token);
       else next.set(token, message);

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
   CatalogEntry,
@@ -44,6 +44,33 @@ interface ProgramSchemaValueEditorProps {
   path?: string;
   onCommit: (value: JsonValue) => void;
   onInvalidChange?: (message: string | null) => void;
+}
+
+// Reporting belongs to a mounted field, not to the parent's callback identity.
+function useInvalidReport(message: string | null, onChange?: (message: string | null) => void) {
+  const callback = useRef(onChange);
+  useEffect(() => { callback.current = onChange; }, [onChange]);
+  useEffect(() => { callback.current?.(message); }, [message]);
+  useEffect(() => () => callback.current?.(null), []);
+}
+
+function useChildErrors() {
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const report = useCallback((key: string, message: string | null) => {
+    setErrors((current) => {
+      if ((current[key] ?? null) === message) return current;
+      const next = { ...current };
+      if (message === null) delete next[key];
+      else next[key] = message;
+      return next;
+    });
+  }, []);
+  return { firstError: Object.values(errors)[0] ?? null, report };
+}
+
+interface EditorRow {
+  id: number;
+  value: JsonValue;
 }
 
 function plainObject(value: JsonValue | undefined): Record<string, JsonValue> {
@@ -174,6 +201,8 @@ function FixedTupleEditor({
   const length = schema.minItems ?? schema.maxItems ?? 0;
   const values = Array.isArray(value) ? value : Array.from({ length }, () => 0);
   const labels = numericLabels(path, length);
+  const { firstError, report } = useChildErrors();
+  useInvalidReport(firstError, onInvalidChange);
   return (
     <fieldset className="program-vector-editor program-schema-tuple">
       <legend>{path.split('.').at(-1)?.replaceAll('_', ' ')}</legend>
@@ -197,7 +226,7 @@ function FixedTupleEditor({
                 candidate[index] = Number(text);
                 return firstCatalogSchemaValidationMessage(schema, candidate, path);
               }}
-              onInvalidChange={onInvalidChange}
+              onInvalidChange={(message) => report(String(index), message)}
               onCommit={(text) => {
                 const candidate = [...values];
                 candidate[index] = Number(text);
@@ -214,21 +243,26 @@ function FixedTupleEditor({
 function ArrayEditor(props: ProgramSchemaValueEditorProps) {
   const { schema, value, disabled, context, path = 'value', onCommit, onInvalidChange } = props;
   const incoming = Array.isArray(value) ? value : [];
-  const [draft, setDraft] = useState<JsonValue[]>(incoming);
-  const [error, setError] = useState<string | null>(null);
+  const [rows, setRows] = useState<EditorRow[]>(() => incoming.map((value, id) => ({ id, value })));
+  const nextId = useRef(incoming.length);
+  const draft = rows.map((row) => row.value);
+  const [ownError, setOwnError] = useState<string | null>(null);
+  const { firstError, report } = useChildErrors();
+  const error = firstError ?? ownError;
   const [expanded, setExpanded] = useState(incoming.length <= 4);
   useEffect(() => {
-    setDraft(Array.isArray(value) ? value : []);
-    setError(null);
+    const values = Array.isArray(value) ? value : [];
+    setRows((current) => values.map((item, index) => ({
+      id: current[index]?.id ?? nextId.current++, value: item,
+    })));
+    setOwnError(null);
   }, [value]);
-  useEffect(() => {
-    onInvalidChange?.(error);
-    return () => onInvalidChange?.(null);
-  }, [error, onInvalidChange]);
-  const submit = (candidate: JsonValue[]) => {
-    setDraft(candidate);
+  useInvalidReport(error, onInvalidChange);
+  const submit = (nextRows: EditorRow[]) => {
+    setRows(nextRows);
+    const candidate = nextRows.map((row) => row.value);
     const message = firstCatalogSchemaValidationMessage(schema, candidate, path);
-    setError(message);
+    setOwnError(message);
     if (message === null) onCommit(candidate);
   };
   const itemSchema = schema.items ?? {};
@@ -240,36 +274,35 @@ function ArrayEditor(props: ProgramSchemaValueEditorProps) {
     >
       <summary>{draft.length} item(s){error ? ' · needs attention' : ''}</summary>
       <div className="program-schema-list-rows">
-        {draft.map((item, index) => (
-          <div className="program-schema-list-row" key={index}>
+        {rows.map((row, index) => (
+          <div className="program-schema-list-row" key={row.id}>
             <ProgramSchemaValueEditor
               schema={itemSchema}
-              value={item}
+              value={row.value}
               disabled={disabled}
               context={context}
               path={`${path}[${index}]`}
               onCommit={(nextItem) => {
-                const candidate = [...draft];
-                candidate[index] = nextItem;
+                const candidate = [...rows];
+                candidate[index] = { ...row, value: nextItem };
                 submit(candidate);
               }}
-              onInvalidChange={(message) => setError(
-                message ? `${path}[${index}]: ${message}` : firstCatalogSchemaValidationMessage(schema, draft, path),
-              )}
+              onInvalidChange={(message) => report(String(row.id), message)}
             />
             <div className="program-schema-row-actions">
               <button type="button" disabled={disabled || index === 0} onClick={() => {
-                const candidate = [...draft];
+                const candidate = [...rows];
                 [candidate[index - 1], candidate[index]] = [candidate[index], candidate[index - 1]];
                 submit(candidate);
               }}>Earlier</button>
               <button type="button" disabled={disabled || index === draft.length - 1} onClick={() => {
-                const candidate = [...draft];
+                const candidate = [...rows];
                 [candidate[index], candidate[index + 1]] = [candidate[index + 1], candidate[index]];
                 submit(candidate);
               }}>Later</button>
               <button type="button" className="text-button" disabled={disabled} onClick={() => {
-                submit(draft.filter((_row, rowIndex) => rowIndex !== index));
+                report(String(row.id), null);
+                submit(rows.filter((item) => item.id !== row.id));
               }}>Remove</button>
             </div>
           </div>
@@ -280,10 +313,10 @@ function ArrayEditor(props: ProgramSchemaValueEditorProps) {
           disabled={disabled || (schema.maxItems !== undefined && draft.length >= schema.maxItems)}
           onClick={() => {
             setExpanded(true);
-            const candidate = [...draft, defaultValue(itemSchema)];
+            const candidate = [...rows, { id: nextId.current++, value: defaultValue(itemSchema) }];
             if (itemSchema['x-manyforge-semantic-type']) {
-              setDraft(candidate);
-              setError(`${path}[${candidate.length - 1}]: select a declared ${itemSchema['x-manyforge-semantic-type'].replaceAll('_', ' ')}.`);
+              setRows(candidate);
+              setOwnError(`${path}[${candidate.length - 1}]: select a declared ${itemSchema['x-manyforge-semantic-type'].replaceAll('_', ' ')}.`);
             } else {
               submit(candidate);
             }
@@ -299,21 +332,23 @@ function ArrayEditor(props: ProgramSchemaValueEditorProps) {
 
 function ObjectEditor(props: ProgramSchemaValueEditorProps) {
   const { schema, value, disabled, context, path = 'value', onCommit, onInvalidChange } = props;
+  const defaults = useMemo(() => Object.fromEntries(
+    Object.entries(schema.properties ?? {}).map(([name, child]) => [name, defaultValue(child)]),
+  ), [schema]);
   const incoming = objectDraftValue(schema, value);
   const [draft, setDraft] = useState<Record<string, JsonValue>>(incoming);
-  const [error, setError] = useState<string | null>(null);
+  const [ownError, setOwnError] = useState<string | null>(null);
+  const { firstError, report } = useChildErrors();
+  const error = firstError ?? ownError;
   useEffect(() => {
     setDraft(objectDraftValue(schema, value));
-    setError(null);
+    setOwnError(null);
   }, [schema, value]);
-  useEffect(() => {
-    onInvalidChange?.(error);
-    return () => onInvalidChange?.(null);
-  }, [error, onInvalidChange]);
+  useInvalidReport(error, onInvalidChange);
   const submit = (candidate: Record<string, JsonValue>) => {
     setDraft(candidate);
     const message = firstCatalogSchemaValidationMessage(schema, candidate, path);
-    setError(message);
+    setOwnError(message);
     if (message === null) onCommit(candidate);
   };
   const properties = schema.properties ?? {};
@@ -338,20 +373,19 @@ function ObjectEditor(props: ProgramSchemaValueEditorProps) {
                 <button type="button" className="text-button" disabled={disabled} onClick={() => {
                   const candidate = { ...draft };
                   delete candidate[name];
+                  report(name, null);
                   submit(candidate);
                 }}>Remove</button>
               )}
             </div>
             <ProgramSchemaValueEditor
               schema={childSchema}
-              value={present ? draft[name] : defaultValue(childSchema)}
+              value={present ? draft[name] : defaults[name]}
               disabled={disabled}
               context={context}
               path={`${path}.${name}`}
               onCommit={(child) => submit({ ...draft, [name]: child })}
-              onInvalidChange={(message) => setError(
-                message ? `${path}.${name}: ${message}` : firstCatalogSchemaValidationMessage(schema, draft, path),
-              )}
+              onInvalidChange={(message) => report(name, message)}
             />
           </div>
         );
@@ -364,72 +398,72 @@ function ObjectEditor(props: ProgramSchemaValueEditorProps) {
 function MapEditor(props: ProgramSchemaValueEditorProps) {
   const { schema, value, disabled, context, path = 'value', onCommit, onInvalidChange } = props;
   const incoming = plainObject(value);
-  const [draft, setDraft] = useState<Record<string, JsonValue>>(incoming);
+  const [rows, setRows] = useState(() => Object.entries(incoming).map(
+    ([key, value], id) => ({ id, key, value }),
+  ));
+  const nextId = useRef(rows.length);
+  const draft = Object.fromEntries(rows.map((row) => [row.key, row.value]));
   const [newKey, setNewKey] = useState('');
-  const [error, setError] = useState<string | null>(null);
+  const [ownError, setOwnError] = useState<string | null>(null);
+  const { firstError, report } = useChildErrors();
+  const error = firstError ?? ownError;
   const itemSchema = typeof schema.additionalProperties === 'object'
     ? schema.additionalProperties
     : {};
   useEffect(() => {
-    setDraft(plainObject(value));
-    setNewKey('');
-    setError(null);
+    setRows((current) => Object.entries(plainObject(value)).map(([key, item]) => ({
+      id: current.find((row) => row.key === key)?.id ?? nextId.current++, key, value: item,
+    })));
+    setOwnError(null);
   }, [value]);
-  useEffect(() => {
-    onInvalidChange?.(error);
-    return () => onInvalidChange?.(null);
-  }, [error, onInvalidChange]);
-  const submit = (candidate: Record<string, JsonValue>) => {
-    setDraft(candidate);
+  useInvalidReport(error, onInvalidChange);
+  const submit = (nextRows: typeof rows) => {
+    setRows(nextRows);
+    const candidate = Object.fromEntries(nextRows.map((row) => [row.key, row.value]));
     const message = firstCatalogSchemaValidationMessage(schema, candidate, path);
-    setError(message);
+    setOwnError(message);
     if (message === null) onCommit(candidate);
   };
   return (
     <fieldset className={`program-schema-map${error ? ' invalid' : ''}`}>
       <legend>{path.split('.').at(-1)?.replaceAll('_', ' ')}</legend>
-      {Object.entries(draft).map(([key, item]) => (
-        <div className="program-schema-map-row" key={key}>
+      {rows.map((row) => (
+        <div className="program-schema-map-row" key={row.id}>
           <DraftTextInput
-            aria-label={`${path} key ${key}`}
-            value={key}
+            aria-label={`${path} key ${row.key}`}
+            value={row.key}
             disabled={disabled}
             validate={(replacement) => {
               const normalized = replacement.trim();
               if (!normalized) return 'Map key is required.';
-              return normalized !== key && Object.prototype.hasOwnProperty.call(draft, normalized)
+              return normalized !== row.key && Object.prototype.hasOwnProperty.call(draft, normalized)
                 ? `Map key '${normalized}' already exists.`
                 : null;
             }}
-            onInvalidChange={setError}
+            onInvalidChange={(message) => report(`${row.id}:key`, message)}
             onCommit={(replacement) => {
               const normalized = replacement.trim();
-              if (!normalized || normalized === key) return;
-              const candidate = { ...draft };
-              delete candidate[key];
-              candidate[normalized] = item;
-              submit(candidate);
+              if (!normalized || normalized === row.key) return;
+              submit(rows.map((item) => item.id === row.id ? { ...item, key: normalized } : item));
             }}
           />
           <ProgramSchemaValueEditor
             schema={itemSchema}
-            value={item}
+            value={row.value}
             disabled={disabled}
             context={context}
-            path={`${path}.${key}`}
-            onCommit={(nextItem) => submit({ ...draft, [key]: nextItem })}
-            onInvalidChange={(message) => setError(
-              message ? `${path}.${key}: ${message}` : firstCatalogSchemaValidationMessage(schema, draft, path),
-            )}
+            path={`${path}.${row.key}`}
+            onCommit={(value) => submit(rows.map((item) => item.id === row.id ? { ...item, value } : item))}
+            onInvalidChange={(message) => report(`${row.id}:value`, message)}
           />
           <button
             type="button"
             className="text-button"
             disabled={disabled}
             onClick={() => {
-              const candidate = { ...draft };
-              delete candidate[key];
-              submit(candidate);
+              report(`${row.id}:key`, null);
+              report(`${row.id}:value`, null);
+              submit(rows.filter((item) => item.id !== row.id));
             }}
           >
             Remove
@@ -450,11 +484,11 @@ function MapEditor(props: ProgramSchemaValueEditorProps) {
           onClick={() => {
             const normalized = newKey.trim();
             if (Object.prototype.hasOwnProperty.call(draft, normalized)) {
-              setError(`Map key '${normalized}' already exists.`);
+              setOwnError(`Map key '${normalized}' already exists.`);
               return;
             }
             setNewKey('');
-            submit({ ...draft, [normalized]: defaultValue(itemSchema) });
+            submit([...rows, { id: nextId.current++, key: normalized, value: defaultValue(itemSchema) }]);
           }}
         >
           Add
@@ -466,10 +500,16 @@ function MapEditor(props: ProgramSchemaValueEditorProps) {
 }
 
 export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
-  const { schema, value, disabled, path = 'value', onCommit, onInvalidChange } = props;
+  const { schema, value: incoming, disabled, path = 'value', onCommit, onInvalidChange } = props;
+  // Owner readback may reconstruct equal JSON. It is not a local-input reset.
+  // Keep only this mounted field's current value, not a shared history/cache.
+  const [value, setValue] = useState(incoming);
+  if (incoming !== value && JSON.stringify(incoming) !== JSON.stringify(value)) setValue(incoming);
+  const fallback = useMemo(() => defaultValue(schema), [schema]);
+  const stableProps = { ...props, value };
   const semanticType = schema['x-manyforge-semantic-type'];
   if (semanticType && semanticType !== 'source_joint') {
-    return <SemanticChoiceEditor {...props} />;
+    return <SemanticChoiceEditor {...stableProps} />;
   }
   if (schema.enum) {
     const encoded = value === undefined ? '' : JSON.stringify(value);
@@ -515,13 +555,13 @@ export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
     && schema.minItems === schema.maxItems
     && ['number', 'integer'].includes(schema.items?.type ?? '')
   ) {
-    return <FixedTupleEditor {...props} />;
+    return <FixedTupleEditor {...stableProps} />;
   }
   if (supportsProgramSpecializedEditor(schema)) {
     return (
       <ProgramSpecializedEditor
         schema={schema}
-        value={value ?? defaultValue(schema)}
+        value={value === undefined ? fallback : value}
         disabled={disabled}
         sourceJointInventory={props.context.sourceJointInventory}
         onCommit={onCommit}
@@ -529,11 +569,11 @@ export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
       />
     );
   }
-  if (schema.type === 'array') return <ArrayEditor {...props} />;
+  if (schema.type === 'array') return <ArrayEditor {...stableProps} />;
   if (schema.type === 'object' && typeof schema.additionalProperties === 'object') {
-    return <MapEditor {...props} />;
+    return <MapEditor {...stableProps} />;
   }
-  if (schema.type === 'object' && schema.properties) return <ObjectEditor {...props} />;
+  if (schema.type === 'object' && schema.properties) return <ObjectEditor {...stableProps} />;
   if (schema.type === 'string' || semanticType === 'source_joint') {
     return (
       <DraftTextInput

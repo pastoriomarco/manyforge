@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 2.3.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:8019b8fff49f4206672820029e059bfac0475ca3d77f50abaa5e9f3816027900
+catalog_digest: sha256:3d5fa47c2dacc69fe56e2ec91e828897f0ac2a6c77f22a50a4acdd45edf41353
 schema_types:
   coordinate_position:
     type: object
@@ -200,6 +200,7 @@ schema_types:
       frame_role_id:
         type: string
         semantic_type: frame_role
+        semantic_scope_parameter: target_role
         required_when:
           type: frame_role
         allowed_when:

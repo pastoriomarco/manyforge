@@ -331,7 +331,6 @@ export function RobotControlPanelView({
   const tcpTransformMode = gizmo.settings.mode === 'scale' ? 'translate' : gizmo.settings.mode;
   const [coordinateStep, setCoordinateStep] = useState(0.01);
   const [moveSourceGroup, setMoveSourceGroup] = useState<MoveToSource['group'] | ''>('');
-  const [storedMoveId, setStoredMoveId] = useState('');
   const [previewInfoOpen, setPreviewInfoOpen] = useState(false);
   const [dismissedPreviewNotice, setDismissedPreviewNotice] = useState<string | null>(null);
   const previewInfoButton = useRef<HTMLButtonElement>(null);
@@ -574,18 +573,6 @@ export function RobotControlPanelView({
     status,
   ]);
 
-  const eligibleStoredMoves = useMemo(() => moveSources.filter((source) => (
-    source.node !== undefined
-    && (state.mode === 'joint'
-      ? source.kind === 'joint'
-      : state.mode === 'pose_goal' || state.mode === 'cartesian_path'
-        ? source.kind === 'pose'
-        : false)
-  )), [moveSources, state.mode]);
-  const selectedStoredMove = eligibleStoredMoves.find(
-    (source) => source.id === storedMoveId,
-  );
-
   const applyMoveSource = (sourceId: string) => {
     const source = moveSources.find((row) => row.id === sourceId);
     if (source === undefined) {
@@ -623,14 +610,6 @@ export function RobotControlPanelView({
     setInputRebase((value) => value + 1);
     revert();
   }, [authoringBlocked, moveSourceCurrent, revert, state.mode, state.phase]);
-
-  const saveObservedIntoStoredMove = () => {
-    if (selectedStoredMove?.node === undefined) return;
-    void draft?.mutate('program_draft_store_observed_move', {
-      instance_id: selectedStoredMove.node.instance_id,
-      observed_kind: selectedStoredMove.kind === 'joint' ? 'joint' : 'tcp_pose',
-    });
-  };
 
   const modeAvailable = (mode: RobotControlMode): boolean => {
     if (status === null) return false;
@@ -1084,24 +1063,6 @@ export function RobotControlPanelView({
                           </details>
                         </>
                       )}
-                      {selectedMoveSource?.node !== undefined && <button
-                        type="button"
-                        disabled={
-                          active
-                          || !draft?.mutationAvailable
-                          || selectedMoveSource?.node === undefined
-                        }
-                        title="Replace only the selected stored move with the current owner-observed target."
-                        onClick={() => {
-                          if (selectedMoveSource?.node === undefined) return;
-                          void draft?.mutate('program_draft_store_observed_move', {
-                            instance_id: selectedMoveSource.node.instance_id,
-                            observed_kind: selectedMoveSource.kind === 'joint' ? 'joint' : 'tcp_pose',
-                          });
-                        }}
-                      >
-                        Save current into selected move
-                      </button>}
                       {selectedMoveSource !== undefined && (
                         <details className="robot-control-resolved-target">
                           <summary>Resolved target · {motion?.baseFrameRoleId}</summary>
@@ -1253,46 +1214,26 @@ export function RobotControlPanelView({
 
               {(state.mode === 'joint'
                 || state.mode === 'pose_goal'
-                || state.mode === 'cartesian_path') && (
+                || state.mode === 'cartesian_path')
+                && overrideCandidate !== null
+                && overrideCandidate.nodeAttemptId !== null && (
+                // Assigning a pose to a Program move belongs to the move's
+                // goal in its properties ("Use current robot pose"). This
+                // block only offers the held move's recovery override.
                 <fieldset className="robot-control-stored-move">
-                  <legend>Apply observed state to a stored move</legend>
-                  <label>
-                    <span>Eligible Program Draft move</span>
-                    <select
-                      value={selectedStoredMove === undefined ? '' : storedMoveId}
-                      disabled={authoringBlocked || eligibleStoredMoves.length === 0}
-                      onChange={(event) => setStoredMoveId(event.currentTarget.value)}
-                    >
-                      <option value="">Choose a stored move</option>
-                      {eligibleStoredMoves.map((source) => (
-                        <option key={source.id} value={source.id}>{source.label}</option>
-                      ))}
-                    </select>
-                  </label>
+                  <legend>Held Program move</legend>
                   <div className="robot-control-stored-actions">
                     <button
                       type="button"
                       disabled={
-                        overrideCandidate?.available !== true
+                        overrideCandidate.available !== true
                         || program?.state.controlPending !== null
                       }
-                      title={overrideCandidate?.reason
+                      title={overrideCandidate.reason
                         ?? 'Stage the exact source-owned observation for the held Program attempt.'}
                       onClick={() => program?.stageObservationOverride()}
                     >
                       {overridePending ? 'Staging' : 'Stage as runtime override'}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={
-                        active
-                        || !draft?.mutationAvailable
-                        || selectedStoredMove?.node === undefined
-                      }
-                      title="Save the exact source-owned current joints or TCP pose into this Program Draft move."
-                      onClick={saveObservedIntoStoredMove}
-                    >
-                      Save to Program Draft
                     </button>
                   </div>
                 </fieldset>

@@ -4426,235 +4426,6 @@
               }
             ]
           },
-          "s_34c9b782f2e22bde": {
-            "additionalProperties": false,
-            "allOf": [
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "component_body_role"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "collision_body_role_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "frame_role"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "frame_role_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "pose"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "pose"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "runtime_object"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "runtime_object_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "scene_resource"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "scene_resource_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "component_body_role"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "collision_body_role_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "frame_role"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "frame_role_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "pose"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "pose"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "runtime_object"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "runtime_object_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "scene_resource"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                }
-              }
-            ],
-            "properties": {
-              "collision_body_role_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "collision_body_role"
-              },
-              "frame_role_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "pose": {
-                "$ref": "#/$defs/s_c0927a2b2371dcad"
-              },
-              "runtime_object_id": {
-                "type": "string"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "type": {
-                "enum": [
-                  "frame_role",
-                  "component_body_role",
-                  "scene_resource",
-                  "runtime_object",
-                  "pose"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "type"
-            ],
-            "type": "object"
-          },
           "s_37246640995e786a": {
             "additionalProperties": false,
             "allOf": [
@@ -5373,6 +5144,236 @@
                 ]
               }
             ]
+          },
+          "s_bd496f5351f68f45": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "component_body_role"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "collision_body_role_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "frame_role"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "pose"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "pose"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "runtime_object"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "runtime_object_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "scene_resource"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "scene_resource_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "component_body_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "collision_body_role_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "frame_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "pose"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "pose"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "runtime_object"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "runtime_object_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "scene_resource"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "collision_body_role_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "collision_body_role"
+              },
+              "frame_role_id": {
+                "type": "string",
+                "x-manyforge-semantic-scope-parameter": "target_role",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "pose": {
+                "$ref": "#/$defs/s_c0927a2b2371dcad"
+              },
+              "runtime_object_id": {
+                "type": "string"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "type": {
+                "enum": [
+                  "frame_role",
+                  "component_body_role",
+                  "scene_resource",
+                  "runtime_object",
+                  "pose"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           },
           "s_c0927a2b2371dcad": {
             "additionalProperties": false,
@@ -6568,7 +6569,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "path": {
                         "items": {
@@ -6605,7 +6606,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "target_role": {
                         "type": "string",
@@ -7020,7 +7021,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
@@ -7049,7 +7050,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "target_role": {
                         "type": "string",
@@ -8850,7 +8851,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "path": {
                         "items": {
@@ -8887,7 +8888,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "target_role": {
                         "type": "string",
@@ -9371,7 +9372,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
@@ -9400,7 +9401,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "target_role": {
                         "type": "string",
@@ -10553,235 +10554,6 @@
               }
             ]
           },
-          "s_34c9b782f2e22bde": {
-            "additionalProperties": false,
-            "allOf": [
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "component_body_role"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "collision_body_role_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "frame_role"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "frame_role_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "pose"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "pose"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "runtime_object"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "runtime_object_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "scene_resource"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "scene_resource_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "component_body_role"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "collision_body_role_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "frame_role"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "frame_role_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "pose"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "pose"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "runtime_object"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "runtime_object_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "scene_resource"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                }
-              }
-            ],
-            "properties": {
-              "collision_body_role_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "collision_body_role"
-              },
-              "frame_role_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "pose": {
-                "$ref": "#/$defs/s_c0927a2b2371dcad"
-              },
-              "runtime_object_id": {
-                "type": "string"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "type": {
-                "enum": [
-                  "frame_role",
-                  "component_body_role",
-                  "scene_resource",
-                  "runtime_object",
-                  "pose"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "type"
-            ],
-            "type": "object"
-          },
           "s_37246640995e786a": {
             "additionalProperties": false,
             "allOf": [
@@ -11528,6 +11300,236 @@
                 ]
               }
             ]
+          },
+          "s_bd496f5351f68f45": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "component_body_role"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "collision_body_role_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "frame_role"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "pose"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "pose"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "runtime_object"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "runtime_object_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "scene_resource"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "scene_resource_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "component_body_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "collision_body_role_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "frame_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "pose"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "pose"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "runtime_object"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "runtime_object_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "scene_resource"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "collision_body_role_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "collision_body_role"
+              },
+              "frame_role_id": {
+                "type": "string",
+                "x-manyforge-semantic-scope-parameter": "target_role",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "pose": {
+                "$ref": "#/$defs/s_c0927a2b2371dcad"
+              },
+              "runtime_object_id": {
+                "type": "string"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "type": {
+                "enum": [
+                  "frame_role",
+                  "component_body_role",
+                  "scene_resource",
+                  "runtime_object",
+                  "pose"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           },
           "s_bfef448c344240d8": {
             "oneOf": [
@@ -13101,7 +13103,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "path": {
                         "items": {
@@ -13138,7 +13140,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "target_role": {
                         "type": "string",
@@ -13622,7 +13624,7 @@
                         "type": "number"
                       },
                       "offset_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
@@ -13651,7 +13653,7 @@
                         "type": "string"
                       },
                       "target_reference": {
-                        "$ref": "#/$defs/s_34c9b782f2e22bde"
+                        "$ref": "#/$defs/s_bd496f5351f68f45"
                       },
                       "target_role": {
                         "type": "string",
@@ -14804,235 +14806,6 @@
               }
             ]
           },
-          "s_34c9b782f2e22bde": {
-            "additionalProperties": false,
-            "allOf": [
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "component_body_role"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "collision_body_role_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "frame_role"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "frame_role_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "pose"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "pose"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "runtime_object"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "runtime_object_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "scene_resource"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "scene_resource_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "component_body_role"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "collision_body_role_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "frame_role"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "frame_role_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "pose"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "pose"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "runtime_object"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "runtime_object_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "scene_resource"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                }
-              }
-            ],
-            "properties": {
-              "collision_body_role_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "collision_body_role"
-              },
-              "frame_role_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "pose": {
-                "$ref": "#/$defs/s_c0927a2b2371dcad"
-              },
-              "runtime_object_id": {
-                "type": "string"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "type": {
-                "enum": [
-                  "frame_role",
-                  "component_body_role",
-                  "scene_resource",
-                  "runtime_object",
-                  "pose"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "type"
-            ],
-            "type": "object"
-          },
           "s_37246640995e786a": {
             "additionalProperties": false,
             "allOf": [
@@ -15780,6 +15553,236 @@
               }
             ]
           },
+          "s_bd496f5351f68f45": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "component_body_role"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "collision_body_role_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "frame_role"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "pose"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "pose"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "runtime_object"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "runtime_object_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "scene_resource"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "scene_resource_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "component_body_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "collision_body_role_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "frame_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "pose"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "pose"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "runtime_object"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "runtime_object_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "scene_resource"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "collision_body_role_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "collision_body_role"
+              },
+              "frame_role_id": {
+                "type": "string",
+                "x-manyforge-semantic-scope-parameter": "target_role",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "pose": {
+                "$ref": "#/$defs/s_c0927a2b2371dcad"
+              },
+              "runtime_object_id": {
+                "type": "string"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "type": {
+                "enum": [
+                  "frame_role",
+                  "component_body_role",
+                  "scene_resource",
+                  "runtime_object",
+                  "pose"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
           "s_bfef448c344240d8": {
             "oneOf": [
               {
@@ -16337,235 +16340,6 @@
                 ]
               }
             ]
-          },
-          "s_34c9b782f2e22bde": {
-            "additionalProperties": false,
-            "allOf": [
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "component_body_role"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "collision_body_role_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "frame_role"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "frame_role_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "pose"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "pose"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "runtime_object"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "runtime_object_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "properties": {
-                    "type": {
-                      "const": "scene_resource"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                "then": {
-                  "required": [
-                    "scene_resource_id"
-                  ]
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "component_body_role"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "collision_body_role_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "frame_role"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "frame_role_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "pose"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "pose"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "runtime_object"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "runtime_object_id"
-                    ]
-                  }
-                }
-              },
-              {
-                "if": {
-                  "not": {
-                    "properties": {
-                      "type": {
-                        "const": "scene_resource"
-                      }
-                    },
-                    "required": [
-                      "type"
-                    ]
-                  }
-                },
-                "then": {
-                  "not": {
-                    "required": [
-                      "scene_resource_id"
-                    ]
-                  }
-                }
-              }
-            ],
-            "properties": {
-              "collision_body_role_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "collision_body_role"
-              },
-              "frame_role_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "frame_role"
-              },
-              "pose": {
-                "$ref": "#/$defs/s_c0927a2b2371dcad"
-              },
-              "runtime_object_id": {
-                "type": "string"
-              },
-              "scene_resource_id": {
-                "type": "string",
-                "x-manyforge-semantic-type": "scene_resource"
-              },
-              "type": {
-                "enum": [
-                  "frame_role",
-                  "component_body_role",
-                  "scene_resource",
-                  "runtime_object",
-                  "pose"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "type"
-            ],
-            "type": "object"
           },
           "s_37246640995e786a": {
             "additionalProperties": false,
@@ -17406,6 +17180,236 @@
                 ]
               }
             ]
+          },
+          "s_bd496f5351f68f45": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "component_body_role"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "collision_body_role_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "frame_role"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "frame_role_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "pose"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "pose"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "runtime_object"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "runtime_object_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "scene_resource"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "required": [
+                    "scene_resource_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "component_body_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "collision_body_role_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "frame_role"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "frame_role_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "pose"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "pose"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "runtime_object"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "runtime_object_id"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "not": {
+                    "properties": {
+                      "type": {
+                        "const": "scene_resource"
+                      }
+                    },
+                    "required": [
+                      "type"
+                    ]
+                  }
+                },
+                "then": {
+                  "not": {
+                    "required": [
+                      "scene_resource_id"
+                    ]
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "collision_body_role_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "collision_body_role"
+              },
+              "frame_role_id": {
+                "type": "string",
+                "x-manyforge-semantic-scope-parameter": "target_role",
+                "x-manyforge-semantic-type": "frame_role"
+              },
+              "pose": {
+                "$ref": "#/$defs/s_c0927a2b2371dcad"
+              },
+              "runtime_object_id": {
+                "type": "string"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              },
+              "type": {
+                "enum": [
+                  "frame_role",
+                  "component_body_role",
+                  "scene_resource",
+                  "runtime_object",
+                  "pose"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           },
           "s_c0927a2b2371dcad": {
             "additionalProperties": false,
@@ -18863,7 +18867,7 @@
                     "type": "number"
                   },
                   "offset_reference": {
-                    "$ref": "#/$defs/s_34c9b782f2e22bde"
+                    "$ref": "#/$defs/s_bd496f5351f68f45"
                   },
                   "path": {
                     "items": {
@@ -18900,7 +18904,7 @@
                     "type": "string"
                   },
                   "target_reference": {
-                    "$ref": "#/$defs/s_34c9b782f2e22bde"
+                    "$ref": "#/$defs/s_bd496f5351f68f45"
                   },
                   "target_role": {
                     "type": "string",
@@ -19373,7 +19377,7 @@
                     "type": "number"
                   },
                   "offset_reference": {
-                    "$ref": "#/$defs/s_34c9b782f2e22bde"
+                    "$ref": "#/$defs/s_bd496f5351f68f45"
                   },
                   "per_joint_dynamics_limits": {
                     "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
@@ -19402,7 +19406,7 @@
                     "type": "string"
                   },
                   "target_reference": {
-                    "$ref": "#/$defs/s_34c9b782f2e22bde"
+                    "$ref": "#/$defs/s_bd496f5351f68f45"
                   },
                   "target_role": {
                     "type": "string",
